@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
     NavigableString = None  # type: ignore[assignment, misc]
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.agent_context import ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.challenge_evidence import (
     CHALLENGE_EVIDENCE_SOURCE_KEY,
     CHALLENGE_KIND_KEY,
@@ -29,7 +30,6 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
 from skyvern.forge.sdk.copilot.composition_evidence_size import size_compaction_omits
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url, page_records_share_location
 from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
-from skyvern.forge.sdk.copilot.runtime import ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 

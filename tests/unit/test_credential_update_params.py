@@ -34,6 +34,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     TotpType,
     UpdateCredentialRequest,
 )
+from skyvern.forge.sdk.services.credential import credential_creation_service
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -127,7 +128,9 @@ async def test_create_credential_response_includes_generated_proxy_pin(monkeypat
         totp_type=TotpType.AUTHENTICATOR,
     )
     vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=stored_credential))
-    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        credential_creation_service, "get_credential_vault_service", AsyncMock(return_value=vault_service)
+    )
 
     data = CreateCredentialRequest(
         name="test",
@@ -198,7 +201,9 @@ async def test_credential_vault_service_update_db_credential_skips_tested_url_wh
 async def test_create_credential_then_get_credential_returns_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
     stored_credential = _make_password_credential(tested_url="https://example.com/login")
     vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=stored_credential))
-    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        credential_creation_service, "get_credential_vault_service", AsyncMock(return_value=vault_service)
+    )
     monkeypatch.setattr(
         forge_app.DATABASE.credentials,
         "get_credential",
@@ -1155,7 +1160,9 @@ def _stored_credential(
 @pytest.mark.asyncio
 async def test_create_credential_links_validated_browser_profile_id(monkeypatch: pytest.MonkeyPatch) -> None:
     vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=_stored_credential()))
-    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        credential_creation_service, "get_credential_vault_service", AsyncMock(return_value=vault_service)
+    )
     monkeypatch.setattr(
         forge_app.DATABASE.browser_sessions,
         "get_browser_profile",
@@ -1194,7 +1201,9 @@ async def test_create_credential_links_validated_browser_profile_id(monkeypatch:
 @pytest.mark.asyncio
 async def test_create_credential_persists_auto_profile_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=_stored_credential()))
-    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        credential_creation_service, "get_credential_vault_service", AsyncMock(return_value=vault_service)
+    )
     update_credential = AsyncMock(return_value=_stored_credential(auto_profile_disabled=True))
     monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
 
@@ -1217,7 +1226,9 @@ async def test_create_credential_persists_auto_profile_disabled(monkeypatch: pyt
 async def test_create_credential_rejects_managed_browser_profile_id(monkeypatch: pytest.MonkeyPatch) -> None:
     vault_create = AsyncMock(return_value=_stored_credential())
     vault_service = SimpleNamespace(create_credential=vault_create)
-    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        credential_creation_service, "get_credential_vault_service", AsyncMock(return_value=vault_service)
+    )
     monkeypatch.setattr(
         forge_app.DATABASE.browser_sessions,
         "get_browser_profile",
@@ -1553,7 +1564,9 @@ async def test_create_credential_profile_alone_does_not_reset_pin(monkeypatch: p
     # K: supplying a browser_profile_id without a pin field must NOT reset the pin — pass None (leave
     # unchanged), not the request model's default False.
     vault_service = SimpleNamespace(create_credential=AsyncMock(return_value=_stored_credential()))
-    monkeypatch.setattr(credentials_routes, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
+    monkeypatch.setattr(
+        credential_creation_service, "get_credential_vault_service", AsyncMock(return_value=vault_service)
+    )
     monkeypatch.setattr(
         forge_app.DATABASE.browser_sessions,
         "get_browser_profile",
@@ -1748,7 +1761,13 @@ class _PreservingVaultService(CredentialVaultService):
         self.stored = stored
         self.written: PasswordCredential | None = None
 
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
+    ) -> Credential:
         raise NotImplementedError
 
     async def update_credential(self, credential: Credential, data: CreateCredentialRequest) -> Credential:
@@ -1847,8 +1866,8 @@ async def test_create_credential_records_the_caller_as_creator(
     monkeypatch.setattr(settings, "LOCAL_CREDENTIAL_VAULT_KEY", None)
     monkeypatch.setattr(forge_app.DATABASE, "credentials", db.credentials)
     monkeypatch.setattr(
-        credentials_routes,
-        "_get_credential_vault_service",
+        credential_creation_service,
+        "get_credential_vault_service",
         AsyncMock(return_value=SkyvernCredentialVaultService()),
     )
 

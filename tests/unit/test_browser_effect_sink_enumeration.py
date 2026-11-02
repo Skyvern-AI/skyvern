@@ -27,10 +27,11 @@ _DISCOVERED_BROWSER_API_CALLS = {
             # 6 = 5 prior + the bounded v4 FileDownloadBlock synchronous popup close (SKY-15371).
             "close": 6,
             "dblclick": 2,
-            # 16 = 15 prior + the held-autocomplete declared-list rows read after input_text (SKY-17867).
-            "evaluate": 16,
+            # 19 = 18 prior + the read-only window offset read behind the page-level scroll progress check.
+            "evaluate": 19,
             "fill": 2,
-            "focus": 4,
+            # 5 = 4 prior + the focus that lets a Flutter text field start editing before a credential write.
+            "focus": 5,
             "go_back": 1,
             "go_forward": 1,
             "goto": 2,
@@ -49,12 +50,13 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "wheel": 5,
         }
     ),
-    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 5}),
+    "skyvern/webeye/actions/multi_field_totp.py": Counter({"fill": 1, "click": 2, "press": 1, "evaluate": 9}),
     "skyvern/webeye/actions/handler_utils.py": Counter(
         {"dispatch_event": 1, "down": 3, "evaluate": 1, "fill": 3, "press": 1, "up": 3}
     ),
     "skyvern/webeye/dialog_handler.py": Counter({"accept": 3, "dismiss": 1}),
-    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 6}),
+    # 8 = 7 prior + the read-only probe for whether a fill would land text on the live node (SKY-19100).
+    "skyvern/webeye/dom_inspection.py": Counter({"evaluate": 8}),
     "skyvern/webeye/utils/dom.py": Counter(
         {
             "check": 2,
@@ -79,6 +81,7 @@ _DISCOVERED_BROWSER_API_CALLS = {
             "click": 4,
             # A grid cell whose editor opens on a double-click (SKY-17868): one by selector, one by locator.
             "dblclick": 2,
+            "drag_and_drop": 1,
             "evaluate": 1,
             "fill": 3,
             "focus": 2,
@@ -112,6 +115,8 @@ _EVALUATE_CALLERS = {
             "bind": 1,
             "refresh": 1,
             "find_multi_field_totp_submit_controls": 1,
+            # read-only checks that a pending click or Enter targets the code group's own submit or resend control
+            "one_time_code_dispatch_kind": 4,
         }
     ),
     "skyvern/webeye/actions/handler_utils.py": Counter({"_uses_native_value_set_fill": 1}),
@@ -128,10 +133,15 @@ _EVALUATE_CALLERS = {
             "_inner": 1,
             # read-only declared-list rows probe after input_text into a held autocomplete (SKY-17867)
             "_held_value_lost_to_unmatched_text": 1,
+            # read-only Flutter text-field probe and two-frame wait around a credential write and its read-back
+            "_is_flutter_text_field": 1,
+            "_two_frames_passed": 1,
             "_normal_select_readback_contradicts": 1,
             "_probe_tel_browser_validity": 1,
             "handle_click_action": 2,
-            "handle_scroll_action": 4,
+            # 5 = 4 prior + the read-only window offset read that decides whether a page-level
+            # scroll revealed anything (SKY-18891)
+            "handle_scroll_action": 5,
         }
     ),
     "skyvern/webeye/dom_inspection.py": Counter(
@@ -139,8 +149,13 @@ _EVALUATE_CALLERS = {
             "read_current_url": 1,
             # locator-scoped live selected/checked read for the cached click guard (SKY-14051)
             "read_locator_selected_state": 1,
+            # read-only static-listbox option snapshot read (pre-click classification)
+            "read_static_listbox_option_snapshot": 1,
             # locator-scoped live isContentEditable read; routes blocks nested in an editing host to the atomic fill
             "read_locator_is_content_editable": 1,
+            # read-only check of whether a fill would land text on the live node, resolved the way the
+            # driver resolves it, so a covering label for a radio is not typed into (SKY-19100)
+            "read_locator_accepts_text_fill": 1,
             "read_locator_tag_name": 1,
             "read_resolved_anchor_href": 1,
             "read_whether_link_or_button": 1,
@@ -264,21 +279,21 @@ def test_discovered_browser_api_lower_bound_is_stable() -> None:
     }
 
     assert observed == _DISCOVERED_BROWSER_API_CALLS
-    assert sum(sum(methods.values()) for methods in observed.values()) == 208
+    assert sum(sum(methods.values()) for methods in observed.values()) == 219
     handler_candidates = _candidate_signatures("skyvern/webeye/actions/handler.py", _CANDIDATE_METHODS)
     classified_non_browser = Counter(
         {signature: count for signature, count in handler_candidates.items() if signature in _NON_BROWSER_CANDIDATES}
     )
     assert classified_non_browser == _NON_BROWSER_CANDIDATES
     assert sum(_NON_BROWSER_CANDIDATES.values()) == 7
-    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 201
+    assert sum(sum(methods.values()) for methods in observed.values()) - sum(_NON_BROWSER_CANDIDATES.values()) == 212
 
 
 def test_every_raw_evaluate_call_is_classified() -> None:
     observed = {path: callers for path in _owned_source_paths() if (callers := _callers_for_method(path, "evaluate"))}
 
     assert observed == _EVALUATE_CALLERS
-    assert sum(sum(callers.values()) for callers in observed.values()) == 39
+    assert sum(sum(callers.values()) for callers in observed.values()) == 48
 
 
 def test_every_cdp_dispatch_is_classified_by_exact_command() -> None:

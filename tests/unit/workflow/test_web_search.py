@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from skyvern.forge.sdk import browser_egress_policy
 from skyvern.forge.sdk.browser_egress_policy import DestinationBlockedError
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
@@ -266,6 +267,25 @@ async def test_withheld_results_are_counted_rather_than_read_as_an_empty_search(
 
     assert observed["results"] == []
     assert observed["extracted_count"] == 3
+    assert observed["withheld_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_result_the_worker_cannot_resolve_is_withheld(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SKY-18836, against the real classifier rather than a stand-in: admission has to require an
+    explicit allow, or a search result whose name resolves to an internal address only from the
+    browser's network is handed to the agent as a reviewed public destination."""
+
+    def no_such_host(_host: str) -> list[str]:
+        raise OSError("no such host")
+
+    arm_search_api(monkeypatch, (200, PAGE))
+    monkeypatch.setattr(browser_egress_policy, "resolve_host", no_such_host)
+    monkeypatch.setattr(web_search, "classify_url_async", browser_egress_policy.classify_url_async)
+
+    observed = await search_web("roofing")
+
+    assert observed["results"] == []
     assert observed["withheld_count"] == 3
 
 

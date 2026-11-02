@@ -8,14 +8,17 @@ token truncation, and error handling for DOCX files.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
 import re
+import struct
 import tempfile
 import time
 import zipfile
-from collections.abc import Awaitable
-from contextlib import suppress
+import zlib
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, get_args
@@ -26,13 +29,27 @@ import libcst as cst
 import pandas as pd
 import pytest
 import structlog
+from pypdf import PdfReader, apply_configuration
+from pypdf.errors import LimitReachedError, PdfReadError
 
+import skyvern.forge.sdk.utils.capped_subprocess as capped_subprocess_module
+import skyvern.forge.sdk.utils.pdf_parser as pdf_parser_module
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.config import settings
 from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
+from skyvern.exceptions import PDFParsingError
 from skyvern.forge import app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, scrambled_text_layer_reason
+from skyvern.forge.sdk.utils.capped_subprocess import MEMORY_CAP_ENFORCED, CappedSubprocessError
+from skyvern.forge.sdk.utils.capped_subprocess_child import MIN_MEMORY_BUDGET_BYTES
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_pdf_file,
+    extract_upright_pdf_words,
+    render_pdf_pages_as_images,
+    scrambled_text_layer_reason,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType, WorksheetNotFound
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
@@ -75,6 +92,7 @@ def _make_pdf_parser_block(file_url: str) -> PDFParserBlock:
 
 def _mock_workflow_run_context() -> MagicMock:
     ctx = MagicMock()
+    ctx.resolve_block_notes_section.return_value = None
     ctx.has_parameter.return_value = False
     ctx.has_value.return_value = False
     ctx.register_output_parameter_value_post_execution = AsyncMock()
@@ -727,6 +745,7 @@ class TestPDFParserSchemaValidation:
     @staticmethod
     def _patch_execute_dependencies(mp: pytest.MonkeyPatch, block: PDFParserBlock, handler: AsyncMock) -> AsyncMock:
         workflow_run_context = MagicMock()
+        workflow_run_context.resolve_block_notes_section.return_value = None
         workflow_run_context.has_parameter.return_value = False
         record_output_parameter_value = AsyncMock()
 
@@ -1071,29 +1090,116 @@ _ITEMISED_INVOICE_LINES = _INVOICE_LINES + tuple(
 )
 
 
-def _build_pdf(lines: tuple[str, ...], remap: dict[int, int] | None = None) -> bytes:
-    """Build a one-page PDF, optionally giving its font a ToUnicode map that lies.
+def _lzw_literals(data: bytes) -> bytes:
+    """LZW-encode ``data`` as bare 9-bit literals, clearing the table often enough that the code width never grows."""
+    codes = [code for index, byte in enumerate(data) for code in ((256, byte) if index % 100 == 0 else (byte,))]
+    bits = "".join(f"{code:09b}" for code in (*codes, 257))
+    bits += "0" * (-len(bits) % 8)
+    return int(bits, 2).to_bytes(len(bits) // 8, "big")
 
-    The page always draws ordinary ASCII character codes, so with ``remap`` set only the
-    ToUnicode map is wrong — which is what makes a subset font's text layer extract as
-    plausible-looking garbage instead of failing outright.
+
+def _run_length_literals(data: bytes) -> bytes:
+    """Run-length-encode ``data`` as literal runs only."""
+    runs = (data[start : start + 128] for start in range(0, len(data), 128))
+    return b"".join(bytes([len(run) - 1]) + run for run in runs) + b"\x80"
+
+
+def _build_pdf(
+    lines: tuple[str, ...],
+    remap: dict[int, int] | None = None,
+    font_entries: bytes = b"",
+    flate_content: bool = False,
+    lzw_content: bool = False,
+    run_length_content: bool = False,
+    gzip_content: bool = False,
+    jbig2_content: bool = False,
+    png_predictor: tuple[int, int] | None = None,
+    flate_xref_stream: bool = False,
+    content_copies: int = 1,
+    cid_widths: bytes | None = None,
+    cid_to_unicode_range: str | None = None,
+    cid_to_unicode_char: str | None = None,
+    content_length: int | None = None,
+) -> bytes:
+    """Build a one-page PDF that always draws plain ASCII codes, so ``remap`` alone makes the ToUnicode map lie.
+
+    The other options each shape one structure a limit test needs: Flate, LZW, run-length, gzip-wrapped Flate or JBIG2
+    content (at most one; gzip reaches pypdf's recovery loop, JBIG2 stays undecoded), a PNG predictor as
+    (Colors, Columns) on Flate content, a Flate xref stream, repeated /Contents, a CID font with its /W array and
+    ToUnicode bfrange or bfchar, and a replaced content /Length. Options that would silently override or ignore each
+    other raise ValueError.
     """
-    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + "".join(f"({line}) Tj T*\n" for line in lines) + "ET").encode()
-    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica"
+    if sum([flate_content, lzw_content, run_length_content, gzip_content, jbig2_content]) > 1:
+        raise ValueError("the content encodings are mutually exclusive")
+    if png_predictor is not None and not flate_content:
+        raise ValueError("png_predictor needs flate_content")
+    if cid_widths is not None and (remap or font_entries):
+        raise ValueError("remap and font_entries are ignored by a CID font, which defines its own ToUnicode")
+    if cid_widths is None and (cid_to_unicode_range is not None or cid_to_unicode_char is not None):
+        raise ValueError("cid_to_unicode_range and cid_to_unicode_char need cid_widths")
+    if cid_widths is None:
+        shown = "".join(f"({line}) Tj T*\n" for line in lines)
+    else:
+        shown = "".join("<" + "".join(f"{ord(char):04X}" for char in line) + "> Tj T*\n" for line in lines)
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + shown + "ET").encode()
+    content_filter = b""
+    if flate_content:
+        if png_predictor is not None:
+            colors, columns = png_predictor
+            row_length = colors * columns
+            content += b" " * (-len(content) % row_length)
+            content = b"".join(
+                b"\x00" + content[start : start + row_length] for start in range(0, len(content), row_length)
+            )
+            content_filter = b" /DecodeParms << /Predictor 12 /Colors %d /Columns %d >>" % (colors, columns)
+        content = zlib.compress(content)
+        content_filter += b" /Filter /FlateDecode"
+    elif gzip_content:
+        content = gzip.compress(content)
+        content_filter = b" /Filter /FlateDecode"
+    elif lzw_content:
+        content = _lzw_literals(content)
+        content_filter = b" /Filter /LZWDecode"
+    elif run_length_content:
+        content = _run_length_literals(content)
+        content_filter = b" /Filter /RunLengthDecode"
+    elif jbig2_content:
+        content_filter = b" /Filter /JBIG2Decode"
+    to_unicode: str | None = None
+    if remap:
+        entries = "\n".join(f"<{code:02X}> <{unicode_point:04X}>" for code, unicode_point in sorted(remap.items()))
+        to_unicode = (
+            f"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n{len(remap)} beginbfchar\n{entries}\nendbfchar\n"
+        )
+    if cid_widths is None:
+        font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica" + font_entries
+    else:
+        to_unicode = (
+            "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            f"1 beginbfrange\n{cid_to_unicode_range or '<0000> <00FF> <0000>'}\nendbfrange\n"
+        )
+        if cid_to_unicode_char:
+            to_unicode += f"1 beginbfchar\n{cid_to_unicode_char}\nendbfchar\n"
+        font = (
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /Helvetica /Encoding /Identity-H /DescendantFonts "
+            b"[<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica "
+            b"/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W %s >>]" % cid_widths
+        )
+    contents = b"5 0 R" if content_copies == 1 else b"[%s]" % b" ".join([b"5 0 R"] * content_copies)
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        font + (b" /ToUnicode 6 0 R >>" if remap else b" >>"),
-        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents %s >>" % contents,
+        font + (b" /ToUnicode 6 0 R >>" if to_unicode else b" >>"),
+        b"<< /Length %d%s >>\nstream\n" % (len(content) if content_length is None else content_length, content_filter)
+        + content
+        + b"\nendstream",
     ]
-    if remap:
-        entries = "\n".join(f"<{code:02X}> <{unicode_point:04X}>" for code, unicode_point in sorted(remap.items()))
+    if to_unicode:
         cmap = (
             "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Broken def\n"
-            "/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
-            f"{len(remap)} beginbfchar\n{entries}\nendbfchar\nendcmap\n"
+            f"/CMapType 2 def\n{to_unicode}endcmap\n"
             "CMapName currentdict /CMap defineresource pop\nend\nend"
         ).encode()
         objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
@@ -1104,9 +1210,21 @@ def _build_pdf(lines: tuple[str, ...], remap: dict[int, int] | None = None) -> b
         offsets.append(len(out))
         out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
     xref_at = len(out)
-    out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
-    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
-    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref_at)
+    if flate_xref_stream:
+        rows = struct.pack(">BIH", 0, 0, 65535)
+        rows += b"".join(struct.pack(">BIH", 1, offset, 0) for offset in (*offsets, xref_at))
+        xref_data = zlib.compress(rows)
+        out += b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /Length %d >>\n" % (
+            len(objects) + 1,
+            len(objects) + 2,
+            len(xref_data),
+        )
+        out += b"stream\n" + xref_data + b"\nendstream\nendobj\n"
+    else:
+        out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+        out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+        out += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
+    out += b"startxref\n%d\n%%%%EOF\n" % xref_at
     return bytes(out)
 
 
@@ -1248,6 +1366,170 @@ class TestScrambledTextLayerDetection:
         assert scrambled_text_layer_reason(scrambled) is not None
 
 
+@contextmanager
+def _fails_at_a_pypdf_limit() -> Iterator[None]:
+    """Expect the no-fallback error, raised from the pypdf error; a failed pdfplumber fallback raises with no cause."""
+    with pytest.raises(PDFParsingError) as excinfo:
+        yield
+    assert excinfo.value.__cause__ is not None
+
+
+class TestPypdfLimitFallback:
+    """Only pypdf's structural limits may fall back to pdfplumber, whose pdfminer has no decompressed-size limit."""
+
+    def test_decompression_limit_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, flate_content=True))
+
+        with apply_configuration(zlib_maximum_output_length=64), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    def test_lzw_limit_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, lzw_content=True))
+        assert "17 Aug 26" in PdfReader(str(pdf_path)).pages[0].extract_text()
+
+        with apply_configuration(lzw_maximum_output_length=64), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    def test_validation_fails_without_falling_back_when_the_xref_stream_hits_the_limit(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, flate_xref_stream=True))
+
+        with apply_configuration(zlib_maximum_output_length=16), _fails_at_a_pypdf_limit():
+            validate_pdf_file(str(pdf_path))
+
+    def test_content_array_over_the_cap_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, content_copies=2))
+
+        # Each copy is under the cap; only the array's total is over it.
+        with apply_configuration(array_based_stream_maximum_output_length=400), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        "pdf_options",
+        [
+            pytest.param({"cid_widths": b"[0 65536 500]"}, id="cid_width_range"),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_range": "<000000> <0186A0> <000000>"},
+                id="to_unicode_range",
+            ),
+        ],
+    )
+    def test_range_pdfminer_would_expand_fails_without_falling_back(
+        self, tmp_path: Path, pdf_options: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        ("pdf_options", "limits"),
+        [
+            pytest.param({}, {"maximum_declared_stream_length": 100}, id="declared_stream_length"),
+            pytest.param(
+                {"content_length": -1}, {"maximum_declared_stream_length": 100}, id="stream_read_to_endstream"
+            ),
+            pytest.param(
+                {"content_length": 5}, {"maximum_declared_stream_length": 100}, id="stream_length_understated"
+            ),
+            pytest.param({}, {"page_tree_maximum_entries": 0}, id="page_tree_entries"),
+            pytest.param({}, {"array_maximum_element_count": 0}, id="array_elements"),
+            pytest.param({}, {"dictionary_maximum_element_count": 0}, id="dictionary_entries"),
+            pytest.param({}, {"stream_parsing_work_maximum_count": 0}, id="content_stream_tokens"),
+            pytest.param({"cid_widths": b"[0 65535 500 65536 131071 500]"}, {}, id="cid_width_entries"),
+            pytest.param({"gzip_content": True}, {"zlib_maximum_output_length": 64}, id="flate_recovery_output"),
+            pytest.param(
+                {"run_length_content": True}, {"run_length_maximum_output_length": 64}, id="run_length_output"
+            ),
+            # pdfminer sizes a buffer by Columns without any limit.
+            pytest.param(
+                {"flate_content": True, "png_predictor": (1, 17)}, {"flate_maximum_columns": 16}, id="predictor_columns"
+            ),
+            pytest.param(
+                {"flate_content": True, "png_predictor": (17, 1)},
+                {"flate_maximum_row_length": 16},
+                id="predictor_colors_over_row_limit",
+            ),
+            pytest.param(
+                {
+                    "cid_widths": b"[0 [500]]",
+                    "cid_to_unicode_range": "<000000000000000041> <000000000000000042> <0041>",
+                },
+                {},
+                id="to_unicode_code_length",
+            ),
+        ],
+    )
+    def test_other_size_cap_pdfminer_lacks_fails_without_falling_back(
+        self, tmp_path: Path, pdf_options: dict[str, Any], limits: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with apply_configuration(**limits), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        ("pdf_options", "limits"),
+        [
+            pytest.param(
+                {"font_entries": b" /FirstChar 0 /LastChar 299 /Widths [%s]" % b" ".join([b"500"] * 300)},
+                {},
+                id="simple_font_with_300_widths",
+            ),
+            pytest.param({"cid_widths": b"[40 30 500]"}, {}, id="inverted_cid_width_range"),
+            pytest.param({"font_entries": b" /Extra " + b"0" * 100}, {}, id="oversized_number_token"),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_char": "<000000000000000041> <0041>"},
+                {},
+                id="oversized_bfchar_code",
+            ),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_char": "<0100> <" + "0041" * 300 + ">"},
+                {},
+                id="oversized_bfchar_string",
+            ),
+            pytest.param({}, {"page_tree_maximum_depth": 0}, id="page_tree_depth"),
+            pytest.param({"flate_content": True, "png_predictor": (17, 1)}, {}, id="predictor_colors"),
+            pytest.param(
+                {"flate_content": True, "png_predictor": (1, 17)},
+                {"flate_maximum_row_length": 16},
+                id="predictor_row_length",
+            ),
+        ],
+    )
+    def test_structural_limit_still_falls_back_to_pdfplumber(
+        self, tmp_path: Path, pdf_options: dict[str, Any], limits: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with apply_configuration(**limits):
+            # pypdf re-raises a limit hit while reading a dictionary value as PdfReadError.
+            with pytest.raises((LimitReachedError, PdfReadError)):
+                PdfReader(str(pdf_path)).pages[0].extract_text()
+
+            assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+
+    def test_jbig2_buffer_limit_still_falls_back_to_pdfplumber(self, tmp_path: Path) -> None:
+        # pdfminer passes a JBIG2 stream through undecoded, so only pypdf's jbig2dec call can hit the limit.
+        jbig2dec = tmp_path / "jbig2dec"
+        jbig2dec.write_text("#!/bin/sh\necho 'FATAL ERROR failed to allocate image data buffer' >&2\nexit 1\n")
+        jbig2dec.chmod(0o755)
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, jbig2_content=True))
+
+        with apply_configuration(jbig2dec_binary=str(jbig2dec)):
+            with pytest.raises((LimitReachedError, PdfReadError)):
+                PdfReader(str(pdf_path)).pages[0].extract_text()
+
+            assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+
+
 class TestForceOcrOnTheCachedScriptPath:
     """A cached run must honor force OCR, or the fix only holds while the block runs via the agent."""
 
@@ -1286,7 +1568,7 @@ class TestForceOcrOnTheCachedScriptPath:
         assert "force_ocr" not in without_force_ocr
 
 
-BLOCKING_PARSE_SECONDS = 0.3
+BLOCKING_PARSE_SECONDS = 0.1
 TICK_INTERVAL_SECONDS = 0.01
 
 
@@ -1498,6 +1780,245 @@ class TestParsingDoesNotBlockEventLoop:
         assert ticks > 0
 
 
+def _build_inflating_pdf(inflated_mib: int) -> bytes:
+    """One text page, no xref table, and an object stream inflating to inflated_mib MiB of zeros.
+    Past pypdf's 75 MB decompression limit pypdf cannot find the catalog, so the pdfplumber fallback gets the file."""
+    compressor = zlib.compressobj(9)
+    zeros = b"\x00" * (16 << 20)
+    stream = compressor.compress(b"10 0 ") + b"".join(compressor.compress(zeros) for _ in range(inflated_mib // 16))
+    stream += compressor.flush()
+    content = b"BT /F1 12 Tf 72 720 Td (Invoice Total 1234.56 GBP) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> "
+        b"/Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+        b"<< /Type /ObjStm /N 1 /First 5 /Filter /FlateDecode /Length %d >>\nstream\n" % len(stream)
+        + stream
+        + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.7\n")
+    for number, payload in enumerate(objects, start=1):
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, len(out))
+    return bytes(out)
+
+
+def _build_letter_pdf(pages: int, lines: tuple[str, ...] = _INVOICE_LINES) -> bytes:
+    """A Letter-size PDF with the same few lines of text on each page."""
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + "".join(f"({line}) Tj T*\n" for line in lines) + "ET").encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(b"%d 0 R" % (5 + i) for i in range(pages)), pages),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    objects += [
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>"
+    ] * pages
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, payload in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref_at)
+    return bytes(out)
+
+
+class _RejectingPdfReader:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise ValueError("pypdf rejected the file")
+
+
+@pytest.fixture(scope="module")
+def inflating_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("inflating") / "inflating.pdf"
+    path.write_bytes(_build_inflating_pdf(128))
+    return path
+
+
+class TestPdfplumberFallbackIsContained:
+    """pdfplumber's parser has no decoded-size limit, so a hostile PDF must fail alone, not OOM-kill the pod."""
+
+    def test_fallback_that_outlives_the_parse_budget_fails_the_pdf(
+        self, inflating_pdf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pdf_parser_module, "FILE_PARSE_STEP_TIMEOUT_SECONDS", 1)
+
+        with pytest.raises(PDFParsingError, match="did not finish within 1 second"):
+            extract_pdf_file(str(inflating_pdf))
+
+    @pytest.mark.skipif(
+        not MEMORY_CAP_ENFORCED, reason="only Linux enforces RLIMIT_AS; elsewhere the child is uncapped"
+    )
+    def test_fallback_that_outgrows_its_memory_cap_fails_the_pdf(
+        self, inflating_pdf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", 16 * 1024 * 1024)
+
+        with pytest.raises(PDFParsingError, match="ran out of memory"):
+            extract_pdf_file(str(inflating_pdf))
+
+    def test_words_past_the_word_cap_fail_the_lookup_instead_of_filling_the_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every glyph here is its own word, so a small file decodes to many times its pickled size in the parent."""
+        crowded_pdf = tmp_path / "crowded.pdf"
+        crowded_pdf.write_bytes(_build_letter_pdf(1, ("a " * 30,) * 20))
+        monkeypatch.setattr(pdf_parser_module, "_UPRIGHT_WORDS_RESULT", pdf_parser_module._ResultLimit(16 * 1024, 6))
+
+        with pytest.raises(CappedSubprocessError) as excinfo:
+            extract_upright_pdf_words(str(crowded_pdf), {0})
+
+        assert excinfo.value.kind == "result_too_large"
+
+    def test_fallback_in_a_pod_without_free_memory_fails_the_pdf_before_parsing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cgroup = tmp_path / "cgroup"
+        cgroup.mkdir()
+        (cgroup / "memory.max").write_text(str(6144 * 1024 * 1024))
+        (cgroup / "memory.current").write_text(str(6000 * 1024 * 1024))
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(1))
+        monkeypatch.setattr(capped_subprocess_module, "MEMORY_CAP_ENFORCED", True)
+        monkeypatch.setattr(capped_subprocess_module, "CGROUP_DIR", str(cgroup))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        with pytest.raises(PDFParsingError, match="not enough free memory"):
+            extract_pdf_file(str(letter_pdf))
+
+    def test_page_images_past_the_result_cap_fail_the_render(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(3))
+        monkeypatch.setattr(settings, "PDFPLUMBER_MAX_RESULT_BYTES", 16 * 1024)
+
+        with pytest.raises(CappedSubprocessError, match="limit on page images"):
+            render_pdf_pages_as_images(str(letter_pdf))
+
+    @pytest.mark.skipif(
+        not MEMORY_CAP_ENFORCED, reason="only Linux enforces RLIMIT_AS; elsewhere the child is uncapped"
+    )
+    @pytest.mark.parametrize(
+        ("memory_ceiling", "letter_pages"),
+        [
+            pytest.param(None, 10, id="default ceiling"),
+            pytest.param(MIN_MEMORY_BUDGET_BYTES, 1, id="budget floor"),
+        ],
+    )
+    def test_ordinary_pdfs_fit_the_memory_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, memory_ceiling: int | None, letter_pages: int
+    ) -> None:
+        if memory_ceiling is not None:
+            monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", memory_ceiling)
+        text_pdf = tmp_path / "invoice.pdf"
+        text_pdf.write_bytes(_build_pdf(_ITEMISED_INVOICE_LINES))
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(letter_pages))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(text_pdf))
+            images = render_pdf_pages_as_images(str(letter_pdf))
+
+        assert "Invoice Total: 1234.56 GBP" in text
+        assert len(images) == letter_pages and all(image.startswith(b"\x89PNG") for image in images)
+        finished = {
+            log["target"].rpartition(".")[2]: log for log in logs if log["event"] == "Capped subprocess finished"
+        }
+        assert set(finished) == {"page_texts", "page_images"}
+        for log in finished.values():
+            assert log["memory_budget_bytes"] <= (memory_ceiling or settings.PDFPLUMBER_MAX_MEMORY_BYTES)
+            assert 0 <= log["rss_growth_sampled_bytes"] < log["memory_budget_bytes"]
+
+
+class TestPdfplumberFallbackTokenLimit:
+    def test_pages_the_character_stop_skipped_are_still_read_up_to_the_token_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A long run of one symbol is a few tokens, so the first pass stops at its character limit with the token
+        cap not yet reached and the pages that fit must be read in a second pass."""
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(3, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        text = extract_pdf_file(str(symbols_pdf), max_tokens=14)
+
+        # Each page is 3 lines and 6 tokens: two pages fit under 14 tokens, the third does not.
+        assert text.count("=" * 60) == 6
+
+    def test_text_past_the_character_limit_is_cut_at_a_page_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_CHAR_LIMIT", 500)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
+
+        # Pages are 182 characters, so the read goes on to the third page, which takes it past 500.
+        assert text.count("=" * 60) == 9
+        assert any("exceeds the size limit" in log["event"] for log in logs)
+
+    def test_a_second_pass_that_fails_keeps_the_pages_the_first_pass_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        run_in_capped_subprocess = pdf_parser_module.run_in_capped_subprocess
+        passes: list[int] = []
+
+        def time_out_on_the_second_pass(*args: Any, **kwargs: Any) -> Any:
+            passes.append(1)
+            if len(passes) == 2:
+                raise CappedSubprocessError("did not finish within 1 second and was stopped", kind="timeout")
+            return run_in_capped_subprocess(*args, **kwargs)
+
+        monkeypatch.setattr(pdf_parser_module, "run_in_capped_subprocess", time_out_on_the_second_pass)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
+
+        assert text.count("=" * 60) == 6
+        (warning,) = (log for log in logs if "failed, keeping the pages already read" in log["event"])
+        assert warning["failure"] == "timeout"
+
+    def test_the_page_that_crosses_the_result_cap_is_cut_instead_of_failing_the_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(2048, 6))
+
+        text = extract_pdf_file(str(symbols_pdf), max_tokens=0)
+
+        # The child keeps 1024 of the 2048 bytes for the text and counts 198 for each page, so the sixth is cut.
+        assert text.count("=" * 60) == 15
+
+    def test_a_first_page_that_does_not_fit_the_result_cap_fails_the_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(2, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(300, 6))
+
+        with pytest.raises(PDFParsingError, match="a result may hold"):
+            extract_pdf_file(str(symbols_pdf), max_tokens=0)
+
+
 @pytest.mark.asyncio
 class TestParseStepTimeout:
     """A pathological document must fail its own block instead of consuming the whole run."""
@@ -1662,7 +2183,7 @@ class TestFileParserTelemetryLogs:
     @staticmethod
     def _patch_extraction(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
         # A real key, so `llm_key` assertions discriminate: an AsyncMock's auto-attribute is not a
-        # str, so `_handler_llm_key` would return None and a null assertion would prove nothing.
+        # str, so `handler_llm_key` would return None and a null assertion would prove nothing.
         handler.llm_key = "test-llm-key"
         mp.setattr(FileParserBlock, "_resolve_file_parser_handler", AsyncMock(return_value=handler))
         mp.setattr(

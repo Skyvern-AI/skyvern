@@ -398,6 +398,7 @@ function CredentialsModal({
     values: false,
   });
   const [noPassword, setNoPassword] = useState(false);
+  const [forwardingActionPending, setForwardingActionPending] = useState(false);
   // Inline authenticator setup error returned by the backend when it rejects a
   // decoded QR value or pasted key. Cleared whenever the user edits the key.
   const [authenticatorSaveError, setAuthenticatorSaveError] =
@@ -423,6 +424,14 @@ function CredentialsModal({
     },
     [],
   );
+
+  const handleForwardingAddressChange = useCallback((identifier: string) => {
+    setPasswordCredentialValues((prev) => ({
+      ...prev,
+      totp_type: "email",
+      totp_identifier: identifier,
+    }));
+  }, []);
 
   const handleNoPasswordChange = useCallback((checked: boolean) => {
     setNoPassword(checked);
@@ -528,6 +537,14 @@ function CredentialsModal({
   const attachAgentCount = attachUsage?.workflows?.length ?? 0;
   // Test & Save Browser Profile state
   const [testAndSave, setTestAndSave] = useState(false);
+  // An already-saved profile ticks the box even without the intent flag, so both
+  // form initialization and change detection must read it from here; comparing
+  // the checkbox against the raw flag would make every bare Update on such a
+  // credential issue a no-op PATCH.
+  const savedBrowserSessionIntent = Boolean(
+    editingCredential?.save_browser_session_intent ||
+    editingCredential?.browser_profile_id,
+  );
   const [testUrl, setTestUrl] = useState("");
   const [userContext, setUserContext] = useState("");
   const [pinResidentialIspProxy, setPinResidentialIspProxy] = useState(false);
@@ -719,10 +736,7 @@ function CredentialsModal({
       if (editingCredential.tested_url) {
         setTestUrl(editingCredential.tested_url);
       }
-      if (
-        editingCredential.save_browser_session_intent ||
-        !!editingCredential.browser_profile_id
-      ) {
+      if (savedBrowserSessionIntent) {
         setTestAndSave(true);
       }
       setBrowserProfileId(editingCredential.browser_profile_id ?? null);
@@ -1045,8 +1059,17 @@ function CredentialsModal({
 
   const createCredentialMutation = useMutation({
     mutationFn: async (request: CreateCredentialRequest) => {
-      const client = await getClient(credentialGetter);
-      const response = await client.post("/credentials", request);
+      const isPasskeySetup =
+        "totp_type" in request.credential &&
+        request.credential.totp_type === "passkey";
+      const client = await getClient(
+        credentialGetter,
+        isPasskeySetup ? "sans-api-v1" : "v1",
+      );
+      const response = await client.post(
+        isPasskeySetup ? "/credentials/passkey/setup" : "/credentials",
+        request,
+      );
       return response.data;
     },
     onSuccess: async (data) => {
@@ -1407,6 +1430,14 @@ function CredentialsModal({
       isEditMode &&
       runSequentially !== (editingCredential?.run_sequentially ?? false);
 
+    // The save-session checkbox is togglable without touching the secrets, so it
+    // has to count as an edit on its own — otherwise a checkbox-only save closed
+    // the modal without sending anything.
+    const saveBrowserSessionIntentChanged =
+      isEditMode &&
+      supportsInlineTest &&
+      testAndSave !== savedBrowserSessionIntent;
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
       if (
@@ -1414,7 +1445,8 @@ function CredentialsModal({
         !editingGroups.values &&
         !proxyPinChanged &&
         !bmChanged &&
-        !runSequentiallyChanged
+        !runSequentiallyChanged &&
+        !saveBrowserSessionIntentChanged
       ) {
         // Nothing was edited — close silently
         reset();
@@ -1429,6 +1461,9 @@ function CredentialsModal({
           ...bmPatch,
           ...(runSequentiallyChanged
             ? { run_sequentially: runSequentially }
+            : {}),
+          ...(saveBrowserSessionIntentChanged
+            ? { save_browser_session_intent: testAndSave }
             : {}),
         });
         return;
@@ -1531,6 +1566,9 @@ function CredentialsModal({
         isEditMode &&
         Boolean(editingCredential?.credential_id) &&
         selectedAdditionalTwoFactorMethod?.saveBeforeCredentialUpdate === true;
+      const createPendingPasskey =
+        !isEditMode &&
+        selectedAdditionalTwoFactorMethod?.requestType === "passkey";
       saveIntentRef.current = {
         shouldTestAfterSave:
           supportsInlineTest &&
@@ -1585,12 +1623,13 @@ function CredentialsModal({
           username,
           ...(preservesStoredPassword ? {} : { password }),
           totp: selectedAdditionalTwoFactorMethod || totp === "" ? null : totp,
-          // Stage "none" for methods that attach after the base update. Methods
-          // that opt into attach-first keep their server-written type here.
-          totp_type:
-            selectedAdditionalTwoFactorMethod &&
-            selectedAdditionalTwoFactorMethod.value !==
-              configuredAdditionalTwoFactorMethod?.value
+          // Create passkeys through the dedicated setup route; other methods
+          // that attach after an edit stage "none" until their material is saved.
+          totp_type: createPendingPasskey
+            ? selectedAdditionalTwoFactorMethod.requestType
+            : selectedAdditionalTwoFactorMethod &&
+                selectedAdditionalTwoFactorMethod.value !==
+                  configuredAdditionalTwoFactorMethod?.value
               ? saveAdditionalTwoFactorBeforeUpdate
                 ? selectedAdditionalTwoFactorMethod.requestType
                 : "none"
@@ -2005,6 +2044,7 @@ function CredentialsModal({
   const saveDisabled =
     activeMutation.isPending ||
     renameCredentialMutation.isPending ||
+    forwardingActionPending ||
     isTestInProgress ||
     Boolean(additionalTwoFactorError);
 
@@ -2012,7 +2052,10 @@ function CredentialsModal({
     if (type === CredentialModalTypes.PASSWORD) {
       return (
         <PasswordCredentialContent
+          credentialId={editingCredential?.credential_id}
+          savedTotpType={editingPasswordCredentialData?.totp_type ?? "none"}
           values={passwordCredentialValues}
+          hasTotp={editingPasswordCredentialData?.has_totp}
           onChange={handlePasswordCredentialChange}
           url={testUrl}
           onUrlChange={setTestUrl}
@@ -2033,6 +2076,8 @@ function CredentialsModal({
           editingGroups={editingGroups}
           onEnableEditName={handleEnableEditName}
           onEnableEditValues={handleEnableEditValues}
+          onForwardingAddressChange={handleForwardingAddressChange}
+          onForwardingActionPendingChange={setForwardingActionPending}
           onPasswordEnter={saveDisabled ? undefined : handleSave}
           totpError={authenticatorKeyError}
           authenticatorSaveError={authenticatorSaveError}
@@ -2080,6 +2125,21 @@ function CredentialsModal({
                     method.
                   </p>
                 )}
+
+                {/* Ticking the box only records the preference; the session comes
+                  from a login test, which this path doesn't run. */}
+                {isEditMode &&
+                  !editingGroups.values &&
+                  supportsInlineTest &&
+                  testAndSave &&
+                  !editingCredential?.browser_profile_id &&
+                  testStatus === "idle" && (
+                    <p className="pl-7 text-sm text-muted-foreground">
+                      No session is saved yet. Skyvern saves one the next time
+                      this login is tested — start a test with the retry button
+                      on this credential in the list.
+                    </p>
+                  )}
 
                 {supportsInlineTest && testAndSave && (
                   <div className="space-y-1 pl-7">

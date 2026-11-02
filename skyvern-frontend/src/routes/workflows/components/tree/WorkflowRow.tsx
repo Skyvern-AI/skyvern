@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import React from "react";
 import {
   BookmarkFilledIcon,
@@ -28,7 +29,6 @@ import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
 import { TagChipList } from "../tagging/TagChipList";
-import { WorkflowReliabilityBadge } from "../../WorkflowReliabilityBadge";
 import { WorkflowRowActions } from "../WorkflowRowActions";
 import { WorkflowCreatorLabel } from "../WorkflowCreatorLabel";
 import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
@@ -217,10 +217,13 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                       </Tooltip>
                     </TooltipProvider>
                   )}
-                  <WorkflowReliabilityBadge
+                  <WorkflowFindingsButton
                     reliability={
                       workflowReliabilityMap[workflow.workflow_permanent_id]
                     }
+                    workflowPermanentId={workflow.workflow_permanent_id}
+                    title={workflow.title}
+                    surface="list"
                   />
                 </div>
                 {taggingEnabled && workflowTags && workflowTags.length > 0 ? (

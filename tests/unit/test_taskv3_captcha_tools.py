@@ -23,7 +23,14 @@ _UNSOLVED = ChallengeOutcome(ChallengeStatus.UNSOLVED)
 
 
 def _task(**overrides: Any) -> SimpleNamespace:
-    base: dict[str, Any] = {"task_id": "tsk_1", "workflow_run_id": "wr_1", "browser_session_id": "bs_1"}
+    base: dict[str, Any] = {
+        "task_id": "tsk_1",
+        "workflow_run_id": "wr_1",
+        "browser_session_id": "bs_1",
+        "error_code_mapping": None,
+        "started_at": None,
+        "created_at": None,
+    }
     base.update(overrides)
     return SimpleNamespace(**base)
 

@@ -465,6 +465,7 @@ class TestRunCreatedHookWiring:
         mock_app.DATABASE.tags.get_active_grouped_tags_for_run = AsyncMock(return_value={})
         mock_app.RATE_LIMITER.rate_limit_submit_run = AsyncMock()
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=original_workflow)
+        mock_app.AGENT_FUNCTION.get_workflow_run_retry_refusal = AsyncMock(return_value=None)
         mock_app.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=False)
 
         with (

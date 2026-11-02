@@ -44,6 +44,9 @@ const flagState = vi.hoisted(() => ({
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => flagState.variant,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagVariantKey: () => flagState.variant,
+}));
 
 type DriverStepCb = (el: Element | undefined, step: DriveStep) => void;
 type DriverCloseCb = () => void;

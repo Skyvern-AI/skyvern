@@ -10,6 +10,8 @@ meters per action exactly like the step engine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import itertools
 import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -22,22 +24,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.config import settings
+import skyvern.webeye.cdp_download_interceptor as cdp_module
+from skyvern.config import Settings, settings
 from skyvern.errors.errors import UserDefinedError
-from skyvern.exceptions import CompletionGateTerminationError, MissingBrowserStatePage, StepTerminationError
+from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
+    CompletionGateTerminationError,
+    MissingBrowserStatePage,
+    StepTerminationError,
+)
 from skyvern.forge import agent as agent_module
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.utils import hydrate_action
 from skyvern.forge.sdk.experimentation.billing_tier import BillingTier
-from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider
+from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import DISABLE_TASK_V3_FLAG
-from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
@@ -73,25 +84,35 @@ from skyvern.forge.taskv3.engine import DEFAULT_MAX_SETTLE_DEFERRALS, MIN_ACTION
 from skyvern.forge.taskv3.goal_check import (
     BLOCK_COMPLETION_CHECK_PROMPT_NAME,
 )
-from skyvern.forge.taskv3.goal_composition import CodeProgressRecord, CodeTypedValue
+from skyvern.forge.taskv3.goal_composition import DOWNLOAD_BLOCK_FACT, CodeProgressRecord, CodeTypedValue
 from skyvern.forge.taskv3.handoff_redaction import pin_caller_authored_block_urls
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_LOOP_GUARD,
+    DOWNLOAD_NO_FILE_FACT,
     NAV_DEAD_END_GUARD,
     LoopOutcome,
     RoundAction,
+    ToolResult,
     ToolSpec,
+    TurnRecord,
     _dead_end_reason,
+    make_finish_tool,
+    run_agent_tool_loop,
 )
 from skyvern.forge.taskv3.run_arms import (
+    ANSWER_AUDIT_LOG_ONLY_FLAG,
     DATE_SEGMENT_AIM_FLAG,
+    DEAD_END_RETURN_FLAG,
+    LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
+    TURN_DOM_FLAG,
     run_arm_enabled,
 )
-from skyvern.forge.taskv3.tools import PageProvider, _record_frame_work
+from skyvern.forge.taskv3.tools import NO_ONE_TIME_CODE_SOURCE, PageProvider, _record_frame_work
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import BlockType
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
 from skyvern.webeye.actions.actions import (
@@ -106,6 +127,8 @@ from skyvern.webeye.actions.actions import (
     SolveCaptchaAction,
     UploadFileAction,
 )
+from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.native_downloads import NativeDownloads
 from tests.unit._download_provider_fakes import (
     _ActionDownloadSource,
     _FakeActionDownloadObservation,
@@ -114,6 +137,7 @@ from tests.unit._download_provider_fakes import (
     _secret_bearing_validation_error,
     _StallingActionDownloadObservation,
 )
+from tests.unit._task_block_fakes import run_bound_browser_state
 from tests.unit.helpers import (
     make_action_row,
     make_browser_state,
@@ -122,6 +146,8 @@ from tests.unit.helpers import (
     make_task,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.test_taskv3_loop import _ScriptedCaller
+from tests.unit.test_taskv3_tools import _FakePage
 
 
 async def _run_execute_task_v3(
@@ -168,8 +194,14 @@ async def _run_execute_task_v3(
     # Leave the credential-TOTP candidate gate reading the real workflow-run context.
     real_credential_totp_candidate: bool = False,
     llm_caller_factory: Any = None,
+    # Off by default: the block-end DOM adds one get_working_page call after the loop.
+    block_end_dom: bool = False,
+    clean_up_task: AsyncMock | None = None,
+    turn_dom_rate: float = 0.0,
     **task_overrides: Any,
 ) -> tuple[Step, Any, AsyncMock, AsyncMock]:
+    monkeypatch.setattr(settings, "TASK_V3_BLOCK_END_DOM", block_end_dom)
+    monkeypatch.setattr(settings, "TASK_V3_TURN_DOM_SAMPLE_RATE", turn_dom_rate)
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
@@ -286,7 +318,7 @@ async def _run_execute_task_v3(
 
     agent.update_step = AsyncMock(side_effect=fake_update_step)
     agent.update_task = AsyncMock(side_effect=update_task_side_effect or fake_update_task)
-    agent.clean_up_task = AsyncMock()
+    agent.clean_up_task = clean_up_task or AsyncMock()
 
     post_step_mock = AsyncMock(side_effect=post_step_side_effect)
     monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", post_step_mock)
@@ -337,6 +369,88 @@ async def _run_execute_task_v3(
     return out_step, out_task, loop_mock, post_step_mock
 
 
+class _ContentPage:
+    url = "https://example.test/done"
+
+    def __init__(self, content: Callable[[], Awaitable[str]]) -> None:
+        self.content = content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "saved"), [("completed", True), ("canceled", False)])
+async def test_v3_block_saves_one_end_of_block_dom_unless_canceled(
+    monkeypatch: pytest.MonkeyPatch, status: str, saved: bool
+) -> None:
+    async def _content() -> str:
+        return "<html><body>final page</body></html>"
+
+    accumulate = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_action_html_to_archive", accumulate)
+
+    step, _task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status=status, reason="done", billable_actions=[]),
+        working_page=_ContentPage(_content),
+        block_end_dom=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    saved_html = [call.kwargs["html_action"] for call in accumulate.call_args_list]
+    assert saved_html == ([b"<html><body>final page</body></html>"] if saved else [])
+    if saved:
+        assert accumulate.call_args.kwargs["step"].step_id == step.step_id
+
+
+@pytest.mark.asyncio
+async def test_a_failing_end_of_block_dom_write_does_not_fail_the_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _content() -> str:
+        return "<html><body>final page</body></html>"
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_action_html_to_archive",
+        MagicMock(side_effect=RuntimeError("redaction failed")),
+    )
+
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        working_page=_ContentPage(_content),
+        block_end_dom=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_end_of_block_dom_is_cut_at_its_cap_and_the_block_still_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _hang() -> str:
+        await asyncio.Event().wait()
+        return ""
+
+    accumulate = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_action_html_to_archive", accumulate)
+    monkeypatch.setattr("skyvern.forge.agent._BLOCK_END_DOM_TIMEOUT_SECONDS", 0.05)
+
+    started = time.monotonic()
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        working_page=_ContentPage(_hang),
+        block_end_dom=True,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert task.status == TaskStatus.completed
+    accumulate.assert_not_called()
+    assert time.monotonic() - started < 5
+
+
 @pytest.mark.asyncio
 async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
     # Without the resolve call every run reads the arm off; bucketed by workflow run like its siblings.
@@ -354,12 +468,9 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
     )
 
     assert loop_mock.date_segment_aim_enabled_during_loop is True
-    assert loop_mock.context.run_arms[DATE_SEGMENT_AIM_FLAG] == (task.workflow_run_id, "treatment")
-    provider.assert_any_await(
-        DATE_SEGMENT_AIM_FLAG,
-        task.workflow_run_id,
-        properties={"organization_id": task.organization_id},
-    )
+    for flag in (DATE_SEGMENT_AIM_FLAG, DEAD_END_RETURN_FLAG, ANSWER_AUDIT_LOG_ONLY_FLAG):
+        assert loop_mock.context.run_arms[flag] == (task.workflow_run_id, "treatment")
+        provider.assert_any_await(flag, task.workflow_run_id, properties={"organization_id": task.organization_id})
 
 
 @pytest.mark.asyncio
@@ -1169,9 +1280,18 @@ def stub_workflow_block_engine_app(mock_wbe_app: MagicMock, *, billing_tier: Bil
     mock_wbe_app.AGENT_FUNCTION.resolve_billing_tier = AsyncMock(return_value=billing_tier)
 
 
-def _v3_task(llm_key: str | None = None, workflow_permanent_id: str | None = None) -> SimpleNamespace:
+def _v3_task(
+    llm_key: str | None = None,
+    workflow_permanent_id: str | None = None,
+    workflow_run_id: str | None = None,
+    task_id: str = "tsk_x",
+) -> SimpleNamespace:
     return SimpleNamespace(
-        llm_key=llm_key, task_id="tsk_x", organization_id="o_test", workflow_permanent_id=workflow_permanent_id
+        llm_key=llm_key,
+        task_id=task_id,
+        organization_id="o_test",
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_run_id=workflow_run_id,
     )
 
 
@@ -1182,7 +1302,7 @@ async def test_resolve_v3_llm_key_prefers_explicit_task_key(monkeypatch: pytest.
         "skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached",
         AsyncMock(side_effect=AssertionError("flag must not be read when task.llm_key is set")),
     )
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="EXPLICIT_KEY")) == "EXPLICIT_KEY"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="EXPLICIT_KEY")) == ("EXPLICIT_KEY", None)
 
 
 @pytest.mark.asyncio
@@ -1193,7 +1313,11 @@ async def test_resolve_v3_llm_key_uses_posthog_override(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "OPENAI_GPT5_6_LUNA"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("OPENAI_GPT5_6_LUNA", None)
+
+
+def _llm_name_properties(reader: AsyncMock) -> dict[str, Any]:
+    return [c for c in reader.call_args_list if c.args[0] == "TASK_V3_LLM_NAME"][-1].kwargs["properties"]
 
 
 @pytest.mark.asyncio
@@ -1206,14 +1330,14 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
 
     resolved = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_permanent_id="wpid_123"))
-    assert resolved == "FLAG_KEY"
-    assert reader.call_args.kwargs["properties"] == {
+    assert resolved == ("FLAG_KEY", None)
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_123",
     }
 
     await agent_module._resolve_task_v3_llm_key(_v3_task())
-    assert reader.call_args.kwargs["properties"] == {
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "not_workflow",
     }
@@ -1225,7 +1349,7 @@ async def test_resolve_v3_llm_key_sends_wpid_flag_property(monkeypatch: pytest.M
         await agent_module._resolve_task_v3_llm_key(_v3_task())
     finally:
         skyvern_context.reset()
-    assert reader.call_args.kwargs["properties"] == {
+    assert _llm_name_properties(reader) == {
         "organization_id": "o_test",
         "workflow_permanent_id": "wpid_from_ctx",
     }
@@ -1253,7 +1377,7 @@ async def test_resolve_v3_llm_key_ignores_unusable_flag_value(
     monkeypatch.setattr(agent_module, "is_custom_llm_key", lambda _k: False)
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "DEFAULT_MODEL"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("DEFAULT_MODEL", None)
 
 
 @pytest.mark.asyncio
@@ -1265,7 +1389,7 @@ async def test_resolve_v3_llm_key_falls_back_when_flag_read_raises(monkeypatch: 
     monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "V3_DIRECT")
     monkeypatch.setattr(agent_module.settings, "LLM_KEY", "DEFAULT_MODEL")
     # TASK_V3_LLM_KEY set → used ahead of LLM_KEY.
-    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == "V3_DIRECT"
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == ("V3_DIRECT", None)
 
 
 @pytest.mark.asyncio
@@ -1297,7 +1421,7 @@ async def test_resolve_v3_llm_key_keeps_a_ui_run_off_flex(
 
     skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
     try:
-        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == expected_key
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task()) == (expected_key, None)
     finally:
         skyvern_context.reset()
 
@@ -1312,9 +1436,161 @@ async def test_resolve_v3_llm_key_honors_an_explicit_flex_key_on_a_ui_run(monkey
     )
     skyvern_context.set(SkyvernContext(trigger_type=WorkflowRunTriggerType.manual))
     try:
-        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == "FLEX_ROUTER"
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="FLEX_ROUTER")) == ("FLEX_ROUTER", None)
     finally:
         skyvern_context.reset()
+
+
+def _route_flag_reader(route_variant: str | Exception | None) -> AsyncMock:
+    """No TASK_V3_LLM_NAME variant; ``route_variant`` for the LLM route arm."""
+
+    async def read(flag: str, _distinct_id: str, properties: dict[str, Any] | None = None) -> str | None:
+        if flag != LLM_ROUTE_FLAG:
+            return None
+        if isinstance(route_variant, Exception):
+            raise route_variant
+        return route_variant
+
+    return AsyncMock(side_effect=read)
+
+
+def _stub_llm_route(monkeypatch: pytest.MonkeyPatch, reader: AsyncMock, non_flex: dict[str, str] | None = None) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.app.EXPERIMENTATION_PROVIDER.get_value_cached", reader)
+    monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "CONTROL_ROUTE")
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_task_v3_llm_route_treatment_key",
+        lambda key: "TREATMENT_ROUTE" if key == "CONTROL_ROUTE" else None,
+        raising=False,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_non_flex_llm_key", lambda key: (non_flex or {}).get(key))
+    monkeypatch.setattr(agent_module.LLMConfigRegistry, "is_registered", lambda _k: True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route_variant", "trigger_type", "expected"),
+    [
+        ("treatment", WorkflowRunTriggerType.api, ("TREATMENT_ROUTE", "treatment")),
+        ("control", WorkflowRunTriggerType.api, ("CONTROL_ROUTE", "control")),
+        (None, WorkflowRunTriggerType.api, ("CONTROL_ROUTE", None)),
+        (RuntimeError("flag service down"), WorkflowRunTriggerType.api, ("CONTROL_ROUTE", None)),
+        # A manual/MCP run still leaves flex on whichever route the arm picked, under the same label.
+        ("treatment", WorkflowRunTriggerType.manual, ("TREATMENT_STANDARD", "treatment")),
+        ("control", WorkflowRunTriggerType.manual, ("CONTROL_STANDARD", "control")),
+    ],
+)
+async def test_resolve_v3_llm_key_llm_route_arm_swaps_only_a_treatment_run(
+    monkeypatch: pytest.MonkeyPatch,
+    route_variant: str | Exception | None,
+    trigger_type: WorkflowRunTriggerType,
+    expected: tuple[str, str | None],
+) -> None:
+    _stub_llm_route(
+        monkeypatch,
+        _route_flag_reader(route_variant),
+        non_flex={"CONTROL_ROUTE": "CONTROL_STANDARD", "TREATMENT_ROUTE": "TREATMENT_STANDARD"},
+    )
+    skyvern_context.set(SkyvernContext(trigger_type=trigger_type))
+    try:
+        assert await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1")) == expected
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_leaves_unmapped_and_explicit_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_llm_route(monkeypatch, _route_flag_reader("treatment"))
+    hook_keys: list[str] = []
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION,
+        "get_task_v3_llm_route_treatment_key",
+        lambda key: hook_keys.append(key) or ("TREATMENT_ROUTE" if key == "CONTROL_ROUTE" else None),
+        raising=False,
+    )
+    # An arm that never applies is never resolved, so its exposure counts only runs it could change.
+    arm_resolver = AsyncMock(side_effect=AssertionError("the route arm must not be resolved"))
+    monkeypatch.setattr(agent_module, "resolve_run_arm", arm_resolver)
+    skyvern_context.set(SkyvernContext())
+    try:
+        explicit = await agent_module._resolve_task_v3_llm_key(_v3_task(llm_key="CONTROL_ROUTE"))
+        monkeypatch.setattr(agent_module.settings, "TASK_V3_LLM_KEY", "UNMAPPED_ROUTE")
+        unmapped = await agent_module._resolve_task_v3_llm_key(_v3_task())
+    finally:
+        skyvern_context.reset()
+    assert (explicit, unmapped) == (("CONTROL_ROUTE", None), ("UNMAPPED_ROUTE", None))
+    assert hook_keys == ["UNMAPPED_ROUTE"]
+    arm_resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_is_unlabeled_without_a_run_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_llm_route(monkeypatch, _route_flag_reader("treatment"))
+    assert await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1")) == ("CONTROL_ROUTE", None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_v3_llm_key_llm_route_arm_is_pinned_across_blocks_of_one_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variants = iter(["treatment", "control"])
+    reader = _route_flag_reader(None)
+    reader.side_effect = lambda flag, *_a, **_k: next(variants) if flag == LLM_ROUTE_FLAG else None
+    _stub_llm_route(monkeypatch, reader)
+    skyvern_context.set(SkyvernContext())
+    try:
+        first = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1", task_id="tsk_1"))
+        second = await agent_module._resolve_task_v3_llm_key(_v3_task(workflow_run_id="wr_1", task_id="tsk_2"))
+    finally:
+        skyvern_context.reset()
+    assert (first, second) == (("TREATMENT_ROUTE", "treatment"), ("TREATMENT_ROUTE", "treatment"))
+    assert [c.args[:2] for c in reader.call_args_list if c.args[0] == LLM_ROUTE_FLAG] == [(LLM_ROUTE_FLAG, "wr_1")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route_variant", ["treatment", "control"])
+async def test_resolve_v3_llm_key_labels_only_blocks_whose_key_went_through_the_arm(
+    monkeypatch: pytest.MonkeyPatch, route_variant: str
+) -> None:
+    overrides = {"tsk_2": "UNPAIRED_ROUTE"}
+
+    async def read(flag: str, distinct_id: str, properties: dict[str, Any] | None = None) -> str | None:
+        return route_variant if flag == LLM_ROUTE_FLAG else overrides.get(distinct_id)
+
+    _stub_llm_route(monkeypatch, AsyncMock(side_effect=read))
+    skyvern_context.set(SkyvernContext())
+    try:
+        labels = [
+            (await agent_module._resolve_task_v3_llm_key(task))[1]
+            for task in (
+                _v3_task(workflow_run_id="wr_1", task_id="tsk_1"),
+                _v3_task(workflow_run_id="wr_1", task_id="tsk_2"),
+                # An explicit key equal to the control key is unlabeled under either pin.
+                _v3_task(llm_key="CONTROL_ROUTE", workflow_run_id="wr_1", task_id="tsk_3"),
+            )
+        ]
+    finally:
+        skyvern_context.reset()
+    assert labels == [route_variant, None, None]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_hands_the_loop_the_route_arm_recorded_with_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module, "_resolve_task_v3_llm_key", AsyncMock(return_value=("TREATMENT_ROUTE", "treatment"))
+    )
+    caller_factory = MagicMock()
+    _, _, loop_mock, _ = await _run_execute_task_v3(
+        monkeypatch, LoopOutcome(status="completed", reason="done"), llm_caller_factory=caller_factory
+    )
+    assert caller_factory.call_args.kwargs["llm_key"] == "TREATMENT_ROUTE"
+    assert loop_mock.await_args.kwargs["llm_route_arm"] == "treatment"
 
 
 @pytest.mark.asyncio
@@ -2122,6 +2398,7 @@ async def _run_execute_step_gate(
     workflow_owned_recovery: bool = False,
     recovery_code_progress: CodeProgressRecord | None = None,
     observer: Any = None,
+    artifact_manager: ArtifactManager | None = None,
     **task_overrides: Any,
 ) -> tuple[AsyncMock, AsyncMock]:
     """Drive ForgeAgent.execute_step through the v3 dispatch gate and return (mocked _execute_task_v3,
@@ -2172,7 +2449,10 @@ async def _run_execute_step_gate(
                 mock_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
                 mock_wbe_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
                 mock_wbe_app.EXPERIMENTATION_PROVIDER.resolve_feature_flag_strict = AsyncMock(return_value=False)
-            mock_app.ARTIFACT_MANAGER.flush_step_archive = AsyncMock()
+            if artifact_manager is not None:
+                mock_app.ARTIFACT_MANAGER = artifact_manager
+            else:
+                mock_app.ARTIFACT_MANAGER.flush_task_step_archives_as_one = AsyncMock()
             try:
                 await agent.execute_step(
                     organization=organization,
@@ -2221,6 +2501,40 @@ async def test_execute_step_dispatches_download_semantics_blocks_to_v3(overrides
     v3_mock.assert_awaited_once()
     assert v3_mock.await_args.kwargs["task_block"] is block
     step_engine_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_step_writes_a_v3_blocks_turn_files_as_one_zip(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A v3 block's turn steps share its ZIP (SKY-18790): the block's end writes their LLM files in one storage PUT,
+    # instead of one ZIP per turn left in memory until the run or workflow ends.
+    manager = ArtifactManager()
+    now = datetime.now(UTC)
+    turn_task = make_task(now, make_organization(now), task_id="tsk_zip")
+    for order in (1, 2):
+        turn = make_step(now, turn_task, step_id=f"turn-{order}", status=StepStatus.completed, order=order, output=None)
+        manager.accumulate_llm_call_to_archive(step=turn, request=b"request", response=b"response")
+    stored: list[Any] = []
+
+    async def _store(artifact: Any, data: bytes) -> None:
+        stored.append(artifact)
+
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager._bundling_enabled", lambda: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE",
+        SimpleNamespace(build_uri=lambda **kwargs: f"s3://artifacts/{kwargs['artifact_id']}", store_artifact=_store),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bulk_create_artifacts", AsyncMock())
+
+    v3_mock, _ = await _run_execute_step_gate(
+        engine=agent_module.RunEngine.skyvern_v3,
+        task_block=_make_block(ActionBlock),
+        artifact_manager=manager,
+        task_id="tsk_zip",
+    )
+
+    v3_mock.assert_awaited_once()
+    assert [artifact.step_id for artifact in stored] == ["step-gate"]
+    assert manager._step_archives == {}
 
 
 @pytest.mark.asyncio
@@ -2361,13 +2675,6 @@ async def test_a_kill_switched_recovery_fails_instead_of_running_on_the_step_eng
     assert v3_mock.task.status is TaskStatus.failed
 
 
-# ---------------------------------------------------------------------------
-# P2b: complete_on_download wiring -- the completion_probe/completion_blocker
-# handed to run_task_v3_agent_loop, backed by the same finalize-and-rename path
-# v1 uses (ForgeAgent._finalize_downloaded_files_for_task).
-# ---------------------------------------------------------------------------
-
-
 async def _run_execute_task_v3_download(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2385,17 +2692,10 @@ async def _run_execute_task_v3_download(
     download_monitor: object | None = None,
     download_timeout: float | None = None,
     cancel_after_checks: int | None = None,
+    data_extraction_goal: str | None = None,
 ) -> dict[str, Any]:
-    """Drive _execute_task_v3 for a complete_on_download block, capturing the loop kwargs.
-
-    The fake loop stands in for run_task_v3_agent_loop: it optionally drops a new file into the
-    run's download directory (mimicking a tool call that triggered a download), then awaits the
-    completion_probe/completion_blocker it was handed, exactly like the real loop does.
-
-    ``loop_fn``, when given, fully replaces the default drop-then-probe-once loop body -- used to
-    drive a block through a custom probe/blocker sequence (e.g. a second block in the same run,
-    checked against a baseline that already contains an earlier block's file).
-    """
+    """Drive _execute_task_v3 for a complete_on_download block with a fake loop that optionally drops a file and
+    awaits the download settle once. ``loop_fn`` replaces that body for a custom settle sequence."""
     agent = ForgeAgent()
     now = datetime.now(UTC)
     organization = make_organization(now)
@@ -2404,7 +2704,7 @@ async def _run_execute_task_v3_download(
         organization,
         task_id=task_id,
         workflow_run_id="wr-download-test",
-        data_extraction_goal=None,
+        data_extraction_goal=data_extraction_goal,
         extracted_information_schema=None,
         browser_session_id=browser_session_id,
     )
@@ -2438,13 +2738,12 @@ async def _run_execute_task_v3_download(
         AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.running)),
     )
 
-    captured: dict[str, Any] = {"cancel_checks": cancel_checks}
+    captured: dict[str, Any] = {"cancel_checks": cancel_checks, "browser_state": browser_state}
 
     async def _default_loop_body(**kwargs: Any) -> LoopOutcome:
         if drop_file:
             (tmp_path / dropped_filename).write_bytes(b"file-bytes")
-        captured["probe_reason"] = await kwargs["completion_probe"](frozenset())
-        captured["blocker_message"] = await kwargs["completion_blocker"](frozenset())
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset())
         if captured["probe_reason"]:
             return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
@@ -2457,6 +2756,10 @@ async def _run_execute_task_v3_download(
     loop_mock = AsyncMock(side_effect=_loop)
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
     monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    # The provider read-back polls and admission grace run at a tenth of production; tests scale their
+    # download_timeout to match.
+    monkeypatch.setattr(taskv3_provider_downloads, "POLL_INTERVAL_SECONDS", 0.1)
+    monkeypatch.setattr(taskv3_provider_downloads, "EVENT_ADMISSION_GRACE_SECONDS", 0.025)
     # get_path_for_workflow_download_directory (imported by agent.py) resolves through this same
     # module-level name at call time, so patching it here also redirects that call.
     monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: str(tmp_path))
@@ -2489,6 +2792,8 @@ async def _run_execute_task_v3_download(
             task.status = status
         if "failure_reason" in _kwargs:
             task.failure_reason = _kwargs["failure_reason"]
+        if "extracted_information" in _kwargs:
+            task.extracted_information = _kwargs["extracted_information"]
         return task
 
     agent.update_step = AsyncMock(side_effect=fake_update_step)
@@ -2523,7 +2828,7 @@ async def _run_execute_task_v3_download(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("block_cls", [ActionBlock, FileDownloadBlock], ids=["action", "file_download"])
-async def test_execute_task_v3_download_completion_probe_finalizes_and_ends_the_loop(
+async def test_execute_task_v3_download_settle_finalizes_the_landed_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, block_cls: type[BaseTaskBlock]
 ) -> None:
     captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=True, block_cls=block_cls)
@@ -2545,7 +2850,7 @@ async def test_execute_task_v3_finalized_download_completes_on_a_blank_page(
     # The file is the goal, and the tab a download opens is routinely left blank.
     async def _download_then_blank(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         (tmp_path / "report.pdf").write_bytes(b"file-bytes")
-        captured["probe_reason"] = await kwargs["completion_probe"](frozenset())
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset())
         page = await kwargs["page_provider"]()
         page.url = "about:blank"
         page.main_frame.child_frames = []
@@ -2620,20 +2925,95 @@ async def test_execute_task_v3_session_only_download_completes_on_a_blank_page(
     assert captured["task"].status == TaskStatus.completed
 
 
+async def _finish_through_the_real_tool(
+    kwargs: dict[str, Any], captured: dict[str, Any], extracted_output: Any
+) -> LoopOutcome:
+    finish = make_finish_tool(
+        should_cancel=kwargs["should_cancel"],
+        download_settle=kwargs["download_settle"],
+        staged_downloads=kwargs["staged_downloads"],
+    )
+    result = await finish.handler({"status": "completed", "reason": "finished", "extracted_output": extracted_output})
+    captured["finish_content"] = result.content
+    return LoopOutcome(
+        status=result.data["status"], reason=result.data["reason"], extracted_output=result.data["extracted_output"]
+    )
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("extraction", [False, True], ids=["no_extraction", "extraction"])
 @pytest.mark.parametrize("block_cls", [ActionBlock, FileDownloadBlock], ids=["action", "file_download"])
-async def test_execute_task_v3_download_completion_probe_no_file_blocks_finish(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, block_cls: type[BaseTaskBlock]
+async def test_execute_task_v3_download_block_completes_with_zero_files_when_none_landed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, block_cls: type[BaseTaskBlock], extraction: bool
 ) -> None:
-    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, block_cls=block_cls)
+    async def _finish_without_a_file(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        captured["goal"] = kwargs["goal"]
+        return await _finish_through_the_real_tool(kwargs, captured, {"records": 0} if extraction else None)
 
-    assert captured["probe_reason"] is None
-    assert captured["blocker_message"]
-    assert isinstance(captured["blocker_message"], str)
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        block_cls=block_cls,
+        loop_fn=_finish_without_a_file,
+        data_extraction_goal="Extract the record count" if extraction else None,
+    )
+
+    assert DOWNLOAD_BLOCK_FACT in captured["goal"]
+    assert DOWNLOAD_NO_FILE_FACT in captured["finish_content"]
+    assert captured["task"].status == TaskStatus.completed
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_download_completion_probe_returns_none_when_wait_reports_cancellation(
+@pytest.mark.parametrize("extraction", [False, True], ids=["no_extraction", "extraction"])
+async def test_execute_task_v3_download_block_records_the_file_that_landed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, extraction: bool
+) -> None:
+    async def _download_then_finish(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "report.pdf").write_bytes(b"file-bytes")
+        return await _finish_through_the_real_tool(kwargs, captured, {"total": "12.00"} if extraction else None)
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        loop_fn=_download_then_finish,
+        data_extraction_goal="Extract the invoice total" if extraction else None,
+    )
+
+    assert captured["task"].status == TaskStatus.completed
+    assert [path.name for path in tmp_path.iterdir()] == ["invoice.pdf"]
+    assert DOWNLOAD_NO_FILE_FACT not in captured["finish_content"]
+    if extraction:
+        assert captured["task"].extracted_information == {"total": "12.00"}
+
+
+@pytest.mark.asyncio
+async def test_task_v3_native_finalizer_keeps_existing_file_behavior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    error_page = b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+
+    async def _download_then_finish(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        (tmp_path / "report.pdf").write_bytes(error_page)
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset())
+        return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        loop_fn=_download_then_finish,
+    )
+
+    assert captured["probe_reason"] == "download completed (1 new file(s))"
+    assert captured["task"].status == TaskStatus.completed
+    assert (tmp_path / "invoice.pdf").read_bytes() == error_page
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_download_settle_returns_none_when_wait_reports_cancellation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # A run being canceled races with a download landing: the wait reports the cancellation, but
@@ -2650,12 +3030,11 @@ async def test_execute_task_v3_download_completion_probe_returns_none_when_wait_
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_download_completion_with_extraction_goal_is_blocker_only(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("extraction", [False, True], ids=["no_extraction", "extraction"])
+async def test_execute_task_v3_download_block_waits_after_actions_and_settles_at_finish(
+    monkeypatch: pytest.MonkeyPatch, extraction: bool
 ) -> None:
-    # A data-extraction goal needs the model to keep the turn and call finish(completed,
-    # extracted_output=...) itself; the probe would otherwise end the loop the moment a billable
-    # action lands the download, before extraction ever happens.
+    # Identical with or without an extraction goal: nothing but the model's finish ends the block.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     block = _make_block(ActionBlock, complete_on_download=True, download_suffix="invoice")
     _step, _task, loop_mock, _post = await _run_execute_task_v3(
@@ -2663,19 +3042,19 @@ async def test_execute_task_v3_download_completion_with_extraction_goal_is_block
         outcome,
         task_block=block,
         workflow_run_id="wr_extract",
-        data_extraction_goal="Extract the invoice total",
+        data_extraction_goal="Extract the invoice total" if extraction else None,
         extracted_information_schema=None,
     )
-    assert loop_mock.await_args.kwargs["completion_probe"] is None
-    assert loop_mock.await_args.kwargs["completion_blocker"] is not None
+    assert loop_mock.await_args.kwargs["download_wait"] is not None
+    assert loop_mock.await_args.kwargs["download_settle"] is not None
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_download_timeout_only_gets_wait_only_probe_no_blocker(
+async def test_execute_task_v3_download_timeout_only_gets_a_download_wait_and_no_settle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # download_timeout alone carries no completion semantics; it must not go inert on v3 -- v1
-    # bounds a post-action download-settle wait with it, so v3 gets an equivalent wait-only probe
+    # bounds a post-action download-settle wait with it, so v3 gets an equivalent download wait
     # that awaits the same in-flight-download wait and never ends the run or blocks finish.
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=[])
     block = _make_block(ActionBlock, download_timeout=5.0)
@@ -2690,12 +3069,12 @@ async def test_execute_task_v3_download_timeout_only_gets_wait_only_probe_no_blo
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
-    probe = loop_mock.await_args.kwargs["completion_probe"]
-    assert probe is not None
-    assert loop_mock.await_args.kwargs["completion_blocker"] is None
+    wait = loop_mock.await_args.kwargs["download_wait"]
+    assert wait is not None
+    assert loop_mock.await_args.kwargs["download_settle"] is None
+    assert DOWNLOAD_BLOCK_FACT not in loop_mock.await_args.kwargs["goal"]
 
-    result = await probe(frozenset())
-    assert result is None
+    await wait()
     wait_mock.assert_awaited_once()
     assert wait_mock.await_args.kwargs["timeout_cap"] is not None
     assert isinstance(wait_mock.await_args.kwargs["exhausted"], set)
@@ -2727,12 +3106,11 @@ async def test_execute_task_v3_download_baseline_is_scoped_per_block(
 
     async def _block2_loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         # No new file yet: block 2's baseline already contains first.pdf, so the probe must not
-        # mistake it for a fresh download, and the blocker must withhold completion.
-        captured["probe_before_new_file"] = await kwargs["completion_probe"](frozenset())
-        captured["blocker_before_new_file"] = await kwargs["completion_blocker"](frozenset())
+        # mistake it for a fresh download.
+        captured["probe_before_new_file"] = await kwargs["download_settle"](frozenset())
 
         (tmp_path / "b.pdf").write_bytes(b"file-bytes-b")
-        captured["probe_after_new_file"] = await kwargs["completion_probe"](frozenset())
+        captured["probe_after_new_file"] = await kwargs["download_settle"](frozenset())
         if captured["probe_after_new_file"]:
             return LoopOutcome(status="completed", reason=captured["probe_after_new_file"], billable_actions=["click"])
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
@@ -2749,8 +3127,6 @@ async def test_execute_task_v3_download_baseline_is_scoped_per_block(
     )
 
     assert captured_block2["probe_before_new_file"] is None
-    assert isinstance(captured_block2["blocker_before_new_file"], str)
-    assert captured_block2["blocker_before_new_file"]
     assert captured_block2["probe_after_new_file"]
 
     # Only b.pdf was new to block 2's run: it alone is finalized/renamed, and first.pdf (block 1's
@@ -2767,16 +3143,15 @@ async def test_execute_task_v3_download_completion_excludes_staged_download_pers
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # file_upload's staged http(s) source file sits in the same download directory and never goes
-    # away on its own; the probe/blocker must exclude it by name on every later call this run, not
+    # away on its own; the probe must exclude it by name on every later call this run, not
     # just the one call that staged it, or it gets finalized/renamed as if it were a real download.
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         (tmp_path / "in.pdf").write_bytes(b"staged-input-bytes")
         staged = frozenset({"in.pdf"})
-        captured["probe_before_download"] = await kwargs["completion_probe"](staged)
-        captured["blocker_before_download"] = await kwargs["completion_blocker"](staged)
+        captured["probe_before_download"] = await kwargs["download_settle"](staged)
 
         (tmp_path / "out.pdf").write_bytes(b"real-download-bytes")
-        captured["probe_after_download"] = await kwargs["completion_probe"](staged)
+        captured["probe_after_download"] = await kwargs["download_settle"](staged)
         if captured["probe_after_download"]:
             return LoopOutcome(status="completed", reason=captured["probe_after_download"], billable_actions=["click"])
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
@@ -2784,8 +3159,6 @@ async def test_execute_task_v3_download_completion_excludes_staged_download_pers
     captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, loop_fn=_loop)
 
     assert captured["probe_before_download"] is None
-    assert isinstance(captured["blocker_before_download"], str)
-    assert captured["blocker_before_download"]
     assert captured["probe_after_download"]
 
     # Only the real download was finalized/renamed per download_suffix; the staged input is
@@ -2821,7 +3194,7 @@ async def test_execute_task_v3_download_completion_staged_add_gated_by_existence
         if not file_exists_at_add_time:
             (tmp_path / "report.csv").write_bytes(b"real-download-bytes")
 
-        captured["probe_reason"] = await kwargs["completion_probe"](frozenset(staged_downloads))
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset(staged_downloads))
         if captured["probe_reason"]:
             return LoopOutcome(status="completed", reason=captured["probe_reason"], billable_actions=["click"])
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
@@ -2841,34 +3214,35 @@ async def test_execute_task_v3_download_completion_staged_add_gated_by_existence
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_download_completion_probe_does_not_refinalize_once_cached(
+async def test_execute_task_v3_download_settle_does_not_refinalize_once_cached(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # A finish(completed) deferred by the settle gate re-probes after the first probe already
-    # finalized the download. Without download_suffix, finalize renames to a fresh random name
+    # A second settle call after the first already finalized the download. Without download_suffix,
+    # finalize renames to a fresh random name
     # every call, so re-finalizing on the re-probe would rename the file again and return a
     # different (but still truthy) reason. The cached-reason short-circuit must make every later
-    # probe/blocker call a no-op: same reason, same directory listing, one finalize call total.
+    # probe call a no-op: same reason, same directory listing, one finalize call total.
     original_finalize = ForgeAgent._finalize_downloaded_files_for_task
     finalize_calls = 0
+
+    finalized: list[list[str]] = []
 
     async def _spy_finalize(self: ForgeAgent, *args: Any, **kwargs: Any) -> Any:
         nonlocal finalize_calls
         finalize_calls += 1
-        return await original_finalize(self, *args, **kwargs)
+        new_files = await original_finalize(self, *args, **kwargs)
+        finalized.append(new_files)
+        return new_files
 
     monkeypatch.setattr(ForgeAgent, "_finalize_downloaded_files_for_task", _spy_finalize)
 
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         (tmp_path / "a.pdf").write_bytes(b"file-bytes")
-        captured["probe_reason_1"] = await kwargs["completion_probe"](frozenset())
+        captured["probe_reason_1"] = await kwargs["download_settle"](frozenset())
         captured["listing_1"] = sorted(p.name for p in tmp_path.iterdir())
 
-        captured["probe_reason_2"] = await kwargs["completion_probe"](frozenset())
+        captured["probe_reason_2"] = await kwargs["download_settle"](frozenset())
         captured["listing_2"] = sorted(p.name for p in tmp_path.iterdir())
-
-        captured["blocker_reason_3"] = await kwargs["completion_blocker"](frozenset())
-        captured["listing_3"] = sorted(p.name for p in tmp_path.iterdir())
 
         if captured["probe_reason_1"]:
             return LoopOutcome(status="completed", reason=captured["probe_reason_1"], billable_actions=["click"])
@@ -2880,12 +3254,12 @@ async def test_execute_task_v3_download_completion_probe_does_not_refinalize_onc
 
     assert captured["probe_reason_1"]
     assert captured["probe_reason_2"] == captured["probe_reason_1"]
-    assert captured["blocker_reason_3"] is None
 
     assert captured["listing_2"] == captured["listing_1"]
-    assert captured["listing_3"] == captured["listing_1"]
 
-    assert finalize_calls == 1
+    # A later settle may look again for files that landed since, but nothing already recorded is recorded again.
+    assert finalize_calls >= 1
+    assert sum(len(files) for files in finalized) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -3651,7 +4025,7 @@ async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_i
     _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
     task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
 
-    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"])
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True)
 
     assert guard is not None
     armed = guard.matches("s3cret-value")
@@ -3659,6 +4033,43 @@ async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_i
     with pytest.raises(CodeBlockCredentialReleaseError):
         guard.check_release(armed[0], "https://phisher-signin.net/login", operation="taskv3.type")
     guard.check_release(armed[0], "https://accounts.portal-example.com/signin", operation="taskv3.type")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sites", "enforced", "page_url", "refused"),
+    [
+        ([LoginSite("https://portal-example.com", whole_site=True)], True, "https://phisher-signin.net/login", True),
+        (
+            [LoginSite("https://portal-example.com", whole_site=True)],
+            True,
+            "https://accounts.portal-example.com/signin",
+            False,
+        ),
+        ([LoginSite("https://portal-example.com", whole_site=True)], False, "https://phisher-signin.net/login", False),
+        ([], True, "https://portal-example.com/login", True),
+    ],
+    ids=["copilot-off-site", "copilot-own-site", "editor-off-site-logged", "copilot-no-checkable-site"],
+)
+async def test_recovery_guard_holds_a_vault_login_to_its_items_sites(
+    monkeypatch: pytest.MonkeyPatch, sites: list[LoginSite], enforced: bool, page_url: str, refused: bool
+) -> None:
+    context = _stub_recovery_run_context(monkeypatch, tested_url=None)
+    context.bitwarden_login_sites["portal_credential"] = sites
+    task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
+
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=enforced)
+
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+    with capture_logs() as logs:
+        if refused:
+            with pytest.raises(CodeBlockCredentialReleaseError):
+                guard.check_release(armed[0], page_url, operation="taskv3.type")
+        else:
+            guard.check_release(armed[0], page_url, operation="taskv3.type")
+    would_refuse = [log for log in logs if log["event"] == "codeblock_credential_release_would_refuse"]
+    assert bool(would_refuse) is (not enforced and not refused)
 
 
 @pytest.mark.asyncio
@@ -3670,7 +4081,7 @@ async def test_recovery_guard_is_absent_when_the_credential_has_no_saved_site(
     _stub_recovery_run_context(monkeypatch, tested_url=None)
     task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
 
-    assert agent_module.recovery_credential_release_guard(task, ["portal_credential"]) is None
+    assert agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True) is None
 
 
 @pytest.mark.asyncio
@@ -4141,6 +4552,176 @@ async def test_a_fifth_veto_on_a_reask_conversion_restores_the_models_own_verdic
     assert task.failure_reason == "the site offers no way to continue"
 
 
+class _ModelSubstitute(_ScriptedCaller):
+    """A deterministic stand-in for the Task V3 model; no LLM is called."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        super().__init__(script)
+        self.original_llm_key = self.llm_key
+        self.llm_config = LLMConfig("scripted/model-substitute", [], True, False)
+
+    async def call(self, *, step: Step | None = None, **kwargs: Any) -> dict[str, Any]:
+        return await super().call(**kwargs)
+
+    def emit_retry_chain_exhausted(self, error: BaseException, prompt_name: str | None) -> None:
+        raise AssertionError(f"the model substitute never exhausts a retry chain: {error!r}")
+
+
+class _PageWithEventAfterFill(_FakePage):
+    def __init__(self, after_fill: Callable[[], None]) -> None:
+        super().__init__()
+        self._after_fill = after_fill
+
+    async def fill(self, selector: str, text: str, timeout: int | None = None) -> None:
+        await super().fill(selector, text, timeout=timeout)
+        self._after_fill()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "status"),
+    [
+        ("none", TaskStatus.completed),
+        ("expected_close", TaskStatus.completed),
+        ("native_close", TaskStatus.failed),
+        ("cancel_and_native_close", TaskStatus.canceled),
+    ],
+)
+async def test_execute_task_v3_native_browser_loss_after_the_last_action_fails_the_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, event: str, status: TaskStatus
+) -> None:
+    # The real loop, finish tool, completion gate and post-loop write; only the model and the page are fakes.
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr_v3_browser_loss",
+        navigation_goal="Fill in the first name",
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    step = make_step(now, task, step_id="step-v3", status=StepStatus.created, order=0, output=None)
+    state, context = run_bound_browser_state("wr_v3_browser_loss")
+    canceled = False
+
+    def _after_last_action() -> None:
+        nonlocal canceled
+        if event == "expected_close":
+            state._expect_runtime_end("normal_close", context)
+        if event == "cancel_and_native_close":
+            canceled = True
+        if event != "none":
+            # Playwright closes a closed context's pages and stops listing them.
+            page._closed = True
+            context.pages = []
+            state._on_browser_context_closed(context)
+
+    page = _PageWithEventAfterFill(_after_last_action)
+    page.url = task.url
+    context.pages = [page]
+    context._skyvern_cdp_download_interceptor = None
+    await state.set_working_page(page)
+    monkeypatch.setattr(state, "take_post_action_screenshot", AsyncMock(return_value=b"png-bytes"))
+
+    # The settle check may hold a finish twice before it accepts one.
+    finish = [("finish", {"status": "completed", "reason": "the first name is filled in"})]
+    model = _ModelSubstitute([[("observe", {})], [("type", {"selector": "#first", "text": "John"})], *[finish] * 3])
+    monkeypatch.setattr("skyvern.forge.agent.LLMCaller", lambda **_kwargs: model)
+    run_context = WorkflowRunContext(
+        workflow_title="wf",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_v3_browser_loss",
+        aws_client=MagicMock(),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context", lambda *_a, **_k: run_context
+    )
+
+    async def _get_task(**_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(status=TaskStatus.canceled if canceled else TaskStatus.running)
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(side_effect=_get_task))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.running, parent_workflow_run_id=None)),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: str(tmp_path))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", AsyncMock(return_value="artifact-1")
+    )
+    persisted_actions: list[Any] = []
+
+    async def _create_action(action: Any) -> Any:
+        persisted_actions.append(action)
+        return action
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.workflow_params.create_action", _create_action)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.tasks.create_step",
+        AsyncMock(side_effect=lambda **kwargs: SimpleNamespace(step_id=f"turn-{kwargs['order']}", retry_index=0)),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.observer.get_workflow_run_block_by_task_id", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr("skyvern.services.otp_service.has_credential_totp_candidate", lambda *_a, **_k: False)
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.post_step_execution", AsyncMock())
+
+    async def fake_update_step(step: Step, status: StepStatus | None = None, **_kwargs: Any) -> Step:
+        if status is not None:
+            step.status = status
+        return step
+
+    async def fake_update_task(task: Any, status: Any = None, **kwargs: Any) -> Any:
+        task.status = status
+        task.failure_reason = kwargs.get("failure_reason")
+        return task
+
+    agent.update_step = AsyncMock(side_effect=fake_update_step)
+    agent.update_task = AsyncMock(side_effect=fake_update_task)
+    agent.clean_up_task = AsyncMock()
+
+    skyvern_context.set(
+        SkyvernContext(
+            task_id=task.task_id,
+            step_id=step.step_id,
+            organization_id=task.organization_id,
+            workflow_run_id=task.workflow_run_id,
+        )
+    )
+    try:
+        await agent._execute_task_v3(
+            task=task,
+            step=step,
+            browser_state=state,
+            organization=organization,
+            api_key=None,
+            close_browser_on_completion=True,
+            browser_session_id=None,
+            task_block=_make_block(NavigationBlock, navigation_goal="Fill in the first name"),
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert ("fill", {"selector": "#first", "text": "John"}) in page.calls
+    assert task.status == status
+    if status == TaskStatus.canceled:
+        return
+    decision = persisted_actions[-1]
+    assert decision.description.endswith("finish completed")
+    if status == TaskStatus.failed:
+        assert decision.status == ActionStatus.failed
+        assert BROWSER_CONNECTION_LOST_ERROR_CODE in task.failure_reason
+    else:
+        assert decision.status == ActionStatus.completed
+        assert task.failure_reason is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("task_type", "custom_key", "criteria"),
@@ -4331,6 +4912,367 @@ async def test_execute_task_v3_actions_are_round_stamped(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each loop turn gets its own step (SKY-18790): the turn's model call runs under it and the rows it writes
+    # point at it, while the block's own step stays the one billing meters and the run's status lands on.
+    created: list[dict[str, Any]] = []
+
+    async def fake_create_step(**kwargs: Any) -> Any:
+        created.append(kwargs)
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}")
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    finish_turn = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", finish_turn)
+    steps_by_turn: list[Any] = []
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        steps_by_turn.append(await kwargs["on_turn_start"](1))
+        click = RoundAction("click", {"selector": "#go"}, True, billable=True)
+        await kwargs["on_action_round"]([click], "clicking", round_done=True)
+        await kwargs["on_turn_end"](
+            TurnRecord(turn=1, llm_seconds=1.5, tool_calls=[StepToolCall(tool="click", status="ok", billable=True)])
+        )
+        steps_by_turn.append(await kwargs["on_turn_start"](2))
+        await kwargs["on_turn_end"](
+            TurnRecord(turn=2, tool_calls=[StepToolCall(tool="finish", status="ok")], outcome_status="completed")
+        )
+
+    outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+    step, _task, _loop_mock, post_step = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        on_loop_async=drive_turns,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert [(c["order"], c["retry_index"], c["status"], c["created_by"]) for c in created] == [
+        (1, step.retry_index, StepStatus.running, TASK_V3_TURN_STEP_CREATED_BY),
+        (2, step.retry_index, StepStatus.running, TASK_V3_TURN_STEP_CREATED_BY),
+    ]
+    assert [turn_step.step_id for turn_step in steps_by_turn] == ["turn-1", "turn-2"]
+    finished = [
+        (c.kwargs["step_id"], c.kwargs["status"], [t.tool for t in c.kwargs["output"].tool_calls])
+        for c in finish_turn.await_args_list
+    ]
+    assert finished == [("turn-1", StepStatus.completed, ["click"]), ("turn-2", StepStatus.completed, ["finish"])]
+    # The click row and the finish decision sit on their turns' steps, still stamped with the round index.
+    rows = [c.kwargs["action"] for c in agent_module.app.DATABASE.workflow_params.create_action.await_args_list]
+    assert [(row.step_id, row.step_order) for row in rows] == [("turn-1", 0), ("turn-2", 0)]
+    assert step.step_id == "step-v3" and step.status == StepStatus.completed
+    assert post_step.await_args.args[1] is step
+
+
+@pytest.mark.asyncio
+async def test_every_look_image_is_stored_on_the_block_step_before_a_later_judge_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Copilot's at-failure frame is the block step's newest screenshot_llm, which follows member order.
+    manager = ArtifactManager()
+    monkeypatch.setattr(agent_module.app, "ARTIFACT_MANAGER", manager)
+
+    async def fake_create_step(**kwargs: Any) -> Any:
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", task_id="tsk-looks")
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", AsyncMock())
+    stored: dict[str, list[bytes]] = {}
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        await kwargs["on_turn_start"](1)
+        kwargs["on_look_screenshots"]([b"look-1"])
+        kwargs["on_look_screenshots"]([b"look-2"])
+        manager.accumulate_screenshot_to_step_archive(
+            step=kwargs["step"], screenshots=[b"judge"], artifact_type=ArtifactType.SCREENSHOT_LLM
+        )
+        stored.update(
+            {
+                step_id: [
+                    acc.entries[name] for kind, name, _ in acc.member_types if kind == ArtifactType.SCREENSHOT_LLM
+                ]
+                for step_id, acc in manager._step_archives.items()
+            }
+        )
+
+    step, *_ = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop_async=drive_turns,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert {step_id: images for step_id, images in stored.items() if images} == {
+        step.step_id: [b"look-1", b"look-2", b"judge"]
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_fails", [False, True])
+async def test_a_bare_v3_tasks_turn_files_are_one_zip_on_its_block_step(
+    monkeypatch: pytest.MonkeyPatch, store_fails: bool
+) -> None:
+    # A bare task's cleanup drains each leftover step archive as its own ZIP, so the turns' shared ZIP is written first,
+    # after the browser closes. A failed write must not cost the rest of the cleanup or the webhook.
+    manager = ArtifactManager()
+    monkeypatch.setattr(agent_module.app, "ARTIFACT_MANAGER", manager)
+    stored: list[Any] = []
+
+    async def _store(artifact: Any, data: bytes) -> None:
+        if store_fails:
+            raise OSError("storage unavailable")
+        stored.append(artifact)
+
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager._bundling_enabled", lambda: True)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.artifact.manager.app.STORAGE",
+        SimpleNamespace(
+            build_uri=lambda **kwargs: f"s3://artifacts/{kwargs['artifact_id']}",
+            store_artifact=_store,
+            save_downloaded_files=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr("skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.bulk_create_artifacts", AsyncMock())
+    now = datetime.now(UTC)
+
+    async def fake_create_step(**kwargs: Any) -> Step:
+        task = make_task(now, make_organization(now), task_id=kwargs["task_id"])
+        return make_step(
+            now, task, step_id=f"turn-{kwargs['order']}", status=StepStatus.running, order=kwargs["order"], output=None
+        )
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", AsyncMock())
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        for turn in (1, 2):
+            turn_step = await kwargs["on_turn_start"](turn)
+            manager.accumulate_llm_call_to_archive(step=turn_step, request=b"request", response=b"response")
+            await kwargs["on_turn_end"](TurnRecord(turn=turn))
+
+    # The real cleanup, with only its browser, webhook and file-store edges faked.
+    cleaner = ForgeAgent()
+    buffered_at_browser_close: list[list[str]] = []
+
+    async def close_browser(*_args: Any, **_kwargs: Any) -> None:
+        buffered_at_browser_close.append(sorted(manager._step_archives))
+
+    cleaner.cleanup_browser_and_create_artifacts = AsyncMock(side_effect=close_browser)  # type: ignore[method-assign]
+    cleaner.async_operation_pool.remove_task = AsyncMock()  # type: ignore[method-assign]
+    webhook = AsyncMock()
+    cleaner.execute_task_webhook = webhook  # type: ignore[method-assign]
+    monkeypatch.setattr("skyvern.forge.agent.app.BROWSER_MANAGER.get_for_task", MagicMock(return_value=None))
+    monkeypatch.setattr("skyvern.forge.agent.drain_speculative_persist_tasks", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "skyvern.forge.agent.uploaded_file_service.delete_files_attached_to_run", AsyncMock(return_value=None)
+    )
+
+    async def real_clean_up(**kwargs: Any) -> None:
+        monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.get_task", AsyncMock(return_value=kwargs["task"]))
+        await cleaner.clean_up_task(**kwargs)
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop_async=drive_turns,
+        clean_up_task=AsyncMock(side_effect=real_clean_up),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    assert buffered_at_browser_close == [["turn-1", "turn-2"]]
+    assert [artifact.step_id for artifact in stored] == ([] if store_fails else ["step-v3"])
+    assert manager._step_archives == {}
+    webhook.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sampled", [True, False])
+async def test_a_sampled_v3_block_saves_each_turns_page_on_that_turn_and_flushes_each_turn(
+    monkeypatch: pytest.MonkeyPatch, sampled: bool
+) -> None:
+    # SKY-18892: a sampled run stores the page each turn started from on that turn's step and makes each turn's
+    # archive durable as the turn ends; an unsampled run reads no page per turn and keeps the block-end ZIP alone.
+    pages = iter(["<p>start</p>", "<p>after click</p>"])
+
+    async def _content() -> str:
+        return next(pages)
+
+    async def fake_create_step(**kwargs: Any) -> Any:
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", task_id="tsk-turns")
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    finish_turn = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", finish_turn)
+    accumulate = MagicMock(side_effect=lambda step, html: f"dom-{step.step_id}")
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_html_scrape_to_archive", accumulate)
+    flush = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.flush_step_archive_in_background", flush)
+
+    async def drive_turns(kwargs: dict[str, Any]) -> None:
+        turn_dom = kwargs.get("turn_dom")
+        assert (turn_dom is not None) is sampled
+        for turn, outcome_status in ((1, None), (2, "completed")):
+            await kwargs["on_turn_start"](turn)
+            if turn_dom is not None:
+                await turn_dom.wait()
+            await kwargs["on_turn_end"](TurnRecord(turn=turn, tool_calls=[], outcome_status=outcome_status))
+
+    await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop_async=drive_turns,
+        working_page=_ContentPage(_content),
+        turn_dom_rate=1.0 if sampled else 0.0,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    saved = [(call.args[0].step_id, call.args[1]) for call in accumulate.call_args_list]
+    flushed = [call.args[0].step_id for call in flush.call_args_list]
+    page_doms = [call.kwargs["output"].page_dom for call in finish_turn.await_args_list]
+    if sampled:
+        assert saved == [("turn-1", b"<p>start</p>"), ("turn-2", b"<p>after click</p>")]
+        assert flushed == ["turn-1", "turn-2"]
+        assert [(dom.status, dom.artifact_id) for dom in page_doms] == [
+            ("stored", "dom-turn-1"),
+            ("stored", "dom-turn-2"),
+        ]
+    else:
+        assert (saved, flushed, page_doms) == ([], [], [None, None])
+
+
+async def _run_with_turn_dom_probe(
+    monkeypatch: pytest.MonkeyPatch, workflow_run_id: str, rate: float, **overrides: Any
+) -> tuple[bool, Any]:
+    created: list[bool] = []
+    _step, _task, loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="completed", reason="done", billable_actions=[]),
+        on_loop=lambda kwargs: created.append(kwargs.get("turn_dom") is not None),
+        turn_dom_rate=rate,
+        workflow_run_id=workflow_run_id,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        **overrides,
+    )
+    [was_created] = created
+    return was_created, loop_mock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("variant", "arm", "rate", "workflow_run_id", "sampled"),
+    [
+        ("treatment", "treatment", 0.0, "wr_turn_dom_0", True),
+        ("control", "control", 1.0, "wr_turn_dom_3", False),
+        # Unrandomized keeps the env rate's hash bucket: wr_turn_dom_3 falls inside 0.25, wr_turn_dom_0 does not.
+        (None, "unrandomized", 0.0, "wr_turn_dom_3", False),
+        (None, "unrandomized", 0.25, "wr_turn_dom_3", True),
+        (None, "unrandomized", 0.25, "wr_turn_dom_0", False),
+        (None, "unrandomized", 1.0, "wr_turn_dom_0", True),
+    ],
+)
+async def test_execute_task_v3_turn_dom_arm_decides_the_sample_and_unrandomized_keeps_the_env_rate(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None, arm: str, rate: float, workflow_run_id: str, sampled: bool
+) -> None:
+    provider = AsyncMock(side_effect=lambda flag, *_a, **_k: variant if flag == TURN_DOM_FLAG else None)
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", provider)
+
+    created, loop_mock = await _run_with_turn_dom_probe(monkeypatch, workflow_run_id, rate)
+
+    assert created is sampled
+    assert loop_mock.context.run_arms[TURN_DOM_FLAG] == (workflow_run_id, arm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_kind", ["noop", "raises"])
+@pytest.mark.parametrize("rate", [0.0, 1.0])
+async def test_execute_task_v3_turn_dom_without_a_usable_provider_samples_by_the_env_rate(
+    monkeypatch: pytest.MonkeyPatch, provider_kind: str, rate: float
+) -> None:
+    if provider_kind == "noop":
+        monkeypatch.setattr(app, "EXPERIMENTATION_PROVIDER", NoOpExperimentationProvider())
+    else:
+        monkeypatch.setattr(
+            app.EXPERIMENTATION_PROVIDER, "get_value_cached", AsyncMock(side_effect=RuntimeError("posthog down"))
+        )
+
+    created, loop_mock = await _run_with_turn_dom_probe(monkeypatch, "wr_turn_dom_fallback", rate)
+
+    assert created is (rate == 1.0)
+    assert loop_mock.context.run_arms[TURN_DOM_FLAG] == ("wr_turn_dom_fallback", "unrandomized")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["treatment", "control", None])
+async def test_execute_task_v3_page_free_validation_captures_no_turn_dom_in_any_arm(
+    monkeypatch: pytest.MonkeyPatch, variant: str | None
+) -> None:
+    monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "get_value_cached", AsyncMock(return_value=variant))
+
+    created, _loop_mock = await _run_with_turn_dom_probe(
+        monkeypatch,
+        "wr_turn_dom_page_free",
+        1.0,
+        task_block=_make_block(ValidationBlock, complete_criterion="The data is consistent"),
+        validation_without_page_information=True,
+        task_type=TaskType.validation,
+    )
+
+    assert created is False
+
+
+@pytest.mark.asyncio
+async def test_a_sampled_v3_turn_cut_short_by_a_raising_loop_keeps_its_finished_page_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _content() -> str:
+        return "<p>start</p>"
+
+    async def fake_create_step(**kwargs: Any) -> Any:
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", task_id="tsk-turns")
+
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
+    finish_turn = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.finish_step", finish_turn)
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.ARTIFACT_MANAGER.accumulate_html_scrape_to_archive",
+        MagicMock(side_effect=lambda step, html: f"dom-{step.step_id}"),
+    )
+    flush = MagicMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.flush_step_archive_in_background", flush)
+
+    async def start_a_turn_then_let_its_read_finish(kwargs: dict[str, Any]) -> None:
+        await kwargs["on_turn_start"](1)
+        await asyncio.sleep(0.05)
+
+    with pytest.raises(RuntimeError, match="model call boom"):
+        await _run_execute_task_v3(
+            monkeypatch,
+            LoopOutcome(status="completed", reason="done", billable_actions=[]),
+            on_loop_async=start_a_turn_then_let_its_read_finish,
+            loop_raises=RuntimeError("model call boom"),
+            working_page=_ContentPage(_content),
+            turn_dom_rate=1.0,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
+
+    [finished] = finish_turn.await_args_list
+    page_dom = finished.kwargs["output"].page_dom
+    assert (finished.kwargs["status"], page_dom.status, page_dom.artifact_id) == (
+        StepStatus.failed,
+        "stored",
+        "dom-turn-1",
+    )
+    assert [call.args[0].step_id for call in flush.call_args_list] == ["turn-1"]
+
+
+@pytest.mark.asyncio
 async def test_execute_task_v3_workflow_run_step_budget_caps_and_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4414,96 +5356,104 @@ async def test_execute_task_v3_detects_user_defined_errors_on_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("finish_status", [TaskStatus.failed, TaskStatus.terminated])
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "no_code_delivered",
-        "code_delivered",
-        "code_tool_offered",
-        "source_failed",
-        "credential_seed_missing",
-        "credential_seed_invalid",
-        "credential_seed_valid",
-    ],
-)
-async def test_execute_task_v3_attributes_a_run_whose_credential_had_no_usable_totp_source(
-    monkeypatch: pytest.MonkeyPatch, finish_status: TaskStatus, scenario: str
+@pytest.mark.parametrize("finish_status", [TaskStatus.failed, TaskStatus.terminated, TaskStatus.completed])
+@pytest.mark.parametrize("last_status", ["no_source", "source_error", "none"])
+async def test_execute_task_v3_reports_the_last_code_tool_status_as_the_failure_reason(
+    monkeypatch: pytest.MonkeyPatch, finish_status: TaskStatus, last_status: str
 ) -> None:
-    # The model narrates the symptom -- a rejected sign-in -- which classifies as the customer's
-    # credentials failing. When the run was refused a one-time code because its credential has no usable
-    # TOTP source and never got one, the run carries the same typed error the step engine records, and
-    # a reason that names the missing source instead. Like the step engine's error, it means NO code
-    # source at all: a run offered a polling source, or whose source failed, is not attributed. A code
-    # tool offered only for a credential whose TOTP seed is missing or invalid is not a source.
-    credential_seed = {
-        "credential_seed_missing": None,
-        "credential_seed_invalid": "not a totp secret!",
-        "credential_seed_valid": "JBSWY3DPEHPK3PXP",
-    }
-    uses_credential = scenario in credential_seed
-    run_overrides: dict[str, Any] = {}
-    task_block = _make_block(NavigationBlock, navigation_goal="Sign in")
-    if uses_credential:
-        run_context = _stub_recovery_run_context(monkeypatch, tested_url=None)
-        run_context.parameters["portal_credential"] = _make_credential_parameter("portal_credential")
-        run_context.values["portal_credential"]["totp"] = "placeholder_Zz9_totp"
-        run_context.secrets["placeholder_Zz9_totp"] = "BW_TOTP"
-        if credential_seed[scenario] is not None:
-            run_context.secrets[run_context.totp_secret_value_key("placeholder_Zz9_totp")] = credential_seed[scenario]
-        task_block = _make_block(
-            NavigationBlock, navigation_goal="Sign in", parameters=[_make_credential_parameter("portal_credential")]
-        )
-        run_overrides = {"workflow_run_id": "wr_test", "real_credential_totp_candidate": True}
+    # A failed run keeps the model's reason and carries the last status the code tool reported. Only the no-source
+    # status carries the step engine's typed MISSING_TOTP_SOURCE error, and a completed run carries neither.
+    status_text = {
+        "no_source": NO_ONE_TIME_CODE_SOURCE,
+        "source_error": "the verification code source returned an error (lookup failed); no polling time remains.",
+        "none": None,
+    }[last_status]
     errors_update = AsyncMock()
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
     seen: dict[str, Any] = {}
 
-    def _refused_a_code(kwargs: dict[str, Any]) -> None:
+    def _reported(kwargs: dict[str, Any]) -> None:
         state = kwargs["verification_blocker"].__self__
-        seen["state"] = state
-        seen["resolver"] = kwargs["resolve_totp_placeholder"]
         seen["tools"] = kwargs["extra_tools"]
-        state.totp_source_missing = True
-        if scenario == "code_delivered":
-            state.values_delivered = 1
-        if scenario == "source_failed":
-            state.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
+        seen["resolver"] = kwargs["resolve_totp_placeholder"]
+        seen["state"] = state
+        state.last_status = status_text
 
     model_reason = "Login failed: the MFA code was rejected"
-    outcome = LoopOutcome(status=finish_status.value, reason=model_reason, billable_actions=[])
-    _step, task, loop_mock, _post = await _run_execute_task_v3(
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
-        outcome,
-        task_block=task_block,
-        on_loop=_refused_a_code,
+        LoopOutcome(status=finish_status.value, reason=model_reason, billable_actions=[]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop=_reported,
         data_extraction_goal=None,
         extracted_information_schema=None,
-        totp_identifier="user@example.com" if scenario == "code_tool_offered" else None,
-        **run_overrides,
     )
     state = seen["state"]
-    assert state.code_tool_offered is (scenario in ("code_tool_offered", "credential_seed_valid"))
-    if uses_credential:
-        # The tool stays offered to the model either way; only the attribution input changes.
-        offered = [tool.name for tool in seen["tools"]]
-        assert "get_verification_code" in offered
+    assert "get_verification_code" in [tool.name for tool in seen["tools"]]
     assert seen["resolver"] == state.resolve_totp_placeholder
     assert state.totp_min_remaining_seconds == settings.TOTP_MULTI_FIELD_MIN_REMAINING_SECONDS
     written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
     assert task.status == finish_status
-    category = loop_mock.update_task_kwargs.get("failure_category") or []
-    if scenario not in ("no_code_delivered", "credential_seed_missing", "credential_seed_invalid"):
-        assert written == []
-        assert task.failure_reason == model_reason
+    if finish_status == TaskStatus.completed:
+        assert task.failure_reason is None and written == []
         return
-    assert [error["error_code"] for error in written] == ["MISSING_TOTP_SOURCE"]
-    reason = (task.failure_reason or "").lower()
-    assert "one-time code" in reason and "totp" in reason
-    assert not any(word in reason for word in ("mfa", "password", "login fail", "authentication fail", "auth fail"))
-    assert all(entry["category"] not in ("AUTH_FAILURE", "CREDENTIAL_ERROR") for entry in category)
-    if finish_status == TaskStatus.failed:
-        assert category
+    assert task.failure_reason is not None and model_reason in task.failure_reason
+    assert status_text in task.failure_reason if status_text else task.failure_reason == model_reason
+    assert [error["error_code"] for error in written] == (["MISSING_TOTP_SOURCE"] if last_status == "no_source" else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clicked_after", [True, False], ids=["page_action_after_status", "status_last"])
+async def test_execute_task_v3_a_code_status_the_model_acted_past_is_not_the_failure_reason(
+    monkeypatch: pytest.MonkeyPatch, clicked_after: bool
+) -> None:
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    model_reason = "the portal rejected the sign-in"
+    seen: dict[str, Any] = {}
+
+    async def _click(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("clicked")
+
+    async def _real_loop(kwargs: dict[str, Any]) -> None:
+        click = ToolSpec(name="click", description="click", parameters={}, handler=_click, billable=True)
+        script = [[("get_verification_code", {})]]
+        if clicked_after:
+            script.append([("click", {"selector": "#skip"})])
+        script.append([("finish", {"status": "failed", "reason": model_reason})])
+        seen["outcome"] = await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=kwargs["extra_tools"] + [click, make_finish_tool()],
+            max_turns=10,
+            max_tool_calls=20,
+            on_page_action=kwargs["on_page_action"],
+        )
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(status="failed", reason=model_reason, billable_actions=[]),
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop_async=_real_loop,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    code_answers = [
+        m["content"]
+        for m in seen["outcome"].messages
+        if m.get("role") == "tool" and m.get("name") == "get_verification_code"
+    ]
+    assert code_answers == [NO_ONE_TIME_CODE_SOURCE]
+    assert (seen["outcome"].status, seen["outcome"].reason) == ("failed", model_reason)
+    written = [
+        error["error_code"] for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []
+    ]
+    if clicked_after:
+        assert task.failure_reason == model_reason and "MISSING_TOTP_SOURCE" not in written
+    else:
+        assert task.failure_reason is not None and model_reason in task.failure_reason
+        assert NO_ONE_TIME_CODE_SOURCE in task.failure_reason and written == ["MISSING_TOTP_SOURCE"]
 
 
 @pytest.mark.asyncio
@@ -4515,7 +5465,7 @@ async def test_execute_task_v3_a_vetoed_completion_is_not_attributed_to_a_missin
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
 
     def _refused_a_code(kwargs: dict[str, Any]) -> None:
-        kwargs["verification_blocker"].__self__.totp_source_missing = True
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
 
     _step, task, _loop_mock, _post = await _run_execute_task_v3(
         monkeypatch,
@@ -4533,11 +5483,76 @@ async def test_execute_task_v3_a_vetoed_completion_is_not_attributed_to_a_missin
 
 
 @pytest.mark.asyncio
-async def test_execute_task_v3_keeps_the_codes_out_of_the_loop_and_the_goal(
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        LoopOutcome(status="loop_error", reason="llm_call_failed: TimeoutError: slow", billable_actions=[]),
+        LoopOutcome(status="budget_exhausted", reason="the run reached its turn limit", billable_actions=[]),
+        LoopOutcome(status="terminated", reason="the page stopped responding", guard=ACTION_LOOP_GUARD),
+    ],
+    ids=["loop_error", "budget_exhausted", "loop_guard"],
+)
+async def test_execute_task_v3_a_run_the_loop_ended_keeps_its_own_reason_over_a_code_status(
+    monkeypatch: pytest.MonkeyPatch, outcome: LoopOutcome
+) -> None:
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+
+    def _no_source(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop=_no_source,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.failure_reason and NO_ONE_TIME_CODE_SOURCE not in task.failure_reason
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert all(error["error_code"] != "MISSING_TOTP_SOURCE" for error in written)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_runs", ["in_loop", "after_loop"])
+async def test_execute_task_v3_a_completion_gate_termination_keeps_the_gates_reason_over_a_code_status(
+    monkeypatch: pytest.MonkeyPatch, gate_runs: str
+) -> None:
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    gate_reason = "the application was already submitted"
+
+    async def _claims_completion(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
+        if gate_runs == "in_loop":
+            with pytest.raises(CompletionGateTerminationError):
+                await kwargs["completion_gate"]()
+
+    outcome = (
+        LoopOutcome(status="terminated", reason=gate_reason, billable_actions=[])
+        if gate_runs == "in_loop"
+        else LoopOutcome(status="completed", reason="signed in", billable_actions=[])
+    )
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop_async=_claims_completion,
+        completion_gate_raises=CompletionGateTerminationError(gate_reason),
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+    assert task.status == TaskStatus.terminated
+    assert task.failure_reason == gate_reason
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert all(error["error_code"] != "MISSING_TOTP_SOURCE" for error in written)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_gives_the_codes_to_the_finish_tool_not_the_goal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # v3 never shows the model the customer's codes: they reach neither the loop nor the goal, and
-    # the detector after the loop is what assigns one.
     mapping = {"COVERAGE_NOT_ACTIVE": "The member has no active plan today."}
     outcome = LoopOutcome(status="completed", reason="ok", billable_actions=[])
     block = _make_block(NavigationBlock, navigation_goal="Go", error_code_mapping=mapping)
@@ -4549,9 +5564,264 @@ async def test_execute_task_v3_keeps_the_codes_out_of_the_loop_and_the_goal(
         data_extraction_goal=None,
         extracted_information_schema=None,
     )
-    assert "error_code_mapping" not in loop_mock.await_args.kwargs
+    assert loop_mock.await_args.kwargs["error_code_mapping"] == mapping
     assert "COVERAGE_NOT_ACTIVE" not in loop_mock.await_args.kwargs["goal"]
     assert "The member has no active plan today." not in loop_mock.await_args.kwargs["goal"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "persisted_code", "detector_runs", "vetoed"),
+    [
+        (
+            LoopOutcome(status="failed", reason="password rejected", error_code="COVERAGE_NOT_ACTIVE"),
+            "COVERAGE_NOT_ACTIVE",
+            False,
+            False,
+        ),
+        (LoopOutcome(status="terminated", reason="no such member", error_code_declined=True), None, False, False),
+        (LoopOutcome(status="failed", reason="step budget used up"), "DETECTED", True, False),
+        (LoopOutcome(status="budget_exhausted", reason="max_turns (40) reached"), "DETECTED", True, False),
+        # A code must never make a successful run carry errors: consumers read errors as "did not succeed".
+        (LoopOutcome(status="completed", reason="done", error_code="COVERAGE_NOT_ACTIVE"), None, False, False),
+        # A conversion that stood, then failed for its missing extraction: the code answered a verdict that did not stand.
+        (
+            LoopOutcome(
+                status="completed",
+                reason="the site skipped a screen",
+                converted_from="failed",
+                converted_from_reason="password rejected",
+                error_code="COVERAGE_NOT_ACTIVE",
+            ),
+            "DETECTED",
+            True,
+            False,
+        ),
+        # A completion vetoed after the loop was never asked for a code, so the page guess decides.
+        (LoopOutcome(status="completed", reason="done"), "DETECTED", True, True),
+        # A vetoed re-ask conversion restores the model's failed verdict, and with it the code it chose.
+        (
+            LoopOutcome(
+                status="completed",
+                reason="the site skipped a screen",
+                converted_from="failed",
+                converted_from_reason="password rejected",
+                error_code="COVERAGE_NOT_ACTIVE",
+            ),
+            "COVERAGE_NOT_ACTIVE",
+            False,
+            True,
+        ),
+    ],
+)
+async def test_execute_task_v3_the_models_finish_answer_replaces_the_page_guess(
+    monkeypatch: pytest.MonkeyPatch, outcome: LoopOutcome, persisted_code: str | None, detector_runs: bool, vetoed: bool
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=True)
+    )
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    mapping = {"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"}
+    _step, task, _loop, _post = await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        error_code_mapping=mapping,
+        data_extraction_goal="Extract the member id" if persisted_code == "DETECTED" and not vetoed else None,
+        extracted_information_schema=None,
+        completion_gate_vetoes=vetoed,
+    )
+
+    assert detect_mock.await_count == (1 if detector_runs else 0)
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ([persisted_code] if persisted_code else [])
+    if persisted_code == "COVERAGE_NOT_ACTIVE":
+        assert written[0]["reasoning"] == (outcome.converted_from_reason or outcome.reason)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gate_on", "model_code", "declined", "detected", "expected"),
+    [
+        (True, "COVERAGE_NOT_ACTIVE", False, [], ["COVERAGE_NOT_ACTIVE"]),
+        (False, None, False, ["incompleteTOTP"], ["incompleteTOTP"]),
+        (True, None, True, [], ["MISSING_TOTP_SOURCE"]),
+        (False, None, False, [], ["MISSING_TOTP_SOURCE"]),
+    ],
+    ids=["model_chose_a_code", "detector_chose_a_code", "model_declined_every_code", "detector_found_nothing"],
+)
+async def test_execute_task_v3_reports_the_built_in_missing_code_source_only_without_the_blocks_own_code(
+    monkeypatch: pytest.MonkeyPatch,
+    gate_on: bool,
+    model_code: str | None,
+    declined: bool,
+    detected: list[str],
+    expected: list[str],
+) -> None:
+    # errors appends and every entry reports USER_DEFINED_ERROR, so the MISSING_TOTP_SOURCE Skyvern attaches
+    # itself is a fallback: written only when neither the model nor the detector produced the block's own code.
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=gate_on)
+    )
+    detect_mock = AsyncMock(
+        return_value=[
+            UserDefinedError(error_code=code, reasoning="page guess", confidence_float=0.5) for code in detected
+        ]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+
+    def _no_source(kwargs: dict[str, Any]) -> None:
+        kwargs["verification_blocker"].__self__.last_status = NO_ONE_TIME_CODE_SOURCE
+
+    _step, task, _loop_mock, _post = await _run_execute_task_v3(
+        monkeypatch,
+        LoopOutcome(
+            status="terminated",
+            reason="no code was delivered",
+            error_code=model_code,
+            error_code_declined=declined,
+        ),
+        task_block=_make_block(NavigationBlock, navigation_goal="Sign in"),
+        on_loop=_no_source,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "incompleteTOTP": "y"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == expected
+    assert detect_mock.await_count == (0 if gate_on else 1)
+    # Suppressing the code does not drop the attribution: the status stays readable on the run.
+    assert NO_ONE_TIME_CODE_SOURCE in (task.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_conversion_a_deployment_gate_terminates_goes_to_the_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(
+        status="completed",
+        reason="the site skipped a screen",
+        converted_from="failed",
+        converted_from_reason="password rejected",
+        error_code="COVERAGE_NOT_ACTIVE",
+    )
+    await _run_execute_task_v3(
+        monkeypatch,
+        outcome,
+        error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"},
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+        completion_gate_raises=CompletionGateTerminationError("already applied to this job"),
+    )
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ["DETECTED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_the_open_source_gate_follows_its_setting_and_is_off_by_default(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    assert Settings.model_fields["TASK_V3_ERROR_CODE_ON_FINISH"].default is False
+    monkeypatch.setattr(settings, "TASK_V3_ERROR_CODE_ON_FINISH", enabled)
+    assert await AgentFunction().task_v3_error_code_on_finish(organization_id="org-1") is enabled
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_gate_off_stores_the_page_guess_and_logs_both_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", AsyncMock(return_value=False)
+    )
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="terminated", reason="password rejected", error_code="COVERAGE_NOT_ACTIVE")
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"}
+        )
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ["DETECTED"]
+    (line,) = (log for log in logs if log["event"] == "task_v3 user-defined error code sources")
+    assert (line["model_error_code"], line["detector_error_codes"]) == ("COVERAGE_NOT_ACTIVE", ["DETECTED"])
+    assert line["reached_finish"] is True and line["model_answer_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_gate_error_falls_back_to_the_page_guess(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish",
+        AsyncMock(side_effect=RuntimeError("flag service down")),
+    )
+    detect_mock = AsyncMock(
+        return_value=[UserDefinedError(error_code="DETECTED", reasoning="page guess", confidence_float=0.5)]
+    )
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
+    errors_update = AsyncMock()
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", errors_update)
+    outcome = LoopOutcome(status="failed", reason="password rejected", error_code="COVERAGE_NOT_ACTIVE")
+    await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x", "DETECTED": "y"})
+
+    written = [error for call in errors_update.await_args_list for error in call.kwargs.get("errors") or []]
+    assert [error["error_code"] for error in written] == ["DETECTED"]
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_gate_demoted_completion_is_not_logged_as_a_model_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = AsyncMock(return_value=True)
+    monkeypatch.setattr("skyvern.forge.agent.app.AGENT_FUNCTION.task_v3_error_code_on_finish", gate)
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock())
+    outcome = LoopOutcome(status="completed", reason="done")
+    with capture_logs() as logs:
+        await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"},
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+            completion_gate_raises=CompletionGateTerminationError("already applied to this job"),
+        )
+
+    gate.assert_not_awaited()
+    (line,) = (log for log in logs if log["event"] == "task_v3 user-defined error code sources")
+    assert line["model_verdict"] == "completed" and line["model_answer_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_v3_a_completion_the_gate_ended_inside_the_loop_logs_the_models_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", AsyncMock(return_value=[]))
+    monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.update_task", AsyncMock())
+    outcome = LoopOutcome(status="terminated", reason="already applied", model_status="completed")
+    with capture_logs() as logs:
+        await _run_execute_task_v3(monkeypatch, outcome, error_code_mapping={"COVERAGE_NOT_ACTIVE": "x"})
+
+    (line,) = (log for log in logs if log["event"] == "task_v3 user-defined error code sources")
+    assert line["model_verdict"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -4560,7 +5830,11 @@ async def test_execute_task_v3_vetoed_completion_still_reaches_the_detector(
 ) -> None:
     # A completion the gate vetoes is demoted to failed, and the detector runs on the demoted status,
     # not on the model's own "completed".
-    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
+    detected = [
+        SimpleNamespace(
+            model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, error_code="COVERAGE_NOT_ACTIVE", reasoning=""
+        )
+    ]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -4781,7 +6055,11 @@ async def test_execute_task_v3_leaves_unasked_failures_to_the_detector(
 ) -> None:
     # The scope guard: a failed v3 run on a task with a mapping hands the code to the detector,
     # exactly as v1's fail_task does.
-    detected = [SimpleNamespace(model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, reasoning="")]
+    detected = [
+        SimpleNamespace(
+            model_dump=lambda: {"error_code": "COVERAGE_NOT_ACTIVE"}, error_code="COVERAGE_NOT_ACTIVE", reasoning=""
+        )
+    ]
     detect_mock = AsyncMock(return_value=detected)
     monkeypatch.setattr("skyvern.forge.agent.detect_user_defined_errors_for_task", detect_mock)
     errors_update = AsyncMock()
@@ -4840,8 +6118,6 @@ async def test_execute_task_v3_router_selected_data_only_validation_goes_page_fr
 async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     # The finish gate the loop receives must be the same VerificationState the auth tools mutate;
     # a fresh or detached state would let a refused source false-complete despite the blocker.
-    from skyvern.forge.taskv3.auth_tools import VerificationFailure
-
     seen_states: list[Any] = []
 
     def capturing_build(
@@ -4859,7 +6135,7 @@ async def test_execute_task_v3_hands_the_loop_the_live_verification_gate(monkeyp
     assert blocker is not None
     assert len(seen_states) == 1 and blocker.__self__ is seen_states[0]
     assert await blocker("completed") is None
-    seen_states[0].arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
+    seen_states[0].arm(VerificationFailure.LINK_REFUSED, "open_verification_link")
     assert await blocker("completed") is not None
 
 
@@ -6705,7 +7981,7 @@ def _click_then_probe(
             monitor.browser_download_event_count += 1
         if local_file is not None:
             (tmp_path / local_file).write_bytes(b"local-bytes")
-        probe = kwargs["completion_probe"]
+        probe = kwargs["download_settle"]
         captured["probe_started_at"] = time.monotonic()
         captured["probe_reason"] = await probe(frozenset())
         captured["probe_returned_at"] = time.monotonic()
@@ -6724,6 +8000,63 @@ def _record_provider_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     monkeypatch.setattr(taskv3_provider_downloads, "asyncio", ScopedAsyncio(sleep=_record))
     return sleeps
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "guard", ["provider", "session_directory", "external", "replaced_context", "unknown_directory"]
+)
+async def test_native_quiescence_never_overrides_an_unknown_download_owner(monkeypatch, tmp_path, guard):
+    original_state = make_browser_state
+    observers = []
+    waits = []
+    real_wait = ForgeAgent._wait_for_in_flight_downloads
+
+    def owned_state():
+        state, browser, page = original_state()
+        observer = NativeDownloads(
+            state.browser_context, str(tmp_path) if guard != "unknown_directory" else None, covered=True
+        )
+        observer.quiescent = AsyncMock(return_value=True)
+        state.browser_artifacts.native_downloads = observer
+        state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
+        state.browser_context._skyvern_external_browser = guard == "external"
+        if guard == "session_directory":
+            state.browser_artifacts.download_binding = DownloadBinding.SESSION_DIR
+        observers.append(observer)
+        return state, browser, page
+
+    async def observed_wait(self, *args, **kwargs):
+        result = await real_wait(self, *args, **kwargs)
+        waits.append((result, set(kwargs["exhausted"])))
+        return result
+
+    async def run_loop(kwargs, captured):
+        observer = observers[0]
+        assert observer.attempt is kwargs["native_download_attempt"]
+        observer.attempt.interrupted = 1
+        if guard == "replaced_context":
+            observer.context = MagicMock()
+        residual = tmp_path / "retained.crdownload"
+        residual.write_bytes(b"partial")
+        await kwargs["download_wait"]()
+        assert residual.exists()
+        return LoopOutcome(status="terminated", reason="Observed transfer outcome.", billable_actions=[])
+
+    monkeypatch.setattr(__name__ + ".make_browser_state", owned_state)
+    monkeypatch.setattr(ForgeAgent, "_wait_for_in_flight_downloads", observed_wait)
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([])) if guard == "provider" else None
+    await _run_execute_task_v3_download(
+        monkeypatch,
+        tmp_path,
+        drop_file=False,
+        provider_source=source,
+        download_timeout=1.2,
+        loop_fn=run_loop,
+    )
+    assert waits == [(False, {str(tmp_path / "retained.crdownload")})]
+    assert observers[0].attempt.closed
+    observers[0].quiescent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -6990,13 +8323,13 @@ async def test_v3_download_provider_wait_ends_at_the_block_download_timeout(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=2.0,
+        download_timeout=0.2,
         loop_fn=_click_then_probe(tmp_path, monitor, source),
     )
 
     assert captured["probe_reason"] is None
     assert observation.poll_deadlines
-    # The block's 2 s timeout, not the 30 s default, set the read deadline; no poll started past it.
+    # The block's own timeout, not the 30 s default, set the read deadline; no poll started past it.
     assert observation.poll_deadlines[0] - captured["probe_started_at"] < (
         taskv3_provider_downloads.PROVIDER_DOWNLOAD_WAIT_SECONDS
     )
@@ -7044,7 +8377,7 @@ async def test_v3_download_does_not_take_a_staged_upload_for_the_admitted_downlo
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         monitor.browser_download_event_count += 1
         (tmp_path / "upload.pdf").write_bytes(b"staged-upload")
-        captured["probe_reason"] = await kwargs["completion_probe"](frozenset({"upload.pdf"}))
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset({"upload.pdf"}))
         return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
 
     captured = await _run_execute_task_v3_download(
@@ -7071,6 +8404,12 @@ async def test_v3_wait_only_download_does_not_read_the_provider(
     observation = _FakeActionDownloadObservation([("export.csv", b"real-export")])
     source = _ActionDownloadSource(observation)
 
+    async def _click_then_wait(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        captured["begin_calls_at_loop_start"] = source.begin_calls
+        monitor.browser_download_event_count += 1
+        await kwargs["download_wait"]()
+        return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
+
     captured = await _run_execute_task_v3_download(
         monkeypatch,
         tmp_path,
@@ -7079,11 +8418,10 @@ async def test_v3_wait_only_download_does_not_read_the_provider(
         download_timeout=10.0,
         provider_source=source,
         download_monitor=monitor,
-        loop_fn=_click_then_probe(tmp_path, monitor, source),
+        loop_fn=_click_then_wait,
     )
 
     assert captured["begin_calls_at_loop_start"] == 0
-    assert captured["probe_reason"] is None
     assert observation.poll_deadlines == []
     assert not [p for p in tmp_path.iterdir() if p.is_file()]
 
@@ -7130,10 +8468,10 @@ async def test_v3_download_without_a_provider_source_is_unchanged(
 def _probe_twice(
     monitor: _FakeBrowserDownloadMonitor, between: Callable[[], None]
 ) -> Callable[[dict[str, Any], dict[str, Any]], Awaitable[LoopOutcome]]:
-    # One click, two probes: the second follows an unrelated billable tool, with no new download event.
+    # One click, two settles: the second finish follows no new download event.
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         monitor.browser_download_event_count += 1
-        probe = kwargs["completion_probe"]
+        probe = kwargs["download_settle"]
         captured["first_reason"] = await probe(frozenset())
         between()
         captured["probe_reason"] = await probe(frozenset())
@@ -7161,7 +8499,7 @@ async def test_v3_download_still_reads_the_provider_after_the_monitor_outlasted_
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _settle),
     )
 
@@ -7187,7 +8525,7 @@ async def test_v3_download_still_reads_the_provider_after_an_empty_first_window(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _list_late),
     )
 
@@ -7207,8 +8545,8 @@ async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cle
 
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         monitor.browser_download_event_count += 1
-        asyncio.get_running_loop().call_later(2.0, gate.set)
-        captured["probe_reason"] = await kwargs["completion_probe"](frozenset())
+        asyncio.get_running_loop().call_later(0.4, gate.set)
+        captured["probe_reason"] = await kwargs["download_settle"](frozenset())
         captured["cleanup_finished_at_return"] = observation.cleanup_finished
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
 
@@ -7224,3 +8562,386 @@ async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cle
 
     assert captured["probe_reason"] is None
     assert captured["cleanup_finished_at_return"] is True
+
+
+@pytest.mark.parametrize(
+    "names", [("first.csv", "second.csv"), ("export.csv", "export.csv")], ids=["new-name", "reused-name"]
+)
+@pytest.mark.asyncio
+async def test_v3_download_records_a_file_that_lands_after_the_block_already_recorded_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, names: tuple[str, str]
+) -> None:
+    # A file selected after the block recorded one gets the suffix too, even under the name a rename vacated.
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        settle = kwargs["download_settle"]
+        (tmp_path / names[0]).write_bytes(b"a,b\n1,2\n")
+        captured["first"] = await settle(frozenset())
+        captured["after_first"] = sorted(p.name for p in tmp_path.iterdir())
+        (tmp_path / names[1]).write_bytes(b"c,d\n3,4\n")
+        captured["second"] = await settle(frozenset())
+        captured["again"] = await settle(frozenset())
+        return LoopOutcome(status="completed", reason=captured["again"] or "", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, loop_fn=_loop)
+
+    assert captured["first"] == "download completed (1 new file(s))"
+    assert captured["second"] == captured["again"] == "download completed (2 new file(s))"
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert len(files) == 2 and all(name.startswith("invoice") for name in files), files
+    assert set(captured["after_first"]) <= set(files)
+    assert sorted(p.read_bytes() for p in tmp_path.iterdir()) == [b"a,b\n1,2\n", b"c,d\n3,4\n"]
+
+
+@pytest.mark.asyncio
+async def test_v3_download_a_listing_failure_never_skips_or_repeats_recording_a_later_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    original_finalize = ForgeAgent._finalize_downloaded_files_for_task
+    original_listing = agent_module.list_files_in_directory
+    finalized: list[list[str]] = []
+    armed = {"listing_fails": False}
+
+    async def _spy_finalize(self: ForgeAgent, *args: Any, **kwargs: Any) -> Any:
+        new_files = await original_finalize(self, *args, **kwargs)
+        finalized.append(new_files)
+        if new_files and len(finalized) == 1:
+            armed["listing_fails"] = True
+        return new_files
+
+    def _listing(*args: Any, **kwargs: Any) -> Any:
+        if armed["listing_fails"]:
+            armed["listing_fails"] = False
+            raise OSError("listing unavailable")
+        return original_listing(*args, **kwargs)
+
+    monkeypatch.setattr(ForgeAgent, "_finalize_downloaded_files_for_task", _spy_finalize)
+    monkeypatch.setattr(agent_module, "list_files_in_directory", _listing)
+
+    async def _settle_allowing_failure(settle: Any) -> str | None:
+        try:
+            return await settle(frozenset())
+        except OSError:
+            return "raised"
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        settle = kwargs["download_settle"]
+        (tmp_path / "first.csv").write_bytes(b"a,b\n1,2\n")
+        captured["reasons"] = [await _settle_allowing_failure(settle)]
+        captured["after_first"] = sorted(p.name for p in tmp_path.iterdir())
+        (tmp_path / "second.csv").write_bytes(b"c,d\n3,4\n")
+        captured["reasons"].append(await _settle_allowing_failure(settle))
+        if captured["reasons"][-1] == "raised":
+            captured["reasons"].append(await _settle_allowing_failure(settle))
+        captured["reasons"].append(await _settle_allowing_failure(settle))
+        return LoopOutcome(status="completed", reason=captured["reasons"][-1] or "", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(monkeypatch, tmp_path, drop_file=False, loop_fn=_loop)
+
+    assert captured["reasons"][0] == "download completed (1 new file(s))"
+    assert captured["reasons"][-1] == "download completed (2 new file(s))", captured["reasons"]
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert len(names) == 2 and all(name.startswith("invoice") for name in names), names
+    assert set(captured["after_first"]) <= set(names)
+    assert sum(len(files) for files in finalized) == 2
+
+
+@pytest.mark.asyncio
+async def test_v3_download_records_a_later_session_file_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    session_files: list[str] = []
+
+    async def _session_listing(**_kwargs: Any) -> list[str]:
+        return list(session_files)
+
+    download = AsyncMock(return_value=b"x,y\n5,6\n")
+    monkeypatch.setattr("skyvern.forge.agent.app.STORAGE.list_downloaded_files_in_browser_session", _session_listing)
+    monkeypatch.setattr(agent_module, "get_aws_client", lambda: SimpleNamespace(download_file=download))
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        settle = kwargs["download_settle"]
+        (tmp_path / "local.csv").write_bytes(b"a,b\n1,2\n")
+        captured["first"] = await settle(frozenset())
+        session_files.append("s3://bucket/run/late.csv")
+        captured["second"] = await settle(frozenset())
+        captured["again"] = await settle(frozenset())
+        return LoopOutcome(status="completed", reason=captured["again"] or "", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, browser_session_id="pbs_1"
+    )
+
+    assert captured["first"] == "download completed (1 new file(s))"
+    assert captured["second"] == captured["again"] == "download completed (2 new file(s))"
+    assert download.await_count == 1
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert len(names) == 2 and all(name.startswith("invoice") for name in names), names
+
+
+_REPLAYED_CSV = b"account,amount\nA-1,12.50\n"
+
+
+def _replay_interceptor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> cdp_module.CDPDownloadInterceptor:
+    monkeypatch.setattr(cdp_module, "_REPLAY_CANDIDATE_HANDLES", itertools.count(1))
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = True
+    interceptor = cdp_module.CDPDownloadInterceptor(
+        output_dir=str(tmp_path), network_egress_monitor=monitor, redirect_hop_authorizer=AsyncMock()
+    )
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[])
+    interceptor._browser_context = context
+    return interceptor
+
+
+def _replay_fetch(monkeypatch: pytest.MonkeyPatch, released: asyncio.Event | None = None) -> None:
+    async def _fetch(*_args: Any, **_kwargs: Any) -> Any:
+        if released is not None:
+            await released.wait()
+        return MagicMock(body=_REPLAYED_CSV, content_type="text/csv", filename="export.csv", status=200)
+
+    monkeypatch.setattr(cdp_module.file_api, "fetch_file_bytes", _fetch, raising=False)
+
+
+@pytest.mark.parametrize("lands", ["in-the-loop", "after-completed", "after-error", "after-cancel"])
+@pytest.mark.asyncio
+async def test_v3_download_block_saves_as_before_a_replay_admitted_before_its_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lands: str
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    released = asyncio.Event()
+    _replay_fetch(monkeypatch, released)
+    # Admitted while no block held candidates, as a download the block's start URL begins is.
+    in_flight = asyncio.ensure_future(
+        interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    )
+    await asyncio.sleep(0)
+    raised = {"after-error": RuntimeError("loop crashed"), "after-cancel": asyncio.CancelledError()}.get(lands)
+    seen: dict[str, Any] = {}
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        seen["holding_at_entry"] = interceptor._replay_candidate_mode
+        if lands == "in-the-loop":
+            released.set()
+            await in_flight
+            seen.update(held=interceptor.replay_candidates(), landed=sorted(p.name for p in tmp_path.iterdir()))
+        if raised is not None:
+            raise raised
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    with contextlib.suppress(RuntimeError, asyncio.CancelledError):
+        await _run_execute_task_v3_download(
+            monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=interceptor
+        )
+    released.set()
+    await in_flight
+
+    assert seen["holding_at_entry"] is True
+    if lands == "in-the-loop":
+        assert seen["held"] == {} and seen["landed"] == ["export.csv"]
+    assert interceptor.replay_candidates() == {}
+    assert (tmp_path / "export.csv").read_bytes() == _REPLAYED_CSV
+    tally = interceptor.download_tally()
+    assert tally is not None and "capture_failed" not in tally.unsolicited_failures
+
+
+@pytest.mark.parametrize("raised", [RuntimeError("loop crashed"), asyncio.CancelledError()], ids=["error", "cancel"])
+@pytest.mark.asyncio
+async def test_v3_download_block_ends_its_hold_on_every_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: BaseException
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    _replay_fetch(monkeypatch)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        captured["held"] = sorted(interceptor.replay_candidates())
+        raise raised
+
+    captured: dict[str, Any] = {}
+
+    async def _capturing_loop(kwargs: dict[str, Any], run_captured: dict[str, Any]) -> LoopOutcome:
+        try:
+            return await _loop(kwargs, run_captured)
+        finally:
+            captured.update(run_captured)
+
+    with contextlib.suppress(RuntimeError, asyncio.CancelledError):
+        await _run_execute_task_v3_download(
+            monkeypatch, tmp_path, drop_file=False, loop_fn=_capturing_loop, download_monitor=interceptor
+        )
+
+    assert captured["held"] == ["c1"]
+    assert not interceptor._replay_candidate_mode
+    # Ending the hold is not a verdict: the bytes stay held, unsaved, for a later model or the run's end.
+    assert list(interceptor.replay_candidates()) == ["c1"] and list(tmp_path.iterdir()) == []
+    # The browser's later downloads outside a hold save as before.
+    await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    assert (tmp_path / "export.csv").read_bytes() == _REPLAYED_CSV
+
+
+@pytest.mark.asyncio
+async def test_a_block_without_complete_on_download_never_holds_replays(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    _replay_fetch(monkeypatch)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        captured["holding"] = interceptor._replay_candidate_mode
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=interceptor, complete_on_download=False
+    )
+
+    assert captured["holding"] is False
+    assert (tmp_path / "export.csv").read_bytes() == _REPLAYED_CSV
+
+
+@pytest.mark.asyncio
+async def test_v3_download_block_leaves_a_hold_it_did_not_begin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    # The block runner begins the hold before navigating to the start URL, and ends it after the task is cleaned up.
+    interceptor.set_replay_candidate_mode(True)
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=interceptor
+    )
+
+    assert interceptor._replay_candidate_mode is True
+
+
+def _replacement_page(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, cdp_module.CDPDownloadInterceptor]:
+    interceptor = _replay_interceptor(tmp_path, monkeypatch)
+    page = MagicMock(context=interceptor._browser_context)
+    page.context._skyvern_cdp_download_interceptor = interceptor
+    return page, interceptor
+
+
+@pytest.mark.parametrize("raised", [None, asyncio.CancelledError()], ids=["completed", "cancel"])
+@pytest.mark.asyncio
+async def test_v3_download_block_keeps_a_replacement_context_held_through_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: BaseException | None
+) -> None:
+    entry = _replay_interceptor(tmp_path, monkeypatch)
+    _replay_fetch(monkeypatch)
+    page, replacement = _replacement_page(tmp_path, monkeypatch)
+
+    async def _page() -> Any:
+        return page
+
+    captured: dict[str, Any] = {}
+
+    async def _loop(kwargs: dict[str, Any], run_captured: dict[str, Any]) -> LoopOutcome:
+        watch = taskv3_tools.DownloadFailureWatch(_page)
+        await watch.attach()
+        watch.close()
+        await replacement._download_url_directly("https://site.example/export.csv", "export.csv")
+        captured["entry_holding"] = entry._replay_candidate_mode
+        captured["held"] = sorted(replacement.replay_candidates())
+        captured["landed"] = sorted(p.name for p in tmp_path.iterdir())
+        if raised is not None:
+            raise raised
+        return LoopOutcome(status="completed", reason="done", billable_actions=["click"])
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await _run_execute_task_v3_download(
+            monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=entry
+        )
+
+    assert captured["entry_holding"] is True
+    assert captured["held"] == ["c1"] and captured["landed"] == []
+    assert not entry._replay_candidate_mode and not replacement._replay_candidate_mode
+
+
+# A replay its hold admitted, in flight at finish (the original one past the 2.5 s request settle), is offered before
+# the task is written completed; one a download timeout or cancel leaves in flight blocks completion and stays running.
+class _SkewedClock:
+    skew = 0.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.skew
+
+
+@pytest.mark.parametrize("mode", ["original-selected", "replacement-empty", "timed-out", "canceled", "fresh-window"])
+@pytest.mark.asyncio
+async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    release_after = {"original-selected": 2.6, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
+    selection = {"original-selected": ["c1"], "fresh-window": ["c2"]}.get(mode, [])
+    harness = {"timed-out": {"download_timeout": 0.5}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
+    if mode == "fresh-window":
+        harness = {"download_timeout": 2.0}
+    monkeypatch.setattr(agent_module, "time", clock := _SkewedClock())
+    steps = [{}, *([{}] if mode == "fresh-window" else []), {"accept_download_candidates": selection}]
+    entry = _replay_interceptor(tmp_path, monkeypatch)
+    released = asyncio.Event()
+    _replay_fetch(monkeypatch, released)
+    page, replacement = _replacement_page(tmp_path, monkeypatch)
+    target = replacement if mode == "replacement-empty" else entry
+    page.context._skyvern_cdp_download_interceptor = target
+    target._accepting_browser_downloads = True
+    finishes: list[ToolResult] = []
+
+    async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
+        if mode == "replacement-empty":
+            captured["browser_state"].browser_context = page.context
+        watch = taskv3_tools.DownloadFailureWatch(AsyncMock(return_value=page))
+        finish = make_finish_tool(
+            download_settle=kwargs["download_settle"],
+            download_wait=kwargs["download_wait"],
+            download_facts=watch.facts,
+            should_cancel=kwargs["should_cancel"],
+        )
+        await watch.attach()
+        if mode == "canceled":
+            # Canceled only once finish is already waiting on the replay.
+            captured["cancel_checks"]["count"] = -(10**6)
+            asyncio.get_running_loop().call_later(0.5, captured["cancel_checks"].update, {"count": 1})
+        target._schedule_browser_download_handler({"url": "https://site.example/export.csv", "suggestedFilename": "x"})
+        if release_after is not None:
+            asyncio.get_running_loop().call_later(release_after, released.set)
+        for step, chosen in enumerate(steps):
+            if step == 1 and mode == "fresh-window":
+                # Long after the first replay's window, a new one needs 1.2 s of its own 2 s.
+                clock.skew += 10
+                released.clear()
+                target._schedule_browser_download_handler(
+                    {"url": "https://site.example/b.csv", "suggestedFilename": "x"}
+                )
+                asyncio.get_running_loop().call_later(1.2, released.set)
+            finishes.append(await finish.handler({"status": "completed", "reason": "exported", **chosen}))
+            if "Task attempt ended" in finishes[-1].content:
+                break
+        watch.close()
+        return LoopOutcome(status="completed", reason="exported", billable_actions=["click"])
+
+    captured = await _run_execute_task_v3_download(
+        monkeypatch, tmp_path, drop_file=False, loop_fn=_loop, download_monitor=entry, **harness
+    )
+    in_flight = [task for task in target._browser_download_tasks if not task.done()]
+    released.set()
+    await asyncio.gather(*target._browser_download_tasks)
+
+    contents = [f.content for f in finishes]
+    if release_after is None:
+        refusal = "could not record them" if mode == "timed-out" else "was canceled"
+        assert len(contents) == 2 and all(refusal in content for content in contents), contents
+        assert len(in_flight) == 1 and not in_flight[0].cancelled() and list(target.replay_candidates()) == ["c1"]
+        assert list(tmp_path.iterdir()) == []
+        return
+    assert "Download candidate c1 held" in contents[0], (contents, target.replay_candidates())
+    assert len(contents) == len(steps) and "Task attempt ended" in contents[-1], contents
+    assert mode != "fresh-window" or "Download candidate c2 held" in contents[1]
+    assert captured["task"].status == TaskStatus.completed
+    assert [p.read_bytes() for p in tmp_path.iterdir()] == ([_REPLAYED_CSV] if selection else [])
+    assert target.replay_candidates() == {}

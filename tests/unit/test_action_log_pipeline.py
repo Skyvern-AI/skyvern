@@ -16,7 +16,6 @@ from uuid import UUID
 
 import httpx
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
@@ -29,7 +28,6 @@ from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.routes import browser_sessions, routers  # noqa: F401  # register action-log routes
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.library.skyvern import Skyvern
 from skyvern.schemas.action_log import (
@@ -40,6 +38,7 @@ from skyvern.schemas.action_log import (
     ActionLogOutcome,
     project_action_event,
 )
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "org_test"
 SESSION_ID = "pbs_test"
@@ -115,8 +114,7 @@ def _route_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMoc
         create_artifact,
     )
 
-    app = FastAPI()
-    app.include_router(routers.base_router, prefix="/v1")
+    app = shared_route_app(monkeypatch)
     app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id=ORG_ID)
     return TestClient(app), get_session, create_artifact
 

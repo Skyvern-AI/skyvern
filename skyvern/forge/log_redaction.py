@@ -40,6 +40,7 @@ SENSITIVE_HEADERS = {
     "set-cookie",
     "x-api-key",
     "x-marketplace-api-key",
+    "sec-websocket-protocol",
     "x-posthog-attribution",
     "x-copilot-credential-recovery-token",
     "x-skyvern-signature",
@@ -108,6 +109,10 @@ _ARTIFACT_CONTENT_URL_QUERY_RE = re.compile(r"(/v1/artifacts/[^/\s\"'<>]+/conten
 # pass `?token=Bearer%20<jwt>` as a query string. The token class spans base64url,
 # standard base64 (`+ / =`) and opaque values (`~`), so a credential is consumed whole.
 _BEARER_TOKEN_RE = re.compile(r"(?i)(token=)(?:Bearer(?:%20|\s+))?[A-Za-z0-9._%~+/=-]+")
+# Deprecated `?apikey=<key>` streaming query credential.
+_APIKEY_QUERY_RE = re.compile(r"(?i)(\bapikey=)[A-Za-z0-9._%~+/=-]+")
+# Streaming credentials carried as `Sec-WebSocket-Protocol` items: `bearer.<jwt>` / `apikey.<key>`.
+_WS_PROTOCOL_CREDENTIAL_RE = re.compile(r"(?i)\b(bearer|apikey)\.[A-Za-z0-9._~+/=-]+")
 # `Authorization: Bearer <token>` / `Proxy-Authorization: Bearer <token>` header
 # values (including dict-repr forms like `'authorization': 'Bearer ...'`). The whole
 # credential after the scheme is dropped regardless of its shape: in a credential
@@ -180,13 +185,18 @@ def strip_artifact_url_query(value: str) -> str:
 def redact_bearer_tokens_in_text(value: str) -> str:
     """Redact Bearer credentials from a single string.
 
-    Covers `?token=Bearer%20<jwt>` query strings, `Authorization: Bearer <token>`
+    Covers `?token=Bearer%20<jwt>` and `?apikey=<key>` query strings, `bearer.<jwt>` / `apikey.<key>`
+    WebSocket subprotocol items, `Authorization: Bearer <token>`
     (and `Proxy-Authorization`) header values of any token shape, and bare
     `Bearer <token>` runs in exception / free text (guarded against prose).
     """
     lowered = value.lower()
     if "token=" in lowered:
         value = _BEARER_TOKEN_RE.sub(r"\1<redacted>", value)
+    if "apikey=" in lowered:
+        value = _APIKEY_QUERY_RE.sub(r"\1<redacted>", value)
+    if "bearer." in lowered or "apikey." in lowered:
+        value = _WS_PROTOCOL_CREDENTIAL_RE.sub(r"\1.<redacted>", value)
     if "authorization" in lowered:
         value = _AUTH_HEADER_BEARER_RE.sub(r"\1Bearer <redacted>", value)
     if "bearer" in lowered:

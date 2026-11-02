@@ -28,7 +28,7 @@ from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext, brow
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
-from tests.unit.conftest import DriverReplyProbe, stalling_async_mock
+from tests.unit.conftest import DriverReplyProbe, settle_or_fail, stalling_async_mock
 from tests.unit.forge_log_capture import capture_runtime_logs
 
 
@@ -184,20 +184,27 @@ async def test_an_abandoned_capture_leaves_the_driver_no_unretrieved_reply(page:
     capture = functools.partial(
         SkyvernFrame.take_scrolling_screenshot, page, mode=ScreenshotMode.LITE, scrolling_number=1
     )
-    if stop == "external_cancel":
-        task = asyncio.create_task(capture(timeout=5000))
-        await asyncio.wait_for(probe.called.wait(), timeout=2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    elif stop == "caller_deadline":
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.025):
-                await capture(timeout=5000)
-    else:
-        with pytest.raises(TimeoutError):
-            await capture(timeout=25)
-    assert not await probe.orphaned_reply()
+
+    # Checked in the same task, before settle_or_fail yields, so a call the capture cancelled without awaiting
+    # has not yet abandoned its reply.
+    async def abandon_the_capture() -> None:
+        if stop == "external_cancel":
+            task = asyncio.create_task(capture(timeout=5000))
+            await asyncio.wait_for(probe.called.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif stop == "caller_deadline":
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.025):
+                    await capture(timeout=5000)
+        else:
+            with pytest.raises(TimeoutError):
+                await capture(timeout=25)
+        assert not probe.orphaned_reply()
+
+    task, _ = await settle_or_fail(abandon_the_capture())
+    task.result()
 
 
 @pytest.mark.asyncio

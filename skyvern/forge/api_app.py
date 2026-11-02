@@ -62,13 +62,13 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     regenerate_local_api_key,
 )
 from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
-from skyvern.services.browser_recording.session_registry import interpretation_registry
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
     start_temp_artifact_sweep,
     stop_cleanup_scheduler,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.hosted_driver_sweep import start_hosted_driver_sweep, stop_hosted_driver_sweep
 from skyvern.services.orphaned_run_reaper import reap_orphaned_runs_once
 from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (
@@ -155,7 +155,9 @@ def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
     fastapi_app.add_middleware(
         CORSMiddleware,
         **cors_middleware_kwargs(
-            settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX, expose_headers=["X-Next-Cursor", "Retry-After"]
+            settings.ALLOWED_ORIGINS,
+            settings.ALLOWED_ORIGIN_REGEX,
+            expose_headers=["X-Next-Cursor", "Retry-After", "X-Has-More"],
         ),
     )
 
@@ -199,6 +201,19 @@ class ExecutionDatePlugin(Plugin):
         return datetime.now()
 
 
+def strip_internal_schema_properties(openapi_schema: dict) -> None:
+    """Drop component properties marked ``x-internal`` so they stay out of the public docs and the SDK."""
+    for schema in openapi_schema.get("components", {}).get("schemas", {}).values():
+        properties = schema.get("properties")
+        if not properties:
+            continue
+        internal = [name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")]
+        for name in internal:
+            del properties[name]
+        if internal and "required" in schema:
+            schema["required"] = [name for name in schema["required"] if name not in internal]
+
+
 def custom_openapi(app: FastAPI) -> dict:
     if app.openapi_schema:
         return app.openapi_schema
@@ -213,6 +228,7 @@ def custom_openapi(app: FastAPI) -> dict:
         {"url": "https://api-staging.skyvern.com", "x-fern-server-name": "Staging"},
         {"url": "http://localhost:8000", "x-fern-server-name": "Local"},
     ]
+    strip_internal_schema_properties(openapi_schema)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
@@ -420,6 +436,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         LOG.info("Cleanup scheduler started")
 
     start_temp_artifact_sweep()
+    start_hosted_driver_sweep()
 
     workflow_schedule_task = start_workflow_schedule_scheduler()
     if workflow_schedule_task:
@@ -465,7 +482,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
     await stop_temp_artifact_sweep()
-    await interpretation_registry.stop_all()
+    await stop_hosted_driver_sweep()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
@@ -502,7 +519,7 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
-    forge_app_instance = start_forge_app()
+    forge_app_instance = start_forge_app(load_api_modules=True)
 
     assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)
@@ -551,9 +568,8 @@ def create_api_app() -> FastAPI:
         include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
-    # Twilio SMS 2FA: public inbound receiver (secret-URL + signature auth inside
-    # the handler) and the org-scoped integration management routes. Same
-    # dual-prefix + include_in_schema=False pattern as the OAuth routers above.
+    # Inbound SMS uses secret-URL and signature authentication. Only the canonical
+    # organization-scoped integration routes appear in the public schema.
     fastapi_app.include_router(
         sms_inbound_router, prefix="/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
     )
@@ -563,7 +579,6 @@ def create_api_app() -> FastAPI:
     fastapi_app.include_router(
         twilio_integration_router,
         prefix="/v1/integrations/twilio",
-        include_in_schema=False,
         dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
     )
     fastapi_app.include_router(
@@ -628,7 +643,9 @@ def create_api_app() -> FastAPI:
             # Both validation messages and unknown field names can contain reported contact details.
             return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
         sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
-        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes):
+        if path != "/v1/agent_feedback" and not any(
+            path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes
+        ):
             return await request_validation_exception_handler(request, exc)
 
         return JSONResponse(

@@ -32,6 +32,8 @@ from skyvern.schemas.workflows import BlockType, WorkflowDefinitionYAML
 from skyvern.services import script_service
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.real_browser_manager import RealBrowserManager
+from tests.unit._task_block_fakes import lost_browser_state, run_bound_browser_state
 from tests.unit._workflow_block_engine_fakes import FakeExperimentationProvider, resolve_arm
 
 MODULE = "skyvern.services.script_service"
@@ -127,6 +129,71 @@ async def test_fallback_inherits_engine_from_run_bound_definition() -> None:
     app = await _run_fallback("my_block", workflow)
 
     assert _fallback_task_block(app).engine == RunEngine.skyvern_v3
+
+
+@pytest.mark.asyncio
+async def test_fallback_does_not_run_the_agent_after_the_browser_was_lost() -> None:
+    app = _make_app(_make_workflow([_make_task_block("my_block")]))
+    app.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=lost_browser_state("wr_test"))
+    update_block = AsyncMock()
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=_make_context()),
+        patch(f"{MODULE}._update_workflow_block", update_block),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION,
+            cache_key="my_block",
+            prompt="do the thing",
+            error=RuntimeError("Target page, context or browser has been closed"),
+            workflow_run_block_id="wrb_script",
+        )
+
+    app.agent.execute_step.assert_not_awaited()
+    assert update_block.await_args.kwargs["error_codes"] == ["browser_connection_lost"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held_by", [None, "wr_child"])
+async def test_adaptive_fallback_capture_does_not_acquire_a_browser(held_by: str | None) -> None:
+    workflow = _make_workflow([_make_task_block("my_block")]).model_copy(update={"run_with": "code", "code_version": 2})
+    app = _make_app(workflow)
+    app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(
+        return_value=MagicMock(
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            parent_workflow_run_id=None,
+            browser_profile_id=None,
+            ai_fallback=True,
+            run_with=None,
+        )
+    )
+    app.DATABASE.scripts.create_fallback_episode = AsyncMock(return_value=SimpleNamespace(episode_id="ep_test"))
+    app.DATABASE.tasks.create_step = AsyncMock(side_effect=RuntimeError("stop after the capture"))
+    manager = RealBrowserManager()
+    if held_by is not None:
+        # A finished synchronous child still holds the run's shared browser.
+        state, _ = run_bound_browser_state(held_by)
+        manager.pages["wr_test"] = state
+    pages_before = dict(manager.pages)
+    app.BROWSER_MANAGER = manager
+    context = _make_context()
+    context.workflow_permanent_id = "wpid_test"
+    with (
+        patch(f"{MODULE}.app", app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=context),
+        patch.object(manager, "_create_browser_state", new=AsyncMock()) as mock_create,
+        pytest.raises(RuntimeError, match="stop after the capture"),
+    ):
+        await script_service._fallback_to_ai_run(
+            block_type=BlockType.NAVIGATION, cache_key="my_block", prompt="do the thing", error=RuntimeError("failed")
+        )
+
+    app.DATABASE.scripts.create_fallback_episode.assert_awaited_once()
+    mock_create.assert_not_awaited()
+    assert manager.pages == pages_before
+    if held_by is not None:
+        assert manager.pages["wr_test"].runtime_event_context.workflow_run_id == held_by
 
 
 @pytest.mark.asyncio

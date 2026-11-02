@@ -6,8 +6,8 @@ import hashlib
 import os
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
-from dataclasses import dataclass, field
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager, nullcontext
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
 
@@ -17,6 +17,7 @@ from cachetools import TTLCache
 from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
 
+from skyvern import analytics
 from skyvern.config import CodeBlockMode, settings
 from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem_with_tier
@@ -61,8 +62,9 @@ from skyvern.forge.sdk.schemas.credentials import (
     NonEmptyPasswordCredential,
     SecretCredential,
 )
-from skyvern.forge.sdk.schemas.feedback import FeedbackEvent
+from skyvern.forge.sdk.schemas.feedback import AgentFeedback, FeedbackEvent
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import HarEvidence, HarEvidenceAvailability
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskStatus
 from skyvern.forge.sdk.services import (
@@ -72,19 +74,22 @@ from skyvern.forge.sdk.services import (
     microsoft_oauth_service,
     sftp_service,
 )
+from skyvern.forge.sdk.services.audit_events import AuditEvent
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityResolution,
     BearerIdentityStatus,
     RequestPrincipal,
     get_request_principal,
+    human_user_id,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.run_enums import RunEngine, RunType
-from skyvern.schemas.workflows import BlockResult, FileStorageType, FileUploadDestination
+from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
 from skyvern.services.otp_email import EmailOTPSearchError, EmailOTPVerificationContext, build_email_otp_sources
+from skyvern.services.webhook_delivery import WebhookDeliveryAttempts, bound_webhook_request
 from skyvern.services.workflow_run_group_service import schedule_advance_after_terminal
 from skyvern.utils.email_validation import normalize_identifier_if_email
 from skyvern.utils.url_validators import pinned_ip_client
@@ -93,6 +98,7 @@ from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelectio
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
 from skyvern.webeye.utils.challenge_signature import ChallengeVendor
+from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveRecord
 from skyvern.webeye.utils.dom import SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame, take_element_screenshot
 
@@ -102,6 +108,7 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
     from skyvern.forge.sdk.db.models import FolderModel
+    from skyvern.forge.sdk.integrations.catalog import AccountsById, IntegrationEntry
     from skyvern.forge.sdk.schemas.totp_codes import OTPType
     from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
     from skyvern.forge.sdk.workflow.code_block_authorized_files import (
@@ -114,27 +121,15 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.workflow.models.tags import CallerType
     from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
     from skyvern.forge.taskv3.answer_basis_audit import AnswerBasisAudit
+    from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission
     from skyvern.forge.taskv3.loop import ToolSpec
     from skyvern.forge.taskv3.tools import PageProvider
     from skyvern.schemas.workflows import WorkflowStatus
     from skyvern.services.otp_service import OTPValue
-    from skyvern.webeye.browser_artifacts import DownloadBinding
+    from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
+    from skyvern.webeye.browser_state import BrowserState
 
 LOG = structlog.get_logger()
-
-
-@dataclass(frozen=True)
-class AuditEvent:
-    """Resource identifiers and field names for an audited write; never secrets or request bodies."""
-
-    organization_id: str
-    action: str
-    resource_type: str
-    resource_id: str | None
-    changed_fields: tuple[str, ...] = ()
-    related_resource_ids: tuple[str, ...] = ()
-    auth_kind: str | None = None
-    oauth_client_id: str | None = None
 
 
 async def record_request_audit_event(
@@ -313,6 +308,8 @@ class CodeBlockEngineFailure:
     # Bare native worker exception class for operation attribution, so secure events are comparable
     # to inline ones; distinct from the healing-facing exception_class above.
     native_exception_class: str | None = None
+    # Decided by the executor from the runner's typed code, so it survives when redaction empties the reason.
+    failure_kind: CodeBlockFailureKind | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -985,6 +982,21 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    async def ensure_email_forwarding_available(
+        self, organization_id: str | None = None, *, fresh: bool = True
+    ) -> bool:
+        """Cloud may hide OSS email-forwarding routes until its ingress is configured."""
+        return True
+
+    def report_download_failure(self, reason: str, *, failure_key: str | None = None) -> None:
+        return None
+
+    def resolve_download_failure(self, failure_key: str) -> None:
+        return None
+
+    def should_log_request_bodies(self, organization_id: str) -> bool:
+        return True
+
     async def accessible_workflow_folder_ids(self, principal: RequestPrincipal | None) -> set[str] | None:
         """Return visible folder IDs for Cloud request lists; OSS keeps organization-wide visibility."""
         return None
@@ -1028,6 +1040,18 @@ class AgentFunction:
     ) -> None:
         """Cloud raises 403 when a workflow folder denies the action; OSS has no folder ACLs."""
         return None
+
+    async def enforce_workflow_delete(
+        self, principal: RequestPrincipal | None, workflow_permanent_id: str, organization_id: str
+    ) -> tuple[str, str | None] | None:
+        """Cloud enforces RBAC and folder permissions for workflow deletion; OSS has no RBAC policy."""
+        return None
+
+    async def enforce_workflow_deletes(
+        self, principal: RequestPrincipal | None, workflow_permanent_ids: set[str], organization_id: str
+    ) -> None:
+        for workflow_permanent_id in workflow_permanent_ids:
+            await self.enforce_workflow_delete(principal, workflow_permanent_id, organization_id)
 
     async def enforce_folder_access_for_references(
         self, principal: RequestPrincipal | None, action: str, payload: Mapping[str, object]
@@ -1117,7 +1141,9 @@ class AgentFunction:
     ) -> str | None:
         return None
 
-    async def enforce_request_authorization(self, principal: RequestPrincipal | None, action: str) -> None:
+    async def enforce_request_authorization(
+        self, principal: RequestPrincipal | None, action: str, *, always_enforce: bool = False
+    ) -> None:
         return None
 
     async def enforce_request_role(
@@ -1155,6 +1181,15 @@ class AgentFunction:
     async def resolve_billing_tier(self, organization_id: str | None) -> BillingTier:
         return BillingTier.UNKNOWN
 
+    # Whether the error code v3's model chose on finish is stored in place of the post-run page guess. The model is
+    # offered the codes either way. The setting forces it on; where it is off, cloud gates this per organization.
+    async def task_v3_error_code_on_finish(self, *, organization_id: str) -> bool:
+        return settings.TASK_V3_ERROR_CODE_ON_FINISH
+
+    # Whether a v3 run holds its first terminated verdict once for what prevents the task. Read once per run.
+    async def task_v3_justify_hold_enabled(self, *, task_id: str | None, organization_id: str | None) -> bool:
+        return not settings.DISABLE_TASK_V3_JUSTIFY_HOLD
+
     # (text appended to a page-aware v3 run's task message or None, reason logged on the loop-finished line), given
     # the run's payload. OSS supplies no default.
     def task_v3_age_default(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
@@ -1164,8 +1199,13 @@ class AgentFunction:
     def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
+    # The submissions a page-level interceptor in this process held for the browser context, oldest first. Must stay a
+    # local read with no page or CDP call: the finish tool reads it on every non-completed verdict. OSS has none.
+    def task_v3_intercepted_submissions(self, browser_context: Any) -> tuple[InterceptedSubmission, ...]:
+        return ()
+
     # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
-    def task_v3_answer_basis_audit(
+    async def task_v3_answer_basis_audit(
         self, parameters: dict[str, Any] | None, *, goal: str, organization_id: str | None, step: Step | None
     ) -> AnswerBasisAudit | None:
         return None
@@ -1258,6 +1298,12 @@ class AgentFunction:
     async def is_onepassword_instance_default_allowed(self, organization_id: str) -> bool:
         return True
 
+    def get_cloud_integration_entries(self) -> list[IntegrationEntry]:
+        return []
+
+    async def get_cloud_integration_accounts(self, organization_id: str) -> AccountsById:
+        return {}
+
     def onepassword_instance_default_policy_mode(self) -> str:
         return "unrestricted"
 
@@ -1349,6 +1395,10 @@ class AgentFunction:
 
     def get_standard_tier_twin_llm_key(self, llm_key: str | None) -> str | None:
         """Return a standard-tier twin for the given LLM key, or None if no twin exists."""
+        return None
+
+    def get_task_v3_llm_route_treatment_key(self, llm_key: str) -> str | None:
+        """Return the registered key a Task V3 run on ``llm_key`` uses in the LLM route arm's treatment, or None."""
         return None
 
     def get_fallback_llm_key(self, llm_key: str | None) -> str | None:
@@ -1586,6 +1636,9 @@ class AgentFunction:
         OSS has no isolated interpreter to host it."""
         return CopilotBrowserCodeMode.OFF
 
+    def copilot_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
+        return ()
+
     async def open_copilot_browser_code_session(
         self,
         *,
@@ -1793,6 +1846,9 @@ class AgentFunction:
         """
         return None
 
+    async def is_mcp_oauth_token_signed_out(self, user_id: str, issued_at: float) -> bool:
+        return False
+
     def build_mcp_auth_db(self, database_string: str, *, debug_enabled: bool) -> Any:
         """Return the DB instance used by MCP auth middleware.
 
@@ -1842,12 +1898,36 @@ class AgentFunction:
     async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
         """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
+    def is_residential_browser_egress(self, browser_context: BrowserContext) -> bool:
+        return False
+
     async def on_browser_context_acquired(
         self,
         browser_context: Any,
         workflow_run_id: str | None,
     ) -> None:
         return
+
+    def note_browser_relaunch(self, browser_state: BrowserState | None, reason: str) -> None:
+        """The next browser creation in this task replaces an earlier one of the same run. OSS no-op."""
+
+    def on_browser_run_released(self, browser_context: BrowserContext | BrowserArtifacts | None) -> None:
+        """A run released a browser that no other run shares. OSS no-op."""
+
+    async def on_run_har_captured(
+        self,
+        browser_state: BrowserState,
+        har_data: bytes,
+        organization_id: str,
+        workflow_run_id: str | None,
+        task_id: str | None,
+        browser_session_id: str | None,
+        attempt_number: int | None = None,
+    ) -> HarEvidence:
+        """A finished run's redacted HAR is in hand at cleanup, before it is archived. Cleanup awaits this, so an
+        override should do only bounded work, must not raise, and must let cancellation propagate. OSS collects
+        nothing."""
+        return HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
 
     async def validate_step_execution(
         self,
@@ -1880,6 +1960,9 @@ class AgentFunction:
         if not can_execute:
             raise StepUnableToExecuteError(step_id=step.step_id, reason=f"Cannot execute step. Reasons: {reasons}")
 
+    async def get_workflow_run_retry_refusal(self, workflow_run: WorkflowRun) -> str | None:
+        return None
+
     async def before_workflow_run_start(
         self,
         workflow_run: WorkflowRun,
@@ -1891,6 +1974,10 @@ class AgentFunction:
 
     async def should_defer_workflow_browser_creation(self, workflow_run: WorkflowRun) -> bool:
         return False
+
+    def generate_root_workflow_run_id(self, trigger_type: WorkflowRunTriggerType | None) -> str | None:
+        """Return the ID for a new root workflow run; None keeps the default ``wr_`` ID."""
+        return None
 
     async def admit_recipe_step_attempt(
         self,
@@ -2112,6 +2199,12 @@ class AgentFunction:
         """Billing seam for a code block's container task; called only after a successful execution."""
         return
 
+    async def post_agent_step_execution(
+        self, organization_id: str | None, workflow_run_id: str, workflow_run_block_id: str, decisions: int
+    ) -> None:
+        """Billing seam for an agent block's own tool calls, called once per block run; must not raise."""
+        return
+
     async def wait_for_challenge_solver(self, page: Page) -> None:
         """Wait for a cloud-managed challenge solver if one is attached to the page."""
         return None
@@ -2249,6 +2342,23 @@ class AgentFunction:
         """
         return nullcontext()
 
+    def challenge_solve_recording(
+        self,
+        client: str,
+        *,
+        page: Any = None,
+        task: Any = None,
+        organization_id: str | None = None,
+        task_id: str | None = None,
+        workflow_run_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> AbstractContextManager[ChallengeSolveRecord]:
+        """Synchronous scope around one canonical challenge-solve call, yielding the record the call site fills in.
+
+        A deployment schedules its solve-ledger writes here without awaiting them; the scope must never alter the
+        call's result or exception. OSS records nothing."""
+        return nullcontext(ChallengeSolveRecord())
+
     def resolve_captcha_solver_extension_timeout(self, page: Page | RecordingPage, default_timeout: float) -> float:
         """The wait budget for the direct ladder's solver-extension arm, resolved inside the solver scope.
 
@@ -2328,28 +2438,53 @@ class AgentFunction:
         connection_id: str | None = None,
         initiating_user_id: str | None = None,
         custody_mode: str | None = None,
+        *,
+        scope_profile: str | None = None,
+        principal: RequestPrincipal | None = None,
+        force_refresh: bool = False,
     ) -> str | None:
+        del force_refresh  # The SDK implementation has no access-token cache.
+        powerbi_profile = microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ
+        if scope_profile not in (
+            None,
+            microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_OUTLOOK_MAIL,
+            powerbi_profile,
+        ):
+            return None
+        is_powerbi = scope_profile == powerbi_profile
+        authenticated_user_id = human_user_id(principal, organization_id) if is_powerbi else None
+        if is_powerbi and (
+            authenticated_user_id is None or (connection_id is not None and connection_id != credential_id)
+        ):
+            return None
+        scopes_to_require = list(required_scopes or [])
+        if is_powerbi and not microsoft_oauth_service.has_required_scopes(scopes_to_require, ["Dataset.Read.All"]):
+            scopes_to_require.append("Dataset.Read.All")
         try:
             secrets = await microsoft_oauth_service.load_credential_secrets(
                 organization_id=organization_id,
                 credential_id=credential_id,
+                scope_profile=scope_profile,
+                authenticated_user_id=authenticated_user_id,
             )
-            if required_scopes and not microsoft_oauth_service.has_required_scopes(secrets.scopes, required_scopes):
+            if scopes_to_require and not microsoft_oauth_service.has_required_scopes(secrets.scopes, scopes_to_require):
                 LOG.info(
                     "Microsoft OAuth credential missing required scopes",
                     organization_id=organization_id,
                     credential_id=credential_id,
-                    required_scopes=required_scopes,
+                    required_scopes=scopes_to_require,
                 )
                 return None
             return await microsoft_oauth_service.refresh_and_rotate(
                 organization_id=organization_id,
                 credential_id=credential_id,
                 credential_secrets=secrets,
-                connection_id=connection_id,
-                initiating_user_id=initiating_user_id,
-                custody_mode=custody_mode,
+                connection_id=None if is_powerbi else connection_id,
+                initiating_user_id=None if is_powerbi else initiating_user_id,
+                custody_mode=None if is_powerbi else custody_mode,
             )
+        except microsoft_oauth_service.MicrosoftOAuthAccessDenied:
+            return None
         except Exception:
             LOG.exception(
                 "Failed to get Microsoft credentials",
@@ -2357,6 +2492,23 @@ class AgentFunction:
                 credential_id=credential_id,
             )
             return None
+
+    async def execute_powerbi_query_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        dataset_id: str,
+        query: str,
+        max_rows: int = 1_000,
+    ) -> list[dict[str, object]]:
+        """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
+
+    async def ensure_powerbi_queries_available(self) -> None:
+        raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
     async def get_google_workspace_credentials(
         self,
@@ -2829,16 +2981,18 @@ class AgentFunction:
         organization_id: str | None = None,
         run_id: str | None = None,
         resolved_ips: tuple[str, ...] | None = None,
+        attempts: WebhookDeliveryAttempts | None = None,
     ) -> httpx.Response:
         """Deliver a webhook POST request to *url*.
 
         Returns the upstream ``httpx.Response``.  Cloud override routes NAT-org
-        traffic through the egress proxy so it egresses from a static IP.
+        traffic through the egress proxy so it egresses from a static IP, and
+        records the proxy-hop connects it retries on ``attempts``.
 
         ``resolved_ips`` pins the connection to addresses the caller already validated,
         closing the DNS-rebinding window between validation and connect.
         """
-        async with pinned_ip_client(resolved_ips) as client:
+        async with bound_webhook_request(attempts, timeout_seconds), pinned_ip_client(resolved_ips) as client:
             return await client.post(
                 url,
                 content=payload,
@@ -2996,6 +3150,15 @@ class AgentFunction:
         del organization_id
         return None if settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE else False
 
+    async def copilot_agent_step_enabled(self, organization_id: str | None) -> bool:
+        del organization_id
+        return False
+
+    async def workflow_doc_editor_enabled(self, organization_id: str, user_id: str | None) -> bool:
+        """Whether this person has the Doc editor, which decides if notes reach Copilot and PDF import."""
+        del organization_id, user_id
+        return False
+
     async def _resolve_copilot_requested_code_block_mode(
         self,
         organization_id: str | None,
@@ -3033,7 +3196,18 @@ class AgentFunction:
         config = self.get_copilot_config(effective_code_block_mode)
         if config is None:
             return None
-        config.authoring_capability = authoring_capability_for_request(code_block_mode, has_code_block_access)
+        try:
+            agent_step_enabled = await self.copilot_agent_step_enabled(organization_id)
+        except Exception:
+            LOG.warning(
+                "Failed to resolve Copilot agent_step access; leaving it unavailable",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+            agent_step_enabled = False
+        config.authoring_capability = replace(
+            authoring_capability_for_request(code_block_mode, has_code_block_access), agent_step=agent_step_enabled
+        )
         config.code_block_available = has_code_block_access
         config.effective_code_block_mode = effective_code_block_mode
         return config
@@ -3346,3 +3520,20 @@ class AgentFunction:
     # cloud overrides to fan the event out (Slack, product analytics).
     async def on_feedback_submitted(self, *, organization: Organization, event: FeedbackEvent) -> None:
         return None
+
+    async def on_agent_feedback_submitted(
+        self, *, organization: Organization, feedback: AgentFeedback, redacted: bool
+    ) -> None:
+        analytics.capture(
+            "mcp_agent_feedback_submitted",
+            data={
+                "agent_feedback_id": feedback.agent_feedback_id,
+                "category": feedback.category,
+                "severity": feedback.severity or "unspecified",
+                "has_tool_name": bool(feedback.tool_name),
+                "has_details": bool(feedback.details),
+                "redacted": redacted,
+            },
+            api_key=settings.MCP_POSTHOG_PROJECT_API_KEY,
+            host=settings.MCP_POSTHOG_PROJECT_HOST,
+        )

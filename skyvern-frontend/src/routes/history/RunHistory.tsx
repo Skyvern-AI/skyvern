@@ -81,7 +81,7 @@ import { WorkflowCreatorLabel } from "@/routes/workflows/components/WorkflowCrea
 import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
-import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { usePostHogFeatureFlagVariantKey as useFeatureFlagVariantKey } from "@/hooks/usePostHogFeatureFlag";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
 import { useRunTagsBatchQuery } from "@/routes/tasks/hooks/useRunTagsBatchQuery";
 import { useRunsHealSummaryBatchQuery } from "@/routes/workflows/hooks/useRunsHealSummaryBatchQuery";

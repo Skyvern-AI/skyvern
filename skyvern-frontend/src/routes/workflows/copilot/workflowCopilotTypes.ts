@@ -4,32 +4,11 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai" | "product";
-/**
- * Mirrors `RecordingEvidencePacket` in skyvern/services/browser_recording/evidence.py.
- * The frontend only counts actions; the rest is opaque payload it forwards verbatim.
- */
-export type RecordingEvidencePacket = {
-  schema_version: number;
-  recording_id?: string | null;
-  recording: Record<string, unknown> & {
-    recording_attempt_id?: string;
-    browser_session_id?: string;
-  };
-  actions: Array<Record<string, unknown>>;
-  deleted_action_ids: Array<string>;
-  truncated_action_count: number;
-  provenance: Record<string, string | number>;
+export type CopilotProductAction = {
+  kind: "diagnose_run";
+  workflowRunId: string;
+  nonce: string;
 };
-export type CopilotProductAction =
-  | {
-      kind: "diagnose_run";
-      workflowRunId: string;
-      nonce: string;
-    }
-  | {
-      kind: "refine_recording";
-      nonce: string;
-    };
 
 export interface WorkflowCopilotDemonstrationInsertion {
   after_label: string | null;
@@ -221,6 +200,8 @@ export interface WorkflowCopilotChatRequest {
   workflow_yaml: string;
   mode?: "build" | null;
   code_block?: boolean | null;
+  /** Internal capability: send only when the document editor is active. */
+  doc_editor_enabled?: boolean;
   cancel_token?: string;
   idempotency_key?: string | null;
   target_block_label?: string | null;
@@ -228,20 +209,8 @@ export interface WorkflowCopilotChatRequest {
   // sent — context for "this block" references, never a directive.
   selected_block_label?: string | null;
   keep_pending_proposal?: boolean;
-  product_action?:
-    | "test_end_to_end"
-    | "diagnose_run"
-    | "refine_recording"
-    | "demonstrate"
-    | null;
+  product_action?: "test_end_to_end" | "diagnose_run" | "demonstrate" | null;
   demonstration_id?: string | null;
-  // Required by the refine_recording action; reaches the model as untrusted
-  // evidence, never as the turn's message.
-  recording_evidence?: RecordingEvidencePacket | null;
-  // The server attaches its own redacted projection of the live recording.
-  recording_in_progress?: boolean;
-  // Panel deletions the server applies to its own draft; no step content is sent.
-  recording_deleted_step_ids?: Array<string>;
   // Opt-in: only clients that can render the credential_required frame set
   // this, so the backend never pauses a turn a client would silently drop.
   supports_credential_pause?: boolean;
@@ -251,6 +220,8 @@ export interface WorkflowCopilotChatRequest {
   supports_question_tool?: boolean;
   supports_account_group_card?: boolean;
   supports_credential_delete_card?: boolean;
+  supports_google_setup_card?: boolean;
+  supports_demonstration_offer?: boolean;
 }
 
 export type WorkflowCopilotCancelSource = "escape_key" | "stop_button" | "api";
@@ -530,6 +501,11 @@ export interface WorkflowCopilotTitleUpdate {
   timestamp: string;
 }
 
+export type CredentialBinding =
+  | "saved_workflow"
+  | "matched_by_saved_url"
+  | "not_bound";
+
 // Mid-build pause frame: the turn stays open (SSE alive) while the client
 // surfaces a credential card. reason stays a raw string here — CredentialCard
 // tolerates unknown reason tokens, so a newer backend can't break the wiring.
@@ -551,6 +527,8 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   // The live browser the user may sign in to themselves; absent when the card does not offer it.
   sign_in_browser_session_id?: string | null;
   signing_in?: boolean;
+  // Set on update cards only: how the credential they name is bound.
+  credential_binding?: CredentialBinding | null;
   // Present on a card that offers Generate and save; never carries a password.
   registration?: {
     username: string;
@@ -579,9 +557,13 @@ export interface WorkflowCopilotDemonstrationActionUpdate {
     | "type_text"
     | "select_option"
     | "press_key"
+    | "drag"
     | "navigate_browser"
     | "upload_attached_file"
     | "fill_credential_field";
+  // Present only on an upload the recorder attached; a skipped file request has none.
+  file_id?: string;
+  filename?: string;
 }
 
 export interface WorkflowCopilotDemonstrationSensitiveFieldUpdate {
@@ -589,6 +571,11 @@ export interface WorkflowCopilotDemonstrationSensitiveFieldUpdate {
   field: "password" | "totp" | "other";
   selector: string;
   url: string;
+}
+
+export interface WorkflowCopilotDemonstrationFileRequestedUpdate {
+  type: "demonstration_file_requested";
+  label: string;
 }
 
 export interface WorkflowCopilotDemonstrationNoticeUpdate {
@@ -613,22 +600,25 @@ export interface WorkflowCopilotDemonstrationStoppedUpdate {
 
 export interface WorkflowCopilotDemonstrationControlRequest {
   demonstration_id: string;
-  action: "navigate" | "fill_credential" | "stop" | "cancel";
+  action: "navigate" | "fill_credential" | "upload_file" | "stop" | "cancel";
   url?: string | null;
   selector?: string | null;
   credential_id?: string | null;
   field?: "password" | "totp" | null;
+  stop_reason?: "browser_gone" | null;
 }
 
 export interface WorkflowCopilotDemonstrationControlResult {
   seq: number;
   action_count?: number | null;
+  file_id?: string | null;
 }
 
 export type WorkflowCopilotDemonstrationUpdate =
   | WorkflowCopilotDemonstrationStartedUpdate
   | WorkflowCopilotDemonstrationActionUpdate
   | WorkflowCopilotDemonstrationSensitiveFieldUpdate
+  | WorkflowCopilotDemonstrationFileRequestedUpdate
   | WorkflowCopilotDemonstrationNoticeUpdate
   | WorkflowCopilotDemonstrationStoppedUpdate;
 
@@ -713,7 +703,23 @@ export interface WorkflowCopilotToolResultUpdate {
   // A successful run_browser_code call's operations as display phrases.
   browser_steps?: string[] | null;
   detail?: string | null;
+  workflow_run_id?: string | null;
+  // Keys and sources only; values are read from the run itself.
+  test_inputs?: CopilotTestInput[] | null;
   timestamp?: string | null;
+}
+
+export type CopilotTestInputSource =
+  | "copilot"
+  | "page"
+  | "earlier_run"
+  | "default"
+  | "placeholder";
+
+export interface CopilotTestInput {
+  key: string;
+  source: CopilotTestInputSource;
+  sourceRunId?: string;
 }
 
 export interface WorkflowCopilotCondensingUpdate {
@@ -749,6 +755,7 @@ export interface WorkflowCopilotBlockProgressUpdate {
 export interface WorkflowCopilotRunStartedUpdate {
   type: "run_started";
   workflow_run_id: string;
+  skipped_prefix?: SkippedPrefixBlock[];
   timestamp: string;
 }
 
@@ -759,6 +766,12 @@ export type WorkflowCopilotRunOutcomeVerdict =
   | "not_evaluated";
 
 export type RunOutcomeRole = "recorded" | "adjudicated" | "interim_build_test";
+
+export interface SkippedPrefixBlock {
+  label: string;
+  kind: "reused" | "not_run";
+  sourceWorkflowRunId?: string;
+}
 
 export interface WorkflowCopilotRunOutcomeUpdate {
   type: "run_outcome";

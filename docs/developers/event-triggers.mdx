@@ -33,7 +33,7 @@ Mappings use [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901). 
 }
 ```
 
-map `order_id` to `/order/id` and `customer_email` to `/order/customer/email`. Pointers must start with `/`; in a key name, encode `~` as `~0` and `/` as `~1`.
+map `order_id` to `/order/id` and `customer_email` to `/order/customer/email`. Pointers must start with `/`; in a key name, encode `~` as `~0` and `/` as `~1`. A numeric segment indexes into an array, so `/items/0/sku` reads the first item's `sku`. A pointer that does not resolve against the body rejects the delivery with the reason `mapping_path_missing`.
 
 ## Send a signed request
 

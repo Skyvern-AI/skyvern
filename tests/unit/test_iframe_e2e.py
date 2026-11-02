@@ -18,7 +18,10 @@ import pytest_asyncio
 from playwright.async_api import async_playwright
 
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
+from skyvern.webeye.scraper.scraper import get_interactable_element_tree
 
 
 def _has_playwright_browser() -> bool:
@@ -196,6 +199,42 @@ class TestFrameListE2E:
         names = [f["name"] for f in frames]
         assert "payment" in names
         assert "empty" in names
+
+
+_MAIN_FRAME_IDS_JS = "(nodes) => nodes.map((node) => node.getAttribute('unique_id'))"
+
+
+def _tree_ids(nodes: list[dict]) -> list[str]:
+    return [id_ for node in nodes for id_ in [node.get("id"), *_tree_ids(node.get("children") or [])] if id_]
+
+
+class TestScrapedElementIdsE2E:
+    @pytest.mark.asyncio
+    async def test_a_frame_holding_copies_of_tagged_main_frame_nodes_gives_each_copy_its_own_id(
+        self, browser_page: _TestPage
+    ) -> None:
+        page = browser_page.page
+        with skyvern_context.scoped(SkyvernContext()):
+            await get_interactable_element_tree(page)
+            main_frame_ids = await page.eval_on_selector_all("[unique_id]", _MAIN_FRAME_IDS_JS)
+            # The copies include an iframe element, the shape that used to loop the frame chain.
+            await page.evaluate(
+                """() => {
+                    const frameDocument = document.getElementById("payment-frame").contentDocument;
+                    for (const selector of ["#main-input", "#main-btn", "#empty-frame"]) {
+                        frameDocument.body.append(document.querySelector(selector).cloneNode(true));
+                    }
+                }"""
+            )
+            await page.frame_locator("#payment-frame").frame_locator("#empty-frame").locator("p").wait_for()
+            elements, element_tree, _ = await get_interactable_element_tree(page)
+
+        element_ids = [element["id"] for element in elements]
+        tree_ids = _tree_ids(element_tree)
+        assert len(element_ids) == len(set(element_ids))
+        assert len(tree_ids) == len(set(tree_ids))
+        assert set(main_frame_ids) <= set(element_ids)
+        assert await page.eval_on_selector_all("[unique_id]", _MAIN_FRAME_IDS_JS) == main_frame_ids
 
 
 # ---------------------------------------------------------------------------

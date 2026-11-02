@@ -28,13 +28,30 @@ import pytest
 import pytest_asyncio
 from playwright.async_api import async_playwright
 
-from skyvern.webeye.actions.handler import _save_adopted_session_download
+from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
+from skyvern.webeye.actions.handler import _save_adopted_session_download as _save_adopted_session_download_impl
 from skyvern.webeye.utils.page import (
     SkyvernFrame,
     install_blob_url_retention,
     probe_blob_action_freshness,
     teardown_blob_url_retention,
 )
+
+
+async def _save_adopted_session_download(
+    download: Any, page: Any, download_dir: Path, *, workflow_run_id: str
+) -> Path | None:
+    # Production passes the run-scoped authority rebound onto the adopted session's interceptor. Blob downloads
+    # return before the guarded URL re-fetch, the only reader of the authorizer, scope and headers.
+    return await _save_adopted_session_download_impl(
+        download,
+        page,
+        download_dir,
+        authorize_request_hop=RunScopedRedirectHopAuthorizer(workflow_run_id),
+        request_headers={},
+        download_scope=workflow_run_id,
+        workflow_run_id=workflow_run_id,
+    )
 
 
 def _has_playwright_browser() -> bool:

@@ -10,9 +10,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from playwright.async_api import Page
 
+from skyvern.cli.mcp_tools import blocks
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
+    NOTES_KNOWLEDGE_TOPIC,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
     _parse_knowledge_topics,
     skyvern_block_schema,
@@ -22,17 +25,31 @@ from skyvern.cli.mcp_tools.blocks import (
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    _LOCATOR_ACTION_MAP,
+    _LOCATOR_FACTORY_METHODS,
+    _PAGE_ACTION_MAP,
+)
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
 
 @pytest.mark.asyncio
 async def test_workflow_knowledge_lists_available_topics_without_returning_the_document() -> None:
     result = await skyvern_workflow_knowledge()
+    public_topics = [topic for topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS if topic != NOTES_KNOWLEDGE_TOPIC]
 
     assert result["ok"] is True
-    assert result["data"]["topics"] == [*WORKFLOW_KNOWLEDGE_TOPIC_HEADERS, CODE_BLOCK_RUNTIME_TOPIC]
-    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS) + 1
+    assert result["data"]["topics"] == [*public_topics, CODE_BLOCK_RUNTIME_TOPIC]
+    assert result["data"]["count"] == len(public_topics) + 1
     assert "A Skyvern workflow is defined" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_hides_doc_editor_topic_from_public_mcp() -> None:
+    result = await skyvern_workflow_knowledge(topics=[NOTES_KNOWLEDGE_TOPIC])
+
+    assert result["ok"] is False
+    assert NOTES_KNOWLEDGE_TOPIC not in result["error"]["hint"]
 
 
 @pytest.mark.asyncio
@@ -50,6 +67,27 @@ async def test_workflow_knowledge_renders_the_code_block_runtime_names_from_the_
     assert "- html: escape" in content
     assert "{{current_date}}" in content
     assert "solve_captcha" in content
+
+    def segments(prefix: str) -> list[set[str]]:
+        line = next((line for line in content.splitlines() if line.startswith(prefix)), None)
+        assert line is not None, f"no line starts with {prefix!r}"
+        return [set(re.findall(r"[\w.]+", segment.split(":", 1)[1])) for segment in line.split(";")]
+
+    page_calls, page_or_locator, locator_only = segments("Recorded as timeline actions")
+    assert {f"page.{name}" for name in _PAGE_ACTION_MAP} | {"page.keyboard.press"} <= page_calls
+    for name in _LOCATOR_ACTION_MAP:
+        assert [name in page_or_locator, name in locator_only].count(True) == 1
+    assert all(hasattr(Page, name) for name in page_or_locator)
+    assert {"set_input_files", "drag_to", "press_sequentially"} <= locator_only
+    assert "inner_text" not in {*_PAGE_ACTION_MAP, *_LOCATOR_ACTION_MAP}
+    assert not any("inner_text" in segment for segment in (page_calls, page_or_locator, locator_only))
+    assert "inner_text" in content
+
+    factories_on_page, factories_on_locator = segments("Locator factories")
+    for name in {"locator", *_LOCATOR_FACTORY_METHODS}:
+        assert [name in factories_on_page, name in factories_on_locator].count(True) == 1
+    assert all(hasattr(Page, name) for name in factories_on_page)
+    assert "evaluate(js, arg=None)" in content
 
 
 @pytest.mark.asyncio
@@ -123,6 +161,15 @@ async def test_workflow_knowledge_rejects_an_incomplete_topic_source(
 
     assert result["ok"] is False
     assert result["error"]["code"] == "SDK_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_block_schema_hides_internal_note_fields() -> None:
+    result = await skyvern_block_schema(block_type="navigation")
+
+    properties = result["data"]["schema"]["properties"]
+    assert "navigation_goal" in properties
+    assert not {"notes", "trailing_notes", "description"} & properties.keys()
 
 
 @pytest.mark.asyncio
@@ -239,6 +286,95 @@ async def test_block_schema_no_type_lists_all() -> None:
     assert "pdf_fill" in block_types
     assert "task" not in block_types
     assert result["data"]["count"] > 0
+
+
+@pytest.mark.asyncio
+async def test_unavailable_powerbi_is_hidden_from_schema_and_nested_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    listed = await skyvern_block_schema()
+    specific = await skyvern_block_schema(block_type="powerbi_query")
+    nested = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "for_loop",
+                "label": "outer_loop",
+                "loop_over_parameter_key": "rows",
+                "loop_blocks": [
+                    {
+                        "block_type": "powerbi_query",
+                        "label": "read_powerbi",
+                        "connection_id": "moc_owner",
+                        "dataset_id": "{{ dataset_id }}",
+                        "query": "{{ dax_query }}",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert "powerbi_query" not in listed["data"]["block_types"]
+    assert specific["ok"] is False
+    assert "Power BI queries are not currently available." in specific["error"]["message"]
+    assert nested["ok"] is False
+    assert "Power BI queries are not currently available." in nested["error"]["message"]
+
+
+CONNECTED_ACCOUNT_MARKER = "x-skyvern-connected-account"
+CONNECTED_ACCOUNT_FIELDS = {
+    ("file_upload", "google_credential_id"),
+    ("file_download", "google_credential_id"),
+    ("send_email", "credential_id"),
+    ("google_sheets_read", "credential_id"),
+    ("email_inbox", "credential_id"),
+    ("google_sheets_write", "credential_id"),
+    ("powerbi_query", "connection_id"),
+}
+
+
+@pytest.mark.asyncio
+async def test_block_schema_marker_alone_finds_exactly_the_connected_account_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: True)
+
+    listed = await skyvern_block_schema()
+    marked: set[tuple[str, str]] = set()
+    for block_type in listed["data"]["block_types"]:
+        result = await skyvern_block_schema(block_type=block_type)
+        assert result["ok"] is True, result
+        schema = result["data"]["schema"]
+        if "$ref" in schema:
+            # Recursive loop blocks publish their own root as a $ref; other blocks nested in $defs are not walked.
+            schema = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]
+        for field, prop in schema["properties"].items():
+            if prop.get(CONNECTED_ACCOUNT_MARKER) is True:
+                marked.add((block_type, field))
+
+    assert marked == CONNECTED_ACCOUNT_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_unavailable_powerbi_does_not_match_trigger_payload_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    result = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "workflow_trigger",
+                "label": "trigger_workflow",
+                "workflow_permanent_id": "wpid_target",
+                "payload": {"metadata": {"block_type": "powerbi_query"}},
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["valid"] is True
 
 
 @pytest.mark.asyncio

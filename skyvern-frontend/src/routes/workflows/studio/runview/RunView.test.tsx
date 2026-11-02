@@ -168,6 +168,7 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => false,
   usePostHog: () => ({ capture: vi.fn() }),
 }));
 vi.mock("posthog-js", () => ({

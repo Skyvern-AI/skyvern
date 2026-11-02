@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useRunViewStore } from "@/store/RunViewStore";
 import {
@@ -62,14 +61,12 @@ export function useBrowserPaneView(): BrowserPaneViewState {
   const intent = useStudioBrowserStore((s) => s.view);
   const setViewIntent = useStudioBrowserStore((s) => s.setView);
   const pinNonce = useRunViewStore((s) => s.pinNonce);
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const demonstrationBrowserSessionId = useRecordingLauncherStore(
     (s) => s.demonstrationBrowserSessionId,
   );
   const userDrivingDebugBrowser =
-    isRecording ||
-    (demonstrationBrowserSessionId !== null &&
-      demonstrationBrowserSessionId === debugBrowserSessionId);
+    demonstrationBrowserSessionId !== null &&
+    demonstrationBrowserSessionId === debugBrowserSessionId;
   const recordingDeepLink = searchParams.get("view") === "recording";
 
   // Timeline selection outranks a pinned pill: a step click (?active= change or

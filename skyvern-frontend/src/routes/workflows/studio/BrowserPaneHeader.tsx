@@ -42,6 +42,7 @@ import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
 import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
+import { browserIsLive } from "./browserLiveStatus";
 import { ControlTooltip } from "./ControlTooltip";
 import { useBrowserPaneView } from "./useBrowserPaneView";
 import { useStudioPaneCompact } from "./StudioShellContext";
@@ -121,6 +122,13 @@ export function BrowserPaneViewPills() {
   const { isExternal: runBrowserExternal } = useStreamTransport(
     liveSurface === "run" ? visuals.workflowRun?.browser_session_id : null,
   );
+  const browserLive = browserIsLive({
+    liveSurface,
+    debugBrowserSessionId,
+    debugStream,
+    runId,
+    runStream,
+  });
 
   // Recording and Screenshots only ever replay a workflow run; with none open
   // they would point at an old run or at nothing, and Live alone is no switch.
@@ -136,11 +144,13 @@ export function BrowserPaneViewPills() {
       // after it dropped; only the stream knows whether frames are painting.
       const runState = runStarting
         ? "starting"
-        : statusFromStream(
-            runStream && runStream.workflowRunId === runId
-              ? runStream.state
-              : undefined,
-          );
+        : browserLive
+          ? "live"
+          : statusFromStream(
+              runStream && runStream.workflowRunId === runId
+                ? runStream.state
+                : undefined,
+            );
       return (
         <>
           <span
@@ -170,7 +180,7 @@ export function BrowserPaneViewPills() {
     ) {
       return (
         <BrowserLiveStatus
-          state={debugStream.state}
+          state={browserLive ? "live" : debugStream.state}
           stoppedHint="Use ⋯ → Reconnect stream or Restart browser"
         />
       );

@@ -39,11 +39,12 @@ from skyvern.forge.failure_classifier import without_output_only_labels
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType, PasswordCredential
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenService
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenLoginSecret, BitwardenService
 from skyvern.forge.sdk.services.credentials import (
     AzureVaultConstants,
     OnePasswordConstants,
@@ -52,9 +53,19 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
+from skyvern.forge.sdk.workflow.block_notes import (
+    block_opts_out_of_workflow_prompt,
+    definition_step_notes,
+    format_notes_section,
+)
 from skyvern.forge.sdk.workflow.credential_fetch_outcome import CredentialFetch, record_credential_fetch
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
-from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.exceptions import (
+    MissingJinjaVariables,
+    OutputParameterKeyCollisionError,
+    RenderFailureKind,
+    TemplateRenderCause,
+)
 from skyvern.forge.sdk.workflow.models._jinja import _JSON_TYPE_MARKER
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -427,6 +438,9 @@ def _json_leaves(rendered: str) -> list[str] | None:
     return leaves
 
 
+_LOOP_TEMPLATE_KEYS = frozenset({"current_index", "current_item", "current_value"})
+
+
 class WorkflowRunContext:
     attempt_number: int = 1
 
@@ -484,10 +498,9 @@ class WorkflowRunContext:
                 )
                 continue
             if parameter.key in workflow_run_context.parameters:
-                prev_value = workflow_run_context.parameters[parameter.key]
-                new_value = run_parameter.value
                 LOG.error(
-                    f"Duplicate parameter key {parameter.key} found while initializing context manager, previous value: {prev_value}, new value: {new_value}. Using new value."
+                    "Duplicate parameter key found while initializing context manager, using new value",
+                    parameter_key=parameter.key,
                 )
 
             workflow_run_context.parameters[parameter.key] = parameter
@@ -605,6 +618,7 @@ class WorkflowRunContext:
         # — single source of truth, no re-resolving the opt-out from the
         # workflow definition in two places (SKY-9147).
         self._block_workflow_system_prompts: dict[str, str | None] = {}
+        self._step_notes_by_label: dict[str, str] | None = None
         self.blocks_metadata: dict[str, BlockMetadata] = {}
         # Kept apart from values and blocks_metadata so no template or branch-evaluation snapshot can see it.
         self.block_outcomes: dict[str, BlockOutcome] = {}
@@ -629,6 +643,8 @@ class WorkflowRunContext:
         self.resolved_credential_parameter_ids: dict[str, str] = {}
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
+        # The sites each Bitwarden login's item is saved for, which a code block checks its release against.
+        self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
         self.materialized_file_paths: dict[str, tuple[str, str]] = {}
         self.runtime_otp_values: set[str] = set()
         self._failure_evidence_capture: _FailureEvidenceCapture | None = None
@@ -746,6 +762,7 @@ class WorkflowRunContext:
         # definition.
         self._effective_workflow_system_prompt_resolved = False
         self._effective_workflow_system_prompt_cache = None
+        self._step_notes_by_label = None
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
@@ -827,6 +844,69 @@ class WorkflowRunContext:
             return True, self._block_workflow_system_prompts[label]
         return False, None
 
+    def resolve_noted_block_system_prompt(self, label: str | None) -> str | None:
+        """The system prompt the block's non-cached run sends, only when the block has notes; else None."""
+        if not label:
+            return None
+        notes_section = self.resolve_block_notes_section(label)
+        if not notes_section:
+            return None
+        recorded, value = self.get_block_workflow_system_prompt(label)
+        if recorded:
+            return value
+        if self.workflow is not None and block_opts_out_of_workflow_prompt(
+            self.workflow.workflow_definition.blocks, label
+        ):
+            return notes_section
+        return "\n\n".join(part for part in (self.resolve_effective_workflow_system_prompt(), notes_section) if part)
+
+    def resolve_block_notes_section(self, label: str) -> str | None:
+        """Render the notes this block reads; child workflows never inherit them."""
+        if self._step_notes_by_label is None:
+            definition = self.workflow.workflow_definition if self.workflow is not None else None
+            self._step_notes_by_label = definition_step_notes(definition) if definition is not None else {}
+        raw = self._step_notes_by_label.get(label)
+        return format_notes_section(self._render_block_notes(raw, label) if raw else None)
+
+    def _render_block_notes(self, raw: str, label: str) -> str:
+        """Keep page data and credentials unrendered; a note must never fail its step."""
+        if "{" not in raw:
+            return raw
+        try:
+            template = jinja_sandbox_env.from_string(raw)
+            names = jinja2_meta.find_undeclared_variables(jinja_sandbox_env.parse(raw))
+            credential_keys = {
+                key
+                for key, parameter in self.parameters.items()
+                if parameter.parameter_type.is_secret_or_credential()
+                or (isinstance(parameter, WorkflowParameter) and parameter.workflow_parameter_type.is_credential_type())
+            }
+            if names & credential_keys or classify_roots(names, self, label, jinja_sandbox_env):
+                return raw
+            template_data: dict[str, Any] = self.values.copy()
+            template_data.setdefault("workflow_title", self.workflow_title)
+            template_data.setdefault("workflow_id", self.workflow_id)
+            template_data.setdefault("workflow_permanent_id", self.workflow_permanent_id)
+            template_data.setdefault("workflow_run_id", self.workflow_run_id)
+            template_data.setdefault("browser_session_id", self.browser_session_id or "")
+            template_data.setdefault("current_date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            template_data.update(
+                {key: value for key, value in self.get_block_metadata(label).items() if key in _LOOP_TEMPLATE_KEYS}
+            )
+            if names - template_data.keys():
+                return raw
+            rendered = template.render(template_data)
+            register_secret_derived_output(self.secrets, template, raw, template_data, rendered)
+            return rendered.strip() or raw
+        except Exception:
+            LOG.warning(
+                "Block notes did not render; sending them unrendered",
+                block_label=label,
+                workflow_run_id=self.workflow_run_id,
+                exc_info=True,
+            )
+            return raw
+
     def resolve_effective_workflow_system_prompt(self) -> str | None:
         """Return the effective workflow-level system prompt for this run.
 
@@ -902,7 +982,21 @@ class WorkflowRunContext:
 
         if missing_variables := get_missing_variables(raw_template, template_data):
             if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
-                raise MissingJinjaVariables(template=raw_template, variables=missing_variables)
+                # A dotted name or a present root is a nested miss, which names no reference.
+                absent_roots = sorted(
+                    name for name in missing_variables if name.isidentifier() and name not in template_data
+                )
+                raise MissingJinjaVariables(
+                    template=raw_template,
+                    variables=missing_variables,
+                    missing_references=absent_roots,
+                    render_cause=TemplateRenderCause(
+                        RenderFailureKind.MISSING_REFERENCE
+                        if absent_roots
+                        else RenderFailureKind.MISSING_KEY_OR_ATTRIBUTE,
+                        field_name="workflow_system_prompt",
+                    ),
+                )
             # Non-strict mode silently renders undefined variables as empty strings,
             # which makes typos like {{ persona }} invisible to the user. Emit a
             # warning so the operator has a breadcrumb when a workflow_system_prompt
@@ -1098,6 +1192,15 @@ class WorkflowRunContext:
         if isinstance(payload, list):
             return [self.represent_plaintext_secrets_as_placeholders(item) for item in payload]
         return payload
+
+    def mask_secrets_in_reasoning(self, reasoning: str) -> str:
+        """``reasoning`` with every registered secret replaced, as the errors[] aggregation masks stored rows."""
+        masked = str(self.mask_secrets_in_data(reasoning))
+        # mask_secrets_in_data leaves a short secret embedded in longer text; the aggregation replaces those too.
+        secrets = {value for value in self.secrets.values() if isinstance(value, str) and value}
+        for secret in sorted(secrets, key=len, reverse=True):
+            masked = masked.replace(secret, "[redacted]")
+        return masked or "[redacted]"
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
         """
@@ -1327,6 +1430,8 @@ class WorkflowRunContext:
             credential_item=credential_item,
         )
         credential = credential_item.credential
+        if credential_item.login_sites is not None:
+            self.bitwarden_login_sites[parameter.key] = credential_item.login_sites
 
         credential_totp_identifier = db_credential.totp_identifier
         if not credential_totp_identifier and isinstance(credential, PasswordCredential):
@@ -1514,6 +1619,17 @@ class WorkflowRunContext:
 
         item_id = self._resolve_required_parameter_value(parameter.item_id, "OnePassword Item ID")
         vault_id = self._resolve_required_parameter_value(parameter.vault_id, "OnePassword Vault ID")
+        imported_credentials = await app.DATABASE.credentials.get_onepassword_credentials(
+            organization.organization_id,
+            item_keys=[(vault_id, item_id)],
+            limit=1,
+        )
+        if imported_credentials:
+            await app.AGENT_FUNCTION.enforce_credential_use(
+                organization.organization_id,
+                imported_credentials[0].credential_id,
+                workflow_run_id=self.workflow_run_id,
+            )
         lookup_context = self._format_resolved_lookup_context("1Password", vault_id=vault_id, item_id=item_id)
         item = await fetch_onepassword_item(token, vault_id, item_id, lookup_context)
         if parameter.totp_identifier:
@@ -1781,6 +1897,10 @@ class WorkflowRunContext:
                     "password": password_secret_id,
                 }
                 self.parameters[parameter.key] = parameter
+                # A read that lost its site list counts as naming no checkable site, so enforced runs refuse the login.
+                self.bitwarden_login_sites[parameter.key] = (
+                    secret_credentials.login_sites if isinstance(secret_credentials, BitwardenLoginSecret) else []
+                )
                 if parameter.totp_identifier:
                     normalized_totp_identifier = _normalize_credential_totp_identifier(parameter.totp_identifier)
                     if normalized_totp_identifier is not None:
@@ -2178,9 +2298,8 @@ class WorkflowRunContext:
                 )
                 if parameter.value:
                     LOG.warning(
-                        f"Context parameter {parameter.key} already has a value, overwriting",
-                        old_value=parameter.value,
-                        new_value=value,
+                        "Context parameter already has a value, overwriting",
+                        parameter_key=parameter.key,
                     )
                 if not isinstance(value, dict) and not isinstance(value, list):
                     raise ValueError(
@@ -2441,6 +2560,14 @@ class WorkflowContextManager:
 
     def remove_workflow_run_context(self, workflow_run_id: str) -> None:
         self.workflow_run_contexts.pop(workflow_run_id, None)
+
+    def remove_workflow_run_context_if_current(
+        self, workflow_run_id: str, workflow_run_context: WorkflowRunContext
+    ) -> bool:
+        if self.workflow_run_contexts.get(workflow_run_id) is not workflow_run_context:
+            return False
+        del self.workflow_run_contexts[workflow_run_id]
+        return True
 
     def has_workflow_run_context(self, workflow_run_id: str) -> bool:
         """Whether a run is live in THIS process. Initialized before any browser is acquired and

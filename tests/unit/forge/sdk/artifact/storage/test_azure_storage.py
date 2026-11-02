@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import os
 from datetime import UTC, datetime, timedelta
@@ -5,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -317,7 +319,7 @@ async def test_get_downloaded_files_legacy_listing_attributes_and_scopes_attempt
     azure_storage.async_client.list_files = AsyncMock(return_value=[old_key, current_key])
     azure_storage.async_client.get_object_info = AsyncMock(side_effect=get_object_info)
     azure_storage.async_client.create_sas_urls = AsyncMock(
-        side_effect=lambda uris: [f"https://signed.test/{uri.rsplit('/', 1)[-1]}" for uri in uris]
+        side_effect=lambda uris, **_: [f"https://signed.test/{uri.rsplit('/', 1)[-1]}" for uri in uris]
     )
     rows = AsyncMock(return_value=[old_artifact])
     monkeypatch.setattr(
@@ -423,15 +425,32 @@ class TestAzureShareLinkSensitiveCap:
         recording = make_artifact(f"azure://{TEST_CONTAINER}/rec.webm", artifact_type=ArtifactType.RECORDING)
         download = make_artifact(f"azure://{TEST_CONTAINER}/file.pdf", artifact_type=ArtifactType.DOWNLOAD)
 
-        async def fake_sas(uris: list[str], expiry_hours: int = 24) -> list[str]:
-            return [f"{uri}?h={expiry_hours}" for uri in uris]
+        async def fake_sas(
+            uris: list[str], expiry_hours: int = 24, attachment_filenames: list[str | None] | None = None
+        ) -> list[str]:
+            suffix = "&attachment" if attachment_filenames is not None else ""
+            return [f"{uri}?h={expiry_hours}{suffix}" for uri in uris]
 
         azure_storage.async_client.create_sas_urls = AsyncMock(side_effect=fake_sas)
         urls = await azure_storage.get_share_links([recording, download])
         assert urls == [
             f"{recording.uri}?h={SENSITIVE_SHARE_URL_EXPIRY_HOURS}",
-            f"{download.uri}?h=24",
+            f"{download.uri}?h=24&attachment",
         ]
+
+
+@pytest.mark.asyncio
+async def test_download_sas_urls_sign_an_octet_stream_attachment() -> None:
+    client = RealAsyncAzureStorageClient(account_name="acct", account_key=base64.b64encode(b"k" * 32).decode())
+
+    forced = await client.create_sas_urls(["azure://c/dir/page.html"], attachment_filenames=[None])
+    inline = await client.create_sas_urls(["azure://c/dir/shot.png"])
+
+    assert forced is not None and inline is not None
+    query = parse_qs(urlparse(forced[0]).query)
+    assert query["rscd"] == ["attachment; filename=\"page.html\"; filename*=UTF-8''page.html"]
+    assert query["rsct"] == ["application/octet-stream"]
+    assert "rscd" not in parse_qs(urlparse(inline[0]).query)
 
 
 @pytest.mark.asyncio

@@ -229,6 +229,7 @@ async def test_export_failure_replaces_stale_successful_output(monkeypatch: pyte
     assert result.output_parameter_value is not None
     assert "extracted_information" not in result.output_parameter_value
     assert result.output_parameter_value["failure_reason"] == "export_data_schema is required when export is enabled"
+    assert "render_failure" not in result.output_parameter_value
     record_mock.assert_awaited_once()
     assert record_mock.await_args.kwargs["value"] == result.output_parameter_value
 

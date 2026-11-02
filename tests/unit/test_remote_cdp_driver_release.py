@@ -29,6 +29,7 @@ from skyvern.webeye.browser_engine import (
     BrowserEngineSelection,
     BrowserSourceNotSupportedByEngine,
 )
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.real_browser_manager import RealBrowserManager, _EngineSelectionOwner, canonical_run_key
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -115,6 +116,65 @@ async def test_close_context_disables_download_interceptor_once() -> None:
     await state.close(close_browser_on_completion=True)
 
     interceptor.disable.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_browser_on_completion", [True, False])
+async def test_close_after_stuck_interceptor_drain_runs_later_phases_and_keeps_handler_tracked(
+    monkeypatch: pytest.MonkeyPatch, close_browser_on_completion: bool
+) -> None:
+    # The handler blocks on events, so the drain overruns any budget. A 0 budget detaches the drain about one loop turn
+    # after it starts, so disable() must reach the download drain without suspending first.
+    monkeypatch.setattr("skyvern.webeye.real_browser_state.BROWSER_INTERCEPTOR_DISABLE_TIMEOUT", 0)
+    pw = _pw_stub()
+    context = _context_stub()
+    context.cookies = AsyncMock(return_value=[])
+    interceptor = CDPDownloadInterceptor(
+        network_egress_monitor=MagicMock(name="inert_network_egress_monitor"),
+        redirect_hop_authorizer=AsyncMock(side_effect=AssertionError("unexpected direct HTTP request")),
+    )
+    interceptor._accepting_browser_downloads = True
+    context._skyvern_cdp_download_interceptor = interceptor
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_handler(event: dict[str, object]) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    monkeypatch.setattr(interceptor, "_handle_browser_download", cancellation_resistant_handler)
+    interceptor._schedule_browser_download_handler({"url": "https://example.test/download"})
+    (handler_task,) = interceptor._browser_download_tasks
+    await asyncio.wait_for(started.wait(), timeout=30)
+
+    state = RealBrowserState(pw=pw, browser_context=context)
+    result = await asyncio.wait_for(state.close(close_browser_on_completion, release_driver=True), timeout=30)
+
+    assert result is close_browser_on_completion
+    if close_browser_on_completion:
+        context.close.assert_awaited_once()
+    else:
+        context.close.assert_not_awaited()
+    pw.stop.assert_awaited_once()
+    assert context._skyvern_cdp_download_interceptor is None
+
+    try:
+        await asyncio.wait_for(cancelled.wait(), timeout=30)
+    except TimeoutError:
+        pytest.fail("Download handler was never cancelled; disable() likely suspended before the download drain")
+    assert not handler_task.done()
+    assert interceptor._browser_download_tasks == {handler_task}
+    (drain_task,) = state._detached_teardown_tasks
+
+    release.set()
+    await asyncio.wait_for(asyncio.wait({handler_task, drain_task}), timeout=30)
+    assert not interceptor._browser_download_tasks
+    assert not state._detached_teardown_tasks
 
 
 @pytest.mark.asyncio

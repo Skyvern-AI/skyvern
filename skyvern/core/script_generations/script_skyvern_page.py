@@ -5,7 +5,7 @@ import inspect
 import os
 import re
 import weakref
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,8 +27,10 @@ from skyvern.core.script_generations.skyvern_page import (
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     BrowserSessionSwitchNotAllowed,
     IllegitCompleteScriptTermination,
+    MissingBrowserState,
     ScriptTerminationException,
     WorkflowRunNotFound,
 )
@@ -46,6 +48,7 @@ from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_a
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
+from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import generate_totp_code
 from skyvern.schemas.steps import AgentStepOutput
@@ -74,9 +77,10 @@ from skyvern.webeye.actions.handler import (
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_engine import BrowserEngineSelection
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.browser_state import BrowserState, get_browser_connection_loss, raise_if_browser_connection_lost
 from skyvern.webeye.navigation import default_navigation_settle, navigate_with_retry, redact_url_secrets
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from skyvern.webeye.utils.challenge_solve_record import calling_solve_client
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -143,6 +147,12 @@ class ScriptSkyvernPage(SkyvernPage):
         self.scraped_page = scraped_page
         _set_scraped_page(self, scraped_page)
         self._record = recorder or (lambda ac: None)
+
+    def _raise_if_browser_connection_lost(self) -> None:
+        context = skyvern_context.current()
+        raise_if_browser_connection_lost(
+            _get_scraped_page(self)._browser_state, workflow_run_id=context.workflow_run_id if context else None
+        )
 
     @classmethod
     async def _get_or_create_browser_state(
@@ -285,6 +295,7 @@ class ScriptSkyvernPage(SkyvernPage):
         Auto-creates action records in DB before action execution
         and screenshot artifacts after action execution.
         """
+        self._raise_if_browser_connection_lost()
 
         prompt = kwargs.get("prompt", "")
 
@@ -337,6 +348,7 @@ class ScriptSkyvernPage(SkyvernPage):
             # Wait for page to be ready before executing action
             # This helps prevent issues where cached actions execute before the page is fully loaded
             await self._wait_for_page_ready_before_action()
+            self._raise_if_browser_connection_lost()
             # NOTE: _ensure_element_ids_on_page() removed from here.
             # unique_id attrs are only needed by the AI fallback path, which
             # already calls _refresh_scraped_page() → build_tree_from_body()
@@ -1114,6 +1126,16 @@ class ScriptSkyvernPage(SkyvernPage):
         last_error: Exception | None = None
         _get_scraped_page(self)._browser_state.begin_navigation()
         for attempt in range(max_retries):
+            # The URL check and the retry backoff both await, and a loss latched meanwhile must not reach a dispatch.
+            connection_loss = get_browser_connection_loss(_get_scraped_page(self)._browser_state)
+            if connection_loss is not None:
+                last_error = last_error or MissingBrowserState(
+                    workflow_run_id=context.workflow_run_id if context else None,
+                    diagnostic=connection_loss,
+                    detected_at=datetime.now(UTC),
+                    failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+                )
+                break
             try:
                 await self.page.goto(url, timeout=timeout, **kwargs)
                 await _get_scraped_page(self)._browser_state.record_navigation_result(None, url=url)
@@ -1122,7 +1144,10 @@ class ScriptSkyvernPage(SkyvernPage):
                 return
             except Exception as e:
                 last_error = e
-                if attempt >= max_retries - 1:
+                if (
+                    attempt >= max_retries - 1
+                    or get_browser_connection_loss(_get_scraped_page(self)._browser_state) is not None
+                ):
                     break
                 LOG.warning(
                     "Navigation attempt failed, retrying",
@@ -1160,6 +1185,13 @@ class ScriptSkyvernPage(SkyvernPage):
         if not totp_identifier and not totp_url:
             raise RuntimeError("A sign-in link is unavailable: this step has no email/SMS identifier to receive it on.")
 
+        task = (
+            await app.DATABASE.tasks.get_task(context.task_id, organization_id=organization_id)
+            if context and context.task_id
+            else None
+        )
+        task_url = task.url if task else None
+
         polled = await poll_otp_value(
             organization_id=organization_id,
             task_id=context.task_id if context else None,
@@ -1168,6 +1200,7 @@ class ScriptSkyvernPage(SkyvernPage):
             totp_identifier=totp_identifier,
             created_after=naive_utc_now() - MAGIC_LINK_ANCHOR_GRACE,
             expected_otp_type=OTPType.MAGIC_LINK,
+            task_url=task_url,
         )
         if polled is None:
             raise RuntimeError("A sign-in link could not be retrieved for this step.")
@@ -1187,6 +1220,7 @@ class ScriptSkyvernPage(SkyvernPage):
             retry_times=NAVIGATION_MAX_RETRY_TIME,
             settle=default_navigation_settle,
             log_url=redact_url_secrets(polled.value),
+            stop_retrying=lambda: get_browser_connection_loss(_get_scraped_page(self)._browser_state) is not None,
         )
 
     @action_wrap(ActionType.SOLVE_CAPTCHA)
@@ -1197,8 +1231,14 @@ class ScriptSkyvernPage(SkyvernPage):
         if not context or not context.organization_id or not context.task_id or not context.step_id:
             # Fallback: solve directly without DB context. Arm the vendor solver lifecycle around the
             # solve so a factory-created (solver-off) session is armed on this path too.
-            async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(self.page):
-                await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
+            with app.AGENT_FUNCTION.challenge_solve_recording(
+                "cached_script",
+                page=self.page,
+                organization_id=context.organization_id if context else None,
+                workflow_run_id=context.workflow_run_id if context else None,
+            ) as record:
+                async with app.AGENT_FUNCTION.captcha_solver_lifecycle_scope(self.page):
+                    record.extension_solved = await app.AGENT_FUNCTION.auto_solve_captchas(self.page)
             return None
 
         task = await app.DATABASE.tasks.get_task(context.task_id, context.organization_id)
@@ -1210,7 +1250,12 @@ class ScriptSkyvernPage(SkyvernPage):
                 task_id=context.task_id,
                 step_id=context.step_id,
             )
-            await solve_captcha_handler(action, self.page, self.scraped_page, task, step)
+            # The v1 handler records the call after its own fast-fail guards; this names the cached script as client.
+            client = calling_solve_client.set("cached_script")
+            try:
+                await solve_captcha_handler(action, self.page, self.scraped_page, task, step)
+            finally:
+                calling_solve_client.reset(client)
         else:
             await asyncio.sleep(30)
 
@@ -1341,6 +1386,7 @@ class ScriptSkyvernPage(SkyvernPage):
             task_id=context.task_id,
             organization_id=context.organization_id,
             output=step_output,
+            write_authority_for_run=run_write_authority,
         )
         LOG.info(
             "Updated step output with cached actions before complete validation",

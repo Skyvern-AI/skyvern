@@ -17,12 +17,14 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from skyvern.config import settings
+from skyvern.forge import app
 from skyvern.forge.log_redaction import (
     REDACTED,
     SENSITIVE_HEADERS,
     redact_sensitive_fields,
     strip_artifact_url_query,
 )
+from skyvern.forge.request_privacy import private_logging_scope, private_request_audit, private_request_path
 from skyvern.forge.sdk.forge_log import exception_log_fields
 
 if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
@@ -36,6 +38,8 @@ if typing.TYPE_CHECKING:  # pragma: no cover - import only for type hints
 LOG = structlog.get_logger()
 
 _SENSITIVE_ENDPOINTS = {
+    # Agent reports can contain credentials before route redaction.
+    "POST /v1/agent_feedback",
     "GET /api/v1/users/me/onboarding",
     "POST /api/v1/users/me/onboarding",
     "POST /api/v1/credentials",
@@ -64,8 +68,12 @@ _SENSITIVE_ENDPOINTS = {
     "POST /api/v1/stripe_webhook",
 }
 _SIGNED_TRIGGER_RECEIVER_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/triggers/[^/]+/events$")
+_AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT = re.compile(r"^POST /(?:api/)?v1/ad-attribution/withdraw$")
 _SENSITIVE_ENDPOINT_PATTERNS = (
+    re.compile(r"^POST /(?:api/)?v1/ad-attribution(?:/withdraw)?$"),
     re.compile(r"^(?:POST|PUT) /(?:api/)?v1/credentials(?:/.*)?$"),
+    re.compile(r"^(?:GET|POST|PUT|DELETE) /(?:api/)?v1/email-forwarding(?:/.*)?$"),
+    re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),
     # Twilio credentials and inbound SMS codes must stay opaque even with malformed bodies.
     re.compile(r"^(?:POST|PUT|PATCH|DELETE) /(?:api/)?v1/(?:integrations/twilio|sms)(?:/.*)?$"),
     # MCP arguments and results can contain arbitrary secrets, including malformed JSON.
@@ -79,6 +87,7 @@ _SENSITIVE_ENDPOINT_PATTERNS = (
     # Skyplane authority calls carry runtime capabilities, tool arguments, agent feedback text and delivered files.
     re.compile(r"^[^ ]+ /api/v1/skyplane(?:/.*)?$"),
 )
+_STREAMING_REQUEST_ENDPOINT_PATTERNS = (re.compile(r"^POST /(?:api/)?v1/email/(?:inbound/[^/]+|sns-inbound)$"),)
 _MAX_BODY_LENGTH = 1000
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # 404/405 are dominated by internet scanners and MCP clients probing GET for an SSE stream;
@@ -196,18 +205,38 @@ def _identity_log_fields() -> dict[str, str | int | bool | None]:
     return fields
 
 
+def _should_log_request_bodies() -> bool:
+    identity = _request_identity.get()
+    if identity is None or identity.organization_id is None:
+        return True
+    return app.AGENT_FUNCTION.should_log_request_bodies(identity.organization_id)
+
+
+def _schedule_validation_error_code(status_code: int, response_body: str) -> str | None:
+    if status_code != 400:
+        return None
+    try:
+        response = json.loads(response_body)
+    except json.JSONDecodeError:
+        return None
+    detail = response.get("detail") if isinstance(response, dict) else None
+    if isinstance(detail, str) and detail.startswith("Missing schedule parameters for workflow "):
+        return "missing_schedule_parameters"
+    return None
+
+
 def integration_platform_from_user_agent(user_agent: str | None) -> str | None:
     if not isinstance(user_agent, str) or not user_agent.strip():
         return None
 
     value = user_agent.casefold()
-    if "zapier" in value:
+    if re.search(r"(?<![\w-])zapier(?![\w-])", value):
         return "zapier"
-    if "n8n" in value:
+    if re.search(r"(?<![\w-])n8n(?![\w-])", value):
         return "n8n"
     if value.startswith("make/") or re.search(r"\bmake\.com\b", value) or "integromat" in value:
         return "make"
-    if "workato" in value:
+    if re.search(r"(?<![\w-])workato(?![\w-])", value):
         return "workato"
     return "other"
 
@@ -239,11 +268,17 @@ def _is_fixture_endpoint(request: Request) -> bool:
 def _is_sensitive_endpoint(request: Request) -> bool:
     endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
     return (
-        _is_fixture_endpoint(request)
+        private_request_path(request.scope) is not None
+        or _is_fixture_endpoint(request)
         or endpoint in _SENSITIVE_ENDPOINTS
         or any(pattern.fullmatch(endpoint) for pattern in _SENSITIVE_ENDPOINT_PATTERNS)
         or (request.method.upper() == "POST" and _ACTION_LOG_ENDPOINT_RE.fullmatch(request.url.path) is not None)
     )
+
+
+def _uses_streaming_request_body(request: Request) -> bool:
+    endpoint = f"{request.method.upper()} {request.url.path.rstrip('/')}"
+    return any(pattern.fullmatch(endpoint) for pattern in _STREAMING_REQUEST_ENDPOINT_PATTERNS)
 
 
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
@@ -327,6 +362,7 @@ def _log_unhandled_request(
     """Emit the raw-request row after the server error handler selects a response."""
     exc = sys.exc_info()[1]
     try:
+        body_fields = {"body": body} if _should_log_request_bodies() else {}
         # No traceback: the server error handler already logs it, and with one this row can pass the
         # container log driver's 16 KiB line limit and be split into fragments that lose every field.
         LOG.error(
@@ -335,9 +371,9 @@ def _log_unhandled_request(
             path=path,
             status_code=status_code,
             client_ip=client_ip,
-            body=body,
             headers=headers,
             duration_seconds=time.monotonic() - start_time,
+            **body_fields,
             **(exception_log_fields(exc) if exc is not None else {}),
             **_identity_log_fields(),
         )
@@ -367,18 +403,26 @@ def _log_request(
         log_method = LOG.info
 
     try:
+        body_fields = (
+            {
+                "body": body,
+                "response_body": response_body,
+                # backwards-compat: keep error_body for existing Datadog queries
+                "error_body": response_body if status_code >= 400 else None,
+            }
+            if _should_log_request_bodies()
+            else {}
+        )
         log_method(
             "api.raw_request",
             method=method,
             path=path,
             status_code=status_code,
             client_ip=client_ip,
-            body=body,
             headers=headers,
-            response_body=response_body,
-            # backwards-compat: keep error_body for existing Datadog queries
-            error_body=response_body if status_code >= 400 else None,
             duration_seconds=time.monotonic() - start_time,
+            error_code=_schedule_validation_error_code(status_code, response_body),
+            **body_fields,
             **_identity_log_fields(),
         )
     except Exception:
@@ -410,8 +454,13 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
                         return Response(status_code=413)
                     bounded.extend(chunk)
             body_bytes = bytes(bounded)
-        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(f"{request.method.upper()} {request.url.path.rstrip('/')}"):
-            # The receiver's route-level size limit must see the unconsumed request stream.
+        elif _SIGNED_TRIGGER_RECEIVER_ENDPOINT.fullmatch(
+            endpoint := f"{request.method.upper()} {request.url.path.rstrip('/')}"
+        ) or _AD_ATTRIBUTION_WITHDRAWAL_ENDPOINT.fullmatch(endpoint):
+            # Route-level body limits must see the unconsumed request stream.
+            body_bytes = b""
+            body_buffered = False
+        elif _uses_streaming_request_body(request):
             body_bytes = b""
             body_buffered = False
         else:
@@ -506,6 +555,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             await super().__call__(scope, receive, send)
             return
 
+        if audit_path := private_request_path(scope):
+            with private_logging_scope(audit_path):
+                identity = _request_identity.set(_RequestIdentity())
+                try:
+                    await self._private_request(scope, receive, send, audit_path=audit_path)
+                finally:
+                    _request_identity.reset(identity)
+            return
+
         # BaseHTTPMiddleware raises a started stream's error only after dispatch returns.
         # Keep the client-visible status here so that error is still countable.
         response_status: int | None = None
@@ -529,3 +587,70 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             _raw_request_exception_logger.set(None)
         finally:
             _raw_request_stream_success_logger.set(None)
+
+    async def _private_request(self, scope: Scope, receive: Receive, send: Send, *, audit_path: str) -> None:
+        start = time.monotonic()
+        status: int | None = None
+        complete = False
+        outcome = "complete"
+
+        async def opaque_send(message: Message) -> None:
+            nonlocal status, complete
+            await send(message)
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            elif message["type"] == "http.response.body" and not message.get("more_body", False):
+                complete = True
+
+        try:
+            try:
+                # Passing receive/send directly keeps payload bytes out of the logger's buffers.
+                await self.app(scope, receive, opaque_send)
+            except ClientDisconnect:
+                outcome = "disconnected"
+                if status is None:
+                    try:
+                        await Response(status_code=499)(scope, receive, opaque_send)
+                    except Exception:
+                        pass
+            except Exception:
+                outcome = "stream_failed" if status is not None else "failed"
+                if status is None:
+                    try:
+                        await Response(
+                            b'{"detail":"private_request_failed"}', status_code=500, media_type="application/json"
+                        )(scope, receive, opaque_send)
+                    except Exception:
+                        pass
+                elif not complete:
+                    try:
+                        await send({"type": "http.response.body", "body": b"", "more_body": False})
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            if settings.LOG_RAW_API_REQUESTS:
+                code = status
+                log = (
+                    LOG.error
+                    if outcome != "complete" or (code is not None and code >= 500)
+                    else LOG.warning
+                    if code is not None and code >= 400
+                    else LOG.info
+                )
+                try:
+                    with private_request_audit():
+                        log(
+                            "api.raw_request",
+                            method=scope["method"]
+                            if scope["method"] in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+                            else "OTHER",
+                            path=audit_path,
+                            status_code=code,
+                            duration_seconds=time.monotonic() - start,
+                            outcome=outcome,
+                        )
+                except Exception:
+                    pass

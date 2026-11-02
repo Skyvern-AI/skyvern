@@ -6,9 +6,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from agents import Agent, Runner
+from litellm.types.utils import ModelResponse
 from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot.model_resolver import CopilotLitellmProvider, resolve_model_config
+from skyvern.schemas.llm import LLMConfig
 
 
 def _install_config(monkeypatch: pytest.MonkeyPatch, config: Any, llm_key: str) -> MagicMock:
@@ -66,9 +69,9 @@ class TestModelResolver:
         from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 
         main = LLMRouterModelConfig(
-            model_name="vertex-gemini-2.5-flash",  # router group alias
+            model_name="vertex-gemini-3-flash-preview",  # router group alias
             litellm_params={
-                "model": "vertex_ai/gemini-2.5-flash",
+                "model": "vertex_ai/gemini-3-flash-preview",
                 "api_base": "https://vertex.example.com",
                 "timeout": 900.0,
             },
@@ -82,22 +85,22 @@ class TestModelResolver:
             litellm_params={"model": "anthropic/claude-sonnet-4-20250514"},
         )
         router_config = LLMRouterConfig(
-            model_name="gemini-2.5-flash-fallback-router",
+            model_name="gemini-3-flash-preview-fallback-router",
             model_list=[main, fallback, final_fallback],
             required_env_vars=["VERTEX_CREDENTIALS"],
             supports_vision=True,
             add_assistant_prefix=False,
-            main_model_group="vertex-gemini-2.5-flash",
+            main_model_group="vertex-gemini-3-flash-preview",
             fallback_model_group=["gpt-4-1-mini-fallback", "claude-fallback"],
             temperature=0.3,
             max_completion_tokens=8192,
         )
-        handler = _install_config(monkeypatch, router_config, "GEMINI_2_5_FLASH_WITH_FALLBACK")
+        handler = _install_config(monkeypatch, router_config, "GEMINI_3_0_FLASH_WITH_FALLBACK")
 
         model_name, run_config, llm_key, supports_vision = resolve_model_config(handler)
 
-        assert model_name == "vertex_ai/gemini-2.5-flash"
-        assert llm_key == "GEMINI_2_5_FLASH_WITH_FALLBACK"
+        assert model_name == "vertex_ai/gemini-3-flash-preview"
+        assert llm_key == "GEMINI_3_0_FLASH_WITH_FALLBACK"
         assert supports_vision is True
         assert run_config.model_settings is not None
         assert run_config.model_settings.temperature == 0.3
@@ -209,7 +212,7 @@ class TestModelResolver:
 
         entry = LLMRouterModelConfig(
             model_name="some-group",
-            litellm_params={"model": "vertex_ai/gemini-2.5-flash"},
+            litellm_params={"model": "vertex_ai/gemini-3-flash-preview"},
         )
         router_config = LLMRouterConfig(
             model_name="misconfigured-router",
@@ -224,7 +227,7 @@ class TestModelResolver:
         with capture_logs() as logs:
             model_name, _, _, _ = resolve_model_config(handler)
 
-        assert model_name == "vertex_ai/gemini-2.5-flash"
+        assert model_name == "vertex_ai/gemini-3-flash-preview"
         joined = " ".join(str(record.get("event", "")) for record in logs)
         assert "main_model_group has no matching" in joined
 
@@ -536,6 +539,34 @@ def test_resolve_model_config_raises_for_unregistered_registry_alias(alias: str)
     handler.llm_key = alias
     with pytest.raises(InvalidLLMConfigError):
         resolve_model_config(handler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["gpt-5.4", "gpt-5", "azure/gpt-5.6-terra"])
+async def test_a_copilot_turn_sends_the_configured_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch, model_name: str
+) -> None:
+    sent: list[dict[str, object]] = []
+
+    async def fake_acompletion(**kwargs: object) -> ModelResponse:
+        sent.append(kwargs)
+        return ModelResponse(choices=[{"index": 0, "message": {"role": "assistant", "content": "ok"}}])
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    config = LLMConfig(
+        model_name=model_name,
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        reasoning_effort="high",
+    )
+    resolved_model_name, run_config, _, _ = resolve_model_config(_install_config(monkeypatch, config, "GPT5_TEST"))
+
+    await Runner.run(Agent(name="workflow-copilot", model=resolved_model_name), "hello", run_config=run_config)
+
+    (request,) = sent
+    assert request["reasoning_effort"] == "high"
+    assert "verbosity" not in request
 
 
 @pytest.mark.parametrize("model_name", ["gpt-4o", "azure/gpt-4.1"])

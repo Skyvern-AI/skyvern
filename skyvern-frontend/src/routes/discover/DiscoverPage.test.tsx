@@ -86,7 +86,11 @@ vi.mock("@/routes/tasks/create/PromptBox", async () => {
       {
         focusAndPrefillExample: (key: string | null, fallback: string) => void;
       },
-      { secondaryAction?: React.ReactNode }
+      {
+        secondaryAction?:
+          | React.ReactNode
+          | ((state: { busy: boolean }) => React.ReactNode);
+      }
     >(function PromptBoxMock({ secondaryAction }, ref) {
       const [value, setValue] = React.useState("");
       const textareaRef = React.useRef<HTMLTextAreaElement>(null);
@@ -106,7 +110,9 @@ vi.mock("@/routes/tasks/create/PromptBox", async () => {
             value={value}
             onChange={(event) => setValue(event.target.value)}
           />
-          {secondaryAction}
+          {typeof secondaryAction === "function"
+            ? secondaryAction({ busy: false })
+            : secondaryAction}
         </div>
       );
     }),

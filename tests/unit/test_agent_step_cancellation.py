@@ -38,6 +38,7 @@ from skyvern.services.run_cancellation import RunCancellation
 from skyvern.webeye.actions.actions import ClickAction, CompleteAction, ExtractAction
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from tests.unit._task_block_fakes import lost_browser_state
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -342,6 +343,48 @@ async def test_canceled_run_stops_before_the_next_action(
     assert (detailed_output.run_cancellation is not None) is stopped
     if stopped:
         harness.agent.check_user_goal_complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action_count", "browser_lost", "run_canceled", "expected_handled"),
+    [
+        pytest.param(2, True, False, 1, id="lost-during-a-continuable-failure"),
+        pytest.param(1, True, False, 1, id="lost-during-the-last-action"),
+        pytest.param(2, False, False, 2, id="ordinary-continuable-failure"),
+        pytest.param(2, True, True, 1, id="cancel-takes-precedence-over-the-loss"),
+    ],
+)
+async def test_lost_browser_fails_the_step_before_its_next_action(
+    monkeypatch: pytest.MonkeyPatch, action_count: int, browser_lost: bool, run_canceled: bool, expected_handled: int
+) -> None:
+    harness = _make_harness(monkeypatch, navigation_goal="Submit the application")
+    actions = [
+        _click_action(harness.task, harness.step, element_id=f"node-{i}", action_order=i) for i in range(action_count)
+    ]
+    monkeypatch.setattr("skyvern.forge.agent.parse_actions", lambda *_, **__: actions)
+    harness.browser_state.must_get_working_page = AsyncMock(return_value=harness.page)
+    canceled = _cancel_when_flagged(monkeypatch, harness)
+    connection_loss = lost_browser_state("workflow-1").get_browser_connection_loss()
+    harness.browser_state.get_browser_connection_loss = MagicMock(return_value=None)
+
+    async def _handle_action(*_args, **_kwargs) -> list[ActionResult]:
+        if browser_lost:
+            harness.browser_state.get_browser_connection_loss.return_value = connection_loss
+        canceled["yet"] = run_canceled
+        return [ActionFailure(exception=RuntimeError("Target closed"), stop_execution_on_failure=False)]
+
+    handle_action_mock = AsyncMock(side_effect=_handle_action)
+    monkeypatch.setattr("skyvern.forge.agent.ActionHandler.handle_action", handle_action_mock)
+
+    step, _ = await harness.run()
+
+    assert handle_action_mock.await_count == expected_handled
+    if browser_lost:
+        assert step.status == (StepStatus.canceled if run_canceled else StepStatus.failed)
+        harness.agent.check_user_goal_complete.assert_not_awaited()
+    else:
+        assert step.status != StepStatus.failed
 
 
 @pytest.mark.asyncio

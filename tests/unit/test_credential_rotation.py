@@ -1052,7 +1052,9 @@ async def test_runtime_credential_registration_proceeds_when_lane_is_safe(
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
 
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as mock_app:
         mock_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
@@ -1653,7 +1655,9 @@ async def test_retry_retains_credential_pool_binding_when_new_lane_cannot_be_adm
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
         context_app.DATABASE = sqlite_db
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
@@ -1775,7 +1779,9 @@ async def test_retry_registers_prepared_binding_after_definition_edit(retry_rota
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
     with patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app:
         context_app.DATABASE = database
         context_app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
@@ -2050,7 +2056,9 @@ async def test_retry_runtime_registration_with_single_credential_definition(
     credential = MagicMock()
     credential.model_dump.return_value = {}
     credential_service = MagicMock()
-    credential_service.get_credential_item = AsyncMock(return_value=SimpleNamespace(credential=credential))
+    credential_service.get_credential_item = AsyncMock(
+        return_value=SimpleNamespace(credential=credential, login_sites=None)
+    )
     with (
         patch("skyvern.forge.sdk.workflow.context_manager.app") as context_app,
         patch("skyvern.forge.sdk.workflow.service.app") as service_app,

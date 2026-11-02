@@ -15,6 +15,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunStatus,
     WorkflowStatus,
 )
+from tests.unit.force_stub_app import released_session_stub
 
 
 def _make_workflow(*, deleted_at: datetime | None) -> Workflow:
@@ -74,9 +75,10 @@ async def test_run_detail_returns_run_when_parent_workflow_soft_deleted(
         agent_protocol.app,
         "DATABASE",
         SimpleNamespace(
+            Session=released_session_stub(),
             browser_sessions=SimpleNamespace(
                 get_persistent_browser_session_by_runnable_id=get_browser_session_mock,
-            )
+            ),
         ),
     )
 

@@ -54,9 +54,15 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
     value: string;
     onChange: (value: string) => void;
     placeholder?: string;
+    name?: string;
+    disabled?: boolean;
   }) => (
     <textarea
-      data-testid="wbi-textarea"
+      data-testid={
+        props.name === "sftpPrivateKey" ? "wbi-private-key" : "wbi-textarea"
+      }
+      name={props.name}
+      disabled={props.disabled}
       value={props.value ?? ""}
       placeholder={props.placeholder}
       onChange={(event) => props.onChange(event.target.value)}
@@ -120,6 +126,7 @@ vi.mock("@/components/ui/select", () => {
 
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { FileUploadBlockForm } from "./FileUploadBlockForm";
 
 beforeEach(() => {
@@ -131,6 +138,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  useWorkflowYamlEditorStore.getState().setCommitInProgress(false);
   vi.useRealTimers();
   cleanup();
 });
@@ -138,7 +146,7 @@ afterEach(() => {
 function setFileUploadNode(
   id: string,
   overrides: Partial<{
-    storageType: "s3" | "azure" | "google_drive";
+    storageType: "s3" | "azure" | "google_drive" | "sftp";
     path: string;
     prompt: string | null;
     s3Bucket: string | null;
@@ -151,6 +159,7 @@ function setFileUploadNode(
     azureBlobContainerName: string | null;
     googleCredentialId: string | null;
     googleDriveFolderId: string | null;
+    sftpPrivateKey: string | null;
     editable: boolean;
   }> = {},
 ) {
@@ -171,6 +180,7 @@ function setFileUploadNode(
       azureBlobContainerName: overrides.azureBlobContainerName ?? null,
       googleCredentialId: overrides.googleCredentialId ?? null,
       googleDriveFolderId: overrides.googleDriveFolderId ?? null,
+      sftpPrivateKey: overrides.sftpPrivateKey ?? null,
       editable: overrides.editable ?? true,
       label: "file_upload_1",
       continueOnFailure: false,
@@ -190,6 +200,118 @@ describe("FileUploadBlockForm (SKY-9361)", () => {
     mockNodes.set("f1", { id: "f1", type: "task", data: {} });
     const { container } = render(<FileUploadBlockForm blockId="f1" />);
     expect(container.firstChild).toBeNull();
+  });
+
+  test("hides a saved SFTP private key and preserves it when saving untouched", async () => {
+    const privateKey = "saved-synthetic-key-marker";
+    setFileUploadNode("f1", {
+      storageType: "sftp",
+      sftpPrivateKey: privateKey,
+    });
+    render(<FileUploadBlockForm blockId="f1" />);
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(document.body.textContent).not.toContain(privateKey);
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(updateNodeData).not.toHaveBeenCalled();
+
+    const { getWorkflowBlocks } = await vi.importActual<
+      typeof import("../../workflowEditorUtils")
+    >("../../workflowEditorUtils");
+    const [savedBlock] = getWorkflowBlocks([mockNodes.get("f1") as never], []);
+    expect(savedBlock).toHaveProperty("sftp_private_key", privateKey);
+  });
+
+  test("keeps SFTP private-key parameter references editable", () => {
+    setFileUploadNode("f1", {
+      storageType: "sftp",
+      sftpPrivateKey: "{{ sftp_key }}",
+    });
+    render(<FileUploadBlockForm blockId="f1" />);
+
+    expect(
+      (screen.getByTestId("wbi-private-key") as HTMLTextAreaElement).value,
+    ).toBe("{{ sftp_key }}");
+    expect(screen.queryByText("A private key is saved and hidden.")).toBeNull();
+  });
+
+  test("resets the private-key draft when switching between upload blocks", () => {
+    setFileUploadNode("f1", {
+      storageType: "sftp",
+      sftpPrivateKey: "block-a-saved-key",
+    });
+    setFileUploadNode("f2", {
+      storageType: "sftp",
+      sftpPrivateKey: "block-b-saved-key",
+    });
+    const { rerender } = render(<FileUploadBlockForm blockId="f1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    fireEvent.change(screen.getByTestId("wbi-private-key"), {
+      target: { value: "block-a-replacement-draft" },
+    });
+
+    rerender(<FileUploadBlockForm blockId="f2" />);
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "block-a-replacement-draft",
+    );
+
+    rerender(<FileUploadBlockForm blockId="f1" />);
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "block-a-replacement-draft",
+    );
+  });
+
+  test("resets the private-key draft after an external value change", () => {
+    setFileUploadNode("f1", {
+      storageType: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    const { rerender } = render(<FileUploadBlockForm blockId="f1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    fireEvent.change(screen.getByTestId("wbi-private-key"), {
+      target: { value: "local-replacement-draft" },
+    });
+
+    setFileUploadNode("f1", {
+      storageType: "sftp",
+      sftpPrivateKey: "restored-key",
+    });
+    rerender(<FileUploadBlockForm blockId="f1" />);
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain("local-replacement-draft");
+  });
+
+  test("keeps a saved key hidden when removal is rejected during a YAML commit", () => {
+    setFileUploadNode("f1", {
+      storageType: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    render(<FileUploadBlockForm blockId="f1" />);
+    useWorkflowYamlEditorStore.getState().setCommitInProgress(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove key" }));
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(updateNodeData).not.toHaveBeenCalled();
   });
 
   test("renders s3 fields when storageType is 's3'", () => {

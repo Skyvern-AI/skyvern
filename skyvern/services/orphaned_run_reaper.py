@@ -1,13 +1,14 @@
-from datetime import timedelta
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from functools import partial
 
 import structlog
 
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import WORKER_CONTAINER_RESTARTED_REASON_CODE, classify_from_failure_reason
+from skyvern.forge.final_failure_diagnostic import log_diagnostic_unavailable
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
-from skyvern.forge.sdk.db.repositories.run_execution_leases import RunExecutionLease
+from skyvern.forge.sdk.db.repositories.run_execution_leases import REAPER_OWNER_SUFFIX, RunExecutionLease
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.executor.run_liveness import (
@@ -19,18 +20,25 @@ from skyvern.forge.sdk.executor.run_liveness import (
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
-from skyvern.forge.sdk.workflow.retry_policy import get_recorded_decision
+from skyvern.forge.sdk.workflow.retry_policy import get_recorded_decision, on_terminal_transition
 from skyvern.services import task_v2_service, uploaded_file_service
 
 LOG = structlog.get_logger()
+_STARTED = (WorkflowRunStatus.running, WorkflowRunStatus.paused)
+# A dispatcher can die after taking the lease but before its first running write.
+_NOT_STARTED = (WorkflowRunStatus.created, WorkflowRunStatus.queued)
+
+EXPIRED_SCAN_LIMIT = 500
+# One traversal walks the leases already expired when it started, page by page in (heartbeat_at, run_id) order.
+# None for both starts a new traversal from the oldest expired lease.
+_scan_cutoff: datetime | None = None
+_scan_after: tuple[datetime, str] | None = None
 
 
 async def _api_key(organization_id: str) -> str | None:
-    token = await app.DATABASE.organizations.get_valid_org_auth_token(
-        organization_id,
-        OrganizationAuthTokenType.api.value,
-    )
+    token = await get_valid_org_api_token(app.DATABASE.organizations, organization_id)
     if token is None:
         LOG.warning("Orphaned run webhook skipped: no API key", organization_id=organization_id)
         return None
@@ -38,6 +46,7 @@ async def _api_key(organization_id: str) -> str | None:
 
 
 async def _workflow_side_effects(run: WorkflowRun, attempt_number: int | None, has_attempts: bool) -> None:
+    log_diagnostic_unavailable(run.workflow_run_id, "orphan_reaper")
     if has_attempts:
         decision = await get_recorded_decision(run.workflow_run_id, attempt_number=attempt_number)
         if decision is None:
@@ -60,30 +69,39 @@ async def _workflow_side_effects(run: WorkflowRun, attempt_number: int | None, h
         await app.WORKFLOW_SERVICE.execute_workflow_webhook(run, api_key, claim_kind=None, finalizer="orphan_reaper")
 
 
-async def _task_v2_side_effects(run: WorkflowRun, task: TaskV2) -> None:
+async def _reload_task_v2(run_id: str, task: TaskV2) -> TaskV2:
     try:
-        task = await app.DATABASE.observer.get_task_v2(task.observer_cruise_id, task.organization_id) or task
+        return await app.DATABASE.observer.get_task_v2(task.observer_cruise_id, task.organization_id) or task
     except Exception:
-        LOG.warning("Failed to reload reaped task v2", run_id=run.workflow_run_id, exc_info=True)
+        LOG.warning("Failed to reload reaped task v2", run_id=run_id, exc_info=True)
+        return task
+
+
+async def _reload_task(task: Task) -> Task:
+    try:
+        return await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
+    except Exception:
+        LOG.warning("Failed to reload reaped task", run_id=task.task_id, exc_info=True)
+        return task
+
+
+# The runs list is synced before effects are queued: a saturated or cancelled effect queue must not leave it running.
+async def _sync_task_v2_run(run_id: str, organization_id: str, task: TaskV2) -> None:
+    task = await _reload_task_v2(run_id, task)
     try:
         await app.DATABASE.tasks.sync_task_run_status(
-            organization_id=run.organization_id,
+            organization_id=organization_id,
             run_id=task.observer_cruise_id,
             status=task.status.value,
             started_at=task.started_at,
             finished_at=task.finished_at,
         )
     except Exception:
-        LOG.warning("Failed to sync reaped task v2", run_id=run.workflow_run_id, exc_info=True)
-    await uploaded_file_service.delete_files_attached_to_run(run_id=run.workflow_run_id)
-    await task_v2_service.send_task_v2_webhook(task)
+        LOG.warning("Failed to sync reaped task v2", run_id=run_id, exc_info=True)
 
 
-async def _task_side_effects(task: Task) -> None:
-    try:
-        task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
-    except Exception:
-        LOG.warning("Failed to reload reaped task", run_id=task.task_id, exc_info=True)
+async def _sync_task_run(task: Task) -> None:
+    task = await _reload_task(task)
     try:
         await app.DATABASE.tasks.sync_task_run_status(
             organization_id=task.organization_id,
@@ -94,21 +112,78 @@ async def _task_side_effects(task: Task) -> None:
         )
     except Exception:
         LOG.warning("Failed to sync reaped task", run_id=task.task_id, exc_info=True)
+
+
+async def _task_v2_side_effects(run: WorkflowRun, task: TaskV2) -> None:
+    log_diagnostic_unavailable(run.workflow_run_id, "orphan_reaper")
+    task = await _reload_task_v2(run.workflow_run_id, task)
+    await uploaded_file_service.delete_files_attached_to_run(run_id=run.workflow_run_id)
+    await task_v2_service.send_task_v2_webhook(task)
+
+
+async def _task_side_effects(task: Task) -> None:
+    log_diagnostic_unavailable(task.task_id, "orphan_reaper")
+    task = await _reload_task(task)
     await uploaded_file_service.delete_files_attached_to_run(run_id=task.task_id)
     api_key = await _api_key(task.organization_id)
     if api_key:
         await app.agent.execute_task_webhook(task, api_key)
 
 
-async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[dict] | None) -> bool:
+async def _finish_committed_failure(run: WorkflowRun, attempt_number: int | None) -> None:
+    # The failed write committed before its finalizer raised, so the retry decision and child cascade may be
+    # missing. Both steps are idempotent; if either raises, the pass unclaims the lease and a later pass resumes.
+    await on_terminal_transition(
+        run,
+        WorkflowRunStatus.failed,
+        run.failure_reason,
+        run.failure_category,
+        attempt_number=attempt_number,
+        refresh_finished_at=False,
+        worker_container_restarted=True,
+    )
+    attempts = await app.DATABASE.workflow_run_attempts.get_attempts(run.workflow_run_id)
+    if attempts and max(row.attempt_number for row in attempts) != attempt_number:
+        return
+    await app.WORKFLOW_SERVICE.cascade_failed_child_entities(
+        run.workflow_run_id, run.organization_id, attempt_number=attempt_number
+    )
+
+
+async def _reap_workflow(
+    lease: RunExecutionLease, reason: str, category: list[dict] | None
+) -> tuple[bool, Callable[[], Awaitable[None]] | None]:
     run = await app.DATABASE.workflow_runs.get_workflow_run(lease.run_id)
-    if run is None or run.status not in (WorkflowRunStatus.running, WorkflowRunStatus.paused):
-        return False
+    if run is None:
+        return False, None
+    # Only a reaper pass leaves its own owner on a lease, so a reaper-owned lease on a run carrying this reaper's
+    # failure is one whose committed failure was not completed: resume it instead of releasing the lease.
+    resuming = (
+        lease.owner_id.endswith(REAPER_OWNER_SUFFIX)
+        and run.status == WorkflowRunStatus.failed
+        and run.failure_reason == reason
+    )
+    if not resuming and run.status not in (*_STARTED, *_NOT_STARTED):
+        return False, None
     attempts = await app.DATABASE.workflow_run_attempts.get_attempts(lease.run_id)
+    # A not-started run with attempt rows belongs to retry recovery, which dispatches it again.
+    eligible = list(_STARTED) if attempts else [*_STARTED, *_NOT_STARTED]
+    if not resuming and run.status not in eligible:
+        return False, None
     if attempts and max(row.attempt_number for row in attempts) != lease.attempt_number:
-        return False
+        return False, None
     task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(lease.run_id, run.organization_id)
-    if task_v2 is not None:
+    if resuming:
+        if task_v2 is not None and not task_v2.status.is_final():
+            return False, None
+        await _finish_committed_failure(run, lease.attempt_number)
+        if task_v2 is not None:
+            effect = partial(_task_v2_side_effects, run, task_v2)
+            outcome = "task_v2_webhook"
+        else:
+            effect = partial(_workflow_side_effects, run, lease.attempt_number, bool(attempts))
+            outcome = "retry_decision" if attempts else "webhook"
+    elif task_v2 is not None:
         won = await app.DATABASE.observer.update_task_v2_status_if_not_final(
             task_v2.observer_cruise_id,
             run.organization_id,
@@ -118,17 +193,18 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
         if not won:
             task_v2 = await app.DATABASE.observer.get_task_v2(task_v2.observer_cruise_id, run.organization_id)
             if task_v2 is None:
-                return False
+                return False, None
             if not task_v2.status.is_final():
-                return False
-            finalized = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
+                return False, None
+            finalized = await app.WORKFLOW_SERVICE._update_workflow_run_status_if_not_final(
                 lease.run_id,
                 WorkflowRunStatus(task_v2.status.value),
-                only_from=[WorkflowRunStatus.running, WorkflowRunStatus.paused],
+                only_from=eligible,
                 require_latest_attempt_number=lease.attempt_number,
             )
             if finalized is None:
-                return False
+                return False, None
+            await _sync_task_v2_run(lease.run_id, run.organization_id, task_v2)
         else:
             task_v2 = task_v2.model_copy(
                 update={
@@ -137,13 +213,14 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
                     "finished_at": task_v2.finished_at or naive_utc_now(),
                 }
             )
+            await _sync_task_v2_run(lease.run_id, run.organization_id, task_v2)
             try:
                 finalized = await app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final(
                     lease.run_id,
                     reason,
                     category,
                     cascade_children=True,
-                    only_from=[WorkflowRunStatus.running, WorkflowRunStatus.paused],
+                    only_from=eligible,
                     require_latest_attempt_number=lease.attempt_number,
                     worker_container_restarted=True,
                 )
@@ -158,9 +235,16 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
                 LOG.warning(
                     "Reaped workflow status committed before finalizer failed", run_id=lease.run_id, exc_info=True
                 )
+                await _finish_committed_failure(finalized, lease.attempt_number)
             if finalized is None:
-                return False
-        schedule_side_effects(partial(_task_v2_side_effects, finalized, task_v2))
+                # The task v2 write already committed `failed`, so its webhook and runs-list sync must still go out.
+                finalized = run
+        effect = partial(_task_v2_side_effects, finalized, task_v2)
+        if finalized.status != WorkflowRunStatus.failed or finalized.failure_reason != reason:
+            # Without this reaper's failure on the run a later pass cannot resume it, so a failed release would drop
+            # the effect; schedule it now.
+            schedule_side_effects(effect)
+            effect = None
         outcome = "task_v2_webhook"
     else:
         try:
@@ -169,7 +253,7 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
                 reason,
                 category,
                 cascade_children=True,
-                only_from=[WorkflowRunStatus.running, WorkflowRunStatus.paused],
+                only_from=eligible,
                 require_latest_attempt_number=lease.attempt_number,
                 worker_container_restarted=True,
             )
@@ -178,9 +262,10 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
             if finalized is None or finalized.status != WorkflowRunStatus.failed or finalized.failure_reason != reason:
                 raise
             LOG.warning("Reaped workflow status committed before finalizer failed", run_id=lease.run_id, exc_info=True)
+            await _finish_committed_failure(finalized, lease.attempt_number)
         if finalized is None:
-            return False
-        schedule_side_effects(partial(_workflow_side_effects, finalized, lease.attempt_number, bool(attempts)))
+            return False, None
+        effect = partial(_workflow_side_effects, finalized, lease.attempt_number, bool(attempts))
         outcome = "retry_decision" if attempts else "webhook"
     LOG.info(
         "Reaped orphaned workflow run",
@@ -189,18 +274,19 @@ async def _reap_workflow(lease: RunExecutionLease, reason: str, category: list[d
         attempt_number=lease.attempt_number,
         outcome=outcome,
     )
-    return True
+    return True, effect
 
 
 async def _reap_task(lease: RunExecutionLease, reason: str) -> bool:
     task = await app.DATABASE.tasks.get_task(lease.run_id)
-    if task is None or task.workflow_run_id is not None or task.status != TaskStatus.running:
+    eligible = [TaskStatus.created, TaskStatus.queued, TaskStatus.running]
+    if task is None or task.workflow_run_id is not None or task.status not in eligible:
         return False
     claimed = await app.DATABASE.tasks.bulk_update_tasks(
         [lease.run_id],
         status=TaskStatus.failed,
         failure_reason=reason,
-        only_if_status_in=[TaskStatus.running],
+        only_if_status_in=eligible,
     )
     if not claimed:
         return False
@@ -219,6 +305,7 @@ async def _reap_task(lease: RunExecutionLease, reason: str) -> bool:
         )
     except Exception:
         LOG.warning("Failed to finalize steps for reaped task", run_id=lease.run_id, exc_info=True)
+    await _sync_task_run(task)
     schedule_side_effects(partial(_task_side_effects, task))
     LOG.info(
         "Reaped orphaned task",
@@ -241,9 +328,19 @@ async def reap_orphaned_runs_once() -> None:
         exception_name=WORKER_CONTAINER_RESTARTED_REASON_CODE,
         fallback_to_unknown=True,
     )
+    global _scan_after, _scan_cutoff
     repository = app.DATABASE.run_execution_leases
-    expired = await repository.get_expired(naive_utc_now() - timedelta(minutes=timeout), limit=500)
-    reaper_id = owner_id() + ":reaper"
+    if _scan_cutoff is None:
+        _scan_cutoff = naive_utc_now() - timedelta(minutes=timeout)
+    expired = await repository.get_expired(_scan_cutoff, limit=EXPIRED_SCAN_LIMIT, after=_scan_after)
+    # Leases this pass cannot reap (registered here, lost claims, failing reaps) stay expired; resuming after this
+    # page keeps them from hiding younger expired leases. The cutoff stays fixed for the traversal, so leases that
+    # expire meanwhile wait for the next one instead of keeping every page full; a short page starts a new traversal.
+    if len(expired) == EXPIRED_SCAN_LIMIT:
+        _scan_after = (expired[-1].heartbeat_at, expired[-1].run_id)
+    else:
+        _scan_after = _scan_cutoff = None
+    reaper_id = owner_id() + REAPER_OWNER_SUFFIX
     for lease in expired:
         if is_run_registered(lease.run_id):
             continue
@@ -253,11 +350,16 @@ async def reap_orphaned_runs_once() -> None:
                 continue
             claimed = True
             won = False
+            effect = None
             if lease.run_type == "workflow_run":
-                won = await _reap_workflow(lease, reason, category)
+                won, effect = await _reap_workflow(lease, reason, category)
             elif lease.run_type == "task":
                 won = await _reap_task(lease, reason)
             await repository.release(reaper_id, [lease.run_id])
+            # A failed release leaves the lease reaper-owned and the next pass resumes this run, so its effects must
+            # wait for the release or they would go out once per pass.
+            if effect is not None:
+                schedule_side_effects(effect)
             if not won:
                 LOG.info(
                     "Released stale run lease",

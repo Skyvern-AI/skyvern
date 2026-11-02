@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import random
 import re
 import secrets
 import string
+import sys
 import time
 import uuid
 from asyncio.exceptions import CancelledError
@@ -16,13 +18,13 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, Sequence, Tuple, cast
+from typing import Any, Awaitable, Callable, Concatenate, Literal, NamedTuple, ParamSpec, Sequence, Tuple, cast
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TargetClosedError
-from playwright.async_api import Page
+from playwright.async_api import BrowserContext, Page
 from yutori.navigator.tools import GET_ELEMENT_BY_REF_SCRIPT, evaluate_tool_script
 
 from skyvern import analytics
@@ -33,6 +35,7 @@ from skyvern.constants import (
     BROWSER_PAGE_CLOSE_TIMEOUT,
     DEFAULT_MAX_SCREENSHOT_SCROLLS,
     DEFAULT_MAX_TOKENS,
+    ERROR_CODE_REASONING_MAX_LENGTH,
     GET_DOWNLOADED_FILES_TIMEOUT,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SCRAPE_TYPE_ORDER,
@@ -43,6 +46,7 @@ from skyvern.constants import (
 from skyvern.errors.errors import (
     GetTOTPVerificationCodeError,
     MissingTOTPSourceError,
+    OTPOutcomeUnconfirmedError,
     ReachMaxRetriesError,
     ReachMaxStepsError,
     SkyvernDefinedError,
@@ -52,11 +56,14 @@ from skyvern.errors.errors import (
     resolve_error_code_mapping_key,
 )
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
+    RUN_FINALIZED_ELSEWHERE_REASON,
     BrowserSessionAlreadyOccupiedError,
     BrowserSessionClosed,
     BrowserSessionDegraded,
     BrowserSessionNotFound,
     BrowserSessionOwnershipConflict,
+    ChildStartRefusedAfterLeaseLoss,
     CompletionGateTerminationError,
     DownloadFileMaxWaitingTime,
     DownloadSaveIncompleteError,
@@ -92,6 +99,7 @@ from skyvern.exceptions import (
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import (
     FailureCategory,
@@ -99,6 +107,7 @@ from skyvern.forge.failure_classifier import (
     classify_from_failure_reason,
     is_captcha_solve_failure,
 )
+from skyvern.forge.final_failure_diagnostic import annotate_failed_task
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import get_aws_client
 from skyvern.forge.sdk.api.files import (
@@ -127,7 +136,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     LLMResponseMissingActionsError,
 )
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
-from skyvern.forge.sdk.api.llm.utils import uses_only_anthropic_models
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata, uses_only_anthropic_models
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import (
     YutoriNavigatorLLMCaller,
@@ -150,8 +159,10 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import (
+    ExternalOTPUse,
     MultiFieldTotpAttempt,
     MultiFieldTotpRejection,
+    RunArm,
     SkyvernContext,
     UnconsumedOTPCode,
     action_for_multi_field_totp_persistence,
@@ -162,7 +173,12 @@ from skyvern.forge.sdk.core.skyvern_context import (
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.executor.run_liveness import note_run_finalized, run_lease_lost
+from skyvern.forge.sdk.executor.run_liveness import (
+    note_run_finalized,
+    run_lease_final_write_blocked,
+    run_lease_lost,
+    run_write_authority,
+)
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
@@ -176,8 +192,9 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import task_v3_disa
 from skyvern.forge.sdk.fail_fast.shadow import record_fail_fast_shadow
 from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
-from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
+from skyvern.forge.sdk.models import TASK_V3_TURN_STEP_CREATED_BY, SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.schemas.har_evidence import HarEvidence, HarEvidenceAvailability
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     external_browser_failure_reason,
@@ -186,6 +203,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import parse_totp_config
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.context_manager import NON_SECRET_CREDENTIAL_FIELDS, WorkflowRunContext
@@ -208,7 +226,16 @@ from skyvern.forge.taskv3.goal_check import (
     GoalJudge,
 )
 from skyvern.forge.taskv3.goal_composition import CodeProgressRecord
-from skyvern.forge.taskv3.loop import ACTION_BLOCK_TARGET_ACTION_RESERVE, LoopOutcome, RoundAction
+from skyvern.forge.taskv3.loop import (
+    ACTION_BLOCK_TARGET_ACTION_RESERVE,
+    DEFAULT_MAX_SETTLE_DEFERRALS,
+    DownloadSettle,
+    DownloadWait,
+    LoopOutcome,
+    RoundAction,
+    TurnRecord,
+    submissions_across_contexts,
+)
 from skyvern.forge.taskv3.pre_submit_capture import PreSubmitCaptureRing, is_run_sampled, pre_submit_screenshot
 from skyvern.forge.taskv3.provider_downloads import (
     PROVIDER_BASELINE_TIMEOUT_SECONDS,
@@ -216,17 +243,23 @@ from skyvern.forge.taskv3.provider_downloads import (
     ProviderDownloadRecovery,
 )
 from skyvern.forge.taskv3.run_arms import (
+    ANSWER_AUDIT_LOG_ONLY_FLAG,
     DATE_SEGMENT_AIM_FLAG,
+    DEAD_END_RETURN_FLAG,
+    LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
+    TURN_DOM_FLAG,
     resolve_run_arm,
+    run_arm_enabled,
 )
 from skyvern.forge.taskv3.target_label import compose_target_intention
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
 from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
     ValidationRouterResult,
     route_validation_evidence,
 )
-from skyvern.schemas.runs import CUA_ENGINES, RunEngine
+from skyvern.schemas.runs import CUA_ENGINES, ProxyLocation, RunEngine
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils, uploaded_file_service
 from skyvern.services.action_service import get_action_history
@@ -287,11 +320,13 @@ from skyvern.webeye.actions.actions import (
     CompleteVerifyResult,
     DecisiveAction,
     DownloadFileAction,
+    DragAction,
     ExtractAction,
     GotoUrlAction,
     HoverAction,
     InputTextAction,
     KeypressAction,
+    NullAction,
     ReloadPageAction,
     SelectOption,
     SelectOptionAction,
@@ -303,8 +338,11 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.actions.handler import (
     ActionHandler,
     _fill_multi_field_totp_group,
+    _refresh_stale_web_action_before_dispatch,
     _register_runtime_otp_value_best_effort,
     _resolve_multi_field_totp_code,
+    otp_dispatch_effect,
+    otp_single_dispatch,
 )
 from skyvern.webeye.actions.handler_utils import should_stop_batch_after_dropdown_select
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
@@ -319,6 +357,7 @@ from skyvern.webeye.actions.multi_field_totp import (
     clear_multi_field_totp_boxes,
     multi_field_totp_candidate_input_count,
     multi_field_totp_group_identity,
+    one_time_code_dispatch_kind,
     parse_multi_field_totp_rejection,
     submit_multi_field_totp_retry,
 )
@@ -329,6 +368,8 @@ from skyvern.webeye.actions.parse_actions import (
     parse_ui_tars_actions,
 )
 from skyvern.webeye.actions.responses import STALE_TARGET_TOOL_RESULT, ActionFailure, ActionResult, ActionSuccess
+from skyvern.webeye.browser_artifacts import DownloadBinding
+from skyvern.webeye.browser_diagnostics import collect_degraded_browser_diagnostics
 from skyvern.webeye.browser_driver_errors import is_driver_error
 from skyvern.webeye.browser_engine import BrowserEngineSelection, is_any_engine_error
 from skyvern.webeye.browser_errors import (
@@ -337,23 +378,33 @@ from skyvern.webeye.browser_errors import (
     is_context_lost_message,
     is_target_closed_message,
 )
-from skyvern.webeye.browser_state import BrowserState, get_browser_state_diagnostic
+from skyvern.webeye.browser_state import (
+    BrowserState,
+    browser_connection_lost_reason,
+    get_browser_connection_loss,
+    get_browser_state_diagnostic,
+)
 from skyvern.webeye.cdp_download_interceptor import (
+    STREAM_TO_DISK_THRESHOLD_BYTES,
+    DownloadTally,
+    _payload_contradiction_reason,
+    _sniff_payload_type,
+    _streamed_payload_contradiction_reason,
+    begin_replay_candidate_hold,
     consume_unsolicited_download_error_for_context,
     download_filename_from_suffix,
+    download_tally_for_context,
     has_download_interceptor_for_context,
     record_download_artifact_outcome_for_context,
+    replay_candidate_holds,
     settle_browser_downloads_for_context,
 )
 from skyvern.webeye.dom_inspection import read_current_url
+from skyvern.webeye.native_downloads import NativeDownloadAttempt, NativeDownloads
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.scraper.scraper import page_is_dead_blank, page_is_http_survivor
 from skyvern.webeye.utils.document import get_main_document_loader_id
 from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS, ScreenshotMode, SkyvernFrame, build_open_tabs_context
-
-if TYPE_CHECKING:
-    # Runtime import is local to _execute_task_v3: auth_tools imports the action handler, which imports this module.
-    from skyvern.forge.taskv3.auth_tools import VerificationState
 
 LOG = structlog.get_logger()
 BLANK_WORKFLOW_TASK_URLS = {"about:blank", ":"}
@@ -366,6 +417,7 @@ EMPTY_PAGE_RECOVERY_MAX_ATTEMPTS = 3
 # Poll cadence for the read-only claimed-dead-blank settlement observation (mirrors the 1s cadence of
 # the download-finished waiter). The observation is bounded by the reservation's remaining grace.
 _CLAIMED_DOWNLOAD_GRACE_POLL_SECONDS = 1.0
+_IN_FLIGHT_DOWNLOAD_CANCEL_POLL_SECONDS = 1.0
 _V3_BLANK_PAGE_SETTLE_POLLS = 8
 _V3_BLANK_PAGE_SETTLE_POLL_SECONDS = 0.25
 
@@ -392,6 +444,15 @@ CUA_EXECUTE_ACTIONS_DIRECTIVE = (
     "If the current screenshot does not give you enough information to act, or the required action is "
     "not supported, ask one specific clarifying question instead of guessing."
 )
+
+
+def _get_browser_state_for_cleanup(task: Task) -> BrowserState | None:
+    # Workflow blocks that never ran a v1 action (Task V3) register the browser under the run id only.
+    # A plain lookup avoids aliasing the task, which would make workflow-run teardown close the state twice.
+    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+    if browser_state is None and task.workflow_run_id:
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(task.workflow_run_id)
+    return browser_state
 
 
 async def resolve_inherited_workflow_task_page(browser_state: BrowserState, workflow_run_id: str) -> Page:
@@ -444,6 +505,21 @@ async def lost_external_browser_reason(
     )
 
 
+def run_browser_connection_lost_reason(task: Task, browser_state: BrowserState | None) -> str | None:
+    """The run's loss fact, looked up by run id when the caller never bound its own reference.
+
+    ``initialize_execution_state`` raises the already-gone browser out of ``execute_step`` before its
+    ``browser_state`` local is assigned, so that step's failure reason has only the run id to go on.
+    """
+    if browser_state is None:
+        browser_state = (
+            app.BROWSER_MANAGER.get_for_workflow_run(task.workflow_run_id)
+            if task.workflow_run_id
+            else app.BROWSER_MANAGER.get_for_task(task.task_id)
+        )
+    return browser_connection_lost_reason(browser_state)
+
+
 def fail_step_if_browser_already_gone(task: Task, step: Step, browser_state: BrowserState) -> None:
     """Probe liveness and fail the step if the browser is already known to be gone.
 
@@ -494,6 +570,7 @@ def mark_pdf_source_downloaded(pdf_src: str) -> None:
 _TASKV3_TOOL_ACTION_TYPES = {
     "click": ActionType.CLICK,
     "hover": ActionType.HOVER,
+    "drag": ActionType.DRAG,
     "type": ActionType.INPUT_TEXT,
     "select_option": ActionType.SELECT_OPTION,
     "select_combobox": ActionType.SELECT_OPTION,
@@ -505,6 +582,12 @@ _TASKV3_TOOL_ACTION_TYPES = {
     "solve_captcha": ActionType.SOLVE_CAPTCHA,
     "reload_page": ActionType.RELOAD_PAGE,
 }
+
+
+def _store_look_screenshots(step: Step, screenshots: list[bytes]) -> None:
+    app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
+        step=step, screenshots=screenshots, artifact_type=ArtifactType.SCREENSHOT_LLM
+    )
 
 
 def _taskv3_label_secret_values(task: Task, secret_values: Collection[str] = ()) -> set[str]:
@@ -591,6 +674,9 @@ _TASKV3_REASONING_MAX_CHARS = 1000
 # Same reason, for the outcome line: it can carry two page-supplied URLs (or, when the call reached no
 # page, the tool's own error text), and neither a URL nor a tool error has a length bound.
 _TASKV3_RESPONSE_MAX_CHARS = 500
+# A turn step write sits on the turn's critical path (the create precedes its model call), so a slow database
+# costs the run at most this per write instead of stalling it.
+_TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS = 3
 
 
 def _taskv3_row_response(outcome: dict[str, Any]) -> str | None:
@@ -674,6 +760,8 @@ def _taskv3_action_for_tool_call(tool_name: str, args: dict[str, Any], **fields:
         return ClickAction(element_id=selector, **fields)
     if tool_name == "hover":
         return HoverAction(element_id=selector, **fields)
+    if tool_name == "drag":
+        return DragAction(element_id=selector, **fields)
     if tool_name == "type":
         return InputTextAction(element_id=selector, text=str(args.get("text") or ""), **fields)
     if tool_name in ("select_option", "select_combobox"):
@@ -950,6 +1038,244 @@ def _mask_multi_field_totp_rejection_digits(value: str | None) -> str:
     return re.sub(r"[0-9]", "*", value or "")
 
 
+_OTP_RESEND_UNANSWERED_REASON = (
+    "A new one-time code was requested, but no new code arrived before the page load timeout. "
+    "The earlier code was not entered again."
+)
+
+
+def _external_otp_use(context: SkyvernContext, task_id: str) -> ExternalOTPUse | None:
+    """The task's entered external codes, unless the current code group takes a seed-generated TOTP."""
+    use = context.external_otp_uses.get(task_id)
+    attempt = context.multi_field_totp.get(task_id)
+    return None if use is None or (attempt is not None and attempt.code_source != "external") else use
+
+
+async def _external_otp_action_kind(
+    page: Page, scraped_page: ScrapedPage, use: ExternalOTPUse, action: Action
+) -> Literal["submit", "resend"] | None:
+    """Whether the action is a click or Enter on the code group's own submit or resend control."""
+    if not isinstance(action, (ClickAction, KeypressAction)):
+        return None
+    try:
+        return await one_time_code_dispatch_kind(
+            page,
+            scraped_page,
+            use.expected_digits,
+            element_id=action.element_id if isinstance(action, ClickAction) else None,
+            keys=action.keys if isinstance(action, KeypressAction) else None,
+        )
+    except Exception as exc:
+        # A control that cannot be tied to the group keeps the ordinary click semantics.
+        LOG.debug("Unable to tie an action to the one-time code group", error_type=type(exc).__name__)
+        return None
+
+
+async def _guard_external_otp_dispatch(
+    context: SkyvernContext, task_id: str, page: Page, scraped_page: ScrapedPage, action: Action
+) -> tuple[Literal["submit", "resend"] | None, ActionFailure | None]:
+    """A press of the group's submit control runs once per entered code; its resend control once per press."""
+    use = _external_otp_use(context, task_id)
+    kind = await _external_otp_action_kind(page, scraped_page, use, action) if use is not None else None
+    if use is None or kind is None or (kind == "submit" and use.current_code_hash is None):
+        return None, None
+    assert isinstance(action, (ClickAction, KeypressAction))
+    if kind == "submit" and use.current_code_hash in use.submitted_code_hashes:
+        LOG.info("Refused to press submit again for the same one-time code", task_id=task_id)
+        refusal = ActionFailure(
+            SkyvernException("The submit control was already pressed for this one-time code."),
+            stop_execution_on_failure=False,
+        )
+        return kind, refusal
+    action.repeat = 1
+    if kind == "submit" and use.current_code_hash is not None:
+        # Recorded before the press and undone only if the press is known not to have reached the page.
+        use.submitted_code_hashes = use.submitted_code_hashes | {use.current_code_hash}
+    return kind, None
+
+
+def _note_external_otp_dispatch(
+    context: SkyvernContext,
+    task_id: str,
+    kind: Literal["submit", "resend"],
+    results: list[ActionResult],
+    dispatched_at: datetime,
+) -> None:
+    use = context.external_otp_uses.get(task_id)
+    if use is None:
+        return
+    effect = otp_dispatch_effect.get()
+    if kind == "submit" and effect is None and not (results and results[-1].success) and use.current_code_hash:
+        use.submitted_code_hashes = use.submitted_code_hashes - {use.current_code_hash}
+    elif kind == "resend" and effect == "dispatched":
+        # The press reached the page, even if the action then failed or was cancelled: one fetch is authorized.
+        use.resend_requested_at = dispatched_at
+        use.resend_attempted = True
+        context.pop_totp_code(task_id)
+        context.totp_codes.pop(f"{task_id}_totp_cache", None)
+        LOG.info("Requested a new one-time code", task_id=task_id)
+
+
+def _external_otp_terminal_plan(
+    task: Task, step: Step, json_response: dict[str, Any], use: ExternalOTPUse
+) -> "ReplacedOTPPlan":
+    errors = (
+        [OTPOutcomeUnconfirmedError(reasoning=use.terminal_reasoning).to_user_defined_error()]
+        if use.terminal_error_code and use.terminal_reasoning
+        else []
+    )
+    return ReplacedOTPPlan(
+        json_response,
+        [
+            TerminateAction(
+                reasoning=use.terminal_reasoning,
+                intention=use.terminal_reasoning,
+                errors=errors,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                action_order=0,
+            )
+        ],
+    )
+
+
+async def _fetch_reissued_external_otp(
+    task: Task, context: SkyvernContext, use: ExternalOTPUse, requested_at: datetime
+) -> bool:
+    """The one bounded fetch a dispatched resend authorizes. It does not prove the site sent a code: it only
+    accepts a code not entered before, delivered after the press. A same-digit new code cannot be told apart."""
+    if task.organization_id is None or not (task.totp_verification_url or task.totp_identifier):
+        return False
+    workflow_run = (
+        await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id) if task.workflow_run_id else None
+    )
+    try:
+        otp_value = await poll_otp_value(
+            organization_id=task.organization_id,
+            task_id=task.task_id,
+            workflow_id=workflow_run.workflow_id if workflow_run else None,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=workflow_run.workflow_permanent_id if workflow_run else None,
+            totp_verification_url=task.totp_verification_url,
+            totp_identifier=task.totp_identifier,
+            created_after=requested_at,
+            expected_otp_type=OTPType.TOTP,
+            max_wait_seconds=settings.BROWSER_LOADING_TIMEOUT_MS / 1000,
+            rejected_code_hash=use.current_code_hash,
+            multi_field_expected_digits=use.expected_digits,
+        )
+    except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
+        otp_value = None
+    if (
+        otp_value is None
+        or otp_value.from_credential_seed
+        or context.external_otp_code_used(task.task_id, otp_value.value)
+    ):
+        LOG.info("No new one-time code arrived after the resend", task_id=task.task_id)
+        return False
+    context.register_secret_value(otp_value.value)
+    attempt = context.multi_field_totp.get(task.task_id)
+    if attempt is not None:
+        context.reset_attempt(task.task_id)
+        attempt.external_code_obtained_at = time.time()
+    context.totp_codes[f"{task.task_id}_totp_cache"] = otp_value.value
+    LOG.info("Accepted a new one-time code after the resend", task_id=task.task_id)
+    return True
+
+
+async def _plan_has_work_besides_reentry(
+    page: Page,
+    scraped_page: ScrapedPage,
+    use: ExternalOTPUse,
+    attempt: MultiFieldTotpAttempt | None,
+    actions: list[Action],
+) -> bool:
+    """Whether the plan does anything besides typing an entered code again or pressing submit again for it."""
+    reentry = _multi_field_totp_action_indices(actions, attempt, allow_partial=True) if attempt is not None else set()
+    for index, action in enumerate(actions):
+        if index in reentry or action.action_type in (ActionType.WAIT, ActionType.NULL_ACTION):
+            continue
+        if isinstance(action, InputTextAction) and attempt is not None and action.text == attempt.hint_code:
+            continue
+        if (
+            use.current_code_hash in use.submitted_code_hashes
+            and await _external_otp_action_kind(page, scraped_page, use, action) == "submit"
+        ):
+            continue
+        return True
+    return False
+
+
+async def _external_otp_reuse_plan(
+    agent: "ForgeAgent",
+    task: Task,
+    step: Step,
+    scraped_page: ScrapedPage,
+    browser_state: BrowserState,
+    json_response: dict[str, Any],
+) -> "ReplacedOTPPlan | None":
+    """When the plan asks for a code and only an entered one is available, never fetch or type it again.
+
+    The plan's other actions still run. If repeating the code is all it can do, the step waits within the
+    entry's page-load budget; then the normal completion check decides between completed and unconfirmed.
+    """
+    context = skyvern_context.current()
+    use = _external_otp_use(context, task.task_id) if context else None
+    if context is None or use is None:
+        return None
+    if use.terminal_reasoning is not None:
+        return _external_otp_terminal_plan(task, step, json_response, use)
+    if use.resend_requested_at is not None:
+        requested_at, use.resend_requested_at = use.resend_requested_at, None
+        await _fetch_reissued_external_otp(task, context, use, requested_at)
+    cached = context.totp_codes.get(f"{task.task_id}_totp_cache")
+    if not json_response.get("place_to_enter_verification_code") or (
+        cached and not context.external_otp_code_used(task.task_id, cached)
+    ):
+        return None
+    page = await browser_state.must_get_working_page()
+    actions = parse_actions(task, step.step_id, step.order, scraped_page, _require_actions_payload(json_response))
+    stamp_parsed_actions(actions)
+    attempt = context.multi_field_totp.get(task.task_id)
+    if await _plan_has_work_besides_reentry(page, scraped_page, use, attempt, actions):
+        return ReplacedOTPPlan(json_response, actions)
+    if use.deadline is not None and time.monotonic() < use.deadline:
+        return ReplacedOTPPlan(
+            json_response,
+            [
+                NullAction(
+                    reasoning="The one-time code was already entered; waiting for the page to respond.",
+                    organization_id=task.organization_id,
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=step.order,
+                    action_order=0,
+                )
+            ],
+        )
+    completion = await agent.check_user_goal_complete(
+        page=page, scraped_page=scraped_page, task=task, step=step, verification_trigger="periodic_after_step"
+    )
+    if isinstance(completion, CompleteAction):
+        completion.organization_id = task.organization_id
+        completion.workflow_run_id = task.workflow_run_id
+        completion.task_id = task.task_id
+        completion.step_id = step.step_id
+        completion.step_order = step.order
+        completion.action_order = 0
+        return ReplacedOTPPlan(json_response, [completion])
+    use.terminal_error_code = OTPOutcomeUnconfirmedError.model_fields["error_code"].default
+    use.terminal_reasoning = (
+        _OTP_RESEND_UNANSWERED_REASON if use.resend_attempted else OTPOutcomeUnconfirmedError().reasoning
+    )
+    LOG.info("One-time code outcome unconfirmed", task_id=task.task_id, step_id=step.step_id)
+    return _external_otp_terminal_plan(task, step, json_response, use)
+
+
 def _planner_confirmed_verification_code_intent(json_response: dict[str, Any]) -> bool:
     return (
         json_response.get("place_to_enter_verification_code") is True
@@ -1054,7 +1380,7 @@ def block_credential_parameter_keys(task_block: BaseTaskBlock | None, workflow_r
 
 
 def recovery_credential_release_guard(
-    task: Task, parameter_keys: Sequence[str] | None
+    task: Task, parameter_keys: Sequence[str] | None, *, enforce_vault_sites: bool
 ) -> CredentialReleaseGuard | None:
     """Arm a workflow-owned recovery's credentials against their saved sites, as the code block arms
     its own before running; None when no credential has a site to compare against."""
@@ -1067,18 +1393,27 @@ def recovery_credential_release_guard(
     for key in parameter_keys:
         tested_url = workflow_run_context.credential_tested_urls.get(key)
         fields = workflow_run_context.get_value_or_none(key)
-        armed = False
-        if tested_url and isinstance(fields, dict):
-            for field, placeholder in fields.items():
-                if field in NON_SECRET_CREDENTIAL_FIELDS:
-                    continue
-                secret = workflow_run_context.get_original_secret_value_or_none(placeholder)
-                armed |= guard.arm(secret, tested_url, key)
-        if not armed:
+        armed = (
+            guard.arm_login(
+                [
+                    workflow_run_context.get_original_secret_value_or_none(placeholder)
+                    for field, placeholder in fields.items()
+                    if field not in NON_SECRET_CREDENTIAL_FIELDS
+                ],
+                key,
+                tested_url=tested_url,
+                vault_sites=workflow_run_context.bitwarden_login_sites.get(key),
+                enforce_vault_sites=enforce_vault_sites,
+            )
+            if isinstance(fields, dict)
+            else []
+        )
+        if not any(entry.enforced for entry in armed):
             LOG.info(
                 "taskv3_credential_release_unarmed",
                 parameter_key=key,
                 has_tested_url=bool(tested_url),
+                observed=bool(armed),
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
             )
@@ -1440,16 +1775,31 @@ async def _read_task_v3_llm_name_override(
     return variant
 
 
-async def _resolve_task_v3_llm_key(task: Task) -> str:
-    """Resolve Task V3's LLM key, preserving explicit task keys and downgrading UI defaults."""
+async def _resolve_task_v3_llm_key(task: Task) -> tuple[str, RunArm | None]:
+    """Resolve Task V3's LLM key and the route arm applied to it; explicit keys keep their key and no arm."""
     if task.llm_key:
-        return task.llm_key
+        return task.llm_key, None
     # get_task builds Task without workflow_permanent_id; the run context is the reliable source.
     context = skyvern_context.current()
     workflow_permanent_id = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
     override = await _read_task_v3_llm_name_override(task.task_id, task.organization_id, workflow_permanent_id)
     resolved = override or settings.TASK_V3_LLM_KEY or settings.LLM_KEY
-    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved
+    treatment_key = app.AGENT_FUNCTION.get_task_v3_llm_route_treatment_key(resolved)
+    route_arm: RunArm | None = None
+    if context is not None and treatment_key:
+        # The arm is pinned per run, not the model: a later block with its own unpaired override keeps that key.
+        arm = await resolve_run_arm(
+            context,
+            LLM_ROUTE_FLAG,
+            distinct_id=task.workflow_run_id or task.task_id,
+            organization_id=task.organization_id,
+            forced=False,
+        )
+        if arm == "treatment":
+            resolved = treatment_key
+        if arm != "unrandomized":
+            route_arm = arm
+    return LLMAPIHandlerFactory.resolve_non_flex_llm_key_for_manual_run(resolved) or resolved, route_arm
 
 
 def _goal_judge_key_skip_reason(judge_key: str | None) -> str | None:
@@ -1478,6 +1828,28 @@ def _task_v3_run_secret_values(task: Task) -> set[str]:
     )
 
 
+def _redacted_user_defined_errors(task: Task, errors: list[UserDefinedError]) -> list[dict[str, Any]]:
+    """Serialize errors for the appending ``tasks.errors`` column, scrubbing run secrets first.
+
+    The codes come from a page read, so a redacted input does not make the output safe: a secret
+    typed into the form can come back in the reasoning, and this column leaves over the customer
+    webhook.
+    """
+    run_secrets = _task_v3_run_secret_values(task)
+    if not run_secrets:
+        return [error.model_dump() for error in errors]
+    return [
+        error.model_copy(
+            update={
+                # model_copy skips the reasoning field validator, and redaction can LENGTHEN the
+                # string, so re-apply the model's own bound rather than trusting what went in.
+                "reasoning": redact_secrets_from_text(error.reasoning, run_secrets)[:ERROR_CODE_REASONING_MAX_LENGTH]
+            }
+        ).model_dump()
+        for error in errors
+    ]
+
+
 def _is_transient_page_read_refusal(exc: BaseException) -> bool:
     """Whether a browser refused a read because the page closed, is mid-navigation, or lost the
     document's context. Matched on the message across every driver family the image can hold,
@@ -1489,6 +1861,47 @@ def _is_transient_page_read_refusal(exc: BaseException) -> bool:
     return (
         is_target_closed_message(message) or is_content_navigating_message(message) or is_context_lost_message(message)
     )
+
+
+_BLOCK_END_DOM_TIMEOUT_SECONDS = 5.0
+
+
+async def _read_page_html(browser_state: BrowserState) -> str | None:
+    # v1's html_scrape content. Callers cap it: the page lookup can wait on a lost-page recovery, and get_content's
+    # own timeout is 300 s.
+    page = await browser_state.get_working_page(prune_excess_pages=False)
+    if page is None:
+        return None
+    return await SkyvernFrame(frame=page, engine_selection=browser_state.engine_selection).get_content()
+
+
+async def _save_block_end_dom(browser_state: BrowserState, step: Step, task_id: str) -> None:
+    # Once per block after the loop.
+    started = time.monotonic()
+    html: str | None = None
+    reason = "no_working_page"
+    try:
+        async with asyncio.timeout(_BLOCK_END_DOM_TIMEOUT_SECONDS):
+            html = await _read_page_html(browser_state)
+    except Exception as exc:
+        reason = type(exc).__name__
+    if html is None:
+        LOG.info(
+            "taskv3 block-end DOM skipped",
+            task_id=task_id,
+            reason=reason,
+            capture_seconds=round(time.monotonic() - started, 3),
+        )
+        return
+    with contained_effect("task_v3 block-end DOM", task_id=task_id):
+        data = html.encode("utf-8")
+        app.ARTIFACT_MANAGER.accumulate_action_html_to_archive(step=step, html_action=data)
+        LOG.info(
+            "taskv3 block-end DOM captured",
+            task_id=task_id,
+            bytes=len(data),
+            capture_seconds=round(time.monotonic() - started, 3),
+        )
 
 
 async def _settle_before_post_action_screenshot(browser_state: BrowserState) -> None:
@@ -1699,26 +2112,6 @@ def _v3_task_status(
     return task_status, missing_extraction
 
 
-# Worded to stay clear of the classifier's credential and sign-in keywords: the customer's credentials
-# were never tried with a code, so neither category is the cause.
-_V3_TOTP_SOURCE_MISSING_REASON = (
-    "task_v3 could not produce the one-time code the page asked for: the credential has no usable TOTP "
-    "source for this block"
-)
-
-
-def _v3_totp_source_missing(task_status: TaskStatus, verification_state: "VerificationState") -> bool:
-    """Whether the run ended on a credential code it could not produce with no other code source at all --
-    the condition the step engine's MISSING_TOTP_SOURCE names."""
-    return (
-        task_status in (TaskStatus.failed, TaskStatus.terminated)
-        and verification_state.totp_source_missing
-        and verification_state.values_delivered == 0
-        and not verification_state.code_tool_offered
-        and not verification_state.source_failed
-    )
-
-
 def _v3_failure_reason(
     outcome: LoopOutcome,
     *,
@@ -1726,7 +2119,7 @@ def _v3_failure_reason(
     completion_rejection: str | None,
     missing_extraction: bool,
     run_secrets: Collection[str],
-    totp_source_missing: bool = False,
+    verification_status: str | None = None,
 ) -> str | None:
     if task_status in (TaskStatus.completed, TaskStatus.canceled):
         failure_reason = None
@@ -1734,8 +2127,9 @@ def _v3_failure_reason(
         failure_reason = f"task_v3 reported completion but {completion_rejection}"
     elif missing_extraction:
         failure_reason = "task_v3 reported completion but returned no extracted_output for the data-extraction goal"
-    elif totp_source_missing:
-        failure_reason = _V3_TOTP_SOURCE_MISSING_REASON
+    # Only the model's own give-up: a loop guard, a loop error or a spent budget ended the run for its own reason.
+    elif verification_status is not None and outcome.guard is None and outcome.status in ("failed", "terminated"):
+        failure_reason = f"{outcome.reason or outcome.status} (last verification code status: {verification_status})"
     else:
         failure_reason = outcome.reason or outcome.status
     # failure_reason is a first-class field on the task webhook payload, so the model's finish
@@ -1787,6 +2181,34 @@ def _v3_failure_category(
     return None
 
 
+_ExecuteArgs = ParamSpec("_ExecuteArgs")
+
+
+def _holding_replay_candidates(
+    execute: Callable[Concatenate["ForgeAgent", _ExecuteArgs], Awaitable[tuple[Step, Task]]],
+) -> Callable[Concatenate["ForgeAgent", _ExecuteArgs], Awaitable[tuple[Step, Task]]]:
+    """Holds a download block's replay candidates from before its download baseline through every exit, so a replay its
+    start URL left in flight waits for the model's selection and no hold outlives the block."""
+
+    @functools.wraps(execute)
+    async def holding(
+        agent: "ForgeAgent", /, *args: _ExecuteArgs.args, **kwargs: _ExecuteArgs.kwargs
+    ) -> tuple[Step, Task]:
+        task = cast(Task, kwargs["task"])
+        task_block = cast(BaseTaskBlock | None, kwargs.get("task_block"))
+        browser_state = cast(BrowserState, kwargs["browser_state"])
+        holds = bool(task_block is not None and task_block.complete_on_download and task.workflow_run_id)
+        # The context it began on: a mid-run reconnect swaps browser_state's, whose hold the run's watcher ends.
+        holding_context = browser_state.browser_context if holds else None
+        # Inside a block this joins its scope; alone it opens one. Either way the scope also ends the holds the run's
+        # download watch begins on contexts a reconnect hands it, after the task's cleanup, never one it borrowed.
+        with replay_candidate_holds(own=False):
+            begin_replay_candidate_hold(holding_context)
+            return await execute(agent, *args, **kwargs)
+
+    return holding
+
+
 class ForgeAgent:
     def __init__(self) -> None:
         self.async_operation_pool = AsyncOperationPool()
@@ -1800,12 +2222,15 @@ class ForgeAgent:
         list_files_before: list[str],
         randomize_if_missing: bool,
         attempt_started_at: datetime | None = None,
+        recorded_into: list[str] | None = None,
+        rejected_into: list[str] | None = None,
+        validate_claimed_type: bool = True,
     ) -> list[str]:
         """Rename newly downloaded files for a task before persistence.
 
         Returns the list of pre-rename file names discovered as new since
         ``list_files_before``, for logging continuity with the legacy inline
-        path.
+        path. ``recorded_into`` and ``rejected_into`` receive paths recorded or rejected by this call.
         """
         if not task.workflow_run_id:
             return []
@@ -1829,6 +2254,62 @@ class ForgeAgent:
         ]
         if not files_to_rename:
             return []
+        if validate_claimed_type:
+            requested_download_failure_reason = "The requested browser download could not be saved."
+            valid_files_to_rename = []
+            for file in files_to_rename:
+                if file.startswith(("s3://", "gs://")):
+                    valid_files_to_rename.append(file)
+                    continue
+                file_path = Path(workflow_download_directory, file)
+                if not file_path.exists():
+                    valid_files_to_rename.append(file)
+                    continue
+                original_filename = (
+                    context.download_suffix_applied_files.get(file_path.name, (file_path.name, ""))[0]
+                    if context
+                    else file_path.name
+                )
+
+                def _claimed_type_rejection_details(
+                    path: Path = file_path, claimed_filename: str = original_filename
+                ) -> tuple[str | None, int, str]:
+                    with path.open("rb") as payload:
+                        size = os.fstat(payload.fileno()).st_size
+                        if size >= STREAM_TO_DISK_THRESHOLD_BYTES:
+                            reason = _streamed_payload_contradiction_reason(payload, "", claimed_filename)
+                            payload.seek(0)
+                            sniffed_type = _sniff_payload_type(payload.read(4096))
+                            return reason, size, sniffed_type
+                        data = payload.read()
+                        reason = _payload_contradiction_reason(
+                            data, "", claimed_filename, allow_typed_extensionless_html=True
+                        )
+                        return reason, size, _sniff_payload_type(data)
+
+                try:
+                    rejection_reason, payload_size, sniffed_type = await asyncio.to_thread(
+                        _claimed_type_rejection_details
+                    )
+                except FileNotFoundError:
+                    continue
+                if rejection_reason is None:
+                    valid_files_to_rename.append(file)
+                    continue
+                LOG.warning(
+                    "Rejected downloaded file whose content contradicts its claimed type",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    reason=rejection_reason,
+                    size=payload_size,
+                    sniffed_type=sniffed_type,
+                )
+                if context is not None:
+                    context.record_download_failure(task.task_id, requested_download_failure_reason)
+                if rejected_into is not None:
+                    rejected_into.append(file)
+                file_path.unlink(missing_ok=True)
+            files_to_rename = valid_files_to_rename
         # A persistent-session download lands in the session dir and, for blob: URLs, is also written to
         # the run dir by the eager carve-out; dedupe the session copy by content so FileUploadBlock uploads
         # one file, not two (SKY-14276). Seed the snapshot only from local paths newly discovered for this
@@ -1846,6 +2327,8 @@ class ForgeAgent:
                     # A listed file that can't be read (vanished mid-finalization, permissions) just
                     # doesn't participate in dedupe — fail open toward materializing, never toward dropping.
                     continue
+        rejected_session_downloads: set[str] = set()
+        uncredited_session_downloads: set[str] = set()
         for file in files_to_rename:
             local_file_name = file
             if file.startswith(("s3://", "gs://")):
@@ -1853,13 +2336,38 @@ class ForgeAgent:
                     file_data = await get_aws_client().download_file(file, log_exception=False)
                 else:
                     file_data = await get_gcs_client().download_file(file, log_exception=False)
-                if not file_data:
+                if file_data is None:
+                    if validate_claimed_type:
+                        uncredited_session_downloads.add(file)
                     continue
+                if not file_data and not validate_claimed_type:
+                    continue
+                local_file_name = file.split("/")[-1]
+                if validate_claimed_type:
+                    applied_download = context.download_suffix_applied_files.get(local_file_name) if context else None
+                    original_filename = applied_download[0] if applied_download else local_file_name
+                    rejection_reason = _payload_contradiction_reason(
+                        file_data, "", original_filename, allow_typed_extensionless_html=True
+                    )
+                    if rejection_reason is not None:
+                        LOG.warning(
+                            "Rejected downloaded file whose content contradicts its claimed type",
+                            task_id=task.task_id,
+                            workflow_run_id=task.workflow_run_id,
+                            reason=rejection_reason,
+                            size=len(file_data),
+                            sniffed_type=_sniff_payload_type(file_data),
+                        )
+                        if context is not None:
+                            context.record_download_failure(task.task_id, requested_download_failure_reason)
+                        if rejected_into is not None:
+                            rejected_into.append(file)
+                        rejected_session_downloads.add(file)
+                        continue
                 candidate_checksum = hashlib.sha256(file_data).hexdigest()
                 if candidate_checksum in run_dir_checksums:
                     continue
                 run_dir_checksums.add(candidate_checksum)
-                local_file_name = file.split("/")[-1]
                 with open(os.path.join(workflow_download_directory, local_file_name), "wb") as f:
                     f.write(file_data)
 
@@ -1918,14 +2426,19 @@ class ForgeAgent:
                     desired_name_fp=diagnostic_fingerprint(desired_name),
                     will_rename=local_basename != desired_name,
                 )
+                recorded_path = os.path.join(workflow_download_directory, local_file_name)
                 if local_basename != desired_name:
-                    rename_file(os.path.join(workflow_download_directory, local_file_name), desired_name)
+                    recorded_path = rename_file(recorded_path, desired_name)
+                if recorded_into is not None:
+                    recorded_into.append(recorded_path)
                 continue
 
             if randomize_if_missing:
                 random_file_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
                 final_file_name = f"download-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{random_file_id}"
             else:
+                if recorded_into is not None:
+                    recorded_into.append(os.path.join(workflow_download_directory, local_file_name))
                 continue
 
             base_final_file_name = final_file_name
@@ -1936,12 +2449,18 @@ class ForgeAgent:
                 target_path = os.path.join(workflow_download_directory, final_file_name + file_extension)
                 counter += 1
 
-            rename_file(
+            recorded_path = rename_file(
                 os.path.join(workflow_download_directory, local_file_name),
                 final_file_name + file_extension,
             )
+            if recorded_into is not None:
+                recorded_into.append(recorded_path)
 
-        return files_to_rename
+        return [
+            file
+            for file in files_to_rename
+            if file not in rejected_session_downloads and file not in uncredited_session_downloads
+        ]
 
     async def _close_claimed_download_popups(
         self,
@@ -2047,6 +2566,7 @@ class ForgeAgent:
         attempt_started_at: datetime | None = None,
         exhausted: set[str] | None = None,
         should_cancel: Callable[[], Awaitable[bool]] | None = None,
+        native_failure_quiescent: Callable[[], Awaitable[bool]] | None = None,
     ) -> bool:
         """Block until any download the task already kicked off settles (or times out).
 
@@ -2088,7 +2608,7 @@ class ForgeAgent:
             if timeout_cap is not None:
                 timeout = min(timeout, timeout_cap)
             try:
-                if should_cancel is None:
+                if should_cancel is None and native_failure_quiescent is None:
                     await wait_for_download_finished(
                         downloading_files=downloading_files,
                         timeout=timeout,
@@ -2098,6 +2618,7 @@ class ForgeAgent:
                         downloading_files=downloading_files,
                         timeout=timeout,
                         should_cancel=should_cancel,
+                        native_failure_quiescent=native_failure_quiescent,
                     )
             except DownloadFileMaxWaitingTime as e:
                 LOG.warning(
@@ -2114,19 +2635,34 @@ class ForgeAgent:
         *,
         downloading_files: list[str],
         timeout: float,
-        should_cancel: Callable[[], Awaitable[bool]],
+        should_cancel: Callable[[], Awaitable[bool]] | None,
+        native_failure_quiescent: Callable[[], Awaitable[bool]] | None = None,
     ) -> bool:
         """Returns True when should_cancel fired and the wait was cut short; False on normal completion."""
         wait_task = asyncio.ensure_future(
             wait_for_download_finished(downloading_files=downloading_files, timeout=timeout)
         )
+        native_check: asyncio.Task[bool] | None = None
+
+        async def check_native() -> bool:
+            if native_failure_quiescent is not None and await native_failure_quiescent():
+                # Stop at the observation, before another poll could reuse a stale quiescent result.
+                wait_task.cancel()
+                return True
+            return False
+
         try:
+            # Probe at once: a retained partial from an already-failed download would otherwise cost a poll per call.
+            if native_failure_quiescent is not None:
+                native_check = asyncio.ensure_future(check_native())
             while True:
-                done, _pending = await asyncio.wait({wait_task}, timeout=1.0)
+                done, _pending = await asyncio.wait({wait_task}, timeout=_IN_FLIGHT_DOWNLOAD_CANCEL_POLL_SECONDS)
                 if wait_task in done:
+                    if wait_task.cancelled() and native_check is not None and await native_check:
+                        return False
                     await wait_task
                     return False
-                if await should_cancel():
+                if should_cancel is not None and await should_cancel():
                     LOG.info(
                         "Cancelling in-flight download wait: run was canceled",
                         downloading_files=downloading_files,
@@ -2135,11 +2671,19 @@ class ForgeAgent:
                     with contextlib.suppress(asyncio.CancelledError):
                         await wait_task
                     return True
+                if native_check is not None and native_check.done():
+                    # A True probe already cancelled wait_task; re-probing could re-raise that cancellation.
+                    if await native_check:
+                        return False
+                    native_check = None
+                if native_failure_quiescent is not None and native_check is None:
+                    native_check = asyncio.ensure_future(check_native())
         finally:
-            if not wait_task.done():
-                wait_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await wait_task
+            pending: list[asyncio.Future[Any]] = [wait_task] if native_check is None else [wait_task, native_check]
+            for pending_task in pending:
+                if not pending_task.done():
+                    pending_task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def create_task_and_step_from_block(
         self,
@@ -2214,15 +2758,15 @@ class ForgeAgent:
             task_order=task_order,
             task_retry=task_retry,
         )
-        # Update task status to running
         if await run_lease_lost(workflow_run.workflow_run_id):
-            task = await app.DATABASE.tasks.get_task(task.task_id, task.organization_id) or task
-        else:
-            task = await app.DATABASE.tasks.update_task(
-                task_id=task.task_id,
-                organization_id=task.organization_id,
-                status=TaskStatus.running,
-            )
+            await self.fail_child_task_after_lease_loss(task)
+            raise ChildStartRefusedAfterLeaseLoss(task.task_id)
+        # Update task status to running
+        task = await app.DATABASE.tasks.update_task(
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            status=TaskStatus.running,
+        )
 
         step = await app.DATABASE.tasks.create_step(
             task.task_id,
@@ -2239,6 +2783,19 @@ class ForgeAgent:
             retry_index=step.retry_index,
         )
         return task, step
+
+    async def fail_child_task_after_lease_loss(self, task: Task) -> None:
+        # Another process owns the run now, so the child this process just created must not stay open.
+        try:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                status=TaskStatus.failed,
+                failure_reason=RUN_FINALIZED_ELSEWHERE_REASON,
+                keep_final_status=True,
+            )
+        except Exception:
+            LOG.warning("Failed to fail child task after run lease loss", task_id=task.task_id, exc_info=True)
 
     async def create_task_and_step_from_code_block(
         self,
@@ -2264,19 +2821,21 @@ class ForgeAgent:
                 retry=task_retry,
             )
             if await run_lease_lost(workflow_run_id):
-                task = await app.DATABASE.tasks.get_task(task.task_id, organization_id) or task
-            else:
-                task = await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=organization_id,
-                    status=TaskStatus.running,
-                )
+                await self.fail_child_task_after_lease_loss(task)
+                raise ChildStartRefusedAfterLeaseLoss(task.task_id)
+            task = await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.running,
+            )
             step = await app.DATABASE.tasks.create_step(
                 task.task_id,
                 order=0,
                 retry_index=0,
                 organization_id=organization_id,
             )
+        except ChildStartRefusedAfterLeaseLoss:
+            raise
         except Exception:
             if task is not None:
                 with contextlib.suppress(Exception):
@@ -2344,6 +2903,7 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
+    @_holding_replay_candidates
     async def _execute_task_v3(
         self,
         *,
@@ -2358,6 +2918,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_enforce_vault_sites: bool = True,
         recovery_code_progress: CodeProgressRecord | None = None,
     ) -> tuple[Step, Task]:
         """Run a whole task via the native Task V3 tool-loop (one persistent conversation).
@@ -2400,9 +2961,9 @@ class ForgeAgent:
             sanitize_handoff_url,
             string_leaves,
         )
-        from skyvern.forge.taskv3.loop import DEFAULT_MAX_SETTLE_DEFERRALS, CompletionBlocker, CompletionProbe
         from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
         from skyvern.forge.taskv3.tools import (
+            NO_ONE_TIME_CODE_SOURCE,
             _document_unidentifiable,
             _observable_child_frames,
             _realm_document_id,
@@ -2441,7 +3002,8 @@ class ForgeAgent:
             # actions, so a lost page yields None and the verdict is accepted as-is.
             return await browser_state.get_working_page()
 
-        llm_caller = LLMCaller(llm_key=await _resolve_task_v3_llm_key(task))
+        llm_key, llm_route_arm = await _resolve_task_v3_llm_key(task)
+        llm_caller = LLMCaller(llm_key=llm_key)
         workflow_run_context = (
             app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(task.workflow_run_id)
             if task.workflow_run_id and app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(task.workflow_run_id)
@@ -2455,6 +3017,7 @@ class ForgeAgent:
         ):
             parameters = workflow_run_context.represent_plaintext_secrets_as_placeholders(parameters)
         context = skyvern_context.current()
+        turn_dom_arm: RunArm = "unrandomized"
         if context:
             # Once for the whole run, before anything reads it: the tool list is built from these reads,
             # and a value that could change afterwards would leave it describing a different run than the
@@ -2473,6 +3036,27 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_LOGIN_PACE,
                 properties={"workflow_permanent_id": task.workflow_permanent_id or context.workflow_permanent_id or ""},
+            )
+            await resolve_run_arm(
+                context,
+                DEAD_END_RETURN_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_DEAD_END_RETURN,
+            )
+            await resolve_run_arm(
+                context,
+                ANSWER_AUDIT_LOG_ONLY_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=False,
+            )
+            turn_dom_arm = await resolve_run_arm(
+                context,
+                TURN_DOM_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=False,
             )
         page_free_validation = bool(
             task_block is not None
@@ -2653,19 +3237,22 @@ class ForgeAgent:
                 )
                 download_baseline_files = download_baseline_files + browser_session_downloaded_files
 
-        # Passed to the loop below as well, so a download-wait probe caps its wait at what's left
+        # Passed to the loop below as well, so a download wait caps itself at what's left
         # of the same deadline the loop enforces.
         loop_deadline_seconds = DEFAULT_DEADLINE_SECONDS
         loop_deadline_at = time.monotonic() + loop_deadline_seconds
-        # Shared across every probe call: a path that already hit DownloadFileMaxWaitingTime once
+        # Shared by every download wait and settle: a path that already hit DownloadFileMaxWaitingTime once
         # is excluded from later waits instead of being re-awaited on every subsequent action.
         download_wait_exhausted: set[str] = set()
 
         download_finalized = False
+        # Files settle already recorded, as the finalizer left them, so a later settle records only files new since.
+        recorded_files: list[str] = []
+        recorded_count = 0
         download_completion_reason: str | None = None
 
         # Owned here (not by the engine) so the final clean_up_task below can also exclude names
-        # tools staged into the downloads dir this run, whether or not the probe ever finalized.
+        # tools staged into the downloads dir this run, whether or not a download settle ever finalized.
         class _StagedDownloads(set[str]):
             # file_upload reports a basename for every source, but only http(s) sources are staged
             # into the downloads dir; a name that isn't there must not shadow a later real download.
@@ -2699,18 +3286,107 @@ class ForgeAgent:
         def _provider_wait_seconds(block: BaseTaskBlock) -> float:
             return min(block.download_timeout or PROVIDER_DOWNLOAD_WAIT_SECONDS, loop_deadline_at - time.monotonic())
 
-        completion_probe: CompletionProbe | None = None
-        completion_blocker: CompletionBlocker | None = None
+        native_download_attempt: NativeDownloadAttempt | None = None
+
+        def _native_attempt_eligible() -> bool:
+            artifacts = browser_state.browser_artifacts
+            observer = artifacts.native_downloads
+            if (
+                native_download_attempt is None
+                or observer is None
+                or observer.attempt is not native_download_attempt
+                or native_download_attempt.task_id != task.task_id
+                or browser_state.browser_context is not observer.context
+                or workflow_download_directory is None
+                or observer.download_dir != workflow_download_directory.resolve()
+                or task.browser_session_id
+                or browser_session_id
+                or artifacts.download_binding != DownloadBinding.RUN_DIR
+                or artifacts.get_action_download_source() is not None
+                or getattr(observer.context, "_skyvern_cdp_download_interceptor", None) is not None
+                or getattr(observer.context, "_skyvern_external_browser", False) is True
+            ):
+                return False
+            return True
+
+        async def _native_failure_quiescent() -> bool:
+            if not _native_attempt_eligible() or native_download_attempt is None:
+                return False
+            quiet = await native_download_attempt.failed_and_quiescent()
+            return quiet and _native_attempt_eligible()
+
+        download_wait: DownloadWait | None = None
+        download_settle: DownloadSettle | None = None
         if task_block is not None and task_block.complete_on_download and task.workflow_run_id:
             complete_on_download_block = task_block
 
-            async def _download_completion_probe(staged: frozenset[str]) -> str | None:
-                nonlocal download_finalized, download_completion_reason
-                # A finish deferred by the settle gate re-probes; finalizing again would re-rename
-                # the same file (or re-fetch a browser-session download).
-                if download_finalized:
-                    return download_completion_reason
+            def _kept_after_recording(recorded: list[str], outputs: list[str]) -> list[str]:
+                # What still names a recorded file: its run-directory output, and a session id (never removed). A local
+                # name the rename vacated is excluded no longer, so a later download saved under it is still new.
+                return [*outputs, *(name for name in recorded if name.startswith(("s3://", "gs://")))]
+
+            replay_drain_until: float | None = None
+
+            async def _settle_context(browser_context: BrowserContext) -> None:
+                async with settle_browser_downloads_for_context(browser_context, keep_producers=True):
+                    pass
+
+            async def _drain_held_replays() -> bool:
+                """False when the run was canceled. A replay a hold admitted is a candidate before this verdict,
+                not in cleanup after it; one in flight past the block's download timeout fails the verdict closed."""
+                nonlocal replay_drain_until
+                if replay_drain_until is None:
+                    timeout = complete_on_download_block.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
+                    replay_drain_until = min(loop_deadline_at, time.monotonic() + timeout)
+                drained: BrowserContext | None = None
+                # Rechecked, so a context a reconnect hands the browser state during the wait is drained too.
+                while (current := browser_state.browser_context) is not drained:
+                    if not has_download_interceptor_for_context(current):
+                        break
+                    drained, drain = current, asyncio.ensure_future(_settle_context(current))
+                    try:
+                        # Polled like the download wait; a replay left in flight stays the interceptor's until teardown.
+                        while (await asyncio.wait({drain}, timeout=1.0))[1]:
+                            if await _should_cancel():
+                                return False
+                            if time.monotonic() >= replay_drain_until:
+                                raise TimeoutError("a download this block's hold admitted is still in flight")
+                    finally:
+                        drain.cancel()
+                        await asyncio.wait({drain})
+                    drain.result()
+                # Quiescent: a download begun after this gets its own window, as a new file does in the download wait.
+                replay_drain_until = None
+                return True
+
+            async def _settle_downloads(staged: frozenset[str]) -> str | None:
+                nonlocal download_finalized, download_completion_reason, recorded_files, recorded_count
                 assert workflow_download_directory is not None  # set alongside complete_on_download above
+                if not await _drain_held_replays():
+                    return None
+                staged_paths = [str(workflow_download_directory / name) for name in sorted(staged)]
+                if download_finalized:
+                    # A candidate selected after a held finish lands after this block recorded its files. The files
+                    # already recorded (their names before and after renaming) are excluded, so none is renamed, or a
+                    # browser-session download re-fetched, twice; with none new this returns the recorded result.
+                    recorded_now: list[str] = []
+                    before = [*(download_baseline_files or []), *staged_paths, *recorded_files]
+                    later = await self._finalize_downloaded_files_for_task(
+                        task,
+                        organization_id=organization.organization_id,
+                        download_suffix=complete_on_download_block.download_suffix,
+                        list_files_before=before,
+                        randomize_if_missing=True,
+                        attempt_started_at=attempt_started_at,
+                        recorded_into=recorded_now,
+                        validate_claimed_type=False,
+                    )
+                    if later:
+                        recorded_files = [*recorded_files, *_kept_after_recording(later, recorded_now)]
+                        recorded_count += len(later)
+                        download_completion_reason = f"download completed ({recorded_count} new file(s))"
+                        LOG.info("Task V3 download finalized", task_id=task.task_id, num_new_files=len(later))
+                    return download_completion_reason
                 cancelled = await self._wait_for_in_flight_downloads(
                     task,
                     complete_on_download_block,
@@ -2719,6 +3395,7 @@ class ForgeAgent:
                     exhausted=download_wait_exhausted,
                     should_cancel=_should_cancel,
                     attempt_started_at=attempt_started_at,
+                    native_failure_quiescent=_native_failure_quiescent,
                 )
                 if cancelled:
                     # The run is being canceled; even if a file landed while we waited, don't
@@ -2734,55 +3411,45 @@ class ForgeAgent:
                 # landed meanwhile must not be finalized into a `completed` result.
                 if await _should_cancel():
                     return None
-                staged_paths = [str(workflow_download_directory / name) for name in sorted(staged)]
+                recorded_now = []
+                before = [*(download_baseline_files or []), *staged_paths]
                 new_files = await self._finalize_downloaded_files_for_task(
                     task,
                     organization_id=organization.organization_id,
                     download_suffix=complete_on_download_block.download_suffix,
-                    list_files_before=[*(download_baseline_files or []), *staged_paths],
+                    list_files_before=before,
                     randomize_if_missing=True,
                     attempt_started_at=attempt_started_at,
+                    recorded_into=recorded_now,
+                    validate_claimed_type=False,
                 )
                 if not new_files:
                     return None
+                if context is not None:
+                    context.download_completed_task_ids.add(task.task_id)
                 download_finalized = True
+                recorded_files = _kept_after_recording(new_files, recorded_now)
+                recorded_count = len(new_files)
                 download_completion_reason = f"download completed ({len(new_files)} new file(s))"
                 LOG.info(
-                    "Task V3 task completed due to download",
+                    "Task V3 download finalized",
                     task_id=task.task_id,
                     num_new_files=len(new_files),
                 )
                 return download_completion_reason
 
-            async def _download_completion_blocker(staged: frozenset[str]) -> str | None:
-                reason = await _download_completion_probe(staged)
-                if reason:
-                    return None
-                return (
-                    "This task only completes once a file download finishes, and no download has "
-                    "been detected yet. Trigger the download, or finish with the non-completed "
-                    "status the finish tool's own rule gives this outcome if it cannot be triggered."
-                )
-
-            # A data-extraction goal needs the model to keep the turn and call finish() itself;
-            # ending the loop from the probe would drop the extraction. The blocker still
-            # withholds completion until the download lands.
-            if not (task.data_extraction_goal or task.extracted_information_schema):
-                completion_probe = _download_completion_probe
-            completion_blocker = _download_completion_blocker
-        elif (
+            download_settle = _settle_downloads
+        if (
             task_block is not None
-            and task_block.download_timeout is not None
-            and not task_block.complete_on_download
+            and (task_block.complete_on_download or task_block.download_timeout is not None)
             and task.workflow_run_id
         ):
-            # download_timeout alone carries no completion semantics; v1 bounds a post-action
-            # download-settle wait with it, so v3 gets an equivalent wait-only probe that never
-            # ends the run or blocks finish.
+            # As in v1, a download an action started lands (or hits download_timeout) before the model's next
+            # turn, so the next result can report it; the wait never ends the run or blocks finish.
             wait_only_block = task_block
 
-            async def _download_wait_only_probe(staged: frozenset[str]) -> str | None:
-                await self._wait_for_in_flight_downloads(
+            async def _download_wait() -> None:
+                if await self._wait_for_in_flight_downloads(
                     task,
                     wait_only_block,
                     organization.organization_id,
@@ -2790,10 +3457,22 @@ class ForgeAgent:
                     exhausted=download_wait_exhausted,
                     should_cancel=_should_cancel,
                     attempt_started_at=attempt_started_at,
-                )
-                return None
+                    # Only a complete_on_download block has the failure watch that tells the model why it ended early.
+                    native_failure_quiescent=_native_failure_quiescent
+                    if wait_only_block.complete_on_download
+                    else None,
+                ):
+                    return
+                # A vendor session can keep a file its replay could not fetch; reading it back into the run dir is
+                # what lets the next result name it.
+                if provider_recovery is not None and wait_only_block.complete_on_download:
+                    await provider_recovery.recover(
+                        staged=staged_downloads,
+                        timeout=_provider_wait_seconds(wait_only_block),
+                        should_cancel=_should_cancel,
+                    )
 
-            completion_probe = _download_wait_only_probe
+            download_wait = _download_wait
 
         # Honor a step cap (per-request override, task, or org, else the same MAX_STEPS_PER_RUN default
         # the step engine uses) as the ACTION-round budget: a v3 step is one action round (a turn that
@@ -2899,6 +3578,87 @@ class ForgeAgent:
                 v3_round_index += 1
             v3_round_billed = False
 
+        # One step row per loop turn beside this block's own `step`: the turn's model call, its tool calls and the
+        # action rows it wrote land on it. `step` keeps the run's status, billing and step-budget unit.
+        v3_turn_step: Step | None = None
+        v3_turn_step_open = False
+        # A randomized arm decides; an unrandomized run (self-hosted, a failed evaluation) falls back to the env
+        # rate, salted so this sample is independent of the pre-submit one, which buckets the same run key.
+        turn_dom_sampled = run_arm_enabled(TURN_DOM_FLAG, forced=False) or (
+            turn_dom_arm == "unrandomized"
+            and is_run_sampled(
+                f"turn_dom:{task.workflow_run_id or task.task_id}", settings.TASK_V3_TURN_DOM_SAMPLE_RATE
+            )
+        )
+        turn_dom = (
+            TurnDomCapture(
+                functools.partial(_read_page_html, browser_state),
+                app.ARTIFACT_MANAGER.accumulate_html_scrape_to_archive,
+            )
+            if not page_free_validation and turn_dom_sampled
+            else None
+        )
+
+        async def _on_turn_start(turn: int) -> Step | None:
+            turn_step = await _open_v3_turn_step(turn)
+            if turn_dom is not None:
+                turn_dom.start(turn_step, turn)
+            return turn_step
+
+        async def _open_v3_turn_step(turn: int) -> Step | None:
+            nonlocal v3_turn_step, v3_turn_step_open
+            v3_turn_step, v3_turn_step_open = None, False
+            try:
+                async with asyncio.timeout(_TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS):
+                    v3_turn_step = await app.DATABASE.tasks.create_step(
+                        task_id=task.task_id,
+                        order=turn,
+                        # The LLM layer reads the attributed step's retry_index to decide whether to send screenshots.
+                        retry_index=step.retry_index,
+                        organization_id=task.organization_id,
+                        status=StepStatus.running,
+                        created_by=TASK_V3_TURN_STEP_CREATED_BY,
+                    )
+            except Exception:
+                # The turn's model call and rows then land on the block's step, as before turn steps existed.
+                LOG.warning("task_v3 failed to create turn step", task_id=task.task_id, turn=turn, exc_info=True)
+                v3_turn_step = None
+                return None
+            v3_turn_step_open = True
+            return v3_turn_step
+
+        async def _finish_v3_turn_step(status: StepStatus, record: TurnRecord | None) -> None:
+            nonlocal v3_turn_step_open
+            if v3_turn_step is None or not v3_turn_step_open:
+                return
+            v3_turn_step_open = False
+            with contained_effect("task_v3 turn step finish", task_id=task.task_id, step_id=v3_turn_step.step_id):
+                async with asyncio.timeout(_TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS):
+                    await app.DATABASE.tasks.finish_step(
+                        task_id=task.task_id,
+                        step_id=v3_turn_step.step_id,
+                        organization_id=task.organization_id,
+                        write_authority_for_run=run_write_authority,
+                        status=status,
+                        output=AgentStepOutput(
+                            llm_seconds=record.llm_seconds if record else None,
+                            tool_calls=record.tool_calls if record else None,
+                            page_dom=turn_dom.turn_output() if turn_dom is not None else None,
+                        ),
+                    )
+            if turn_dom is not None:
+                # A sampled run keeps each turn durable as it ends; the rest share the block's ZIP.
+                app.ARTIFACT_MANAGER.flush_step_archive_in_background(v3_turn_step)
+
+        async def _on_turn_end(record: TurnRecord) -> None:
+            if record.outcome_status == "canceled":
+                status = StepStatus.canceled
+            elif record.outcome_status == "loop_error":
+                status = StepStatus.failed
+            else:
+                status = StepStatus.completed
+            await _finish_v3_turn_step(status, record)
+
         async def _on_action_round(
             round_actions: list[RoundAction], turn_reasoning: str | None, /, *, round_done: bool
         ) -> None:
@@ -2921,7 +3681,7 @@ class ForgeAgent:
                 await _settle_before_post_action_screenshot(browser_state)
                 screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
                 screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
-                    step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=screenshot
+                    step=v3_turn_step or step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=screenshot
                 )
             except Exception:
                 LOG.warning("task_v3 failed to capture post-action screenshot", task_id=task.task_id, exc_info=True)
@@ -2937,7 +3697,7 @@ class ForgeAgent:
                 turn_reasoning = turn_reasoning[:_TASKV3_REASONING_MAX_CHARS]
             for round_action in round_actions:
                 v3_round_billed = v3_round_billed or round_action.billable
-                # A row that bills nothing rides the LAST consumed index (or the single Step's own
+                # A row that bills nothing rides the LAST consumed index (or the block step's own
                 # order 0) the way the decision row below does: the workflow-run step budget counts
                 # distinct (task_id, step_order) pairs, and a fresh index nothing later claims would
                 # open one of its own. Read per row because a row publishes before the rest of its
@@ -2949,6 +3709,7 @@ class ForgeAgent:
                         args if isinstance(args, dict) else {}, secret_values, placeholder_ids
                     )
                     selector = tool_args.get("selector", "")
+                    drop_target = f" onto {tool_args['target']}" if name == "drag" and tool_args.get("target") else ""
                     row_response = _taskv3_row_response(round_action.outcome) if round_action.outcome else None
                     if row_response is not None:
                         # The outcome carries page-supplied URLs the arg redaction above never saw, and a
@@ -2978,13 +3739,13 @@ class ForgeAgent:
                         organization_id=task.organization_id,
                         workflow_run_id=task.workflow_run_id,
                         task_id=task.task_id,
-                        step_id=step.step_id,
-                        # Round index, not the single Step's order: makes each BILLABLE v3 action
+                        step_id=(v3_turn_step or step).step_id,
+                        # Round index, not the turn step's order: makes each BILLABLE v3 action
                         # ROUND count as one unit of the workflow-run step budget (distinct (task,
                         # order) pairs).
                         step_order=row_step_order,
                         action_order=len(v3_persisted_actions),
-                        description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}".strip(),
+                        description=f"{TASK_V3_ACTION_DESCRIPTION_PREFIX}{name} {selector}{drop_target}".strip(),
                         screenshot_artifact_id=screenshot_artifact_id,
                         reasoning=turn_reasoning,
                         intention=_taskv3_row_intention(task, round_action, secret_values, tool_args),
@@ -3043,7 +3804,9 @@ class ForgeAgent:
         )
         release_guard = (
             recovery_credential_release_guard(
-                task, recovery_release_parameter_keys or recovery_credential_parameter_keys
+                task,
+                recovery_release_parameter_keys or recovery_credential_parameter_keys,
+                enforce_vault_sites=recovery_enforce_vault_sites,
             )
             if task_block is None and workflow_owned_recovery
             else None
@@ -3190,9 +3953,18 @@ class ForgeAgent:
         prev_active_credential_parameter_key = context.active_credential_parameter_key if context else None
         if context and credential_parameter_key is not None:
             context.active_credential_parameter_key = credential_parameter_key
+        observer = browser_state.browser_artifacts.native_downloads
+        if (
+            isinstance(observer, NativeDownloads)
+            and observer.context is browser_state.browser_context
+            and task_block is not None
+            and not task.browser_session_id
+            and not browser_session_id
+        ):
+            native_download_attempt = observer.begin_attempt(task.task_id)
         try:
-            # Built AFTER the credential pin: the tool-offer gate (has_credential_totp_candidate)
-            # must see the pinned key, or a multi-credential context hides get_verification_code.
+            # Built AFTER the credential pin: the code-source check (has_credential_totp_candidate)
+            # must see the pinned key, or a multi-credential context reads as having no code source.
             # No page provider in page-free mode: the sign-in-link tool navigates, and a run that
             # structurally never touches the live DOM must not be offered it.
             verification_state = VerificationState(
@@ -3264,16 +4036,27 @@ class ForgeAgent:
                     )
 
             async def _completion_gate() -> bool:
-                return await app.AGENT_FUNCTION.gate_step_completion(
-                    task=task,
-                    step=step,
-                    task_block=task_block,
-                    page=await browser_state.get_working_page(),
-                    browser_state=browser_state,
-                )
+                try:
+                    return await app.AGENT_FUNCTION.gate_step_completion(
+                        task=task,
+                        step=step,
+                        task_block=task_block,
+                        page=await browser_state.get_working_page(),
+                        browser_state=browser_state,
+                    )
+                except (CompletionGateTerminationError, StepTerminationError):
+                    # The gate's verdict ends the run with its own reason, not a code status the model saw earlier.
+                    verification_state.last_status = None
+                    raise
 
             outcome = await run_task_v3_agent_loop(
                 page_provider=_page_provider,
+                llm_route_arm=llm_route_arm,
+                # Read through browser_state each time: a recovered browser brings a new context, and the old
+                # one's submissions still count.
+                intercepted_submissions=submissions_across_contexts(
+                    app.AGENT_FUNCTION.task_v3_intercepted_submissions, lambda: browser_state.browser_context
+                ),
                 resolve_typed_text=resolve_typed_text,
                 credential_release_guard=release_guard,
                 resolve_totp_placeholder=verification_state.resolve_totp_placeholder,
@@ -3288,6 +4071,7 @@ class ForgeAgent:
                 download_attempts=_download_attempts,
                 block_type=block_type,
                 has_navigation_goal=bool(task.navigation_goal),
+                error_code_mapping=task.error_code_mapping,
                 extraction_requested=extraction_requested,
                 # Only the customer's own instructions can define what counts as done. Auth and captcha
                 # guidance are how-to, and the judge is told an outcome its instructions allow is no
@@ -3330,13 +4114,20 @@ class ForgeAgent:
                 step=step,
                 should_cancel=_should_cancel,
                 on_action_round=_on_action_round,
+                on_turn_start=_on_turn_start,
+                on_turn_end=_on_turn_end,
+                turn_dom=turn_dom,
                 on_pre_action=pre_submit_ring.capture if pre_submit_ring is not None else None,
+                on_look_screenshots=functools.partial(_store_look_screenshots, step),
+                # A code status the model has moved past is no longer what the run ends on.
+                on_page_action=verification_state.page_engaged,
                 extra_tools=auth_tools + captcha_tools,
                 extra_system_guidance="\n\n".join(
                     part for part in (auth_guidance, captcha_guidance, workflow_system_guidance) if part
                 ),
-                completion_probe=completion_probe,
-                completion_blocker=completion_blocker,
+                download_wait=download_wait,
+                download_settle=download_settle,
+                native_download_attempt=native_download_attempt,
                 completion_gate=_completion_gate,
                 staged_downloads=staged_downloads,
                 deadline_seconds=loop_deadline_seconds,
@@ -3361,14 +4152,32 @@ class ForgeAgent:
                 anthropic_cache_markers=uses_only_anthropic_models(llm_caller.llm_config),
             )
         finally:
+            if native_download_attempt is not None:
+                native_download_attempt.end()
             input_dispatch.end_login_pace()
             if context and credential_parameter_key is not None:
                 context.active_credential_parameter_key = prev_active_credential_parameter_key
+            # A loop that raised never ended its last turn.
+            await _finish_v3_turn_step(
+                StepStatus.canceled if isinstance(sys.exception(), asyncio.CancelledError) else StepStatus.failed,
+                None,
+            )
+            if turn_dom is not None:
+                turn_dom.cancel()
             # Frames are already in memory, so a loop that raised or ran out of budget still
             # persists what it captured; bounded so the unwind of a cancelled run is not held up.
             with contained_effect("task_v3 pre-submit frame persist", task_id=task.task_id):
                 async with asyncio.timeout(30):
                     await _persist_pre_submit_frames()
+        if (
+            settings.TASK_V3_BLOCK_END_DOM
+            and not page_free_validation
+            and outcome.status != "canceled"
+            and get_browser_connection_loss(browser_state) is None
+        ):
+            await _save_block_end_dom(browser_state, step, task.task_id)
+        # The model's own verdict, before a completion gate or a re-ask conversion rewrote the status.
+        model_verdict = outcome.model_status or outcome.converted_from or outcome.status
         LOG.info(
             "Task V3 loop finished",
             task_id=task.task_id,
@@ -3379,7 +4188,11 @@ class ForgeAgent:
             block_type=block_type,
         )
         completion_rejection: str | None = None
-        if outcome.status == "completed":
+        if outcome.status == "completed" and get_browser_connection_loss(browser_state) is not None:
+            # The gates below fail open on a page that is gone, so a loss after the last action must fail here.
+            completion_rejection = f"the run lost its browser connection ({BROWSER_CONNECTION_LOST_ERROR_CODE})"
+            LOG.warning("task_v3 completion rejected after a browser connection loss", task_id=task.task_id)
+        elif outcome.status == "completed":
             # The deployment gate for a completion the finish tool could not put to it (no headroom left to
             # act on a refusal, a re-ask conversion, or a gate error). The loop has returned, so a veto fails.
             gate_page = None
@@ -3405,6 +4218,8 @@ class ForgeAgent:
                 LOG.warning(
                     "task_v3 completion gate errored; accepting completion", task_id=task.task_id, exc_info=True
                 )
+            if outcome.status != "completed":
+                verification_state.last_status = None
             if outcome.status == "terminated":
                 LOG.info("task_v3 completion terminated by completion gate", task_id=task.task_id)
             elif outcome.status == "failed":
@@ -3428,7 +4243,7 @@ class ForgeAgent:
                             return False
 
                     blank_page = await _v3_page_left_blank(first_sample, _fingerprint_page, _settle_should_stop)
-                    # A suffix-only download block has no probe; its file is finalized by clean_up_task below.
+                    # No download settle finalized this block's file; clean_up_task below does.
                     # Same local-plus-session listing as the baseline, and a partial is not a delivered file.
                     if (
                         blank_page is not None
@@ -3495,7 +4310,9 @@ class ForgeAgent:
                         async with asyncio.timeout(30):
                             decision_shot = await browser_state.take_post_action_screenshot(scrolling_number=0)
                             decision_screenshot_id = await app.ARTIFACT_MANAGER.create_artifact(
-                                step=step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=decision_shot
+                                step=v3_turn_step or step,
+                                artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                                data=decision_shot,
                             )
                     except Exception:
                         LOG.warning(
@@ -3508,8 +4325,9 @@ class ForgeAgent:
                     organization_id=task.organization_id,
                     workflow_run_id=task.workflow_run_id,
                     task_id=task.task_id,
-                    step_id=step.step_id,
-                    # The decision rides on the LAST consumed billable index (or the single Step's own
+                    # The last turn's step: a verdict is that turn's finish call.
+                    step_id=(v3_turn_step or step).step_id,
+                    # The decision rides on the LAST consumed billable index (or the block step's own
                     # order 0): a fresh index would read as a new distinct (task, step_order) pair to
                     # the workflow-run step budget, the way v1's complete shares its final step.
                     step_order=max(v3_round_index - 1, 0),
@@ -3598,24 +4416,30 @@ class ForgeAgent:
                 step_id=step.step_id,
                 exc_info=True,
             )
-        totp_source_missing = _v3_totp_source_missing(task_status, verification_state)
         failure_reason = _v3_failure_reason(
             outcome,
             task_status=task_status,
             completion_rejection=completion_rejection,
             missing_extraction=missing_extraction,
             run_secrets=run_secrets,
-            totp_source_missing=totp_source_missing,
+            verification_status=verification_state.last_status,
         )
-        # Only when that is the reason recorded: a vetoed completion or a missing extraction failed for its own.
-        if totp_source_missing and failure_reason == _V3_TOTP_SOURCE_MISSING_REASON:
-            LOG.info("task_v3 attributed to a missing TOTP source", task_id=task.task_id, task_status=task_status)
-            with contained_effect("task_v3 missing TOTP source error persist", task_id=task.task_id):
-                await app.DATABASE.tasks.update_task(
-                    task_id=task.task_id,
-                    organization_id=task.organization_id,
-                    errors=[MissingTOTPSourceError().to_user_defined_error().model_dump()],
-                )
+        if verification_state.last_status is not None:
+            LOG.info(
+                "task_v3 ended on a verification code status",
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                workflow_run_id=task.workflow_run_id,
+                task_status=task_status.value,
+                polling_spent_seconds=round(verification_state.polling_spent_seconds, 1),
+                remaining_seconds=round(verification_state.remaining_budget_seconds, 1),
+                values_delivered=verification_state.values_delivered,
+            )
+        # Only when the reason recorded carries that status: a vetoed completion or a missing extraction failed for
+        # its own. Persisted below, and only when the block's own mapping produced no code of its own.
+        missing_totp_source = verification_state.last_status == NO_ONE_TIME_CODE_SOURCE and NO_ONE_TIME_CODE_SOURCE in (
+            failure_reason or ""
+        )
         if outcome.cap_trip is not None:
             # The typed fact a budget cap tripped this run, independent of whether the model went on
             # to finish on the granted final turn (a completed/failed/terminated verdict) or the loop
@@ -3633,7 +4457,48 @@ class ForgeAgent:
             completion_rejection=completion_rejection,
             missing_extraction=missing_extraction,
         )
-        if task.error_code_mapping and task_status in (TaskStatus.failed, TaskStatus.terminated):
+        coded_failure = bool(task.error_code_mapping) and task_status in (TaskStatus.failed, TaskStatus.terminated)
+        # The answer belongs to the model's own failed/terminated verdict, never to a completion demoted after the loop.
+        # A conversion still standing here was ended by a deployment gate, not by the model's verdict.
+        model_answered = (
+            coded_failure
+            and outcome.status in ("failed", "terminated")
+            and outcome.converted_from is None
+            and (outcome.error_code is not None or outcome.error_code_declined)
+        )
+        model_answer_used = False
+        if model_answered:
+            try:
+                model_answer_used = await app.AGENT_FUNCTION.task_v3_error_code_on_finish(
+                    organization_id=task.organization_id
+                )
+            except Exception:
+                LOG.warning("task_v3 error code on finish gate failed", task_id=task.task_id, exc_info=True)
+        detector_codes: list[str] | None = None
+        # Set only once a write landed: contained_effect and the detector's handler both swallow, and a
+        # suppression below must not be claimed on behalf of a code that never reached the column.
+        block_code_persisted = False
+        if model_answer_used and outcome.error_code:
+            with contained_effect("task_v3 model-chosen error code persist", task_id=task.task_id):
+                code_reasoning = outcome.reason
+                if run_secrets:
+                    code_reasoning = redact_secrets_from_text(code_reasoning, run_secrets)
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=task.organization_id,
+                    errors=[
+                        UserDefinedError(
+                            error_code=outcome.error_code,
+                            reasoning=code_reasoning[:_TASKV3_REASONING_MAX_CHARS],
+                            confidence_float=1.0,
+                        ).model_dump()
+                    ],
+                )
+                block_code_persisted = True
+        elif model_answer_used and outcome.error_code_declined:
+            # An explicit "none of these" is the model's judgment, so the page guess must not override it.
+            LOG.info("task_v3 user-defined error code declined by the model", task_id=task.task_id)
+        elif coded_failure:
             try:
                 detected_errors = await detect_user_defined_errors_for_task(
                     task=task,
@@ -3663,8 +4528,40 @@ class ForgeAgent:
                         organization_id=task.organization_id,
                         errors=[error.model_dump() for error in detected_errors],
                     )
+                    block_code_persisted = True
+                detector_codes = [error.error_code for error in detected_errors]
             except Exception:
                 LOG.warning("task_v3 user-defined error detection failed", task_id=task.task_id, exc_info=True)
+        if coded_failure:
+            # One line per task, so the model's code can be read against the page guess before an org relies on it.
+            LOG.info(
+                "task_v3 user-defined error code sources",
+                task_id=task.task_id,
+                task_status=task_status,
+                reached_finish=outcome.guard is None and model_verdict in ("completed", "failed", "terminated"),
+                model_verdict=model_verdict,
+                model_error_code=outcome.error_code,
+                model_declined=outcome.error_code_declined,
+                detector_error_codes=detector_codes,
+                model_answer_used=model_answer_used,
+            )
+        # A fallback for a run that has no code of its own: `errors` appends, and every entry reports
+        # error_type USER_DEFINED_ERROR, so a code Skyvern attached itself beside the block's own reads to
+        # a caller as a second failure it must route on. The attribution stays in failure_reason and here.
+        if missing_totp_source:
+            LOG.info(
+                "task_v3 attributed to a missing TOTP source",
+                task_id=task.task_id,
+                task_status=task_status,
+                suppressed_by_block_code=block_code_persisted,
+            )
+            if not block_code_persisted:
+                with contained_effect("task_v3 missing TOTP source error persist", task_id=task.task_id):
+                    await app.DATABASE.tasks.update_task(
+                        task_id=task.task_id,
+                        organization_id=task.organization_id,
+                        errors=[MissingTOTPSourceError().to_user_defined_error().model_dump()],
+                    )
         need_call_webhook = True
         try:
             task = await self.update_task(
@@ -3745,7 +4642,7 @@ class ForgeAgent:
                             finish_reason=finish_reason,
                             final_url=final_url,
                         )
-        # A probe-finalized run must not be finalized again (double rename); otherwise the fallback
+        # A settle-finalized run must not be finalized again (double rename); otherwise the fallback
         # finalize still has to exclude tool-staged inputs from what counts as a download.
         cleanup_list_files_before: list[str] | None = None
         if not download_finalized and download_baseline_files is not None:
@@ -3763,6 +4660,8 @@ class ForgeAgent:
             browser_session_id=browser_session_id,
             download_suffix=task_block.download_suffix if task_block else None,
             list_files_before=cleanup_list_files_before,
+            bundle_step_archives=True,
+            validate_claimed_type=False,
         )
         return step, task
 
@@ -3786,6 +4685,7 @@ class ForgeAgent:
         workflow_owned_recovery: bool = False,
         recovery_credential_parameter_keys: list[str] | None = None,
         recovery_release_parameter_keys: list[str] | None = None,
+        recovery_enforce_vault_sites: bool = True,
         recovery_code_progress: CodeProgressRecord | None = None,
         cua_response: OpenAIResponse | None = None,
         llm_caller: LLMCaller | None = None,
@@ -3880,6 +4780,7 @@ class ForgeAgent:
                 close_browser_on_completion=close_browser_on_completion,
                 download_suffix=task_block.download_suffix if task_block else None,
                 list_files_before=download_baseline_files,
+                validate_claimed_type=engine != RunEngine.skyvern_v3,
             )
             return step, None, None
 
@@ -3908,6 +4809,11 @@ class ForgeAgent:
         # than an inference from the task row, which cannot distinguish it from the unconditional
         # handlers that clean up on an already-final row too.
         cleanup_skipped_by_handler = False
+        # Set before the browser is acquired so a download the task's first navigation starts is covered too.
+        download_timeout_context = context
+        prev_download_timeout = download_timeout_context.download_timeout
+        if engine == RunEngine.skyvern_v3:
+            download_timeout_context.download_timeout = task.download_timeout
         try:
             if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
@@ -3958,6 +4864,8 @@ class ForgeAgent:
                     last_step=step,
                     api_key=api_key,
                     need_call_webhook=True,
+                    # A goto-only workflow block never took a final screenshot; the full-page capture costs seconds.
+                    need_final_screenshot=task.workflow_run_id is None,
                     close_browser_on_completion=close_browser_on_completion,
                     browser_session_id=browser_session_id,
                 )
@@ -4011,10 +4919,13 @@ class ForgeAgent:
                         workflow_owned_recovery=workflow_owned_recovery,
                         recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                         recovery_release_parameter_keys=recovery_release_parameter_keys,
+                        recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                         recovery_code_progress=recovery_code_progress,
                     )
                 finally:
-                    await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                    # The block's turn steps share its ZIP: one storage PUT per block rather than one per turn.
+                    with contained_effect("task_v3 block archive flush", task_id=step.task_id):
+                        await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(step)
                 return step, detailed_output, None
 
             if workflow_owned_recovery:
@@ -4116,6 +5027,15 @@ class ForgeAgent:
                     attempt_started_at=attempt_started_at,
                     list_files_before=list_files_before,
                 )
+            # update_step returns a database-reloaded step, which cannot retain this private marker.
+            download_failure_status = None
+            if isinstance(task_block, FileDownloadBlock) and task_block.complete_on_download and task.workflow_run_id:
+                download_failure_status = self._latest_download_failure_status(
+                    [step.model_copy(update={"output": detailed_output.to_agent_step_output()})]
+                    if detailed_output
+                    else [step],
+                    attributed_only=True,
+                )
             await app.AGENT_FUNCTION.post_step_execution(task, step)
             task = await self.update_task_errors_from_detailed_output(task, detailed_output)  # type: ignore
             # Shadow-only loop-stall observability; never raises, never terminates (see shadow.py).
@@ -4171,6 +5091,7 @@ class ForgeAgent:
                     task, task_block, organization.organization_id, attempt_started_at=attempt_started_at
                 )
 
+                rejected_downloads: list[str] = []
                 files_to_rename = await self._finalize_downloaded_files_for_task(
                     task,
                     organization_id=organization.organization_id,
@@ -4178,34 +5099,35 @@ class ForgeAgent:
                     list_files_before=list_files_before,
                     randomize_if_missing=True,
                     attempt_started_at=attempt_started_at,
+                    rejected_into=rejected_downloads,
                 )
-                if files_to_rename:
-                    LOG.info(
-                        "Task marked as completed due to download",
-                        task_id=task.task_id,
-                        num_files_before=len(list_files_before),
-                        num_files_after=len(list_files_before) + len(files_to_rename),
-                        new_files=files_to_rename,
-                    )
-                    # The download is durably credited now; close the popup(s) the download action
-                    # opened so the next task does not select one as its working page.
-                    await self._close_credited_download_popups(task, browser_state)
+                if files_to_rename or rejected_downloads:
+                    if files_to_rename:
+                        LOG.info(
+                            "Task marked as completed due to download",
+                            task_id=task.task_id,
+                            num_files_before=len(list_files_before),
+                            num_files_after=len(list_files_before) + len(files_to_rename),
+                            new_files=files_to_rename,
+                        )
+                        # The download is durably credited now; close the popup(s) the download action
+                        # opened so the next task does not select one as its working page.
+                        await self._close_credited_download_popups(task, browser_state)
                     last_step = await self.update_step(step, is_last=True)
-                    completed_task = await self.update_task(
-                        task,
-                        status=TaskStatus.completed,
-                    )
                     await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
                     # Skip per-step video sync: clean_up_task performs the authoritative final upload.
                     # Do not pass download finalization inputs into cleanup here:
                     # the early complete_on_download path already finalized files
                     # against the pre-step baseline and cleanup must not do it again.
                     await self.clean_up_task(
-                        task=completed_task,
+                        task=task,
                         last_step=last_step,
                         api_key=api_key,
                         close_browser_on_completion=close_browser_on_completion,
                         browser_session_id=browser_session_id,
+                        download_completion_pending=True,
+                        completion_extracted_information=task.extracted_information,
+                        download_rejections=rejected_downloads,
                     )
                     return last_step, detailed_output, None
 
@@ -4216,6 +5138,35 @@ class ForgeAgent:
                 release_context = skyvern_context.current()
                 if release_context is not None:
                     release_context.apply_pending_download_reservation_release(task.task_id)
+
+            if (
+                isinstance(task_block, FileDownloadBlock)
+                and task_block.complete_on_download
+                and task.workflow_run_id
+                and download_failure_status is not None
+                and 500 <= download_failure_status < 600
+            ):
+                failure_reason = (
+                    f"The site's main or targeted frame returned HTTP {download_failure_status} "
+                    "and no file was received."
+                )
+                step = await self.update_step(step, is_last=True)
+                is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state)
+                if is_task_marked_as_failed:
+                    await app.ARTIFACT_MANAGER.flush_step_archive(step.step_id)
+                    await self.clean_up_task(
+                        task=task,
+                        last_step=step,
+                        api_key=api_key,
+                        close_browser_on_completion=close_browser_on_completion,
+                        browser_session_id=browser_session_id,
+                        download_suffix=task_block.download_suffix,
+                        list_files_before=list_files_before,
+                    )
+                else:
+                    LOG.warning("Task isn't marked as failed after a download HTTP failure. NOT clean up the task")
+                    cleanup_skipped_by_handler = True
+                return step, detailed_output, None
 
             # If the step failed, mark the step as failed and retry
             if step.status == StepStatus.failed:
@@ -4279,6 +5230,13 @@ class ForgeAgent:
                         browser_session_id=browser_session_id,
                         download_suffix=task_block.download_suffix if task_block else None,
                         list_files_before=list_files_before,
+                        download_completion_pending=bool(
+                            is_task_completed
+                            and task_block
+                            and task_block.complete_on_download
+                            and task.workflow_run_id
+                        ),
+                        completion_extracted_information=task.extracted_information,
                     )
                     return last_step, detailed_output, None
                 elif maybe_next_step:
@@ -4327,6 +5285,7 @@ class ForgeAgent:
                     workflow_owned_recovery=workflow_owned_recovery,
                     recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
+                    recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -4347,6 +5306,7 @@ class ForgeAgent:
                     workflow_owned_recovery=workflow_owned_recovery,
                     recovery_credential_parameter_keys=recovery_credential_parameter_keys,
                     recovery_release_parameter_keys=recovery_release_parameter_keys,
+                    recovery_enforce_vault_sites=recovery_enforce_vault_sites,
                     cua_response=cua_response_param,
                     llm_caller=llm_caller,
                     download_baseline_files=list_files_before,
@@ -4553,6 +5513,7 @@ class ForgeAgent:
                 task,
                 step,
                 await lost_external_browser_reason(task.organization_id, browser_session_id, browser_state)
+                or run_browser_connection_lost_reason(task, browser_state)
                 or get_user_facing_exception_message(e),
                 browser_state,
                 exception=e,
@@ -4572,7 +5533,7 @@ class ForgeAgent:
             await self.fail_task(
                 task,
                 step,
-                "The browser Skyvern was driving stopped responding to its commands and did not recover. This is a fault in the browser itself rather than in the website, so retrying the run should get a healthy one.",
+                "The browser stopped responding to Skyvern's commands and did not recover. Retrying in that browser will likely fail the same way. A new run gets a fresh browser, unless it uses an existing session or connects to your own browser.",
                 browser_state,
                 exception=e,
             )
@@ -4697,19 +5658,22 @@ class ForgeAgent:
                 context.task_id = None
                 context.navigation_goal = None
                 context.navigation_payload = None
+                download_timeout_context.download_timeout = prev_download_timeout
 
     @staticmethod
-    def _latest_download_failure_status(steps: list[Step]) -> int | None:
+    def _latest_download_failure_status(steps: list[Step], *, attributed_only: bool = False) -> int | None:
         """The failure status carried by the run's latest download-intent action, folded across steps.
 
         Walks every persisted step with output in execution order, and every action within a step in
         order. A download-intent action is one whose result recorded a download outcome
-        (``download_triggered`` set) or a stamped failure status. Each later download-intent action
+        (``download_triggered`` set) or a diagnostic failure status. Each later download-intent action
         supersedes earlier evidence: a later action that actually saved a file (non-empty
         ``downloaded_files``), or a later download that received no file and observed no status, clears
-        an earlier status. A triggered-but-empty or aborted action that carries a status keeps it —
-        ``download_triggered=True`` alone is only a credited signal, not proof a file was saved. Ordinary
-        non-download actions never clear it. Returns the surviving status, or None.
+        an earlier status. With ``attributed_only``, only a Document 5xx from the main or action-target
+        frame is returned; passive observations remain available for diagnostic enrichment. A triggered-but-empty
+        or aborted action that carries a status keeps it — ``download_triggered=True`` alone is only a
+        credited signal, not proof a file was saved. Ordinary non-download actions never clear it. Returns
+        the surviving status, or None.
         """
         latest_status: int | None = None
         for step in steps:
@@ -4726,8 +5690,9 @@ class ForgeAgent:
                 if any(result.downloaded_files for result in results):
                     latest_status = None
                     continue
+                status_attr = "attributed_download_failure_status" if attributed_only else "download_failure_status"
                 latest_status = next(
-                    (result.download_failure_status for result in reversed(results) if result.download_failure_status),
+                    (status for result in reversed(results) if (status := getattr(result, status_attr, None))),
                     None,
                 )
         return latest_status
@@ -4764,24 +5729,37 @@ class ForgeAgent:
             return None
 
     async def _enrich_failure_reason_with_download_status(self, task: Task, reason: str) -> str:
-        """Append one bounded sentence to a terminal failure reason when the run's latest download-intent
-        action received no file and passively observed a server 5xx status.
-
-        Folds over every persisted step's output in execution order; only the latest download-intent
-        action's own evidence counts. The original reason is preserved verbatim and the sentence is
-        appended once (deduplicated). Returns the (possibly unchanged) reason to store; never raises.
-        """
+        """Append terminal download evidence without changing the original reason or its classification."""
         try:
             steps = await app.DATABASE.tasks.get_task_steps(task_id=task.task_id, organization_id=task.organization_id)
             status = self._latest_download_failure_status(steps)
-            if status is None:
+            if status is not None:
+                sentence = (
+                    f"An HTTP request made during the download action returned HTTP {status}, and no file was received."
+                )
+                if sentence not in reason:
+                    reason = f"{reason} {sentence}"
+            context = skyvern_context.current()
+            if (
+                context is None
+                or context.task_id != task.task_id
+                or context.workflow_run_id != task.workflow_run_id
+                or context.organization_id != task.organization_id
+                or task.task_id not in context.residential_download_interrupted_task_ids
+                or task.task_id in context.download_completed_task_ids
+                or task.proxy_location == ProxyLocation.RESIDENTIAL_ISP
+                or task.status in (TaskStatus.completed, TaskStatus.canceled, TaskStatus.timed_out)
+                or any(
+                    result.downloaded_files
+                    for step in steps
+                    if step.output and step.output.actions_and_results
+                    for _action, results in step.output.actions_and_results
+                    for result in results
+                )
+            ):
                 return reason
-            sentence = (
-                f"An HTTP request made during the download action returned HTTP {status}, and no file was received."
-            )
-            if sentence in reason:
-                return reason
-            return f"{reason} {sentence}"
+            advice = "Try using an ISP proxy."
+            return reason if advice in reason else f"{reason} {advice}"
         except Exception:
             LOG.warning(
                 "Failed to enrich failure reason with download status",
@@ -5353,6 +6331,8 @@ class ForgeAgent:
             )
             if canceled is not None:
                 return actions, canceled
+            if get_browser_connection_loss(browser_state) is not None:
+                return actions, await self._fail_step_unless_run_canceled(task, step, detailed_agent_step_output)
 
             context = skyvern_context.ensure_context()
             if context.refresh_working_page:
@@ -5525,17 +6505,42 @@ class ForgeAgent:
                     action.skip_auto_complete_tab = True
                 action.stop_batch_after_dropdown_select = should_stop_batch_after_dropdown_select(next_action)
 
-            results = await ActionHandler.handle_action(
-                scraped_page=totp_dispatch_page if totp_armed else scraped_page,
-                task=task,
-                step=step,
-                page=current_page,
-                action=action,
-                file_download_false_click_eligible=file_download_false_click_eligible,
-                # Only actions after the first can be stale: an earlier action in this same batch
-                # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
-                allow_stale_refresh=action_idx > 0,
+            dispatch_page = totp_dispatch_page if totp_armed else scraped_page
+            if action_idx > 0 and not totp_armed and _external_otp_use(context, task.task_id) is not None:
+                # The handler's own stale remap would run after the guard below and hand it a remounted Verify or
+                # Resend it cannot classify; remap here so the guard and the click see the same control.
+                refreshed = await _refresh_stale_web_action_before_dispatch(dispatch_page, current_page, action)
+                if refreshed is not None:
+                    dispatch_page, action = refreshed
+            otp_dispatch, otp_refusal = await _guard_external_otp_dispatch(
+                context, task.task_id, current_page, dispatch_page, action
             )
+            dispatched_at = naive_utc_now()
+            effect_token = otp_dispatch_effect.set(None)
+            single_token = otp_single_dispatch.set(otp_dispatch is not None)
+            otp_results: list[ActionResult] = []
+            try:
+                if otp_refusal is not None:
+                    results = [otp_refusal]
+                else:
+                    results = await ActionHandler.handle_action(
+                        scraped_page=dispatch_page,
+                        task=task,
+                        step=step,
+                        page=current_page,
+                        action=action,
+                        file_download_false_click_eligible=file_download_false_click_eligible,
+                        # Only actions after the first can be stale: an earlier action in this same batch
+                        # may have remounted/reflowed this one's target away from the shared pre-batch scrape.
+                        allow_stale_refresh=action_idx > 0,
+                    )
+                otp_results = results
+            finally:
+                # Before the context is restored, so a press that reached the page is kept even on cancellation.
+                if otp_dispatch is not None and otp_refusal is None:
+                    _note_external_otp_dispatch(context, task.task_id, otp_dispatch, otp_results, dispatched_at)
+                otp_single_dispatch.reset(single_token)
+                otp_dispatch_effect.reset(effect_token)
             await app.AGENT_FUNCTION.post_action_execution(action)
             detailed_agent_step_output.actions_and_results[action_idx] = (
                 action,
@@ -5552,8 +6557,8 @@ class ForgeAgent:
             # Skip sleep and post-action artifacts for page-level SCROLL to preserve
             # scroll-driven JS state. Many pages enable buttons only while scrolled to
             # bottom (e.g. T&C "Agree" buttons) and re-disable them after any delay or
-            # programmatic scroll. Sub-container scrolls (strategies 1 & 2) don't affect
-            # page position, so they keep normal sleep and artifact recording.
+            # programmatic scroll. Sub-container scrolls don't affect page position, so they
+            # keep normal sleep and artifact recording.
             is_page_level_scroll = action.action_type == ActionType.SCROLL and any(
                 r.success and isinstance(r.data, dict) and r.data.get("page_level_scroll") for r in results
             )
@@ -5663,6 +6668,8 @@ class ForgeAgent:
                 return actions, await self._fail_step_unless_run_canceled(task, step, detailed_agent_step_output)
 
         await artifact_tracker.drain()
+        if get_browser_connection_loss(browser_state) is not None:
+            return actions, await self._fail_step_unless_run_canceled(task, step, detailed_agent_step_output)
         # A cancel landing during the last action would otherwise reach extraction and completion.
         return actions, await self._stop_step_if_run_canceled(task, step, detailed_agent_step_output, skipped_actions=0)
 
@@ -6211,7 +7218,7 @@ class ForgeAgent:
                     screenshots=scraped_page.screenshots,
                     system_prompt=task.workflow_system_prompt,
                 )
-                LOG.info("Skyvern response to CUA question", skyvern_response=skyvern_response)
+                LOG.info("Skyvern response to CUA question", **llm_response_log_metadata(skyvern_response))
                 cua_question = cua_question or skyvern_response.get("question_or_decision")
                 resp_content = skyvern_response.get("answer")
                 if not resp_content:
@@ -6441,7 +7448,7 @@ class ForgeAgent:
         # Generate response using the LLMCaller
         response_content = await llm_caller.generate_ui_tars_response(step)
 
-        LOG.info(f"UI-TARS raw response: {response_content}")
+        LOG.info("UI-TARS raw response", **llm_response_log_metadata(response_content))
 
         window_dimension = (
             cast(Resolution, scraped_page.window_dimension)
@@ -7387,6 +8394,7 @@ class ForgeAgent:
         browser_state: BrowserState,
         scrape_type: ScrapeType,
         engine: RunEngine,
+        navigation_deadline: float | None = None,
     ) -> ScrapedPage:
         if scrape_type == ScrapeType.NORMAL:
             pass
@@ -7395,6 +8403,10 @@ class ForgeAgent:
             LOG.info("Try to stop loading the page before scraping")
             await browser_state.stop_page_loading()
         elif scrape_type == ScrapeType.RELOAD:
+            # The NORMAL rungs only wait for a navigation the browser had already reported when they checked; one
+            # reported later is still in flight here, and reloading would cancel it.
+            if navigation_deadline is not None and (page := await browser_state.get_working_page()) is not None:
+                await browser_state.wait_for_main_frame_navigation(page, navigation_deadline)
             LOG.info("Try to reload the page before scraping")
             await browser_state.reload_page(degradation=True)
 
@@ -7422,6 +8434,7 @@ class ForgeAgent:
             # Only this agent-step scrape opts into transient-UI scroll suppression (SKY-12735);
             # verification / extraction / error-detection scrapes keep legacy scrolling.
             allow_transient_ui_suppression=True,
+            navigation_deadline=navigation_deadline,
         )
 
     async def _observe_claimed_download_within_grace(
@@ -7775,20 +8788,33 @@ class ForgeAgent:
             # Probed between steps, not inside the ladder below: the ladder's RELOAD rung is what
             # rescues a page whose own JS wedged the renderer, so it keeps every attempt it has.
             if context and context.browser_health.is_degraded:
+                consecutive_timeouts = context.browser_health.consecutive_timeouts
                 stuck_operations = context.browser_health.describe_stuck_operations()
-                LOG.error(
-                    "Browser session stopped responding; failing the run instead of starting another step",
-                    consecutive_timeouts=context.browser_health.consecutive_timeouts,
-                    stuck_operations=stuck_operations,
-                    step_order=step.order,
-                    step_retry=step.retry_index,
-                    url=task.url,
-                )
+                stall_diagnostics: dict[str, Any] = {
+                    **context.browser_health.stall_fields(),
+                    "renderer_metrics": "cancelled",
+                }
+                try:
+                    stall_diagnostics |= await collect_degraded_browser_diagnostics(browser_state)
+                finally:
+                    with contained_effect("stalled-browser guard log", task_id=task.task_id):
+                        LOG.error(
+                            "Browser session stopped responding; failing the run instead of starting another step",
+                            consecutive_timeouts=consecutive_timeouts,
+                            stuck_operations=stuck_operations,
+                            step_order=step.order,
+                            step_retry=step.retry_index,
+                            url=task.url,
+                            **stall_diagnostics,
+                        )
                 raise BrowserSessionDegraded(
-                    consecutive_timeouts=context.browser_health.consecutive_timeouts,
+                    consecutive_timeouts=consecutive_timeouts,
                     stuck_operations=stuck_operations,
                 )
             blank_page_error: ScrapingFailedBlankPage | None = None
+            # One budget for the whole ladder: a scrape waits for an in-flight page navigation instead of
+            # timing out against it, and no later rung or replacement navigation gets a budget of its own.
+            navigation_deadline = time.monotonic() + settings.BROWSER_LOADING_TIMEOUT_MS / 1000
             for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
                 try:
                     scraped_page = await self._scrape_with_type(
@@ -7797,6 +8823,7 @@ class ForgeAgent:
                         browser_state=browser_state,
                         scrape_type=scrape_type,
                         engine=engine,
+                        navigation_deadline=navigation_deadline,
                     )
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed, FailedToReloadPage) as e:
@@ -8072,8 +9099,8 @@ class ForgeAgent:
             cache_key = f"{EXTRACT_ACTION_CACHE_KEY_PREFIX}{variant_suffix}-{resolved_llm_key}"
 
             # Get the actual model name from LLM config to ensure correct format
-            # (e.g., "gemini-2.5-flash" with decimal, not "gemini-2-5-flash")
-            model_name = "gemini-2.5-flash"  # Default
+            # (e.g., "gemini-3.1-flash-lite" with decimal, not "gemini-3-1-flash-lite")
+            model_name = "gemini-3-flash-preview"  # Default
 
             try:
                 llm_config = LLMConfigRegistry.get_config(resolved_llm_key)
@@ -8097,7 +9124,7 @@ class ForgeAgent:
                 # Try to extract from model_name if it contains "vertex_ai/" or starts with "gemini-"
                 if not extracted_name and hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
                     if "vertex_ai/" in llm_config.model_name:
-                        # Direct Vertex config: "vertex_ai/gemini-2.5-flash" -> "gemini-2.5-flash"
+                        # Direct Vertex config: "vertex_ai/gemini-3-flash-preview" -> "gemini-3-flash-preview"
                         extracted_name = llm_config.model_name.split("/")[-1]
                     elif llm_config.model_name.startswith("gemini-"):
                         # Already in correct format
@@ -8108,15 +9135,15 @@ class ForgeAgent:
                     params = llm_config.litellm_params
                     api_base = getattr(params, "api_base", None)
                     if api_base and isinstance(api_base, str) and "/models/" in api_base:
-                        # Extract from URL: .../models/gemini-2.5-flash -> "gemini-2.5-flash"
+                        # Extract from URL: .../models/gemini-3-flash-preview -> "gemini-3-flash-preview"
                         extracted_name = api_base.split("/models/")[-1]
 
                 # For router configs without api_base, infer from the llm_key itself
                 if not extracted_name:
-                    # Extract version from llm_key (e.g., VERTEX_GEMINI_1_5_FLASH -> "1_5" or VERTEX_GEMINI_2.5_FLASH -> "2.5")
+                    # Extract version from llm_key (e.g., VERTEX_GEMINI_1_5_FLASH -> "1_5" or VERTEX_GEMINI_3.0_FLASH -> "3.0")
                     # Pattern: GEMINI_{version}_{flavor} where version can use dots, underscores, or dashes
                     version_match = re.search(r"GEMINI[_-](\d+[._-]\d+)", resolved_llm_key, re.IGNORECASE)
-                    version = version_match.group(1).replace("_", ".").replace("-", ".") if version_match else "2.5"
+                    version = version_match.group(1).replace("_", ".").replace("-", ".") if version_match else "3"
 
                     # Determine flavor
                     if "_PRO_" in resolved_llm_key or resolved_llm_key.endswith("_PRO"):
@@ -8132,7 +9159,7 @@ class ForgeAgent:
             except Exception as e:
                 LOG.debug("Failed to extract model name from config, using default", error=str(e))
 
-            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro).
+            # Normalize model name to the canonical Vertex identifier (e.g., gemini-3-flash-preview).
             # Preserve preview suffixes so we don't strip required identifiers (e.g., gemini-3-flash-preview).
             match = re.search(
                 r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro)(?:-preview)?)", model_name, re.IGNORECASE
@@ -9016,10 +10043,18 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
-    ) -> None:
+        bundle_step_archives: bool = False,
+        download_completion_pending: bool = False,
+        completion_extracted_information: dict[str, Any] | list | str | None = None,
+        download_completion_feedback: list[str] | None = None,
+        download_artifact_baseline_count: int | None = 0,
+        download_tally_baseline: DownloadTally | None = None,
+        validate_claimed_type: bool = True,
+        download_rejections: list[str] | None = None,
+    ) -> Task:
         cleanup_context = skyvern_context.current()
         try:
-            await self._clean_up_task(
+            return await self._clean_up_task(
                 task,
                 last_step,
                 api_key,
@@ -9029,9 +10064,18 @@ class ForgeAgent:
                 browser_session_id,
                 download_suffix,
                 list_files_before,
+                bundle_step_archives=bundle_step_archives,
+                download_completion_pending=download_completion_pending,
+                completion_extracted_information=completion_extracted_information,
+                download_completion_feedback=download_completion_feedback,
+                download_artifact_baseline_count=download_artifact_baseline_count,
+                download_tally_baseline=download_tally_baseline,
+                validate_claimed_type=validate_claimed_type,
+                download_rejections=download_rejections,
             )
         finally:
             if cleanup_context is not None:
+                cleanup_context.consume_download_failures(task.task_id)
                 cleanup_context.clear_download_popup_claims(task.task_id)
                 # Workflow diagnostics are retained later, while the workflow context still owns the masking state.
                 if task.workflow_run_id is None:
@@ -9049,11 +10093,20 @@ class ForgeAgent:
         browser_session_id: str | None = None,
         download_suffix: str | None = None,
         list_files_before: list[str] | None = None,
-    ) -> None:
+        bundle_step_archives: bool = False,
+        download_completion_pending: bool = False,
+        completion_extracted_information: dict[str, Any] | list | str | None = None,
+        download_completion_feedback: list[str] | None = None,
+        download_artifact_baseline_count: int | None = 0,
+        download_tally_baseline: DownloadTally | None = None,
+        validate_claimed_type: bool = True,
+        download_rejections: list[str] | None = None,
+    ) -> Task:
         # Keep the capture window alive through settle/finalize; only durable credit permits closing reservations.
         # The outer finally releases ownership on every terminal exit.
         _claim_context = skyvern_context.current()
         _download_popup_state_taken = False
+        rejected_downloads = list(download_rejections or [])
 
         def _take_download_popup_state() -> tuple[list[Page], list[Page]]:
             """Exactly-once: detach the task listener and pop this task's strong claims + late candidates."""
@@ -9093,19 +10146,19 @@ class ForgeAgent:
         # This allows multiple tasks with the same llm_key to share the same cache
 
         # log the task status as an event
-        analytics.capture(
-            "skyvern-oss-agent-task-status", {"status": task.status}, organization_id=task.organization_id
-        )
+        if not download_completion_pending:
+            analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
         # Add task completion tag to trace
-        otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
+        if not download_completion_pending:
+            otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state
             # We don't need the artifacts and send the webhook response directly only when there is an issue with the browser
             # initialization. In this case, we don't have any artifacts to send and we can't take final screenshots etc.
             # since the browser is not initialized properly or the proxy is not working.
 
-            browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+            browser_state = _get_browser_state_for_cleanup(task)
             if browser_state is not None:
                 # get_working_page() is inside the try so a raise here cannot propagate and strand the
                 # task listener/claim state armed (terminal-expiry promise).
@@ -9130,11 +10183,15 @@ class ForgeAgent:
                 except Exception:
                     LOG.exception("Failed to take screenshot before sending task response")
 
+        artifact_outcome: Literal["registered", "partial", "failed", "unknown"] = "unknown"
+        artifact_error: str | None = None
+        artifact_failure_details: list[str] = []
+        captured_file_count = 0
         if task.organization_id:
             _tracer = otel_trace.get_tracer("skyvern")
             with traced_span(_tracer, "skyvern.agent.cleanup.save_downloaded_files") as _cl_save_span:
                 apply_context_attrs(_cl_save_span)
-                browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id)
+                browser_state = _get_browser_state_for_cleanup(task)
                 browser_context = browser_state.browser_context if browser_state is not None else None
                 track_download_outcome = has_download_interceptor_for_context(browser_context)
                 context = skyvern_context.current()
@@ -9142,8 +10199,6 @@ class ForgeAgent:
                     resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id
                 )
                 registered_file_count = 0
-                artifact_outcome: Literal["registered", "partial", "failed", "unknown"] = "unknown"
-                artifact_error: str | None = None
                 try:
                     # Keep both finalize and save inside a single timeout budget so a hung
                     # finalize call cannot block persistence forever; accept the trade-off
@@ -9151,7 +10206,9 @@ class ForgeAgent:
                     async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
                         async with settle_browser_downloads_for_context(browser_context):
                             pass
-                        if download_suffix and list_files_before is not None:
+                        if list_files_before is not None and (
+                            download_suffix or (validate_claimed_type and download_completion_pending)
+                        ):
                             attempt_started_at = await get_download_retry_started_at(
                                 task.organization_id, finalization_run_id
                             )
@@ -9162,6 +10219,8 @@ class ForgeAgent:
                                 list_files_before=list_files_before,
                                 randomize_if_missing=False,
                                 attempt_started_at=attempt_started_at,
+                                validate_claimed_type=validate_claimed_type and download_completion_pending,
+                                rejected_into=rejected_downloads,
                             )
                             # Cleanup finalization is the second durable-credit seam: only when it proves a new
                             # file did the download land, so only then take the claims/late-candidates (now that
@@ -9190,17 +10249,29 @@ class ForgeAgent:
                             )
                             artifact_outcome = "partial"
                             artifact_error = "storage_partial"
+                            artifact_failure_details.extend(
+                                f"Downloaded file {Path(file).name!r} could not be saved or registered."
+                                for file in exc.skipped_files
+                            )
                         # Reconcile session-scoped DOWNLOAD rows the watcher left unbound, so
                         # GET /v1/runs/{id} surfaces them (see
                         # cloud_docs/BROWSER_SESSION_DOWNLOAD_ARTIFACTS.md).
                         browser_session_id = context.browser_session_id if context else None
                         if browser_session_id and task.organization_id and finalization_run_id:
                             try:
+                                rejected_session_uris = [
+                                    uri for uri in rejected_downloads if uri.startswith(("s3://", "gs://"))
+                                ]
+                                claim_arguments: dict[str, Any] = {
+                                    "run_id": finalization_run_id,
+                                    "browser_session_id": browser_session_id,
+                                    "organization_id": task.organization_id,
+                                    "run_started_at": task.created_at,
+                                }
+                                if rejected_session_uris:
+                                    claim_arguments["excluded_uris"] = rejected_session_uris
                                 claimed = await app.DATABASE.artifacts.claim_session_download_artifacts_for_run(
-                                    run_id=finalization_run_id,
-                                    browser_session_id=browser_session_id,
-                                    organization_id=task.organization_id,
-                                    run_started_at=task.created_at,
+                                    **claim_arguments
                                 )
                                 if claimed:
                                     LOG.debug(
@@ -9225,10 +10296,18 @@ class ForgeAgent:
                                     organization_id=task.organization_id,
                                     artifact_type=ArtifactType.DOWNLOAD,
                                 )
-                                registered_file_count = len(download_artifacts)
+                                if download_artifact_baseline_count is None:
+                                    artifact_outcome = artifact_outcome if artifact_outcome != "unknown" else "failed"
+                                    artifact_error = artifact_error or "artifact_baseline_lookup_failed"
+                                else:
+                                    registered_file_count = max(
+                                        0, len(download_artifacts) - download_artifact_baseline_count
+                                    )
                                 if artifact_outcome == "unknown":
                                     artifact_outcome = "registered"
                             except Exception:
+                                if artifact_outcome == "unknown":
+                                    artifact_outcome = "failed"
                                 artifact_error = artifact_error or "artifact_lookup_failed"
                                 LOG.warning(
                                     "Failed to read registered download artifact count",
@@ -9259,12 +10338,20 @@ class ForgeAgent:
                     # is a no-op there; on every other path it expires without a destructive close.
                     _take_download_popup_state()
                     if track_download_outcome:
-                        record_download_artifact_outcome_for_context(
+                        download_tally = download_tally_for_context(browser_context)
+                        captured_file_count = download_tally.saved if download_tally is not None else 0
+                        if download_tally is not None and download_tally_baseline is not None:
+                            if download_tally.generation == download_tally_baseline.generation:
+                                captured_file_count = max(0, captured_file_count - download_tally_baseline.saved)
+                        recorded_outcome = record_download_artifact_outcome_for_context(
                             browser_context,
                             registered_file_count=registered_file_count,
                             outcome=artifact_outcome,
                             error=artifact_error,
+                            captured_file_count=captured_file_count,
                         )
+                        if recorded_outcome is not None:
+                            artifact_outcome, artifact_error = recorded_outcome
                         unsolicited_download_error = consume_unsolicited_download_error_for_context(browser_context)
                         if unsolicited_download_error is not None:
                             try:
@@ -9279,6 +10366,72 @@ class ForgeAgent:
                                     task_id=task.task_id,
                                     workflow_run_id=task.workflow_run_id,
                                 )
+
+        download_context = skyvern_context.current()
+        download_failure_reasons = (
+            download_context.consume_download_failures(task.task_id) if download_context is not None else []
+        )
+        if download_completion_pending and task.status == TaskStatus.running:
+            if artifact_outcome == "partial":
+                if artifact_error == "artifact_count_mismatch":
+                    download_failure_reasons.append(
+                        f"Only {registered_file_count} of {captured_file_count} captured downloads were registered "
+                        "as artifacts."
+                    )
+                elif artifact_error == "storage_partial":
+                    download_failure_reasons.extend(
+                        artifact_failure_details or ["One or more downloaded files could not be saved to storage."]
+                    )
+                elif artifact_error == "session_claim_failed":
+                    download_failure_reasons.append("One or more downloaded files could not be registered.")
+                else:
+                    download_failure_reasons.append("One or more downloaded files could not be saved or registered.")
+            elif artifact_outcome == "failed":
+                if artifact_error == "artifact_baseline_lookup_failed":
+                    download_failure_reasons.append(
+                        "Could not establish the task's starting download-artifact baseline."
+                    )
+                elif artifact_error == "storage_timeout":
+                    download_failure_reasons.append("Timed out while saving downloaded files.")
+                else:
+                    download_failure_reasons.append("Failed to save downloaded files.")
+            download_failure_reasons = list(dict.fromkeys(download_failure_reasons))
+            failure_reason = "; ".join(download_failure_reasons) if download_failure_reasons else None
+            if failure_reason and download_completion_feedback is not None:
+                download_completion_feedback.extend(download_failure_reasons)
+            else:
+                completion_status = TaskStatus.failed if failure_reason else TaskStatus.completed
+                completion_updates: dict[str, Any] = {}
+                extracted_information = (
+                    completion_extracted_information
+                    if completion_extracted_information is not None
+                    else task.extracted_information
+                )
+                if extracted_information is not None:
+                    completion_updates["extracted_information"] = extracted_information
+                if failure_reason:
+                    completion_updates["failure_reason"] = failure_reason
+                    completion_updates["failure_category"] = classify_from_failure_reason(
+                        failure_reason, fallback_to_unknown=True
+                    )
+                try:
+                    task = await self.update_task(
+                        task,
+                        status=completion_status,
+                        **completion_updates,
+                    )
+                except (TaskAlreadyTimeout, TaskAlreadyCanceled, InvalidTaskStatusTransition):
+                    LOG.info(
+                        "Download completion was finalized externally; keeping the existing task status",
+                        task_id=task.task_id,
+                    )
+                    refreshed_task = await app.DATABASE.tasks.get_task(
+                        task_id=task.task_id, organization_id=task.organization_id
+                    )
+                    if refreshed_task:
+                        task = refreshed_task
+                analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
+                otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
 
         # Terminal-expiry backstop for the org-less path (the credited/finally take above runs only inside the
         # `if task.organization_id:` block): detach the listener and expire any claims/candidates. Idempotent.
@@ -9304,20 +10457,31 @@ class ForgeAgent:
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
             )
-            return
+            return task
 
         await self.async_operation_pool.remove_task(task.task_id)
 
         _tracer = otel_trace.get_tracer("skyvern")
         with traced_span(_tracer, "skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:
             apply_context_attrs(_cl_br_span)
-            await self.cleanup_browser_and_create_artifacts(
+            har_evidence = await self.cleanup_browser_and_create_artifacts(
                 close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
             )
+        # After the HAR closes and before the webhook, which rebuilds its payload from this task.
+        diagnostic_cancelled = False
+        try:
+            task = await annotate_failed_task(task, har_evidence)
+        except asyncio.CancelledError:
+            # The diagnostic is optional; the terminal webhook below still goes out before the cancellation does.
+            diagnostic_cancelled = True
 
         # Wait for all tasks to complete before generating the links for the artifacts
         with traced_span(_tracer, "skyvern.agent.cleanup.wait_for_upload") as _cl_wait_span:
             apply_context_attrs(_cl_wait_span)
+            if bundle_step_archives:
+                # The drain below writes one ZIP per step; a Task V3 block's turn steps share one on its block step.
+                with contained_effect("task_v3 block archive flush", task_id=task.task_id):
+                    await app.ARTIFACT_MANAGER.flush_task_step_archives_as_one(last_step)
             await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([task.task_id])
 
         # Before the webhook, so a caller acting on the run's completion already sees the
@@ -9329,6 +10493,10 @@ class ForgeAgent:
             with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:
                 apply_context_attrs(_cl_wh_span)
                 await self.execute_task_webhook(task=task, api_key=api_key)
+        if diagnostic_cancelled:
+            raise asyncio.CancelledError
+
+        return task
 
     async def execute_task_webhook(
         self,
@@ -9579,7 +10747,7 @@ class ForgeAgent:
         last_step: Step,
         task: Task,
         browser_session_id: str | None = None,
-    ) -> None:
+    ) -> HarEvidence:
         """
         Developer notes: we should not expect any exception to be raised here.
         This function should handle exceptions gracefully.
@@ -9699,6 +10867,20 @@ class ForgeAgent:
                     task=task,
                     browser_session_id=browser_session_id,
                 )
+            har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.har_missing)
+            if har_data:
+                try:
+                    har_evidence = await app.AGENT_FUNCTION.on_run_har_captured(
+                        browser_state=browser_state,
+                        har_data=har_data,
+                        organization_id=task.organization_id,
+                        workflow_run_id=task.workflow_run_id,
+                        task_id=task.task_id,
+                        browser_session_id=browser_session_id or task.browser_session_id,
+                    )
+                except Exception:
+                    har_evidence = HarEvidence.unavailable(HarEvidenceAvailability.parse_error)
+                    LOG.warning("Failed to hand the run HAR to post-run processing", exc_info=True)
             LOG.debug("Uploading har data", har_size=len(har_data))
 
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
@@ -9729,11 +10911,12 @@ class ForgeAgent:
                     step=last_step,
                     entries=task_archive_entries,
                 )
-        else:
-            LOG.warning(
-                "BrowserState is missing before sending response to webhook_callback_url",
-                web_hook_url=task.webhook_callback_url,
-            )
+            return har_evidence
+        LOG.warning(
+            "BrowserState is missing before sending response to webhook_callback_url",
+            web_hook_url=task.webhook_callback_url,
+        )
+        return HarEvidence.unavailable(HarEvidenceAvailability.not_collected)
 
     async def update_step(
         self,
@@ -9779,6 +10962,7 @@ class ForgeAgent:
             task_id=step.task_id,
             step_id=step.step_id,
             organization_id=step.organization_id,
+            write_authority_for_run=run_write_authority,
             **updates,
         )
 
@@ -9792,14 +10976,46 @@ class ForgeAgent:
         errors: list[dict[str, Any]] | None = None,
         failure_category: list[dict[str, Any]] | None = None,
     ) -> Task:
+        updated_task, _ = await self._update_task_and_return_transition(
+            task,
+            status,
+            extracted_information=extracted_information,
+            failure_reason=failure_reason,
+            webhook_failure_reason=webhook_failure_reason,
+            errors=errors,
+            failure_category=failure_category,
+        )
+        return updated_task
+
+    async def update_task_for_cancel(
+        self,
+        task: Task,
+        audit_actor: RequestPrincipal | None = None,
+        on_transition: Callable[[], Awaitable[None]] | None = None,
+    ) -> tuple[Task, bool]:
+        return await self._update_task_and_return_transition(
+            task, TaskStatus.canceled, audit_actor=audit_actor, on_transition=on_transition
+        )
+
+    async def _update_task_and_return_transition(
+        self,
+        task: Task,
+        status: TaskStatus,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        failure_reason: str | None = None,
+        webhook_failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        failure_category: list[dict[str, Any]] | None = None,
+        *,
+        audit_actor: RequestPrincipal | None = None,
+        on_transition: Callable[[], Awaitable[None]] | None = None,
+    ) -> tuple[Task, bool]:
         # refresh task from db to get the latest status
         task_from_db = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
         if task_from_db:
             task = task_from_db
 
-        # Enrich only the stored reason with a server 5xx observed on an admitted xhr/fetch request during
-        # the run's latest download action that received no file. Runs at the shared terminal seam so every
-        # failed/terminated path inherits it; the caller's classification of the original reason is untouched.
+        # Enrich only the stored terminal reason; callers classify the original before this seam.
         if status in (TaskStatus.failed, TaskStatus.terminated) and failure_reason is not None:
             failure_reason = await self._enrich_failure_reason_with_download_status(task, failure_reason)
 
@@ -9860,18 +11076,41 @@ class ForgeAgent:
             sampling=True,
         )
         registered_run_id = task.workflow_run_id or task.task_id
-        lease_lost = await run_lease_lost(registered_run_id)
-        if lease_lost and not status.is_final():
-            return await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id) or task
-        updated_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
-            task.task_id,
-            organization_id=task.organization_id,
-            keep_final_status=lease_lost,
-            **updates,
-        )
-        if lease_lost and updated_task.status != status:
-            note_run_finalized(task.task_id)
-            return updated_task
+        final_write_blocked = False
+        if status.is_final():
+            final_write_blocked = await run_lease_final_write_blocked(registered_run_id)
+        elif await run_lease_lost(registered_run_id):
+            latest_task = await app.DATABASE.tasks.get_task(task_id=task.task_id, organization_id=task.organization_id)
+            return latest_task or task, False
+        if status == TaskStatus.canceled:
+            completion = asyncio.create_task(
+                app.DATABASE.tasks.update_task_and_claim_finish_for_cancel(
+                    task.task_id,
+                    organization_id=task.organization_id,
+                    audit_actor=audit_actor,
+                    failure_reason=failure_reason,
+                    errors=errors,
+                    extracted_information=extracted_information,
+                    webhook_failure_reason=webhook_failure_reason,
+                )
+            )
+            try:
+                updated_task, finish_claimed, status_changed = await asyncio.shield(completion)
+            except CancelledError:
+                await asyncio.shield(completion)
+                raise
+            if status_changed and on_transition is not None:
+                await on_transition()
+        else:
+            updated_task, finish_claimed = await app.DATABASE.tasks.update_task_and_claim_finish(
+                task.task_id,
+                organization_id=task.organization_id,
+                keep_final_status=final_write_blocked,
+                **updates,
+            )
+            status_changed = False
+        if final_write_blocked and updated_task.status != status:
+            return updated_task, status_changed
         if status.is_final():
             note_run_finalized(task.task_id)
         # Minutes emit only when THIS write atomically flipped finished_at from NULL
@@ -9906,7 +11145,7 @@ class ForgeAgent:
                     task_id=updated_task.task_id,
                     status=updated_task.status,
                 )
-        return updated_task
+        return updated_task, status_changed
 
     async def _maybe_retry_multi_field_totp_after_rejection(
         self,
@@ -9954,6 +11193,12 @@ class ForgeAgent:
         context = skyvern_context.ensure_context()
         previous_rejection = context.multi_field_totp_rejections.get(task.task_id)
         attempt = context.multi_field_totp.get(task.task_id)
+        if attempt is not None and attempt.code_source == "external":
+            use = context.external_otp_uses.get(task.task_id)
+            if use is not None and use.terminal_reasoning is None:
+                use.terminal_reasoning = reasoning
+            # Another external code needs a dispatched resend; fetching one automatically would repeat the entry.
+            return skipped("external_code_not_retried")
         if skyvern_context.multi_field_totp_retry_budget_exhausted(task.task_id):
             assert previous_rejection is not None
             if previous_rejection.submitted_at is None:
@@ -10361,8 +11606,9 @@ class ForgeAgent:
                     "Parallel verification: termination required, marking task as terminated",
                     step_id=step.step_id,
                     task_id=task.task_id,
-                    reasoning=skyvern_context.mask_multi_field_totp_data(
-                        complete_action.reasoning, task_id=task.task_id
+                    reasoning_type=type(complete_action.reasoning).__name__,
+                    reasoning_length=(
+                        len(complete_action.reasoning) if isinstance(complete_action.reasoning, str) else None
                     ),
                 )
                 final_status = step.speculative_original_status or StepStatus.completed
@@ -10741,8 +11987,8 @@ class ForgeAgent:
                 "Dropped LLM-returned error codes not in user error_code_mapping",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                dropped_codes=dropped,
-                allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+                dropped_count=len(dropped),
+                allowed_codes_count=len(task.error_code_mapping or {}),
             )
         return kept
 
@@ -10834,6 +12080,7 @@ class ForgeAgent:
                 navigation_payload=task.navigation_payload,
                 steps=steps_results,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                antibot_evidence_str=prompt_evidence_str(task) if task.error_code_mapping else None,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await get_org_aware_primary_llm_api_handler(default=app.LLM_API_HANDLER)(
@@ -10994,6 +12241,7 @@ class ForgeAgent:
                 page_html=html,
                 max_retries=max_retries,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
+                antibot_evidence_str=prompt_evidence_str(task) if task.error_code_mapping else None,
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             )
             json_response = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
@@ -11227,18 +12475,22 @@ class ForgeAgent:
             goal_achieved = False
         if goal_achieved:
             LOG.info(
-                "Step completed and goal achieved, marking task as completed",
+                "Step completed and goal achieved",
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
+                **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
             last_step = await self.update_step(step, is_last=True)
             extracted_information = await self.get_extracted_information_for_task(task)
-            await self.update_task(
-                task,
-                status=TaskStatus.completed,
-                extracted_information=extracted_information,
-            )
+            if task_completes_on_download:
+                # Cleanup is the last chance to validate a native download before completion.
+                task.extracted_information = extracted_information
+            else:
+                await self.update_task(
+                    task,
+                    status=TaskStatus.completed,
+                    extracted_information=extracted_information,
+                )
             return True, last_step, None
         if step.is_terminated():
             terminate_action = (
@@ -11281,12 +12533,31 @@ class ForgeAgent:
                     "Step completed and terminated by the agent, marking task as terminated",
                     step_order=step.order,
                     step_retry=step.retry_index,
-                    output=skyvern_context.mask_multi_field_totp_data(step.output.model_dump(), task_id=task.task_id)
-                    if step.output is not None and task.task_id in skyvern_context.multi_field_totp_masking_task_ids()
-                    else step.output,
+                    **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
                 )
                 last_step = await self.update_step(step, is_last=True)
                 failure_category = classify_from_failure_reason(failure_reason)
+                # handle_terminate_action already resolved the block's error_code_mapping against the
+                # page and left the codes on the action. Persist them, as the sibling terminal paths
+                # (terminate_check_goal, max_retries, max_steps) do: without this a mapped
+                # termination reaches the customer webhook with an empty `errors`, indistinguishable
+                # from an unmapped one, so the code is their only status-independent signal.
+                task_errors = None
+                if terminate_action and terminate_action.errors:
+                    redacted_errors = _redacted_user_defined_errors(task, terminate_action.errors)
+                    # execute_step already appends these errors, and update_task appends again.
+                    existing_errors = {
+                        (error.get("error_code"), error.get("reasoning"))
+                        for error in (task.errors or [])
+                        if isinstance(error, dict)
+                    }
+                    new_errors = [
+                        error
+                        for error in redacted_errors
+                        if (error["error_code"], error["reasoning"]) not in existing_errors
+                    ]
+                    if new_errors:
+                        task_errors = new_errors
                 LOG.info(
                     "Task failure classified",
                     task_id=task.task_id,
@@ -11297,11 +12568,15 @@ class ForgeAgent:
                     primary_failure_category=failure_category[0].get("category") if failure_category else None,
                     failure_category_source="code_level",
                     failure_category_path="terminate_extract_action",
+                    error_codes=[error.error_code for error in terminate_action.errors]
+                    if terminate_action and terminate_action.errors
+                    else [],
                 )
                 await self.update_task(
                     task,
                     status=TaskStatus.terminated,
                     failure_reason=failure_reason,
+                    errors=task_errors,
                     failure_category=failure_category,
                 )
                 return False, last_step, None
@@ -11321,7 +12596,7 @@ class ForgeAgent:
                 "Step completed for the action block, marking task as completed",
                 step_order=step.order,
                 step_retry=step.retry_index,
-                output=step.output,
+                **llm_response_log_metadata(step.output.model_dump() if step.output is not None else None),
             )
             last_step = await self.update_step(step, is_last=True)
             await self.update_task(
@@ -11417,6 +12692,10 @@ class ForgeAgent:
     ) -> tuple[dict[str, Any], list[Action]]:
         if not task.organization_id:
             return json_response, []
+
+        reuse_plan = await _external_otp_reuse_plan(self, task, step, scraped_page, browser_state, json_response)
+        if reuse_plan is not None:
+            return reuse_plan
 
         if not task.totp_verification_url and not task.totp_identifier:
             return json_response, []
@@ -11565,6 +12844,7 @@ class ForgeAgent:
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
             expected_otp_type=OTPType.MAGIC_LINK,
+            task_url=task.url,
         )
         if not otp_value or otp_value.get_otp_type() != OTPType.MAGIC_LINK:
             return []
@@ -11797,7 +13077,8 @@ class ForgeAgent:
     ) -> Task:
         task_errors = task.errors
         step_errors = detailed_step_output.extract_errors() or []
-        task_errors.extend([error.model_dump() for error in step_errors])
+        if step_errors:
+            task_errors.extend(_redacted_user_defined_errors(task, step_errors))
 
         return await app.DATABASE.tasks.update_task(
             task_id=task.task_id,

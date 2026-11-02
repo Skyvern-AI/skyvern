@@ -1,0 +1,8 @@
+From: forwarding-noreply@google.com
+To: forward@inbound.example
+Subject: Gmail Forwarding Confirmation
+X-Skyvern-External-Message-ID: google-confirmation-1
+Content-Type: text/plain; charset="utf-8"
+
+Confirmation code: 123456
+Confirm at https://mail.google.com/mail/verify?token=fixture

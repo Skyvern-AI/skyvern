@@ -2,7 +2,7 @@
 
 Covers the scraper blank predicate, the scrape-ladder blank-evidence preservation, the
 handle_completed_step ActionBlock/max-step guards for a recovery-only step, the download-popup
-claim read, and the cached-script generation marker filter.
+claim read, and the cached-script tab-close skip.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ from skyvern.webeye.scraper.scraper import (
     scrape_web_unsafe,
 )
 from tests.unit.helpers import make_organization, make_step, make_task
+from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import ScopedTime
 
 
 def _frame(url: str) -> MagicMock:
@@ -47,6 +49,22 @@ def _page(url: str, child_frame_urls: list[str] | None = None) -> MagicMock:
 
 
 _AGENT = "skyvern.forge.agent"
+
+
+@pytest.fixture
+def agent_virtual_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The agent's grace deadlines read a clock that only its own sleeps advance, so a runner stall cannot
+    expire a 0.05s grace before the step under test. Use only where every awaited call is an instant mock:
+    ``asyncio.wait_for`` timeouts still run on the real loop clock."""
+    clock = ScopedTime()
+
+    async def _sleep(delay: float, result: object = None) -> object:
+        clock.now += delay
+        await asyncio.sleep(0)
+        return result
+
+    monkeypatch.setattr(f"{_AGENT}.time", clock)
+    monkeypatch.setattr(f"{_AGENT}.asyncio", ScopedAsyncio(sleep=_sleep))
 
 
 def _task_block(*, complete_on_download: bool = True, download_timeout: float | None = None) -> MagicMock:
@@ -312,7 +330,7 @@ def test_has_download_popup_claim_is_identity_based() -> None:
     assert context.has_download_popup_claim("other-task", claimed) is False
 
 
-# ---- Case 8: cached-script generation skips the recovery marker ------------------------------
+# ---- Case 8: cached-script generation skips the recovery marker -----------------------------
 
 
 def test_generate_script_skips_internal_recovery_close_action() -> None:
@@ -321,8 +339,6 @@ def test_generate_script_skips_internal_recovery_close_action() -> None:
     recovery_action = {"action_type": "close_page", "is_internal_recovery": True}
     block = {"block_type": "navigation", "label": "b", "actions": [recovery_action]}
 
-    # The recovery close has no ACTION_MAP entry; without the marker filter _action_to_stmt raises
-    # KeyError and aborts whole-script generation. The filter must drop it so generation succeeds.
     fn = _build_block_fn(block, actions=[recovery_action])
     assert fn is not None
 
@@ -752,6 +768,7 @@ async def test_session_listing_error_during_grace_waits_then_releases_and_recove
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("agent_virtual_clock")
 async def test_nested_inflight_waiter_error_during_grace_waits_then_releases_and_recovers(tmp_path: Path) -> None:
     """Round-18 B: the in-flight branch calls _wait_for_in_flight_downloads, whose OWN session listing can
     raise a NON-timeout error. That must be contained as no settle for the iteration -- the observer keeps
@@ -798,6 +815,7 @@ async def test_nested_inflight_waiter_error_during_grace_waits_then_releases_and
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("agent_virtual_clock")
 async def test_sibling_delta_popup_not_credited_by_sibling_file_and_settles_own_download(tmp_path: Path) -> None:
     """Round-19: two blank popups claimed together in one delta sweep are same-action siblings with no
     file->page mapping. In a NON-complete block, sibling #2's dead-blank recovery must NOT early-credit and
@@ -1102,6 +1120,7 @@ async def test_inflight_crdownload_settling_during_grace_does_not_credit(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("agent_virtual_clock")
 async def test_session_only_file_present_at_claim_time_does_not_credit_but_later_arrival_does(
     tmp_path: Path,
 ) -> None:
@@ -1202,6 +1221,7 @@ async def test_false_click_claim_not_credited_by_session_only_file(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("agent_virtual_clock")
 async def test_finally_resnapshot_augments_stale_event_recorded_session_baseline(tmp_path: Path) -> None:
     """Round-12: an event-recorded popup anchors the STALE pre-action session snapshot (empty here). An
     earlier action's session download settles before the popup is minted; the action-finally resnapshot
@@ -1258,6 +1278,7 @@ async def test_finally_resnapshot_augments_stale_event_recorded_session_baseline
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("agent_virtual_clock")
 async def test_own_inflight_partial_excluded_from_baseline_still_credits(tmp_path: Path) -> None:
     """Round-13 (observer view): the popup's OWN download in-flight at the finally must NOT be in its
     baseline, so when it settles during a later grace the observer credits it. If the partial's identity had
@@ -1311,6 +1332,7 @@ async def test_own_inflight_partial_excluded_from_baseline_still_credits(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("agent_virtual_clock")
 async def test_session_inflight_partial_settling_during_grace_does_not_credit_but_later_partial_does(
     tmp_path: Path,
 ) -> None:

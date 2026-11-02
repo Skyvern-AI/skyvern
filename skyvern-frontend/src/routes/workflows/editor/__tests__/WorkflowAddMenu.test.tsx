@@ -13,7 +13,6 @@ import {
 
 import type { RadialMenuItem } from "@/components/RadialMenu";
 import { DebugStoreContext } from "@/store/DebugStoreContext";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 
 const radialMenuMock = vi.fn(({ children }: { children: React.ReactNode }) => (
@@ -28,7 +27,6 @@ vi.mock("@/components/RadialMenu", () => ({
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
 
 const initialSettings = useSettingsStore.getState();
-const initialRecording = useRecordingStore.getState();
 
 function renderInDebugMode() {
   return render(
@@ -80,7 +78,6 @@ describe("WorkflowAddMenu — Demonstrate task item visibility/enabled state", (
 
   afterEach(() => {
     useSettingsStore.setState(initialSettings, true);
-    useRecordingStore.setState(initialRecording, true);
     cleanup();
   });
 
@@ -104,28 +101,15 @@ describe("WorkflowAddMenu — Demonstrate task item visibility/enabled state", (
     expect(item?.enabled).toBe(false);
   });
 
-  it("shows the Demonstrate task item as ENABLED once the browser is ready and not recording", () => {
+  it("shows the Demonstrate task item as ENABLED once the browser is ready", () => {
     useSettingsStore.getState().setIsUsingABrowser(true);
     useSettingsStore.getState().setIsLoadingABrowser(false);
-    useRecordingStore.setState({ isRecording: false });
 
     renderInDebugMode();
 
     const item = recordTaskItem(lastItems());
     expect(item).toBeDefined();
     expect(item?.enabled).toBe(true);
-  });
-
-  it("disables the Demonstrate task item while recording is in progress, even when isUsingABrowser is true", () => {
-    useSettingsStore.getState().setIsUsingABrowser(true);
-    useSettingsStore.getState().setIsLoadingABrowser(false);
-    useRecordingStore.setState({ isRecording: true });
-
-    renderInDebugMode();
-
-    const item = recordTaskItem(lastItems());
-    expect(item).toBeDefined();
-    expect(item?.enabled).toBe(false);
   });
 });
 
@@ -136,14 +120,12 @@ describe("WorkflowAddMenu — menu visibility gate", () => {
 
   afterEach(() => {
     useSettingsStore.setState(initialSettings, true);
-    useRecordingStore.setState(initialRecording, true);
     cleanup();
   });
 
   it("renders the radial menu in the studio editor (blockRunsEnabled) even when not in debug mode", () => {
     useSettingsStore.getState().setIsUsingABrowser(true);
     useSettingsStore.getState().setIsLoadingABrowser(false);
-    useRecordingStore.setState({ isRecording: false });
 
     const { getByTestId } = renderWithScope({
       isDebugMode: false,

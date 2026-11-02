@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.errors.errors import TimeoutGetTOTPVerificationCodeError, UserDefinedError
 from skyvern.webeye.actions.actions import TerminateAction
@@ -180,6 +181,41 @@ async def test_terminate_preserves_errors_when_extract_fails() -> None:
     # The original errors from LLM reasoning must be preserved
     assert len(action.errors) == 1
     assert action.errors[0].error_code == "OTP_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_terminate_does_not_log_malformed_llm_error_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-malformed-terminate-error-sentinel"
+    task = _make_task(error_code_mapping={"LOGIN_FAILED": "the login did not complete"})
+    task.navigation_goal = "Log in"
+    task.navigation_payload = {}
+    action = TerminateAction(reasoning="Page validation failed", errors=[])
+
+    with (
+        _surface_errors_llm_returns(
+            monkeypatch,
+            [{"error_code": sentinel, "reasoning": sentinel, "confidence_float": sentinel}],
+        ),
+        capture_logs() as events,
+    ):
+        results = await handle_terminate_action(
+            action=action,
+            page=MagicMock(),
+            scraped_page=_make_scraped_page(),
+            task=task,
+            step=_make_step(),
+        )
+
+    assert len(results) == 1
+    assert isinstance(results[0], ActionSuccess)
+    event = next(
+        event
+        for event in events
+        if event["event"] == "extract_user_defined_errors failed, using errors from action reasoning"
+    )
+    assert event["error_type"] == "ValidationError"
+    assert "exc_info" not in event
+    assert sentinel not in repr(event)
 
 
 @pytest.mark.asyncio

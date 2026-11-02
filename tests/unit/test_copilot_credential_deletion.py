@@ -50,7 +50,9 @@ class FakeVault:
     entered: asyncio.Event = field(default_factory=asyncio.Event)
     deleted: list[str] = field(default_factory=list)
     get_credential_item: AsyncMock = field(
-        default_factory=lambda: AsyncMock(return_value=SimpleNamespace(credential=SimpleNamespace(secret=SECRET)))
+        default_factory=lambda: AsyncMock(
+            return_value=SimpleNamespace(credential=SimpleNamespace(secret=SECRET), login_sites=None)
+        )
     )
     post_delete_credential_item: AsyncMock = field(default_factory=lambda: AsyncMock(return_value=True))
 

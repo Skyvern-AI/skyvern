@@ -136,7 +136,7 @@ def test_manifest_key_derives_extension_id() -> None:
     assert manifest["content_scripts"] == [
         {
             "matches": ["http://*/*", "https://*/*"],
-            "js": ["control_indicator.js", "form_controls.js"],
+            "js": ["control_indicator.js", "form_controls.js", "foreign_frames.js"],
             "run_at": "document_start",
             "all_frames": False,
             "world": "ISOLATED",

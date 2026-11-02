@@ -11,6 +11,7 @@ type Props = {
   availableOutputParameters: Array<string>;
   parameters: Array<string>;
   onParametersChange: (parameters: Array<string>) => void;
+  disabled?: boolean;
 };
 
 const CREDENTIALS_PAGE_SIZE = 100;
@@ -19,6 +20,7 @@ function ParametersMultiSelect({
   availableOutputParameters,
   parameters,
   onParametersChange,
+  disabled = false,
 }: Props) {
   const skyvernCredentialSourceAvailable =
     useSkyvernCredentialSourceAvailable();
@@ -78,6 +80,7 @@ function ParametersMultiSelect({
         onValueChange={onParametersChange}
         options={options}
         maxCount={50}
+        disabled={disabled}
       />
     </div>
   );

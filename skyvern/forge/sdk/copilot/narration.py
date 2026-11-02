@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
     REPLY_TOOL_NAME,
     ActivityBucket,
+    CopilotTestInput,
     NarrativeBlockAttempt,
     upsert_narrative_block_attempt,
 )
@@ -55,10 +56,13 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "scroll": "Interacting with page",
     "select_option": "Selecting option",
     "press_key": "Interacting with page",
+    "drag": "Interacting with page",
     "navigate_browser": "Opening page",
     "get_block_schema": "Checking workflow block options",
     "get_workflow_knowledge": "Looking up workflow guidance",
     "list_integrations": "Checking connected integrations",
+    "request_google_connection": "Preparing a Google connection",
+    "offer_demonstration": "Offering a demonstration",
     "read_google_sheet": "Reading the Google Sheet",
     "get_organization_usage_quota": "Checking account usage",
     "inspect_current_workflow": "Inspecting workflow",
@@ -96,6 +100,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "start_fresh_browser": "Starting a fresh browser",
     "extend_browser_session": "Extending the browser session",
     "upload_attached_file": "Attaching your file to the page",
+    "read_attached_pdf": "Reading your attached PDF",
     "run_browser_code": "Working in the browser",
     "edit_block": "Editing block",
     "add_block": "Adding block",
@@ -166,6 +171,8 @@ def build_tool_result_activity(
     display_label: str | None = None,
     code_diffs: list[CodeWriteDiff] | None = None,
     browser_steps: list[str] | None = None,
+    workflow_run_id: str | None = None,
+    test_inputs: list[CopilotTestInput] | None = None,
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
@@ -184,6 +191,10 @@ def build_tool_result_activity(
         entry["codeDiffs"] = code_diffs
     if browser_steps:
         entry["browserSteps"] = browser_steps
+    if workflow_run_id:
+        entry["workflowRunId"] = workflow_run_id
+    if test_inputs:
+        entry["testInputs"] = test_inputs
     return entry
 
 

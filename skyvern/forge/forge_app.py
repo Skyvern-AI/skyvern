@@ -37,6 +37,9 @@ from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
+from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
+    ConnectedBitwardenCredentialVaultService,
+)
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.services.credential.gcp_credential_vault_service import GcpCredentialVaultService
@@ -45,7 +48,6 @@ from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service impo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
@@ -105,7 +107,6 @@ class ForgeApp:
     WORKFLOW_SERVICE: WorkflowService
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
-    BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
     SKYVERN_CREDENTIAL_VAULT_SERVICE: SkyvernCredentialVaultService | None
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
@@ -283,7 +284,6 @@ def create_forge_app() -> ForgeApp:
             "Set BROWSER_STREAMING_MODE=cdp to stream the remote browser through this backend.",
             browser_streaming_mode=settings.BROWSER_STREAMING_MODE,
         )
-    app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.GCP_CLIENT_FACTORY = RealGcpClientFactory()
@@ -343,6 +343,7 @@ def create_forge_app() -> ForgeApp:
         CredentialVaultType.GCP: app.GCP_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.ONEPASSWORD: app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.BITWARDEN_CONNECTED: ConnectedBitwardenCredentialVaultService(),
     }
 
     app.scrape_exclude = None

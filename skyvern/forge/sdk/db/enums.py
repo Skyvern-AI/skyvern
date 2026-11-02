@@ -52,6 +52,7 @@ class WorkflowRunTriggerType(StrEnum):
     - event: Triggered by an external event source
     - job_recipe_extract: Launched by a job recipe extract request
     - job_recipe_apply: Launched by a job recipe apply request
+    - seo_recipe_submit: Launched by an SEO recipe directory submission
     """
 
     manual = "manual"
@@ -62,6 +63,7 @@ class WorkflowRunTriggerType(StrEnum):
     event = "event"
     job_recipe_extract = "job_recipe_extract"
     job_recipe_apply = "job_recipe_apply"
+    seo_recipe_submit = "seo_recipe_submit"
 
 
 class WorkflowBuildSource(StrEnum):
@@ -105,6 +107,15 @@ JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES = frozenset(
 
 def is_job_recipe_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
     return trigger_type in JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES
+
+
+RECIPE_BILLING_WORKFLOW_RUN_TRIGGER_TYPES = JOB_RECIPE_WORKFLOW_RUN_TRIGGER_TYPES | frozenset(
+    {WorkflowRunTriggerType.seo_recipe_submit}
+)
+
+
+def is_recipe_billing_workflow_run_trigger_type(trigger_type: WorkflowRunTriggerType | None) -> bool:
+    return trigger_type in RECIPE_BILLING_WORKFLOW_RUN_TRIGGER_TYPES
 
 
 class WorkflowRunStatus(StrEnum):

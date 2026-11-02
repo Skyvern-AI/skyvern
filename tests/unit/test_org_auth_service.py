@@ -20,7 +20,6 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.request_logging import RequestLoggingMiddleware
 from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
 from skyvern.forge.sdk.core.security import assert_signing_key_usable, create_access_token
-from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth as streaming_auth
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 from skyvern.forge.sdk.services import org_auth_service, org_auth_token_service, request_principal
@@ -35,6 +34,7 @@ from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityStatus,
     get_request_principal,
 )
+from tests.unit.shared_route_app import shared_route_app
 
 
 def test_authenticated_org_age_is_cached_for_lines_that_only_name_the_org() -> None:
@@ -581,10 +581,8 @@ async def _mint_api_token(
     return token, db, repository
 
 
-def _organization_routes_client() -> TestClient:
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
-    return TestClient(fastapi_app)
+def _organization_routes_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return TestClient(shared_route_app(monkeypatch))
 
 
 @pytest.mark.asyncio
@@ -790,7 +788,7 @@ async def test_self_hosted_api_key_route_rejects_ui_session_token(
 ) -> None:
     token, _, _ = await _mint_ui_session_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             f"/api/v1/organizations/org-ui-session/apikeys{suffix}",
             headers={"x-api-key": token},
@@ -807,7 +805,7 @@ async def test_api_key_route_accepts_api_token(
 ) -> None:
     token, _, _ = await _mint_api_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             f"/api/v1/organizations/org-api-route/apikeys{suffix}",
             headers={"x-api-key": token},
@@ -832,7 +830,7 @@ async def test_self_hosted_credential_gate_accepts_ui_session_token(monkeypatch:
 async def test_ordinary_organization_route_accepts_ui_session_token(monkeypatch: pytest.MonkeyPatch) -> None:
     token, _, _ = await _mint_ui_session_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             "/api/v1/organizations/me",
             headers={"x-api-key": token},
@@ -1147,24 +1145,41 @@ def test_bearer_scheme_is_matched_case_insensitively() -> None:
 
 
 _PRINCIPAL_FIELDS = ("auth_kind", "user_id", "org_role", "org_role_claim", "token_has_organization_claim")
-_NO_USER = {"user_id": None, "org_role": None, "org_role_claim": None, "token_has_organization_claim": None}
+_NO_USER = {
+    "user_id": None,
+    "org_role": None,
+    "org_role_claim": None,
+    "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
+}
 _ADMIN = {
     "user_id": "user_admin",
     "org_role": "org:admin",
     "org_role_claim": "org_role",
     "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
 }
 _MEMBER = {
     "user_id": "user_member",
     "org_role": "member",
     "org_role_claim": "o.rol",
     "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
 }
 _ROLELESS = {
     "user_id": "user_roleless",
     "org_role": None,
     "org_role_claim": None,
     "token_has_organization_claim": None,
+    "app_role": None,
+    "app_role_is_authoritative": False,
+    "impersonator_user_id": None,
 }
 
 
@@ -1275,6 +1290,10 @@ def _logged_principals(log: MagicMock) -> list[dict[str, object]]:
     ]
 
 
+def _logged_principal_snapshot(principal: dict[str, object]) -> dict[str, object]:
+    return {field: principal[field] for field in ("organization_id", *_PRINCIPAL_FIELDS)}
+
+
 def _use_bearer_authentication(monkeypatch: pytest.MonkeyPatch, organization: Organization | None) -> None:
     """Configure bearer authentication for ``organization``, or none at all as in a self-hosted deployment."""
 
@@ -1355,7 +1374,7 @@ async def test_raw_request_record_carries_the_request_principal(
     principal = {"organization_id": organization_id, **expected}
     assert response.status_code == 200
     assert response.json() == principal
-    assert _logged_principals(raw_request_log) == [principal]
+    assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal)]
 
 
 @pytest.mark.asyncio
@@ -1396,7 +1415,7 @@ async def test_every_org_auth_dependency_resolves_the_principal_without_changing
     principal = {"organization_id": organization_id, **expected}
     assert response.status_code == 200
     assert response.json() == principal
-    assert _logged_principals(raw_request_log) == [principal]
+    assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal)]
 
 
 @pytest.mark.asyncio
@@ -1418,7 +1437,7 @@ async def test_two_users_behind_one_key_each_get_their_own_principal_across_a_ca
         {"organization_id": organization_id, "auth_kind": "api_key_and_bearer", **user} for user in (_ADMIN, _MEMBER)
     ]
     assert [response.json() for response in responses] == principals
-    assert _logged_principals(raw_request_log) == principals
+    assert _logged_principals(raw_request_log) == [_logged_principal_snapshot(principal) for principal in principals]
 
 
 @pytest.mark.asyncio

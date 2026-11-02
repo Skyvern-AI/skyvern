@@ -11,6 +11,8 @@ import structlog
 from playwright.async_api import Page
 from pydantic import BaseModel, PrivateAttr
 
+from skyvern.webeye.native_downloads import NativeDownloads
+
 LOG = structlog.get_logger()
 
 
@@ -90,6 +92,8 @@ class BrowserArtifacts(BaseModel):
     # None when none was requested or the chosen creator could not load one (remote/vendor browsers,
     # storage miss, corruption fallback) — consumers must treat None as "profile not applied".
     applied_browser_profile_id: str | None = None
+    # The saved profile an attached persistent session reports it loaded remotely; never read by whole-dir write-back.
+    session_loaded_browser_profile_id: str | None = None
     local_display_recording_eligible: bool = False
     # ((input_w, input_h), (output_w, output_h)) for the whole-display recorder, resolved from the final
     # launch --window-size at the configure seam and carried to the acquire seam. None → fixed full screen.
@@ -120,6 +124,21 @@ class BrowserArtifacts(BaseModel):
     # treats the seed as UNKNOWN and never full-overwrites (a None etag would otherwise read "unchanged").
     _seed_capture_failed: bool = PrivateAttr(default=False)
     _action_download_source: ActionDownloadSource | None = PrivateAttr(default=None)
+    # The GL flags (--use-gl / --use-angle) a local creator handed the driver, for launch telemetry; no other arg.
+    _requested_graphics_flags: tuple[str, ...] | None = PrivateAttr(default=None)
+    # Whether the creator started this browser's process on this host itself, rather than dialing one.
+    _spawned_local_browser: bool = PrivateAttr(default=False)
+    _native_downloads: NativeDownloads | None = PrivateAttr(default=None)
+    # Log-only provider session id for runtime events. Unlike remote_browser_session_id it must not drive
+    # page selection, downloads or any other behavior.
+    _provider_session_id: str | None = PrivateAttr(default=None)
+
+    @property
+    def native_downloads(self) -> NativeDownloads | None:
+        return self._native_downloads
+
+    def attach_native_downloads(self, observer: NativeDownloads | None) -> None:
+        self._native_downloads = observer
 
     def local_paths(self) -> list[str]:
         """Files and folders on this host that the browser writes to: recordings, HAR, traces, profile, console log."""
@@ -130,6 +149,31 @@ class BrowserArtifacts(BaseModel):
             if path
         ]
         return paths
+
+    def note_requested_launch_args(self, args: object) -> None:
+        # Args a creator could not see stay unrecorded, which telemetry reads as unknown.
+        if isinstance(args, list):
+            self._requested_graphics_flags = tuple(
+                arg for arg in args if isinstance(arg, str) and arg.split("=", 1)[0] in ("--use-gl", "--use-angle")
+            )
+
+    @property
+    def requested_graphics_flags(self) -> tuple[str, ...] | None:
+        return self._requested_graphics_flags
+
+    def note_provider_session_id(self, session_id: str | None) -> None:
+        self._provider_session_id = session_id or None
+
+    @property
+    def provider_session_id(self) -> str | None:
+        return self._provider_session_id
+
+    def note_spawned_local_browser(self) -> None:
+        self._spawned_local_browser = True
+
+    @property
+    def spawned_local_browser(self) -> bool:
+        return self._spawned_local_browser
 
     def attach_action_download_source(self, source: ActionDownloadSource | None) -> None:
         self._action_download_source = source

@@ -105,14 +105,21 @@ async def test_each_flag_keeps_its_own_arm_within_one_run(
     assert (run_arm_enabled(_FLAG, forced=False), run_arm_enabled(_OTHER_FLAG, forced=False)) == (True, False)
 
 
-def _run_arm_call_flags(func_name: str, flag_position: int) -> set[str]:
+def _run_arm_call_flags(func_name: str, flag_position: int, *, result_used: bool = False) -> set[str]:
     """Names passed as the flag to every ``func_name`` call in the skyvern package; a literal fails the test."""
     names: set[str] = set()
     for path in Path(skyvern.__file__).parent.rglob("*.py"):
         source = path.read_text()
         if func_name not in source:
             continue
-        for node in ast.walk(ast.parse(source)):
+        tree = ast.parse(source)
+        # An assigned, awaited result is how a caller reads the arm it resolved.
+        calls = (
+            [a.value.value for a in ast.walk(tree) if isinstance(a, ast.Assign) and isinstance(a.value, ast.Await)]
+            if result_used
+            else list(ast.walk(tree))
+        )
+        for node in calls:
             if not isinstance(node, ast.Call):
                 continue
             callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
@@ -132,4 +139,5 @@ def test_every_arm_is_declared_in_run_arms_resolved_and_read() -> None:
     declared = {name for name, value in vars(run_arms).items() if name.isupper() and isinstance(value, str)}
     assert declared
     assert _run_arm_call_flags("resolve_run_arm", 1) == declared
-    assert _run_arm_call_flags("run_arm_enabled", 0) == declared
+    read = _run_arm_call_flags("run_arm_enabled", 0) | _run_arm_call_flags("resolve_run_arm", 1, result_used=True)
+    assert read == declared

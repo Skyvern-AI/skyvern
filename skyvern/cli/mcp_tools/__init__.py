@@ -106,6 +106,7 @@ from .credential import (
     skyvern_onepassword_config_set,
     skyvern_onepassword_items,
 )
+from .feedback import skyvern_feedback
 from .folder import (
     skyvern_folder_create,
     skyvern_folder_delete,
@@ -553,6 +554,9 @@ mcp.tool(description=FINISH_DESCRIPTION, tags={"lean"}, annotations=_ro("Declare
 # Additive page-read surface; intentionally excluded from every existing scope.
 mcp.tool(tags={"page_read", "lean"}, annotations=_web_ro("Read Page"))(size_capped(skyvern_page))
 
+# -- Feedback --
+mcp.tool(tags={"feedback"}, annotations=_mut("Send Feedback to Skyvern"))(skyvern_feedback)
+
 __all__ = [
     "mcp",
     # Session
@@ -694,4 +698,6 @@ __all__ = [
     # Schema-constrained output
     "skyvern_extract_structured",
     "skyvern_finish",
+    # Feedback
+    "skyvern_feedback",
 ]

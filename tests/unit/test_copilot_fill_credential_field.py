@@ -8,6 +8,7 @@ recorded interaction, or error string.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -30,23 +31,22 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import CredentialOriginRecovery, OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.blocker_signal import CREDENTIAL_ORIGIN_RECOVERY_PENDING_REASON_CODE
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
     _build_request_policy_bootstrap,
     _ground_user_provided_sites,
     _seed_prior_approved_credentials,
     admit_credential_for_live_page,
+    admit_vault_login_for_live_page,
+    resolve_credential_for_live_page,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    CredentialOriginRecovery,
-    OriginRunRedactionRegistry,
-    browser_session_recovery,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext, browser_session_recovery
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
@@ -58,13 +58,29 @@ from skyvern.forge.sdk.copilot.tools import credential_fill as credential_fill_m
 from skyvern.forge.sdk.copilot.tools import mcp_hooks as mcp_hooks_module
 from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
-from skyvern.forge.sdk.schemas.credentials import CredentialType, CredentialVaultType, PasswordCredential, TotpType
+from skyvern.forge.sdk.copilot.vault_logins import load_vault_logins, vault_login_credential, vault_login_ref
+from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.schemas.credentials import (
+    Credential,
+    CredentialItem,
+    CredentialType,
+    CredentialVaultType,
+    PasswordCredential,
+    TotpType,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from skyvern.forge.sdk.services.bitwarden import BitwardenLoginSecret
+from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
-from tests.unit.conftest import make_copilot_context
+from tests.unit.conftest import (
+    ORG_VAULT_LOGIN_PASSWORD,
+    OrgVaultFake,
+    make_copilot_context,
+    org_vault_overview,
+)
 from tests.unit.copilot_test_helpers import (
     make_copilot_ctx,
     wire_credential_vault,
@@ -127,9 +143,11 @@ def _ctx(**overrides: Any) -> SimpleNamespace:
         scouted_credential_field_inventory_by_credential_id={},
         org_credentials_for_turn=None,
         vault_login_uris_by_credential_id={},
+        scoped_login_sites_by_credential_id={},
         signed_out_page_observations=[],
         signed_out_page_observation_attempts=[],
         credential_origin_recovery=None,
+        credential_origin_refusals=set(),
         blocker_signal=None,
         codeblock_redaction_parameters={},
         supports_vision=False,
@@ -1949,7 +1967,7 @@ class TestCredentialFillLivePageAdmission:
             ),
             WorkflowCopilotChatHistoryMessage(
                 sender=WorkflowCopilotChatSender.AI,
-                content="I created a draft workflow with 1 block and tested it, but the test failed.",
+                content="I tested the draft, but the test failed: Login rejected.",
                 created_at=datetime.now(UTC),
             ),
         ]
@@ -2189,8 +2207,14 @@ class TestObservationSeamCredentialBinding:
         return result, load_mock
 
     @pytest.mark.asyncio
-    async def test_navigating_to_a_matched_login_page_binds_and_surfaces_the_id(self) -> None:
-        policy = RequestPolicy()
+    @pytest.mark.parametrize(
+        ("persisted_ids", "binding"),
+        [([], "matched_by_saved_url"), (["cred_analytics"], "saved_workflow")],
+    )
+    async def test_navigating_to_a_matched_login_page_binds_and_surfaces_the_id(
+        self, persisted_ids: list[str], binding: str
+    ) -> None:
+        policy = RequestPolicy(persisted_workflow_credential_ids=persisted_ids)
         ctx = _ctx(request_policy=policy)
 
         result, _ = await self._observe_navigate(
@@ -2204,6 +2228,7 @@ class TestObservationSeamCredentialBinding:
         )
 
         assert result["resolved_login_credential_id"] == "cred_analytics"
+        assert result["resolved_login_credential_binding"] == CREDENTIAL_BINDING_FACTS[binding]
         assert result["resolved_login_credential_name"] == "analytics"
         assert "candidate_login_credentials" not in result
 
@@ -2588,6 +2613,329 @@ class TestVaultNamedSiteGrant:
 
         assert not credential_fill_module._within_grant("https://other.example.com/login", page_grant)
         assert credential_fill_module._within_grant("https://eu.example.com/step2", page_grant)
+
+
+_REAL_RESOLVE_CREDENTIAL_FILL_VALUE = credential_fill_module._resolve_credential_fill_value
+_VAULT_PAGE_URL = "https://portal.example.com/login"
+
+
+def _vault_sites(org_vault: OrgVaultFake, sites: list[LoginSite], **overview: Any) -> None:
+    org_vault.listing.return_value = [org_vault_overview(sites=sites, **overview)]
+    org_vault.secret.return_value = BitwardenLoginSecret(dict(org_vault.secret.return_value), sites)
+
+
+class TestVaultLoginImportOnFill:
+    """A vault login not saved yet fills, and is saved, only where its own item's sites place it."""
+
+    def _wire(self, monkeypatch: pytest.MonkeyPatch, page_url: str = _VAULT_PAGE_URL) -> _FakePage:
+        page = _FakePage(url=page_url)
+        _wire_impl(monkeypatch, page)
+        monkeypatch.setattr(
+            credential_fill_module, "_resolve_credential_fill_value", _REAL_RESOLVE_CREDENTIAL_FILL_VALUE
+        )
+        monkeypatch.setattr(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=page_url))
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", AsyncMock(return_value=page_url))
+        monkeypatch.setattr(credential_fill_module, "load_credentials", AsyncMock(return_value=[]))
+        return page
+
+    async def _listed_ctx(self, *, named: bool) -> tuple[SimpleNamespace, str]:
+        policy = RequestPolicy()
+        logins, _ = await load_vault_logins("o_test_org", policy)
+        [ref] = logins
+        if named:
+            policy.resolved_credentials = [vault_login_credential("o_test_org", ref, logins[ref])]
+            policy.current_turn_named_credential_ids = {ref}
+        return _ctx(organization_id="o_test_org", request_policy=policy), ref
+
+    @pytest.mark.asyncio
+    async def test_a_named_vault_login_fills_on_its_own_site_and_is_saved_once(
+        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake
+    ) -> None:
+        page = self._wire(monkeypatch)
+        ctx, ref = await self._listed_ctx(named=True)
+
+        first = await tools_module.fill_credential_field(ctx, "#passwordInput", ref, "password")
+        second = await tools_module.fill_credential_field(ctx, "#usernameInput", ref, "username")
+
+        [row] = await org_vault.imported_rows()
+        assert first["ok"] is True and second["ok"] is True
+        assert page.fill_calls[0] == ("#passwordInput", ORG_VAULT_LOGIN_PASSWORD)
+        assert [credential.credential_id for credential in ctx.request_policy.resolved_credentials] == [
+            row.credential_id
+        ]
+        assert ctx.request_policy.current_turn_named_credential_ids == {row.credential_id}
+        assert ORG_VAULT_LOGIN_PASSWORD not in json.dumps(first)
+        assert ORG_VAULT_LOGIN_PASSWORD in ctx.secret_scrub_values
+
+    @pytest.mark.asyncio
+    async def test_a_vault_login_listed_in_an_earlier_turn_fills_without_a_listing_this_turn(
+        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake
+    ) -> None:
+        page = self._wire(monkeypatch)
+        ctx, ref = await self._listed_ctx(named=True)
+        ctx.request_policy.vault_logins = None
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", ref, "password")
+
+        assert result["ok"] is True
+        assert page.fill_calls == [("#passwordInput", ORG_VAULT_LOGIN_PASSWORD)]
+        assert len(await org_vault.imported_rows()) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sites", "page_url", "filled"),
+        [
+            pytest.param(
+                [LoginSite("https://app.example.com", whole_site=False)],
+                "https://other.example.com/login",
+                False,
+                id="host-match-other-host",
+            ),
+            pytest.param(
+                [LoginSite("https://portal.example.com", whole_site=False)],
+                "https://app.portal.example.com/login",
+                False,
+                id="host-match-sibling-host",
+            ),
+            pytest.param(
+                [LoginSite("https://example.com", whole_site=True)],
+                "https://app.portal.example.com/login",
+                True,
+                id="base-domain-sibling-host",
+            ),
+            pytest.param([], _VAULT_PAGE_URL, False, id="no-site"),
+        ],
+    )
+    async def test_a_named_vault_login_is_filled_and_saved_only_where_its_item_places_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        org_vault: OrgVaultFake,
+        sites: list[LoginSite],
+        page_url: str,
+        filled: bool,
+    ) -> None:
+        _vault_sites(org_vault, sites)
+        page = self._wire(monkeypatch, page_url)
+        ctx, ref = await self._listed_ctx(named=True)
+        ctx.request_policy.user_provided_site_urls = [page_url]
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", ref, "password")
+
+        assert result["ok"] is filled
+        assert bool(page.fill_calls) is filled
+        assert len(await org_vault.imported_rows()) == int(filled)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rival", [None, "second_vault_login", "saved_credential"])
+    async def test_an_unnamed_vault_login_is_admitted_on_the_live_page_only_as_its_sole_candidate(
+        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake, rival: str | None
+    ) -> None:
+        page = self._wire(monkeypatch)
+        ctx, ref = await self._listed_ctx(named=False)
+        if rival == "second_vault_login":
+            second = org_vault_overview(item_id="6c1f0b7e-0d0a-4f6e-9a55-2b8f3c1d4e21", title="Second portal")
+            [login] = ctx.request_policy.vault_logins.values()
+            ctx.request_policy.vault_logins["vlogin_second"] = dataclasses.replace(
+                login, item_id=second.item_id, title=second.title
+            )
+        if rival == "saved_credential":
+            saved = Credential(
+                credential_id="cred_rival",
+                organization_id="o_test_org",
+                name="Saved portal",
+                vault_type=CredentialVaultType.SKYVERN,
+                item_id="item_rival",
+                credential_type=CredentialType.PASSWORD,
+                username="rival@example.com",
+                card_last4=None,
+                card_brand=None,
+                tested_url=_VAULT_PAGE_URL,
+                created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                modified_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+            monkeypatch.setattr(credential_fill_module, "load_credentials", AsyncMock(return_value=[saved]))
+
+        result = await tools_module.fill_credential_field(ctx, "#passwordInput", ref, "password")
+
+        assert result["ok"] is (rival is None)
+        assert bool(page.fill_calls) is (rival is None)
+        assert len(await org_vault.imported_rows()) == int(rival is None)
+
+    @pytest.mark.asyncio
+    async def test_an_imported_vault_login_is_admitted_again_on_its_site_in_a_fresh_chat(
+        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake
+    ) -> None:
+        _vault_sites(org_vault, [LoginSite("https://portal.example.com", whole_site=False)])
+        self._wire(monkeypatch)
+        ctx, ref = await self._listed_ctx(named=True)
+        await tools_module.fill_credential_field(ctx, "#passwordInput", ref, "password")
+        [row] = await org_vault.imported_rows()
+        saved = await org_vault.database.credentials.get_credential(row.credential_id, organization_id="o_test_org")
+        assert saved is not None and saved.tested_url is None
+        page = self._wire(monkeypatch)
+        monkeypatch.setattr(credential_fill_module, "load_credentials", AsyncMock(return_value=[saved]))
+        fresh_policy = RequestPolicy()
+        listed, _ = await load_vault_logins("o_test_org", fresh_policy)
+        assert listed[row.credential_id].credential_id == row.credential_id
+        fresh_ctx = _ctx(organization_id="o_test_org", request_policy=fresh_policy)
+
+        result = await tools_module.fill_credential_field(fresh_ctx, "#passwordInput", row.credential_id, "password")
+
+        assert result["ok"] is True
+        assert page.fill_calls == [("#passwordInput", ORG_VAULT_LOGIN_PASSWORD)]
+        assert [credential.credential_id for credential in await org_vault.imported_rows()] == [row.credential_id]
+
+    @pytest.mark.asyncio
+    async def test_a_named_1password_login_keeps_its_tested_origin_after_its_first_fill_imports_it(
+        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake
+    ) -> None:
+        login = _vault_login("item_op", urls=(_VAULT_PAGE_URL,))
+        item = CredentialItem(
+            item_id="item_op",
+            name="item_op",
+            credential_type=CredentialType.PASSWORD,
+            credential=PasswordCredential(username="vault-user@example.com", password=ORG_VAULT_LOGIN_PASSWORD),
+            login_uris=[_VAULT_PAGE_URL],
+        )
+        monkeypatch.setitem(
+            app.CREDENTIAL_VAULT_SERVICES,
+            CredentialVaultType.ONEPASSWORD,
+            SimpleNamespace(get_credential_item=AsyncMock(return_value=item)),
+        )
+        ref = vault_login_ref(login)
+        policy = RequestPolicy(
+            vault_logins={ref: login},
+            vault_listing=VaultLoginListing(logins=(login,)),
+            resolved_credentials=[vault_login_credential("o_test_org", ref, login)],
+            current_turn_named_credential_ids={ref},
+        )
+        ctx = _ctx(organization_id="o_test_org", request_policy=policy)
+        self._wire(monkeypatch)
+        first = await tools_module.fill_credential_field(ctx, "#usernameInput", ref, "username")
+        [row] = await org_vault.imported_rows()
+        sibling_host = self._wire(monkeypatch, "https://app.portal.example.com/login")
+
+        second = await tools_module.fill_credential_field(ctx, "#passwordInput", row.credential_id, "password")
+
+        assert first["ok"] is True
+        assert second["ok"] is False
+        assert sibling_host.fill_calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tested_url", [None, "https://app.portal.example.com/login"])
+    async def test_a_saved_vault_login_is_refused_off_its_item_sites_whatever_else_vouches_for_the_page(
+        self, monkeypatch: pytest.MonkeyPatch, org_vault: OrgVaultFake, tested_url: str | None
+    ) -> None:
+        self._wire(monkeypatch)
+        ctx, ref = await self._listed_ctx(named=True)
+        await tools_module.fill_credential_field(ctx, "#passwordInput", ref, "password")
+        [row] = await org_vault.imported_rows()
+        async with org_vault.database.Session() as session:
+            stored = await session.get(type(row), row.credential_id)
+            stored.tested_url = tested_url
+            await session.commit()
+        saved = await org_vault.database.credentials.get_credential(row.credential_id, organization_id="o_test_org")
+        off_site = "https://app.portal.example.com/login"
+        page = self._wire(monkeypatch, off_site)
+        next_ctx = _ctx(
+            organization_id="o_test_org",
+            request_policy=RequestPolicy(
+                resolved_credentials=[saved],
+                current_turn_named_credential_ids={row.credential_id},
+                user_provided_site_urls=[off_site],
+            ),
+        )
+
+        result = await tools_module.fill_credential_field(next_ctx, "#passwordInput", row.credential_id, "password")
+
+        assert result["ok"] is False
+        assert page.fill_calls == []
+
+
+def _vault_login(item_id: str, *, urls: tuple[str, ...], credential_id: str | None = None) -> VaultLogin:
+    return VaultLogin(
+        vault_type=CredentialVaultType.ONEPASSWORD,
+        vault_id="vault_1",
+        item_id=item_id,
+        title=item_id,
+        urls=urls,
+        sites=(LoginSite(urls[0], whole_site=False),) if urls else (),
+        tested_url=urls[0] if urls else None,
+        credential_id=credential_id,
+    )
+
+
+def _imported(login: VaultLogin) -> Credential:
+    assert login.credential_id is not None
+    credential = vault_login_credential("o_test_org", login.credential_id, login)
+    return credential.model_copy(update={"tested_url": login.tested_url})
+
+
+class TestVaultLoginRivals:
+    """Every login a vault lists for the page competes for it, imported or not; none competes with itself."""
+
+    @pytest.mark.asyncio
+    async def test_after_one_account_is_imported_another_account_for_the_page_makes_it_ambiguous(self) -> None:
+        account_a = _vault_login("item_a", urls=(_VAULT_PAGE_URL,), credential_id="cred_a")
+        account_b = _vault_login("item_b", urls=(_VAULT_PAGE_URL,))
+        policy = RequestPolicy(vault_logins={"cred_a": account_a, "vlogin_b": account_b})
+
+        record = await resolve_credential_for_live_page(
+            policy,
+            organization_id="o_test_org",
+            page_url=_VAULT_PAGE_URL,
+            load_org_credentials=AsyncMock(return_value=[_imported(account_a)]),
+        )
+
+        assert record.verdict == "ambiguous"
+        assert {candidate.credential_id for candidate in record.candidates} == {"cred_a", vault_login_ref(account_b)}
+
+    @pytest.mark.asyncio
+    async def test_a_single_imported_login_is_not_ambiguous_with_itself(self) -> None:
+        account_a = _vault_login("item_a", urls=(_VAULT_PAGE_URL,), credential_id="cred_a")
+        policy = RequestPolicy(vault_logins={"vlogin_a": account_a, "cred_a": account_a})
+
+        record = await resolve_credential_for_live_page(
+            policy,
+            organization_id="o_test_org",
+            page_url=_VAULT_PAGE_URL,
+            load_org_credentials=AsyncMock(return_value=[_imported(account_a)]),
+        )
+
+        assert record.verdict == "resolved"
+        assert [candidate.credential_id for candidate in record.candidates] == ["cred_a"]
+
+    @pytest.mark.asyncio
+    async def test_an_imported_login_with_a_tested_url_is_matched_by_that_url_not_its_whole_site(self) -> None:
+        account_a = _vault_login("item_a", urls=("https://portal.example.com/login",), credential_id="cred_a")
+        policy = RequestPolicy(vault_logins={"cred_a": account_a})
+
+        record = await resolve_credential_for_live_page(
+            policy,
+            organization_id="o_test_org",
+            page_url="https://portal.example.com/uploads/avatar",
+            load_org_credentials=AsyncMock(return_value=[_imported(account_a)]),
+        )
+
+        assert record.verdict != "resolved"
+
+    @pytest.mark.asyncio
+    async def test_a_login_saved_for_the_page_with_an_exact_uri_still_competes(self) -> None:
+        account_a = _vault_login("item_a", urls=(_VAULT_PAGE_URL,))
+        exact_only = dataclasses.replace(_vault_login("item_b", urls=(_VAULT_PAGE_URL,)), sites=())
+        policy = RequestPolicy(vault_logins={"vlogin_a": account_a, "vlogin_b": exact_only})
+
+        admission = await admit_vault_login_for_live_page(
+            policy,
+            organization_id="o_test_org",
+            credential_id="vlogin_a",
+            login=account_a,
+            page_url=_VAULT_PAGE_URL,
+            load_org_credentials=AsyncMock(return_value=[]),
+        )
+
+        assert admission.admitted is False
+        assert "vlogin_a" not in policy.live_page_admitted_urls
 
 
 _RUN_OTP = "424242"

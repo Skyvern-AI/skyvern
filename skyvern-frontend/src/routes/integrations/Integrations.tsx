@@ -6,6 +6,7 @@ import {
   UpdateIcon,
 } from "@radix-ui/react-icons";
 import { GoogleOAuthCredential } from "@/api/types";
+import { MessageIcon } from "@/components/icons/MessageIcon";
 import { GoogleOAuthClientConfigForm } from "@/components/GoogleOAuthClientConfigForm";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,6 +21,7 @@ import {
   DialogClose,
   DialogContent,
   DialogDescription,
+  DialogHeader,
   DialogFooter,
   DialogTitle,
   DialogTrigger,
@@ -32,6 +34,7 @@ import {
   useGoogleOAuthCredentials,
   type GmailCapability,
 } from "@/hooks/useGoogleOAuthCredentials";
+import { useTwilioCredentialQuery } from "@/hooks/useTwilioIntegration";
 import {
   GOOGLE_DRIVE_REQUIRED_SCOPES,
   GOOGLE_GMAIL_REQUIRED_SCOPES,
@@ -47,6 +50,7 @@ import {
   getGoogleOAuthAppOrigin,
   storeGoogleOAuthIntegrationIdForState,
 } from "./googleOAuth";
+import { TwilioIntegrationPanel } from "./twilio/TwilioIntegrationPanel";
 
 const integrations = [
   {
@@ -92,6 +96,17 @@ function Integrations() {
     deleteCredential,
     isDeletingCredential,
   } = useGoogleOAuthCredentials({ includeEmail: true });
+  const {
+    data: twilioCapability,
+    isLoading: isLoadingTwilioCredential,
+    isFetching: isFetchingTwilioCredential,
+    isError: isTwilioCredentialError,
+    error: twilioCredentialError,
+    refetch: refetchTwilioCredential,
+  } = useTwilioCredentialQuery();
+  const twilioCredential = twilioCapability?.credential;
+  const hasTwilioCredentialError =
+    isTwilioCredentialError || Boolean(twilioCredentialError);
 
   const connect = async (integration: (typeof integrations)[number]) => {
     setConnectingId(integration.id);
@@ -217,6 +232,70 @@ function Integrations() {
           );
         })}
       </div>
+      {twilioCapability?.available !== false ? (
+        <section className="space-y-3">
+          <div>
+            <h2 className="text-lg font-semibold">Communication</h2>
+            <p className="text-sm text-muted-foreground">
+              Connect services that deliver verification messages to workflows.
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-3">
+            <Card>
+              <CardHeader>
+                <div className="mb-2 flex size-9 items-center justify-center rounded-md border bg-muted">
+                  <MessageIcon className="size-5" />
+                </div>
+                <CardTitle className="text-base">Twilio</CardTitle>
+                <CardDescription>
+                  Connected and enabled Twilio numbers deliver SMS 2FA codes
+                  automatically. For any other number, push codes through the
+                  2FA API or UI.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="text-sm text-muted-foreground">
+                  {isLoadingTwilioCredential
+                    ? "Checking connection..."
+                    : twilioCredential
+                      ? "Connected"
+                      : "Not connected"}
+                </div>
+                <Dialog>
+                  <DialogTrigger asChild>
+                    <Button
+                      type="button"
+                      className="w-full"
+                      onClick={(event) =>
+                        hasTwilioCredentialError &&
+                        (event.preventDefault(), void refetchTwilioCredential())
+                      }
+                      disabled={
+                        isLoadingTwilioCredential || isFetchingTwilioCredential
+                      }
+                    >
+                      {(hasTwilioCredentialError && "Retry") ||
+                        (twilioCredential ? "Manage" : "Configure")}
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-4xl">
+                    <DialogHeader>
+                      <DialogTitle>Twilio</DialogTitle>
+                      <DialogDescription>
+                        Connect Twilio and choose the phone numbers that deliver
+                        SMS verification codes to Skyvern automatically.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="pt-2">
+                      <TwilioIntegrationPanel />
+                    </div>
+                  </DialogContent>
+                </Dialog>
+              </CardContent>
+            </Card>
+          </div>
+        </section>
+      ) : null}
 
       <Card>
         <CardHeader className="border-b-2">

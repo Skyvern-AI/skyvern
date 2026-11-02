@@ -49,8 +49,10 @@ def test_dom_inspection_interface_accepts_no_caller_supplied_code() -> None:
     }
     assert set(public_operations) == {
         "read_current_url",
+        "read_locator_accepts_text_fill",
         "read_locator_is_content_editable",
         "read_locator_selected_state",
+        "read_static_listbox_option_snapshot",
         "read_locator_tag_name",
         "read_resolved_anchor_href",
         "read_whether_link_or_button",

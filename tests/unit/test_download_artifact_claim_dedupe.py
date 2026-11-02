@@ -130,6 +130,26 @@ async def test_run_scoped_read_keeps_session_download_without_run_scoped_twin(
 
 
 @pytest.mark.asyncio
+async def test_session_download_claim_skips_rejected_uris(sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    org = await sqlite_db.organizations.create_organization("Test Org rejected")
+    org_id, session_id, run_id = org.organization_id, "pbs_rejected", "wr_rejected"
+    await _make(sqlite_db, org_id, "a_session_valid", run_id=None, browser_session_id=session_id, checksum="valid")
+    await _make(sqlite_db, org_id, "a_session_rejected", run_id=None, browser_session_id=session_id, checksum="bad")
+    rejected_uri = f"s3://skyvern-artifacts/v1/production/{org_id}/a_session_rejected.pdf"
+
+    claimed = await sqlite_db.artifacts.claim_session_download_artifacts_for_run(
+        run_id=run_id,
+        browser_session_id=session_id,
+        organization_id=org_id,
+        run_started_at=_WINDOW_START,
+        excluded_uris=[rejected_uri],
+    )
+
+    assert claimed == 1
+    assert await _run_scoped_ids(sqlite_db, org_id, run_id, monkeypatch) == {"a_session_valid"}
+
+
+@pytest.mark.asyncio
 async def test_run_scoped_read_never_collapses_null_checksum_rows(
     sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:

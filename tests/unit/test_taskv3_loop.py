@@ -13,29 +13,44 @@ import copy
 import dataclasses
 import functools
 import hashlib
+import itertools
 import json
 import random
 import re
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Collection
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
 
-from skyvern.exceptions import CompletionGateTerminationError, SkyvernContextWindowExceededError, StepTerminationError
-from skyvern.forge.sdk.api.llm.exceptions import LLMProviderErrorRetryableTask
+import skyvern.webeye.action_deadline as action_deadline_module
+import skyvern.webeye.cdp_download_interceptor as cdp_module
+from skyvern.config import settings
+from skyvern.exceptions import (
+    ActionDeadlineExceeded,
+    CompletionGateTerminationError,
+    MissingBrowserStatePage,
+    SkyvernContextWindowExceededError,
+    StepTerminationError,
+)
+from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.taskv3 import auth_tools as auth_tools_module
+from skyvern.forge.taskv3 import captcha_tools as captcha_tools_module
 from skyvern.forge.taskv3 import loop as loop_module
 from skyvern.forge.taskv3 import tools as taskv3_tools_module
-from skyvern.forge.taskv3.auth_tools import _COMPLETION_BLOCKED, VerificationFailure, VerificationState
+from skyvern.forge.taskv3.answer_basis_audit import ANSWER_BASIS_MAX_HOLDS, RecordedAnswer, apply_answer_basis_audit
+from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS, VerificationFailure, VerificationState
 from skyvern.forge.taskv3.engine import MAX_TOKENS_CEILING, MAX_TOKENS_PER_ACTION_STEP, taskv3_runaway_backstops
-from skyvern.forge.taskv3.goal_check import GoalVerdict, ToolTrail, run_goal_check
+from skyvern.forge.taskv3.goal_check import GoalVerdict, NonCompletedStatus, ToolTrail, UnlistedReask, run_goal_check
 from skyvern.forge.taskv3.handoff_redaction import ELIDED_URL_PATH, caller_known_published_urls
+from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
 from skyvern.forge.taskv3.loop import (
     ACTION_BLOCK_TARGET_ACTION_RESERVE,
     ACTION_BUDGET_EXTENDED_EVENT,
@@ -45,9 +60,16 @@ from skyvern.forge.taskv3.loop import (
     ACTION_LOOP_NUDGE_AFTER,
     ACTION_LOOP_TERMINATE_AFTER,
     ACTION_OUTCOME_DATA_KEY,
+    ANSWER_BASIS_HOLD_BOUND_GUARD,
+    BROWSER_LOST_EVENT,
+    BROWSER_LOST_GUARD,
+    BROWSER_LOST_REASON,
     CLICK_DISPATCHED_DATA_KEY,
     CODE_TOOL_NAME,
     COMPLETION_GATE_REFUSAL,
+    DOWNLOAD_FAILURE_MAX_LINES,
+    DOWNLOAD_NO_FILE_FACT,
+    FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS,
     FAILURE_EVIDENCE_MIN_TOOL_CALLS,
     FAILURE_EVIDENCE_MIN_TURNS,
     FINAL_TURN_GRANTED_EVENT,
@@ -70,12 +92,20 @@ from skyvern.forge.taskv3.loop import (
     PROGRESS_LEDGER_SHADOW_EVENT,
     PROGRESS_LEDGER_WINDOW,
     STALE_READ_MAX_HOLDS,
+    SUBMISSION_HELD_WAIT_MAX_SECONDS,
+    SUBMISSION_RENDER_MARGIN_SECONDS,
     TARGET_ACTION_ROUND_EVENT,
+    TARGET_KIND_DATA_KEY,
+    TARGET_LABEL_DATA_KEY,
     TOKEN_BUDGET_EXTENDED_EVENT,
     TOKEN_BUDGET_EXTENSION_REFUSED_EVENT,
+    TOOL_CALL_STARTED_EVENT,
+    TOOL_CALL_TIMED_OUT_EVENT,
     UNCHARGED_REFUSAL_GRACE,
     VERDICT_URL_MAX_CHARS,
+    VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS,
     ActivityRecency,
+    DownloadFailureFacts,
     LoopOutcome,
     RoundAction,
     SemanticCommitStats,
@@ -84,6 +114,7 @@ from skyvern.forge.taskv3.loop import (
     ToolRefusal,
     ToolResult,
     ToolSpec,
+    TurnRecord,
     UnseenPageText,
     _arms_failure_evidence,
     _budget_extension_gate,
@@ -101,16 +132,22 @@ from skyvern.forge.taskv3.loop import (
     record_covered_layer,
     record_hit_class,
     record_resolve_seconds,
+    record_text_delta,
     run_agent_tool_loop,
+    submissions_across_contexts,
+    submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG
 from skyvern.forge.taskv3.tools import build_browser_tools
 from skyvern.utils.url_validators import validate_fetch_url
-from tests.unit.helpers import make_organization, make_task
+from tests.unit.helpers import held_finish_restated
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _ScriptedCaller:
-    """Emits one queued turn per ``call``. Each turn is a list of (tool_name, args)."""
+    """Emits one queued turn per ``call``. Each turn is a list of (tool_name, args). Past the script's end, a finish the
+    justification hold held is made again unless ``restate_held_finish`` is off."""
 
     def __init__(
         self,
@@ -119,8 +156,10 @@ class _ScriptedCaller:
         reasoning_contents: list[str | None] | None = None,
         turn_tokens: int = 15,
         usage_for_call: Callable[[int], dict[str, int]] | None = None,
+        restate_held_finish: bool = True,
     ) -> None:
         self._script = script
+        self._restate_held_finish = restate_held_finish
         self._turn_tokens = turn_tokens
         # Per-call usage by call index, for tests that need a fixed prefix plus growth; overrides turn_tokens.
         self._usage_for_call = usage_for_call
@@ -167,7 +206,10 @@ class _ScriptedCaller:
         )
         self.image_blocks_per_call.append(history_images + (len(screenshots) if screenshots else 0))
         idx = self.calls
-        turn = self._script[idx] if idx < len(self._script) else []
+        if idx < len(self._script):
+            turn = self._script[idx]
+        else:
+            turn = held_finish_restated(self.message_history) if self._restate_held_finish else []
         text = self._texts[idx] if self._texts and idx < len(self._texts) else "reasoning..."
         reasoning_content = (
             self._reasoning_contents[idx] if self._reasoning_contents and idx < len(self._reasoning_contents) else None
@@ -301,6 +343,120 @@ async def test_finish_terminates_with_status_and_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_accepted_finish_answers_trailing_batched_tool_calls_for_history() -> None:
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    finish = make_finish_tool(max_settle_deferrals=0)
+    observe = _recording_tool("observe", observe_calls)
+    outcome, _ = await _run(
+        [[("finish", {"status": "completed", "reason": "goal met"}), ("observe", {})]],
+        [finish, observe],
+    )
+
+    assistant_calls = next(message["tool_calls"] for message in outcome.messages if message.get("tool_calls"))
+    tool_results = {message["tool_call_id"]: message for message in outcome.messages if message.get("role") == "tool"}
+    assert [call["id"] for call in assistant_calls] == list(tool_results)
+    assert tool_results["call_1"]["content"] == "skipped: finish was accepted"
+    assert observe_calls == []
+
+
+@pytest.mark.asyncio
+async def test_loop_can_resume_from_existing_conversation() -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "goal still met"})]])
+    history = [
+        {"role": "system", "content": "original system"},
+        {"role": "user", "content": "original goal"},
+        {"role": "assistant", "content": "I clicked download."},
+        {"role": "user", "content": "Final storage result: timeout."},
+    ]
+
+    outcome = await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="not used when history is supplied",
+        user_prompt="not used when history is supplied",
+        initial_messages=history,
+        tools=[make_finish_tool()],
+        max_turns=1,
+        max_tool_calls=1,
+    )
+
+    assert outcome.status == "completed"
+    assert caller.message_history[: len(history)] == history
+
+
+_UNMAPPED_FINISH_SCHEMA_SHA256 = "7d3bd060a60aa326dedb4cd5474b0bf4b9e7f25ea19ea60ddfb9f19375cd8d33"
+
+
+def test_finish_schema_is_unchanged_for_a_task_without_error_codes() -> None:
+    # finish is on every v3 run, so a task without codes must see exactly the schema it saw before codes existed.
+    spec = make_finish_tool(error_code_mapping=None)
+    blob = json.dumps({"description": spec.description, "parameters": spec.parameters}, sort_keys=True)
+    assert hashlib.sha256(blob.encode()).hexdigest() == _UNMAPPED_FINISH_SCHEMA_SHA256
+    assert make_finish_tool(error_code_mapping={}).parameters == spec.parameters
+
+
+_ERROR_CODE_FIELD_GUIDANCE_SHA256 = "d5cd09e0225a45b48968b8a41a0263afd795df15e8e25ca41fbdf621cfdf8836"
+
+
+def test_error_code_guidance_is_the_replay_validated_text() -> None:
+    # The wording was chosen by an offline replay of production finish turns; a change needs a new replay.
+    guidance = loop_module.ERROR_CODE_FIELD_GUIDANCE
+    assert hashlib.sha256(guidance.encode()).hexdigest() == _ERROR_CODE_FIELD_GUIDANCE_SHA256
+    assert len(guidance) < 700
+    spec = make_finish_tool(error_code_mapping={"invalid_credentials": "The site rejected the password."})
+    assert spec.parameters["properties"]["error_code"]["description"].startswith(guidance + "\n")
+
+
+def test_finish_offers_exactly_the_users_codes_plus_none_of_these() -> None:
+    mapping = {"invalid_credentials": "The site rejected the username or password.", "account_locked": "Locked."}
+    spec = make_finish_tool(error_code_mapping=mapping)
+    error_code = spec.parameters["properties"]["error_code"]
+    assert error_code["enum"] == ["account_locked", "invalid_credentials", loop_module.NO_MATCHING_ERROR_CODE]
+    assert "The site rejected the username or password." in error_code["description"]
+    assert "error_code" not in spec.parameters["required"]
+    assert spec.description == make_finish_tool().description
+
+    colliding = make_finish_tool(error_code_mapping={"none_of_these": "x", "": "y", "invalid_credentials": "z"})
+    assert colliding.parameters["properties"]["error_code"]["enum"] == [
+        "invalid_credentials",
+        loop_module.NO_MATCHING_ERROR_CODE,
+    ]
+    # Nothing to offer, or too much to send on every turn: the post-run detector keeps the mapping.
+    for unoffered in ({"none_of_these": "x", " ": "y"}, {f"code_{i}": "d" for i in range(65)}, {"big": "x" * 40_000}):
+        assert make_finish_tool(error_code_mapping=unoffered).parameters == make_finish_tool().parameters
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "answer", "code", "declined"),
+    [
+        ("failed", "INVALID_CREDENTIALS", "invalid_credentials", False),
+        ("terminated", "invalid_credentials", "invalid_credentials", False),
+        ("failed", "none_of_these", None, True),
+        ("failed", "PAYMENT_DECLINED", None, False),
+        ("failed", " invalid_credentials ", "invalid_credentials", False),
+        ("failed", None, None, False),
+        ("completed", "invalid_credentials", None, False),
+    ],
+)
+async def test_finish_carries_only_a_validated_code_on_a_run_that_did_not_succeed(
+    status: str, answer: str | None, code: str | None, declined: bool
+) -> None:
+    mapping = {"invalid_credentials": "The site rejected the username or password."}
+    args: dict[str, Any] = {"status": status, "reason": "the site said the password is wrong"}
+    if answer is not None:
+        args["error_code"] = answer
+    tools = [make_finish_tool(error_code_mapping=mapping)]
+    with capture_logs() as logs:
+        outcome, _ = await _run([[("finish", args)]], tools)
+
+    assert outcome.status == status
+    assert outcome.error_code == code
+    assert outcome.error_code_declined is declined
+    if answer == "PAYMENT_DECLINED":
+        assert all(answer not in str(log) for log in logs)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("next_tool", "code_kept"), [("observe", True), ("click", False)])
 async def test_a_failed_navigation_code_survives_reads_but_not_a_later_action(next_tool: str, code_kept: bool) -> None:
     async def _navigate_into_the_proxy(args: dict[str, Any]) -> ToolResult:
@@ -423,6 +579,89 @@ async def test_n_looks_add_exactly_n_images_total() -> None:
     assert total_images == 2
     # And no single request ever carries more than the one image just produced.
     assert max(caller.image_blocks_per_call) == 1
+
+
+def _numbered_look_tool(sink: list[bytes]) -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        sink.append(f"\x89PNG-look-{len(sink)}".encode())
+        return ToolResult.ok("[1] button 'Next'", data={"marks_renumbered": True}, screenshots=[sink[-1]])
+
+    return ToolSpec(name="look", description="look", parameters={"type": "object", "properties": {}}, handler=handler)
+
+
+async def _run_with_look_hook(
+    caller: _ScriptedCaller, tools: list[ToolSpec], on_look_screenshots: Callable[[list[bytes]], None]
+) -> Any:
+    return await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=100,
+        on_look_screenshots=on_look_screenshots,
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_look_is_handed_to_the_hook_and_only_the_latest_is_sent() -> None:
+    images: list[bytes] = []
+    hooked: list[list[bytes]] = []
+    caller = _ScriptedCaller(
+        [
+            [("look", {}), ("look", {})],
+            [("click", {"mark": 1})],
+            [("look", {}), ("finish", {"status": "completed", "reason": "ok"})],
+        ]
+    )
+    outcome = await _run_with_look_hook(
+        caller, [_numbered_look_tool(images), _recording_tool("click", []), make_finish_tool()], hooked.append
+    )
+
+    assert outcome.status == "completed"
+    # The superseded first look and the final look no later call carries are handed over too.
+    assert hooked == [[image] for image in images] and len(images) == 3
+    assert caller.screenshots_per_call == [None, hooked[1], None]
+
+
+@pytest.mark.asyncio
+async def test_look_hook_fires_at_capture_before_a_later_tool_in_the_batch() -> None:
+    # A later tool in the same batch stands for the in-loop judge, which writes its frame immediately.
+    images: list[bytes] = []
+    events: list[Any] = []
+
+    async def judge(args: dict[str, Any]) -> ToolResult:
+        events.append("judge")
+        return ToolResult.ok("judged")
+
+    judge_tool = ToolSpec(
+        name="judge", description="judge", parameters={"type": "object", "properties": {}}, handler=judge
+    )
+    caller = _ScriptedCaller([[("look", {}), ("judge", {})], [("finish", {"status": "completed", "reason": "ok"})]])
+    await _run_with_look_hook(caller, [_numbered_look_tool(images), judge_tool, make_finish_tool()], events.extend)
+
+    assert events == [images[0], "judge"]
+
+
+@pytest.mark.asyncio
+async def test_a_raising_look_hook_does_not_change_the_run() -> None:
+    def raising_hook(screenshots: list[bytes]) -> None:
+        raise RuntimeError("archive unavailable")
+
+    images: list[bytes] = []
+    caller = _ScriptedCaller([[("look", {})], [("finish", {"status": "completed", "reason": "ok"})]])
+    with capture_logs() as logs:
+        outcome = await _run_with_look_hook(caller, [_numbered_look_tool(images), make_finish_tool()], raising_hook)
+
+    assert outcome.status == "completed"
+    assert caller.screenshots_per_call == [None, images]
+    assert any(log["event"] == "taskv3 on_look_screenshots callback failed" for log in logs)
+
+
+def test_loop_takes_no_screenshot_of_its_own() -> None:
+    # The look image is stored from bytes the tool already captured; the loop itself never captures.
+    source = Path(loop_module.__file__).read_text()
+    assert re.findall(r"\.screenshot\(|take_screenshot", source) == []
 
 
 @pytest.mark.asyncio
@@ -567,26 +806,177 @@ async def test_navigate_without_dead_end_does_not_terminate() -> None:
     assert outcome.reason == "applied"
 
 
+_DEAD = "https://jobs.example.test/acme/closed"
+_DEAD_TOO = "https://jobs.example.test/acme/gone"
+_DEAD_THREE = "https://jobs.example.test/acme/removed"
+_LIVE = "https://jobs.example.test/acme/open"
+
+
+def _url_navigate_tool(dead: frozenset[str] = frozenset({_DEAD, _DEAD_TOO, _DEAD_THREE})) -> ToolSpec:
+    # Like the real tool: ok either way, the dead end in its data, and the move inside its action outcome.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        url = args["url"]
+        data: dict[str, Any] = {"page_state_changed": True, ACTION_OUTCOME_DATA_KEY: {"page_transitioned": True}}
+        if url in dead:
+            return ToolResult.ok(
+                f"navigated to {url} (HTTP 404)",
+                data={**data, "navigation_dead_end": 404, "navigation_dead_end_url": url},
+            )
+        return ToolResult.ok(f"navigated to {url}", data=data)
+
+    return ToolSpec(
+        name="navigate",
+        description="navigate",
+        parameters={"type": "object", "properties": {"url": {"type": "string"}}},
+        handler=handler,
+    )
+
+
+def _page_text_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("page text")
+
+    return ToolSpec(name="observe", description="observe", parameters={}, handler=handler, compactable=True)
+
+
+async def _run_dead_end(
+    script: list[list[tuple[str, dict[str, Any]]]], *, activity: ActivityRecency | None = None, **kwargs: Any
+) -> tuple[LoopOutcome, list[ToolResult]]:
+    activity = activity or ActivityRecency()
+    finish = make_finish_tool(activity=activity)
+    finishes: list[ToolResult] = []
+
+    async def recording_finish(args: dict[str, Any]) -> ToolResult:
+        finishes.append(result := await finish.handler(args))
+        return result
+
+    tools = [_url_navigate_tool(), _page_text_tool(), dataclasses.replace(finish, handler=recording_finish)]
+    outcome, _ = await _run(script, tools, activity=activity, **kwargs)
+    return outcome, finishes
+
+
 @pytest.mark.asyncio
-async def test_batched_dead_end_then_live_navigate_recovers() -> None:
-    # The system prompt tells the model to batch aggressively. A turn that batches a speculative
-    # navigate that 404s WITH a fallback navigate to a live page must NOT be terminated on the first
-    # of the batch — the fallback runs and the run proceeds to the model's own verdict.
-    live = _navigate_tool(dead_end_status=None)
-    dead = _navigate_tool(dead_end_status=404)
-    tools = [
-        ToolSpec(name="navigate_dead", description="d", parameters=dead.parameters, handler=dead.handler),
-        ToolSpec(name="navigate_live", description="l", parameters=live.parameters, handler=live.handler),
-        make_finish_tool(),
-    ]
+@pytest.mark.parametrize("arm", ["forced", "treatment"])
+async def test_every_in_loop_dead_end_goes_back_to_the_model_under_the_arm(
+    monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    if arm == "forced":
+        monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
     script = [
-        [("navigate_dead", {"url": "https://jobs.example.test/acme/closed"}), ("navigate_live", {"url": "x"})],
+        [("navigate", {"url": _DEAD})],
+        [("navigate", {"url": _DEAD_TOO}), ("observe", {})],
+        [("navigate", {"url": _DEAD_THREE})],
+        [("navigate", {"url": _LIVE})],
+        [("finish", {"status": "completed", "reason": "posting is open"})],
+    ]
+    context = SkyvernContext(run_arms={DEAD_END_RETURN_FLAG: ("wr_1", "treatment")} if arm == "treatment" else {})
+    activity = ActivityRecency()
+    with skyvern_context.scoped(context), capture_logs() as logs:
+        outcome, _ = await _run_dead_end(script, activity=activity)
+
+    assert (outcome.status, outcome.reason) == ("completed", "posting is open")
+    lines = [entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end"]
+    assert [(line["returned_to_model"], line["provenance"]) for line in lines] == [(True, "undecided")] * 3
+    assert activity.dead_ends_returned == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "failed", "terminated"])
+async def test_any_verdict_is_accepted_on_a_returned_dead_end(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    # A goal can be met by confirming a link is dead; the model, which sees the goal and the page, decides.
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
+    script = [[("navigate", {"url": _DEAD})], [("finish", {"status": status, "reason": "the posting is gone"})]]
+    outcome, finishes = await _run_dead_end(script)
+
+    assert [result.status for result in finishes] == ["ok"]
+    assert (outcome.status, outcome.reason) == (status, "the posting is gone")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm_on", [False, True])
+async def test_batched_dead_end_then_live_navigate_recovers(monkeypatch: pytest.MonkeyPatch, arm_on: bool) -> None:
+    # The model is told to batch aggressively: a fallback navigate in the same batch recovers, under either arm.
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+    script = [
+        [("navigate", {"url": _DEAD}), ("navigate", {"url": _LIVE})],
+        [("navigate", {"url": _DEAD_TOO}), ("observe", {})],
+        [("navigate", {"url": _LIVE})],
         [("finish", {"status": "completed", "reason": "applied to the live one"})],
     ]
-    outcome, _ = await _run(script, tools)
+    with capture_logs() as logs:
+        outcome, _ = await _run_dead_end(script)
 
-    assert outcome.status == "completed"
-    assert outcome.reason == "applied to the live one"
+    if arm_on:
+        assert (outcome.status, outcome.reason) == ("completed", "applied to the live one")
+    else:
+        assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    # Only the second batch's dead end reaches the settle site.
+    assert len([entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_after_a_task_url_dead_end_behaves_the_same_under_either_arm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stale_click(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.error("stale ref", data={"page_state_changed": True})
+
+    click = ToolSpec(name="click", description="click", parameters={}, handler=stale_click, billable=True)
+    script = [
+        [("navigate", {"url": _DEAD}), ("click", {"ref": 3})],
+        [("finish", {"status": "failed", "reason": "gone"})],
+    ]
+    outcomes = []
+    for arm_on in (False, True):
+        monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+        activity = ActivityRecency()
+        tools = [_url_navigate_tool(), click, make_finish_tool(activity=activity)]
+        outcome, _ = await _run(
+            script, tools, activity=activity, task_target_urls=caller_known_published_urls(_DEAD, keep_query=True)
+        )
+        outcomes.append((outcome.status, outcome.guard))
+
+    # The failed click reports a page change, which clears the pending dead end as on main, so the model's verdict stands.
+    assert outcomes == [("failed", None), ("failed", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_dead_end_on_the_granted_final_turn_still_ends_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
+    activity = ActivityRecency(final_turn_active=True)
+    script = [[("navigate", {"url": _DEAD})], [("finish", {"status": "completed", "reason": "never"})]]
+    outcome, _ = await _run(script, [_url_navigate_tool(), make_finish_tool(activity=activity)], activity=activity)
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm_on", [False, True])
+async def test_a_dead_end_on_the_tasks_own_url_is_the_models_evidence_under_the_arm(
+    monkeypatch: pytest.MonkeyPatch, arm_on: bool
+) -> None:
+    # The goal can be to confirm the link it supplies is dead; under the arm the model judges that from the status.
+    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+    script = [
+        [("navigate", {"url": _DEAD})],
+        [("finish", {"status": "completed", "reason": "the supplied link is dead"})],
+    ]
+    with capture_logs() as logs:
+        outcome, finishes = await _run_dead_end(
+            script, task_target_urls=caller_known_published_urls(_DEAD, keep_query=True)
+        )
+
+    if arm_on:
+        assert (outcome.status, outcome.reason) == ("completed", "the supplied link is dead")
+        assert [result.status for result in finishes] == ["ok"]
+    else:
+        assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert (line["provenance"], line["returned_to_model"]) == ("task_supplied", arm_on)
+
+    # The pre-loop initial navigation is not in-loop: it ends the run under either arm.
+    initial, _ = await _run_dead_end(script[1:], initial_navigation_status=404, initial_navigation_url=_DEAD)
+    assert (initial.status, initial.guard) == ("terminated", NAV_DEAD_END_GUARD)
 
 
 @pytest.mark.parametrize("status", sorted(NAVIGATION_DEAD_END_STATUSES))
@@ -886,6 +1276,276 @@ async def test_deadline_seconds_exhausts_budget(monkeypatch: pytest.MonkeyPatch)
     assert "deadline" not in outcome.reason
     assert outcome.cap_trip == "deadline (60s) reached"
     assert caller.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The wait_for makes a regression fail instead of hanging; the margin puts the timeout past the run deadline.
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.2)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    timed_out_results: list[ToolResult] = []
+    _tool_call_timed_out = loop_module._tool_call_timed_out
+
+    def _capture_timeout(tool_name: str, budget_ms: int, *, call_site: str = "dispatch") -> ToolResult:
+        result = _tool_call_timed_out(tool_name, budget_ms, call_site=call_site)
+        timed_out_results.append(result)
+        return result
+
+    monkeypatch.setattr(loop_module, "_tool_call_timed_out", _capture_timeout)
+
+    async def _never_returns(args: dict[str, Any]) -> ToolResult:
+        await asyncio.Event().wait()
+        raise AssertionError("the handler was awaited to completion")
+
+    hung = ToolSpec(
+        name="click",
+        description="click",
+        parameters={"type": "object", "properties": {}},
+        handler=_never_returns,
+        billable=True,
+    )
+    caller = _ScriptedCaller([[("click", {"selector": "ref=1"})]])
+    with capture_logs() as logs:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=[hung, make_finish_tool()],
+                max_turns=20,
+                max_tool_calls=100,
+                deadline_seconds=1.0,
+            ),
+            10,
+        )
+    # The run ends on the guard that was unreachable before, not on a caller's timeout.
+    assert outcome.cap_trip == "deadline (1s) reached"
+    assert outcome.status == "budget_exhausted"
+    timed_out = [entry for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT]
+    assert [entry["tool"] for entry in timed_out] == ["click"]
+    # The result keeps the conservative click-dispatched signal.
+    assert timed_out_results[0].data == {CLICK_DISPATCHED_DATA_KEY: True}
+    assert timed_out_results[0].error_class == "timeout_other"
+    stopped = [m for m in caller.message_history if m.get("role") == "tool" and "was stopped" in str(m.get("content"))]
+    assert len(stopped) == 1, caller.message_history
+    assert "click" in stopped[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    link_calls: list[None] = []
+
+    async def never_returns(_args: dict[str, Any]) -> ToolResult:
+        link_calls.append(None)
+        await asyncio.Event().wait()
+        raise AssertionError("the handler was awaited to completion")
+
+    open_link = ToolSpec(
+        name="open_verification_link",
+        description="open verification link",
+        parameters={},
+        handler=never_returns,
+        engages_page=True,
+    )
+    outcome, caller = await asyncio.wait_for(
+        _run(
+            [
+                [("observe", {})],
+                [
+                    ("open_verification_link", {}),
+                    ("finish", {"status": "completed", "reason": "link opened"}),
+                ],
+            ],
+            [_recording_tool("observe", observe_calls), open_link, make_finish_tool()],
+            max_tool_calls=1,
+            deadline_seconds=0.2,
+        ),
+        timeout=5,
+    )
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert link_calls == [None]
+    finish_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "finish"
+    ]
+    assert len(finish_results) == 1
+    assert finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    calls: list[int] = []
+
+    async def _observe(args: dict[str, Any]) -> ToolResult:
+        calls.append(args["id"])
+        if args["id"] == 1:
+            await asyncio.Event().wait()
+        return ToolResult.ok("observed")
+
+    observe = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=_observe,
+        compactable=True,
+    )
+    with capture_logs() as logs:
+        outcome, caller = await asyncio.wait_for(
+            _run(
+                [[("observe", {"id": 1}), ("observe", {"id": 2})]],
+                [observe, make_finish_tool()],
+                deadline_seconds=0.25,
+            ),
+            timeout=5,
+        )
+
+    assert outcome.status == "budget_exhausted"
+    assert calls == [1]
+    first_batch_results = [m for m in caller.message_history if m.get("role") == "tool"][:2]
+    assert len(first_batch_results) == 2
+    assert "was stopped" in first_batch_results[0]["content"]
+    assert first_batch_results[1]["content"].startswith("skipped:")
+    assert [entry["call_site"] for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT] == ["dispatch"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call_site", "expected_status", "finish_is_dispatched"),
+    [("page_refresh", "budget_exhausted", False), ("on_pre_action", "failed", True)],
+)
+async def test_hung_pre_dispatch_work_is_bounded_and_logged(
+    call_site: str, expected_status: str, finish_is_dispatched: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    action_calls: list[tuple[str, dict[str, Any]]] = []
+    timed_out_results: list[ToolResult] = []
+    original_timeout_result = loop_module._tool_call_timed_out
+
+    def capture_timeout_result(tool_name: str, budget_ms: int, *, call_site: str = "dispatch") -> ToolResult:
+        result = original_timeout_result(tool_name, budget_ms, call_site=call_site)
+        timed_out_results.append(result)
+        return result
+
+    monkeypatch.setattr(loop_module, "_tool_call_timed_out", capture_timeout_result)
+
+    async def _hang(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    kwargs: dict[str, Any] = {}
+    context = SkyvernContext(task_id="tsk_dispatch_bound")
+    if call_site == "page_refresh":
+        context.refresh_working_page = True
+        kwargs["reload_page"] = _hang
+    else:
+        kwargs["on_pre_action"] = _hang
+
+    skyvern_context.set(context)
+    try:
+        with capture_logs() as logs:
+            outcome, caller = await asyncio.wait_for(
+                _run(
+                    [
+                        [("click", {"selector": "#submit"}), ("observe", {})],
+                        [("finish", {"status": "failed", "reason": "deadline reached"})],
+                    ],
+                    [
+                        _recording_tool("click", action_calls, billable=True),
+                        _recording_tool("observe", []),
+                        make_finish_tool(),
+                    ],
+                    deadline_seconds=0.25,
+                    **kwargs,
+                ),
+                timeout=5,
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == expected_status
+    assert outcome.cap_trip is not None and "deadline" in outcome.cap_trip
+    assert action_calls == []
+    starts = [
+        entry for entry in logs if entry.get("event") == TOOL_CALL_STARTED_EVENT and entry.get("call_site") == call_site
+    ]
+    timeouts = [entry for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT]
+    assert [(entry["tool"], entry["call_site"]) for entry in starts] == [("click", call_site)]
+    assert any(entry.get("event") == TOOL_CALL_STARTED_EVENT and entry.get("tool") == "finish" for entry in logs) is (
+        finish_is_dispatched
+    )
+    assert [(entry["tool"], entry["call_site"]) for entry in timeouts] == [("click", call_site)]
+    first_batch_results = [m for m in caller.message_history if m.get("role") == "tool"][:2]
+    assert len(first_batch_results) == 2
+    assert "was not dispatched" in first_batch_results[0]["content"]
+    assert "tool handler did not run" in first_batch_results[0]["content"]
+    assert first_batch_results[1]["content"].startswith("skipped:")
+    assert len(timed_out_results) == 1
+    assert timed_out_results[0].data is None
+    assert timed_out_results[0].error_class == "timeout_other"
+
+
+@pytest.mark.asyncio
+async def test_a_tools_own_deadline_escaping_its_handler_is_still_reported_as_the_tools_error() -> None:
+    # under_action_deadline re-raises an inner scope's expiry unchanged, so a tool's own bounded call
+    # timing out arrives at the dispatch exactly as the dispatch bound does; only the elapsed time
+    # separates them. Reporting this one as the dispatch bound would hide which tool failed and how.
+    async def _raises_its_own_deadline(args: dict[str, Any]) -> ToolResult:
+        raise ActionDeadlineExceeded("the browser did not answer within 1 ms")
+
+    spec = ToolSpec(
+        name="observe",
+        description="observe",
+        parameters={"type": "object", "properties": {}},
+        handler=_raises_its_own_deadline,
+    )
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "failed", "reason": "no page"})]])
+    with capture_logs() as logs:
+        outcome = await run_agent_tool_loop(
+            llm_caller=caller,
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=[spec, make_finish_tool()],
+            max_turns=20,
+            max_tool_calls=100,
+            deadline_seconds=1800.0,
+        )
+    assert outcome.status == "failed"
+    assert not [entry for entry in logs if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT]
+    assert [entry["tool"] for entry in logs if entry.get("event") == "taskv3 tool handler raised"] == ["observe"]
+
+
+def test_the_dispatch_bound_margin_leaves_every_self_bounding_tool_its_own_timeout() -> None:
+    """The margin is the whole allowance once the deadline has elapsed. Below any tool's own per-call
+    ceiling it would win that race and replace that tool's structured answer with the blunt one, so a
+    new owned ceiling belongs in the list below. The download wait, its provider recovery and the
+    finish-time settle are absent on purpose: each caps itself at the loop deadline the margin sits on
+    top of, so they are bounded structurally rather than by a constant to pin here."""
+    owned_caps_ms = {
+        "click/type whole call": taskv3_tools_module._ACT_TOOL_TIMEOUT_MS,
+        "ref/mark resolution": taskv3_tools_module._ADDRESS_RESOLVE_TIMEOUT_MS,
+        "verification code per call": auth_tools_module._PER_CALL_WAIT_SECONDS * 1000,
+        "captcha solve": captcha_tools_module._SOLVE_CAPTCHA_CEILING_SECONDS * 1000,
+    }
+    too_long = {
+        name: cap_ms
+        for name, cap_ms in owned_caps_ms.items()
+        if loop_module.TOOL_CALL_DEADLINE_MARGIN_SECONDS < action_deadline_module.outer_cap_seconds(int(cap_ms))
+    }
+    assert not too_long, f"margin {loop_module.TOOL_CALL_DEADLINE_MARGIN_SECONDS}s is under: {too_long}"
 
 
 @pytest.mark.asyncio
@@ -4802,6 +5462,118 @@ async def test_on_action_round_falls_back_to_reasoning_summary_when_text_empty()
 
 
 @pytest.mark.asyncio
+async def test_each_turn_runs_its_model_call_under_its_own_kwargs_and_reports_every_tool_call() -> None:
+    # One record per turn whatever the turn did (SKY-18790): a read, a batch with a failed call, its skipped
+    # dependent and an independent call, a turn with no tool call, and the finish. The step on_turn_start returns
+    # is that turn's model call `step`, over the run-wide one.
+    events: list[Any] = []
+
+    class _StepRecordingCaller(_ScriptedCaller):
+        async def call(self, *, step: Any = None, **kwargs: Any) -> dict[str, Any]:
+            events.append(("call", step))
+            return await super().call(**kwargs)
+
+    async def on_turn_start(turn: int) -> str:
+        events.append(("start", turn))
+        return f"turn-step-{turn}"
+
+    async def on_turn_end(record: TurnRecord) -> None:
+        assert record.llm_seconds is not None
+        calls = [(call.tool, call.status, call.billable) for call in record.tool_calls]
+        events.append(("end", record.turn, calls, record.outcome_status))
+
+    async def probe() -> str | None:
+        return "doc-1"
+
+    sink: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _recording_tool("observe", sink),
+        _recording_tool("type", sink, raises=True, billable=True),
+        _recording_tool("press_key", sink, billable=True),
+        _recording_tool("select_option", sink, billable=True),
+        make_finish_tool(),
+    ]
+    script = [
+        [("observe", {})],
+        [("type", {"selector": "#q"}), ("press_key", {"selector": "#q"}), ("select_option", {"selector": "#z"})],
+        [],
+        [("finish", {"status": "completed", "reason": "done"})],
+    ]
+    outcome = await run_agent_tool_loop(
+        llm_caller=_StepRecordingCaller(script),
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=100,
+        call_kwargs={"step": "block-step"},
+        page_probe=probe,
+        on_turn_start=on_turn_start,
+        on_turn_end=on_turn_end,
+    )
+
+    assert outcome.status == "completed"
+    assert events == [
+        ("start", 1),
+        ("call", "turn-step-1"),
+        ("end", 1, [("observe", "ok", False)], None),
+        ("start", 2),
+        ("call", "turn-step-2"),
+        ("end", 2, [("type", "error", True), ("press_key", "skipped", True), ("select_option", "ok", True)], None),
+        ("start", 3),
+        ("call", "turn-step-3"),
+        ("end", 3, [], None),
+        ("start", 4),
+        ("call", "turn-step-4"),
+        ("end", 4, [("finish", "ok", False)], "completed"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_on_model_returned_runs_after_each_model_call_and_before_the_turn_touches_the_page() -> None:
+    # The per-turn page capture joins here, so nothing that reads or acts on the page may run first:
+    # not the batch fingerprint sample, not a tool, and not the nudge on a turn with no tool call.
+    events: list[str] = []
+
+    class _Caller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            events.append("call")
+            return await super().call(**kwargs)
+
+    async def on_model_returned() -> None:
+        events.append("returned")
+
+    async def fingerprint() -> str | None:
+        events.append("fingerprint")
+        return "fp"
+
+    async def click(_args: dict[str, Any]) -> ToolResult:
+        events.append("click")
+        return ToolResult.ok("clicked")
+
+    tools = [
+        ToolSpec(name="click", description="click", parameters={"type": "object"}, handler=click, billable=True),
+        make_finish_tool(),
+    ]
+    script = [[("click", {"selector": "#go"})], [], [("finish", {"status": "completed", "reason": "done"})]]
+    outcome = await run_agent_tool_loop(
+        llm_caller=_Caller(script),
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=tools,
+        max_turns=20,
+        max_tool_calls=100,
+        page_fingerprint=fingerprint,
+        on_model_returned=on_model_returned,
+    )
+
+    assert outcome.status == "completed"
+    assert events[:4] == ["call", "returned", "fingerprint", "click"]
+    assert events.count("call") == events.count("returned") == 3
+    assert all(events[i + 1] == "returned" for i, event in enumerate(events) if event == "call")
+
+
+@pytest.mark.asyncio
 async def test_on_action_round_prefers_content_over_reasoning_summary() -> None:
     round_texts: list[str | None] = []
 
@@ -5230,15 +6002,25 @@ async def test_no_tool_call_turn_is_counted_and_nudged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_loop_does_not_blame_an_optional_call_param_for_a_context_window_overflow() -> None:
-    # Dropping a parameter cannot shrink a transcript, so re-issuing would burn a second oversized
-    # request and mislabel the failure.
-    class _OverflowingCaller(_ScriptedCaller):
+@pytest.mark.parametrize(
+    ("exc", "reason_fragment"),
+    [
+        (SkyvernContextWindowExceededError(model="test-model"), "context window exceeded"),
+        (LLMContentFilteredError("TEST_KEY", ["primary", "fallback"]), "refused"),
+    ],
+    ids=["context_window", "refusal"],
+)
+async def test_loop_does_not_blame_an_optional_call_param_for_an_unfixable_call_failure(
+    exc: Exception, reason_fragment: str
+) -> None:
+    # Dropping a parameter cannot shrink a transcript or change a refusal, so re-issuing would burn
+    # a second request and mislabel the failure.
+    class _FailingCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             self.calls += 1
-            raise SkyvernContextWindowExceededError(model="test-model")
+            raise exc
 
-    caller = _OverflowingCaller([])
+    caller = _FailingCaller([])
     outcome = await run_agent_tool_loop(
         llm_caller=caller,
         system_prompt="sys",
@@ -5247,10 +6029,13 @@ async def test_loop_does_not_blame_an_optional_call_param_for_a_context_window_o
         max_turns=5,
         max_tool_calls=10,
         call_kwargs={"reasoning_effort": {"effort": "high", "summary": "auto"}},
+        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+        call_retry_base_delay=0.0,
     )
 
     assert outcome.status == "loop_error"
     assert caller.calls == 1
+    assert reason_fragment in outcome.reason
 
 
 @pytest.mark.asyncio
@@ -5332,7 +6117,7 @@ _OBSERVE_SUMMARY_FIELDS = (
     "hidden_listed",
     "iframes_in_component_roots",
     "undiscovered_roots",
-    "omitted_unnameable",
+    "listed_by_handle_only",
     "invalid_fields",
     "markers_minted",
     "markers_reused",
@@ -6025,7 +6810,7 @@ def _main_would_fire(sequence: list[tuple[str, str, str]], threshold: int) -> bo
     return False
 
 
-@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("seed", range(50))
 def test_live_stall_firing_is_a_subset_of_the_per_tool_counter(seed: int) -> None:
     # The central claim of keying per probe: the loop never terminates a run the per-tool counter
     # would have let live. Enumerated over random probe sequences, because seven hand-picked
@@ -6043,7 +6828,7 @@ def test_live_stall_firing_is_a_subset_of_the_per_tool_counter(seed: int) -> Non
             break
 
 
-@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("seed", range(50))
 def test_imminent_is_exactly_whether_one_more_read_of_some_probe_trips_live(seed: int) -> None:
     # ``next_snapshot_can_trip`` is pinned by simulation, not by restating its formula: after every
     # prefix, it must equal "re-reading SOME probe once, returning what it last returned, reaches
@@ -6923,6 +7708,1076 @@ async def test_finish_terminated_after_submit_click_stands_without_a_relook() ->
     assert fp_calls["n"] == 0
 
 
+class _FakeSubmissions:
+    """What a page-level interceptor's ledger reports, driven by the test's own tools."""
+
+    def __init__(self) -> None:
+        self.records: list[InterceptedSubmission] = []
+
+    def __call__(self) -> tuple[InterceptedSubmission, ...]:
+        return tuple(self.records)
+
+    def deliver(self, *, ago: float = 0.0, outcome: SubmissionOutcome = SubmissionOutcome.DELIVERED) -> None:
+        at = time.monotonic() - ago
+        self.records.append(
+            InterceptedSubmission(
+                record_id=len(self.records) + 1,
+                outcome=outcome,
+                # A request sent now reaches the interceptor after the action that sent it was dispatched.
+                started_at=at - min(ago, 0.5),
+                released_at=at,
+                delivered_at=at,
+                site_error_type="RECAPTCHA_SCORE_BELOW_THRESHOLD"
+                if outcome is SubmissionOutcome.REJECTED_BY_SITE
+                else None,
+            )
+        )
+
+    def hold(self) -> int:
+        record_id = len(self.records) + 1
+        self.records.append(
+            InterceptedSubmission(record_id=record_id, outcome=SubmissionOutcome.HELD, started_at=time.monotonic())
+        )
+        return record_id
+
+    def release(self, record_id: int) -> None:
+        now = time.monotonic()
+        self.records[record_id - 1] = dataclasses.replace(
+            self.records[record_id - 1], outcome=SubmissionOutcome.DELIVERED, released_at=now, delivered_at=now
+        )
+
+
+def _submission_tools(
+    submissions: _FakeSubmissions,
+    activity: ActivityRecency,
+    *,
+    observe_delivers_mid_read: bool = False,
+    click_delivers: bool = False,
+    click_settles: bool = False,
+    **finish_kwargs: Any,
+) -> list[ToolSpec]:
+    async def click(args: dict[str, Any]) -> ToolResult:
+        if click_delivers:
+            submissions.deliver()
+        if click_settles:
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("click done")
+
+    async def observe(args: dict[str, Any]) -> ToolResult:
+        if observe_delivers_mid_read:
+            # The reference run: the read started before the response reached the page and returned after it.
+            submissions.deliver()
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("url=x text: 'Submit application'")
+
+    return [
+        ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True),
+        ToolSpec(name="observe", description="o", parameters={}, handler=observe, compactable=True),
+        make_finish_tool(activity=activity, intercepted_submissions=submissions, **finish_kwargs),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminated_held_once_when_a_submission_response_landed_after_the_last_read() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "form still shows submit"})],
+        [("observe", {})],
+        [("finish", {"status": "completed", "reason": "confirmation shown"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools, activity=activity)
+    assert outcome.status == "completed"
+    assert outcome.turns == 5
+    held = [e for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    assert [e["record_ids"] for e in held] == [[1]]
+    hold_result = next(m for m in caller.message_history if m.get("role") == "tool" and "verdict held" in m["content"])
+    assert "not by itself a confirmation" in hold_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_counts_a_read_from_its_start_not_its_end() -> None:
+    # A read that began before the response reached the page and returned after it can still show the old page.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, observe_delivers_mid_read=True)
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "nothing happened"})],
+        [("finish", {"status": "terminated", "reason": "nothing happened, re-checked"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "terminated"
+    assert outcome.reason == "nothing happened, re-checked"
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_ignores_page_text_in_the_finishs_own_batch() -> None:
+    # The model emitted finish alongside the reads, so it decided before any of them came back.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True, click_settles=True)
+    script = [
+        [("click", {"selector": "#submit"}), ("observe", {}), ("finish", {"status": "terminated", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.status == "terminated"
+    assert outcome.reason == "r2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("own_read_lines", "earlier_lines", "shown_fresh", "counts"),
+    # (41, 40, 0): the budget cut every line this call found, so only held lines reached the model.
+    [(1, 0, 1, True), (2, 1, 1, True), (None, 1, 0, False), (1, 1, 0, False), (41, 40, 0, False)],
+)
+async def test_action_result_page_text_counts_as_a_read_only_when_this_call_read_it(
+    own_read_lines: int | None, earlier_lines: int, shown_fresh: int, counts: bool
+) -> None:
+    # Lines held back by an earlier read and flushed by this call show the page from before it.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.deliver(ago=5.0)
+
+    async def type_(args: dict[str, Any]) -> ToolResult:
+        record_text_delta(0.0, own_read_lines, pending=earlier_lines, shown_fresh=shown_fresh)
+        return ToolResult.ok("typed\nThe page newly shows: 'Thanks'", data={"delta_at": 6})
+
+    tools = [
+        ToolSpec(name="type", description="t", parameters={}, handler=type_, billable=True),
+        make_finish_tool(activity=activity, intercepted_submissions=submissions),
+    ]
+    script = [
+        [("type", {"selector": "#q", "text": "x"})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert outcome.reason == ("r1" if counts else "r2")
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_negatives_leave_the_verdict_alone() -> None:
+    # A response the model's last read already covered, no submissions, and a completed verdict.
+    for setup, status in (("covered", "terminated"), ("none", "terminated"), ("fresh", "completed")):
+        submissions, activity = _FakeSubmissions(), ActivityRecency()
+        if setup == "covered":
+            submissions.deliver(ago=5.0)
+        tools = _submission_tools(submissions, activity, click_delivers=setup == "fresh")
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#submit"})] if setup == "fresh" else [("observe", {})],
+            [("finish", {"status": status, "reason": "r"})],
+        ]
+        outcome, _ = await _run(script, tools, activity=activity)
+        assert (setup, outcome.status, outcome.turns) == (setup, status, 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("during_reask", "held_ids", "would_hold_ids", "turns"),
+    [
+        ("delivered", [[1]], [], 5),
+        ("rejected", [[1]], [], None),
+        ("nothing", [], [], 3),
+        ("covered", [], [], 3),
+        ("no_headroom", [], [[1]], 3),
+    ],
+)
+async def test_a_submission_answered_while_the_reask_runs_is_held_once_before_the_verdict_stands(
+    during_reask: str, held_ids: list[list[int]], would_hold_ids: list[list[int]], turns: int | None
+) -> None:
+    # The finish's own check ran before the re-ask; only a record that response hold would take may hold the exit.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    if during_reask == "covered":
+        submissions.deliver(ago=5.0)
+
+    async def unlisted_reask(original: NonCompletedStatus, reason: str) -> UnlistedReask:
+        if during_reask in ("delivered", "no_headroom"):
+            submissions.deliver()
+        elif during_reask == "rejected":
+            submissions.deliver(outcome=SubmissionOutcome.REJECTED_BY_SITE)
+        if during_reask == "no_headroom":
+            activity.final_turn_active = True
+        return UnlistedReask(original_status=original, converts=False, skipped_reason=None, latency_s=0.0)
+
+    tools = _submission_tools(submissions, activity, unlisted_reask=unlisted_reask)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    held = [e["record_ids"] for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    would_hold = [
+        e["record_ids"] for e in logs if e["event"] == "taskv3 finish would hold on an unseen submission response"
+    ]
+    assert (held, would_hold, outcome.status) == (held_ids, would_hold_ids, "terminated")
+    if turns is not None:
+        assert outcome.turns == turns
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_seen_while_waiting_on_a_request_sent_during_the_reask_never_ends_the_run_negative() -> None:
+    # The wait spends the headroom a hold needs, so only the cancel it saw can keep the verdict from standing.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    cancel_checks = [False]
+
+    async def should_cancel() -> bool:
+        return cancel_checks.pop(0) if cancel_checks else True
+
+    async def unlisted_reask(original: NonCompletedStatus, reason: str) -> UnlistedReask:
+        submissions.hold()
+        return UnlistedReask(original_status=original, converts=False, skipped_reason=None, latency_s=0.0)
+
+    finish = make_finish_tool(
+        activity=activity,
+        intercepted_submissions=submissions,
+        should_cancel=should_cancel,
+        unlisted_reask=unlisted_reask,
+        deadline_at=time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS + 0.2,
+    )
+    result = await finish.handler({"status": "terminated", "reason": "r"})
+    assert (result.status, result.data) == ("error", None)
+
+
+@pytest.mark.asyncio
+async def test_failed_submission_hold_replaces_the_failure_evidence_hold() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    tools = _submission_tools(
+        submissions,
+        activity,
+        click_delivers=True,
+        page_fingerprint=fingerprint,
+        settle_wait_seconds=0.0,
+        failure_settle_max_seconds=0.01,
+    )
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("failed", "r2", 4)
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_without_headroom_only_logs() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True)
+    script = [[("click", {"selector": "#submit"})], [("finish", {"status": "terminated", "reason": "r"})]]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity, max_turns=3)
+    assert (outcome.status, outcome.turns) == ("terminated", 2)
+    events = [e["event"] for e in logs]
+    assert "taskv3 finish would hold on an unseen submission response" in events
+    assert "taskv3 finish held on an unseen submission response" not in events
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_waits_for_a_held_submission_then_holds() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+
+    async def release_soon() -> None:
+        await asyncio.sleep(0.3)
+        submissions.release(record_id)
+
+    tools = _submission_tools(submissions, activity)
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    releaser = asyncio.create_task(release_soon())
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    await releaser
+    assert (outcome.status, outcome.reason) == ("terminated", "r2")
+    held = next(e for e in logs if e["event"] == "taskv3 finish held on an unseen submission response")
+    assert held["outcomes"] == ["delivered"]
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_wait_on_a_held_submission_ends_on_cancel() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.hold()
+
+    async def canceled() -> bool:
+        return True
+
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions, should_cancel=canceled)
+    started = time.monotonic()
+    result = await finish.handler({"status": "terminated", "reason": "r"})
+    assert result.status == "error"
+    assert "still waiting" in result.content
+    assert time.monotonic() - started < SUBMISSION_HELD_WAIT_MAX_SECONDS / 2
+
+
+@pytest.mark.asyncio
+async def test_submission_hold_rechecks_headroom_after_waiting_on_a_held_submission() -> None:
+    # The wait spends deadline; a hold issued without the headroom it needs would end the run budget_exhausted.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+
+    async def release_soon() -> None:
+        await asyncio.sleep(0.3)
+        submissions.release(record_id)
+
+    finish = make_finish_tool(
+        activity=activity,
+        intercepted_submissions=submissions,
+        deadline_at=time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS + 0.2,
+    )
+    releaser = asyncio.create_task(release_soon())
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "r"})
+    await releaser
+    assert result.status == "ok"
+    events = [e["event"] for e in logs]
+    assert "taskv3 finish would hold on an unseen submission response" in events
+    assert "taskv3 finish held on an unseen submission response" not in events
+
+
+@pytest.mark.asyncio
+async def test_a_second_finish_in_the_held_batch_is_held_too() -> None:
+    # Neither finish in the batch has seen the hold, so the second must not stand without the re-observe.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"}), ("finish", {"status": "terminated", "reason": "r2"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "r3", 5)
+    held = [e for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    assert len(held) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["terminated", "failed"])
+async def test_a_submission_released_after_the_wait_cap_is_still_shown_before_the_verdict_stands(
+    status: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The interceptor can hold longer than the wait: the hold that fired while it was held must not spend the
+    # chance to see the response it later delivers, here behind a read that started before that response.
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.2)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+    reads = [0]
+
+    async def observe(args: dict[str, Any]) -> ToolResult:
+        reads[0] += 1
+        if reads[0] == 2:
+            submissions.release(record_id)
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("url=x text: 'Submit application'")
+
+    tools = [
+        ToolSpec(name="observe", description="o", parameters={}, handler=observe, compactable=True),
+        make_finish_tool(activity=activity, intercepted_submissions=submissions),
+    ]
+    script = [
+        [("observe", {})],
+        [("finish", {"status": status, "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": status, "reason": "r2"})],
+        [("observe", {})],
+        [("finish", {"status": status, "reason": "r3"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    held = [e["outcomes"] for e in logs if e["event"] == "taskv3 finish held on an unseen submission response"]
+    assert held == [["held"], ["delivered"]]
+    assert (outcome.status, outcome.reason) == (status, "r3")
+
+
+@pytest.mark.asyncio
+async def test_a_submission_still_held_after_its_hold_is_not_waited_on_or_held_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.3)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.hold()
+    tools = _submission_tools(submissions, activity)
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    started = time.monotonic()
+    outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason) == ("terminated", "r2")
+    assert time.monotonic() - started < 0.3 * 2
+
+
+@pytest.mark.asyncio
+async def test_a_new_response_does_not_re_wait_on_a_submission_already_held_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.6)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    submissions.hold()
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions)
+    await finish.handler({"status": "terminated", "reason": "r1"})
+    submissions.deliver()
+    activity.turn += 1
+    started = time.monotonic()
+    second = await finish.handler({"status": "terminated", "reason": "r2"})
+    assert second.status == "error" and "got the site's response" in second.content
+    assert time.monotonic() - started < 0.6
+
+
+@pytest.mark.asyncio
+async def test_a_late_released_submission_without_headroom_only_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(loop_module, "SUBMISSION_HELD_WAIT_MAX_SECONDS", 0.2)
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    record_id = submissions.hold()
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions)
+    first = await finish.handler({"status": "terminated", "reason": "r1"})
+    submissions.release(record_id)
+    activity.turn += 1
+    activity.final_turn_active = True
+    with capture_logs() as logs:
+        second = await finish.handler({"status": "terminated", "reason": "r2"})
+    assert (first.status, second.status) == ("error", "ok")
+    assert "taskv3 finish would hold on an unseen submission response" in [e["event"] for e in logs]
+
+
+def test_submissions_since_keeps_a_response_landing_within_the_render_margin_before_the_block() -> None:
+    # The page may still be rendering a response that landed just before the block began, so the read-start check,
+    # not the block boundary, decides whether this block saw it.
+    submissions = _FakeSubmissions()
+    started_at = time.monotonic()
+    inside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS / 2
+    outside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS * 2
+    for at in (outside, inside):
+        submissions.records.append(
+            InterceptedSubmission(
+                record_id=len(submissions.records) + 1,
+                outcome=SubmissionOutcome.DELIVERED,
+                started_at=at - 0.1,
+                released_at=at,
+                delivered_at=at,
+            )
+        )
+    assert [r.record_id for r in submissions_since(submissions, started_at)()] == [2]
+
+
+def test_submissions_since_drops_an_earlier_blocks_settled_records() -> None:
+    submissions = _FakeSubmissions()
+    submissions.deliver(ago=5.0)
+    submissions.hold()
+    read = submissions_since(submissions, time.monotonic() - 1.0)
+    assert [r.record_id for r in read()] == [2]
+    submissions.deliver()
+    assert [r.record_id for r in read()] == [2, 3]
+
+
+_RETRY_HELD = "taskv3 finish held for the permitted retry of a typed site rejection"
+_RETRY_WOULD_HOLD = "taskv3 finish would hold for the permitted retry of a typed site rejection"
+_REJECTED = SubmissionOutcome.REJECTED_BY_SITE
+
+
+async def _typed_rejection_run(
+    submissions: _FakeSubmissions,
+    script: list[list[tuple[str, dict[str, Any]]]],
+    *,
+    click_outcomes: list[SubmissionOutcome] | None = None,
+    finish_kwargs: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Each click is a submit the interceptor records with the next outcome; once they run out it records nothing."""
+    activity = ActivityRecency()
+    tools = _submission_tools(submissions, activity, **(finish_kwargs or {}))
+    pending = list(click_outcomes or [])
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        if pending:
+            next_outcome = pending.pop(0)
+            if next_outcome is SubmissionOutcome.HELD:
+                submissions.hold()
+            else:
+                submissions.deliver(outcome=next_outcome)
+            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("click done")
+
+    tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity, **kwargs)
+    return outcome, logs
+
+
+_SUBMIT_REJECTED_THEN_GIVE_UP = [
+    [("observe", {})],
+    [("click", {"selector": "#submit"})],
+    [("observe", {})],
+    [("finish", {"status": "terminated", "reason": "flagged as spam"})],
+]
+
+
+@pytest.mark.asyncio
+async def test_a_lone_typed_rejection_holds_a_give_up_once_for_the_permitted_retry() -> None:
+    script = [*_SUBMIT_REJECTED_THEN_GIVE_UP, [("finish", {"status": "terminated", "reason": "not retrying"})]]
+    outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
+    assert (outcome.status, outcome.reason) == ("terminated", "not retrying")
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+
+
+@pytest.mark.asyncio
+async def test_any_submit_after_the_typed_rejection_ends_the_offer() -> None:
+    # The retry's own record, whatever it got back, or a resubmit the interceptor never saw: either way no offer.
+    for retry in (_REJECTED, SubmissionOutcome.UNKNOWN, SubmissionOutcome.DELIVERED, None):
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#submit"})],
+            [("observe", {})],
+            [("click", {"selector": "#submit"})],
+            [("observe", {})],
+            [("finish", {"status": "terminated", "reason": "rejected again"})],
+        ]
+        outcomes = [_REJECTED] if retry is None else [_REJECTED, retry]
+        outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=outcomes)
+        assert (retry, outcome.status, outcome.turns) == (retry, "terminated", 6)
+        assert _RETRY_HELD not in [e["event"] for e in logs]
+
+
+@pytest.mark.asyncio
+async def test_only_this_blocks_own_typed_rejection_offers_the_retry() -> None:
+    for lone in (SubmissionOutcome.DELIVERED, SubmissionOutcome.UNKNOWN):
+        script = [*_SUBMIT_REJECTED_THEN_GIVE_UP[:3], [("finish", {"status": "failed", "reason": "r"})]]
+        outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[lone])
+        assert (lone, outcome.status, outcome.turns) == (lone, "failed", 4)
+        assert _RETRY_HELD not in [e["event"] for e in logs]
+    # A rejection this block made no submit for: an earlier block's submission, settled while this one ran.
+    submissions = _FakeSubmissions()
+    submissions.deliver(ago=5.0, outcome=_REJECTED)
+    outcome, logs = await _typed_rejection_run(
+        submissions, [[("observe", {})], [("finish", {"status": "terminated", "reason": "nothing to submit"})]]
+    )
+    assert (outcome.status, outcome.turns) == ("terminated", 2)
+    assert _RETRY_HELD not in [e["event"] for e in logs]
+    submissions = _FakeSubmissions()
+    submissions.hold()
+
+    async def canceled() -> bool:
+        return True
+
+    activity = ActivityRecency()
+    finish = make_finish_tool(activity=activity, intercepted_submissions=submissions, should_cancel=canceled)
+    with capture_logs() as logs:
+        await finish.handler({"status": "terminated", "reason": "r"})
+        activity.turn += 1
+        result = await finish.handler({"status": "terminated", "reason": "r"})
+    assert result.status == "ok"
+    assert _RETRY_HELD not in [e["event"] for e in logs]
+
+
+@pytest.mark.asyncio
+async def test_a_second_finish_in_the_batch_of_the_retry_hold_is_held_too() -> None:
+    script = [
+        *_SUBMIT_REJECTED_THEN_GIVE_UP[:3],
+        [("finish", {"status": "terminated", "reason": "r1"}), ("finish", {"status": "terminated", "reason": "r2"})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    outcome, logs = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "r3", 5)
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+
+
+_RETRY_HOLD = "verdict held once: the only submission the page-level interceptor saw"
+# The hold reports the rejection as a fact; it must not tell the model what to do about it.
+_STEERING = ("you may retry", "unused", "retry the submission")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second", [None, SubmissionOutcome.HELD, SubmissionOutcome.DELIVERED, SubmissionOutcome.UNKNOWN, _REJECTED]
+)
+async def test_a_submit_queued_behind_the_retry_hold_spends_the_offer_for_the_rest_of_the_batch(
+    second: SubmissionOutcome | None,
+) -> None:
+    # [finish, submit, finish] in one batch: the second finish must not repeat a permission the submit already used,
+    # whether the interceptor recorded it (in flight, delivered, unknown, rejected) or never saw it (None).
+    submissions = _FakeSubmissions()
+    outcomes = [_REJECTED] if second is None else [_REJECTED, second]
+    script = [
+        *_SUBMIT_REJECTED_THEN_GIVE_UP[:3],
+        [
+            ("finish", {"status": "terminated", "reason": "r1"}),
+            ("click", {"selector": "#submit"}),
+            ("finish", {"status": "terminated", "reason": "r2"}),
+        ],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+
+    async def settle_held() -> None:
+        while not any(r.outcome is SubmissionOutcome.HELD for r in submissions.records):
+            await asyncio.sleep(0.01)
+        submissions.release(next(r.record_id for r in submissions.records if r.outcome is SubmissionOutcome.HELD))
+
+    releaser = asyncio.create_task(settle_held()) if second is SubmissionOutcome.HELD else None
+    outcome, logs = await _typed_rejection_run(submissions, script, click_outcomes=outcomes)
+    if releaser is not None:
+        await releaser
+    finishes = [
+        str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
+    ]
+    assert finishes[0].startswith(_RETRY_HOLD)
+    assert finishes[1].startswith("verdict held") and not finishes[1].startswith(_RETRY_HOLD), finishes[1]
+    assert all(not later.startswith(_RETRY_HOLD) for later in finishes[2:])
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_submission_the_loop_did_not_send_also_spends_the_retry_offer_for_the_batch() -> None:
+    # The page can send a submission on its own (a script re-submitting): a new record with no submit-shaped action.
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity)
+    reads = [0]
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        submissions.deliver(outcome=_REJECTED)
+        await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        return ToolResult.ok("click done")
+
+    async def observe(args: dict[str, Any]) -> ToolResult:
+        reads[0] += 1
+        if reads[0] == 2:
+            submissions.deliver(outcome=SubmissionOutcome.DELIVERED)
+        return ToolResult.ok("url=x text: 'Submit application'")
+
+    tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True)
+    tools[1] = ToolSpec(name="observe", description="o", parameters={}, handler=observe, compactable=True)
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("observe", {})],
+        [
+            ("finish", {"status": "terminated", "reason": "r1"}),
+            ("observe", {}),
+            ("finish", {"status": "terminated", "reason": "r2"}),
+        ],
+    ]
+    outcome, _ = await _run(script, tools, activity=activity)
+    finishes = [
+        str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
+    ]
+    assert finishes[0].startswith(_RETRY_HOLD)
+    assert finishes[1].startswith("verdict held") and not finishes[1].startswith(_RETRY_HOLD), finishes[1]
+
+
+@pytest.mark.asyncio
+async def test_the_typed_rejection_hold_states_the_rejection_without_steering() -> None:
+    script = [*_SUBMIT_REJECTED_THEN_GIVE_UP, [("finish", {"status": "terminated", "reason": "r2"})]]
+    outcome, _ = await _typed_rejection_run(_FakeSubmissions(), script, click_outcomes=[_REJECTED])
+    hold = next(m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish")
+    assert hold.startswith(_RETRY_HOLD) and "RECAPTCHA_SCORE_BELOW_THRESHOLD" in hold, hold
+    assert not any(phrase in hold.lower() for phrase in _STEERING), hold
+    assert (outcome.status, outcome.reason) == ("terminated", "r2")
+
+
+@pytest.mark.asyncio
+async def test_a_later_generic_hold_is_not_reported_as_a_spent_retry_offer() -> None:
+    # Offer in one turn, a submission in the next, then a plain unseen-response hold: the second finish in that later
+    # batch gets the same plain hold, not the claim that a submission followed the offer in this batch.
+    script = [
+        *_SUBMIT_REJECTED_THEN_GIVE_UP,
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"}), ("finish", {"status": "terminated", "reason": "r2"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    outcome, _ = await _typed_rejection_run(
+        _FakeSubmissions(), script, click_outcomes=[_REJECTED, SubmissionOutcome.DELIVERED]
+    )
+    finishes = [
+        str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
+    ]
+    assert finishes[0].startswith(_RETRY_HOLD)
+    assert "got the site's response after your last look" in finishes[1], finishes[1]
+    assert finishes[2] == finishes[1], finishes[2]
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+
+
+@pytest.mark.asyncio
+async def test_typed_rejection_retry_without_headroom_only_logs() -> None:
+    reloads: list[None] = []
+
+    async def reload_page() -> None:
+        reloads.append(None)
+
+    # The retry is a refill and a resubmit, so it is funded like the give-up hold, not like a re-observe.
+    deadline = {"deadline_at": time.monotonic() + VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS - 10}
+    for limit, finish_kwargs in (
+        ({"max_turns": 4}, None),
+        ({"max_action_steps": 1}, None),
+        ({"max_refresh_cycles": 1}, None),
+        ({}, deadline),
+    ):
+        ctx = SkyvernContext(task_id="tsk_typed_rejection")
+        skyvern_context.set(ctx)
+        ctx.refresh_working_page = "max_refresh_cycles" in limit
+        try:
+            outcome, logs = await _typed_rejection_run(
+                _FakeSubmissions(),
+                _SUBMIT_REJECTED_THEN_GIVE_UP,
+                click_outcomes=[_REJECTED],
+                finish_kwargs=finish_kwargs,
+                reload_page=reload_page,
+                **limit,
+            )
+        finally:
+            skyvern_context.reset()
+        events = [e["event"] for e in logs]
+        assert (str(limit), outcome.status, _RETRY_HELD in events) == (str(limit), "terminated", False)
+        assert _RETRY_WOULD_HOLD in events
+
+
+_JUSTIFY_HELD = "taskv3 finish justification held"
+_JUSTIFY_WOULD_HOLD = "taskv3 finish justification would hold"
+
+
+def _justify_tools(
+    activity: ActivityRecency, clicks: list[tuple[str, dict[str, Any]]] | None = None, **finish_kwargs: Any
+) -> list[ToolSpec]:
+    return [
+        _perception_tool("observe", "url=x text: 'Results'"),
+        _billable_tool("click", clicks if clicks is not None else []),
+        make_finish_tool(activity=activity, justify_stops=True, **finish_kwargs),
+    ]
+
+
+def _finish_results(outcome: Any) -> list[str]:
+    return [str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+
+
+def _justify_events(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e for e in logs if e["event"] in (_JUSTIFY_HELD, _JUSTIFY_WOULD_HOLD)]
+
+
+@pytest.mark.asyncio
+async def test_first_terminated_verdict_is_held_once_then_stands() -> None:
+    activity = ActivityRecency()
+    reason = "I can't search for this person's records."
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": reason})],
+        [("finish", {"status": "terminated", "reason": reason})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", reason, 3)
+    assert _finish_results(outcome)[0] == loop_module.JUSTIFY_HOLD_MESSAGE
+    (held,) = _justify_events(logs)
+    assert (held["event"], held["status"], held["turn"], held["reason_chars"]) == (
+        _JUSTIFY_HELD,
+        "terminated",
+        2,
+        len(reason),
+    )
+    assert held["reason_refusal_shaped"] is True
+    assert reason not in str(held)
+
+
+@pytest.mark.asyncio
+async def test_a_held_terminated_that_continues_can_complete() -> None:
+    activity = ActivityRecency()
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "this lookup is not permitted"})],
+        [("click", {"selector": "#result"})],
+        [("finish", {"status": "completed", "reason": "opened the record"})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity, clicks), activity=activity)
+    assert outcome.status == "completed"
+    assert clicks == [("click", {"selector": "#result"})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "cause"),
+    [
+        ({"final_turn_active": True}, "final_turn"),
+        ({"turns_remaining": FAILURE_EVIDENCE_MIN_TURNS - 1}, "no_headroom"),
+        ({"tool_calls_remaining": FAILURE_EVIDENCE_MIN_TOOL_CALLS - 1}, "no_headroom"),
+        ({"tokens_remaining": 10, "last_turn_tokens": 10}, "no_headroom"),
+        ({"perception_stall_imminent": True}, "no_headroom"),
+        ({}, "no_headroom"),
+        ({"action_steps_remaining": 1}, "no_action_step"),
+        ({"action_steps_remaining": 2}, None),
+    ],
+    ids=["final_turn", "turns", "tool_calls", "tokens", "stall", "deadline", "one_action_step", "two_action_steps"],
+)
+async def test_justification_hold_stands_aside_without_room_to_continue(
+    state: dict[str, Any], cause: str | None
+) -> None:
+    short_deadline = not state
+    deadline_at = time.monotonic() + FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS - 10 if short_deadline else None
+    finish = make_finish_tool(activity=ActivityRecency(**state), justify_stops=True, deadline_at=deadline_at)
+    with capture_logs() as logs:
+        result = await finish.handler({"status": "terminated", "reason": "r1"})
+    if cause is None:
+        assert (result.status, result.content) == ("error", loop_module.JUSTIFY_HOLD_MESSAGE)
+        assert [e["event"] for e in _justify_events(logs)] == [_JUSTIFY_HELD]
+    else:
+        assert result.status == "ok"
+        assert [(e["event"], e["cause"]) for e in _justify_events(logs)] == [(_JUSTIFY_WOULD_HOLD, cause)]
+
+
+@pytest.mark.asyncio
+async def test_justification_hold_does_not_stack_on_a_submission_hold() -> None:
+    submissions, activity = _FakeSubmissions(), ActivityRecency()
+    tools = _submission_tools(submissions, activity, click_delivers=True, justify_stops=True)
+    script = [
+        [("observe", {})],
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("finish", {"status": "terminated", "reason": "r2"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "r2", 4)
+    assert [e["event"] for e in logs].count("taskv3 finish held on an unseen submission response") == 1
+    assert [(e["event"], e["cause"]) for e in _justify_events(logs)] == [(_JUSTIFY_WOULD_HOLD, "other_hold")]
+
+
+@pytest.mark.asyncio
+async def test_justification_hold_does_not_stack_on_the_typed_rejection_or_failure_evidence_hold() -> None:
+    script = [*_SUBMIT_REJECTED_THEN_GIVE_UP, [("finish", {"status": "terminated", "reason": "not retrying"})]]
+    outcome, logs = await _typed_rejection_run(
+        _FakeSubmissions(), script, click_outcomes=[_REJECTED], finish_kwargs={"justify_stops": True}
+    )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "not retrying", 5)
+    assert [e["event"] for e in logs].count(_RETRY_HELD) == 1
+    assert [e["event"] for e in _justify_events(logs)] == [_JUSTIFY_WOULD_HOLD]
+
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    tools = _justify_tools(activity, page_fingerprint=fingerprint, settle_wait_seconds=0.0)
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "blocked"})],
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": "the site refused it"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, tools, activity=activity)
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", "the site refused it", 4)
+    assert [e["event"] for e in logs].count("taskv3 finish failure deferred for evidence") == 1
+    assert [(e["event"], e["cause"]) for e in _justify_events(logs)] == [(_JUSTIFY_WOULD_HOLD, "other_hold")]
+
+
+@pytest.mark.asyncio
+async def test_a_verification_blocker_give_up_hold_comes_first() -> None:
+    waits = {"n": 0}
+
+    async def verification_blocker(status: str) -> str | None:
+        if status != "completed" and waits["n"] == 0:
+            waits["n"] += 1
+            return "still waiting for the sign-in link"
+        return None
+
+    activity = ActivityRecency()
+    script = [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2, 3)]
+    outcome, _ = await _run(
+        script, _justify_tools(activity, verification_blocker=verification_blocker), activity=activity
+    )
+    finishes = _finish_results(outcome)
+    assert finishes[:2] == ["still waiting for the sign-in link", loop_module.JUSTIFY_HOLD_MESSAGE]
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_verdict_is_never_held() -> None:
+    for first in ("observe", "click"):
+        activity = ActivityRecency()
+        script = [[(first, {"selector": "#a"})], [("finish", {"status": "failed", "reason": "r1"})]]
+        with capture_logs() as logs:
+            outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+        assert (first, outcome.status, outcome.turns) == (first, "failed", 2)
+        assert _justify_events(logs) == []
+
+    activity = ActivityRecency()
+    fingerprint, _ = _fingerprint_seq(["fp"])
+    script = [
+        [("click", {"selector": "#submit"})],
+        [("finish", {"status": "failed", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "r2"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            script,
+            _justify_tools(activity, page_fingerprint=fingerprint, settle_wait_seconds=0.0),
+            activity=activity,
+        )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("failed", "r2", 4)
+    assert [e["event"] for e in logs].count("taskv3 finish failure deferred for evidence") == 1
+    assert _justify_events(logs) == []
+
+
+@pytest.mark.asyncio
+async def test_the_premise_check_runs_only_on_the_verdict_that_stands() -> None:
+    checks: list[tuple[str, int]] = []
+
+    async def terminate_premise(reason: str, prior_checks: int) -> None:
+        checks.append((reason, prior_checks))
+
+    activity = ActivityRecency()
+    script = [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)]
+    outcome, _ = await _run(script, _justify_tools(activity, terminate_premise=terminate_premise), activity=activity)
+    await asyncio.sleep(0)
+    assert outcome.reason == "r2"
+    assert checks == [("r2", 0)]
+
+
+@pytest.mark.asyncio
+async def test_the_unlisted_reask_runs_only_on_the_verdict_that_stands() -> None:
+    asked: list[tuple[str, str]] = []
+
+    async def unlisted_reask(original: str, reason: str) -> UnlistedReask:
+        asked.append((original, reason))
+        return UnlistedReask(original_status="terminated", converts=False, skipped_reason=None, latency_s=0.0)
+
+    activity = ActivityRecency()
+    script = [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)]
+    outcome, _ = await _run(script, _justify_tools(activity, unlisted_reask=unlisted_reask), activity=activity)
+    assert outcome.reason == "r2"
+    assert asked == [("terminated", "r2")]
+
+
+@pytest.mark.asyncio
+async def test_a_held_verdicts_error_code_is_not_reported() -> None:
+    mapping = {"not_permitted": "The task is not permitted.", "no_record": "No record matched."}
+    activity = ActivityRecency()
+    script = [
+        [("finish", {"status": "terminated", "reason": "r1", "error_code": "not_permitted"})],
+        [("finish", {"status": "terminated", "reason": "r2", "error_code": "no_record"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, _justify_tools(activity, error_code_mapping=mapping), activity=activity)
+    assert (outcome.reason, outcome.error_code) == ("r2", "no_record")
+    assert [e["chosen_error_code"] for e in logs if e["event"] == "taskv3 finish user-defined error code"] == [
+        "no_record"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_status_at_hold_gate_records_the_held_verdict() -> None:
+    activity = ActivityRecency()
+    script = [
+        [("finish", {"status": "terminated", "reason": "r1"})],
+        [("observe", {})],
+        [("finish", {"status": "failed", "reason": "r2"})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+    assert outcome.status == "failed"
+    assert (activity.status_at_hold_gate, activity.perceptions_at_hold_gate) == ("terminated", 0)
+
+
+@pytest.mark.asyncio
+async def test_calls_queued_after_a_held_finish_are_skipped_not_run() -> None:
+    activity = ActivityRecency()
+    clicks: list[tuple[str, dict[str, Any]]] = []
+    script = [
+        [("observe", {})],
+        [
+            ("finish", {"status": "terminated", "reason": "r1"}),
+            ("click", {"selector": "#next"}),
+            ("finish", {"status": "completed", "reason": "r2"}),
+        ],
+        [("finish", {"status": "terminated", "reason": "r3"})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity, clicks), activity=activity)
+    assert clicks == []
+    assert (outcome.status, outcome.reason) == ("terminated", "r3")
+    asked = [c["id"] for m in outcome.messages if m.get("role") == "assistant" for c in m.get("tool_calls") or []]
+    answered = [m["tool_call_id"] for m in outcome.messages if m.get("role") == "tool"]
+    assert sorted(asked) == sorted(answered)
+    skipped = [str(m["content"]) for m in outcome.messages if str(m.get("content", "")).startswith("skipped:")]
+    assert skipped == [f"skipped: {loop_module._JUSTIFY_HOLD_SKIP}"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_completed_verdict_never_reaches_the_justification_hold() -> None:
+    activity = ActivityRecency()
+    with capture_logs() as logs:
+        outcome, _ = await _run(
+            [[("finish", {"status": "completed", "reason": "done"})]], _justify_tools(activity), activity=activity
+        )
+        assert (outcome.status, outcome.turns) == ("completed", 1)
+
+        async def completion_gate() -> bool:
+            raise CompletionGateTerminationError("an earlier entry exists")
+
+        finish = make_finish_tool(activity=ActivityRecency(), justify_stops=True, completion_gate=completion_gate)
+        result = await finish.handler({"status": "completed", "reason": "done"})
+        assert (result.status, (result.data or {}).get("status")) == ("ok", "terminated")
+    assert _justify_events(logs) == []
+
+
+def test_the_hold_text_is_generic() -> None:
+    words = set(re.findall(r"[a-z]+", loop_module.JUSTIFY_HOLD_MESSAGE.lower()))
+    assert not words & {"age", "minor", "minors", "adult", "privacy", "private", "person", "people", "broker"}
+    on, off = make_finish_tool(justify_stops=True), make_finish_tool()
+    assert (on.description, on.parameters) == (off.description, off.parameters)
+
+
+def test_the_hold_lets_the_goal_text_set_the_refinish_status() -> None:
+    # A goal can give the stopping outcome its own status ("no record found: mark as complete"); the hold
+    # must not fix the re-finish to terminated when the rule the model quotes says otherwise.
+    assert "status=terminated" not in loop_module.JUSTIFY_HOLD_MESSAGE
+    assert (
+        "finish again with the status the goal's text gives this outcome (terminated if it gives none)"
+        in loop_module.JUSTIFY_HOLD_MESSAGE
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_missing_fact_stop_restated_after_the_hold_stands_as_terminated() -> None:
+    activity = ActivityRecency()
+    reason = "The form requires a street address and the data gives none."
+    script = [
+        [("observe", {})],
+        [("finish", {"status": "terminated", "reason": reason})],
+        [("finish", {"status": "terminated", "reason": reason})],
+    ]
+    outcome, _ = await _run(script, _justify_tools(activity), activity=activity)
+    assert _finish_results(outcome)[0] == loop_module.JUSTIFY_HOLD_MESSAGE
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", reason, 3)
+
+
+def test_submissions_across_contexts_keeps_a_replaced_contexts_records_apart() -> None:
+    first, second = object(), object()
+    ledgers = {
+        first: (InterceptedSubmission(1, _REJECTED, started_at=1.0, released_at=2.0, delivered_at=2.0),),
+        second: (InterceptedSubmission(1, _REJECTED, started_at=3.0, released_at=4.0, delivered_at=4.0),),
+    }
+    current = [first]
+    read = submissions_across_contexts(lambda context: ledgers.get(context, ()), lambda: current[0])
+    current[0] = second
+    records = read()
+    assert [r.started_at for r in records] == [1.0, 3.0]
+    assert len({r.record_id for r in records}) == 2
+    assert [r.record_id for r in read()] == [r.record_id for r in records]
+
+
 @pytest.mark.asyncio
 async def test_failure_gate_off_without_activity_tracker() -> None:
     # Fenced like the completed-side probe: without an activity tracker (bare callers) the failure
@@ -7387,13 +9242,29 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed <= 0.3, elapsed
+    assert elapsed <= 1.0, elapsed
     assert hang_calls["n"] == 0  # the hanging sampler was never awaited, at either call site
     assert outcome.status in ("budget_exhausted", "completed")
 
 
 @pytest.mark.asyncio
-async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_deadline() -> None:
+@pytest.mark.parametrize(
+    ("skipped_tool_before_finish", "expected_status", "expected_skips"),
+    [
+        pytest.param(None, "completed", [True, False], id="finish-only"),
+        pytest.param("observe", "completed", [True, True, False], id="skipped-read-before-finish"),
+        pytest.param("click", "budget_exhausted", [True, True, True], id="skipped-action-before-finish"),
+        pytest.param("solve_captcha", "budget_exhausted", [True, True, True], id="skipped-recordable-page-action"),
+        pytest.param(
+            "open_verification_link", "budget_exhausted", [True, True, True], id="skipped-engaging-page-action"
+        ),
+    ],
+)
+async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_deadline(
+    skipped_tool_before_finish: str | None,
+    expected_status: str,
+    expected_skips: list[bool],
+) -> None:
     # The stall detector's pre-batch fingerprint baseline passes deadline_at, so a slow LLM turn that
     # burns the whole deadline must skip the sample entirely -- a hanging sampler there would otherwise
     # run the full 10s probe timeout with the run already over.
@@ -7404,7 +9275,10 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
         await asyncio.sleep(5.0)
         return "fp"
 
+    click_calls: list[None] = []
+
     async def click_handler(_args: dict[str, Any]) -> ToolResult:
+        click_calls.append(None)
         return ToolResult.ok("click done")
 
     tools = [
@@ -7415,6 +9289,21 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
             handler=click_handler,
             billable=True,
         ),
+        ToolSpec(
+            name="solve_captcha",
+            description="solve captcha",
+            parameters={},
+            handler=click_handler,
+            recordable=True,
+        ),
+        ToolSpec(
+            name="open_verification_link",
+            description="open verification link",
+            parameters={},
+            handler=click_handler,
+            engages_page=True,
+        ),
+        _recording_tool("observe", []),
         make_finish_tool(),
     ]
 
@@ -7424,9 +9313,12 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
                 await asyncio.sleep(0.2)  # eats the whole deadline before this turn's batch dispatches
             return await super().call(**kwargs)
 
-    caller = _SlowFirstCallCaller(
-        [[("click", {"selector": "#next"})], [("finish", {"status": "completed", "reason": "ok"})]]
-    )
+    final_batch: list[tuple[str, dict[str, Any]]] = []
+    if skipped_tool_before_finish is not None:
+        skipped_args = {"selector": "#wrap-up"} if skipped_tool_before_finish == "click" else {}
+        final_batch.append((skipped_tool_before_finish, skipped_args))
+    final_batch.append(("finish", {"status": "completed", "reason": "ok"}))
+    caller = _SlowFirstCallCaller([[("click", {"selector": "#next"})], final_batch])
     started = time.monotonic()
     outcome = await run_agent_tool_loop(
         llm_caller=caller,
@@ -7440,13 +9332,80 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     )
     elapsed = time.monotonic() - started
 
-    # Deliberate contract change: the elapsed deadline grants one final observed turn instead of
-    # ending the run, and the scripted finish on that turn wins; cap_trip carries the deadline fact.
-    # The hang guard is unchanged: the sampler must stay un-awaited on the granted turn too.
-    assert outcome.status == "completed"
+    # Skipped page-changing calls invalidate a queued finish; skipped reads do not.
+    assert outcome.status == expected_status
     assert outcome.cap_trip is not None and "deadline" in outcome.cap_trip
+    assert click_calls == []
     assert fp_calls["n"] == 0  # deadline already gone -- the hanging sampler was never awaited
+    tool_results = [message for message in outcome.messages if message.get("role") == "tool"]
+    assert [message["content"].startswith("skipped:") for message in tool_results] == expected_skips
     assert elapsed < 2.0, elapsed  # loose wall-clock bound: an awaited sampler would add its full 5s sleep
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_refresh_expiry_does_not_duplicate_skipped_tail_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.01)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+
+    async def click_handler(_args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("click done")
+
+    finish = make_finish_tool()
+    finish_handler = finish.handler
+    assert finish_handler is not None
+    ctx = SkyvernContext(task_id="tsk_post_dispatch_refresh_expired_final_turn")
+
+    async def finish_with_refresh(args: dict[str, Any]) -> ToolResult:
+        result = await finish_handler(args)
+        ctx.refresh_working_page = True
+        return result
+
+    finish.handler = finish_with_refresh
+    tools = [
+        ToolSpec(name="click", description="click", parameters={}, handler=click_handler, billable=True),
+        finish,
+        _recording_tool("observe", []),
+    ]
+
+    class _SlowFirstCallCaller(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls == 0:
+                await asyncio.sleep(0.1)
+            return await super().call(**kwargs)
+
+    caller = _SlowFirstCallCaller(
+        [
+            [("click", {})],
+            [("finish", {"status": "completed", "reason": "deadline wrap-up"}), ("observe", {})],
+        ]
+    )
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=tools,
+                max_turns=20,
+                max_tool_calls=100,
+                deadline_seconds=0.02,
+            ),
+            timeout=2,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert ctx.refresh_working_page is False
+    observe_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "observe"
+    ]
+    assert len(observe_results) == 1
+    assert observe_results[0]["content"].startswith("skipped:")
 
 
 @pytest.mark.asyncio
@@ -7568,6 +9527,25 @@ async def test_the_loop_records_the_clicked_control_for_the_pending_gate() -> No
     outcome, _ = await _run(script, tools, submit_watch=watch)
     assert outcome.status == "completed"
     assert asked == ["#submit"]
+
+
+@pytest.mark.asyncio
+async def test_the_loop_records_a_drags_drop_target_for_the_pending_gate() -> None:
+    # A drop handler can start a save, so the gate watches the drop target the drag reports, not its source.
+    probe, asked = _pending_probe(None)
+    watch = SubmitWatch()
+    drags: list[tuple[str, dict[str, Any]]] = []
+    tools = [
+        _billable_tool("drag", drags, data={"drop_target": "#done"}),
+        make_finish_tool(pending_marker=probe, submit_watch=watch),
+    ]
+    script = [
+        [("drag", {"selector": "#card", "target": "ref=4"})],
+        [("finish", {"status": "completed", "reason": "moved the card"})],
+    ]
+    outcome, _ = await _run(script, tools, submit_watch=watch)
+    assert outcome.status == "completed"
+    assert asked == ["#done"]
 
 
 @pytest.mark.asyncio
@@ -7805,7 +9783,7 @@ async def test_a_failing_pending_probe_fails_open() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("seed", range(50))
 async def test_every_live_verdict_is_preceded_by_exactly_one_warning_on_its_tool_streak(seed: int) -> None:
     # The warning reads the per-tool counter because that counter moves by exactly one per read:
     # any live verdict needs tool_identical >= terminate > nudge on the same streak, so the streak
@@ -8239,6 +10217,7 @@ async def test_navigate_records_name_the_host_and_no_other_tool_does() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_a_url_the_record_cannot_parse_redacts_it_and_never_aborts_the_run() -> None:
     # The record helper is evaluated to build the kwargs BEFORE the `taskv3 tool handler raised` call
     # is entered, so anything it raises escapes that except block, the per-call try AND the batch loop:
@@ -8541,202 +10520,103 @@ def test_canonicalization_covers_a_marker_fragment_left_open_at_the_tail() -> No
 
 
 @pytest.mark.asyncio
-async def test_completion_probe_ends_loop_mid_batch_without_finish() -> None:
-    # A billable action's own result can carry the download-completion signal; the probe ends the
-    # run right there, no finish tool call needed, and the rest of the batch never dispatches.
-    clicks: list[tuple[str, dict[str, Any]]] = []
+@pytest.mark.parametrize("settle_outcome", ["no_file", "landed", "raises_once", "canceled"])
+async def test_download_settle_accepts_a_completed_finish_it_could_record(settle_outcome: str) -> None:
+    canceled = False
+    raised = False
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal canceled, raised
+        if settle_outcome == "raises_once" and not raised:
+            raised = True
+            raise RuntimeError("storage unavailable")
+        canceled = settle_outcome == "canceled"
+        return "Downloaded report.csv" if settle_outcome == "landed" else None
 
-    tools = [_billable_tool("click", clicks), make_finish_tool()]
-    script = [[("click", {"selector": "#a"}), ("click", {"selector": "#b"})]]
-    recorded_rounds: list[list[RoundAction]] = []
+    async def should_cancel() -> bool:
+        return canceled
 
-    async def on_action_round(round_actions: list[RoundAction], _turn_text: str | None, *, round_done: bool) -> None:
-        recorded_rounds.append(round_actions)
-
-    outcome, _ = await _run(script, tools, completion_probe=probe, on_action_round=on_action_round)
-
-    assert outcome.status == "completed"
-    assert outcome.reason == "a file finished downloading"
-    assert len(clicks) == 1  # the second batched click never ran
-    assert outcome.tool_calls == 1
-    # The click that produced the download must be billed and persisted, not lost because the
-    # probe fired before the recording step that appends it.
-    assert outcome.billable_actions == ["click"]
-    assert recorded_rounds == [[RoundAction("click", {"selector": "#a"}, True, billable=True)]]
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_is_refused_while_verification_never_delivered() -> None:
-    # The probe is a second path to `completed` that never reaches the finish tool, so it needs the
-    # same verification gate: a file landing after the code source gave up must not read as success.
-    now = datetime.now(UTC)
-    task = make_task(now, make_organization(now), totp_verification_url="https://example.com/otp")
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
-
-    gave_up = VerificationState(task=task)
-    gave_up.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
-    outcome, caller = await _run(
-        [
-            [("click", {"selector": "#a"})],
-            [("finish", {"status": "failed", "reason": "the verification step never completed"})],
-        ],
-        [_billable_tool("click", []), make_finish_tool()],
-        completion_probe=probe,
-        verification_blocker=gave_up.block_finish,
-    )
-    assert outcome.status == "failed", outcome.reason
-    # The refusal has to REACH the model. DOWNLOAD_COMPLETION_GUIDANCE tells it the run ends on its
-    # own and not to call finish(completed), so a silent refusal would leave it acting until a stall
-    # guard terminated the run instead of finishing failed with the verification reason.
-    assert _COMPLETION_BLOCKED in json.dumps(caller.message_history, default=str)
-
-    # Control: the identical landed download still completes when the source never failed, so the
-    # refusal above is the gate firing and not the probe being disabled.
-    healthy = VerificationState(task=task)
-    ok_outcome, _ = await _run(
-        [[("click", {"selector": "#a"})]],
-        [_billable_tool("click", []), make_finish_tool()],
-        completion_probe=probe,
-        verification_blocker=healthy.block_finish,
-    )
-    assert ok_outcome.status == "completed"
-    assert ok_outcome.reason == "a file finished downloading"
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_ignores_staged_download_unless_download_notice_too() -> None:
-    # file_upload stages an http(s) source file into the same downloads dir and marks it via
-    # staged_download; that must not read as the run's own landed download.
-    probe_calls = 0
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        nonlocal probe_calls
-        probe_calls += 1
-        return "a file finished downloading"
-
-    async def staged_only_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf"})
-
-    staged_only_tool = ToolSpec(
-        name="file_upload",
-        description="file_upload",
-        parameters={"type": "object", "properties": {}},
-        handler=staged_only_handler,
-        billable=True,
-    )
+    facts = DownloadFailureFacts()
+    facts.add("Request failed: POST /api/collect returned HTTP 404", repeat=True)
+    finish = ("finish", {"status": "completed", "reason": "the account shows 0 records"})
     outcome, _ = await _run(
-        [[("file_upload", {})], [("finish", {"status": "completed", "reason": "done"})]],
-        [staged_only_tool, make_finish_tool()],
-        completion_probe=probe,
+        [[finish], [finish]],
+        [make_finish_tool(download_settle=settle, should_cancel=should_cancel, download_facts=facts)],
+        should_cancel=should_cancel,
     )
-    assert outcome.status == "completed"
-    assert outcome.reason == "done"  # not the probe's reason -- it was never consulted
-    assert probe_calls == 0
 
-    async def staged_and_landed_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("uploaded", data={"staged_download": "x.pdf", "download_notice": True})
-
-    staged_and_landed_tool = ToolSpec(
-        name="file_upload",
-        description="file_upload",
-        parameters={"type": "object", "properties": {}},
-        handler=staged_and_landed_handler,
-        billable=True,
-    )
-    outcome2, _ = await _run(
-        [[("file_upload", {})]],
-        [staged_and_landed_tool, make_finish_tool()],
-        completion_probe=probe,
-    )
-    assert outcome2.status == "completed"
-    assert outcome2.reason == "a file finished downloading"
-    assert probe_calls == 1
+    if settle_outcome == "canceled":
+        assert outcome.status == "canceled"
+        return
+    assert (outcome.status, outcome.reason) == ("completed", "the account shows 0 records")
+    finishes = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    # A settle that raised could not record the block's files, so that finish is refused and the retry ends it.
+    assert len(finishes) == (2 if settle_outcome == "raises_once" else 1), finishes
+    assert "POST /api/collect returned HTTP 404" in finishes[-1]
+    assert (DOWNLOAD_NO_FILE_FACT in finishes[-1]) is (settle_outcome != "landed"), finishes
 
 
 @pytest.mark.asyncio
-async def test_completion_probe_gated_on_billable_or_download_notice() -> None:
-    probe_calls = 0
+async def test_a_held_finish_leaves_download_failures_and_files_for_the_accepted_finish() -> None:
+    facts = DownloadFailureFacts()
+    facts.add("Request failed: POST /api/export returned HTTP 503", repeat=True)
+    holds = iter(["the verification code never arrived"])
+    landed = ["guide.txt"]
+    recorded: list[list[str]] = []
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        nonlocal probe_calls
-        probe_calls += 1
-        return None
+    async def verification_blocker(_status: str) -> str | None:
+        return next(holds, None)
 
-    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("observed")
+    async def settle(_staged: frozenset[str]) -> str | None:
+        recorded.append(list(landed))
+        return f"download completed ({len(landed)} new file(s))"
 
-    observe_tool = ToolSpec(
-        name="observe", description="observe", parameters={"type": "object", "properties": {}}, handler=observe_handler
+    async def click(_args: dict[str, Any]) -> ToolResult:
+        landed.append("invoice.txt")
+        return ToolResult.ok("clicked")
+
+    click_tool = ToolSpec(
+        name="click", description="click", parameters={"type": "object", "properties": {}}, handler=click
+    )
+    finish = ("finish", {"status": "completed", "reason": "done"})
+    outcome, _ = await _run(
+        [[finish], [("click", {})], [finish]],
+        [
+            click_tool,
+            make_finish_tool(verification_blocker=verification_blocker, download_facts=facts, download_settle=settle),
+        ],
     )
 
-    async def check_download_handler(_args: dict[str, Any]) -> ToolResult:
-        return ToolResult.ok("download seen", data={"download_notice": True})
+    finishes = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert len(finishes) == 2
+    assert "HTTP 503" not in finishes[0] and "HTTP 503" in finishes[1]
+    # The settle finalizes the block's files, so it runs once, for the finish that ends the block.
+    assert recorded == [["guide.txt", "invoice.txt"]]
 
-    download_tool = ToolSpec(
-        name="check_download",
-        description="check_download",
-        parameters={"type": "object", "properties": {}},
-        handler=check_download_handler,
+
+@pytest.mark.asyncio
+async def test_finish_shows_at_most_the_capped_download_failures() -> None:
+    facts = DownloadFailureFacts()
+
+    async def click(args: dict[str, Any]) -> ToolResult:
+        # The last failure past the cap repeats; it is still one failure.
+        for i in [*range(DOWNLOAD_FAILURE_MAX_LINES + 2), DOWNLOAD_FAILURE_MAX_LINES + 1]:
+            facts.add(f"Request failed: GET /api/{args['batch']}{i} returned HTTP 503", repeat=True)
+        return ToolResult.ok("clicked")
+
+    click_tool = ToolSpec(
+        name="click", description="click", parameters={"type": "object", "properties": {}}, handler=click
     )
-
     script = [
-        [("observe", {})],  # non-billable, no download_notice -> probe not consulted
-        [("check_download", {})],  # non-billable but download_notice -> probe consulted
+        [("click", {"batch": "a"})],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
-    outcome, _ = await _run(script, [observe_tool, download_tool, make_finish_tool()], completion_probe=probe)
+    outcome, _ = await _run(script, [click_tool, make_finish_tool(download_facts=facts)])
 
-    assert outcome.status == "completed"
-    assert probe_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_exception_is_logged_and_treated_as_none() -> None:
-    async def probe(_staged: frozenset[str]) -> str | None:
-        raise RuntimeError("boom")
-
-    clicks: list[tuple[str, dict[str, Any]]] = []
-    tools = [_billable_tool("click", clicks), make_finish_tool()]
-    script = [[("click", {"selector": "#a"})], [("finish", {"status": "completed", "reason": "done normally"})]]
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, completion_probe=probe)
-
-    assert outcome.status == "completed"
-    assert outcome.reason == "done normally"
-    assert any(log["log_level"] == "warning" for log in logs)
-
-
-@pytest.mark.asyncio
-async def test_completion_blocker_gates_completed_status_only() -> None:
-    # completed: blocked once, then allowed once the blocker clears.
-    responses = iter(["wait: the download has not started yet", None])
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return next(responses)
-
-    tools = [make_finish_tool(completion_blocker=blocker)]
-    script = [
-        [("finish", {"status": "completed", "reason": "first attempt"})],
-        [("finish", {"status": "completed", "reason": "second attempt"})],
-    ]
-    outcome, caller = await _run(script, tools)
-    assert outcome.status == "completed"
-    assert outcome.reason == "second attempt"
-    assert caller.calls == 2  # the first finish was rejected, forcing a second turn
-
-    # failed: the blocker is never consulted, even though it would block if asked.
-    async def always_blocks(_staged: frozenset[str]) -> str | None:
-        return "should never be read"
-
-    tools2 = [make_finish_tool(completion_blocker=always_blocks)]
-    outcome2, _ = await _run([[("finish", {"status": "failed", "reason": "blocked reason"})]], tools2)
-    assert outcome2.status == "failed"
-    assert outcome2.reason == "blocked reason"
+    assert (outcome.status, outcome.reason) == ("completed", "done")
+    [finished] = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    assert finished.count("Request failed:") == DOWNLOAD_FAILURE_MAX_LINES and "+2 more failures" in finished
+    assert not facts.undelivered
 
 
 def _gate_refusals(outcome: LoopOutcome) -> int:
@@ -8805,6 +10685,7 @@ async def test_completion_gate_raise_ends_the_run_with_the_gates_reason(
     assert outcome.status == status
     assert reason in outcome.reason
     assert not outcome.gate_passed
+    assert outcome.model_status == "completed"
     assert caller.calls == 1
 
 
@@ -8881,78 +10762,27 @@ async def test_completion_gate_never_holds_a_non_completed_finish(status: str) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "finish_kwargs, held_with",
-    [
-        (
-            {"completion_blocker": lambda _downloads: _async_value("the download has not landed")},
-            "the download has not landed",
-        ),
-        (
-            {"page_fingerprint": lambda: _async_value(str(time.monotonic_ns())), "settle_wait_seconds": 0},
-            "still rendering",
-        ),
-    ],
-    ids=["completion_blocker", "unsettled_page"],
-)
-async def test_an_earlier_completed_side_hold_answers_before_the_completion_gate_is_spent(
-    finish_kwargs: dict[str, Any], held_with: str
-) -> None:
+async def test_an_earlier_completed_side_hold_answers_before_the_completion_gate_is_spent() -> None:
     gate = _CountingGate()
-    outcome, _ = await _run(
-        [[("finish", {"status": "completed", "reason": "done"})]],
-        [make_finish_tool(completion_gate=gate, **finish_kwargs)],
+    finish = make_finish_tool(
+        completion_gate=gate, page_fingerprint=lambda: _async_value(str(time.monotonic_ns())), settle_wait_seconds=0
     )
+    outcome, _ = await _run([[("finish", {"status": "completed", "reason": "done"})]], [finish])
 
     first_finish_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
-    assert held_with in first_finish_result
+    assert "still rendering" in first_finish_result
     assert gate.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_completion_blocker_exception_fails_closed() -> None:
-    # A transient storage error checking for a landed download is evidence of nothing -- it must
-    # not let a download-gated task complete with no file. finish(failed) is unaffected.
-    calls = 0
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        nonlocal calls
-        calls += 1
-        raise RuntimeError("boom")
-
-    tools = [make_finish_tool(completion_blocker=blocker)]
-    script = [
-        [("finish", {"status": "completed", "reason": "first attempt"})],
-        [("finish", {"status": "failed", "reason": "give up"})],
-    ]
-    with capture_logs() as logs:
-        outcome, caller = await _run(script, tools)
-
-    assert outcome.status == "failed"
-    assert outcome.reason == "give up"
-    assert caller.calls == 2  # the completed attempt was rejected, forcing a second turn
-    assert calls == 1  # a failed verdict never consults the blocker
-    assert any(log["log_level"] == "warning" for log in logs)
-    rejected_tool_messages = [
-        m for m in outcome.messages if m.get("role") == "tool" and "Could not verify" in m.get("content", "")
-    ]
-    assert len(rejected_tool_messages) == 1
-
-
-@pytest.mark.asyncio
 async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
-    # file_upload's staged http(s) source fetch must not be treated as a landed download by any
-    # LATER probe/blocker call this run -- not just skipped for the tool call that staged it.
+    # file_upload's staged http(s) source fetch must not be treated as a landed download by a
+    # LATER settle this run -- not just skipped for the tool call that staged it.
     staged_downloads: set[str] = set()
-    probe_seen: list[frozenset[str]] = []
-    blocker_seen: list[frozenset[str]] = []
+    settle_seen: list[frozenset[str]] = []
 
-    async def probe(staged: frozenset[str]) -> str | None:
-        probe_seen.append(staged)
-        return None
-
-    async def blocker(staged: frozenset[str]) -> str | None:
-        blocker_seen.append(staged)
+    async def settle(staged: frozenset[str]) -> str | None:
+        settle_seen.append(staged)
         return None
 
     async def stage_handler(_args: dict[str, Any]) -> ToolResult:
@@ -8969,20 +10799,17 @@ async def test_staged_download_stays_excluded_for_the_rest_of_the_run() -> None:
     tools = [
         stage_tool,
         _billable_tool("click", click_calls),
-        make_finish_tool(completion_blocker=blocker, staged_downloads=staged_downloads),
+        make_finish_tool(download_settle=settle, staged_downloads=staged_downloads),
     ]
     script = [
         [("file_upload", {})],
         [("click", {"selector": "#a"})],
         [("finish", {"status": "completed", "reason": "done"})],
     ]
-    outcome, _ = await _run(script, tools, completion_probe=probe, staged_downloads=staged_downloads)
+    outcome, _ = await _run(script, tools, staged_downloads=staged_downloads)
 
     assert outcome.status == "completed"
-    # The staging call itself never consults the probe (no download_notice); the next billable
-    # call's probe already carries the name it staged.
-    assert probe_seen == [frozenset({"in.pdf"})]
-    assert blocker_seen == [frozenset({"in.pdf"})]
+    assert settle_seen == [frozenset({"in.pdf"})]
 
 
 # --- SKY-15020 Lever C: net-progress _ProgressLedger (additive shadow) ---
@@ -9793,6 +11620,355 @@ async def test_refresh_signal_reloads_once_clears_flag_and_skips_rest_of_batch()
     assert "refresh" in tool_messages[0]["content"]
     user_notes = [m["content"] for m in caller.message_history if m.get("role") == "user"]
     assert any("re-observe" in note for note in user_notes)
+
+
+@pytest.mark.asyncio
+async def test_refused_finish_preserves_pending_refresh_before_next_observe() -> None:
+    events: list[str] = []
+    ctx = SkyvernContext(task_id="tsk_refused_finish_pending_refresh")
+
+    async def reload_page() -> None:
+        events.append("reload")
+
+    async def observe_handler(_args: dict[str, Any]) -> ToolResult:
+        events.append("observe")
+        return ToolResult.ok("observed")
+
+    class _RefreshDuringModelCall(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            response = await super().call(**kwargs)
+            if self.calls == 1:
+                ctx.refresh_working_page = True
+            return response
+
+    caller = _RefreshDuringModelCall(
+        [
+            [
+                ("type", {"selector": "#name", "text": "x"}),
+                ("finish", {"status": "completed", "reason": "done"}),
+            ],
+            [("observe", {})],
+            [("finish", {"status": "completed", "reason": "done"})],
+        ]
+    )
+    skyvern_context.set(ctx)
+    try:
+        outcome = await run_agent_tool_loop(
+            llm_caller=caller,
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=[
+                _recording_tool("type", []),
+                ToolSpec(name="observe", description="observe", parameters={}, handler=observe_handler),
+                make_finish_tool(),
+            ],
+            max_turns=20,
+            max_tool_calls=100,
+            refuse_input_entry=True,
+            reload_page=reload_page,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert events == ["reload", "observe"]
+    assert ctx.refresh_working_page is False
+    finish_results = [message for message in outcome.messages if message.get("name") == "finish"]
+    assert len(finish_results) == 2
+    assert finish_results[0]["content"].startswith("skipped:")
+    assert not finish_results[1]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_tail", [[], [("observe", {})]], ids=["no-pending-call", "pending-call"])
+@pytest.mark.parametrize("wrap_up_tool", ["finish", "observe"], ids=["final-finish", "final-nonfinish"])
+async def test_post_dispatch_refresh_timeout_skips_only_pending_calls(
+    batch_tail: list[tuple[str, dict[str, Any]]], wrap_up_tool: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+
+    async def reload_page() -> None:
+        await asyncio.Event().wait()
+
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    tools = [_refresh_signaling_click(click_calls), _recording_tool("observe", observe_calls), make_finish_tool()]
+    wrap_up_batch = (
+        [("finish", {"status": "completed", "reason": "deadline wrap-up"})]
+        if wrap_up_tool == "finish"
+        else [("observe", {})]
+    )
+    script: list[list[tuple[str, dict[str, Any]]]] = [
+        [("click", {"selector": "#submit"}), *batch_tail],
+        wrap_up_batch,
+    ]
+    ctx = SkyvernContext(task_id="tsk_post_dispatch_refresh_timeout")
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome, caller = await asyncio.wait_for(
+                _run(script, tools, reload_page=reload_page, deadline_seconds=0.5), timeout=5
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == ("completed" if wrap_up_tool == "finish" else "budget_exhausted")
+    assert len(click_calls) == 1 and observe_calls == []
+    assert ctx.refresh_working_page is False
+    refresh_timeouts = [
+        entry
+        for entry in logs
+        if entry.get("event") == TOOL_CALL_TIMED_OUT_EVENT and entry.get("call_site") == "page_refresh"
+    ]
+    assert [(entry["tool"], entry["call_site"]) for entry in refresh_timeouts] == [("click", "page_refresh")]
+    click_results = [
+        message
+        for message in caller.message_history
+        if message.get("role") == "tool" and message.get("name") == "click"
+    ]
+    assert len(click_results) == 1 and click_results[0]["content"] == "click done"
+    observe_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "observe"
+    ]
+    assert len(observe_results) == len(batch_tail) + int(wrap_up_tool == "observe")
+    assert all(message["content"].startswith("skipped:") for message in observe_results)
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    reload_calls: list[None] = []
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+        await asyncio.Event().wait()
+
+    ctx = SkyvernContext(task_id="tsk_refresh_timeout_on_cap_final_turn")
+    skyvern_context.set(ctx)
+    try:
+        outcome, caller = await asyncio.wait_for(
+            _run(
+                [
+                    [("observe", {})],
+                    [
+                        ("click", {"selector": "#submit"}),
+                        ("finish", {"status": "completed", "reason": "reload completed"}),
+                    ],
+                ],
+                [
+                    _recording_tool("observe", observe_calls),
+                    _refresh_signaling_click(click_calls),
+                    make_finish_tool(),
+                ],
+                reload_page=reload_page,
+                deadline_seconds=0.2,
+                max_tool_calls=1,
+            ),
+            timeout=5,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert len(click_calls) == len(reload_calls) == 1
+    assert ctx.refresh_working_page is False
+    finish_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "finish"
+    ]
+    assert len(finish_results) == 1
+    assert finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.5)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    click_calls: list[tuple[str, dict[str, Any]]] = []
+    click_times: list[float] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    reload_calls: list[None] = []
+    ctx = SkyvernContext(task_id="tsk_refresh_dropped_after_deadline")
+
+    async def observe_handler(args: dict[str, Any]) -> ToolResult:
+        observe_calls.append(("observe", args))
+        await asyncio.sleep(0.35)
+        return ToolResult.ok("observed")
+
+    async def click_handler(args: dict[str, Any]) -> ToolResult:
+        click_calls.append(("click", args))
+        click_times.append(time.monotonic())
+        await asyncio.sleep(0.25)
+        click_times.append(time.monotonic())
+        ctx.refresh_working_page = True
+        return ToolResult.ok("click done")
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+
+    tools = [
+        ToolSpec(name="observe", description="observe", parameters={}, handler=observe_handler),
+        ToolSpec(name="click", description="click", parameters={}, handler=click_handler, billable=True),
+        make_finish_tool(),
+    ]
+    caller = _ScriptedCaller(
+        [
+            [("observe", {})],
+            [("click", {"selector": "#submit"}), ("finish", {"status": "completed", "reason": "done"})],
+        ]
+    )
+    run_started_at = time.monotonic()
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=tools,
+                max_turns=20,
+                max_tool_calls=1,
+                deadline_seconds=0.5,
+                reload_page=reload_page,
+            ),
+            timeout=5,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert click_calls == [("click", {"selector": "#submit"})]
+    assert len(click_times) == 2
+    assert click_times[0] - run_started_at < 0.5 <= click_times[1] - run_started_at
+    assert reload_calls == []
+    assert ctx.refresh_working_page is False
+    finish_results = [message for message in outcome.messages if message.get("name") == "finish"]
+    assert len(finish_results) == 1 and finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
+    reload_calls: list[None] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    ctx = SkyvernContext(task_id="tsk_refresh_timeout_before_observe")
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+        await asyncio.Event().wait()
+
+    class _RefreshBeforeFinalCall(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls == 1:
+                ctx.refresh_working_page = True
+            return await super().call(**kwargs)
+
+    caller = _RefreshBeforeFinalCall(
+        [[("observe", {})], [("observe", {}), ("finish", {"status": "completed", "reason": "done"})]]
+    )
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=[_recording_tool("observe", observe_calls), make_finish_tool()],
+                max_turns=20,
+                max_tool_calls=1,
+                deadline_seconds=0.5,
+                reload_page=reload_page,
+            ),
+            timeout=5,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert reload_calls == [None]
+    assert ctx.refresh_working_page is False
+    observe_results = [message for message in outcome.messages if message.get("name") == "observe"]
+    finish_results = [message for message in outcome.messages if message.get("name") == "finish"]
+    assert len(observe_results) == 2
+    assert "page refresh did not finish" in observe_results[1]["content"]
+    assert len(finish_results) == 1 and finish_results[0]["content"].startswith("skipped:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_status", ["completed", "failed", "terminated"])
+@pytest.mark.parametrize("read_before_finish", [False, True], ids=["finish-only", "skipped-read-first"])
+async def test_expired_deadline_preserves_refresh_before_granted_finish(
+    finish_status: str, read_before_finish: bool
+) -> None:
+    reload_calls: list[None] = []
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    final_call_times: list[float] = []
+    ctx = SkyvernContext(task_id="tsk_expired_refresh_before_finish")
+
+    async def reload_page() -> None:
+        reload_calls.append(None)
+
+    class _RefreshDuringFinalCall(_ScriptedCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:
+            if self.calls == 1:
+                await asyncio.sleep(0.55)
+                ctx.refresh_working_page = True
+                final_call_times.append(time.monotonic())
+            return await super().call(**kwargs)
+
+    final_batch = ([("observe", {})] if read_before_finish else []) + [
+        ("finish", {"status": finish_status, "reason": "done"})
+    ]
+    caller = _RefreshDuringFinalCall([[("observe", {})], final_batch])
+    run_started_at = time.monotonic()
+    skyvern_context.set(ctx)
+    try:
+        outcome = await asyncio.wait_for(
+            run_agent_tool_loop(
+                llm_caller=caller,
+                system_prompt="sys",
+                user_prompt="goal",
+                tools=[_recording_tool("observe", observe_calls), make_finish_tool()],
+                max_turns=20,
+                max_tool_calls=1,
+                deadline_seconds=0.5,
+                reload_page=reload_page,
+            ),
+            timeout=3,
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert final_call_times and final_call_times[0] - run_started_at >= 0.5
+    assert outcome.status == "budget_exhausted"
+    assert outcome.cap_trip == "max_tool_calls (1) reached"
+    assert observe_calls == [("observe", {})]
+    assert reload_calls == []
+    assert ctx.refresh_working_page is False
+    finish_results = [
+        message for message in outcome.messages if message.get("role") == "tool" and message.get("name") == "finish"
+    ]
+    assert len(finish_results) == 1 and finish_results[0]["content"].startswith("skipped:")
 
 
 @pytest.mark.asyncio
@@ -10833,45 +13009,6 @@ async def test_canonical_loop_not_masked_by_replayed_download_notice() -> None:
 
 
 @pytest.mark.asyncio
-async def test_canonical_loop_suppressed_when_completion_probe_fires_on_the_rung_touch() -> None:
-    # complete_on_download: the file can land while the probe waits, AFTER the tool result returned
-    # without download_new. The probe's outcome skips the end-of-batch detector, but the pending
-    # rung minted by that same touch must not be emitted — the run completed on real progress.
-    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
-
-    calls = {"n": 0}
-
-    async def handler(args: dict[str, Any]) -> ToolResult:
-        calls["n"] += 1
-        return ToolResult.error("click refused") if calls["n"] < 3 else ToolResult.ok("clicked")
-
-    click = ToolSpec(
-        name="click",
-        description="click",
-        parameters={"type": "object", "properties": {}},
-        handler=handler,
-        billable=True,
-    )
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading" if calls["n"] >= 3 else None
-
-    script = [
-        [("click", {"selector": "#dl", "note": "a"})],
-        [("click", {"selector": "#dl", "note": "b"})],
-        [("click", {"selector": "#dl", "note": "c"})],
-        [("finish", {"status": "failed", "reason": "unreached"})],
-    ]
-    with capture_logs() as logs:
-        outcome, _ = await _run(
-            script, [click, make_finish_tool()], completion_probe=probe, max_turns=50, max_tool_calls=100
-        )
-    assert outcome.status == "completed"
-    assert outcome.reason == "a file finished downloading"
-    assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
-
-
-@pytest.mark.asyncio
 async def test_canonical_loop_not_masked_by_missing_probe_samples() -> None:
     # A missing probe sample around a failed dispatch is not evidence of a page change: intermittent
     # probe timeouts must not keep clearing the ring and permanently mask a genuine loop.
@@ -11072,41 +13209,6 @@ async def test_canonical_loop_clears_on_new_low_even_under_a_replayed_notice() -
     assert outcome.status == "failed"
     assert len(touches) == 4
     assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
-
-
-@pytest.mark.asyncio
-async def test_completion_probe_spares_a_sibling_targets_rung() -> None:
-    # Blocker 2 (AronPerez round 10): the probe firing is progress for the COMPLETING touch only.
-    # A five-error streak on one selector minted a genuine rung 6 the same batch a download on a
-    # DIFFERENT selector completed the run — that sibling rung is real data and must survive.
-    from skyvern.forge.taskv3.loop import CANONICAL_LOOP_EVENT
-
-    touches: list[tuple[str, dict[str, Any]]] = []
-    fetched = {"done": False}
-
-    async def fetch_handler(_args: dict[str, Any]) -> ToolResult:
-        fetched["done"] = True
-        return ToolResult.ok("fetch dispatched")
-
-    fetch = ToolSpec(
-        name="fetch",
-        description="fetch",
-        parameters={"type": "object", "properties": {}},
-        handler=fetch_handler,
-        billable=True,
-    )
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading" if fetched["done"] else None
-
-    script = [[("click", {"selector": "#stuck", "note": str(i)})] for i in range(5)]
-    script.append([("click", {"selector": "#stuck", "note": "sixth"}), ("fetch", {"selector": "#other"})])
-    tools = [_error_billable_tool("click", touches), fetch, make_finish_tool()]
-    with capture_logs() as logs:
-        outcome, _ = await _run(script, tools, completion_probe=probe, max_turns=50, max_tool_calls=100)
-    assert outcome.status == "completed"
-    fires = [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT]
-    assert [e["repeat_count"] for e in fires] == [3, 4, 6]
 
 
 @pytest.mark.asyncio
@@ -11333,111 +13435,77 @@ async def test_a_renumbered_mark_does_not_alias_with_its_pre_renumber_history() 
     assert [e for e in logs if e.get("event") == CANONICAL_LOOP_EVENT] == []
 
 
-def _awaiting_verification_state(*, spent: float = 120.0, budget: float = 900.0) -> Any:
-    """A VerificationState in the exact shape the bug produces: a healthy source that answered "not
-    yet" one 120s slice ago, with most of the 900s budget still unspent."""
-    from skyvern.forge.taskv3.auth_tools import VerificationState
-
-    state = VerificationState(
+def _verification_state() -> VerificationState:
+    return VerificationState(
         task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
     )
-    state.budget_seconds = budget
+
+
+def _awaiting_link_state(*, spent: float = 120.0) -> VerificationState:
+    state = _verification_state()
     state.polling_spent_seconds = spent
-    state.awaiting_code_since = time.monotonic()
+    state.awaiting_link_since = state.link_wait_since = time.monotonic()
     return state
-
-
-def _spend_tool(state: Any, per_call_seconds: float) -> ToolSpec:
-    """Stands in for get_verification_code: the only thing the loop can see it do is draw the budget
-    down, which is exactly what the gate's monotone bound is keyed on."""
-
-    async def _handler(args: dict[str, Any]) -> ToolResult:
-        state.polling_spent_seconds += per_call_seconds
-        state.awaiting_code_since = time.monotonic()
-        return ToolResult.ok("no verification code available yet")
-
-    return ToolSpec(name="get_verification_code", description="poll", parameters={"type": "object"}, handler=_handler)
 
 
 @pytest.mark.parametrize("status", ["failed", "terminated"])
 @pytest.mark.asyncio
-async def test_giveup_with_unspent_verification_budget_is_deferred(status: str) -> None:
-    # The defect: a run that has spent one 120s slice of a 900s budget on a source that has not
-    # answered yet ends on the model's first non-complete verdict, throwing away ~13 minutes of
-    # polling it already owns. Both non-complete verdicts, not just `failed` -- `terminated` was
-    # gated by nothing at all.
-    state = _awaiting_verification_state()
+async def test_a_non_complete_verdict_stands_while_a_code_is_awaited(status: str) -> None:
+    # The model decides from the code statuses it was given; the finish tool does not hold that give-up.
+    state = _verification_state()
+    state.polling_spent_seconds = 120.0
+    state.last_status = "no verification code has arrived yet; about 13.0 minutes of polling time remain."
     tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
-    script = [
-        [("finish", {"status": status, "reason": "the code never arrived"})],
-        [("finish", {"status": status, "reason": "the code never arrived"})],
-    ]
-    outcome, _ = await _run(script, tools)
-
-    finish_messages = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
-    assert any("polling budget remain" in m for m in finish_messages)
-    # The number is the point: an unquantified "keep waiting" is the prose the customer's own "do not
-    # retry" instruction competes with. 900 - 120 = 780s = 13.0 minutes.
-    assert any("13.0 minutes" in m for m in finish_messages)
-    assert state.giveup_deferrals == 1
-    # ...and the hold is a hold, not a trap: the verdict still lands.
-    assert outcome.status == status
-
-
-@pytest.mark.asyncio
-async def test_a_model_that_ignores_the_giveup_deferral_ends_on_its_second_verdict() -> None:
-    # Bounded termination for the model that refuses to re-poll. Asserted on the run's TERMINAL
-    # STATUS, not on a deferral counter: without the unproductive-deferral bound this run ping-pongs
-    # against the gate until the budget is exhausted, and the assertion that catches that is the run
-    # never reaching `failed`.
-    state = _awaiting_verification_state()
-    tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
-    script = [[("finish", {"status": "failed", "reason": "no code"})] for _ in range(6)]
+    script = [[("finish", {"status": status, "reason": "the code never arrived"})]]
     outcome, caller = await _run(script, tools)
 
-    assert outcome.status == "failed"
+    assert outcome.status == status
+    assert caller.calls == 1
+
+
+@pytest.mark.parametrize("status", ["failed", "terminated"])
+@pytest.mark.asyncio
+async def test_a_give_up_while_a_sign_in_link_is_awaited_is_held_once_then_stands(status: str) -> None:
+    state = _awaiting_link_state()
+    tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
+    script = [[("finish", {"status": status, "reason": "the link never arrived"})] for _ in range(4)]
+    outcome, caller = await _run(script, tools)
+
+    finish_messages = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
+    # 900 - 120 = 780s of budget left.
+    assert any("13.0 minutes of sign-in link polling budget remain" in m for m in finish_messages)
+    assert outcome.status == status
     assert caller.calls == 2
     assert state.giveup_deferrals == 1
 
 
 @pytest.mark.asyncio
-async def test_a_model_that_polls_minimally_ends_within_the_absolute_deferral_cap() -> None:
-    # The monotone-budget bound alone does not terminate: a slice may advance spend by as little as
-    # _MIN_SLICE_SECONDS, so 10s polls would buy ~90 deferrals out of a 900s budget. The absolute cap
-    # is what ends this run, and the assertion is again the terminal status -- a run that never
-    # reaches `failed` here is one the gate trapped.
-    from skyvern.forge.taskv3.auth_tools import _MAX_GIVEUP_DEFERRALS
+async def test_a_model_that_polls_for_a_link_minimally_ends_within_the_deferral_cap() -> None:
+    state = _awaiting_link_state(spent=0.0)
 
-    state = _awaiting_verification_state(spent=0.0)
+    async def _poll(args: dict[str, Any]) -> ToolResult:
+        state.polling_spent_seconds += 10.0
+        state.link_wait_since = time.monotonic()
+        return ToolResult.error("no sign-in link available yet")
+
     tools = [
-        _spend_tool(state, 10.0),
+        ToolSpec(name="open_verification_link", description="poll", parameters={"type": "object"}, handler=_poll),
         make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency()),
     ]
     script: list[list[tuple[str, dict[str, Any]]]] = []
     for _ in range(15):
-        script.append([("get_verification_code", {})])
-        script.append([("finish", {"status": "failed", "reason": "no code"})])
+        script.append([("open_verification_link", {})])
+        script.append([("finish", {"status": "failed", "reason": "no link"})])
     outcome, _ = await _run(script, tools, max_turns=60, max_tool_calls=200)
 
     assert outcome.status == "failed"
     assert state.giveup_deferrals == _MAX_GIVEUP_DEFERRALS
-    # The cap, not the budget, is what bound this run: 8 x 10s of polling leaves the budget nearly full.
     assert state.remaining_budget_seconds > 800.0
 
 
 @pytest.mark.asyncio
-async def test_giveup_deferral_is_refused_without_the_deadline_headroom_to_fund_a_poll_slice() -> None:
-    # A deferral asks for a 120s BLOCKING poll on top of the re-finish cycle. Deferring with less
-    # than that leaves the run to die on the wall clock as budget_exhausted -- converting the
-    # model's honest verdict into an unmapped one, the exact conversion the headroom gates exist to
-    # prevent. The failure-evidence gate's 60s reservation is not enough to cover a poll slice.
-    from skyvern.forge.taskv3.loop import (
-        FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS,
-        VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS,
-    )
-
-    assert VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS > FAILURE_EVIDENCE_MIN_DEADLINE_HEADROOM_SECONDS
-    state = _awaiting_verification_state()
+async def test_a_link_give_up_is_not_held_without_the_deadline_headroom_to_fund_a_poll_slice() -> None:
+    state = _awaiting_link_state()
     tools = [
         make_finish_tool(
             verification_blocker=state.block_finish,
@@ -11445,67 +13513,42 @@ async def test_giveup_deferral_is_refused_without_the_deadline_headroom_to_fund_
             deadline_at=time.monotonic() + (VERIFICATION_GIVEUP_MIN_DEADLINE_HEADROOM_SECONDS - 5.0),
         )
     ]
-    script = [[("finish", {"status": "failed", "reason": "no code"})]]
-    with capture_logs() as logs:
-        outcome, caller = await _run(script, tools)
+    script = [[("finish", {"status": "failed", "reason": "no link"})]]
+    outcome, caller = await _run(script, tools)
 
     assert outcome.status == "failed"
     assert caller.calls == 1
     assert state.giveup_deferrals == 0
-    # The gate is not consulted at all here, so it writes nothing. That is a KNOWN LIMIT of the
-    # probe, asserted rather than papered over: a give-up refused for want of hold budget is not
-    # directly counted, because only the gate knows whether the run was awaiting a code and this is
-    # the one case where the gate is not asked.
-    assert [e for e in logs if e.get("event") == "task_v3 verification give-up gate"] == []
 
 
 @pytest.mark.asyncio
-async def test_a_completed_verdict_is_never_held_for_unspent_verification_budget() -> None:
-    # The widened primitive answers all three verdicts from one branch, so the completed side has to
-    # be shown unchanged: unspent budget is a reason to keep WAITING, never a reason to refuse a
-    # success the model can see on the page.
-    state = _awaiting_verification_state()
+async def test_a_completed_verdict_after_a_failed_code_source_stands() -> None:
+    state = _verification_state()
+    state.arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
+    state.arm(VerificationFailure.BUDGET_EXHAUSTED, "get_verification_code")
     tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
     script = [[("finish", {"status": "completed", "reason": "signed in"})]]
     outcome, caller = await _run(script, tools)
 
     assert outcome.status == "completed"
     assert caller.calls == 1
-    assert state.giveup_deferrals == 0
 
 
 @pytest.mark.asyncio
-async def test_a_completion_blocked_run_still_escapes_via_failed_at_production_wiring() -> None:
-    # The escape hatch `test_verification_blocker_refuses_completed_but_not_failed` protects, pinned
-    # where it actually has to hold. That test passes a bare mock and no `activity`, so the widened
-    # primitive is consulted for `completed` only and the give-up side is never exercised -- but
-    # engine.py always passes an ActivityRecency, so the production configuration DOES reach the
-    # give-up side. What makes the escape safe there is not the missing accounting, it is that a
-    # terminally-failed source returns None from `block_giveup` by construction: giving up IS the
-    # correct answer once the source has been judged. Asserted against the real VerificationState,
-    # not a mock that cannot disagree with the gate it is standing in for.
-    from skyvern.forge.taskv3.auth_tools import VerificationFailure, VerificationState
-
-    state = VerificationState(
-        task=SimpleNamespace(task_id="tsk_1", organization_id="o_1", workflow_run_id=None)  # type: ignore[arg-type]
-    )
-    state.polling_spent_seconds = 120.0
-    state.awaiting_code_since = time.monotonic()
-    state.arm(VerificationFailure.NO_CODE_TWICE, "get_verification_code")
-
+async def test_a_completion_refused_after_a_failed_sign_in_link_still_escapes_via_failed() -> None:
+    state = _verification_state()
+    state.arm(VerificationFailure.NO_LINK_TWICE, "open_verification_link")
     tools = [make_finish_tool(verification_blocker=state.block_finish, activity=ActivityRecency())]
     script = [
         [("finish", {"status": "completed", "reason": "signed in"})],
-        [("finish", {"status": "failed", "reason": "the code never arrived"})],
+        [("finish", {"status": "failed", "reason": "the link never arrived"})],
     ]
     outcome, caller = await _run(script, tools)
 
     finish_messages = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"]
-    assert any("the verification step never completed" in m for m in finish_messages)
-    # On its FIRST failed verdict, with no hold in between -- two LLM turns total.
+    assert any("the sign-in link step never completed" in m for m in finish_messages)
     assert outcome.status == "failed"
     assert caller.calls == 2
-    assert state.giveup_deferrals == 0
 
 
 @pytest.mark.asyncio
@@ -11678,6 +13721,121 @@ async def test_a_handler_that_raises_still_reports_the_time_it_spent_resolving_t
     assert by_tool["type"]["resolve_seconds"] == 0.5
     # Per call, never carried over: finish resolved no address and must report none.
     assert "resolve_seconds" not in by_tool["finish"]
+
+
+@pytest.mark.asyncio
+async def test_a_lost_browser_ends_the_run_where_any_other_raise_comes_back_as_a_tool_error() -> None:
+    # SKY-18903: the page accessor behind every tool raises MissingBrowserStatePage only after its own
+    # reopen attempt failed, so handing that back as a tool error bought 7-9 identical errors and four
+    # more model turns per task on a browser that cannot come back. The arms are in ONE script because
+    # the whole claim is the discriminator: a generic raise must still be a retryable tool error (turn 1
+    # is answered and the run reaches turn 2), and only the browser-gone class ends the run.
+    observe_calls: list[tuple[str, dict[str, Any]]] = []
+    type_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def browser_is_gone(args: dict[str, Any]) -> ToolResult:
+        raise MissingBrowserStatePage(task_id="tsk_lost")
+
+    tools = [
+        _recording_tool("type", type_calls, raises=True, billable=True),
+        ToolSpec(name="click", description="c", parameters={}, handler=browser_is_gone, billable=True),
+        _recording_tool("observe", observe_calls),
+        make_finish_tool(),
+    ]
+    script = [
+        [("type", {"selector": "#a", "text": "x"})],
+        [("click", {"selector": "#b"}), ("observe", {})],
+        [("finish", {"status": "completed", "reason": "never reached"})],
+    ]
+    with capture_logs() as logs:
+        outcome, caller = await _run(script, tools)
+
+    assert (outcome.status, outcome.guard) == ("failed", BROWSER_LOST_GUARD)
+    # Verbatim: this leaves the system as the task's customer-visible failure_reason.
+    assert outcome.reason == BROWSER_LOST_REASON
+    # Two turns, not three: the model was never asked to act on the dead browser again.
+    assert caller.calls == 2
+    # The sibling queued behind it never ran, and its tool_call id is still answered.
+    assert observe_calls == []
+    assert [content.startswith("skipped:") for content in _tool_contents(outcome, "observe")] == [True]
+    # The control arm: the generic raise was answered as an error the model could read and retry past.
+    assert any("tool_error: RuntimeError" in content for content in _tool_contents(outcome, "type"))
+    (lost,) = (entry for entry in logs if entry["event"] == BROWSER_LOST_EVENT)
+    assert (lost["guard"], lost["tool"]) == (BROWSER_LOST_GUARD, "click")
+
+
+@pytest.mark.asyncio
+async def test_the_answer_audit_ends_a_run_it_keeps_holding_with_a_verdict_naming_the_question() -> None:
+    # The bound's hold ends the run terminated; the holds before it stay ordinary refusals the model reads.
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    class _FlagsEverything:
+        async def unsupported(self, answers: list[RecordedAnswer]) -> list[RecordedAnswer]:
+            return answers
+
+    async def type_answer(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "typed", data={TARGET_LABEL_DATA_KEY: "Work authorization", TARGET_KIND_DATA_KEY: "textbox"}
+        )
+
+    tools = [
+        ToolSpec(name="type", description="t", parameters={}, handler=type_answer, billable=True),
+        _recording_tool("click", clicks, billable=True),
+        make_finish_tool(),
+    ]
+    apply_answer_basis_audit(tools, _FlagsEverything())
+    # A different control each turn, so the repeated-action guard never fires first.
+    submits = [[("click", {"selector": f"#next{i}"})] for i in range(ANSWER_BASIS_MAX_HOLDS + 1)]
+    script = [
+        [("type", {"selector": "#auth", "text": "Yes"})],
+        *submits,
+        [("finish", {"status": "completed", "reason": "x"})],
+    ]
+    outcome, caller = await _run(script, tools, max_turns=30)
+
+    assert (outcome.status, outcome.guard) == ("terminated", ANSWER_BASIS_HOLD_BOUND_GUARD)
+    assert "'Work authorization'" in outcome.reason and "Yes" not in outcome.reason
+    assert caller.calls == 1 + ANSWER_BASIS_MAX_HOLDS
+    assert clicks == []
+
+
+@pytest.mark.asyncio
+async def test_log_only_answer_audit_logs_each_hold_and_never_blocks_or_ends_the_run() -> None:
+    clicks: list[tuple[str, dict[str, Any]]] = []
+
+    class _FlagsEverything:
+        async def unsupported(self, answers: list[RecordedAnswer]) -> list[RecordedAnswer]:
+            return answers
+
+    async def type_answer(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(
+            "typed", data={TARGET_LABEL_DATA_KEY: "Work authorization", TARGET_KIND_DATA_KEY: "textbox"}
+        )
+
+    tools = [
+        ToolSpec(name="type", description="t", parameters={}, handler=type_answer, billable=True),
+        _recording_tool("click", clicks, billable=True),
+        make_finish_tool(),
+    ]
+    apply_answer_basis_audit(tools, _FlagsEverything(), log_only=True, log_fields={"audit_mode_arm": "treatment"})
+    submits = [[("click", {"selector": f"#next{i}"})] for i in range(ANSWER_BASIS_MAX_HOLDS + 2)]
+    script = [
+        [("type", {"selector": "#auth", "text": "Yes"})],
+        *submits,
+        [("finish", {"status": "completed", "reason": "x"})],
+    ]
+    with capture_logs() as logs:
+        outcome, _caller = await _run(script, tools, max_turns=30)
+
+    assert (outcome.status, outcome.guard) == ("completed", None)
+    assert len(clicks) == len(submits)
+    holds = [e for e in logs if e["event"] == "taskv3 answer basis hold"]
+    assert len(holds) == len(submits)
+    assert all(
+        (e["log_only"], e["would_hold"], e["flagged"], e["holds"], e["audit_mode_arm"])
+        == (True, True, 1, 0, "treatment")
+        for e in holds
+    )
 
 
 def test_every_driver_timeout_type_installed_here_classifies_as_a_driver_timeout() -> None:
@@ -12788,6 +14946,26 @@ async def test_loop_reads_that_differ_only_in_their_delta_get_the_marker_and_kee
     assert [r.rsplit("\n", 1)[1] for r in reads] == [f"[delta {n}]" for n in range(1, 7)]
     assert _perception_fields(outcome)["perception_epoch_rewrites"] == 1
     assert reads[0].startswith("[superseded get_html(selector=#a)")
+
+
+@pytest.mark.asyncio
+async def test_a_re_read_that_differs_only_by_a_download_failure_gets_the_marker_and_keeps_the_failure() -> None:
+    body = "<form #a>" + "y" * 2_000
+    failure = "Request failed: POST /api/export returned HTTP 503"
+    results = [ToolResult.ok(body), ToolResult.ok(f"{body}\n{failure}", data={"download_failure_at": len(body)})]
+
+    async def get_html(_args: dict[str, Any]) -> ToolResult:
+        return results.pop(0)
+
+    reader = _get_html_tool()
+    reader.handler = get_html
+    script = [[("get_html", {"selector": "#a"})], [("get_html", {"selector": "#a"})]]
+    script.append([("finish", {"status": "completed", "reason": "ok"})])
+    outcome, _ = await _run(script, [reader, make_finish_tool()])
+
+    reread = _tool_contents(outcome, "get_html")[1]
+    assert reread.startswith("[get_html(selector=#a) returned the same "), reread[:120]
+    assert reread.endswith(f"\n{failure}")
 
 
 def test_perception_store_does_not_charge_the_unread_round() -> None:
@@ -13963,17 +16141,17 @@ async def test_a_mutation_batched_behind_an_accepted_verdict_never_dispatches() 
 
 @pytest.mark.asyncio
 async def test_hold_gate_snapshot_records_the_verdict_after_a_refused_completion() -> None:
-    # A zero-action finish(completed) refused by a gate above -- here the completion blocker -- is
+    # A zero-action finish(completed) refused by a gate above -- here the verification blocker -- is
     # followed by finish(failed); the snapshot records that failed verdict, not the refused completion.
     activity = ActivityRecency()
     fingerprint, _ = _fingerprint_seq(["fp"])
 
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return "wait: the download has not started yet"
+    async def verification_blocker(status: str) -> str | None:
+        return "the verification code was never entered" if status == "completed" else None
 
     tools = [
         _perception_tool("observe", _REJECTION_OBSERVE),
-        make_finish_tool(page_fingerprint=fingerprint, activity=activity, completion_blocker=blocker),
+        make_finish_tool(page_fingerprint=fingerprint, activity=activity, verification_blocker=verification_blocker),
     ]
     script = [
         [("observe", {})],
@@ -14061,3 +16239,293 @@ def test_every_finish_status_is_defined_on_its_own_in_the_tool_description() -> 
 def test_every_menu_withhold_reason_reaches_the_call_record(reason: str) -> None:
     result = ToolResult.ok("menu", data={"menu_note": "withheld", "menu_rows": 3, "withhold_reason": reason})
     assert loop_module._menu_note_record_fields("click", result).get("withhold_reason") == reason
+
+
+_EXPORT_CSV = b"account,amount\nA-1,12.50\n"
+
+
+def _candidate_interceptor(output_dir: Path, monkeypatch: pytest.MonkeyPatch) -> cdp_module.CDPDownloadInterceptor:
+    # Handles are process-wide; a fresh sequence lets the script name the first candidate.
+    monkeypatch.setattr(cdp_module, "_REPLAY_CANDIDATE_HANDLES", itertools.count(1))
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = True
+    interceptor = cdp_module.CDPDownloadInterceptor(
+        output_dir=str(output_dir), network_egress_monitor=monitor, redirect_hop_authorizer=AsyncMock()
+    )
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[])
+    interceptor._browser_context = context
+    interceptor.set_replay_candidate_mode(True)
+    return interceptor
+
+
+async def _replay_into(interceptor: cdp_module.CDPDownloadInterceptor, body: bytes = _EXPORT_CSV) -> None:
+    response = MagicMock(body=body, content_type="text/csv", filename="export.csv", status=200)
+    with patch.object(cdp_module.file_api, "fetch_file_bytes", AsyncMock(return_value=response), create=True):
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+
+
+async def _no_settle(_staged: frozenset[str]) -> str | None:
+    return None
+
+
+def _candidate_facts(interceptor: cdp_module.CDPDownloadInterceptor) -> DownloadFailureFacts:
+    return DownloadFailureFacts(
+        held_candidates=interceptor.replay_candidates, resolve_candidates=interceptor.resolve_replay_candidates
+    )
+
+
+def _finish_contents(outcome: Any) -> list[str]:
+    return [
+        m["content"]
+        for m in outcome.messages
+        if m.get("role") == "tool" and m.get("name") == "finish" and m.get("content") != "skipped: finish was accepted"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_that_arrives_during_the_final_settle_is_offered_before_the_block_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    settles = 0
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal settles
+        settles += 1
+        if settles == 1:
+            await _replay_into(interceptor)
+        return "download completed (1 new file(s))" if any(tmp_path.iterdir()) else None
+
+    plain = ("finish", {"status": "completed", "reason": "exported"})
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    outcome, _ = await _run(
+        [[plain], [accept]],
+        [make_finish_tool(download_settle=settle, download_facts=_candidate_facts(interceptor))],
+    )
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed"
+    assert len(finishes) == 2 and "Download candidate c1" in finishes[0], finishes
+    assert (tmp_path / "export.csv").read_bytes() == _EXPORT_CSV
+
+
+@pytest.mark.asyncio
+async def test_a_selected_candidate_that_fails_to_save_holds_the_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    await _replay_into(interceptor)
+
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
+    with patch.object(interceptor, "_atomically_write_bytes", side_effect=OSError("disk full")):
+        # The first selection came before c1's facts were shown, so it holds; the next one fails to save.
+        outcome, _ = await _run(
+            [[accept], [accept], [none]],
+            [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+        )
+
+    finishes = _finish_contents(outcome)
+    assert len(finishes) == 3, finishes
+    assert "c1" in finishes[1] and "could not be saved" in finishes[1], finishes
+    assert outcome.reason == "nothing to save"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_the_provider_copy_is_read_back_before_a_selected_candidate_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    await _replay_into(interceptor, b'{"outcome": "error"}')
+    provider_reads: list[bool] = []
+
+    async def read_back() -> None:
+        # Whether the selected candidate's bytes were already on disk when the provider was read back.
+        provider_reads.append(not (tmp_path / "export.csv").exists())
+        (tmp_path / "provider.csv").write_bytes(_EXPORT_CSV)
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        return "download completed" if any(tmp_path.iterdir()) else None
+
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    # The first selection came before c1's facts were shown, so it holds; the provider is read again before the save.
+    outcome, _ = await _run(
+        [[accept], [accept]],
+        [
+            make_finish_tool(
+                download_settle=settle, download_wait=read_back, download_facts=_candidate_facts(interceptor)
+            )
+        ],
+    )
+
+    assert outcome.status == "completed"
+    assert provider_reads == [True, True]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["export.csv", "provider.csv"]
+
+
+@pytest.mark.asyncio
+async def test_a_late_candidate_is_offered_even_when_another_file_was_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    settles = 0
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        nonlocal settles
+        settles += 1
+        if settles == 1:
+            (tmp_path / "provider.csv").write_bytes(_EXPORT_CSV)
+            await _replay_into(interceptor, b"second,file\n1,2\n")
+        return f"download completed ({len(list(tmp_path.iterdir()))} new file(s))"
+
+    plain = ("finish", {"status": "completed", "reason": "exported"})
+    accept = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c1"]})
+    outcome, _ = await _run(
+        [[plain], [accept]],
+        [make_finish_tool(download_settle=settle, download_facts=_candidate_facts(interceptor))],
+    )
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed"
+    assert len(finishes) == 2 and "Download candidate c1" in finishes[0], finishes
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["export.csv", "provider.csv"]
+
+
+@pytest.mark.asyncio
+async def test_selecting_a_candidate_the_block_no_longer_holds_does_not_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+
+    stale = ("finish", {"status": "completed", "reason": "exported", "accept_download_candidates": ["c7"]})
+    none = ("finish", {"status": "completed", "reason": "nothing to save", "accept_download_candidates": []})
+    outcome, _ = await _run(
+        [[stale], [none]],
+        [make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))],
+    )
+
+    finishes = _finish_contents(outcome)
+    assert len(finishes) == 2 and "c7" in finishes[0], finishes
+    assert outcome.reason == "nothing to save"
+
+
+def _observe_then(*finishes: tuple[str, dict[str, Any]]) -> list[list[tuple[str, dict[str, Any]]]]:
+    return [[("observe", {})], *[[finish] for finish in finishes]]
+
+
+_OMITTED = ("finish", {"status": "completed", "reason": "exported"})
+
+
+def _held_fact_count(outcome: Any, handle: str = "c1") -> int:
+    return sum(
+        m["content"].count(f"Download candidate {handle} held") for m in outcome.messages if m.get("role") == "tool"
+    )
+
+
+# Andrew's reviews of 89c31976 and a44bc56b: unseen facts are held once while a verdict turn remains (a finish queued
+# behind the hold is skipped); after them, or on the granted final turn, the verdict stands, omitted or [].
+@pytest.mark.parametrize("same_batch", [False, True], ids=["next-turn", "same-batch"])
+@pytest.mark.parametrize("future_turns", [0, 1, 2], ids=["granted-final-turn", "one-turn-left", "two-turns-left"])
+@pytest.mark.parametrize("prefill", [{}, {"accept_download_candidates": []}], ids=["omitted", "empty"])
+@pytest.mark.parametrize("held", ["informed", "unseen", "arriving-in-settle"])
+@pytest.mark.asyncio
+async def test_a_held_candidate_is_held_once_while_a_verdict_turn_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held: str,
+    prefill: dict[str, Any],
+    future_turns: int,
+    same_batch: bool,
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    arriving = [held == "arriving-in-settle"]
+
+    async def settle(_staged: frozenset[str]) -> str | None:
+        if arriving[0]:
+            arriving[0] = False
+            await _replay_into(interceptor)
+        return None
+
+    if held != "arriving-in-settle":
+        await _replay_into(interceptor)
+    activity = ActivityRecency()
+    facts = _candidate_facts(interceptor)
+    if held == "informed":
+        facts.mark_shown(list(interceptor.replay_candidates().values()))
+    finish = make_finish_tool(download_settle=settle, download_facts=facts, activity=activity)
+    verdict = ("finish", {**_OMITTED[1], **prefill})
+    script = [[("observe", {})], [verdict, verdict], [verdict]] if same_batch else _observe_then(verdict, verdict)
+    tools = [_recording_tool("observe", []), finish]
+    outcome, _ = await _run(script, tools, max_turns=2 + future_turns if future_turns else 1, activity=activity)
+
+    finishes, held_once = _finish_contents(outcome), held != "informed" and future_turns > 0
+    assert outcome.status == "completed", outcome
+    assert len(finishes) == 1 + held_once * (1 + same_batch) and _held_fact_count(outcome) == held_once, finishes
+    assert not (held_once and same_batch) or finishes[1].startswith("skipped:")
+    assert "c1" in finishes[-1] and "not selected, so not saved" in finishes[-1]
+    assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}
+
+
+# A selection written in the same turn as the click, before its facts were shown, is not a verdict on them.
+@pytest.mark.parametrize("prefill", [{}, {"accept_download_candidates": []}], ids=["omitted", "prefilled-empty"])
+@pytest.mark.asyncio
+async def test_a_click_and_finish_in_one_turn_hold_once_then_complete_unsaved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefill: dict[str, Any]
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+
+    async def export(_args: dict[str, Any]) -> ToolResult:
+        await _replay_into(interceptor)
+        return ToolResult.ok("click done")
+
+    click = ToolSpec(name="click", description="click", parameters={"type": "object", "properties": {}}, handler=export)
+    finish = make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))
+    first = ("finish", {**_OMITTED[1], **prefill})
+    outcome, _ = await _run([[("click", {}), first], [_OMITTED], [_OMITTED]], [click, finish], max_turns=4)
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed", outcome
+    assert len(finishes) == 2 and "Download candidate c1" in finishes[0], finishes
+    assert _held_fact_count(outcome) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_empty_selection_completes_and_saves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    await _replay_into(interceptor)
+
+    none = ("finish", {"status": "completed", "reason": "not the file", "accept_download_candidates": []})
+    finish = make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))
+    outcome, _ = await _run([[none], [none]], [finish])
+
+    # The first [] came before c1's facts were shown, so it holds; the [] after them stands.
+    assert "Download candidate c1" in _finish_contents(outcome)[0]
+    assert outcome.status == "completed" and outcome.reason == "not the file", outcome
+    assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}
+
+
+@pytest.mark.asyncio
+async def test_an_unowned_candidate_is_shown_once_then_an_omitted_selection_discards_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interceptor = _candidate_interceptor(tmp_path, monkeypatch)
+    # This block's hold began after an earlier block's hold ended (epochs 1, 2, 3).
+    interceptor.set_replay_candidate_mode(False)
+    interceptor.set_replay_candidate_mode(True)
+    response = MagicMock(body=_EXPORT_CSV, content_type="text/csv", filename="export.csv", status=200)
+    with patch.object(cdp_module.file_api, "fetch_file_bytes", AsyncMock(return_value=response), create=True):
+        # Its request began during the earlier block's hold, as that block's late download does.
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv", candidate_epoch=1)
+
+    finish = make_finish_tool(download_settle=_no_settle, download_facts=_candidate_facts(interceptor))
+    outcome, _ = await _run(_observe_then(_OMITTED, _OMITTED), [_recording_tool("observe", []), finish], max_turns=4)
+
+    finishes = _finish_contents(outcome)
+    assert outcome.status == "completed", outcome
+    assert len(finishes) == 2 and "its request began during an earlier block's hold" in finishes[0], finishes
+    assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}

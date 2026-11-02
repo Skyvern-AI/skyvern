@@ -11,6 +11,7 @@ Two layers:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import TagEventType, TagSource
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_test"
 OTHER_ORG_ID = "o_other"
@@ -284,7 +286,7 @@ def _make_org(org_id: str = ORG_ID) -> Organization:
 
 
 @pytest.fixture(scope="module")
-def _route_app() -> tuple[FastAPI, MagicMock, dict[str, object]]:
+def _route_app() -> Iterator[tuple[FastAPI, MagicMock, dict[str, object]]]:
     """Mount the real GET /workflows route once per module with a mocked WORKFLOW_SERVICE.
 
     Captures the workflow_tags value the route passes to the service so the
@@ -294,8 +296,6 @@ def _route_app() -> tuple[FastAPI, MagicMock, dict[str, object]]:
     ``include_router`` is expensive, so the app is shared; ``route_client`` clears
     the captured dict and re-applies the ``app`` monkeypatch per test.
     """
-    from skyvern.forge.sdk.routes.routers import base_router
-
     captured: dict[str, object] = {}
 
     async def _get_workflows_by_organization_id(**kwargs: object) -> list:
@@ -311,11 +311,10 @@ def _route_app() -> tuple[FastAPI, MagicMock, dict[str, object]]:
     app_mock.STORAGE.retrieve_global_workflows = AsyncMock(return_value=[])
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
 
-    test_app = FastAPI()
-    test_app.include_router(base_router, prefix="/v1")
-    test_app.dependency_overrides[org_auth_service.get_current_org] = lambda: _make_org(ORG_ID)
-
-    return test_app, app_mock, captured
+    with pytest.MonkeyPatch.context() as module_patches:
+        test_app = shared_route_app(module_patches)
+        test_app.dependency_overrides[org_auth_service.get_current_org] = lambda: _make_org(ORG_ID)
+        yield test_app, app_mock, captured
 
 
 @pytest.fixture

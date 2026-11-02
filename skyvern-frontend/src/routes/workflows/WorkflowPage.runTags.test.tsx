@@ -52,6 +52,10 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => false,
   useFeatureFlagVariantKey: () => undefined,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagEnabled: () => false,
+  usePostHogFeatureFlagVariantKey: () => undefined,
+}));
 
 const flagState = vi.hoisted(() => ({
   taggingEnabled: true as boolean | undefined,

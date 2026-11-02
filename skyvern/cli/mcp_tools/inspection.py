@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, url
 import structlog
 from pydantic import Field
 
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.cli.core.browser_ops import (
     do_network_request_detail,
     do_network_requests,
@@ -243,6 +244,19 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
     # Stateless HTTP mode disables every body reader, so a fetch there only blocks the hosting (API) event loop.
     capture_bodies = not is_stateless_http_mode()
 
+    def track_page_task(task: asyncio.Task[None]) -> None:
+        if state.context is None or state.context.mode != "extension":
+            return
+        tasks = state._page_pending_tasks.setdefault(id(raw_page), set())
+        tasks.add(task)
+
+        def forget_task(finished: asyncio.Task[None]) -> None:
+            tasks.discard(finished)
+            if not tasks and state._page_pending_tasks.get(id(raw_page)) is tasks:
+                state._page_pending_tasks.pop(id(raw_page), None)
+
+        task.add_done_callback(forget_task)
+
     def _on_console(msg: Any) -> None:
         try:
             event = _redact_inspection_value(
@@ -314,6 +328,7 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
                     task = asyncio.create_task(_capture_body(response, request_id, state))
                     state._pending_tasks.add(task)
                     task.add_done_callback(state._pending_tasks.discard)
+                    track_page_task(task)
                     captured_url = network_event.get("url")
                     callback_url = captured_url if type(captured_url) is str else ""
                     task.add_done_callback(lambda t: _body_capture_done(t, request_id, callback_url))
@@ -414,7 +429,16 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
     def _on_close(_page: Page) -> None:
         # Python reuses a closed page's id() for a later page, which would inherit these entries.
         try:
-            state.request_failures.take_tab(str(id(raw_page)))
+            failures = state.request_failures.take_tab(str(id(raw_page)))
+            if state.context is not None and state.context.mode == "extension":
+                runtime = BrowserExtensionRuntime.instance()
+                target_id = runtime.last_page_target_id(raw_page) if runtime is not None else None
+                record = runtime.tab_reconnect(target_id) if runtime is not None and target_id is not None else None
+                if record is not None and record.state in {"pending", "done"}:
+                    state._reconnect_request_failures[raw_page] = failures
+                    state.active_routes.pop(id(raw_page), None)
+                    for task in state._page_pending_tasks.pop(id(raw_page), set()):
+                        task.cancel()
         except BaseException:
             pass
 
@@ -446,6 +470,7 @@ def _make_page_handlers(state: Any, raw_page: Any) -> dict[str, Any]:
             task = asyncio.create_task(dialog.dismiss())
             state._pending_tasks.add(task)
             task.add_done_callback(state._pending_tasks.discard)
+            track_page_task(task)
             task.add_done_callback(lambda t: _dismiss_done(t, event_record))
         except BaseException:
             pass
@@ -921,9 +946,11 @@ async def _page_cursor_binding(
     session_identity = (ctx.mode, resolved_id)
     epoch_js = "() => performance.timeOrigin"
     deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+    scope = None
     try:
+        scope = page.locator_scope
         document_epoch = await SkyvernFrame._evaluate_expression(
-            frame=page.locator_scope,
+            frame=scope,
             expression=epoch_js,
             evaluate_expression=lambda: page.locator_scope.evaluate(epoch_js),
             timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
@@ -936,7 +963,7 @@ async def _page_cursor_binding(
         # content read: a slow read must not be reported as the identity check timing out.
         if isinstance(exc, SkyvernPageAnalysisTimeout) or not deadline_ended_the_call(exc, deadline):
             raise
-        record_unreported_timeout(exc)
+        record_unreported_timeout(exc, scope)
         raise SkyvernPageAnalysisTimeout(str(exc)) from exc
     raise_if_cancelled()
     # Read after the epoch: it is the only await here, and navigation recovery can retry it against a

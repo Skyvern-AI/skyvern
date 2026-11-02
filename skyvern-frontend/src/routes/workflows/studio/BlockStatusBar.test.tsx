@@ -24,12 +24,13 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
   useWorkflowRunWithWorkflowQuery: () => ({ data: mocks.run }),
 }));
 
-function seedRunningBlock() {
+function seedRunningBlock(workflowRunId = "wr_2") {
   mocks.timeline = [
     {
       type: "block",
       block: {
         workflow_run_block_id: "wrb_1",
+        workflow_run_id: workflowRunId,
         block_type: "task",
         label: "checkout",
         status: Status.Running,
@@ -66,6 +67,11 @@ describe("BlockStatusBar", () => {
     const { container } = renderBar();
 
     expect(container.textContent).toBe("");
+  });
+
+  it("does not show a child run's same-label block", () => {
+    seedRunningBlock("wr_child");
+    expect(renderBar().container.textContent).toBe("");
   });
 
   it("shows the block status for the run in view", () => {

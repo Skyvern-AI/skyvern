@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import re
 import socket
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog.testing
 
+from skyvern.constants import NAV_ERROR_MAX_BROWSER_DRAWS, PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS
 from skyvern.exceptions import (
     BlockedHost,
     BlockedNavigationDestination,
@@ -235,6 +237,103 @@ async def test_get_or_create_page_retries_retriable_failed_navigation() -> None:
     browser_state.validate_browser_context.assert_awaited_once_with(page)
 
 
+def _tunnel_refusal() -> FailedToNavigateToUrl:
+    # The shape the driver reports when the proxy hop answers CONNECT with a non-200 (SKY-19080).
+    return FailedToNavigateToUrl(
+        url="http://example.com",
+        error_message="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at http://example.com",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_keeps_drawing_proxies_through_tunnel_refusals() -> None:
+    # A refusal by the proxy hop is a property of the draw, not of the route or the target, so a run
+    # that gets only one extra draw dies whenever two draws in a row are refused.
+    page = AsyncMock()
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(side_effect=[None, page])
+    browser_state.check_and_fix_state = AsyncMock(
+        side_effect=[_tunnel_refusal(), _tunnel_refusal(), _tunnel_refusal(), None]
+    )
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+    browser_state.validate_browser_context = AsyncMock(return_value=True)
+    browser_state._RealBrowserState__assert_page = AsyncMock(return_value=page)
+
+    result = await browser_state.get_or_create_page(url="http://example.com")
+
+    assert result is page
+    assert browser_state.check_and_fix_state.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_stops_drawing_proxies_after_the_last_tunnel_refusal() -> None:
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    async def refuse(**_: object) -> None:
+        raise _tunnel_refusal()
+
+    browser_state.check_and_fix_state = AsyncMock(side_effect=refuse)
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+
+    with pytest.raises(FailedToNavigateToUrl):
+        await browser_state.get_or_create_page(url="http://example.com")
+
+    assert browser_state.check_and_fix_state.await_count == PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_draws_once_more_for_an_error_the_target_reported() -> None:
+    # Only the proxy hop's own refusal earns the wider budget; everything else keeps the single
+    # historical recovery, so a site that resets every connection cannot cost four browser launches.
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(return_value=None)
+
+    async def reset_connection(**_: object) -> None:
+        raise FailedToNavigateToUrl(url="http://example.com", error_message="net::ERR_CONNECTION_RESET")
+
+    browser_state.check_and_fix_state = AsyncMock(side_effect=reset_connection)
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+
+    with pytest.raises(FailedToNavigateToUrl):
+        await browser_state.get_or_create_page(url="http://example.com")
+
+    assert browser_state.check_and_fix_state.await_count == NAV_ERROR_MAX_BROWSER_DRAWS
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_page_tears_down_every_browser_an_abandoned_draw_left() -> None:
+    # Each draw owns a browser, an egress proxy and extension copies, and the rebuild replaces
+    # browser_cleanup with the new launch's. Without carrying the abandoned one forward, every extra
+    # draw leaks its egress proxy for the life of the worker.
+    page = AsyncMock()
+    browser_state = RealBrowserState(pw=AsyncMock())
+    browser_state.get_working_page = AsyncMock(side_effect=[None, page])
+    torn_down: list[str] = []
+    pending_launches = ["first", "second", "third"]
+
+    async def fix_state(**_: object) -> None:
+        name = pending_launches.pop(0)
+
+        async def cleanup() -> None:
+            torn_down.append(name)
+
+        browser_state.browser_cleanup = cleanup
+        if pending_launches:
+            raise _tunnel_refusal()
+
+    browser_state.check_and_fix_state = AsyncMock(side_effect=fix_state)
+    browser_state.close_current_open_page = AsyncMock(return_value=True)
+    browser_state.validate_browser_context = AsyncMock(return_value=True)
+    browser_state._RealBrowserState__assert_page = AsyncMock(return_value=page)
+    browser_state.browser_context = MagicMock()
+
+    await browser_state.get_or_create_page(url="http://example.com")
+    await browser_state._run_browser_cleanup_bounded()
+
+    assert torn_down == ["first", "second", "third"]
+
+
 _DEAD_URL = "https://gone.example.com/search"
 
 
@@ -244,6 +343,25 @@ def _no_such_host(*args: object, **kwargs: object) -> list[object]:
 
 def _resolver_cannot_answer(*args: object, **kwargs: object) -> list[object]:
     raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+
+def _resolves_once_then(failure: Callable[..., list[object]]) -> Callable[..., list[object]]:
+    """A resolver that answers the pre-dispatch check and then stops answering.
+
+    The pre-dispatch guard refuses a host it cannot resolve, so this is what still reaches the
+    post-failure corroboration: a record that was there when the destination was reviewed and
+    gone (or unanswerable) by the time the navigation failed.
+    """
+    answered = False
+
+    def resolve(*args: object, **kwargs: object) -> list[object]:
+        nonlocal answered
+        if answered:
+            return failure(*args, **kwargs)
+        answered = True
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 0))]
+
+    return resolve
 
 
 async def _navigate_failing_with(error_message: str) -> FailedToNavigateToUrl:
@@ -276,7 +394,7 @@ async def test_a_proxy_error_for_a_host_with_no_address_record_is_not_blamed_on_
 ) -> None:
     # A proxied browser hands the hostname to the proxy, so a domain whose record is gone comes
     # back as the proxy failing to open a tunnel rather than as ERR_NAME_NOT_RESOLVED.
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _no_such_host)
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolves_once_then(_no_such_host))
 
     error = await _navigate_failing_with(error_message)
 
@@ -303,7 +421,7 @@ async def test_a_resolver_that_cannot_answer_does_not_reattribute_a_proxy_error(
 ) -> None:
     # EAI_AGAIN means the resolver never answered. Reading it as a dead host would reclassify every
     # egress failure fleet-wide the moment worker DNS degrades.
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolver_cannot_answer)
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolves_once_then(_resolver_cannot_answer))
 
     error = await _navigate_failing_with("net::ERR_TUNNEL_CONNECTION_FAILED")
 
@@ -350,15 +468,55 @@ def test_validate_navigation_destination_allows_public_targets(url: str) -> None
     validate_navigation_destination(url)
 
 
-def test_validate_navigation_destination_allows_a_host_the_worker_cannot_resolve(
+@pytest.mark.asyncio
+async def test_a_host_the_worker_cannot_resolve_is_refused_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-        raise OSError("dns unavailable")
+    # SKY-18836: the browser resolves the hostname itself, so a public-suffix name with a
+    # split-horizon internal A record is NXDOMAIN here and 10.x there. Admitting it because our
+    # own check could not run would hand the browser an unreviewed internal destination.
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _no_such_host)
+    page = AsyncMock()
+    page.goto = AsyncMock()
 
-    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
+    with pytest.raises(UnresolvableNavigationHost) as raised:
+        await navigate_with_retry(
+            navigate=lambda strategy: page.goto(_DEAD_URL, wait_until=strategy),
+            url=_DEAD_URL,
+            retry_times=5,
+            settle=AsyncMock(),
+            sleep=AsyncMock(),
+        )
 
-    validate_navigation_destination("https://public.example.test/path")
+    page.goto.assert_not_awaited()
+    # A resolver that answers "this name has no address" is reporting the target's own state, so
+    # the refusal keeps the dead-host verdict rather than calling a public name internal.
+    assert raised.value.host == "gone.example.com"
+    assert is_egress_attributable_navigation_failure(raised.value) is False
+
+
+@pytest.mark.asyncio
+async def test_a_destination_the_resolver_cannot_answer_for_is_refused_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolver_cannot_answer)
+    page = AsyncMock()
+    page.goto = AsyncMock()
+
+    with pytest.raises(BlockedNavigationDestination) as raised:
+        await navigate_with_retry(
+            navigate=lambda strategy: page.goto(_DEAD_URL, wait_until=strategy),
+            url=_DEAD_URL,
+            retry_times=5,
+            settle=AsyncMock(),
+            sleep=AsyncMock(),
+        )
+
+    page.goto.assert_not_awaited()
+    # A resolver that could not answer says nothing about the target, so the refusal must not
+    # claim it is internal either.
+    assert "unverifiable host" in raised.value.reason
+    assert not isinstance(raised.value, UnresolvableNavigationHost)
 
 
 @pytest.mark.parametrize("url", BLOCKED_DESTINATIONS)

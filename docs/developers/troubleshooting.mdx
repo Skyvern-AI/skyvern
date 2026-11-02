@@ -198,7 +198,9 @@ See [Anti-bot and CAPTCHA](/developers/production#anti-bot-and-captcha). In shor
 </Accordion>
 
 <Accordion title="City or state proxy unavailable">
-**Fix:** widen the `GeoTarget` from city to state to country, or retry later.
+Skyvern widens the target for you: when the proxy provider repeatedly reports that it has no exit for the requested city or state, that proxy request falls back to the country alone, so the browser starts from elsewhere in that country. The next proxy request, such as a retry or relaunch, tries your city or state first again.
+
+**Fix:** if the run still fails to get a proxy, send only `country` in the `GeoTarget`, or retry later.
 </Accordion>
 
 <Accordion title="504 when creating a browser session">

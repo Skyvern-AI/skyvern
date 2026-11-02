@@ -42,6 +42,7 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository, fake_download_registration_app
 from tests.unit.forge.sdk.artifact.storage.test_azure_storage import AzureStorageForTests
 from tests.unit.forge.sdk.artifact.storage.test_gcs_storage import GcsStorageForTests
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _is_amazonaws_s3_url(url: str) -> bool:
@@ -524,7 +525,7 @@ def test_content_endpoint_download_non_ascii_filename_does_not_crash_header_enco
 def test_sanitize_header_filename_strips_crlf_and_quotes_directly():
     """Direct unit test on _sanitize_header_filename so we know the function works
     even when urlparse isn't part of the chain (defense in depth)."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert _sanitize_header_filename('evil"pdf') == "evilpdf"
     assert _sanitize_header_filename("hello\r\nworld.pdf") == "helloworld.pdf"
@@ -544,7 +545,7 @@ def test_content_endpoint_download_filename_preserves_question_and_hash():
 def test_sanitize_header_filename_strips_bidi_and_format_characters():
     """Unicode bidi overrides and format chars (ZWSP, RLO, ZWNBSP) enable filename
     spoofing in the browser's download UI (``invoice\\u202efdp.exe`` -> ``invoice.exe.pdf``)."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert "\u202e" not in _sanitize_header_filename("invoice\u202efdp.exe")
     assert "\u200b" not in _sanitize_header_filename("stealth\u200b.pdf")
@@ -554,7 +555,7 @@ def test_sanitize_header_filename_strips_bidi_and_format_characters():
 def test_ascii_fallback_filename_preserves_stem_for_pure_unicode_names():
     """Pure non-ASCII names (e.g. CJK, emoji) must not reduce to a bare ``.pdf`` hidden
     dotfile after the NFKD strip; fall back to a ``download`` stem instead."""
-    from skyvern.forge.sdk.routes.agent_protocol import _ascii_fallback_filename
+    from skyvern.utils.content_disposition import ascii_fallback_filename as _ascii_fallback_filename
 
     assert _ascii_fallback_filename("文档.pdf") == "download.pdf"
     assert _ascii_fallback_filename("🎉.pdf") == "download.pdf"
@@ -564,7 +565,7 @@ def test_ascii_fallback_filename_preserves_stem_for_pure_unicode_names():
 
 def test_sanitize_header_filename_strips_control_characters():
     """NUL/DEL/C1 control chars are valid Latin-1 bytes but violate RFC 7230 header syntax."""
-    from skyvern.forge.sdk.routes.agent_protocol import _sanitize_header_filename
+    from skyvern.utils.content_disposition import sanitize_header_filename as _sanitize_header_filename
 
     assert "\x00" not in _sanitize_header_filename("evil\x00.pdf")
     assert "\x7f" not in _sanitize_header_filename("evil\x7f.pdf")
@@ -573,7 +574,7 @@ def test_sanitize_header_filename_strips_control_characters():
 
 
 @pytest.mark.asyncio
-async def test_content_endpoint_sets_nosniff_header_end_to_end():
+async def test_content_endpoint_sets_nosniff_header_end_to_end(monkeypatch: pytest.MonkeyPatch):
     """Hit the real route through a FastAPI TestClient and verify the response
     actually carries X-Content-Type-Options: nosniff on the DOWNLOAD path.
 
@@ -581,12 +582,10 @@ async def test_content_endpoint_sets_nosniff_header_end_to_end():
     the header without this suite noticing."""
     import json
 
-    from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from skyvern.config import settings
     from skyvern.forge.sdk.artifact.signing import sign_artifact_url
-    from skyvern.forge.sdk.routes.routers import base_router
 
     artifact = _make_artifact("a_e2e", "s3://skyvern-uploads/downloads/local/o_1/wr_1/report.pdf")
     keyring_json = json.dumps({"current_kid": "k1", "keys": {"k1": {"secret": "0" * 64, "created_at": "2026-04-23"}}})
@@ -609,9 +608,7 @@ async def test_content_endpoint_sets_nosniff_header_end_to_end():
             artifact_type="download",
         )
 
-        test_app = FastAPI()
-        test_app.include_router(base_router, prefix="/v1")
-        client = TestClient(test_app)
+        client = TestClient(shared_route_app(monkeypatch))
         resp = client.get(signed_url.replace("http://testserver", ""))
 
     assert resp.status_code == 200, resp.text
@@ -824,7 +821,7 @@ async def test_retry_downloads_preserve_attempt_objects_and_rows(
     async def get_object_info(uri: str):
         return object_info[uri]
 
-    async def sign_urls(uris: list[str]):
+    async def sign_urls(uris: list[str], **_: object):
         return [f"https://storage.example{urlparse(uri).path}?signature=test" for uri in uris]
 
     async def find(*, uri: str, **kwargs):
@@ -1265,3 +1262,173 @@ def test_local_snapshot_aliases_consume_primary_before_live_baseline_and_preserv
         {DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(live)]},
         aliases=storage.get_downloaded_file_signature_aliases,
     ) == [retry]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["local", "s3", "azure", "gcs"])
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("run_id", ["wr_1", "tsk_1"])
+async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkeypatch, backend, signed, run_id):
+    monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON if signed else None)
+    storage = {
+        "local": lambda: LocalStorage(str(tmp_path / "artifacts")),
+        "s3": S3Storage,
+        "azure": lambda: AzureStorageForTests("uploads"),
+        "gcs": lambda: GcsStorageForTests("uploads"),
+    }[backend]()
+    storage.async_client = MagicMock()
+    if backend in ("s3", "gcs"):
+        monkeypatch.setattr(storage, "_get_storage_class_for_org", AsyncMock(return_value="STANDARD"))
+    if backend == "gcs":
+        monkeypatch.setattr(storage, "_get_tags_for_org", AsyncMock(return_value=None))
+    directory = tmp_path / "downloads"
+    directory.mkdir()
+    (directory / "extensionless").write_bytes(b"complete")
+    (directory / "unconfirmed.crdownload").write_bytes(b"partial")
+    rows = []
+    objects = {}
+    metadata = {}
+    now = datetime.now(UTC)
+
+    async def create(**kwargs):
+        row = Artifact(**kwargs, created_at=now, modified_at=now)
+        rows.append(row)
+        return row
+
+    async def upload(*, uri, file_path, **kwargs):
+        objects[uri] = Path(file_path).read_bytes()
+        metadata[uri] = {
+            "Metadata": kwargs.get("metadata", {}),
+            "ContentLength": len(objects[uri]),
+            "LastModified": now,
+        }
+
+    manager = ArtifactManager()
+    fake_app = SimpleNamespace(
+        ARTIFACT_MANAGER=manager,
+        WORKFLOW_CONTEXT_MANAGER=WorkflowContextManager(),
+        DATABASE=SimpleNamespace(
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[])),
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            artifacts=SimpleNamespace(
+                find_download_artifact=AsyncMock(return_value=None),
+                create_artifact=create,
+                list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **_: list(rows)),
+            ),
+        ),
+    )
+    module = {"local": local_module, "s3": s3_module, "azure": azure_module, "gcs": gcs_module}[backend]
+    for item in (module, base_module, manager_module):
+        monkeypatch.setattr(item, "app", fake_app)
+    monkeypatch.setattr(module, "get_download_dir", lambda **_: str(directory))
+    monkeypatch.setattr(
+        manager_module.skyvern_context,
+        "current",
+        lambda: SkyvernContext(workflow_run_id=run_id if run_id.startswith("wr_") else None),
+    )
+    storage.async_client.upload_file_from_path = upload
+    storage.async_client.list_files = AsyncMock(
+        side_effect=lambda **_: [urlparse(uri).path.lstrip("/") for uri in objects]
+    )
+    storage.async_client.get_object_info = AsyncMock(side_effect=lambda uri: metadata[uri])
+    signing = {
+        "s3": "create_presigned_urls",
+        "azure": "create_sas_urls",
+        "gcs": "create_signed_urls",
+        "local": "unused",
+    }[backend]
+    setattr(
+        storage.async_client,
+        signing,
+        AsyncMock(side_effect=lambda uris, **_: ["https://storage.example/file" for _ in uris]),
+    )
+    monkeypatch.setattr(
+        manager,
+        "resolve_share_url",
+        AsyncMock(side_effect=lambda artifact, **_: f"https://api.example/{artifact.artifact_id}"),
+    )
+    monkeypatch.setattr(manager, "resolve_artifact_url_expiry_seconds", AsyncMock(return_value=3600))
+    await storage.save_downloaded_files(organization_id="o_1", run_id=run_id)
+    assert len(rows) == 1 and rows[0].uri.endswith("/extensionless")
+    assert all(not uri.endswith(".crdownload") for uri in objects)
+    legacy = rows[0].model_copy(
+        update={"artifact_id": "a_legacy_partial", "uri": rows[0].uri.rsplit("/", 1)[0] + "/legacy.crdownload"}
+    )
+    rows.append(legacy)
+    if backend == "local":
+        Path(parse_uri_to_path(legacy.uri)).write_bytes(b"legacy partial")
+    else:
+        objects[legacy.uri] = b"legacy partial"
+        metadata[legacy.uri] = {"Metadata": {}, "ContentLength": 14, "LastModified": now}
+    infos = await storage.get_downloaded_files(organization_id="o_1", run_id=run_id)
+    assert [info.filename for info in infos] == ["extensionless"]
+    assert (directory / "unconfirmed.crdownload").read_bytes() == b"partial"
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_awaits_only_container_children() -> None:
+    service = WorkflowService()
+    value = {"rows": [{"id": 1, "name": "a"}, {"tags": ["x", "y"], "ok": True}], "note": "n", "empty": None}
+    real = service._substitute_artifact_urls
+    calls: list[object] = []
+
+    async def counting(child, *args, **kwargs):
+        calls.append(child)
+        return await real(child, *args, **kwargs)
+
+    with patch.object(service, "_substitute_artifact_urls", side_effect=counting):
+        result = await service._substitute_artifact_urls(value, {}, {}, "wr_1", None)
+
+    assert result is value
+    assert value == {"rows": [{"id": 1, "name": "a"}, {"tags": ["x", "y"], "ok": True}], "note": "n", "empty": None}
+    assert all(isinstance(child, (dict, list)) for child in calls)
+    assert len(calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_reassigns_every_child_through_container_setitem() -> None:
+    writes: list[tuple[str, object]] = []
+
+    class RecordingDict(dict):
+        def __setitem__(self, key, item):
+            writes.append(("dict", key))
+            super().__setitem__(key, item)
+
+    class RecordingList(list):
+        def __setitem__(self, index, item):
+            writes.append(("list", index))
+            super().__setitem__(index, item)
+
+    class RejectingDict(dict):
+        def __setitem__(self, key, item):
+            if key == "b":
+                raise KeyError(key)
+            super().__setitem__(key, item)
+
+    value = RecordingDict(a=1, b=RecordingList([1, "x", {"task_screenshot_artifact_ids": ["a1"]}]), c=None)
+    await WorkflowService()._substitute_artifact_urls(value, {"a1": "https://example.com/a1"}, {}, "wr_1", None)
+
+    assert writes == [("dict", "a"), ("list", 0), ("list", 1), ("list", 2), ("dict", "b"), ("dict", "c")]
+    assert value["b"][2]["task_screenshots"] == ["https://example.com/a1"]
+
+    rejecting = RejectingDict()
+    dict.update(rejecting, a=[1], b=2, c={"task_screenshot_artifact_ids": ["a1"]})
+    with pytest.raises(KeyError):
+        await WorkflowService()._substitute_artifact_urls(rejecting, {"a1": "https://example.com/a1"}, {}, "wr_1", None)
+    assert "task_screenshots" not in rejecting["c"]
+
+
+@pytest.mark.asyncio
+async def test_substitute_artifact_urls_keeps_legacy_screenshot_lookup_beside_scalar_siblings() -> None:
+    service = WorkflowService()
+    value = {
+        "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["stale"], "extracted_information": {"k": "v"}}, "s"]
+    }
+
+    with patch.object(service, "get_recent_task_screenshot_urls", AsyncMock(return_value=["fresh"])) as lookup:
+        await service._substitute_artifact_urls(value, {}, {}, "wr_1", "o_1")
+
+    lookup.assert_awaited_once_with(organization_id="o_1", task_id="tsk_1")
+    assert value == {
+        "outputs": [7, {"task_id": "tsk_1", "task_screenshots": ["fresh"], "extracted_information": {"k": "v"}}, "s"]
+    }

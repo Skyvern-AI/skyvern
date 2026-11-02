@@ -36,6 +36,7 @@ from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
+from skyvern.webeye.action_deadline import bounded_lookup_call
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
@@ -58,6 +59,34 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 MAX_LOGGED_FRAME_COLLISION_PAIRS = 10
+
+# Reads every stamped element's live tag name, role and match count in one pass, open shadow roots
+# included, so a caller can resolve a whole subtree without a round trip per element.
+LIVE_ELEMENT_PROBE_JS = """(attrName) => {
+    // Element ids come from page attributes and can collide with Object.prototype keys.
+    const probes = Object.create(null);
+    const pending = [document.documentElement];
+    while (pending.length) {
+        const node = pending.pop();
+        if (!node) continue;
+        const elementId = node.getAttribute ? node.getAttribute(attrName) : null;
+        if (elementId) {
+            const probe = probes[elementId];
+            if (probe === undefined) {
+                probes[elementId] = {
+                    count: 1,
+                    tagName: node.tagName ? node.tagName.toLowerCase() : "",
+                    role: node.getAttribute("role"),
+                };
+            } else {
+                probe.count += 1;
+            }
+        }
+        for (const child of node.children || []) pending.push(child);
+        if (node.shadowRoot) pending.push(node.shadowRoot);
+    }
+    return probes;
+}"""
 
 
 async def build_scraping_failed_reason(
@@ -289,6 +318,9 @@ def build_element_dict(
         if previous_frame is not None and previous_frame != element["frame"]:
             cross_frame_collision_ids.add(element_id)
             colliding_frame_pairs.add((previous_frame, element["frame"]))
+            # Frames arrive breadth-first, parents before children, so the first owner is the likelier target, and a
+            # frame's copy of its own iframe cannot re-point that iframe into its subtree and loop the frame chain.
+            continue
         # get_interactable_element_tree marks each interactable element with a SKYVERN_ID_ATTR attribute
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
@@ -299,10 +331,10 @@ def build_element_dict(
 
     if cross_frame_collision_ids:
         iframe_collision_count = len(cross_frame_collision_ids & {element["frame"] for element in elements})
-        # Only an overwritten iframe entry can turn an element's frame chain into a loop.
+        # A shared iframe id is the collision that can misroute an element's frame chain.
         log = LOG.warning if iframe_collision_count else LOG.info
         log(
-            "Element ids collide across frames; the later frame's element replaces the earlier one",
+            "Element ids collide across frames; the earlier frame's element is kept",
             collision_count=len(cross_frame_collision_ids),
             iframe_collision_count=iframe_collision_count,
             frame_pairs=sorted(colliding_frame_pairs)[:MAX_LOGGED_FRAME_COLLISION_PAIRS],
@@ -329,6 +361,7 @@ async def scrape_website(
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
     allow_transient_ui_suppression: bool = False,
+    navigation_deadline: float | None = None,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -366,6 +399,7 @@ async def scrape_website(
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
     try:
@@ -439,6 +473,7 @@ async def scrape_website(
             scroll=scroll,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
 
@@ -494,6 +529,30 @@ def _should_use_page_ready_wait() -> bool:
     """Check if the enhanced page-ready wait is enabled via context (set by agent before scraping)."""
     context = skyvern_context.current()
     return bool(context and context.enable_page_ready_wait)
+
+
+async def _prepare_scrape_frame(
+    browser_state: BrowserState, page: Page, navigation_deadline: float | None, support_empty_page: bool
+) -> tuple[SkyvernFrame, str]:
+    """Get the working page ready for scraping and return its frame with the URL of the document being scraped.
+
+    Settles any in-flight navigation, rejects a dead blank page, injects the helpers, then waits for readiness.
+    Injection evaluates in the page, and evaluate calls are deferred while a cross-document navigation is pending,
+    so the navigation wait must come first. Only callers that pass a deadline (the step's scrape ladder) wait for it.
+    """
+    if navigation_deadline is not None:
+        await browser_state.wait_for_main_frame_navigation(page, navigation_deadline)
+    url = page.url
+    if url in BLANK_PAGE_URLS and not support_empty_page:
+        # A blank working page (about:blank or the ":" download-popup shape) is only scrapeable when
+        # a meaningful child frame renders real content (e.g. an Edge PDF interstitial); otherwise it
+        # is a dead blank and must fail classification so the caller can recover or fail closed.
+        if not page_has_meaningful_child_frame(page):
+            raise ScrapingFailedBlankPage()
+        LOG.info("blank page has meaningful child frames, proceeding with scraping")
+    skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
+    await _wait_for_scrape_ready(skyvern_frame)
+    return skyvern_frame, url
 
 
 async def _wait_for_scrape_ready(skyvern_frame: SkyvernFrame) -> None:
@@ -584,6 +643,7 @@ async def scrape_web_unsafe(
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
     allow_transient_ui_suppression: bool = False,
+    navigation_deadline: float | None = None,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -604,17 +664,7 @@ async def scrape_web_unsafe(
     # We check if the scroll_y_px_old is the same as scroll_y_px to determine if we have reached the end of the page.
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
-    url = page.url
-    if url in BLANK_PAGE_URLS and not support_empty_page:
-        # A blank working page (about:blank or the ":" download-popup shape) is only scrapeable when
-        # a meaningful child frame renders real content (e.g. an Edge PDF interstitial); otherwise it
-        # is a dead blank and must fail classification so the caller can recover or fail closed.
-        if not page_has_meaningful_child_frame(page):
-            raise ScrapingFailedBlankPage()
-        LOG.info("blank page has meaningful child frames, proceeding with scraping")
-
-    skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
-    await _wait_for_scrape_ready(skyvern_frame)
+    skyvern_frame, url = await _prepare_scrape_frame(browser_state, page, navigation_deadline, support_empty_page)
 
     if wait_seconds > 0:
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
@@ -1023,6 +1073,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         # native analysis timeout; None (default) preserves the stock Playwright timeout identity.
         self.engine_selection = engine_selection
         self.last_used_element_tree_html: str | None = None
+        self._live_element_probes: dict[str, dict] | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
         self.element_tree_trimmed = element_tree_trimmed
@@ -1058,6 +1109,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 
         self.elements = incremental_elements
+        self._live_element_probes = None
 
         incremental_tree = await cleanup_element_tree(frame, frame.url, _deepcopy_element_tree(incremental_tree))
         trimmed_element_tree = trim_element_tree(_deepcopy_element_tree(incremental_tree))
@@ -1112,6 +1164,49 @@ class IncrementalScrapePage(ElementTreeBuilder):
         }"""
         return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
 
+    async def _get_live_element_probes(self) -> dict[str, dict]:
+        """Live tag name, role and match count of every stamped element in the frame, keyed by element id.
+
+        Read in one pass instead of a locator resolve plus an attribute read per element: an opened
+        dropdown menu can hold hundreds of elements, and each round trip to a remote browser costs
+        a fraction of a second. Cached until the next incremental scrape replaces the element tree.
+        """
+        cached = self._live_element_probes
+        if cached is not None:
+            return cached
+
+        probes: dict[str, dict] = await SkyvernFrame.evaluate(
+            frame=self.skyvern_frame.get_frame(), expression=LIVE_ELEMENT_PROBE_JS, arg=SKYVERN_ID_ATTR
+        )
+        self._live_element_probes = probes
+        return probes
+
+    async def find_option_list_element_id(self, root_element: dict) -> str | None:
+        """Id of the first <ul> or role="listbox" element in the subtree, the root element included."""
+        try:
+            probes = await self._get_live_element_probes()
+        except Exception:
+            # Same outcome the per-element reads had when the page wouldn't answer: no match.
+            LOG.debug("Failed to read the live element tree, no option list element found", exc_info=True)
+            return None
+
+        queue = [root_element]
+        index = 0
+        while index < len(queue):
+            element = queue[index]
+            index += 1
+            element_id: str = element.get("id", "")
+            probe = probes.get(element_id)
+            # An id matching no element, or more than one, is not addressable by its selector.
+            if probe is not None and probe.get("count") == 1:
+                if element.get("tagName") == "ul":
+                    return element_id
+                # The role may change after the scrape, so use the live probe as authoritative.
+                if probe.get("role") == "listbox":
+                    return element_id
+            queue.extend(element.get("children", []))
+        return None
+
     async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
         """
         Locator: the locator of the matched element. None if no valid element to interact;
@@ -1136,7 +1231,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
             if is_match:
                 if child_locator:
                     return child_locator, True
-                if interactable and parent_locator and await parent_locator.count() > 0:
+                if interactable and parent_locator and await bounded_lookup_call(parent_locator.count) > 0:
                     return parent_locator, True
                 return None, True
 
@@ -1147,7 +1242,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         if text != value:
             return None, False
 
-        if await parent_locator.count() == 0:
+        if await bounded_lookup_call(parent_locator.count) == 0:
             return None, False
 
         if not interactable:

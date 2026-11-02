@@ -54,12 +54,12 @@ async def _tool_tags(server: FastMCP) -> set[str]:
 def test_scope_tag_sets_are_exact() -> None:
     scopes = _load_scopes_module()
 
-    operate = {"workflow", "schedule", "folder", "script"}
+    operate = {"workflow", "schedule", "folder", "script", "feedback"}
     assert scopes.SCOPES == {
         "operate": operate,
         "build": operate | {"block_discovery", "inspection", "ai_powered", "session", "state"},
-        "browser": {"browser_primitive", "tab_management", "session", "browser_profile", "inspection"},
-        "lean": {"lean"},
+        "browser": {"browser_primitive", "tab_management", "session", "browser_profile", "inspection", "feedback"},
+        "lean": {"lean", "feedback"},
     }
 
 
@@ -182,11 +182,11 @@ async def test_every_real_scope_is_non_empty_strict_subset(scoped_mcp: FastMCP) 
 # on ONE tool of many — the tag survives elsewhere, the subset stays strict, and the scope
 # silently loses a tool. Only an external oracle catches that, so these numbers are a ratchet:
 # adding or re-tagging a tool must be a conscious edit here, reviewed alongside the scope map.
-RESOLVED_SCOPE_SIZES: dict[MCPScope, int] = {"operate": 30, "build": 62, "browser": 54, "lean": 33}
+RESOLVED_SCOPE_SIZES: dict[MCPScope, int] = {"operate": 31, "build": 63, "browser": 55, "lean": 34}
 
 # Same ratchet for the unfiltered (`all`) surface. Kept in one place because duplicated copies
 # drift: a registration that bumps only its own copy leaves the others to fail in CI.
-TOTAL_TOOL_COUNT: int = 117
+TOTAL_TOOL_COUNT: int = 118
 
 
 @pytest.mark.asyncio
@@ -207,6 +207,7 @@ async def test_lean_scope_resolves_to_exact_existing_tools(scoped_mcp: FastMCP) 
     from skyvern.cli.mcp_tools.scopes import apply_scope
 
     expected = {
+        "skyvern_feedback",
         "skyvern_browser_session_create",
         "skyvern_browser_session_close",
         "skyvern_browser_session_list",

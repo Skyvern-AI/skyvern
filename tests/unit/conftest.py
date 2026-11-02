@@ -3,6 +3,7 @@
 # -- begin speed up unit tests
 import asyncio
 import contextlib
+import functools
 import hashlib
 import itertools
 import logging
@@ -15,20 +16,28 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 import structlog
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from playwright.async_api import Download
+from PIL import Image
+from playwright.async_api import BrowserContext, Download
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -46,25 +55,38 @@ from skyvern.forge.sdk.copilot.context import (
     model_written_context_fields,
     tool_recorded_context_fields,
 )
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import Base, CredentialModel, WorkflowModel
 from skyvern.forge.sdk.db.utils import _custom_json_serializer
+from skyvern.forge.sdk.encrypt import encryptor
+from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.executor.async_executor import AsyncExecutor
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.schemas.credentials import BitwardenItemOverview, CredentialType, CredentialVaultType
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken, Organization
+from skyvern.forge.sdk.services.bitwarden import BitwardenConstants, BitwardenLoginSecret, BitwardenService
+from skyvern.forge.sdk.services.credential import credential_creation_service
+from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
+    ConnectedBitwardenCredentialVaultService,
+)
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services import workflow_run_group_service as group_service
+from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
-from tests.unit.dns_fixtures import no_env_proxy, public_dns  # noqa: F401
+from tests.unit.dns_fixtures import no_env_proxy, public_dns, unresolvable_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
 from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
 from tests.unit.litellm_model_registry import registered_gpt56_litellm_models
@@ -220,6 +242,46 @@ def setup_forge_stub_app():
     yield
 
 
+def cancel_leftover_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    # A task left suspended in a SQLAlchemy session on a closed loop is later finalized by a garbage collection
+    # inside another test's session, which fails that test with GeneratorExit and stops all later collections.
+    cancelled: set[asyncio.Task[Any]] = set()
+    for _ in range(3):
+        leftover = {task for task in asyncio.all_tasks(loop) if not task.done()}
+        if not leftover:
+            break
+        for task in leftover:
+            task.cancel()
+        cancelled |= leftover
+        # Bounded and repeated, as asyncio.run is not: a task that swallows one cancel must not hang teardown.
+        loop.run_until_complete(asyncio.wait(leftover, timeout=2))
+    for task in cancelled:
+        # Reading the exception also marks it retrieved, so the loop handler reports it once.
+        if task.done() and not task.cancelled() and task.exception() is not None:
+            loop.call_exception_handler(
+                {
+                    "message": "unhandled exception during test loop teardown",
+                    "exception": task.exception(),
+                    "task": task,
+                }
+            )
+    for task in asyncio.all_tasks(loop):
+        loop.call_exception_handler(
+            {"message": "task still pending after cancellation at test loop teardown", "task": task}
+        )
+
+
+@pytest.fixture
+def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    # pytest-asyncio's default loop closes without cancelling the tasks a test left running.
+    loop = asyncio.new_event_loop()
+    yield loop
+    if not loop.is_closed():
+        cancel_leftover_tasks(loop)
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
 @pytest.fixture(autouse=True)
 def reset_collapse_xp_assignment_memo():
     # The collapse umbrella memo is process-global by design; without clearing it,
@@ -310,6 +372,19 @@ _AGENT_TEMPLATE_DEFAULTS = dict(
 def render_agent_prompt(**overrides: str) -> str:
     """Render the workflow-copilot-agent template with test defaults; overrides replace named params."""
     return prompt_engine.load_prompt("workflow-copilot-agent", **{**_AGENT_TEMPLATE_DEFAULTS, **overrides})
+
+
+def use_templating_strictness(monkeypatch: pytest.MonkeyPatch, strictness: str) -> None:
+    """The block module picks its Jinja environment at import, so strict mode swaps in a StrictUndefined one."""
+    monkeypatch.setattr(settings, "WORKFLOW_TEMPLATING_STRICTNESS", strictness)
+    if strictness != "strict":
+        return
+    env = SandboxedEnvironment(undefined=StrictUndefined)
+    env.filters["json"] = block_module._json_type_filter
+    globals_free_env = env.overlay()
+    globals_free_env.globals = {}
+    monkeypatch.setattr(block_module, "jinja_sandbox_env", env)
+    monkeypatch.setattr(block_module, "_globals_free_jinja_env", globals_free_env)
 
 
 def make_block_output_parameter(key: str = "block_output", workflow_id: str = "workflow-id") -> OutputParameter:
@@ -407,6 +482,14 @@ def gpt56_litellm_models() -> Iterator[None]:
 # DDL, and each test still gets its own isolated database.
 
 
+@pytest.fixture
+def registered_encryption() -> Iterator[None]:
+    """The real AES-CBC and AES-GCM encryptors, registered as a deployment with ENABLE_ENCRYPTION would."""
+    with patch.dict(encryptor._methods, clear=True):
+        register_aes_encryptor(secret_key="registered-encryption-test-key")
+        yield
+
+
 @pytest.fixture(scope="session")
 def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     template_path = tmp_path_factory.mktemp("sqlite_schema") / "schema.db"
@@ -489,6 +572,7 @@ def make_input_element_mock(*, element_id: str = "AADC", attrs: dict[str, object
     el.has_attr = AsyncMock(return_value=False)
     el.is_spinbtn_input = AsyncMock(return_value=False)
     el.is_editable = AsyncMock(return_value=True)
+    el.accepts_text_fill = AsyncMock(return_value=True)
     el.supports_text_input = AsyncMock(return_value=True)
     el.is_visible = AsyncMock(return_value=True)
     el.is_raw_input = AsyncMock(return_value=False)
@@ -1013,10 +1097,37 @@ async def settle_or_fail(coro: Awaitable[_T], wait_seconds: float = 2.0) -> tupl
     elapsed = loop.time() - started
     if not task.done():
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # A task that swallows its cancellation would hang an unbounded await here as well.
+        await asyncio.wait({task}, timeout=wait_seconds)
+        if task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         pytest.fail(f"task still running after {wait_seconds}s")
     return task, elapsed
+
+
+async def cancel_once_parked(
+    coro: Awaitable[_T], parked: asyncio.Event, release: asyncio.Event, wait_seconds: float = 5.0
+) -> asyncio.Task[_T]:
+    """Run ``coro``, cancel it once it reaches a collaborator parked on ``release``, and fail if it does not finish
+    within ``wait_seconds`` of that cancel, so work re-entered after cancellation fails instead of hanging. The
+    parked collaborator is always released and the task's outcome retrieved before returning."""
+    task = asyncio.ensure_future(coro)
+    try:
+        reached = asyncio.ensure_future(parked.wait())
+        await asyncio.wait({task, reached}, timeout=wait_seconds, return_when=asyncio.FIRST_COMPLETED)
+        reached.cancel()
+        if not parked.is_set():
+            pytest.fail(f"never reached the parked collaborator within {wait_seconds}s")
+        task.cancel()
+        await settle_or_fail(task, wait_seconds)
+        return task
+    finally:
+        release.set()
+        if not task.done():
+            await asyncio.wait({task}, timeout=wait_seconds)
+        if task.done() and not task.cancelled():
+            task.exception()
 
 
 class DriverReplyProbe:
@@ -1027,9 +1138,8 @@ class DriverReplyProbe:
     without its task ending therefore leaves the reply live, and the driver's late error lands on it
     with nobody left to retrieve it."""
 
-    def __init__(self, error: BaseException, answers_after_seconds: float = 0.05) -> None:
+    def __init__(self, error: BaseException) -> None:
         self._error = error
-        self._answers_after_seconds = answers_after_seconds
         self.called = asyncio.Event()
         self.reply: asyncio.Future[Any] | None = None
 
@@ -1046,16 +1156,17 @@ class DriverReplyProbe:
                 reply.cancel()
 
         issuing_task.add_done_callback(abandon_reply)
-        loop.call_later(self._answers_after_seconds, lambda: reply.done() or reply.set_exception(self._error))
         # The driver abandons an unanswered reply on the line after this await, which cancellation skips.
         await asyncio.wait({reply}, return_when=asyncio.FIRST_COMPLETED)
         return reply.result()
 
-    async def orphaned_reply(self, wait_seconds: float = 2.0) -> bool:
-        """Whether the late reply carries an error nobody retrieved -- asyncio's never-retrieved line."""
+    def orphaned_reply(self) -> bool:
+        """Deliver the driver's late error now that the caller has given up, and report whether it landed on a reply
+        nobody will retrieve (asyncio's never-retrieved line)."""
         assert self.reply is not None, "the driver was never called"
-        await asyncio.wait({self.reply}, timeout=wait_seconds)
-        return self.reply.done() and not self.reply.cancelled() and self.reply.exception() is not None
+        if not self.reply.done():
+            self.reply.set_exception(self._error)
+        return not self.reply.cancelled() and self.reply.exception() is not None
 
 
 def stalled_scrolling_capture(entered: asyncio.Event, timeout_ms: float) -> AsyncMock:
@@ -1183,7 +1294,6 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "RATE_LIMITER", limiter, raising=False)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", service)
-    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
     monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
     monkeypatch.setattr(app.AGENT_FUNCTION, "is_block_scoped_workflow_run", AsyncMock(return_value=False))
     monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
@@ -1193,3 +1303,208 @@ async def run_group_env(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEng
     for coroutine in spawned:
         coroutine.close()
     await asyncio.gather(*app.WORKFLOW_SERVICE._background_tasks, return_exceptions=True)
+
+
+ORG_VAULT_ITEM_ID = "0f4a3a52-6f4e-4c43-9d37-8f6f2a1c9b10"
+ORG_VAULT_ACCOUNT_EMAIL = "vault-owner@example.com"
+ORG_VAULT_MASTER_PASSWORD = "ORG_VAULT_MASTER_SECRET"
+ORG_VAULT_LOGIN_PASSWORD = "ORG_VAULT_LOGIN_SECRET"
+ORG_VAULT_PORTAL_SITES = [LoginSite("https://portal.example.com", whole_site=False)]
+
+
+def org_vault_overview(**overrides: Any) -> BitwardenItemOverview:
+    fields: dict[str, Any] = {
+        "item_id": ORG_VAULT_ITEM_ID,
+        "title": "Example portal",
+        "collection_id": "col_1",
+        "credential_type": CredentialType.PASSWORD,
+        "url": "https://portal.example.com/login",
+        "sites": ORG_VAULT_PORTAL_SITES,
+        **overrides,
+    }
+    fields.setdefault("urls", [fields["url"]] if fields["url"] else [])
+    return BitwardenItemOverview(**fields)
+
+
+@dataclass
+class OrgVaultFake:
+    listing: AsyncMock
+    secret: AsyncMock
+    org_token: AsyncMock
+    folders_restricted: AsyncMock
+    organization: Organization
+    database: AgentDB
+
+    async def imported_rows(self) -> list[CredentialModel]:
+        async with self.database.Session() as session:
+            return list((await session.scalars(select(CredentialModel))).all())
+
+
+@pytest_asyncio.fixture
+async def org_vault(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine) -> OrgVaultFake:
+    """An organization with a connected Bitwarden account, faked only at the BitwardenService boundary and the
+    org-token read, over a real credentials table. It lists one login whose only site is portal.example.com."""
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    token = BitwardenOrganizationAuthToken(
+        id="oat_org_vault",
+        organization_id="o_test_org",
+        token_type=OrganizationAuthTokenType.bitwarden_credential,
+        valid=True,
+        created_at=now,
+        modified_at=now,
+        credential=BitwardenCredential(email=ORG_VAULT_ACCOUNT_EMAIL, master_password=ORG_VAULT_MASTER_PASSWORD),
+    )
+    organization = Organization(
+        organization_id="o_test_org",
+        organization_name="Test org",
+        bw_collection_ids=["col_1"],
+        created_at=now,
+        modified_at=now,
+    )
+    database = AgentDB("sqlite+aiosqlite://", db_engine=sqlite_engine)
+    fake = OrgVaultFake(
+        listing=AsyncMock(return_value=[org_vault_overview()]),
+        secret=AsyncMock(
+            return_value=BitwardenLoginSecret(
+                {
+                    BitwardenConstants.USERNAME: "vault-user@example.com",
+                    BitwardenConstants.PASSWORD: ORG_VAULT_LOGIN_PASSWORD,
+                    BitwardenConstants.TOTP: "",
+                },
+                ORG_VAULT_PORTAL_SITES,
+            )
+        ),
+        org_token=AsyncMock(return_value=token),
+        folders_restricted=AsyncMock(return_value=False),
+        organization=organization,
+        database=database,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "organizations",
+        SimpleNamespace(get_valid_org_auth_token=fake.org_token, get_organization=AsyncMock(return_value=organization)),
+        raising=False,
+    )
+    monkeypatch.setattr(app.DATABASE, "credentials", database.credentials, raising=False)
+    # `app` is an AppHolder proxy without __delattr__; patch the underlying instance so teardown can delete it.
+    monkeypatch.setattr(
+        object.__getattribute__(app, "_inst"),
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.BITWARDEN_CONNECTED: ConnectedBitwardenCredentialVaultService()},
+        raising=False,
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "credential_folders_restricted", fake.folders_restricted)
+    monkeypatch.setattr(
+        credential_creation_service,
+        "get_request_principal",
+        lambda: RequestPrincipal("o_test_org", AuthKind.ui_session, user_id="u_org_vault"),
+    )
+    monkeypatch.setattr(BitwardenService, "list_item_overviews", fake.listing)
+    monkeypatch.setattr(BitwardenService, "get_secret_value_from_url", fake.secret)
+    return fake
+
+
+MARKER_RGB = (12, 200, 34)
+
+
+@functools.cache
+def chromium_available() -> bool:
+    try:
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+def requires_chromium(test: _T) -> _T:
+    return pytest.mark.skipif(
+        not chromium_available(),
+        reason="Requires Playwright browsers installed (run: playwright install chromium)",
+    )(test)
+
+
+@asynccontextmanager
+async def chromium_context() -> AsyncIterator[BrowserContext]:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            yield await browser.new_context()
+        finally:
+            await browser.close()
+
+
+@asynccontextmanager
+async def never_answering_origin() -> AsyncIterator[str]:
+    """An HTTP origin that accepts requests and never answers; a web font fetched from it holds ``page.screenshot``."""
+    release = asyncio.Event()
+
+    async def hold(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await release.wait()
+        writer.close()
+
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    try:
+        yield f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    finally:
+        release.set()
+        server.close()
+        await server.wait_closed()
+
+
+def stalled_font_css(origin: str, color: tuple[int, int, int]) -> str:
+    rgb = "rgb({},{},{})".format(*color)
+    return (
+        f"@font-face{{font-family:Never;src:url({origin}/never.woff2)}}"
+        f"html,body{{font-family:Never !important;background:{rgb} !important}}"
+    )
+
+
+async def open_marker_page(
+    context: BrowserContext,
+    color: tuple[int, int, int],
+    url: str,
+    *,
+    stall_origin: str | None = None,
+    height_px: int = 720,
+) -> Page:
+    """Serve ``url`` to this page only as one solid ``color``; ``stall_origin`` (same origin as ``url``) leaves a
+    web font loading forever."""
+    rgb = "rgb({},{},{})".format(*color)
+    css = stalled_font_css(stall_origin, color) if stall_origin else ""
+    html = (
+        f"<html><head><style>html,body{{margin:0;background:{rgb}}}{css}</style></head>"
+        f"<body><div style='height:{height_px}px'>marker</div></body></html>"
+    )
+    page = await context.new_page()
+    await page.route(url, lambda route: route.fulfill(body=html, content_type="text/html"))
+    await page.goto(url, wait_until="domcontentloaded")
+    if stall_origin:
+        await page.wait_for_function("document.fonts.status === 'loading'")
+    return page
+
+
+def png_background_colors(png: bytes) -> set[tuple[int, int, int]]:
+    """Colors of the right-edge column every 50 px, clear of the top-left marker text."""
+    with Image.open(BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+        return {rgb.getpixel((rgb.width - 5, y)) for y in range(0, rgb.height, 50)}
+
+
+async def _never_start_driver() -> NoReturn:
+    raise AssertionError("driver startup is outside this test")
+
+
+def skycdp_engine_selection() -> BrowserEngineSelection:
+    return BrowserEngineSelection(
+        name=SKYCDP_ENGINE_NAME,
+        start_driver=_never_start_driver,
+        error_type=PlaywrightError,
+        timeout_error_type=PlaywrightTimeoutError,
+        metadata=BrowserEngineMetadata(name=SKYCDP_ENGINE_NAME, version="test"),
+        selection_reason="test",
+    )
+
+
+async def screenshot_stalls_until_its_own_timeout(*, timeout: float, **_kwargs: object) -> bytes:
+    await asyncio.sleep(timeout / 1000)
+    raise PlaywrightTimeoutError("waiting for fonts to load")

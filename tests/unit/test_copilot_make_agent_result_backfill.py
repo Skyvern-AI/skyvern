@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _make_agent_result,
     _terminal_failed_operation,
 )
+from skyvern.forge.sdk.copilot.agent_context import CredentialOriginRecovery
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.build_test_outcome import (
@@ -26,7 +27,6 @@ from skyvern.forge.sdk.copilot.context import (
 )
 from skyvern.forge.sdk.copilot.google_connection_notice import GoogleConnectionNotice
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import CredentialOriginRecovery
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage, WorkflowCopilotChatSender
 from tests.unit.copilot_test_helpers import failed_second_factor_run
@@ -85,8 +85,11 @@ def test_backfill_tolerates_turn_outcome_none() -> None:
     assert "responseKind" not in result.narrative_payload
 
 
-def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
+def test_backfill_adds_setup_and_binding_google_connection_notices_to_terminal_payload() -> None:
     ctx = _ctx()
+    ctx.google_setup_notices = [
+        GoogleConnectionNotice(connectionId=None, condition="unbound", scopeProfile="gmail", origin="setup")
+    ]
     ctx.google_connection_notices = [
         GoogleConnectionNotice(
             connectionId="goac_needs_reconnect",
@@ -101,10 +104,21 @@ def test_backfill_adds_google_connection_notices_to_terminal_payload() -> None:
     assert result.narrative_payload["googleConnectionNotices"] == [
         {
             "provider": "google",
+            "connectionId": None,
+            "displayName": None,
+            "condition": "unbound",
+            "scopeProfile": "gmail",
+            "origin": "setup",
+            "choices": [],
+        },
+        {
+            "provider": "google",
             "connectionId": "goac_needs_reconnect",
             "displayName": "Sheets account",
             "condition": "unusable",
-        }
+            "scopeProfile": "google_sheets",
+            "origin": "workflow",
+        },
     ]
 
 

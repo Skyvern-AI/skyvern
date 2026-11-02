@@ -1,5 +1,7 @@
+import hmac
 import json
 import typing
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import pydantic
@@ -36,9 +38,10 @@ from skyvern.forge.sdk.db.models import (
     WorkflowScheduleModel,
 )
 from skyvern.forge.sdk.encrypt import encryptor
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import EncryptMethod, TokenDecryptionError
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.har_evidence import without_final_har_user_match
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
@@ -492,7 +495,8 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         browser_session_id=task_obj.browser_session_id,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
-        failure_category=task_obj.failure_category,
+        # The final recording match's claim is row bookkeeping, read only by the task repository's guarded writers.
+        failure_category=without_final_har_user_match(task_obj.failure_category),
     )
     return task
 
@@ -612,6 +616,22 @@ def convert_to_organization(org_model: OrganizationModel) -> Organization:
         created_at=org_model.created_at,
         modified_at=org_model.modified_at,
     )
+
+
+async def rows_with_secret(rows: Iterable[OrganizationAuthTokenModel], secret: str) -> list[OrganizationAuthTokenModel]:
+    """The rows whose stored token, decrypted when encrypted, equals ``secret``; undecryptable rows never match."""
+    matches = []
+    for row in rows:
+        stored = row.token
+        if row.encrypted_token and row.encrypted_method:
+            try:
+                stored = await encryptor.decrypt(row.encrypted_token, EncryptMethod(row.encrypted_method))
+            except (TokenDecryptionError, ValueError):
+                LOG.debug("Skipping undecryptable organization auth token", token_id=row.id)
+                continue
+        if stored and hmac.compare_digest(stored.encode("utf-8"), secret.encode("utf-8")):
+            matches.append(row)
+    return matches
 
 
 async def convert_to_organization_auth_token(

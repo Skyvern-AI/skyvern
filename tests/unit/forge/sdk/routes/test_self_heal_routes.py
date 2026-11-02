@@ -4,12 +4,10 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import skyvern.forge.sdk.routes.self_heal as self_heal_routes
 from skyvern.forge import app as forge_app
-from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.self_heal import (
     HealEpisode,
@@ -20,6 +18,7 @@ from skyvern.schemas.self_heal import (
     WorkflowReliability,
     compute_workflow_reliability,
 )
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "org_self_heal"
 
@@ -64,9 +63,8 @@ def _build_client(monkeypatch) -> tuple[TestClient, AsyncMock, AsyncMock, AsyncM
     monkeypatch.setattr(self_heal_routes, "get_workflow_reliability", get_reliability)
     monkeypatch.setattr(self_heal_routes, "get_workflows_reliability", get_reliability_batch)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
     return TestClient(fastapi_app), get_for_workflow, get_for_run, get_reliability, get_reliability_batch
 
 

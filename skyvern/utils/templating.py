@@ -1,6 +1,7 @@
 import json
 import keyword
 import re
+from collections.abc import Iterable
 from typing import Any, Callable
 
 from jinja2 import StrictUndefined, UndefinedError, meta, nodes
@@ -115,6 +116,53 @@ def get_missing_variables(template_source: str, template_data: dict) -> set[str]
     return missing_vars
 
 
+def get_jinja_template_variable_roots(template_source: str) -> set[str]:
+    """Return undeclared Jinja names used by a template without rendering it."""
+    env = SandboxedEnvironment(undefined=StrictUndefined)
+    env.globals = {}
+    return meta.find_undeclared_variables(env.parse(template_source))
+
+
+def get_jinja_template_variable_roots_in_value(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return get_jinja_template_variable_roots(value)
+    items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+    return set().union(*(get_jinja_template_variable_roots_in_value(item) for item in items))
+
+
+def get_caller_supplied_workflow_parameter_keys(parameters: Iterable[object]) -> set[str]:
+    """Return workflow inputs whose defaults cannot source values from runtime outputs."""
+    workflow_parameters: dict[str, object] = {}
+    for parameter in parameters:
+        key = getattr(parameter, "key", None)
+        if getattr(parameter, "parameter_type", None) == "workflow" and isinstance(key, str):
+            workflow_parameters[key] = parameter
+    dependencies: dict[str, set[str]] = {}
+    safe_keys: set[str] = set()
+
+    for key, parameter in workflow_parameters.items():
+        default_value = getattr(parameter, "default_value", None)
+        if default_value is None:
+            safe_keys.add(key)
+            continue
+        try:
+            roots = get_jinja_template_variable_roots_in_value(default_value)
+        except Exception:
+            continue
+        if roots <= workflow_parameters.keys():
+            dependencies[key] = roots
+
+    while True:
+        newly_safe = {key for key, roots in dependencies.items() if roots <= safe_keys}
+        if newly_safe <= safe_keys:
+            return safe_keys
+        safe_keys.update(newly_safe)
+
+
+class TransformedPlaceholderError(ValueError):
+    pass
+
+
 def reject_jinja_transformations_on_variable(
     template_source: str,
     variable_name: str,
@@ -132,7 +180,7 @@ def reject_jinja_transformations_on_variable(
         variable.name == variable_name and id(variable) not in direct_interpolations
         for variable in ast.find_all(nodes.Name)
     ):
-        raise ValueError(f"The {variable_name} placeholder must be used without Jinja transformations")
+        raise TransformedPlaceholderError(f"The {variable_name} placeholder must be used without Jinja transformations")
 
 
 MAX_AVAILABLE_KEYS = 200
