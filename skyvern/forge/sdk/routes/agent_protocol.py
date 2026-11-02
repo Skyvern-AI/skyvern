@@ -126,6 +126,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON,
     UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_INT4, MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.routes.trigger_type import (
     caps_run_response_values,
@@ -1953,7 +1954,7 @@ async def get_folder(
 )
 @base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
 async def get_folders(
-    page: int = Query(1, ge=1, description="Page number"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -4852,8 +4853,8 @@ async def retry_webhook(
 )
 async def get_tasks(
     filters: Annotated[TaskListFilters, Depends(task_list_filters)],
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     cursor: str | None = Query(None, max_length=_TASK_CURSOR_MAX_LENGTH),
 ) -> Response:
@@ -4944,8 +4945,8 @@ _RUN_SEARCH_KEY_EXAMPLES = ["login_url", "wr_abc123", "bp_123456789", "cred_1234
 )
 async def get_runs(
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
@@ -5419,7 +5420,7 @@ async def run_workflow_legacy(
     background_tasks: BackgroundTasks,
     workflow_id: str,  # this is the workflow_permanent_id internally
     workflow_request: WorkflowRequestBody,
-    version: int | None = None,
+    version: Annotated[int | None, Query(ge=1, le=MAX_INT4)] = None,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     template: bool = Query(False),
@@ -5560,8 +5561,8 @@ async def run_workflow_legacy(
     include_in_schema=False,
 )
 async def get_workflow_runs(
-    page: int = Query(1, ge=1, description="Page number for pagination."),
-    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE, description="Number of runs to return per page."),
     status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
@@ -5781,8 +5782,8 @@ async def _get_workflow_runs_by_id(
 )
 async def get_workflow_runs_by_id(
     workflow_id: str,
-    page: int = Query(1, ge=1, description="Page number for pagination."),
-    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE, description="Number of runs to return per page."),
     status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
@@ -5875,8 +5876,8 @@ async def get_workflow_runs_by_id(
 )
 async def get_workflow_runs_by_id_legacy(
     workflow_id: str,
-    page: int = Query(1, ge=1, description="Page number for pagination."),
-    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE, description="Number of runs to return per page."),
     status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
@@ -6068,8 +6069,8 @@ async def _build_workflow_and_run_from_workflow_run_id(
 )
 async def get_workflow_run_timeline(
     workflow_run_id: str,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> list[WorkflowRunTimeline]:
@@ -6148,8 +6149,8 @@ async def _build_workflow_run(
 )
 @base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
     only_templates: bool = Query(False),
@@ -6406,7 +6407,9 @@ async def get_workflow_templates() -> list[Workflow]:
 @base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
 async def get_workflow(
     workflow_permanent_id: str,
-    version: int | None = None,
+    # Annotated, not Query(None, ...): this function is also called directly in Python, where
+    # a Query default would become the runtime value and reach the database as a bind param.
+    version: Annotated[int | None, Query(ge=1, le=MAX_INT4)] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> Workflow:

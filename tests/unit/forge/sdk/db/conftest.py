@@ -12,26 +12,22 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.config import settings
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import Base
-from tests.unit.conftest import skip_unless_local_postgres
+from tests.unit.conftest import SqliteEngineFactory, skip_unless_local_postgres
 
 
 @pytest_asyncio.fixture
-async def db_engine() -> AsyncGenerator[Any]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield engine
-    await engine.dispose()
+async def db_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory()
 
 
 @pytest_asyncio.fixture
 async def agent_db(db_engine: Any) -> AsyncGenerator[AgentDB]:
-    yield AgentDB(database_string="sqlite+aiosqlite:///:memory:", debug_enabled=True, db_engine=db_engine)
+    yield AgentDB(database_string=str(db_engine.url), debug_enabled=True, db_engine=db_engine)
 
 
 @pytest.fixture(scope="session")

@@ -67,7 +67,7 @@ def local_server(monkeypatch: pytest.MonkeyPatch) -> Any:
     _RecordingHandler.received_raw_query = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _RecordingHandler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     # The SSRF guard blocks loopback by default; the local fixture is explicitly allowed, exactly as
     # the existing adopted-session download integration test does.
     monkeypatch.setattr(settings, "ALLOWED_HOSTS", [*settings.ALLOWED_HOSTS, "127.0.0.1"])

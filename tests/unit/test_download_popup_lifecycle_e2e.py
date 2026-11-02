@@ -83,7 +83,7 @@ async def popup_site() -> Any:
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -682,7 +682,7 @@ async def test_download_on_outside_client_new_tab_keeps_its_extension(tmp_path: 
     from playwright.async_api import async_playwright
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CsvAttachmentHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     origin = f"http://127.0.0.1:{server.server_address[1]}"
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

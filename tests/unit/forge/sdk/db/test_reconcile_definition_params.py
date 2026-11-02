@@ -1,7 +1,7 @@
 """Round-trip tests for the update-path parameter reconcile helpers.
 
 Exercises ``WorkflowsRepository.update_workflow_and_reconcile_definition_params``
-against an in-memory SQLite DB so add / update / remove / type-change / revive
+against a SQLite DB so add / update / remove / type-change / revive
 semantics plus the critical ID-preservation invariant are verified end to end.
 
 The ID-preservation invariant is the load-bearing one: workflow_run_parameters
@@ -19,18 +19,17 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, AsyncGenerator
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import update
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge import app
 from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.db.models import Base, WorkflowRunParameterModel
+from skyvern.forge.sdk.db.models import WorkflowRunParameterModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.routes import agent_protocol
@@ -48,20 +47,6 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 # --------------------------------------------------------------------------- #
 # Fixtures                                                                    #
 # --------------------------------------------------------------------------- #
-
-
-@pytest_asyncio.fixture
-async def db_engine() -> AsyncGenerator[Any]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield engine
-    await engine.dispose()
-
-
-@pytest_asyncio.fixture
-async def agent_db(db_engine: Any) -> AsyncGenerator[AgentDB]:
-    yield AgentDB(database_string="sqlite+aiosqlite:///:memory:", debug_enabled=True, db_engine=db_engine)
 
 
 @pytest_asyncio.fixture

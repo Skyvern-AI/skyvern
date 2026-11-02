@@ -84,6 +84,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
@@ -2642,6 +2643,7 @@ async def get_credentials(
     page: int = Query(
         1,
         ge=1,
+        le=MAX_PAGE,
         description="Page number for pagination",
         examples=[1],
         openapi_extra={"x-fern-sdk-parameter-name": "page"},
@@ -2649,6 +2651,7 @@ async def get_credentials(
     page_size: int = Query(
         10,
         ge=1,
+        le=MAX_PAGE_SIZE,
         description="Number of items per page",
         examples=[10],
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
@@ -2785,7 +2788,7 @@ async def get_credential_folder(
 )
 @base_router.get("/credential_folders/", response_model=list[CredentialFolder], include_in_schema=False)
 async def get_credential_folders(
-    page: int = Query(1, ge=1, description="Page number"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),

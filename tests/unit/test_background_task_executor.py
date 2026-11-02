@@ -1,8 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock
@@ -27,7 +25,6 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
-    Base,
     OrganizationModel,
     OutputParameterModel,
     StepModel,
@@ -58,6 +55,7 @@ from skyvern.schemas.run_enums import WebhookDeliveryStatus
 from skyvern.services import orphaned_run_reaper
 from skyvern.services import workflow_schedule_service as schedule_service_module
 from skyvern.services.webhook_delivery import PreparedWorkflowWebhook
+from tests.unit.conftest import SqliteEngineFactory
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -71,15 +69,9 @@ def workflow_service(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest_asyncio.fixture
-async def sqlite_db(tmp_path: Path) -> AsyncIterator[AgentDB]:
-    url = f"sqlite+aiosqlite:///{tmp_path / 'recovery.db'}"
-    engine = _build_engine(url)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    try:
-        yield AgentDB(url, db_engine=engine)
-    finally:
-        await engine.dispose()
+async def sqlite_db(sqlite_engine_factory: SqliteEngineFactory) -> AgentDB:
+    engine = sqlite_engine_factory(build_engine=_build_engine)
+    return AgentDB(str(engine.url), db_engine=engine)
 
 
 @pytest_asyncio.fixture
