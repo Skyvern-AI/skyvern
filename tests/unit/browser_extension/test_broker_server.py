@@ -4738,6 +4738,7 @@ async def test_client_output_watchdog_global_cap_and_bounded_stop(monkeypatch: p
     assert any(event == "browser_extension_client_output_global_cap" for event, _fields in logs)
 
     monkeypatch.setattr(broker_server_module, "MAX_GLOBAL_OUTPUT_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(broker_server_module, "BROKER_DRAINING_SEND_TIMEOUT_SECONDS", 0.05)
     stop_server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
     stop_connection = _ClientConnection(
         "never-drains",

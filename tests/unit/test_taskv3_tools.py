@@ -1185,7 +1185,8 @@ async def test_navigate_reports_a_ready_document_whose_load_never_fired_in_budge
     # keeps `load` from firing. The wait for load is still made — the readiness budget is the bound,
     # not the event — and when that budget runs out the tool reports what the document actually
     # reached instead of raising. RED with the load wait removed: one wait, and no time spent on it.
-    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 150)
+    monkeypatch.setattr(taskv3_tools, "_NAVIGATE_READINESS_PROBE_RESERVE_MS", 100)
     page, tools = _readiness_tools(monkeypatch, "interactive")
 
     async def _load_starves(state: str = "load", timeout: float | None = None) -> None:
@@ -1202,7 +1203,7 @@ async def test_navigate_reports_a_ready_document_whose_load_never_fired_in_budge
     assert r.status == "ok", r.content
     assert r.ok_class == "document_ready"
     assert [wait["state"] for wait in _load_state_waits(page)] == ["domcontentloaded", "load"]
-    assert waited >= 0.4  # the load wait was made and spent its budget, not skipped
+    assert waited >= 0.045  # the load wait was made and spent its budget, not skipped
     assert "https://jobs.example.test/acme/123" in r.content and "(HTTP 200)" in r.content
     assert "the document is ready" in r.content and "still loading its scripts and resources" in r.content
     assert "act on what has rendered, or wait for the rest" in r.content
@@ -1221,7 +1222,8 @@ async def test_navigate_reports_a_ready_document_whose_readystate_read_never_ans
     # evaluate could not complete inside its reserve. The domcontentloaded wait had already RETURNED,
     # so the document was ready and the tool knew it; deriving the class from the read instead threw
     # that away and told the model the state was unknown, stopping the rest of its batch.
-    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 150)
+    monkeypatch.setattr(taskv3_tools, "_NAVIGATE_READINESS_PROBE_RESERVE_MS", 100)
     page, tools = _readiness_tools(monkeypatch, "interactive")
     page_evaluate = page.evaluate
 
@@ -1323,7 +1325,8 @@ async def test_navigate_does_not_read_an_advisory_waits_timeout_as_the_event(
     # `document_ready`, with the batch behind it left to run against it.
     # The readyState read never answers here, so the class rests on the waits alone: this is the arm
     # where the deadline guard is the only thing between an advisory timeout and a false witness.
-    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 150)
+    monkeypatch.setattr(taskv3_tools, "_NAVIGATE_READINESS_PROBE_RESERVE_MS", 100)
     page, tools = _readiness_tools(monkeypatch, "loading")
     page_evaluate = page.evaluate
 

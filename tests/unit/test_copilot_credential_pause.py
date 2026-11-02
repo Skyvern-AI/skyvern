@@ -26,7 +26,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterator
 from copy import deepcopy
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from itertools import count
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -144,6 +144,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import wire_credential_vault
+from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_copilot_make_agent_result_backfill import _payload as _backfill_payload
 
 
@@ -152,6 +153,37 @@ def _sequential_resume_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each card gets tok-1, tok-2, ... so a test can pre-seed the answer for the card it expects."""
     tokens = (f"tok-{n}" for n in count(1))
     monkeypatch.setattr(credential_pause_module, "_new_resume_token", lambda: next(tokens))
+
+
+class _CardClock:
+    """credential_pause's monotonic and wall clocks, moved only by its own poll sleeps, so an unanswered card
+    reaches its deadline without the test waiting it out."""
+
+    def __init__(self) -> None:
+        self._monotonic = 0.0
+        self._wall = datetime.now(timezone.utc)
+
+    def monotonic(self) -> float:
+        return self._monotonic
+
+    def now(self, tz: tzinfo) -> datetime:
+        return self._wall.astimezone(tz)
+
+    fromisoformat = staticmethod(datetime.fromisoformat)
+
+    async def sleep(self, seconds: float) -> None:
+        self._monotonic += seconds
+        self._wall += timedelta(seconds=seconds)
+        await asyncio.sleep(0)
+
+
+@pytest.fixture
+def card_clock(monkeypatch: pytest.MonkeyPatch) -> _CardClock:
+    clock = _CardClock()
+    monkeypatch.setattr(credential_pause_module, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(credential_pause_module, "datetime", clock)
+    monkeypatch.setattr(credential_pause_module, "asyncio", ScopedAsyncio(sleep=clock.sleep))
+    return clock
 
 
 def _repair_contract(
@@ -3326,6 +3358,7 @@ async def test_an_authenticator_update_ask_neither_spends_nor_resolves_origin_re
     assert ctx.credential_origin_refusals == set()
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("answer", "status"), [("skip", "skipped"), (None, "unanswered")])
 async def test_a_declined_origin_recovery_ends_the_turn_naming_the_missing_login(
@@ -3446,6 +3479,7 @@ def _update_ask_binding_setup(policy: RequestPolicy, credential: Credential, bin
         policy.current_turn_named_credential_ids = {"cred_1"}
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("binding_case", "binding"),
