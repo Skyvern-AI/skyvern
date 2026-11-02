@@ -84,7 +84,7 @@ vi.mock("@/hooks/useFeatureFlag", () => ({
   useFeatureFlag: () => false,
 }));
 vi.mock("@/hooks/useEmailForwarding", () => ({
-  useEmailForwardingAvailable: () => forwardingAvailability.available,
+  useForwardingCapability: () => forwardingAvailability.available,
 }));
 vi.mock("@/components/emailForwarding/CredentialForwardingAddress", () => ({
   CredentialForwardingAddress: () => <div>Forwarding address controls</div>,

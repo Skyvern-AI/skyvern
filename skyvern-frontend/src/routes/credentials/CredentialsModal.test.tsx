@@ -46,6 +46,8 @@ function permissionsForCredentialDelete(allowed: boolean): PermissionsState {
       role: allowed ? "admin" : "member",
       capabilities: [
         { capability: "credential.delete", allowed, reason: "role" },
+        { capability: "email_forwarding.list", allowed, reason: "role" },
+        { capability: "email_forwarding.create", allowed, reason: "role" },
       ],
     },
   };

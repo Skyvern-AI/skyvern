@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -11,10 +12,15 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReactNode, useState } from "react";
 import CloudContext from "@/store/CloudContext";
-import { useEmailForwardingAvailable } from "@/hooks/useEmailForwarding";
-import { forwardingError } from "@/api/emailForwarding";
+import { PageSlotsProvider } from "@/store/PageSlots";
+import {
+  useEmailForwardingAvailable,
+  type ForwardingCapability,
+} from "@/hooks/useEmailForwarding";
+import { forwardingError, type ForwardingAddress } from "@/api/emailForwarding";
 import { CredentialForwardingAddress } from "./CredentialForwardingAddress";
 import { ForwardingInbox } from "./ForwardingInbox";
+import { ForwardingAddressPanel } from "./ForwardingAddressPanel";
 import { EmailForwardingSettings } from "./EmailForwardingSettings";
 
 const api = vi.hoisted(() => ({
@@ -37,7 +43,7 @@ vi.mock("@/api/AxiosClient", () => ({
   }),
 }));
 
-const address = {
+const address: ForwardingAddress = {
   forwarding_address_id: "fea_test",
   organization_id: "o_test",
   email_config_id: "emc_test",
@@ -53,6 +59,14 @@ const address = {
   modified_at: "2026-09-01T00:00:00",
 };
 
+const forwardingActions = [
+  "list",
+  "read",
+  "create",
+  "update",
+  "delete",
+] as const;
+
 function mount(
   children: ReactNode,
   isCloud = true,
@@ -66,6 +80,49 @@ function mount(
       <MemoryRouter initialEntries={initialEntries}>
         <CloudContext.Provider value={isCloud}>
           {children}
+        </CloudContext.Provider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+function mountWithForwardingAllowed(
+  children: ReactNode,
+  allowed: boolean | Partial<Record<ForwardingCapability, boolean>>,
+  permissionStatus: "ready" | "loading" = "ready",
+) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const capabilities = forwardingActions.map((action) => ({
+    capability: `email_forwarding.${action}`,
+    allowed: typeof allowed === "boolean" ? allowed : (allowed[action] ?? true),
+    reason: "role" as const,
+  }));
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <CloudContext.Provider value={true}>
+          <PageSlotsProvider
+            value={{
+              permissions:
+                permissionStatus === "ready"
+                  ? {
+                      status: "ready",
+                      data: {
+                        organization_id: "o_test",
+                        user_id: "u_1",
+                        auth_kind: "bearer",
+                        org_role: "org:member",
+                        role: "member",
+                        capabilities,
+                      },
+                    }
+                  : { status: "loading" },
+            }}
+          >
+            {children}
+          </PageSlotsProvider>
         </CloudContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -274,10 +331,266 @@ describe("email forwarding", () => {
     );
   });
 
-  it("requires a saved credential before generating a bound address", async () => {
-    mount(<CredentialForwardingAddress identifier="" onChange={vi.fn()} />);
+  it.each([
+    ["denied", "ready"],
+    ["loading", "loading"],
+  ] as const)(
+    "sends no forwarding request and shows no surface while capabilities are %s",
+    async (_state, permissionStatus) => {
+      mountWithForwardingAllowed(
+        <>
+          <EmailForwardingSettings />
+          <CredentialForwardingAddress
+            credentialId="cred_test"
+            identifier="user@example.test"
+            onChange={vi.fn()}
+          />
+        </>,
+        false,
+        permissionStatus,
+      );
+      // Let React Query settle so the cold-cache request assertion is meaningful.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(api.getAvailability).not.toHaveBeenCalled();
+      expect(api.get).not.toHaveBeenCalled();
+      expect(screen.queryByText("Email forwarding")).toBeNull();
+      expect(
+        screen.queryByRole("button", {
+          name: "Generate a Skyvern forwarding address",
+        }),
+      ).toBeNull();
+      expect(api.post).not.toHaveBeenCalled();
+    },
+  );
+
+  it("closes the inbox and hides cached messages when read access is revoked", async () => {
+    let revokeRead = () => {};
+    function CapabilityHarness({ children }: { children: ReactNode }) {
+      const [canRead, setCanRead] = useState(true);
+      revokeRead = () => setCanRead(false);
+      const capabilities = (
+        ["list", "read", "create", "update", "delete"] as const
+      ).map((action) => ({
+        capability: `email_forwarding.${action}`,
+        allowed: action === "read" ? canRead : true,
+        reason: "role" as const,
+      }));
+      return (
+        <PageSlotsProvider
+          value={{
+            permissions: {
+              status: "ready",
+              data: {
+                organization_id: "o_test",
+                user_id: "u_1",
+                auth_kind: "bearer",
+                org_role: "org:member",
+                role: "member",
+                capabilities,
+              },
+            },
+          }}
+        >
+          {children}
+        </PageSlotsProvider>
+      );
+    }
+
+    api.get.mockResolvedValue({
+      data: [
+        {
+          inbound_email_id: "email_test",
+          category: "otp",
+          subject: "Verification code",
+          from_address: "sender@example.test",
+          created_at: "2026-10-01T00:00:00",
+          body_text: "Cached verification message",
+          links: [],
+          verdicts: {},
+        },
+      ],
+      headers: { "x-has-more": "false" },
+    });
+    mount(
+      <CapabilityHarness>
+        <ForwardingAddressPanel address={address} />
+      </CapabilityHarness>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "View confirmation" }),
+    );
+    expect(await screen.findByText("Cached verification message")).toBeTruthy();
+
+    act(() => revokeRead());
+    await waitFor(() => {
+      expect(screen.queryByText("Cached verification message")).toBeNull();
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
+
+  it("still lists addresses for a role that holds the capability", async () => {
+    api.get.mockImplementation(async () => ({ data: [address] }));
+    mountWithForwardingAllowed(<EmailForwardingSettings />, true);
+    await waitFor(() =>
+      expect(api.get).toHaveBeenCalledWith("/email-forwarding/addresses"),
+    );
+    expect(await screen.findByText("Email forwarding")).toBeTruthy();
+  });
+
+  it("checks availability and lists addresses for a list-only role", async () => {
+    mountWithForwardingAllowed(<EmailForwardingSettings />, {
+      list: true,
+      read: false,
+      create: false,
+      update: false,
+      delete: false,
+    });
+
+    expect(await screen.findByText("Email forwarding")).toBeTruthy();
+    expect(api.getAvailability).toHaveBeenCalledWith(
+      "/api/v1/email-forwarding/availability",
+    );
+    await waitFor(() =>
+      expect(api.get).toHaveBeenCalledWith("/email-forwarding/addresses"),
+    );
     expect(
-      screen.getByText(
+      screen.queryByRole("button", { name: "Generate address" }),
+    ).toBeNull();
+  });
+
+  it.each([
+    {
+      capability: "create",
+      launchButton: "Generate address",
+      confirmButton: "Create address",
+    },
+    {
+      capability: "update",
+      launchButton: "Rotate",
+      confirmButton: "Rotate address",
+    },
+    {
+      capability: "delete",
+      launchButton: "Revoke",
+      confirmButton: "Revoke address",
+    },
+  ] as const)(
+    "closes the $capability confirmation when access is revoked",
+    async ({ capability, launchButton, confirmButton }) => {
+      let revokeCapability: () => void = () => {};
+      function CapabilityHarness({ children }: { children: ReactNode }) {
+        const [allowed, setAllowed] = useState<
+          Record<ForwardingCapability, boolean>
+        >({ list: true, read: true, create: true, update: true, delete: true });
+        revokeCapability = () =>
+          setAllowed((current) => ({ ...current, [capability]: false }));
+        const capabilities = forwardingActions.map((action) => ({
+          capability: `email_forwarding.${action}`,
+          allowed: allowed[action],
+          reason: "role" as const,
+        }));
+        return (
+          <PageSlotsProvider
+            value={{
+              permissions: {
+                status: "ready",
+                data: {
+                  organization_id: "o_test",
+                  user_id: "u_1",
+                  auth_kind: "bearer",
+                  org_role: "org:member",
+                  role: "member",
+                  capabilities,
+                },
+              },
+            }}
+          >
+            {children}
+          </PageSlotsProvider>
+        );
+      }
+
+      api.get.mockResolvedValue({ data: [address] });
+      mount(
+        <CapabilityHarness>
+          <EmailForwardingSettings />
+        </CapabilityHarness>,
+      );
+      fireEvent.click(
+        await screen.findByRole("button", { name: launchButton }),
+      );
+      expect(
+        await screen.findByRole("button", { name: confirmButton }),
+      ).toBeTruthy();
+
+      act(() => revokeCapability());
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(api.post).not.toHaveBeenCalled();
+      expect(api.delete).not.toHaveBeenCalled();
+    },
+  );
+
+  it("closes the previous-address revoke dialog when delete access is revoked", async () => {
+    let revokeDelete = () => {};
+    function CapabilityHarness({ children }: { children: ReactNode }) {
+      const [canDelete, setCanDelete] = useState(true);
+      revokeDelete = () => setCanDelete(false);
+      const capabilities = forwardingActions.map((action) => ({
+        capability: `email_forwarding.${action}`,
+        allowed: action === "delete" ? canDelete : true,
+        reason: "role" as const,
+      }));
+      return (
+        <PageSlotsProvider
+          value={{
+            permissions: {
+              status: "ready",
+              data: {
+                organization_id: "o_test",
+                user_id: "u_1",
+                auth_kind: "bearer",
+                org_role: "org:member",
+                role: "member",
+                capabilities,
+              },
+            },
+          }}
+        >
+          {children}
+        </PageSlotsProvider>
+      );
+    }
+
+    api.get.mockResolvedValue({ data: [address] });
+    mount(
+      <CapabilityHarness>
+        <CredentialForwardingAddress
+          credentialId="cred_test"
+          identifier="changed@example.test"
+          onChange={vi.fn()}
+        />
+      </CapabilityHarness>,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Revoke previous address" }),
+    );
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+
+    act(() => revokeDelete());
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(api.delete).not.toHaveBeenCalled();
+  });
+
+  it("requires a saved credential before generating a bound address", async () => {
+    mountWithForwardingAllowed(
+      <CredentialForwardingAddress identifier="" onChange={vi.fn()} />,
+      true,
+    );
+    expect(
+      await screen.findByText(
         /click Email again to clear it, then save this credential/i,
       ),
     ).toBeTruthy();

@@ -1,5 +1,5 @@
 import { isAxiosError } from "axios";
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { EnvelopeClosedIcon, PlusIcon } from "@radix-ui/react-icons";
 import CloudContext from "@/store/CloudContext";
@@ -40,9 +40,9 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
-  useEmailForwardingAvailable,
   useForwardingAction,
   useForwardingAddresses,
+  useForwardingCapability,
 } from "@/hooks/useEmailForwarding";
 import { ForwardingAddressPanel } from "./ForwardingAddressPanel";
 import {
@@ -70,9 +70,12 @@ export function EmailForwardingSettings() {
 }
 
 function EmailForwardingSettingsBody() {
-  const available = useEmailForwardingAvailable();
+  const canList = useForwardingCapability("list");
+  const canCreate = useForwardingCapability("create");
+  const canUpdate = useForwardingCapability("update");
+  const canRevoke = useForwardingCapability("delete");
   const { hash } = useLocation();
-  useScrollToHash(available && hash === "#email-forwarding");
+  useScrollToHash(canList && hash === "#email-forwarding");
   const isCloud = useContext(CloudContext);
   const addresses = useForwardingAddresses();
   const action = useForwardingAction();
@@ -86,7 +89,23 @@ function EmailForwardingSettingsBody() {
   const [rotated, setRotated] = useState<ForwardingAddress | null>(null);
   const [rotatedFromUnboundDedicated, setRotatedFromUnboundDedicated] =
     useState(false);
-  if (!available) return null;
+  const canConfirmPending =
+    pending !== null &&
+    canList &&
+    (pending.kind === "rotate" ? canUpdate : canRevoke);
+  useEffect(() => {
+    if (!canList) {
+      setDetails(null);
+      setPending(null);
+      setMintOpen(false);
+      return;
+    }
+    if (!canCreate) setMintOpen(false);
+    if (pending && (pending.kind === "rotate" ? !canUpdate : !canRevoke)) {
+      setPending(null);
+    }
+  }, [canList, canCreate, canUpdate, canRevoke, pending]);
+  if (!canList) return null;
   const addressCount =
     addresses.data?.filter((address) => address.status !== "revoked").length ??
     0;
@@ -97,7 +116,13 @@ function EmailForwardingSettingsBody() {
     ) ?? details;
 
   async function confirm() {
-    if (!pending) return;
+    if (
+      !pending ||
+      !canList ||
+      (pending.kind === "rotate" ? !canUpdate : !canRevoke)
+    ) {
+      return;
+    }
     try {
       const result = await action.mutateAsync(
         pending.kind === "rotate"
@@ -155,7 +180,7 @@ function EmailForwardingSettingsBody() {
                   ? "Included with Pro"
                   : "Bring your own email receiver"}
               </p>
-              {isCloud && (
+              {isCloud && canCreate && (
                 <Button
                   type="button"
                   variant="outline"
@@ -294,57 +319,63 @@ function EmailForwardingSettingsBody() {
                             </Button>
                             {address.status !== "revoked" && (
                               <>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="sm"
-                                  disabled={action.isPending}
-                                  onClick={() => {
-                                    action.reset();
-                                    setReplacement("");
-                                    setPending({
-                                      kind: "rotate",
-                                      address,
-                                      managed: isCloud,
-                                    });
-                                  }}
-                                >
-                                  Rotate
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="sm"
-                                  disabled={action.isPending}
-                                  onClick={() =>
-                                    action.mutate({
-                                      kind:
-                                        address.status === "disabled"
-                                          ? "enable"
-                                          : "disable",
-                                      address,
-                                    })
-                                  }
-                                >
-                                  {address.status === "disabled"
-                                    ? "Enable"
-                                    : "Disable"}
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="sm"
-                                  disabled={action.isPending}
-                                  onClick={() => {
-                                    action.reset();
-                                    setPending({
-                                      kind: "revoke",
-                                      address,
-                                    });
-                                  }}
-                                >
-                                  Revoke
-                                </Button>
+                                {canUpdate && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={action.isPending}
+                                    onClick={() => {
+                                      action.reset();
+                                      setReplacement("");
+                                      setPending({
+                                        kind: "rotate",
+                                        address,
+                                        managed: isCloud,
+                                      });
+                                    }}
+                                  >
+                                    Rotate
+                                  </Button>
+                                )}
+                                {canUpdate && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={action.isPending}
+                                    onClick={() =>
+                                      action.mutate({
+                                        kind:
+                                          address.status === "disabled"
+                                            ? "enable"
+                                            : "disable",
+                                        address,
+                                      })
+                                    }
+                                  >
+                                    {address.status === "disabled"
+                                      ? "Enable"
+                                      : "Disable"}
+                                  </Button>
+                                )}
+                                {canRevoke && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={action.isPending}
+                                    onClick={() => {
+                                      action.reset();
+                                      setPending({
+                                        kind: "revoke",
+                                        address,
+                                      });
+                                    }}
+                                  >
+                                    Revoke
+                                  </Button>
+                                )}
                               </>
                             )}
                           </div>
@@ -376,7 +407,7 @@ function EmailForwardingSettingsBody() {
           </DialogContent>
         </Dialog>
         <Dialog
-          open={Boolean(pending)}
+          open={Boolean(pending) && canConfirmPending}
           onOpenChange={(open) => {
             if (!open && !action.isPending) setPending(null);
           }}
@@ -424,6 +455,7 @@ function EmailForwardingSettingsBody() {
                 type="button"
                 disabled={
                   action.isPending ||
+                  !canConfirmPending ||
                   (pending?.kind === "rotate" &&
                     !pending.managed &&
                     !replacement.trim())
@@ -440,9 +472,9 @@ function EmailForwardingSettingsBody() {
           </DialogContent>
         </Dialog>
         <Dialog
-          open={mintOpen}
+          open={mintOpen && canList && canCreate}
           onOpenChange={(open) => {
-            if (!action.isPending) setMintOpen(open);
+            if (!action.isPending && canList && canCreate) setMintOpen(open);
           }}
         >
           <DialogContent>
@@ -504,8 +536,9 @@ function EmailForwardingSettingsBody() {
               </Button>
               <Button
                 type="button"
-                disabled={action.isPending}
+                disabled={action.isPending || !canList || !canCreate}
                 onClick={async () => {
+                  if (!canList || !canCreate) return;
                   try {
                     const result = await action.mutateAsync({
                       kind: "mint",
