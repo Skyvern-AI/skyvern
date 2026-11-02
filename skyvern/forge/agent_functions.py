@@ -144,10 +144,19 @@ async def record_request_audit_event(
     *,
     changed_fields: tuple[str, ...] = (),
     related_resource_ids: tuple[str, ...] = (),
+    metadata: Mapping[str, str | list[str]] | None = None,
 ) -> None:
     await app.AGENT_FUNCTION.record_audit_event(
         get_request_principal(),
-        AuditEvent(organization_id, action, resource_type, resource_id, changed_fields, related_resource_ids),
+        AuditEvent(
+            organization_id,
+            action,
+            resource_type,
+            resource_id,
+            changed_fields,
+            related_resource_ids,
+            metadata=metadata or {},
+        ),
     )
 
 

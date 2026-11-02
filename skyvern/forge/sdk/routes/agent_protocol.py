@@ -970,6 +970,16 @@ async def bulk_cancel_runs(
         raise
 
 
+def _sanitize_workflow_yaml_mapping(parsed: Any) -> dict[str, Any]:
+    # YAML parses a bare word, number, list or empty body to a non-dict, which the sanitizer cannot copy.
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid workflow definition. The YAML must be a mapping with a title and a workflow_definition.",
+        )
+    return sanitize_workflow_yaml_with_references(parsed)
+
+
 @legacy_base_router.post(
     "/workflows",
     openapi_extra={
@@ -1008,7 +1018,7 @@ async def create_workflow_legacy(
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     # Auto-sanitize block labels and update references for imports
-    workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
+    workflow_yaml = _sanitize_workflow_yaml_mapping(workflow_yaml)
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
@@ -1215,7 +1225,7 @@ async def create_workflow(
         if data.yaml_definition:
             workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
-            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
+            workflow_json_from_yaml = _sanitize_workflow_yaml_mapping(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
@@ -1715,7 +1725,7 @@ async def update_workflow(
         if data.yaml_definition:
             workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
-            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
+            workflow_json_from_yaml = _sanitize_workflow_yaml_mapping(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
