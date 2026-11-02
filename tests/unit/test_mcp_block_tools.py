@@ -322,6 +322,40 @@ async def test_unavailable_powerbi_is_hidden_from_schema_and_nested_validation(
     assert "Power BI queries are not currently available." in nested["error"]["message"]
 
 
+CONNECTED_ACCOUNT_MARKER = "x-skyvern-connected-account"
+CONNECTED_ACCOUNT_FIELDS = {
+    ("file_upload", "google_credential_id"),
+    ("file_download", "google_credential_id"),
+    ("send_email", "credential_id"),
+    ("google_sheets_read", "credential_id"),
+    ("email_inbox", "credential_id"),
+    ("google_sheets_write", "credential_id"),
+    ("powerbi_query", "connection_id"),
+}
+
+
+@pytest.mark.asyncio
+async def test_block_schema_marker_alone_finds_exactly_the_connected_account_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: True)
+
+    listed = await skyvern_block_schema()
+    marked: set[tuple[str, str]] = set()
+    for block_type in listed["data"]["block_types"]:
+        result = await skyvern_block_schema(block_type=block_type)
+        assert result["ok"] is True, result
+        schema = result["data"]["schema"]
+        if "$ref" in schema:
+            # Recursive loop blocks publish their own root as a $ref; other blocks nested in $defs are not walked.
+            schema = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]
+        for field, prop in schema["properties"].items():
+            if prop.get(CONNECTED_ACCOUNT_MARKER) is True:
+                marked.add((block_type, field))
+
+    assert marked == CONNECTED_ACCOUNT_FIELDS
+
+
 @pytest.mark.asyncio
 async def test_unavailable_powerbi_does_not_match_trigger_payload_data(
     monkeypatch: pytest.MonkeyPatch,
