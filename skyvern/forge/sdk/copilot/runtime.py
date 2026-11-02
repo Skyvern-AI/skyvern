@@ -1332,12 +1332,12 @@ def _check_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
         started_at is not None
         and turn_clock_seconds(ctx, started_at, time.monotonic()) >= MINTED_BROWSER_RENEWAL_TURN_SECONDS
     ):
-        _end_minted_browser_renewal(ctx, session_id)
+        end_minted_browser_renewal(ctx, session_id)
     else:
         _arm_minted_browser_renewal_check(ctx, session_id)
 
 
-def _end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+def end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
     check = ctx.minted_browser_renewal_checks.pop(session_id, None)
     if check is None:
         return
@@ -1347,7 +1347,7 @@ def _end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
 
 def end_minted_browser_renewals(ctx: AgentContext) -> None:
     for session_id in list(ctx.minted_browser_renewal_checks):
-        _end_minted_browser_renewal(ctx, session_id)
+        end_minted_browser_renewal(ctx, session_id)
 
 
 async def _provision_browser_session(
@@ -1590,7 +1590,7 @@ async def _prestart_build_test_browser(
 
 
 async def _close_build_test_prestart(ctx: AgentContext, session_id: str, *, reason: BrowserSessionCloseReason) -> None:
-    _end_minted_browser_renewal(ctx, session_id)
+    end_minted_browser_renewal(ctx, session_id)
     attached = ctx.attached_browser_drivers.pop(session_id, None)
     if attached is not None:
         await wait_for_driver_releases([start_browser_driver_release(ctx.organization_id, attached)])
