@@ -155,8 +155,8 @@ async def test_get_verification_code_polling_budget_bounds_a_never_answering_sou
     # polls for at most the per-call cap and returns "not yet", the cumulative polling is capped at
     # VERIFICATION_CODE_POLLING_TIMEOUT_MINS, and once spent the tool says so without awaiting the
     # resolver again.
-    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=1 / 60))
-    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=0.1 / 60))
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.005)
     monkeypatch.setattr(auth_tools, "_MIN_SLICE_SECONDS", 0.0)
     resolver_calls = 0
     caps: list[float] = []
@@ -190,7 +190,7 @@ async def test_get_verification_code_polling_budget_bounds_a_never_answering_sou
     assert {e["reason"] for e in armings} == {"budget_exhausted"}
     assert {e["tool"] for e in armings} == {"get_verification_code"}
     assert [e["arming_count"] for e in armings] == list(range(1, len(exhausted) + 1))
-    assert all(cap <= 0.05 for cap in caps) and sum(caps) <= 1.0 + 0.05
+    assert all(cap <= 0.005 for cap in caps) and sum(caps) <= 0.1 + 0.005
 
 
 @pytest.mark.asyncio
@@ -338,7 +338,8 @@ def _arming_setup(
     link = OTPValue(value="https://example.test/magic?token=abc", type=OTPType.MAGIC_LINK)
 
     if case in {"budget_exhausted", "budget_exhausted_on_the_link_tool"}:
-        monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=1 / 60))
+        monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=0.1 / 60))
+        monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.005)
         monkeypatch.setattr(auth_tools, "_MIN_SLICE_SECONDS", 0.0)
 
         async def _never_answers(*_a: Any, max_wait_seconds: float, **_k: Any) -> OTPValue | None:
@@ -1768,8 +1769,8 @@ async def test_code_tool_never_redirects_to_a_stored_link_this_task_must_not_fol
 @pytest.mark.asyncio
 async def test_verification_tools_share_one_polling_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     # Two tools over one verification source must not double the wait a never-answering source can buy.
-    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=1 / 60))
-    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(auth_tools, "settings", SimpleNamespace(VERIFICATION_CODE_POLLING_TIMEOUT_MINS=0.1 / 60))
+    monkeypatch.setattr(auth_tools, "_PER_CALL_WAIT_SECONDS", 0.005)
     monkeypatch.setattr(auth_tools, "_MIN_SLICE_SECONDS", 0.0)
     resolver_calls = 0
 

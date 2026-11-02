@@ -1429,7 +1429,7 @@ async def test_a_challenge_frame_behind_wedged_frames_is_still_found(monkeypatch
         },
     )()
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.1)
     challenge = FakeFrame(url="https://app.example/challenge-frame", nested_marker=FakeLocator(count=1), visible=True)
     page = FakePage(frames=[*(_WedgedFrame() for _ in range(4)), challenge])  # type: ignore[list-item]
 
@@ -1473,7 +1473,7 @@ async def test_hcaptcha_arm_bound_cuts_extension_before_default_timeout(monkeypa
     monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 5)
 
     async def slow_solve(_page: FakePage) -> bool:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
         return True
 
     agent_function = type(
@@ -1504,7 +1504,7 @@ async def test_extension_arm_bound_falls_back_to_default_when_no_hcaptcha_marker
     monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 0.05)
 
     async def slow_solve(_page: FakePage) -> bool:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
         return True
 
     agent_function = type(

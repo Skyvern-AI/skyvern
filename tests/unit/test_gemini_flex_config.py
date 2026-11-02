@@ -14,13 +14,14 @@ from skyvern.schemas.llm import LLMConfig
 @pytest.fixture
 def gemini_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """ENABLE_GEMINI is off by default, so the Gemini block only registers on a reload with it
-    set. The registry dict, config_registry's module-level `settings` binding and SettingsManager
-    are all process-global; snapshot and restore the three so the reload can't leak into other
-    tests (or be leaked into, depending on execution order).
+    set. The registry dict, config_registry's module globals (the reload rebinds `settings` and the
+    `LLMConfigRegistry` class other modules imported by name) and SettingsManager are all
+    process-global; snapshot and restore the three so the reload can't leak into other tests (or be
+    leaked into, depending on execution order).
     """
     previous_settings = SettingsManager.get_settings()
     previous_configs = dict(config_registry.LLMConfigRegistry._configs)
-    previous_module_settings = config_registry.settings
+    previous_namespace = dict(vars(config_registry))
 
     gemini_settings = Settings(ENABLE_GEMINI=True, GEMINI_API_KEY="test-key")
     SettingsManager.set_settings(gemini_settings)
@@ -31,9 +32,9 @@ def gemini_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         yield
     finally:
         SettingsManager.set_settings(previous_settings)
+        vars(config_registry).update(previous_namespace)
         config_registry.LLMConfigRegistry._configs.clear()
         config_registry.LLMConfigRegistry._configs.update(previous_configs)
-        config_registry.settings = previous_module_settings
 
 
 def test_gemini_3_1_flash_lite_flex_requests_the_flex_service_tier(gemini_registry: None) -> None:
