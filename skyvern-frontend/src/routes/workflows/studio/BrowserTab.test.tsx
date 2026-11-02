@@ -608,6 +608,40 @@ describe("BrowserTab view machine", () => {
       artifactId: "art_1",
       stepId: "step_1",
       actionOrder: 0,
+      workflowRunBlockId: null,
+    });
+  });
+
+  it("gives a failed code block's trailing row its block so the hero can fall back to a block screenshot", () => {
+    seedRun({ status: Status.Failed });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          block_type: "code",
+          status: Status.Failed,
+          actions: [
+            buildAction({
+              action_id: "act_failed",
+              action_type: ActionTypes.NullAction,
+              status: Status.Failed,
+              action_order: 1,
+              screenshot_artifact_id: null,
+            }),
+            buildAction(),
+          ],
+        }),
+      ),
+    ];
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=act_failed`);
+
+    const shot = screen.getByTestId("hero-screenshot");
+    expect(JSON.parse(shot.getAttribute("data-selection") ?? "{}")).toEqual({
+      kind: "action",
+      artifactId: null,
+      stepId: "step_1",
+      actionOrder: 1,
+      workflowRunBlockId: "wrb_1",
     });
   });
 
