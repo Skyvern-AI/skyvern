@@ -64,12 +64,11 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
 from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
-    start_hosted_driver_sweep,
     start_temp_artifact_sweep,
     stop_cleanup_scheduler,
-    stop_hosted_driver_sweep,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.hosted_driver_sweep import start_hosted_driver_sweep, stop_hosted_driver_sweep
 from skyvern.services.orphaned_run_reaper import reap_orphaned_runs_once
 from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (

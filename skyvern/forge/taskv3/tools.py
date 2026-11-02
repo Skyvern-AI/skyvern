@@ -5388,6 +5388,8 @@ _ACT_TOOL_TIMEOUT_MS = _ADDRESS_RESOLVE_TIMEOUT_MS + 180_000
 # the delay between keys, so a key gets ~3x that; the cap keeps a field that never takes keys from stalling the run.
 _PER_KEY_TIMEOUT_MS = 250
 _TYPING_TIMEOUT_CAP_MS = 120_000
+# How long a click on a matched suggestion row waits to land before the pick is reported as not clicked.
+_SUGGESTION_ROW_CLICK_TIMEOUT_MS = 3000
 # How long one box of a one-character-per-box code field may stay disabled once the box before it holds a character.
 _CODE_BOX_ENABLE_WAIT_MS = 1500
 # Fewer adjacent one-character boxes (initials, a two-box suffix) are separate fields, not one segmented field.
@@ -8819,6 +8821,10 @@ _POPUP_FILTER_INPUT_JS = (
 # Wall-clock cap on the virtualized-list walk: a pathological list degrades to the "cut short" error
 # instead of consuming the task's step budget in one call.
 _SCROLL_SEARCH_BUDGET_S = 20.0
+# The open-click's row poll and a popup filter box's reads run this long, and up to the hard cap while the list shows
+# an in-flight indicator.
+_LIST_POLL_SOFT_S = 2.4
+_LIST_POLL_HARD_S = 8.0
 
 # What the tagged scroller currently renders first: the first option row's text and its top in the
 # scroller's own coordinate space. A virtualiser that has re-rendered for a new scrollTop shows a
@@ -17445,7 +17451,7 @@ def build_browser_tools(
         # candidate scoring (word-overlap with the TYPED query) can drop a row the widget still renders.
         rows_armed = await _arm_rows_at_press(page, selector)
         try:
-            if not await _click_stamped_row(page, stamp, best_txt, 3000):
+            if not await _click_stamped_row(page, stamp, best_txt, _SUGGESTION_ROW_CLICK_TIMEOUT_MS):
                 raise RuntimeError("stamped suggestion row is no longer the matched row")
             clicked = True
         except Exception:
@@ -17480,7 +17486,9 @@ def build_browser_tools(
                         except Exception:
                             LOG.debug("taskv3 commit-event arm failed", selector=selector)
                         rows_armed = await _arm_rows_at_press(page, selector)
-                        clicked = await _click_stamped_row(page, f'[data-tv3-sugg="{idx}"]', best_txt, 3000)
+                        clicked = await _click_stamped_row(
+                            page, f'[data-tv3-sugg="{idx}"]', best_txt, _SUGGESTION_ROW_CLICK_TIMEOUT_MS
+                        )
             except Exception:
                 clicked = False
         if not clicked:
@@ -20493,8 +20501,8 @@ def build_browser_tools(
             # row, a spinner) the rows are still coming, so the poll wait extends — production pods run
             # at a fraction of a vCPU and a fetch that renders instantly on a laptop lands seconds later
             # there. The extension is bounded: a permanently-busy page stops at the hard cap.
-            soft_deadline = time.monotonic() + 2.4
-            hard_deadline = time.monotonic() + 8.0
+            soft_deadline = time.monotonic() + _LIST_POLL_SOFT_S
+            hard_deadline = time.monotonic() + _LIST_POLL_HARD_S
             while True:
                 await asyncio.sleep(0.4)
                 try:
@@ -21039,8 +21047,8 @@ def build_browser_tools(
                 return first in v.casefold() and v != cleared
 
             seen = await _box_value()
-            land_soft = time.monotonic() + 2.4
-            land_hard = time.monotonic() + 8.0
+            land_soft = time.monotonic() + _LIST_POLL_SOFT_S
+            land_hard = time.monotonic() + _LIST_POLL_HARD_S
             while not _landed(seen):
                 await asyncio.sleep(0.3)
                 prev, seen = seen, await _box_value()
@@ -21074,8 +21082,8 @@ def build_browser_tools(
             rival_texts: list[str] = []
             # Same budget as the open poll: a read that misses may be a placeholder row or a filter still in
             # flight, so the wait ends only past the deadline on a settled, not-busy read.
-            soft_deadline = time.monotonic() + 2.4
-            hard_deadline = time.monotonic() + 8.0
+            soft_deadline = time.monotonic() + _LIST_POLL_SOFT_S
+            hard_deadline = time.monotonic() + _LIST_POLL_HARD_S
             while True:
                 await asyncio.sleep(0.3)
                 filtered, complete, fresh = await _read_rows()

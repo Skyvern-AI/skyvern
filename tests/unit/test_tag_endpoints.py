@@ -13,6 +13,7 @@ of tag objects rather than key-maps.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -30,6 +31,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.forge.sdk.workflow.models.validators import TAG_COLOR_PALETTE
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_test"
 OTHER_ORG_ID = "o_other"
@@ -98,7 +100,7 @@ def _make_org(org_id: str = ORG_ID) -> Organization:
 
 
 @pytest.fixture(scope="module")
-def _route_app() -> tuple[FastAPI, MagicMock]:
+def _route_app() -> Iterator[tuple[FastAPI, MagicMock]]:
     """Mount the real routers once per module and return ``(app, app_mock)``.
 
     ``include_router`` over the full ``base_router`` (~285 routes) costs ~0.3s, so
@@ -107,8 +109,6 @@ def _route_app() -> tuple[FastAPI, MagicMock]:
     ``app.DATABASE.workflows``; only the per-test ``TagsRepository`` and the tagging
     flag are re-pointed in ``app_with_routes``.
     """
-    from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-
     workflows_mock = MagicMock()
 
     async def _get_workflow_by_permanent_id(
@@ -170,10 +170,6 @@ def _route_app() -> tuple[FastAPI, MagicMock]:
     app_mock = MagicMock()
     app_mock.DATABASE = database_mock
 
-    test_app = FastAPI()
-    test_app.include_router(base_router, prefix="/v1")
-    test_app.include_router(legacy_base_router, prefix="/api/v1")
-
     def _override_get_current_org() -> Organization:
         return _make_org(ORG_ID)
 
@@ -184,10 +180,13 @@ def _route_app() -> tuple[FastAPI, MagicMock]:
             caller_type=CallerType.USER,
         )
 
-    test_app.dependency_overrides[org_auth_service.get_current_org] = _override_get_current_org
-    test_app.dependency_overrides[org_auth_service.get_current_caller_context] = _override_get_current_caller_context
-
-    return test_app, app_mock
+    with pytest.MonkeyPatch.context() as module_patches:
+        test_app = shared_route_app(module_patches)
+        test_app.dependency_overrides[org_auth_service.get_current_org] = _override_get_current_org
+        test_app.dependency_overrides[org_auth_service.get_current_caller_context] = (
+            _override_get_current_caller_context
+        )
+        yield test_app, app_mock
 
 
 @pytest.fixture
