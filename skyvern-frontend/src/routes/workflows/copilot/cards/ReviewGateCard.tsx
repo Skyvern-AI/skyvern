@@ -255,8 +255,7 @@ function changeRows(
 }
 
 function blockCountLabel(rows: ChangeRow[], inputCount: number): string | null {
-  const changed = rows.filter((row) => !row.muted).length;
-  const count = changed > 0 || inputCount > 0 ? changed : rows.length;
+  const count = rows.filter((row) => !row.muted).length;
   const parts = [
     count > 0 ? `${count} ${count === 1 ? "block" : "blocks"}` : null,
     inputCount > 0
@@ -431,11 +430,10 @@ function ResolvedReviewCard({
   const applied =
     accepted || (turn !== undefined && draftLanded(turn, { rejected }));
   const inputCount = turn?.review?.inputs?.length ?? 0;
+  const changedRows = rows.filter((row) => !row.muted);
   const names =
-    rows.length > 0 &&
-    rows.length <= 2 &&
-    (inputCount === 0 || rows.some((row) => !row.muted))
-      ? rows.map((row) => humanizeBlockLabel(row.label)).join(", ") +
+    changedRows.length > 0 && changedRows.length <= 2
+      ? changedRows.map((row) => humanizeBlockLabel(row.label)).join(", ") +
         (inputCount > 0
           ? ` · ${inputCount} ${inputCount === 1 ? "input" : "inputs"}`
           : "")

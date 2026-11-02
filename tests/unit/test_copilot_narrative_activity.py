@@ -561,7 +561,7 @@ workflow_definition:
   blocks:
     - block_type: task
       label: existing
-      prompt: before
+      navigation_goal: before
 """
     ctx.staged_workflow_yaml = """
 workflow_definition:
@@ -569,10 +569,10 @@ workflow_definition:
   blocks:
     - block_type: task
       label: existing
-      prompt: after
+      navigation_goal: after
     - block_type: task
       label: added
-      prompt: new
+      navigation_goal: new
 """
     ctx.staged_workflow = _staged("existing", "added")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
