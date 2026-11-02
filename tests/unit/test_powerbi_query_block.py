@@ -362,6 +362,25 @@ async def test_powerbi_runtime_reports_malformed_template_as_safe_block_failure(
 
 
 @pytest.mark.asyncio
+async def test_powerbi_render_failure_names_its_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = FakeWorkflowRunContext(values={"dax_query": "EVALUATE VALUES('Private_Sales_Table')"})
+    context.parameters = {"dax_query": _workflow_parameter("dax_query")}
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(_block(query="{{ dax_query + 1 }}", parameters=[_workflow_parameter()]), context=context)
+
+    assert result.failure_reason == (
+        "Could not render Power BI query fields. Wrong value type in `dax_query + ...` (field query, line 1)."
+    )
+    assert result.output_parameter_value == {
+        "error": "template_format_failed",
+        "render_failure": {"kind": "Wrong value type", "field": "query", "expression": "dax_query + ...", "line": 1},
+    }
+    run_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_powerbi_runtime_rejects_runtime_output_hidden_in_parameter_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

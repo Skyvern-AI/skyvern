@@ -1185,6 +1185,13 @@ class ScriptSkyvernPage(SkyvernPage):
         if not totp_identifier and not totp_url:
             raise RuntimeError("A sign-in link is unavailable: this step has no email/SMS identifier to receive it on.")
 
+        task = (
+            await app.DATABASE.tasks.get_task(context.task_id, organization_id=organization_id)
+            if context and context.task_id
+            else None
+        )
+        task_url = task.url if task else None
+
         polled = await poll_otp_value(
             organization_id=organization_id,
             task_id=context.task_id if context else None,
@@ -1193,6 +1200,7 @@ class ScriptSkyvernPage(SkyvernPage):
             totp_identifier=totp_identifier,
             created_after=naive_utc_now() - MAGIC_LINK_ANCHOR_GRACE,
             expected_otp_type=OTPType.MAGIC_LINK,
+            task_url=task_url,
         )
         if polled is None:
             raise RuntimeError("A sign-in link could not be retrieved for this step.")

@@ -567,6 +567,7 @@ describe("notConfirmedOutcome — recorded run facts", () => {
     expect(outcome).toEqual({
       verdict: "not_demonstrated",
       displayReason: "Browser operation timed out on line 18.",
+      workflowRunId: "wr_1",
     });
   });
 
@@ -968,6 +969,7 @@ describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
     expect(notConfirmedOutcome(withBlock!)).toEqual({
       verdict: "not_demonstrated",
       displayReason: "Cart never showed the item.",
+      workflowRunId: "wr_superseded",
     });
 
     const withoutBlocks = hydrateNarrativeFromPayload({
@@ -980,6 +982,7 @@ describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
     expect(notConfirmedOutcome(withoutBlocks!)).toEqual({
       verdict: "not_demonstrated",
       displayReason: null,
+      workflowRunId: "wr_superseded",
     });
   });
 

@@ -60,7 +60,12 @@ from skyvern.forge.sdk.workflow.block_notes import (
 )
 from skyvern.forge.sdk.workflow.credential_fetch_outcome import CredentialFetch, record_credential_fetch
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
-from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.exceptions import (
+    MissingJinjaVariables,
+    OutputParameterKeyCollisionError,
+    RenderFailureKind,
+    TemplateRenderCause,
+)
 from skyvern.forge.sdk.workflow.models._jinja import _JSON_TYPE_MARKER
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -977,7 +982,21 @@ class WorkflowRunContext:
 
         if missing_variables := get_missing_variables(raw_template, template_data):
             if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
-                raise MissingJinjaVariables(template=raw_template, variables=missing_variables)
+                # A dotted name or a present root is a nested miss, which names no reference.
+                absent_roots = sorted(
+                    name for name in missing_variables if name.isidentifier() and name not in template_data
+                )
+                raise MissingJinjaVariables(
+                    template=raw_template,
+                    variables=missing_variables,
+                    missing_references=absent_roots,
+                    render_cause=TemplateRenderCause(
+                        RenderFailureKind.MISSING_REFERENCE
+                        if absent_roots
+                        else RenderFailureKind.MISSING_KEY_OR_ATTRIBUTE,
+                        field_name="workflow_system_prompt",
+                    ),
+                )
             # Non-strict mode silently renders undefined variables as empty strings,
             # which makes typos like {{ persona }} invisible to the user. Emit a
             # warning so the operator has a breadcrumb when a workflow_system_prompt

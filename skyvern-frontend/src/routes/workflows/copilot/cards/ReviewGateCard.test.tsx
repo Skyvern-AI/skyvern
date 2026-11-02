@@ -814,6 +814,69 @@ describe("ReviewGateCard — recorded review projection", () => {
     expect(screen.getByRole("button", { name: "Show 1 more" })).not.toBeNull();
   });
 
+  it("shows an input-only change above the fold of unchanged blocks", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: ["one", "two", "three", "four", "five", "six"].map(
+              (name) => ({
+                label: `keep_${name}`,
+                blockType: "task",
+                change: "unchanged" as const,
+              }),
+            ),
+            duplicateWrites: [],
+            inputs: [{ key: "seed_rows", change: "removed" }],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    const input = screen.getByText("seed_rows");
+    const fold = screen.getByRole("button", { name: "Show 2 more" });
+    expect(
+      input.compareDocumentPosition(fold) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByText(/· 1 input$/)).toBeTruthy();
+  });
+
+  it("counts both blocks and inputs in the header when both change", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              { label: "seed_step", blockType: "task", change: "removed" },
+            ],
+            duplicateWrites: [],
+            inputs: [{ key: "seed_rows", change: "removed" }],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText(/· 1 block · 1 input$/)).toBeTruthy();
+  });
+
   it("hydrates the optional projection and ignores malformed review payloads", () => {
     const basePayload = {
       turnId: "turn-1",
@@ -841,7 +904,55 @@ describe("ReviewGateCard — recorded review projection", () => {
     });
 
     expect(hydrated?.review?.blocks[0]?.label).toBe("saved_step");
+    expect(hydrated?.review?.inputs).toEqual([]);
     expect(malformed?.review).toBeNull();
+  });
+
+  it("shows input rows from a reloaded payload, dropping a malformed row instead of the review", () => {
+    const reloaded = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      review: {
+        blocks: [],
+        duplicateWrites: [],
+        inputs: [
+          { key: "seed_rows", change: "removed" },
+          { key: "api_region", change: "added" },
+          { key: "row_limit", change: "renamed" },
+          "not-a-row",
+        ],
+      },
+    });
+    expect(reloaded?.review?.inputs).toEqual([
+      { key: "seed_rows", change: "removed" },
+      { key: "api_region", change: "added" },
+    ]);
+
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({ review: reloaded?.review ?? null })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText("seed_rows").parentElement?.className).toContain(
+      "line-through",
+    );
+    expect(
+      screen.getByText("api_region").parentElement?.className,
+    ).not.toContain("line-through");
+    expect(screen.queryByText("row_limit")).toBeNull();
+    expect(screen.getByText(/· 2 inputs$/)).toBeTruthy();
   });
 });
 
@@ -901,6 +1012,37 @@ describe("ReviewGateCard — answered proposals collapse", () => {
         "Add To Cart and Send Receipt write to the same destination.",
       ),
     ).toBeTruthy();
+  });
+
+  it("counts inputs beside the named blocks of a collapsed proposal", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              { label: "fetch_rows", blockType: "task", change: "changed" },
+            ],
+            duplicateWrites: [],
+            inputs: [
+              { key: "seed_rows", change: "removed" },
+              { key: "api_region", change: "added" },
+            ],
+          },
+        })}
+        pending={false}
+        settled="accepted"
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText(/Fetch Rows · 2 inputs$/)).toBeTruthy();
   });
 });
 

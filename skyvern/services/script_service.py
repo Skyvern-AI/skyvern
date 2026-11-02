@@ -80,6 +80,7 @@ from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_script_code
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, register_secret_derived_output
 from skyvern.forge.sdk.workflow.exceptions import (
+    RENDER_FAILURE_OUTPUT_KEY,
     FailedToFormatJinjaStyleParameter,
     InsecureCodeDetected,
     MissingJinjaVariables,
@@ -115,6 +116,8 @@ from skyvern.forge.sdk.workflow.models.block import (
     WhileLoopBlock,
     WorkflowTriggerBlock,
     get_all_blocks,
+    render_failure_reason,
+    render_failure_record,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -4651,6 +4654,7 @@ async def while_loop(
     block_validation_output.context.active_loop_label = block_validation_output.label
 
     loop_idx = 0
+    render_failure: dict[str, Any] | None = None
     try:
         while True:
             _refuse_statement_after_browser_connection_loss()
@@ -4670,15 +4674,9 @@ async def while_loop(
                     browser_session_id=block_validation_output.browser_session_id,
                 )
             except (FailedToFormatJinjaStyleParameter, MissingJinjaVariables) as exc:
-                if workflow_run_block_id:
-                    await _update_workflow_block(
-                        workflow_run_block_id,
-                        BlockStatus.failed,
-                        failure_reason=f"Failed to evaluate while-loop condition: {exc}",
-                        output=block_validation_output.context.loop_output_values,
-                        label=label,
-                    )
-                raise Exception(f"Failed to evaluate while-loop condition: {exc}") from exc
+                redact = while_block.secret_redactor(workflow_run_context)
+                render_failure = render_failure_record(exc, redact)
+                raise Exception(render_failure_reason("Failed to evaluate while-loop condition:", exc, redact)) from exc
 
             _refuse_statement_after_browser_connection_loss()
             if not should_continue:
@@ -4752,11 +4750,19 @@ async def while_loop(
             )
     except Exception as e:
         if workflow_run_block_id:
+            failure_reason = str(e).strip() or type(e).__name__
+            loop_outputs = block_validation_output.context.loop_output_values
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus.failed,
-                failure_reason=str(e).strip() or type(e).__name__,
-                output=block_validation_output.context.loop_output_values,
+                failure_reason=failure_reason,
+                output=loop_outputs
+                if render_failure is None
+                else {
+                    "failure_reason": failure_reason,
+                    RENDER_FAILURE_OUTPUT_KEY: render_failure,
+                    "loop_output_values": loop_outputs,
+                },
                 label=label,
             )
         raise

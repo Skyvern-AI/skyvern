@@ -825,6 +825,12 @@ _ROLE_TO_TAG: dict[str, str] = {
     "treeitem": "li",
 }
 
+# Roles `roleFor` in _OBSERVE_INTERACTABLES_JS can assign by heuristic rather than read from markup;
+# merge keys keep the host tag for these so a pointer-cursor wrapper sharing a label cannot claim an
+# a11y entry. Every other role is declared by markup, where _ROLE_TO_TAG names just one of the tags
+# that can carry it (a combobox is a <select>, or an input/div with role=combobox).
+_INFERRED_DOM_ROLES = frozenset({"button", "option"})
+
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
 
@@ -1356,19 +1362,19 @@ def _merge_dom_observe_elements(
     merged = list(a11y_elements)
     selector_seen = {element.get("selector") for element in merged if element.get("selector")}
 
-    # Only upgrade an a11y element with a DOM selector when the (role, name, tag) key is
-    # unambiguous on both sides. A duplicate label would otherwise risk attaching the
-    # selector to the wrong element — a confidently wrong deterministic action. Ambiguous
-    # DOM elements still fall through to the append path with their own distinct selector.
+    # Only upgrade an a11y element with a DOM selector when the merge key is unambiguous on
+    # both sides. A duplicate label would otherwise risk attaching the selector to the wrong
+    # element — a confidently wrong deterministic action. Ambiguous DOM elements still fall
+    # through to the append path with their own distinct selector.
     def _key(role: str, name: str, tag: str) -> tuple[str, str, str]:
-        return role, name, tag
+        return role, name, tag if role in _INFERRED_DOM_ROLES else ""
 
-    a11y_key_counts: dict[tuple[str, str, str], int] = {}
+    a11y_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for element in merged:
         if not element.get("selector"):
             role = element.get("role", "")
             key = _key(role, element.get("name", ""), _ROLE_TO_TAG.get(role, ""))
-            a11y_key_counts[key] = a11y_key_counts.get(key, 0) + 1
+            a11y_by_key.setdefault(key, []).append(element)
     dom_key_counts: dict[tuple[str, str, str], int] = {}
     for dom_element in dom_elements:
         key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
@@ -1379,33 +1385,26 @@ def _merge_dom_observe_elements(
         if dom_selector and dom_selector in selector_seen:
             continue
         dom_key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
-        unambiguous = a11y_key_counts.get(dom_key, 0) == 1 and dom_key_counts.get(dom_key, 0) == 1
-        matched_existing = False
-        if unambiguous:
-            for existing in merged:
-                if (
-                    not existing.get("selector")
-                    and existing.get("role", "") == dom_element.get("role", "")
-                    and existing.get("name", "") == dom_element.get("name", "")
-                    and _ROLE_TO_TAG.get(existing.get("role", ""), "") == dom_element.get("tag", "")
-                ):
-                    existing["selector"] = dom_selector
-                    if dom_element.get("value") is not None:
-                        existing["value"] = dom_element["value"]
-                    if dom_element.get("options") and not existing.get("children"):
-                        existing["options"] = dom_element.get("options")
-                    if dom_element.get("aria_controls"):
-                        existing["aria_controls"] = dom_element["aria_controls"]
-                    if dom_element.get("aria_owns"):
-                        existing["aria_owns"] = dom_element["aria_owns"]
-                    matched_existing = True
-                    if dom_selector:
-                        selector_seen.add(dom_selector)
-                    break
-        if not matched_existing:
+        candidates = a11y_by_key.get(dom_key, [])
+        if len(candidates) == 1 and dom_key_counts.get(dom_key, 0) == 1:
+            existing = candidates[0]
+            existing["selector"] = dom_selector
+            # The a11y entry carries no tag of its own; without this it keeps reporting
+            # _ROLE_TO_TAG's guess instead of the tag it merged with.
+            if dom_element.get("tag"):
+                existing["tag"] = dom_element["tag"]
+            if dom_element.get("value") is not None:
+                existing["value"] = dom_element["value"]
+            if dom_element.get("options") and not existing.get("children"):
+                existing["options"] = dom_element.get("options")
+            if dom_element.get("aria_controls"):
+                existing["aria_controls"] = dom_element["aria_controls"]
+            if dom_element.get("aria_owns"):
+                existing["aria_owns"] = dom_element["aria_owns"]
+        else:
             merged.append(dom_element)
-            if dom_selector:
-                selector_seen.add(dom_selector)
+        if dom_selector:
+            selector_seen.add(dom_selector)
 
     return merged
 

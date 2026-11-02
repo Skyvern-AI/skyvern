@@ -4341,7 +4341,12 @@ async def test_test_end_to_end_run_gets_its_own_row_carrying_its_input_sources(
         },
     }
 
+    sent_before_run: list[WorkflowCopilotStreamMessageType] = []
+    narrated_run: list[bool] = []
+
     async def _dispatch(ctx: CopilotContext, workflow_yaml: str, *, seed_like_normal_run: bool) -> dict[str, Any]:
+        sent_before_run.extend(frame.type for frame in stream.sent)
+        narrated_run.append(ctx.narrator_state is not None)
         ctx.pending_test_inputs["wr_button"] = copy.deepcopy(sources)
         return copy.deepcopy(run_result)
 
@@ -4352,6 +4357,8 @@ async def test_test_end_to_end_run_gets_its_own_row_carrying_its_input_sources(
     handoff = await agent_module._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml)
 
     call_id = "call_test_end_to_end_turn_1"
+    assert sent_before_run == [WorkflowCopilotStreamMessageType.DESIGN_START]
+    assert narrated_run == [True]
     assert [frame.type for frame in stream.sent] == [
         WorkflowCopilotStreamMessageType.DESIGN_START,
         WorkflowCopilotStreamMessageType.TOOL_CALL,
