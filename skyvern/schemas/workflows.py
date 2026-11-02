@@ -1551,8 +1551,8 @@ class AgentStepBlockYAML(BlockYAML):
     tools: list[str] | None = Field(
         default=None,
         description="The tools the step may call. A block it runs through run_block is named by its block type, such "
-        "as http_request. finish and read_run_data are always offered, and login only when the run has a credential "
-        "parameter. Without a list the step has no other tools.",
+        "as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a "
+        "credential parameter. Without a list the step has no other tools.",
     )
 
     @field_validator("tools")

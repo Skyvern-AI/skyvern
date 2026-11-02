@@ -1661,9 +1661,11 @@ async def _connect_to_cdp_browser(
             viewport=browser_args["viewport"],
             extra_http_headers=browser_args["extra_http_headers"],
         )
+        browser_artifacts.note_cdp_context(browser_context, "new", browser_args["viewport"])
     else:
         LOG.info("Reusing existing browser context", existing_contexts=len(contexts))
         browser_context = contexts[0]
+        browser_artifacts.note_cdp_context(browser_context, "existing")
 
     # Enable CDPDownloadInterceptor when enable_download is set.
     # This captures downloads via the Fetch domain and saves them locally.

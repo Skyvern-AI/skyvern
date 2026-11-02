@@ -1486,10 +1486,6 @@ async def run_blocks_tool(
     and return compact debug output (status, failure reason, visible elements).
     The workflow must be saved before running blocks.
     Block labels must match labels in the saved workflow.
-    A run that starts at the first block opens a fresh browser loaded with the saved browser
-    profile, if any, that a normal run of the saved workflow would load. A profile that is only
-    staged in a proposal is not loaded until the workflow is saved with it, except the profile the
-    user saved by signing in from the credential card this turn: a draft that selects it loads it now.
 
     If an existing saved block can establish the state you need, run that
     block unchanged before scouting the resulting page.
@@ -2656,6 +2652,24 @@ def _with_executed_source_param(tool: FunctionTool, *, browser_code_available: b
     return dataclasses.replace(tool, params_json_schema=schema)
 
 
+BUILD_TEST_BROWSER_START = (
+    "A test that starts at the workflow's first block runs in a new browser with no cookies or storage, unless a "
+    "normal run of the saved workflow would load a saved browser profile; then it loads that profile. A profile "
+    "that is only staged in a proposal is not loaded until the workflow is saved with it, except the profile the "
+    "user saved by signing in from the credential card this turn: a draft that selects it loads it now. A test "
+    "whose first blocks are already verified and unchanged may start at the first block that is not. A test that "
+    "starts at a later block with the earlier blocks verified continues in the browser that ran them when that "
+    "browser is where the test starts. A later-block test instead runs every block it asked for in a new browser "
+    "when that browser is not where it starts. It does the same when the tested blocks sign in or fill a "
+    "credential. It does the same when a block before its start branches or jumps, or a later block jumps back "
+    "before it. That new browser starts as described above when the blocks it asked for begin at the first "
+    "block, and with no cookies or storage otherwise. In every other case a later-block test runs in this chat's "
+    "browser."
+)
+_BUILD_TEST_TOOL_NAMES = frozenset(
+    {EDIT_BLOCK_AND_RUN_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, run_blocks_tool.name}
+)
+
 _LIST_INTEGRATIONS_RUN_GUIDANCE = (
     "For a build-and-test request, pass the completed workflow and the bound block label to "
     f"`{UPDATE_AND_RUN_BLOCKS_TOOL_NAME}` in the same turn; do not stop at `{UPDATE_WORKFLOW_TOOL_NAME}`."
@@ -2701,6 +2715,8 @@ def copilot_native_tools(
             )
         if tool.name in _EXECUTED_SOURCE_PARAMS:
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
+        if tool.name in _BUILD_TEST_TOOL_NAMES:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{BUILD_TEST_BROWSER_START}")
         if tool.name == list_integrations_tool.name and run_tools_available:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}")
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:
