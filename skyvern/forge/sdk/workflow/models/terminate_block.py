@@ -9,7 +9,7 @@ from jinja2 import meta as jinja2_meta
 from jinja2 import nodes
 
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import Block, jinja_sandbox_env
+from skyvern.forge.sdk.workflow.models.block import Block, jinja_sandbox_env, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, error_code_key_error
 from skyvern.utils.secret_redaction import (
@@ -199,7 +199,14 @@ class TerminateBlock(Block):
                     reason = rendered_reason
         except Exception as exc:
             return await self._template_format_failure_result(
-                exc, str(exc), workflow_run_context, workflow_run_id, workflow_run_block_id, organization_id
+                exc,
+                render_failure_reason(
+                    "Failed to format jinja template:", exc, self.secret_redactor(workflow_run_context)
+                ),
+                workflow_run_context,
+                workflow_run_id,
+                workflow_run_block_id,
+                organization_id,
             )
 
         error_code_dropped = False

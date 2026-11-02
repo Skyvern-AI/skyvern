@@ -160,6 +160,7 @@ from .blockers import _run_blocks_structured_blocker_message as _run_blocks_stru
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status
 from .browser_code import TOOL_NAME as BROWSER_CODE_TOOL_NAME
 from .browser_code import (
+    render_browser_code_description,
     resolve_executed_browser_code_source,
     run_browser_code_tool,
 )
@@ -2663,6 +2664,7 @@ def copilot_native_tools(
     supports_credential_delete_card: bool = False,
     supports_google_setup_card: bool = False,
     supports_demonstration_offer: bool = False,
+    browser_pattern_accepting_calls: tuple[str, ...] = (),
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
@@ -2685,6 +2687,10 @@ def copilot_native_tools(
         if tool.name == REPLY_TOOL_NAME:
             tools.append(tool)
             continue
+        if tool.name == BROWSER_CODE_TOOL_NAME:
+            tool = dataclasses.replace(
+                tool, description=render_browser_code_description(browser_pattern_accepting_calls)
+            )
         if tool.name in _EXECUTED_SOURCE_PARAMS:
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
         if tool.name == list_integrations_tool.name and run_tools_available:

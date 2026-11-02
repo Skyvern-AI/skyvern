@@ -6,6 +6,7 @@ schema while keeping it callable for backwards compatibility.
 """
 
 import importlib
+from collections.abc import Iterator
 
 import pytest
 from fastapi import FastAPI
@@ -13,17 +14,15 @@ from fastapi.routing import APIRoute
 
 from skyvern.forge.api_app import custom_openapi, register_agent_route_aliases
 from skyvern.forge.sdk.routes.routers import base_router
+from tests.unit.shared_route_app import shared_route_app
 
 
 @pytest.fixture(scope="module")
-def app() -> FastAPI:
-    # Import the route modules so base_router is fully populated before we mirror it.
-    for module in ("agent_protocol", "run_blocks", "workflow_schedules"):
-        importlib.import_module(f"skyvern.forge.sdk.routes.{module}")
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    register_agent_route_aliases(fastapi_app)
-    return fastapi_app
+def app() -> Iterator[FastAPI]:
+    with pytest.MonkeyPatch.context() as module_patches:
+        fastapi_app = shared_route_app(module_patches)
+        register_agent_route_aliases(fastapi_app)
+        yield fastapi_app
 
 
 def test_no_workflow_paths_remain_in_schema(app: FastAPI) -> None:

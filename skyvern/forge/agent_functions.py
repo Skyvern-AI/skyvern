@@ -982,7 +982,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
-    async def ensure_email_forwarding_available(self, organization_id: str | None = None) -> bool:
+    async def ensure_email_forwarding_available(
+        self, organization_id: str | None = None, *, fresh: bool = True
+    ) -> bool:
         """Cloud may hide OSS email-forwarding routes until its ingress is configured."""
         return True
 
@@ -1633,6 +1635,9 @@ class AgentFunction:
         """Whether run_browser_code joins the copilot surface, and whether it replaces the browser tools;
         OSS has no isolated interpreter to host it."""
         return CopilotBrowserCodeMode.OFF
+
+    def copilot_browser_pattern_accepting_calls(self) -> tuple[str, ...]:
+        return ()
 
     async def open_copilot_browser_code_session(
         self,

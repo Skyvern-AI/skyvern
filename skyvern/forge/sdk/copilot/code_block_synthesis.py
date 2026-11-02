@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
+from skyvern.forge.sdk.copilot.agent_context import ScoutedDynamicRowEvidence, ScoutedDynamicRowPeriodMatch
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
     SameMonthFileMatchTransform,
@@ -38,10 +39,6 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_CLAIM_HELPER_NAME,
     ReachedDownloadTarget,
     can_deliver_registered_download,
-)
-from skyvern.forge.sdk.copilot.runtime import (
-    ScoutedDynamicRowEvidence,
-    ScoutedDynamicRowPeriodMatch,
 )
 
 LOG = structlog.get_logger()

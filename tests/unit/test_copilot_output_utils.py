@@ -1539,6 +1539,18 @@ class TestFormatToolResultForUser:
         )
         assert summary == "A workflow parameter could not be filled in."
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "workflow_trigger block failed. failure reason: Failed to resolve templates: "
+            "Missing key or attribute in `a.output.id` (line 1) at payload[id].",
+            "Failed to evaluate while-loop condition: Missing reference `count` (line 1).",
+        ],
+    )
+    def test_render_failures_without_a_jinja_prefix_translate_to_parameter_phrasing(self, error: str) -> None:
+        summary = self._format("update_and_run_blocks", {"ok": False, "error": error})
+        assert summary == "A workflow parameter could not be filled in."
+
     def test_invalid_selector_failure_replaces_engine_instruction_text(self) -> None:
         summary = self._format(
             "click",

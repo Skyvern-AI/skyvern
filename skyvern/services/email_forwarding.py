@@ -323,7 +323,7 @@ def _decoded_subject(value: str | Header) -> str:
                 parts.append(_decode_email_text(part, charset or "utf-8") if isinstance(part, bytes) else part)
             end = match.end()
         parts.append(recovered[end:])
-    except Exception:
+    except Exception:  # noqa: BLE001 - decode untrusted email headers defensively.
         return sanitize_postgres_text(recovered)
     return sanitize_postgres_text("".join(parts))
 
@@ -627,7 +627,7 @@ async def ingest_inbound_email(
 
     try:
         body_text, links = await asyncio.to_thread(extract_email_body, message)
-    except Exception:  # noqa: BLE001 - extraction parses untrusted email input.
+    except Exception:
         LOG.warning(
             "Dropped malformed inbound email during body extraction",
             email_config_id=config.email_config_id,

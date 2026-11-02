@@ -2,14 +2,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.copilot.goal_suggestion import suggest_goal_from_code
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
-from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.services import org_auth_service
 from tests.unit.copilot_test_helpers import install_org_secondary_llm_override
+from tests.unit.shared_route_app import shared_route_app
 
 
 @pytest.mark.asyncio
@@ -41,9 +40,8 @@ def test_an_oversized_suggestion_request_is_rejected_before_any_model_call(monke
 
     suggest = AsyncMock(return_value="unused")
     monkeypatch.setattr(workflow_copilot_route, "suggest_goal_from_code", suggest)
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = fake_org
-    fastapi_app.include_router(base_router, prefix="/v1")
 
     response = TestClient(fastapi_app).post(
         "/v1/workflow/copilot/suggest-goal",

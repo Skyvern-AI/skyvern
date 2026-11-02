@@ -20,7 +20,6 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.request_logging import RequestLoggingMiddleware
 from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
 from skyvern.forge.sdk.core.security import assert_signing_key_usable, create_access_token
-from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth as streaming_auth
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 from skyvern.forge.sdk.services import org_auth_service, org_auth_token_service, request_principal
@@ -35,6 +34,7 @@ from skyvern.forge.sdk.services.request_principal import (
     BearerIdentityStatus,
     get_request_principal,
 )
+from tests.unit.shared_route_app import shared_route_app
 
 
 def test_authenticated_org_age_is_cached_for_lines_that_only_name_the_org() -> None:
@@ -581,10 +581,8 @@ async def _mint_api_token(
     return token, db, repository
 
 
-def _organization_routes_client() -> TestClient:
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
-    return TestClient(fastapi_app)
+def _organization_routes_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return TestClient(shared_route_app(monkeypatch))
 
 
 @pytest.mark.asyncio
@@ -790,7 +788,7 @@ async def test_self_hosted_api_key_route_rejects_ui_session_token(
 ) -> None:
     token, _, _ = await _mint_ui_session_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             f"/api/v1/organizations/org-ui-session/apikeys{suffix}",
             headers={"x-api-key": token},
@@ -807,7 +805,7 @@ async def test_api_key_route_accepts_api_token(
 ) -> None:
     token, _, _ = await _mint_api_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             f"/api/v1/organizations/org-api-route/apikeys{suffix}",
             headers={"x-api-key": token},
@@ -832,7 +830,7 @@ async def test_self_hosted_credential_gate_accepts_ui_session_token(monkeypatch:
 async def test_ordinary_organization_route_accepts_ui_session_token(monkeypatch: pytest.MonkeyPatch) -> None:
     token, _, _ = await _mint_ui_session_token(monkeypatch)
 
-    with _organization_routes_client() as client:
+    with _organization_routes_client(monkeypatch) as client:
         response = client.get(
             "/api/v1/organizations/me",
             headers={"x-api-key": token},

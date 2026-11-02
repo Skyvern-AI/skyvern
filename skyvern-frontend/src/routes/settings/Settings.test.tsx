@@ -16,6 +16,10 @@ import { Settings } from "./Settings";
 const scrollIntoViewMock = vi.fn();
 const originalScrollIntoView = Element.prototype.scrollIntoView;
 
+vi.mock("@/components/emailForwarding/EmailForwardingSettings", () => ({
+  EmailForwardingSettings: () => null,
+}));
+
 vi.mock("@/components/OnePasswordTokenForm", () => ({
   OnePasswordTokenForm: () => null,
 }));

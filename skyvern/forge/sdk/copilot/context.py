@@ -18,6 +18,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BrowserAblationMetadata,
     CopilotToolSurfaceIdentity,
@@ -36,7 +37,6 @@ from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts
@@ -161,6 +161,7 @@ class SkippedPrefixBlock(TypedDict):
 class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
+    workflowRunId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -310,6 +311,13 @@ class NarrativeScreenshot(TypedDict):
     toolCallId: str | None
 
 
+class CanonicalWorkflowUnavailableFacts(TypedDict):
+    workflow_permanent_id: str
+    candidate_published: NotRequired[Literal[False]]
+    test_started: Literal[False]
+    detail: NotRequired[str]
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -335,6 +343,7 @@ class TurnNarrativePayload(TypedDict):
     outputFiles: NotRequired[list[NarrativeOutputFile]]
     googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
     demonstrationOffer: NotRequired[bool]
+    canonicalWorkflowUnavailable: NotRequired[CanonicalWorkflowUnavailableFacts]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -1364,6 +1373,7 @@ class CopilotContext(AgentContext):
     google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
     # Kept apart from google_connection_notices, which each workflow save recomputes wholesale.
     google_setup_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    canonical_workflow_unavailable: CanonicalWorkflowUnavailableFacts | None = None
 
     # Tool tracking
     tool_activity: list[dict[str, Any]] = field(default_factory=list)

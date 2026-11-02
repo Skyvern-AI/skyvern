@@ -24,6 +24,8 @@ from skyvern.forge.sdk.workflow.models.block import (
     FailedToFormatJinjaStyleParameter,
     WorkflowTriggerBlock,
     jinja_sandbox_env,
+    render_failure_reason,
+    render_failure_record,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
@@ -107,8 +109,14 @@ class TestRenderTemplateValue:
     def test_mid_string_json_marker_raises(self) -> None:
         block = _make_block()
         bad_value = f"prefix-{_JSON_TYPE_MARKER}1234{_JSON_TYPE_MARKER}"
-        with pytest.raises(FailedToFormatJinjaStyleParameter, match="complete value replacement"):
+        with pytest.raises(FailedToFormatJinjaStyleParameter, match="complete value replacement") as excinfo:
             self._render(block, "prefix-{{ x | json }}", bad_value)
+        assert render_failure_record(excinfo.value, lambda value: value) == {
+            "kind": "`| json` combined with other text",
+            "field": None,
+            "expression": None,
+            "line": None,
+        }
 
 
 class TestRenderTemplatesInPayload:
@@ -238,6 +246,27 @@ class TestPayloadTemplateRenderError:
         with pytest.raises(PayloadTemplateRenderError) as excinfo:
             self._render_payload_live(block, {'weird"key': bad})
         assert excinfo.value.path == 'payload["weird\\"key"]'
+
+    @pytest.mark.parametrize("prefix_keys", [["a"], ["k" * 100]])
+    def test_failure_reason_never_carries_a_secret_payload_key(self, prefix_keys: list[str]) -> None:
+        secret = 'Sec"ret\\Key-Value'
+        payload: dict[str, Any] = {secret: "{{ foo. }}"}
+        for key in reversed(prefix_keys):
+            payload = {key: payload}
+        block = _make_block()
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, payload)
+        ctx = MagicMock()
+        ctx.secrets = {"secret-id": secret}
+
+        reason = render_failure_reason("Failed to resolve templates:", excinfo.value, block.secret_redactor(ctx))
+
+        assert reason.startswith(
+            f"Failed to resolve templates: Syntax error in `foo.` (field payload, line 1) at payload.{prefix_keys[0]}"
+        )
+        assert len(reason) < 200
+        for leaked in (secret, json.dumps(secret)[1:-1]):
+            assert leaked[:9] not in reason
 
     def test_good_templates_render_normally(self) -> None:
         # Sanity: live Jinja2 env renders a valid template referencing nothing.

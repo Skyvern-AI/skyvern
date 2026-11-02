@@ -10,13 +10,15 @@ type RunLike = {
   workflow_run_id: string;
   status: Status;
   failure_reason?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export function useRunCompletionToast(run: RunLike | null | undefined) {
   const { workflowRunId, blockLabel } = useBlockRunTarget();
   const observedActiveRunIds = useRef(new Set<string>());
   useEffect(() => {
-    if (!run) return;
+    // Copilot reports its own test runs in the chat card.
+    if (!run || run.copilot_session_id) return;
     const runId = run.workflow_run_id;
     if (runIsLogicallyActive(run)) {
       observedActiveRunIds.current.add(runId);

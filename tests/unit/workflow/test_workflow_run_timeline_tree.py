@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from fastapi import FastAPI
 from pydantic import TypeAdapter
 
 from skyvern.forge import app
@@ -28,6 +27,7 @@ from tests.unit.helpers import (
     make_one_time_code_action_rows,
     make_session_factory_yielding,
 )
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _block(
@@ -191,8 +191,7 @@ async def test_native_download_url_survives_registered_timeline_response(
     monkeypatch.setattr(app.DATABASE.observer, "get_task_v2_by_workflow_run_id", AsyncMock(return_value=None))
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *_args, **_kwargs: None)
-    api = FastAPI()
-    api.include_router(agent_protocol.base_router, prefix="/v1")
+    api = shared_route_app(monkeypatch)
     api.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id="o_test")
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://test") as client:

@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from enum import StrEnum
+
 from starlette import status
 
 from skyvern.exceptions import SkyvernException, SkyvernHTTPException
@@ -229,6 +232,37 @@ class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
         )
 
 
+class RenderFailureKind(StrEnum):
+    SYNTAX_ERROR = "Syntax error"
+    MISSING_REFERENCE = "Missing reference"
+    MISSING_KEY_OR_ATTRIBUTE = "Missing key or attribute"
+    WRONG_VALUE_TYPE = "Wrong value type"
+    UNSAFE_OPERATION = "Unsafe template operation"
+    INVALID_URL_MALFORMED = "Invalid URL: malformed"
+    INVALID_URL_UNSUPPORTED_SCHEME = "Invalid URL: unsupported scheme"
+    TRANSFORMED_PLACEHOLDER = "Placeholder used with a transformation"
+    JSON_FILTER_WITH_OTHER_TEXT = "`| json` combined with other text"
+    RENDER_ERROR = "Render error"
+
+
+@dataclass(frozen=True)
+class TemplateRenderCause:
+    """Why a template failed to render, built only from the exception class, the template source and field names."""
+
+    kind: RenderFailureKind
+    expressions: tuple[str, ...] = ()
+    line: int | None = None
+    field_name: str | None = None
+
+
+RENDER_FAILURE_OUTPUT_KEY = "render_failure"
+
+
+def has_render_failure_record(output: object) -> bool:
+    """Whether a failed block's output carries the record its template render failure wrote (ADR 0028 typed state)."""
+    return isinstance(output, dict) and isinstance(output.get(RENDER_FAILURE_OUTPUT_KEY), dict)
+
+
 class FailedToFormatJinjaStyleParameter(SkyvernException):
     def __init__(
         self,
@@ -237,10 +271,12 @@ class FailedToFormatJinjaStyleParameter(SkyvernException):
         *,
         available_keys: list[str] | None = None,
         missing_references: list[str] | None = None,
+        render_cause: TemplateRenderCause | None = None,
     ) -> None:
         self.template = template
         self.available_keys = available_keys or []
         self.missing_references = missing_references or []
+        self.render_cause = render_cause
         super().__init__(
             f"Failed to format Jinja style parameter '{template}'. "
             f"Reason: {msg}. "
@@ -257,8 +293,9 @@ class PayloadTemplateRenderError(SkyvernException):
     string so the run's failure reason tells the author where to look.
     """
 
-    def __init__(self, path: str, template: str, original: BaseException) -> None:
+    def __init__(self, path: str, template: str, original: BaseException, segments: tuple[str | int, ...] = ()) -> None:
         self.path = path
+        self.segments = segments
         self.template = template
         self.original = original
         lineno = getattr(original, "lineno", None)
@@ -288,9 +325,17 @@ class PayloadTemplateSyntaxError(WorkflowDefinitionValidationException):
 
 
 class MissingJinjaVariables(SkyvernException):
-    def __init__(self, template: str, variables: set[str], *, missing_references: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        template: str,
+        variables: set[str],
+        *,
+        missing_references: list[str] | None = None,
+        render_cause: TemplateRenderCause | None = None,
+    ) -> None:
         self.variables = variables
         self.missing_references = missing_references or []
+        self.render_cause = render_cause
 
         super().__init__(
             f"Missing variables for '{template}'. Missing: {variables}. "

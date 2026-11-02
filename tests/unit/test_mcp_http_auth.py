@@ -21,7 +21,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from skyvern.cli.core import client as client_mod
-from skyvern.cli.core import mcp_http_auth, session_manager
+from skyvern.cli.core import copilot_sessions, mcp_http_auth, session_manager
 from skyvern.cli.core.result import BrowserContext
 
 _TEST_BASE_URL = "http://testserver"
@@ -32,7 +32,7 @@ def _reset_auth_context() -> Iterator[None]:
     client_mod._api_key_override.set(None)
     session_manager._current_session.set(None)
     session_manager._global_session = None
-    session_manager._copilot_sessions.clear()
+    copilot_sessions._copilot_sessions.clear()
     session_manager._organization_sessions.clear()
     session_manager._current_organization_id.set(None)
     session_manager.set_stateless_http_mode(False)
@@ -302,7 +302,7 @@ async def test_stateful_http_session_is_scoped_to_authenticated_organization_wit
                 api_key_hash=session_manager.active_api_key_hash(),
             )
             session_manager.set_current_session(state)
-            session_manager.register_copilot_session(session_id, state, organization_id="org_first")
+            copilot_sessions.register_copilot_session(session_id, state, organization_id="org_first")
             return JSONResponse({"owner": first_browser.owner})
 
         try:

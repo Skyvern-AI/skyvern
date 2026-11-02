@@ -2386,7 +2386,12 @@ def summarize_tool_result_detail(
     return _sanitize_failure_text(failure_message, max_chars=max_chars)
 
 
-_JINJA_ERROR_MARKERS: tuple[str, ...] = ("Failed to format jinja", "Jinja style parameter")
+_JINJA_ERROR_MARKERS: tuple[str, ...] = (
+    "Failed to format jinja",
+    "Jinja style parameter",
+    "Failed to resolve templates:",
+    "Failed to evaluate while-loop condition:",
+)
 # Markers are matched against a lower-cased copy of the error.
 _ENGINE_INSTRUCTION_MARKERS: tuple[str, ...] = (
     "invalid selector:",

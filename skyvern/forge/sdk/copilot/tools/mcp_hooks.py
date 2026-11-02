@@ -25,6 +25,7 @@ from skyvern.cli.mcp_tools.blocks import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent_context import ScoutedDragDestination, ScoutedInteraction, ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.blocker_signal import stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
@@ -74,9 +75,6 @@ from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_pa
 from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    ScoutedDragDestination,
-    ScoutedInteraction,
-    ScoutedSelectorCandidate,
     browser_valid_tab_count,
     current_demonstrated_action,
     tab_switch_refusal,
@@ -2542,8 +2540,8 @@ def _normalized_authoring_capability(
 
 def _workflow_knowledge_description(capability: AuthoringCapability) -> str:
     topics_lead = (
-        f"Topic {CODE_BLOCK_RUNTIME_TOPIC} covers the builtins, module shims, and helpers a code block's Python may "
-        "use; omit"
+        f"Topic {CODE_BLOCK_RUNTIME_TOPIC} covers the builtins, module shims, helpers, and page object a code "
+        "block's Python may use, including which page calls are recorded as actions; omit"
         if capability.code_blocks
         else "Omit"
     )

@@ -1198,7 +1198,8 @@ class CodeBlockYAML(BlockYAML):
         if isinstance(data, dict) and "parameters" in data:
             raise ValueError(
                 "Code blocks do not accept a 'parameters' field; use 'parameter_keys' "
-                "(a list of workflow parameter names) to inject parameters into the code block."
+                "(a list of workflow parameter names and earlier block outputs, `<label>_output`) "
+                "to inject parameters into the code block."
             )
         if isinstance(data, dict):
             _validate_code_block_error_code_mapping(data.get("error_code_mapping"))
@@ -1265,7 +1266,7 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
-    google_credential_id: str | None = None
+    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1316,6 +1317,7 @@ class SendEmailBlockYAML(BlockYAML):
     credential_id: str | None = Field(
         default=None,
         description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
+        json_schema_extra={"x-skyvern-connected-account": True},
     )
     cc: list[str] = Field(default_factory=list, description="Cc recipients. Only with transport 'gmail'.")
     bcc: list[str] = Field(default_factory=list, description="Bcc recipients. Only with transport 'gmail'.")
@@ -1587,7 +1589,7 @@ class FileDownloadBlockYAML(BlockYAML):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
-    google_credential_id: str | None = None
+    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1800,7 +1802,7 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = None
+    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     has_header_row: bool = True
     parameter_keys: list[str] | None = None
 
@@ -1808,7 +1810,7 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
 class EmailInboxBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
     email_client: Literal["gmail", "outlook"]
-    credential_id: str | None = None
+    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     folder: str | None = None
     prompt: str | None = None
     sender: str | None = None
@@ -1827,7 +1829,7 @@ class GoogleSheetsWriteBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = None
+    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     write_mode: Literal["append", "update"] = "append"
     values: str = ""
     column_mapping: dict[str, str] | None = None
@@ -1839,7 +1841,11 @@ class PowerBIQueryBlockYAML(BlockYAML):
     """Documented ahead of release; saves are unavailable until the Power BI catalog status is live."""
 
     block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
-    connection_id: str = Field(min_length=1, description="Microsoft OAuth credential ID for this user.")
+    connection_id: str = Field(
+        min_length=1,
+        description="Microsoft OAuth credential ID for this user.",
+        json_schema_extra={"x-skyvern-connected-account": True},
+    )
     dataset_id: str = Field(min_length=1)
     query: str = Field(min_length=1, description="A single read-only DAX query.")
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)

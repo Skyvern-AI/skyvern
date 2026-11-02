@@ -380,14 +380,18 @@ async def _get_address_or_404(forwarding_address_id: str, organization_id: str) 
 )
 async def list_forwarded_emails(
     forwarding_address_id: str,
+    response: Response,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     current_org: Organization = Depends(get_current_org_for_email_forwarding),
 ) -> list[InboundEmail]:
     address = await _get_address_or_404(forwarding_address_id, current_org.organization_id)
     emails = await app.DATABASE.email_forwarding.list_inbound_emails(
-        forwarding_address_id, current_org.organization_id, limit, offset
+        forwarding_address_id, current_org.organization_id, limit + 1, offset
     )
+    has_more = len(emails) > limit
+    emails = emails[:limit]
+    response.headers["X-Has-More"] = str(has_more).lower()
     if address.credential_id is not None or not emails:
         return emails
     if not await app.AGENT_FUNCTION.credential_folders_restricted(current_org.organization_id):

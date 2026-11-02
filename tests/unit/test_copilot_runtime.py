@@ -788,6 +788,38 @@ async def test_cancelled_browser_boot_closes_the_partially_created_session(monke
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_browser_create_closes_the_session_once_created(monkeypatch: pytest.MonkeyPatch) -> None:
+    create_started = asyncio.Event()
+    release_create = asyncio.Event()
+
+    async def _slow_create(**_kwargs: Any) -> SimpleNamespace:
+        create_started.set()
+        await release_create.wait()
+        return SimpleNamespace(persistent_browser_session_id="pbs_cancelled_create")
+
+    manager = _manager_reporting_fixed_deadline(None)
+    manager.create_session = AsyncMock(side_effect=_slow_create)
+    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(runtime, "_ABANDONED_DRIVER_RELEASES", set())
+
+    ctx = _make_ctx()
+    task = asyncio.create_task(ensure_browser_session(ctx))
+    await create_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ctx.browser_session_id is None
+    manager.close_session.assert_not_awaited()
+
+    release_create.set()
+    await asyncio.gather(*runtime._ABANDONED_DRIVER_RELEASES)
+    manager.close_session.assert_awaited_once_with(
+        "org_1", "pbs_cancelled_create", reason=BrowserSessionCloseReason.turn_ended
+    )
+
+
+@pytest.mark.asyncio
 async def test_mcp_browser_context_rejects_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """Silently skipping set_api_key_override when ctx.api_key is None would
     let get_active_api_key() fall back to settings.SKYVERN_API_KEY — the

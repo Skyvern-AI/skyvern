@@ -14907,7 +14907,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "folder": {
             "anyOf": [
@@ -16409,7 +16410,8 @@
                 "type": "null"
               }
             ],
-            "title": "Google Credential Id"
+            "title": "Google Credential Id",
+            "x-skyvern-connected-account": true
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -17543,7 +17545,8 @@
                 "type": "null"
               }
             ],
-            "title": "Google Credential Id"
+            "title": "Google Credential Id",
+            "x-skyvern-connected-account": true
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -18679,7 +18682,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "has_header_row": {
             "type": "boolean",
@@ -18992,7 +18996,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "write_mode": {
             "type": "string",
@@ -23197,7 +23202,8 @@
             "type": "string",
             "minLength": 1,
             "title": "Connection Id",
-            "description": "Microsoft OAuth credential ID for this user."
+            "description": "Microsoft OAuth credential ID for this user.",
+            "x-skyvern-connected-account": true
           },
           "dataset_id": {
             "type": "string",
@@ -24848,7 +24854,8 @@
               }
             ],
             "title": "Credential Id",
-            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
+            "x-skyvern-connected-account": true
           },
           "cc": {
             "items": {
