@@ -138,6 +138,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
     WorkflowCopilotWorkflowDraftUpdate,
+    WorkflowYAMLConversionRequest,
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
@@ -5347,6 +5348,114 @@ def _make_copilot_workflow(title: str, modified_at: datetime) -> Workflow:
 
 
 @pytest.mark.asyncio
+async def test_a_saved_workflow_with_inputs_but_no_blocks_is_the_review_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    original_workflow = _make_copilot_workflow("Inputs only", _NOW)
+    original_workflow.workflow_definition = convert_workflow_definition(
+        WorkflowCreateYAMLRequest.model_validate(
+            {
+                "title": "Inputs only",
+                "workflow_definition": {
+                    "parameters": [
+                        {"parameter_type": "workflow", "key": "account_id", "workflow_parameter_type": "string"}
+                    ],
+                    "blocks": [],
+                },
+            }
+        ).workflow_definition,
+        original_workflow.workflow_id,
+    )
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    agent_result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
+    captured = install_fake_create(monkeypatch)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    agent_mock = AsyncMock(return_value=agent_result)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
+
+    await workflow_copilot_chat_post(api_key_request, _make_chat_request(mode="build"), organization)
+    await captured["handler"](copilot_stream)
+
+    assert agent_mock.await_args is not None
+    kwargs = agent_mock.await_args.kwargs
+    assert kwargs["persisted_workflow_yaml"] is None
+    ctx = CopilotContext(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wpid-1",
+        workflow_yaml="",
+        persisted_workflow_yaml=kwargs["persisted_workflow_yaml"],
+        saved_workflow=kwargs["saved_workflow"],
+        browser_session_id=None,
+        stream=copilot_stream,
+    )
+    proposal_yaml = yaml.safe_dump(
+        {
+            "title": "Inputs only",
+            "workflow_definition": {
+                "parameters": [
+                    {"parameter_type": "workflow", "key": "account_id", "workflow_parameter_type": "string"},
+                    {"parameter_type": "workflow", "key": "seed_rows", "workflow_parameter_type": "string"},
+                ],
+                "blocks": [{"block_type": "code", "label": "Seed_Rows", "code": "return {}"}],
+            },
+        }
+    )
+    review = agent_module._review_projection_for(ctx, proposal_yaml)
+
+    assert review is not None
+    assert review["inputs"] == [{"key": "seed_rows", "change": "added"}]
+
+
+@pytest.mark.asyncio
+async def test_a_pending_proposal_restores_over_the_canvas_of_a_blank_saved_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    api_key_request: MagicMock,
+    copilot_stream: MagicMock,
+    organization: SimpleNamespace,
+) -> None:
+    original_workflow = _make_copilot_workflow("Blank", _NOW)
+    proposal_yaml = yaml.safe_dump(
+        {
+            "title": "Blank",
+            "workflow_definition": {
+                "parameters": [],
+                "blocks": [{"block_type": "code", "label": "Seed_Rows", "code": "return {}"}],
+            },
+        }
+    )
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "pending-build", "_copilot_yaml": proposal_yaml},
+        auto_accept=False,
+    )
+    agent_result = AgentResult(user_response="done", updated_workflow=None, global_llm_context=None)
+    captured = install_fake_create(monkeypatch)
+    setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    agent_mock = AsyncMock(return_value=agent_result)
+    monkeypatch.setattr(workflow_copilot_route, "run_copilot_agent", agent_mock)
+    request = _make_chat_request(mode="build")
+    request.workflow_yaml = workflow_copilot_route.workflow_to_copilot_yaml(original_workflow)
+
+    await workflow_copilot_chat_post(api_key_request, request, organization)
+    await captured["handler"](copilot_stream)
+
+    assert agent_mock.await_args is not None
+    assert "Seed_Rows" in (agent_mock.await_args.kwargs["prior_copilot_workflow_yaml"] or "")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("headers", ["invalid", ["invalid"], {1: "invalid"}, {"X-Test": 1}])
 @pytest.mark.parametrize("source", ["canvas", "proposal", "persisted_fallback"])
 async def test_invalid_private_headers_allow_the_turn_to_continue(
@@ -8951,6 +9060,59 @@ async def test_accept_writes_the_live_title_when_the_row_was_renamed_after_publi
 
 
 @pytest.mark.asyncio
+async def test_accepting_a_multi_block_list_without_routing_saves_it_as_a_version_one_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published = _make_copilot_workflow("New Agent", _NOW).model_copy(update={"run_sequentially": False})
+    proposal = {
+        **published.model_dump(mode="json"),
+        "_copilot_yaml": (
+            "title: New Agent\nworkflow_definition:\n  parameters: []\n  blocks:\n"
+            "  - {block_type: navigation, label: first, url: https://example.com, navigation_goal: Open the page.}\n"
+            "  - {block_type: navigation, label: second, navigation_goal: Read the page.}\n"
+        ),
+        COPILOT_PROPOSAL_METADATA_KEY: {
+            "owner_turn_id": "turn-owner",
+            "revision": 2,
+            "canonical_fingerprint": _fingerprint_of(published),
+            "disposition": "review_tested",
+        },
+    }
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        proposed_workflow=proposal,
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(
+            get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
+            claim_workflow_copilot_candidate=AsyncMock(return_value=SimpleNamespace(proposed_workflow=proposal)),
+            clear_workflow_copilot_candidate=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(
+        app.DATABASE, "workflows", SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=published))
+    )
+    create_workflow = AsyncMock(return_value=(published, ("workflow_definition",)))
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", SimpleNamespace(create_workflow_from_request=create_workflow))
+
+    await workflow_copilot_route.workflow_copilot_apply_proposed_workflow(
+        WorkflowCopilotApplyProposedWorkflowRequest(
+            workflow_copilot_chat_id="chat-1",
+            owner_turn_id="turn-owner",
+            revision=2,
+        ),
+        SimpleNamespace(organization_id="org-1"),
+    )
+
+    saved = create_workflow.await_args.kwargs["request"].workflow_definition
+    assert saved.version == 1
+    assert [(block.label, block.next_block_label) for block in saved.blocks] == [("first", None), ("second", None)]
+
+
+@pytest.mark.asyncio
 async def test_demonstration_turn_follows_the_authoring_dial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9881,3 +10043,27 @@ async def test_message_feedback_is_scoped_to_the_org_and_survives_reload(
     )
     assert cleared.feedback is None
     assert captured[-1]["rating"] is None
+
+
+_TWO_STEP_DEFINITION = """parameters: []
+blocks:
+  - block_type: navigation
+    label: first
+    url: https://example.com
+    navigation_goal: Open the page.
+  - block_type: navigation
+    label: second
+    navigation_goal: Read the page.
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("version_line", "first_next"), [("", None), ("version: 2\n", "second")])
+async def test_convert_route_stitches_only_a_version_2_top_level(version_line: str, first_next: str | None) -> None:
+    response = await workflow_copilot_route.workflow_copilot_convert_yaml_to_blocks(
+        WorkflowYAMLConversionRequest(workflow_definition_yaml=version_line + _TWO_STEP_DEFINITION, workflow_id="w"),
+        organization=SimpleNamespace(organization_id="o"),
+    )
+
+    blocks = response.workflow_definition["blocks"]
+    assert [block["next_block_label"] for block in blocks] == [first_next, None]

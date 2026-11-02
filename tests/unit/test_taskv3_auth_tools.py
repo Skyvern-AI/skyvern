@@ -45,6 +45,7 @@ _TASK_CREATED_AT = datetime(2026, 9, 30, 17, 50, 0)
 def _task(**overrides: Any) -> SimpleNamespace:
     base: dict[str, Any] = {
         "task_id": "tsk_1",
+        "url": "https://example.com/login",
         "organization_id": "o_1",
         "workflow_run_id": None,
         "totp_verification_url": None,

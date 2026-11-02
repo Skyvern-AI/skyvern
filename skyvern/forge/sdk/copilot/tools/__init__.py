@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import json
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
@@ -127,7 +128,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_workflow_yaml,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.web_search import MAX_RESULTS_LIMIT
 from skyvern.utils.strings import join_phrases
 from skyvern.utils.yaml_loader import dump_workflow_yaml
@@ -159,6 +160,7 @@ from .blockers import _run_blocks_structured_blocker_message as _run_blocks_stru
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status
 from .browser_code import TOOL_NAME as BROWSER_CODE_TOOL_NAME
 from .browser_code import (
+    render_browser_code_description,
     resolve_executed_browser_code_source,
     run_browser_code_tool,
 )
@@ -239,6 +241,7 @@ from .frontier import _workflow_with_runtime_frontier_anchor as _workflow_with_r
 from .frontier import (
     _workflow_with_runtime_frontier_starter_url_seed as _workflow_with_runtime_frontier_starter_url_seed,
 )
+from .frontier import inputs_only_read_by_deleted_block as inputs_only_read_by_deleted_block
 from .guardrails import (
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     _authority_tool_error,
@@ -477,6 +480,7 @@ async def _persist_block_scoped_edit(
     block_observation_refs: list[BlockObservationRef] | None = None,
     rebuilt_block_labels: list[str] | None = None,
     edited_label: str | None = None,
+    data_extra: Callable[[Workflow], dict[str, list[str]]] | None = None,
 ) -> str:
     """Send a server-composed workflow through the normal persistence path.
 
@@ -507,6 +511,8 @@ async def _persist_block_scoped_edit(
             originating_call_id=originating_call_id,
             block_scoped_authoring_prior_yaml=authoring_prior_yaml,
         )
+        if data_extra is not None and result.get("ok") is True:
+            result["data"] = {**(result.get("data") or {}), **data_extra(result["_workflow"])}
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
         finalize_build_test_result(
@@ -878,14 +884,13 @@ async def add_block_tool(
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override="delete_block")
-async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
-    """Remove one block from the workflow by label.
-
-    Deleting is an explicit action: leaving a block out of a workflow you send elsewhere does not
-    remove it. Any block that pointed at this one as its next step is unlinked.
-    """
+async def delete_block_tool(ctx: RunContextWrapper, label: str, remove_parameters: list[str] | None = None) -> str:
+    """Remove one block by label (leaving it out of a workflow sent elsewhere does not delete it), unlinking any
+    block that pointed at it, plus the declared input keys in `remove_parameters` in the same write (an undeclared
+    key is an error). The result's `data.inputs_only_read_by_deleted_block` lists still-declared inputs that only
+    the deleted block read."""
     copilot_ctx = ctx.context
-    arguments = {"label": label}
+    arguments = {"label": label, "remove_parameters": remove_parameters}
     authority_error = _authority_tool_error(copilot_ctx, "delete_block")
     if authority_error:
         result = {"ok": False, "error": authority_error}
@@ -897,8 +902,9 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
         )
         return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
     async with copilot_ctx.block_edit_lock:
+        stored_yaml = _stored_workflow_yaml(copilot_ctx)
         try:
-            workflow_yaml = delete_block_from_workflow(_stored_workflow_yaml(copilot_ctx), label)
+            workflow_yaml = delete_block_from_workflow(stored_yaml, label, remove_parameters=remove_parameters)
         except BlockEditError as exc:
             result = {"ok": False, "error": str(exc)}
             record_tool_step_result_for_ctx(copilot_ctx, "delete_block", arguments, result)
@@ -910,7 +916,14 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
             )
             return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
         return await _persist_block_scoped_edit(
-            copilot_ctx, "delete_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+            copilot_ctx,
+            "delete_block",
+            workflow_yaml,
+            arguments,
+            originating_call_id=_originating_call_id(ctx),
+            data_extra=lambda saved: {
+                "inputs_only_read_by_deleted_block": inputs_only_read_by_deleted_block(label, stored_yaml, saved)
+            },
         )
 
 
@@ -2651,6 +2664,7 @@ def copilot_native_tools(
     supports_credential_delete_card: bool = False,
     supports_google_setup_card: bool = False,
     supports_demonstration_offer: bool = False,
+    browser_pattern_accepting_calls: tuple[str, ...] = (),
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
@@ -2673,6 +2687,10 @@ def copilot_native_tools(
         if tool.name == REPLY_TOOL_NAME:
             tools.append(tool)
             continue
+        if tool.name == BROWSER_CODE_TOOL_NAME:
+            tool = dataclasses.replace(
+                tool, description=render_browser_code_description(browser_pattern_accepting_calls)
+            )
         if tool.name in _EXECUTED_SOURCE_PARAMS:
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
         if tool.name == list_integrations_tool.name and run_tools_available:

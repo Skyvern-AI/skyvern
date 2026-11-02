@@ -1615,6 +1615,18 @@ async def test_gmail_send_refusals_make_no_token_or_provider_call(
 
 
 @pytest.mark.asyncio
+async def test_gmail_send_template_refusal_names_its_cause(gmail_env: GmailEnv) -> None:
+    result = await _run_gmail(_gmail_block(subject="Weekly report {{ missing_block.output.total }}"))
+
+    assert _outcome(result) == ("failed", "template_error", False)
+    assert result.failure_reason.startswith("A template in the email could not be rendered.")
+    assert "Missing reference in `missing_block.output.total` (field subject, line 1)" in result.failure_reason
+    assert "Weekly report" not in result.failure_reason
+    assert result.output_parameter_value["render_failure"]["kind"] == "Missing reference"
+    assert gmail_env.requests == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "respond",
     [

@@ -3805,6 +3805,21 @@ async def _two_frames_passed(
     return frames is True
 
 
+async def _clear_unverified_secret(skyvern_element: SkyvernElement) -> None:
+    # The ActionFailure only skips this step's submit, so a field left holding the unverified value lets a
+    # later step send a wrong credential toward an account lockout, and a non-password field's value reaches
+    # prompts through the scraper (a scramble is a reordering, so exact-value redaction misses it). Clearing
+    # is best effort: the mismatch stands whether or not it lands.
+    try:
+        await skyvern_element.input_clear()
+    except Exception as exc:
+        LOG.warning(
+            "Could not clear the credential field after a read-back mismatch",
+            element_id=skyvern_element.get_id(),
+            error_type=type(exc).__name__,
+        )
+
+
 async def _fill_secret_with_readback(
     *,
     skyvern_element: SkyvernElement,
@@ -3944,6 +3959,7 @@ async def _fill_secret_with_readback(
         "Secret input read-back mismatch after retry",
         element_id=skyvern_element.get_id(),
     )
+    await _clear_unverified_secret(skyvern_element)
     return ActionFailure(SecretInputMismatch())
 
 

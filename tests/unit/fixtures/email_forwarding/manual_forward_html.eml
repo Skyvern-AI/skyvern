@@ -1,0 +1,8 @@
+From: User <user@customer.example>
+To: forward@inbound.example
+Subject: Fwd: Sign in to Example
+Message-ID: <manual-forward-1>
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+
+<html><body><p>Your login code is <strong>731204</strong>.</p><a href="https://app.example/verify?t=abc">Verify account</a><img src="https://tracker.example/pixel"></body></html>
