@@ -10,11 +10,15 @@ import type {
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useActiveOrgId } from "@/store/ActiveOrgContext";
 import CloudContext from "@/store/CloudContext";
+import { useHasCapability } from "@/store/PageSlots";
 
 const ROOT = "/email-forwarding";
 
-export function useEmailForwardingAvailability(): boolean | undefined {
+export function useEmailForwardingAvailability(
+  capabilityAllowed = true,
+): boolean | undefined {
   const isCloud = useContext(CloudContext);
+  const canList = useHasCapability("email_forwarding.list");
   const credentialGetter = useCredentialGetter();
   const orgId = useActiveOrgId();
   const { data, isPending } = useQuery({
@@ -25,12 +29,13 @@ export function useEmailForwardingAvailability(): boolean | undefined {
           await getClient(credentialGetter, "v1")
         ).get<{ available: boolean }>(`${ROOT}/availability`)
       ).data.available,
-    enabled: isCloud,
+    enabled: isCloud && capabilityAllowed && canList,
     retry: false,
     retryOnMount: false,
     staleTime: Infinity,
   });
   if (!isCloud) return true;
+  if (!capabilityAllowed || !canList) return false;
   if (isPending) return undefined;
   return data === true;
 }
@@ -39,10 +44,23 @@ export function useEmailForwardingAvailable(): boolean {
   return useEmailForwardingAvailability() === true;
 }
 
+export type ForwardingCapability =
+  | "list"
+  | "read"
+  | "create"
+  | "update"
+  | "delete";
+
+export function useForwardingCapability(action: ForwardingCapability): boolean {
+  const allowed = useHasCapability("email_forwarding." + action);
+  const available = useEmailForwardingAvailability(allowed);
+  return available === true && allowed;
+}
+
 export function useForwardingAddresses(enabled = true) {
   const credentialGetter = useCredentialGetter();
   const orgId = useActiveOrgId();
-  const available = useEmailForwardingAvailable();
+  const canList = useForwardingCapability("list");
   return useQuery({
     queryKey: ["emailForwarding", orgId, "addresses"],
     queryFn: async () =>
@@ -51,7 +69,7 @@ export function useForwardingAddresses(enabled = true) {
           await getClient(credentialGetter, "sans-api-v1")
         ).get<ForwardingAddress[]>(`${ROOT}/addresses`)
       ).data,
-    enabled: available && enabled,
+    enabled: canList && enabled,
     refetchInterval: (query) =>
       isForbiddenError(query.state.error) ? false : 10_000,
     retry: false,
@@ -61,7 +79,7 @@ export function useForwardingAddresses(enabled = true) {
 export function useForwardingInbox(addressId: string, offset: number) {
   const credentialGetter = useCredentialGetter();
   const orgId = useActiveOrgId();
-  const available = useEmailForwardingAvailable();
+  const canRead = useForwardingCapability("read");
   return useQuery({
     queryKey: ["emailForwarding", orgId, "inbox", addressId, offset],
     queryFn: async () => {
@@ -75,7 +93,7 @@ export function useForwardingInbox(addressId: string, offset: number) {
         hasMore: response.headers?.["x-has-more"] === "true",
       };
     },
-    enabled: available,
+    enabled: canRead,
     refetchInterval: (query) =>
       offset === 0 && !isForbiddenError(query.state.error) ? 10_000 : false,
     retry: false,

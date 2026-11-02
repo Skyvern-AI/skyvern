@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { useEmailForwardingAvailable } from "@/hooks/useEmailForwarding";
+import { useForwardingCapability } from "@/hooks/useEmailForwarding";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { TwilioPhoneNumberPicker } from "@/routes/integrations/twilio/TwilioPhoneNumberPicker";
 import { cn } from "@/util/utils";
@@ -278,7 +278,7 @@ function PasswordCredentialContent({
   totpError,
   authenticatorSaveError,
 }: Props) {
-  const forwardingEnabled = useEmailForwardingAvailable();
+  const forwardingEnabled = useForwardingCapability("list");
   const { enterpriseApps, additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
   const { name, username, password, totp, totp_type, totp_identifier } = values;

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { receivedAt, type ForwardingAddress } from "@/api/emailForwarding";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { useForwardingCapability } from "@/hooks/useEmailForwarding";
 import { ForwardingCopy, ForwardingStatus } from "./ForwardingUi";
 import { ForwardingInbox } from "./ForwardingInbox";
 
@@ -17,7 +18,11 @@ export function ForwardingAddressPanel({
 }: {
   address: ForwardingAddress;
 }) {
+  const canReadInbox = useForwardingCapability("read");
   const [inboxOpen, setInboxOpen] = useState(false);
+  useEffect(() => {
+    if (!canReadInbox) setInboxOpen(false);
+  }, [canReadInbox]);
   return (
     <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -47,16 +52,18 @@ export function ForwardingAddressPanel({
         <p className="text-xs text-muted-foreground">
           Last received: {receivedAt(address.last_received_at)}
         </p>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => setInboxOpen(true)}
-        >
-          {address.has_pending_confirmation
-            ? "View confirmation"
-            : "Open inbox"}
-        </Button>
+        {canReadInbox && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setInboxOpen(true)}
+          >
+            {address.has_pending_confirmation
+              ? "View confirmation"
+              : "Open inbox"}
+          </Button>
+        )}
       </div>
       {address.status === "disabled" && (
         <p className="text-sm">
@@ -106,7 +113,7 @@ export function ForwardingAddressPanel({
           </a>
         </div>
       </details>
-      <Dialog open={inboxOpen} onOpenChange={setInboxOpen}>
+      <Dialog open={inboxOpen && canReadInbox} onOpenChange={setInboxOpen}>
         <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Forwarding inbox</DialogTitle>
@@ -114,7 +121,7 @@ export function ForwardingAddressPanel({
               {address.email_address}
             </DialogDescription>
           </DialogHeader>
-          {inboxOpen && (
+          {inboxOpen && canReadInbox && (
             <ForwardingInbox
               key={address.forwarding_address_id}
               addressId={address.forwarding_address_id}

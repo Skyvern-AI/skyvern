@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -11,6 +11,7 @@ import {
 import {
   useForwardingAction,
   useForwardingAddresses,
+  useForwardingCapability,
 } from "@/hooks/useEmailForwarding";
 import CloudContext from "@/store/CloudContext";
 import { ForwardingAddressPanel } from "./ForwardingAddressPanel";
@@ -36,13 +37,20 @@ export function CredentialForwardingAddress({
     "For self-hosted forwarding, register a receiver and address through the email forwarding API, then enter that address as this credential’s email identifier.";
   const addresses = useForwardingAddresses(Boolean(credentialId));
   const action = useForwardingAction();
+  const canList = useForwardingCapability("list");
+  const canCreate = useForwardingCapability("create");
+  const canRevoke = useForwardingCapability("delete");
   const [revokeOpen, setRevokeOpen] = useState(false);
+  useEffect(() => {
+    if (!canList || !canRevoke) setRevokeOpen(false);
+  }, [canList, canRevoke]);
   const current = addresses.data?.find(
     (address) =>
       address.match_mode === "dedicated" &&
       address.status !== "revoked" &&
       address.email_address === identifier.trim().toLowerCase(),
   );
+  if (!canList) return null;
   if (!credentialId)
     return (
       <p className="text-sm text-muted-foreground">
@@ -94,21 +102,23 @@ export function CredentialForwardingAddress({
             label="Copy previous forwarding address"
           />
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          disabled={disabled || action.isPending}
-          onClick={() => {
-            action.reset();
-            setRevokeOpen(true);
-          }}
-        >
-          Revoke previous address
-        </Button>
+        {canRevoke && (
+          <Button
+            type="button"
+            variant="outline"
+            disabled={disabled || action.isPending}
+            onClick={() => {
+              action.reset();
+              setRevokeOpen(true);
+            }}
+          >
+            Revoke previous address
+          </Button>
+        )}
         <Dialog
-          open={revokeOpen}
+          open={revokeOpen && canList && canRevoke}
           onOpenChange={(open) => {
-            if (!action.isPending) setRevokeOpen(open);
+            if (!action.isPending && canList && canRevoke) setRevokeOpen(open);
           }}
         >
           <DialogContent>
@@ -131,8 +141,9 @@ export function CredentialForwardingAddress({
               </Button>
               <Button
                 type="button"
-                disabled={action.isPending}
+                disabled={action.isPending || !canList || !canRevoke}
                 onClick={async () => {
+                  if (!canList || !canRevoke) return;
                   try {
                     await action.mutateAsync({
                       kind: "revoke",
@@ -162,6 +173,7 @@ export function CredentialForwardingAddress({
         edit it, choose Email, and generate a forwarding address.
       </p>
     );
+  if (!canCreate) return null;
   return (
     <div className="space-y-2 rounded-lg border border-dashed p-4">
       <p className="text-sm text-muted-foreground">
@@ -174,6 +186,7 @@ export function CredentialForwardingAddress({
         variant="outline"
         disabled={disabled || action.isPending}
         onClick={async () => {
+          if (!canList || !canCreate) return;
           onPendingChange?.(true);
           try {
             const result = await action.mutateAsync({
