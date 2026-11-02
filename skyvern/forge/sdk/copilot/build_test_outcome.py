@@ -37,10 +37,12 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_param_ids,
     parse_workflow_yaml,
+    saved_credential_ids,
     workflow_blocks,
 )
 from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import ActionStatus
 from skyvern.webeye.utils.captcha_solver import ChallengeArm, ChallengePageState, ChallengeStatus
 
 LOG = structlog.get_logger()
@@ -110,6 +112,7 @@ TerminalCause = Literal[
     "billing_credit_admission_refusal",
     "saved_profile_unresolved",
     "saved_profile_not_applied",
+    "unsaved_browser_profile_pick",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -335,7 +338,7 @@ class BuildTestFailedOperation(BaseModel):
     @field_validator("block_label")
     @classmethod
     def redact_block_label(cls, value: str | None) -> str | None:
-        return _redacted_terminal_text(value)
+        return redacted_terminal_text(value)
 
 
 class BuildTestPacketFailure(BaseModel):
@@ -606,6 +609,17 @@ _ValueT = TypeVar("_ValueT")
 BLOCK_FACT_MAX_LABELS = 12
 BLOCK_FACT_MAX_OBSERVATIONS = 6
 BLOCK_FACT_MAX_CHARS = 300
+
+
+_RECORDED_FAILURE_OBSERVATION = re.compile(rf"\S+ {ActionStatus.failed.value} code_line=\d+[^:]*: ")
+
+
+def recorded_failure_observation(observation: str) -> bool:
+    """Whether a rendered action observation carries a code-block operation's recorded error, which native task
+    rows never do."""
+    return _RECORDED_FAILURE_OBSERVATION.match(observation) is not None
+
+
 # An over-long URL is refused rather than cut everywhere it is bounded: a cut URL still parses, so
 # it would be reported as a page the run reached while being unresumable.
 BLOCK_FACT_URL_MAX_CHARS = 2000
@@ -1631,12 +1645,12 @@ def _recorded_outcome_from_run_blocks_result(
         result, block_associations_by_label=block_associations_by_label
     )
     block_labels = [
-        label for block in blocks if (label := _redacted_terminal_text(_safe_str(block.get("label")))) is not None
+        label for block in blocks if (label := redacted_terminal_text(_safe_str(block.get("label")))) is not None
     ]
     requested = data.get("requested_block_labels")
     requested_block_labels = (
         _clean_list(
-            [redacted for label in requested if isinstance(label, str) if (redacted := _redacted_terminal_text(label))]
+            [redacted for label in requested if isinstance(label, str) if (redacted := redacted_terminal_text(label))]
         )
         if isinstance(requested, list)
         else []
@@ -1660,7 +1674,7 @@ def _recorded_outcome_from_run_blocks_result(
             redacted
             for block in blocks
             if _safe_str(block.get("status")) in _EXECUTED_BLOCK_STATUSES
-            if (redacted := _redacted_terminal_text(_safe_str(block.get("label"))))
+            if (redacted := redacted_terminal_text(_safe_str(block.get("label"))))
         ]
     )
     executed_block_associations = _block_associations(blocks, block_associations_by_label, _EXECUTED_BLOCK_STATUSES)
@@ -1986,7 +2000,7 @@ def _recorded_outcome_from_run_blocks_result(
     return RecordedBuildTestOutcome(
         phase="persisted_block_run",
         attempted_tool="update_and_run_blocks",
-        attempted_block_label=_redacted_terminal_text(_safe_str(failed_block.get("label"))) or ""
+        attempted_block_label=redacted_terminal_text(_safe_str(failed_block.get("label"))) or ""
         if failed_block is not None
         else "",
         verdict=verdict,
@@ -1996,7 +2010,7 @@ def _recorded_outcome_from_run_blocks_result(
         requested_block_labels=requested_block_labels,
         executed_block_labels=executed_block_labels,
         failed_block_labels=_clean_list(
-            [redacted for label in _failed_block_labels(blocks) if (redacted := _redacted_terminal_text(label))]
+            [redacted for label in _failed_block_labels(blocks) if (redacted := redacted_terminal_text(label))]
         ),
         block_shape_hashes=block_shape_hashes,
         structural_failure_identity=structural_identity,
@@ -2099,8 +2113,8 @@ def failed_block_bound_credential_ids(
         return set()
     credential_ids = block_credential_ids(code_blocks[0], credential_params_by_key)
     # A rotation pool or a fallback list picks its credential per run, out of reach here, so naming any
-    # member could send the user to edit a credential the site never saw.
-    return credential_ids if len(credential_ids) == 1 else set()
+    # member could send the user to edit a credential the site never saw. A vault-item binding has no card.
+    return credential_ids if len(credential_ids) == 1 and saved_credential_ids(credential_ids) else set()
 
 
 def connect_failure_from_run_blocks_result(result: Mapping[str, object]) -> BuildTestConnectFailure | None:
@@ -2282,7 +2296,7 @@ def _bounded_text(value: object, max_chars: int = _TEXT_MAX) -> str:
     return text[:max_chars]
 
 
-def _redacted_terminal_text(value: str | None) -> str | None:
+def redacted_terminal_text(value: str | None) -> str | None:
     if not isinstance(value, str):
         return None
     redacted = redact_raw_secrets_for_prompt(scrub_all_registered_from_text(value))
@@ -2291,7 +2305,7 @@ def _redacted_terminal_text(value: str | None) -> str | None:
 
 def _recorded_output_field_text(value: object) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str, separators=(",", ":"))
-    return (_redacted_terminal_text(text) or "")[:_TEXT_MAX]
+    return (redacted_terminal_text(text) or "")[:_TEXT_MAX]
 
 
 def scrubbed_slice(text: str, limit: int) -> str:
@@ -2337,7 +2351,7 @@ def _recorded_block_outcome_facts(
     """
     executed: list[_ExecutedRow] = []
     for block in blocks:
-        label = _redacted_terminal_text(_safe_str(block.get("label")))
+        label = redacted_terminal_text(_safe_str(block.get("label")))
         status = _safe_str(block.get("status"))
         if not label or status not in _EXECUTED_BLOCK_STATUSES:
             continue
@@ -2355,7 +2369,7 @@ def _recorded_block_outcome_facts(
                 # A key is as free-form as a value, so it gets both passes its value gets before it is
                 # bounded — a generic secret shape cut at 96 characters is no longer a shape — and two keys
                 # that come out alike keep both rows rather than one replacing the other.
-                screened_key = _bounded_ref(_redacted_terminal_text(str(key)) or "")
+                screened_key = _bounded_ref(redacted_terminal_text(str(key)) or "")
                 fields[_disambiguated(screened_key, fields)] = _recorded_output_field_text(value)
         elif output is not None:
             output_text = _recorded_output_field_text(output)

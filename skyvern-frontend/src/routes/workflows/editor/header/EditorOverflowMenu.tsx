@@ -29,8 +29,8 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useProductTourStore } from "@/store/ProductTourStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -68,9 +68,12 @@ export function EditorOverflowMenu({
     (s) => s.saveBlockedReason,
   );
   const saveLockReason = useWorkflowYamlEditorStore(selectSaveLockReason);
-  const templateSaveReason = saveBlockedReason ?? saveLockReason;
+  const proposalPending = useCopilotProposalStore((s) => s.proposal !== null);
+  // Saving here would make a staged Copilot proposal durable without Accept.
+  const templateSaveReason = proposalPending
+    ? "Resolve the Copilot proposal before saving."
+    : (saveBlockedReason ?? saveLockReason);
   const templateReasonId = useId();
-  const isRecording = useRecordingStore((s) => s.isRecording);
   const requestTour = useProductTourStore((s) => s.requestTour);
   const onSave = useSaveWorkflow();
   const credentialGetter = useCredentialGetter();
@@ -114,7 +117,7 @@ export function EditorOverflowMenu({
     },
   });
 
-  const disabled = isRecording || templateMutation.isPending || saving;
+  const disabled = templateMutation.isPending || saving;
   // Only adding a template saves first. Radix skips a `disabled` item in keyboard navigation,
   // so the held item stays focusable and carries aria-disabled to keep its reason reachable.
   const templateSaveHeld = !isTemplate && Boolean(templateSaveReason);
@@ -122,6 +125,7 @@ export function EditorOverflowMenu({
   const handleTemplateToggle = async () => {
     const newIsTemplate = !isTemplate;
     if (newIsTemplate) {
+      if (useCopilotProposalStore.getState().proposal) return;
       await onSave();
     }
     templateMutation.mutate(newIsTemplate);
@@ -132,13 +136,9 @@ export function EditorOverflowMenu({
   const trigger = (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span
-          className="inline-flex shrink-0"
-          {...(isRecording ? { tabIndex: 0 } : {})}
-        >
+        <span className="inline-flex shrink-0">
           <DropdownMenuTrigger asChild>
             <Button
-              disabled={isRecording}
               size="icon"
               variant="tertiary"
               className={triggerClassName}
@@ -158,18 +158,15 @@ export function EditorOverflowMenu({
       {embedded ? trigger : <TooltipProvider>{trigger}</TooltipProvider>}
       <DropdownMenuContent align="end" className="min-w-[12rem]">
         {!embedded && enterYamlMode && (
-          <DropdownMenuItem
-            disabled={isRecording}
-            onSelect={() => enterYamlMode()}
-          >
+          <DropdownMenuItem onSelect={() => enterYamlMode()}>
             <FileTextIcon className="mr-2 size-4" />
             View schema
           </DropdownMenuItem>
         )}
         <CodeSubmenu />
-        {!workflowRunIsRunningOrQueued && (
+        {/* Restoring a version would replace the canvas a Copilot proposal is staged on. */}
+        {!workflowRunIsRunningOrQueued && !proposalPending && (
           <DropdownMenuItem
-            disabled={isRecording}
             onSelect={() => (onVersionHistory ?? toggleHistoryPanel)()}
           >
             <CounterClockwiseClockIcon className="mr-2 size-4" />

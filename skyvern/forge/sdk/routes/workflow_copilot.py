@@ -3,6 +3,7 @@ import contextlib
 import contextvars
 import hashlib
 import hmac
+import io
 import json
 import re
 import time
@@ -15,7 +16,7 @@ from urllib.parse import urlparse
 
 import structlog
 import yaml
-from fastapi import BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import BackgroundTasks, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile, status
 from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
@@ -31,9 +32,13 @@ from skyvern.forge.sdk.api.files import is_uploaded_file_id
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
-from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.cache.base import BaseCache
-from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.agent import (
+    completed_tool_names,
+    run_copilot_agent,
+    stopped_turn_facts,
+    turn_facts_for_context,
+)
 from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_CONCURRENCY,
     CREDENTIAL_DELETE_RECORD_ATTEMPTS,
@@ -51,13 +56,12 @@ from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_finge
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     AgentResult,
-    ApprovedCredential,
     CopilotContext,
     ProposalDisposition,
     TurnNarrativePayload,
     clear_proposed_credential,
-    merge_approved_credentials_into_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.cost_telemetry import CopilotCostLedger, copilot_cost_scope, current_copilot_cost
 from skyvern.forge.sdk.copilot.credential_generation import generate_registration_password
 from skyvern.forge.sdk.copilot.credential_pause import (
     MANUAL_SIGN_IN_CLAIM_SECONDS,
@@ -75,7 +79,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     sign_in_site,
     start_manual_sign_in,
 )
-from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, safe_admitted_url
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationRecorder,
     DemonstrationRejection,
@@ -83,6 +87,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     append_demonstration_control,
     claim_demonstration_recording,
     demonstration_action_labels,
+    demonstration_file_ids,
     demonstration_limit_reached,
     demonstration_owner_is_live,
     demonstration_time_limit_reached,
@@ -90,6 +95,13 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     validate_demonstration_for_replay,
 )
 from skyvern.forge.sdk.copilot.enforcement import EXPIRED_TURN_REPLY_SECONDS, TOTAL_TIMEOUT_SECONDS
+from skyvern.forge.sdk.copilot.eval_llm_overrides import (
+    EVAL_LLM_OVERRIDES_HEADER,
+    EvalLLMOverrides,
+    admit_eval_llm_overrides,
+    current_eval_llm_overrides,
+    eval_llm_override_scope,
+)
 from skyvern.forge.sdk.copilot.goal_suggestion import suggest_goal_from_code
 from skyvern.forge.sdk.copilot.interruption import (
     INTERRUPTED_TERMINAL_REASON,
@@ -106,7 +118,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginRefusal, resolve_repair_origin_binding
-from skyvern.forge.sdk.copilot.request_policy import screen_raw_secret_safety
+from skyvern.forge.sdk.copilot.request_policy import raw_secret_safety_log_fields, screen_raw_secret_safety
 from skyvern.forge.sdk.copilot.review_gate import parse_execution_receipts, serialize_execution_receipts
 from skyvern.forge.sdk.copilot.runtime import close_browser_session_quietly
 from skyvern.forge.sdk.copilot.steer import STEER_DOORBELL_TTL, copilot_steer_key
@@ -133,6 +145,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _runs_in_list_order,
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
@@ -151,22 +164,19 @@ from skyvern.forge.sdk.db.exceptions import (
     DuplicateCopilotTurnError,
     NotFoundError,
 )
-from skyvern.forge.sdk.experimentation.copilot_demonstration import (
-    copilot_demonstration_enabled,
-    shared_copilot_demonstration_cache,
-)
 from skyvern.forge.sdk.forge_log import _generated_log_value
 from skyvern.forge.sdk.routes.browser_profiles import (
     _hard_delete_created_profile_after_store_failure,
     create_profile_from_running_session,
 )
-from skyvern.forge.sdk.routes.credentials import (
-    delete_organization_credential,
-    prepare_credential_create,
-    store_new_credential,
-)
+from skyvern.forge.sdk.routes.credentials import delete_organization_credential
 from skyvern.forge.sdk.routes.routers import base_router
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import PersistedCopilotComposerMode, ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    CopilotRequestBrowserAllocations,
+    PersistedCopilotComposerMode,
+    ResponseKind,
+    TurnOutcome,
+)
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
@@ -178,6 +188,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PRIVATE_SETTINGS_KEY,
     COPILOT_PROPOSAL_METADATA_KEY,
+    MAX_ATTACHED_FILES_PER_MESSAGE,
     TURN_OPENER_SENDERS,
     CopilotAttachedFile,
     CopilotCancelSource,
@@ -226,11 +237,19 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.credential.credential_creation_service import (
+    prepare_credential_create,
+    store_new_credential,
+)
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.secret_encryption import (
+    mask_workflow_for_api,
+    preserve_workflow_definition_secrets,
+)
 from skyvern.forge.sdk.workflow.service import workflow_changed_fields
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
@@ -238,8 +257,7 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
 )
-from skyvern.services.browser_recording.evidence import build_recording_evidence
-from skyvern.services.browser_recording.session_registry import interpretation_registry
+from skyvern.services import uploaded_file_service
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import is_blocked_host, validate_webhook_url
@@ -320,30 +338,10 @@ COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON = "copilot_recoverable_failure"
 USER_CANCELLED_TERMINAL_REASON = "user_cancelled"
 TEST_END_TO_END_TURN_MESSAGE = "Test this workflow end to end."
 DIAGNOSE_RUN_TURN_MESSAGE = "Diagnose run {run_id} and repair the workflow."
-# The first sentence is the row the transcript shows; REFINE_RECORDING_RECEIPT in
-# WorkflowCopilotChat.tsx echoes it so a history reload does not reword the turn.
-REFINE_RECORDING_RECEIPT = "Refine the recording ({action_count} actions) into a reusable workflow."
-REFINE_RECORDING_INSTRUCTION = (
-    "From recorded browser evidence, infer the user's objective and refine the literal replay into the simplest "
-    "reusable workflow that achieves it.\n\n"
-    "Treat recorded actions as evidence, not a checklist. Remove exploratory, corrective, duplicated, or incidental "
-    "actions only when neither the objective nor any retained interaction depends on the state they create. You may "
-    "collapse a multi-action path into a direct action only when the replacement reaches the same required browser "
-    "state and does not depend on state created by removed actions.\n\n"
-    "For every required interaction, preserve its recorded semantics and actionable target by default. Do not "
-    "change the interaction primitive or retarget to an associated, nested, or semantically similar element unless "
-    "the replacement is successfully tested and produces the same observable state. If a dependency or equivalence "
-    "is uncertain and cannot be tested in this turn, retain the recorded interaction.\n\n"
-    "Generalize user-entered values into workflow parameters. Improve selectors only while targeting the same "
-    "actionable surface. Add validation and any extraction required by the objective.\n\n"
-    "Fail closed: raise unless the objective is verifiably achieved, and return output only on success. Write the "
-    "workflow with the workflow tool before replying; do not substitute a prose-only answer."
-)
-
 
 # The id is interpolated into a row the transcript renders as a product utterance, so anything
 # that could read as prose is refused rather than echoed.
-_WORKFLOW_RUN_ID_RE = re.compile(r"\Awr_[A-Za-z0-9]{1,40}\Z")
+_WORKFLOW_RUN_ID_RE = re.compile(r"\Awr_(?:[A-Za-z0-9]{1,40}|sched_[0-9a-f]{20,32}|recipe_[0-9]{1,40})\Z")
 
 _UNUSABLE_DIAGNOSE_RUN_REFUSALS = frozenset(
     {
@@ -355,7 +353,7 @@ _UNUSABLE_DIAGNOSE_RUN_REFUSALS = frozenset(
 
 
 def _turn_opener_sender(chat_request: WorkflowCopilotChatRequest) -> WorkflowCopilotChatSender:
-    if chat_request.product_action in ("diagnose_run", "refine_recording"):
+    if chat_request.product_action == "diagnose_run":
         return WorkflowCopilotChatSender.PRODUCT
     return WorkflowCopilotChatSender.USER
 
@@ -365,8 +363,6 @@ def _turn_opener_message_for_persistence(
     *,
     canonical_message: str | None = None,
 ) -> str:
-    if chat_request.product_action == "refine_recording" and chat_request.recording_evidence is not None:
-        return REFINE_RECORDING_RECEIPT.format(action_count=len(chat_request.recording_evidence.actions))
     return chat_request.message if canonical_message is None else canonical_message
 
 
@@ -413,120 +409,6 @@ async def _apply_diagnose_run_action(
             status_code=status.HTTP_409_CONFLICT,
             detail="workflow_run_id names a run that is still in progress.",
         )
-
-
-async def _apply_refine_recording_action(
-    chat_request: WorkflowCopilotChatRequest,
-    *,
-    organization_id: str,
-    workflow_permanent_id: str,
-) -> list[ApprovedCredential]:
-    """Replace caller prose with the server's model-facing instruction, or refuse the action.
-
-    Like ``_apply_diagnose_run_action``, the instruction is written before the first await so no failure
-    inside this function can reach a writer while the request still holds caller text under the
-    product sender.
-    """
-    if chat_request.product_action != "refine_recording":
-        return []
-    evidence = chat_request.recording_evidence
-    if evidence is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="recording_evidence is required to refine a recording.",
-        )
-    # No actions means the user deleted every interpreted step, so there is no intent to infer.
-    if not evidence.actions:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="recording_evidence has no actions to refine.",
-        )
-    if evidence.recording.workflow_permanent_id != workflow_permanent_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="recording_evidence was recorded for a different workflow.",
-        )
-    chat_request.message = (
-        f"{REFINE_RECORDING_RECEIPT.format(action_count=len(evidence.actions))} {REFINE_RECORDING_INSTRUCTION}"
-    )
-    browser_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
-        evidence.recording.browser_session_id,
-        organization_id,
-    )
-    if not browser_session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="recording_evidence names a browser session of another organization.",
-        )
-    if evidence.recording_id is None:
-        return []
-    recording = await app.DATABASE.browser_recordings.get_recording(evidence.recording_id, organization_id)
-    if recording is None or (
-        recording.recording_attempt_id != evidence.recording.recording_attempt_id
-        or recording.browser_session_id != evidence.recording.browser_session_id
-        or recording.workflow_permanent_id != workflow_permanent_id
-    ):
-        LOG.warning(
-            "record_browser.credential_approval_recording_identity_mismatch",
-            organization_id=organization_id,
-            recording_id=evidence.recording_id,
-        )
-        return []
-
-    approvals: list[ApprovedCredential] = []
-    for item in recording.metadata.get("credential_approvals", []):
-        try:
-            approval = ApprovedCredential.model_validate(item)
-        except ValidationError:
-            continue
-        admitted_url = safe_admitted_url(approval.admitted_url)
-        if (
-            not approval.credential_id.startswith("cred_")
-            or not admitted_url
-            or canonicalize_origin(admitted_url) is None
-        ):
-            continue
-        approvals.append(ApprovedCredential(credential_id=approval.credential_id, admitted_url=admitted_url))
-    return approvals
-
-
-def _live_recording_evidence(
-    chat_request: WorkflowCopilotChatRequest,
-    *,
-    organization_id: str,
-    workflow_permanent_id: str,
-) -> str | None:
-    if not chat_request.recording_in_progress or chat_request.product_action is not None:
-        return None
-    session = (
-        interpretation_registry.get_live_session(
-            browser_session_id=chat_request.browser_session_id,
-            organization_id=organization_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-        if chat_request.browser_session_id
-        else None
-    )
-    if session is None:
-        # The session lives only on the API process holding the recording stream. Keep the
-        # recording_state marker so the turn is still read as recording context, with no actions.
-        LOG.info(
-            "No live recording session for copilot turn; sending recording state without actions",
-            browser_session_id=chat_request.browser_session_id,
-            workflow_permanent_id=workflow_permanent_id,
-        )
-        return json.dumps({"recording_state": "recording_in_progress", "actions": []})
-    # Shaped like the client's getFinalDraftSteps(): None before any draft exists, else the draft minus
-    # deletions. Renames are not applied because a patched label would reach the model as draft_label.
-    deleted_step_ids = set(chat_request.recording_deleted_step_ids)
-    packet = build_recording_evidence(
-        session.recorded_actions(),
-        [step for step in session.steps if step.step_id not in deleted_step_ids] if session.steps else None,
-        browser_session_id=session.browser_session_id,
-        workflow_permanent_id=session.workflow_permanent_id,
-        recording_attempt_id=session.recording_attempt_id or session.interpretation_session_id,
-    )
-    return json.dumps({"recording_state": "recording_in_progress", **packet.model_dump(mode="json")})
 
 
 def _effective_copilot_build_mode(
@@ -663,8 +545,7 @@ async def _resolve_copilot_request_config(
 ) -> CopilotConfig:
     copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
         organization_id,
-        # A recording becomes code; a demonstration follows the org's authoring dial like any other turn.
-        code_block_mode=True if chat_request.product_action == "refine_recording" else chat_request.code_block,
+        code_block_mode=chat_request.code_block,
     )
     return copilot_config or CopilotConfig()
 
@@ -795,13 +676,37 @@ async def _stop_older_live_turns(
 RouteExit = Literal["completed", "error", "cancelled", "duplicate", "refused"]
 
 
+def _copilot_eval_cost_enabled(organization_id: str) -> bool:
+    return (
+        settings.WORKFLOW_COPILOT_EVAL_COST_ENABLED
+        and organization_id in settings.WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS
+    )
+
+
+def _copilot_eval_cost_headers(ledger: CopilotCostLedger | None) -> dict[str, str]:
+    if ledger is None:
+        return {}
+    receipt = {"receipt_id": uuid.uuid4().hex, "llm_cost": ledger.snapshot()}
+    return {"X-Copilot-Eval-LLM-Cost": json.dumps(receipt, separators=(",", ":"))}
+
+
 class _FirstEventTimingStream:
-    def __init__(self, stream: EventSourceStream, started_at: float) -> None:
+    def __init__(self, stream: EventSourceStream, started_at: float, *, include_eval_cost: bool = False) -> None:
         self._stream = stream
         self._started_at = started_at
+        self._include_eval_cost = include_eval_cost
         self.first_event_seconds: float | None = None
 
     async def send(self, data: Any) -> bool:
+        if isinstance(data, WorkflowCopilotStreamResponseUpdate):
+            overrides = current_eval_llm_overrides()
+            data = data.model_copy(
+                update={
+                    "eval_llm_config_overrides": dict(overrides.config_keys) if overrides else None,
+                    "eval_llm_config_overrides_sha256": overrides.sha256 if overrides else None,
+                    "llm_cost": current_copilot_cost() if self._include_eval_cost else None,
+                }
+            )
         is_status_ack = isinstance(data, WorkflowCopilotProcessingUpdate) and data.status in {
             "Processing...",
             "Thinking...",
@@ -1110,11 +1015,31 @@ def _client_visible_proposal(proposal: dict[str, Any], stored: Workflow | None) 
 
 
 async def _client_visible_updated_workflow(updated_workflow: Workflow, agent_result: AgentResult) -> dict[str, Any]:
-    stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=updated_workflow.workflow_permanent_id, organization_id=updated_workflow.organization_id
+    return await _client_visible_response_proposal(
+        _build_proposed_workflow_data(updated_workflow, agent_result),
+        workflow_permanent_id=updated_workflow.workflow_permanent_id,
+        organization_id=updated_workflow.organization_id,
     )
-    visible = _client_visible_proposal(_build_proposed_workflow_data(updated_workflow, agent_result), stored)
+
+
+async def _client_visible_response_proposal(
+    proposal: dict[str, Any], *, workflow_permanent_id: str, organization_id: str
+) -> dict[str, Any]:
+    stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id, organization_id=organization_id
+    )
+    visible = _client_visible_proposal(proposal, stored)
     return {key: value for key, value in visible.items() if not key.startswith("_copilot_")}
+
+
+async def _stored_draft_of_turn(chat: WorkflowCopilotChat, turn_id: str) -> dict[str, Any] | None:
+    current_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=chat.organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    )
+    proposal = current_chat.proposed_workflow if current_chat is not None else None
+    metadata = copilot_proposal_metadata(proposal)
+    return proposal if metadata is not None and metadata.owner_turn_id == turn_id else None
 
 
 def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
@@ -1450,6 +1375,10 @@ async def _persist_turn_messages(
             if pending is not None:
                 pending_user_message_id = pending.user_message_id
                 request_cancel_token = pending.cancel_token or request_cancel_token
+                if turn_outcome is not None and pending.request_browser_allocations is not None:
+                    turn_outcome = turn_outcome.model_copy(
+                        update={"request_browser_allocations": pending.request_browser_allocations}
+                    )
                 if pending.question_interactions:
                     if narrative_payload is None:
                         narrative_payload = _make_error_narrative_payload(turn_id, None, assistant_content)
@@ -1675,14 +1604,41 @@ async def _persist_cancel_turn(
     narrative_payload: TurnNarrativePayload | None
     workflow_applied = False
     canonical_rolled_back = False
+    published_draft: dict[str, Any] | None = None
+    published_disposition: ProposalDisposition | None = None
     if agent_result is None:
+        # A cancel landing in the agent's own cleanup leaves no result, but the context it built
+        # still holds what the turn's tools completed. An interrupted turn keeps its own record.
+        sink_ctx = ctx_sink[0] if ctx_sink and not record_as_interrupted else None
+        tool_calls = completed_tool_names(sink_ctx) if sink_ctx is not None else []
+        acted_ctx = (
+            sink_ctx
+            if sink_ctx is not None
+            and (tool_calls or sink_ctx.edited_block_labels_this_turn or sink_ctx.dispatched_run_ids_this_turn)
+            else None
+        )
+        # The chat row was read at turn start, so a draft this turn published mid-turn is read back from the store.
+        if (
+            sink_ctx is not None
+            and sink_ctx.has_staged_proposal
+            and turn_id is not None
+            and sink_ctx.proposal_owner_turn_id == turn_id
+        ):
+            published_draft = await asyncio.shield(_stored_draft_of_turn(chat, turn_id))
+            stored_metadata = copilot_proposal_metadata(published_draft)
+            if published_draft is not None and stored_metadata is not None:
+                chat.proposed_workflow = published_draft
+                # The stored disposition is what the review card's pill reads; a stop never auto-applies.
+                published_disposition = (
+                    "review_tested" if stored_metadata.disposition == "review_tested" else "review_untested"
+                )
         user_response = cancel_notice(
             stop_button=cancel_source == "stop_button",
-            # Only a draft that survives the clear below is still awaiting the user.
-            preserved_draft=_preserved_draft_disposition(
-                draft_present=chat.proposed_workflow is not None and keep_pending_proposal
-            ),
+            # Otherwise only a draft that survives the clear below is still awaiting the user.
+            preserved_draft=published_disposition
+            or _preserved_draft_disposition(draft_present=chat.proposed_workflow is not None and keep_pending_proposal),
             canonical_rolled_back=False,
+            stopped=stopped_turn_facts(acted_ctx) if acted_ctx is not None else None,
         )
         updated_workflow = None
         updated_global_llm_context = clear_proposed_credential(prior_global_llm_context)
@@ -1699,11 +1655,14 @@ async def _persist_cancel_turn(
             cancel_source=cancel_source,
             copilot_effective_mode=effective_mode,
             copilot_code_available=code_available or False,
+            tool_calls=tool_calls,
         )
         response_turn_id = turn_id
         narrative_summary = user_response
         narrative_payload = _make_error_narrative_payload(turn_id, None, user_response)
-        if chat.proposed_workflow is not None and not keep_pending_proposal:
+        if acted_ctx is not None:
+            narrative_payload["turnFacts"] = turn_facts_for_context(acted_ctx, None)
+        if chat.proposed_workflow is not None and not keep_pending_proposal and published_draft is None:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
         restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
@@ -1765,6 +1724,7 @@ async def _persist_cancel_turn(
                     agent_result, draft_present=chat.proposed_workflow is not None
                 ),
                 canonical_rolled_back=canonical_rolled_back,
+                stopped=agent_result.cancellation_stopped_facts,
             )
         # The reload leg reads the payload text, so it must name the same report the row stores.
         if narrative_payload is not None and narrative_payload.get("terminalMessage") != user_response:
@@ -1810,7 +1770,7 @@ async def _persist_cancel_turn(
     if narrative_payload is not None and receipts is not None:
         narrative_payload = {**narrative_payload, "testedBlockFingerprints": serialize_execution_receipts(receipts)}
 
-    proposal_disposition = _proposal_disposition(agent_result)
+    proposal_disposition = published_disposition or _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         narrative_payload,
         cancelled=True,
@@ -1837,14 +1797,19 @@ async def _persist_cancel_turn(
         # Reading the run facts inside the shield keeps a cancel arriving during that read from
         # taking the terminal frame with it.
         proposed_workflow_run = await _terminal_proposal_run_facts(chat, proposed_workflow_metadata, organization_id)
+        visible_workflow: dict[str, Any] | None = None
+        if updated_workflow is not None and agent_result is not None:
+            visible_workflow = await _client_visible_updated_workflow(updated_workflow, agent_result)
+        elif published_draft is not None:
+            visible_workflow = await _client_visible_response_proposal(
+                published_draft, workflow_permanent_id=chat.workflow_permanent_id, organization_id=organization_id
+            )
         await stream.send(
             WorkflowCopilotStreamResponseUpdate(
                 type=WorkflowCopilotStreamMessageType.RESPONSE,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 message=user_response,
-                updated_workflow=await _client_visible_updated_workflow(updated_workflow, agent_result)
-                if updated_workflow is not None and agent_result is not None
-                else None,
+                updated_workflow=visible_workflow,
                 response_time=response_time,
                 total_tokens=total_tokens,
                 response_type=response_type,
@@ -2182,6 +2147,10 @@ async def _commit_staged_workflow(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
+    preserve_workflow_definition_secrets(
+        staged_workflow.workflow_definition,
+        canonical.workflow_definition if canonical is not None else None,
+    )
     title = _accepted_workflow_title(staged_workflow.title, canonical, metadata)
     # Auto-accept saves without the update route, so the staged definition gets the same reference check.
     await app.AGENT_FUNCTION.enforce_folder_access_for_references(
@@ -2470,6 +2439,8 @@ async def _new_copilot_chat_post(
     *,
     eval_mode: CopilotEvalMode | None = None,
     eval_entrypoint_url: str | None = None,
+    eval_llm_overrides: EvalLLMOverrides | None = None,
+    eval_cost_enabled: bool = False,
 ) -> EventSourceResponse:
     """Run the OpenAI Agents SDK copilot and
     streams responses in the same SSE shape the frontend consumes. On
@@ -2480,16 +2451,8 @@ async def _new_copilot_chat_post(
     """
     request_started_at = time.monotonic()
 
-    # Captured before any await, since stopping the recording drops the live session while this turn loads.
-    # The request wpid is safe here: the registry matches org and wpid, and the chat lookup rejects a mismatch.
-    live_recording_evidence = _live_recording_evidence(
-        chat_request,
-        organization_id=organization.organization_id,
-        workflow_permanent_id=chat_request.workflow_permanent_id,
-    )
-
     async def stream_handler(raw_stream: EventSourceStream) -> None:
-        stream = _FirstEventTimingStream(raw_stream, request_started_at)
+        stream = _FirstEventTimingStream(raw_stream, request_started_at, include_eval_cost=eval_cost_enabled)
         LOG.info(
             "Workflow copilot agent chat request",
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
@@ -2499,11 +2462,6 @@ async def _new_copilot_chat_post(
             workflow_yaml_length=len(chat_request.workflow_yaml or ""),
             organization_id=organization.organization_id,
             product_action=chat_request.product_action,
-            recording_attempt_id=(
-                chat_request.recording_evidence.recording.recording_attempt_id
-                if chat_request.recording_evidence is not None
-                else None
-            ),
         )
 
         # Canonical turn_id for the whole HTTP request. Generated before any
@@ -2845,11 +2803,6 @@ async def _new_copilot_chat_post(
                 organization_id=chat.organization_id,
                 workflow_permanent_id=chat.workflow_permanent_id,
             )
-            recording_credential_approvals = await _apply_refine_recording_action(
-                chat_request,
-                organization_id=chat.organization_id,
-                workflow_permanent_id=chat.workflow_permanent_id,
-            )
             chat_request.audio_artifact_id = await _validate_copilot_audio_artifact_id(
                 audio_artifact_id=chat_request.audio_artifact_id,
                 organization_id=organization.organization_id,
@@ -2875,22 +2828,11 @@ async def _new_copilot_chat_post(
                 organization.organization_id,
                 chat_request,
             )
-            if chat_request.product_action == "refine_recording":
-                # The turn runs on a recording the user just made, with nobody present to consent
-                # to a run, so it must not be able to mint a browser session or bill run credits.
-                # Mutated in place: the cloud config subclass has a narrow keyword-only __init__.
-                copilot_config.browser_tools_available = False
             current_code_available = copilot_config.code_block_available
-            # refine_recording resolves code authoring server-side, so the resolved config outranks
-            # the wire value the composer sent.
             effective_mode = (
                 "code" if copilot_config.effective_code_block_mode else _effective_copilot_build_mode(chat_request)
             )
             global_llm_context = _prior_global_llm_context(chat_messages)
-            global_llm_context = merge_approved_credentials_into_global_llm_context(
-                global_llm_context,
-                recording_credential_approvals,
-            )
 
             original_workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
                 workflow_permanent_id=chat_request.workflow_permanent_id,
@@ -2913,6 +2855,7 @@ async def _new_copilot_chat_post(
                 if chat_request.product_action == "test_end_to_end"
                 else strip_copilot_yaml_headers(chat_request.workflow_yaml),
                 persisted_workflow_yaml=persisted_workflow_yaml,
+                saved_workflow=original_workflow,
                 browser_session_id=None,
                 stream=stream,
             )
@@ -3022,6 +2965,18 @@ async def _new_copilot_chat_post(
                         turn_id=turn_id,
                         started_at=datetime.now(UTC),
                         cancel_token=chat_request.cancel_token,
+                        request_browser_allocations=CopilotRequestBrowserAllocations(
+                            organization_id=organization.organization_id,
+                            workflow_permanent_id=chat.workflow_permanent_id,
+                            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                            turn_id=turn_id,
+                            request_cancel_token=chat_request.cancel_token,
+                            allocations=[],
+                            recording_incomplete=False,
+                            truncated=False,
+                        )
+                        if eval_llm_overrides is not None
+                        else None,
                         pre_turn_workflow=original_workflow.model_dump(mode="json"),
                         pre_turn_proposed_workflow=proposed_workflow_at_turn_start,
                         keep_pending_proposal=chat_request.keep_pending_proposal,
@@ -3121,6 +3076,17 @@ async def _new_copilot_chat_post(
                     artifacts=artifacts,
                 )
 
+            async def persist_browser_allocation(allocation_id: str, browser_session_id: str | None) -> None:
+                await app.DATABASE.workflow_params.record_copilot_browser_allocation(
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    workflow_permanent_id=chat.workflow_permanent_id,
+                    turn_id=turn_id,
+                    request_cancel_token=chat_request.cancel_token,
+                    allocation_id=allocation_id,
+                    browser_session_id=browser_session_id,
+                )
+
             with _bind_copilot_session_id(chat):
                 agent_result = await run_copilot_agent(
                     stream=stream,
@@ -3144,7 +3110,11 @@ async def _new_copilot_chat_post(
                     persist_unsafe_video_file_ids=persist_unsafe_video_file_ids,
                     persist_too_long_video_file_ids=persist_too_long_video_file_ids,
                     persist_video_evidence_artifacts=persist_video_evidence_artifacts,
+                    browser_allocation_recorder=(
+                        persist_browser_allocation if eval_llm_overrides is not None else None
+                    ),
                     persisted_workflow_yaml=persisted_workflow_yaml,
+                    saved_workflow=original_workflow,
                     opening_workflow_title=original_workflow.title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=(
@@ -3155,11 +3125,6 @@ async def _new_copilot_chat_post(
                     auto_accept=chat.auto_accept,
                     private_workflow_settings=private_workflow_settings,
                     ctx_sink=turn_ctx_sink,
-                    untrusted_evidence=(
-                        chat_request.recording_evidence.model_dump_json()
-                        if chat_request.recording_evidence is not None
-                        else live_recording_evidence
-                    ),
                 )
 
             agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(
@@ -3514,7 +3479,12 @@ async def _new_copilot_chat_post(
                         first_event_seconds=stream.first_event_seconds,
                     )
 
-    return FastAPIEventSourceStream.create(request, stream_handler)
+    async def scoped_stream_handler(raw_stream: EventSourceStream) -> None:
+        cost_scope = copilot_cost_scope() if eval_cost_enabled else contextlib.nullcontext()
+        with eval_llm_override_scope(eval_llm_overrides, chat_request.workflow_permanent_id), cost_scope:
+            await stream_handler(raw_stream)
+
+    return FastAPIEventSourceStream.create(request, scoped_stream_handler)
 
 
 async def _get_or_create_workflow_copilot_chat(
@@ -3696,6 +3666,16 @@ async def _validate_copilot_audio_artifact_id(
     return audio_artifact_id
 
 
+def _has_audio_container_signature(data: bytes) -> bool:
+    """The declared content type is client-controlled, so the bytes must open as a container browsers record into."""
+    return (
+        data.startswith((b"\x1a\x45\xdf\xa3", b"OggS", b"ID3", b"fLaC"))
+        or (data[:4] == b"RIFF" and data[8:12] == b"WAVE")
+        or data[4:8] == b"ftyp"
+        or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+    )
+
+
 @base_router.post("/workflow/copilot/chat-audio", include_in_schema=False)
 async def workflow_copilot_chat_audio(
     workflow_permanent_id: str = Form(...),
@@ -3727,6 +3707,14 @@ async def workflow_copilot_chat_audio(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Audio file exceeds the maximum allowed size ({max_upload_bytes / 1024 / 1024:.0f} MB)",
         )
+
+    if not _has_audio_container_signature(audio_bytes):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="File content is not a supported audio format"
+        )
+    await asyncio.to_thread(
+        uploaded_file_service.validate_upload_type, UploadFile(file=io.BytesIO(audio_bytes), filename=file.filename)
+    )
 
     chat = await _get_or_create_workflow_copilot_chat(
         organization_id=organization.organization_id,
@@ -3802,19 +3790,35 @@ async def workflow_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    current_user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> EventSourceResponse:
+    # The client can opt out, but only the server can enable note-aware Copilot behavior.
+    server_doc_editor_enabled = await app.AGENT_FUNCTION.workflow_doc_editor_enabled(
+        organization.organization_id, current_user_id
+    )
+    chat_request.doc_editor_enabled = chat_request.doc_editor_enabled and server_doc_editor_enabled
+    eval_llm_overrides = admit_eval_llm_overrides(
+        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+    )
+    eval_cost_enabled = _copilot_eval_cost_enabled(organization.organization_id)
     eval_entrypoint_url = _validated_eval_entrypoint_url(request, chat_request, organization)
+    if app.CACHE is None or not app.CACHE.is_shared:
+        # Demonstrations live in the shared cache, so Copilot must not offer one this backend cannot start.
+        chat_request.supports_demonstration_offer = False
     if chat_request.product_action == "demonstrate":
-        cache = shared_copilot_demonstration_cache()
-        if not await copilot_demonstration_enabled(organization.organization_id) or cache is None:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot demonstration is disabled")
+        cache = app.CACHE
+        if cache is None or not cache.is_shared:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Copilot demonstration requires a shared cache",
+            )
         if not chat_request.demonstration_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="demonstration_id is required for a Copilot demonstration",
             )
         try:
-            await validate_demonstration_for_replay(
+            demonstration = await validate_demonstration_for_replay(
                 cache,
                 organization_id=organization.organization_id,
                 workflow_permanent_id=chat_request.workflow_permanent_id,
@@ -3822,6 +3826,13 @@ async def workflow_copilot_chat_post(
             )
         except DemonstrationRejection as rejection:
             raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
+        # A reloaded card no longer holds the files it attached; the recorded upload events still do.
+        demonstrated_file_ids = await demonstration_file_ids(
+            cache, organization.organization_id, chat_request.demonstration_id, demonstration.event_count
+        )
+        chat_request.attached_file_ids = list(dict.fromkeys([*chat_request.attached_file_ids, *demonstrated_file_ids]))[
+            :MAX_ATTACHED_FILES_PER_MESSAGE
+        ]
     raw_eval_mode = request.headers.get("x-copilot-eval-mode")
     if raw_eval_mode is not None:
         try:
@@ -3842,6 +3853,8 @@ async def workflow_copilot_chat_post(
             organization,
             eval_mode=eval_mode,
             eval_entrypoint_url=eval_entrypoint_url,
+            eval_llm_overrides=eval_llm_overrides,
+            eval_cost_enabled=eval_cost_enabled,
         )
 
     return await _new_copilot_chat_post(
@@ -3849,6 +3862,8 @@ async def workflow_copilot_chat_post(
         chat_request,
         organization,
         eval_entrypoint_url=eval_entrypoint_url,
+        eval_llm_overrides=eval_llm_overrides,
+        eval_cost_enabled=eval_cost_enabled,
     )
 
 
@@ -4189,6 +4204,30 @@ async def workflow_copilot_chat_history(
                 ),
                 None,
             )
+    request_browser_allocations = None
+    if chat is not None and request_turn_id is not None and request_cancel_token is not None:
+        pending_entry = chat.pending_turns.get(request_turn_id)
+        if pending_entry is not None:
+            candidate = pending_entry.request_browser_allocations
+        else:
+            candidate = next(
+                (
+                    message.turn_outcome.request_browser_allocations
+                    for message in reversed(chat_messages)
+                    if message.turn_outcome is not None
+                    and message.turn_outcome.copilot_turn_id == request_turn_id
+                    and message.turn_outcome.request_cancel_token == request_cancel_token
+                ),
+                None,
+            )
+        if candidate is not None and (
+            candidate.organization_id == organization.organization_id
+            and candidate.workflow_permanent_id == chat.workflow_permanent_id
+            and candidate.workflow_copilot_chat_id == chat.workflow_copilot_chat_id
+            and candidate.turn_id == request_turn_id
+            and candidate.request_cancel_token == request_cancel_token
+        ):
+            request_browser_allocations = candidate
     pending_credentials = (
         await pending_credential_requests(
             organization.organization_id,
@@ -4283,6 +4322,7 @@ async def workflow_copilot_chat_history(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
+        request_browser_allocations=request_browser_allocations,
         question_interactions=question_interactions,
         pending_question_cancel_token=next(
             (
@@ -4305,6 +4345,8 @@ async def workflow_copilot_chat_history(
 
 @base_router.post("/workflow/copilot/question-response", include_in_schema=False)
 async def workflow_copilot_question_response(
+    request: Request,
+    http_response: Response,
     question_response: WorkflowCopilotQuestionResponseRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> QuestionInteraction:
@@ -4313,6 +4355,9 @@ async def workflow_copilot_question_response(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    eval_llm_overrides = admit_eval_llm_overrides(
+        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+    )
     response = QuestionResponse(
         answers=question_response.answers,
         text=question_response.text,
@@ -4338,23 +4383,33 @@ async def workflow_copilot_question_response(
     if recorded.status == "resolved":
         return recorded
     if response.text is not None or any(answer.text is not None for answer in response.answers):
-        handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
+        cost_scope = (
+            copilot_cost_scope()
+            if _copilot_eval_cost_enabled(organization.organization_id)
+            else contextlib.nullcontext()
+        )
+        with eval_llm_override_scope(eval_llm_overrides, chat.workflow_permanent_id), cost_scope as ledger:
+            handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
 
-        async def screen_text(text: str) -> str:
-            safety = await screen_raw_secret_safety(text, handler, organization_id=organization.organization_id)
-            if safety.status == "blocked":
-                raise HTTPException(
-                    status_code=503, detail="The safety screen is unavailable. Please retry your answer."
-                )
-            if safety.status == "detected":
-                response.raw_secret_detected = True
-            return safety.canonical_user_message
+            async def screen_text(text: str) -> str:
+                safety = await screen_raw_secret_safety(text, handler, organization_id=organization.organization_id)
+                LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "question_response"))
+                if safety.status == "blocked":
+                    raise HTTPException(
+                        status_code=503,
+                        detail="The safety screen is unavailable. Please retry your answer.",
+                        headers=_copilot_eval_cost_headers(ledger),
+                    )
+                if safety.status == "detected":
+                    response.raw_secret_detected = True
+                return safety.canonical_user_message
 
-        if response.text is not None:
-            response.text = await screen_text(response.text)
-        for answer in response.answers:
-            if answer.text is not None:
-                answer.text = await screen_text(answer.text)
+            if response.text is not None:
+                response.text = await screen_text(response.text)
+            for answer in response.answers:
+                if answer.text is not None:
+                    answer.text = await screen_text(answer.text)
+        http_response.headers.update(_copilot_eval_cost_headers(ledger))
     return await resolve()
 
 
@@ -4499,6 +4554,8 @@ async def workflow_copilot_credential_deletion(
 
 @base_router.post("/workflow/copilot/steer", include_in_schema=False, response_model=CopilotSteerMessage)
 async def workflow_copilot_steer(
+    request: Request,
+    http_response: Response,
     steer_request: WorkflowCopilotSteerRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> CopilotSteerMessage:
@@ -4510,6 +4567,9 @@ async def workflow_copilot_steer(
     )
     if chat is None:
         raise HTTPException(status_code=404, detail="Unknown Copilot chat")
+    eval_llm_overrides = admit_eval_llm_overrides(
+        request.headers.get(EVAL_LLM_OVERRIDES_HEADER), organization.organization_id
+    )
 
     async def record(steer: CopilotSteerMessage | None = None) -> CopilotSteerMessage | None:
         try:
@@ -4525,12 +4585,25 @@ async def workflow_copilot_steer(
 
     recorded = await record()
     if recorded is None:
-        handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
-        safety = await screen_raw_secret_safety(
-            steer_request.message, handler, organization_id=organization.organization_id
+        cost_scope = (
+            copilot_cost_scope()
+            if _copilot_eval_cost_enabled(organization.organization_id)
+            else contextlib.nullcontext()
         )
+        with eval_llm_override_scope(eval_llm_overrides, chat.workflow_permanent_id), cost_scope as ledger:
+            handler = await resolve_raw_secret_safety_handler(chat.workflow_permanent_id, organization.organization_id)
+            safety = await screen_raw_secret_safety(
+                steer_request.message, handler, organization_id=organization.organization_id
+            )
+            LOG.info("raw-secret safety screen", **raw_secret_safety_log_fields(safety, "steer"))
+        cost_headers = _copilot_eval_cost_headers(ledger)
+        http_response.headers.update(cost_headers)
         if safety.status == "blocked":
-            raise HTTPException(status_code=503, detail="The safety screen is unavailable. Please retry your message.")
+            raise HTTPException(
+                status_code=503,
+                detail="The safety screen is unavailable. Please retry your message.",
+                headers=cost_headers,
+            )
         screened = CopilotSteerMessage(
             steer_id=steer_request.steer_id,
             text=safety.canonical_user_message,
@@ -4783,10 +4856,13 @@ async def workflow_copilot_credential_response(
     return WorkflowCopilotCredentialResponseResult(result="accepted")
 
 
-async def _demonstration_cache(organization_id: str) -> BaseCache:
-    cache = shared_copilot_demonstration_cache()
-    if not await copilot_demonstration_enabled(organization_id) or cache is None:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Copilot demonstration is disabled")
+async def _demonstration_cache() -> BaseCache:
+    cache = app.CACHE
+    if cache is None or not cache.is_shared:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Copilot demonstration requires a shared cache",
+        )
     return cache
 
 
@@ -4796,7 +4872,7 @@ async def workflow_copilot_demonstration_record(
     record_request: WorkflowCopilotDemonstrationRecordRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
-    cache = await _demonstration_cache(organization.organization_id)
+    cache = await _demonstration_cache()
     api_key = await _resolve_copilot_api_key(request, organization.organization_id)
     copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
         organization.organization_id,
@@ -4849,7 +4925,7 @@ async def workflow_copilot_demonstration_control(
     control_request: WorkflowCopilotDemonstrationControlRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowCopilotDemonstrationControlResult:
-    cache = await _demonstration_cache(organization.organization_id)
+    cache = await _demonstration_cache()
     if control_request.action == "navigate":
         try:
             parsed = urlparse(control_request.url or "")
@@ -4897,13 +4973,69 @@ async def workflow_copilot_demonstration_control(
     return WorkflowCopilotDemonstrationControlResult(seq=seq)
 
 
+@base_router.post(
+    "/workflow/copilot/demonstration/upload",
+    include_in_schema=False,
+    response_model=WorkflowCopilotDemonstrationControlResult,
+)
+async def workflow_copilot_demonstration_upload(
+    demonstration_id: str = Form(..., max_length=64),
+    file: UploadFile = File(...),
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowCopilotDemonstrationControlResult:
+    cache = await _demonstration_cache()
+    demonstration = await load_demonstration_record(cache, organization.organization_id, demonstration_id)
+    if demonstration is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown demonstration")
+    await app.AGENT_FUNCTION.enforce_folder_access(
+        get_request_principal(),
+        "workflow_copilot.manage",
+        {"workflow_permanent_id": demonstration.workflow_permanent_id},
+    )
+    if demonstration.status != "recording":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Demonstration is not recording")
+    attached_file_ids = await demonstration_file_ids(
+        cache, organization.organization_id, demonstration_id, demonstration.event_count
+    )
+    # Done carries every attached file, so the message limit bounds them; failed attempts are not counted.
+    if len(attached_file_ids) >= MAX_ATTACHED_FILES_PER_MESSAGE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A demonstration can attach at most {MAX_ATTACHED_FILES_PER_MESSAGE} files",
+        )
+    # Demonstrations replay the user's own file into the target site, so any type that site accepts must pass.
+    await uploaded_file_service.validate_passthrough_upload(
+        file, max_size_bytes=app.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE, purpose="copilot_demonstration"
+    )
+    try:
+        uploaded, _ = await uploaded_file_service.save_uploaded_file(
+            file=file, organization_id=organization.organization_id
+        )
+    except uploaded_file_service.UploadStorageError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+    # The recorder attaches only files stored here for this demonstration, never an id the client names.
+    try:
+        seq = await append_demonstration_control(
+            cache,
+            organization_id=organization.organization_id,
+            request=WorkflowCopilotDemonstrationControlRequest(demonstration_id=demonstration_id, action="upload_file"),
+            file_id=uploaded.file_id,
+        )
+    except DemonstrationRejection as rejection:
+        await uploaded_file_service.delete_uploaded_file(
+            file_id=uploaded.file_id, organization_id=organization.organization_id
+        )
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail) from rejection
+    return WorkflowCopilotDemonstrationControlResult(seq=seq, file_id=uploaded.file_id)
+
+
 @base_router.get("/workflow/copilot/demonstration/active", include_in_schema=False)
 async def workflow_copilot_demonstration_active(
     workflow_permanent_id: str,
     browser_session_id: str,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> WorkflowCopilotDemonstrationActiveResult | None:
-    cache = await _demonstration_cache(organization.organization_id)
+    cache = await _demonstration_cache()
     active = await active_demonstration(
         cache,
         organization_id=organization.organization_id,
@@ -5403,7 +5535,7 @@ async def workflow_copilot_apply_proposed_workflow(
                 changed_fields=changed_fields,
             ),
         )
-    return new_workflow
+    return mask_workflow_for_api(new_workflow)
 
 
 async def _history_with_resolved_attachments(
@@ -5532,7 +5664,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
         parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
-        _repair_next_block_label_chain(workflow_definition_yaml.blocks)
+        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=_runs_in_list_order(parsed_yaml))
 
         workflow_definition = convert_workflow_definition(
             workflow_definition_yaml=workflow_definition_yaml,

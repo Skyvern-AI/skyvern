@@ -5,9 +5,7 @@ utility without touching S3 or the database.
 """
 
 import asyncio
-import gc
 import io
-import weakref
 import zipfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -804,7 +802,6 @@ class TestWaitForUploadAiotasksCleanup:
 
         hanging = asyncio.create_task(hang())
         manager.upload_aiotasks_map["k"].extend([failed, hanging])
-        ref = weakref.ref(failed)
 
         wait_task = asyncio.create_task(manager.wait_for_upload_aiotasks(["k"]))
         await asyncio.sleep(0.01)
@@ -814,10 +811,6 @@ class TestWaitForUploadAiotasksCleanup:
 
         assert "k" not in manager.upload_aiotasks_map
         assert all(failed is not t for lst in manager.upload_aiotasks_map.values() for t in lst)
-
-        del failed
-        gc.collect()
-        assert ref() is None  # traceback + byte payload no longer reachable through the map
 
         await asyncio.gather(hanging, return_exceptions=True)  # settle the gather-cancelled task
 

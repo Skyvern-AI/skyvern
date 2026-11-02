@@ -15,6 +15,12 @@ import pytest
 
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import (
+    OriginRunRedactionRegistry,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
+)
 from skyvern.forge.sdk.copilot.build_test_outcome import ChallengeEffects, challenge_notices
 from skyvern.forge.sdk.copilot.challenge_evidence import stamp_challenge_frame_fact
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
@@ -35,14 +41,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _classifier_fallback_policy,
     build_classifier_fallback_floor,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    OriginRunRedactionRegistry,
-    PreRunPageReference,
-    RegisteredArtifactEntry,
-    RegisteredArtifactEvidence,
-    RunSecretsNotRegistered,
-    browser_session_turn,
-)
+from skyvern.forge.sdk.copilot.runtime import RunSecretsNotRegistered, browser_session_turn
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools import completion as completion_module
 from skyvern.forge.sdk.copilot.tools import composition_capture as composition_capture_module
@@ -714,7 +713,7 @@ async def test_track_a_registry_admits_complete_run_bound_static_credential_valu
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier=None)
     credential = PasswordCredential(username="private-user", password="private-pass")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     process = AsyncMock(return_value=credential_item)
     monkeypatch.setattr(
@@ -762,7 +761,7 @@ async def test_track_a_registry_keeps_static_credential_values_when_totp_is_dyna
     ctx.secret_scrub_values = []
     db_credential = SimpleNamespace(vault_type=None, totp_identifier="totp_ref")
     credential = PasswordCredential(username="private-user", password="private-pass", totp_identifier="totp_ref")
-    credential_item = SimpleNamespace(credential=credential)
+    credential_item = SimpleNamespace(credential=credential, login_sites=None)
     service = SimpleNamespace(get_credential_item=AsyncMock(return_value=credential_item))
     monkeypatch.setattr(
         run_execution_module,
@@ -1027,7 +1026,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
         plaintext = value
         return "opaque-ciphertext"
 
-    async def fake_decrypt(_value: str, _method: object) -> str:
+    async def fake_decrypt_unlabeled(_value: str) -> str:
         assert plaintext is not None
         return plaintext
 
@@ -1035,7 +1034,7 @@ async def test_runtime_secret_bridge_encrypts_shared_cache_payload(monkeypatch: 
     monkeypatch.setattr(
         runtime_secret_bridge,
         "encryptor",
-        SimpleNamespace(encrypt=fake_encrypt, decrypt=fake_decrypt),
+        SimpleNamespace(encrypt=fake_encrypt, decrypt_unlabeled=fake_decrypt_unlabeled),
     )
     workflow_run_context = SimpleNamespace(
         secrets={"password": "private-pass", "runtime": "654321"},

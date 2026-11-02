@@ -20,12 +20,14 @@ GPT6_MODEL_NAMES: dict[str, str] = {
     "astra": "gpt-6-astra",
     "sol": "gpt-6-sol",
     "1_sol": "gpt-6.1-sol",
+    "1_terra": "gpt-6.1-terra",
     "luna": "gpt-6-luna",
 }
 GPT6_REASONING_EFFORT: dict[str, str] = {
     "astra": "xhigh",
     "sol": "medium",
     "1_sol": "medium",
+    "1_terra": "medium",
     "luna": settings.GPT6_LUNA_REASONING_EFFORT,
 }
 XAI_GROK_4_5_MODEL = "xai/grok-4.5"
@@ -39,8 +41,38 @@ XAI_GROK_4_5_MAX_OUTPUT_TOKENS = 128_000
 # recognize in `ignore` is skipped silently rather than rejected.
 OPENINFERENCE_PROVIDER_SLUG = "open-inference"
 # OpenRouter routes by provider SLUG and skips an unrecognised one silently, so a name here
-# that no longer matches enforces nothing. Both are asserted in tests for that reason.
+# that no longer matches enforces nothing. All three are asserted in tests for that reason.
 AMAZON_BEDROCK_PROVIDER_SLUG = "amazon-bedrock"
+# Serves DeepSeek V4 Flash without enforcing either token cap: measured reasoning spend reached
+# 131K tokens against a 65,536 completion cap and a 49,152 reasoning budget, leaving the answer no
+# room and returning it empty. 20% of its calls overran the budget against 0.5% elsewhere, so the
+# model is excluded from it rather than retried on it (SKY-19198).
+CLOUDFLARE_PROVIDER_SLUG = "cloudflare"
+# A completion cap bounds reasoning and answer together, so a reasoning model can spend the whole
+# cap thinking and stop at finish_reason=length with no content at all (SKY-18857). Reserve this
+# much of the cap for the answer and give reasoning the rest.
+OPENROUTER_ANSWER_TOKEN_RESERVE = 16_384
+# Shared by every OpenRouter config serving this model, so a reasoning budget derived from it can
+# never drift from the cap it has to fit inside.
+DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS = 65_536
+
+
+def openrouter_reasoning_budget(max_completion_tokens: int) -> dict[str, int]:
+    """OpenRouter's reasoning budget for a completion cap, leaving the answer room to be written.
+
+    Mutually exclusive with `reasoning.effort` / `reasoning_effort` upstream, so never set both.
+    """
+    return {
+        "max_tokens": max(max_completion_tokens - OPENROUTER_ANSWER_TOKEN_RESERVE, max_completion_tokens // 2),
+    }
+
+
+def deepseek_v4_flash_provider_routing() -> dict[str, dict[str, list[str]]]:
+    """Shared by every OpenRouter config serving this model, so the exclusions cannot drift apart.
+
+    A fresh dict per config: litellm_params are shallow-merged into per-call parameters.
+    """
+    return {"provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG, CLOUDFLARE_PROVIDER_SLUG]}}
 
 
 @dataclass(frozen=True)
@@ -1462,158 +1494,6 @@ if settings.ENABLE_GEMINI:
         ),
     )
     _register_builtin_config(
-        "GEMINI_2.5_PRO",
-        LLMConfig(
-            "gemini/gemini-2.5-pro",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "GEMINI_2.5_PRO_PREVIEW",
-        LLMConfig(
-            "gemini/gemini-2.5-pro-preview-05-06",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "GEMINI_2.5_PRO_EXP_03_25",
-        LLMConfig(
-            "gemini/gemini-2.5-pro-exp-03-25",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "GEMINI_2.5_FLASH",
-        LLMConfig(
-            "gemini/gemini-2.5-flash",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "GEMINI_2.5_FLASH_PREVIEW",
-        LLMConfig(
-            "gemini/gemini-2.5-flash-preview-05-20",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-            ),
-        ),
-    )
-    # Gemini API (Google AI Studio) flex tier variants — 50% cheaper, best-effort latency.
-    # Docs: https://ai.google.dev/gemini-api/docs/flex-inference
-    _register_builtin_config(
-        "GEMINI_2.5_PRO_FLEX",
-        LLMConfig(
-            "gemini/gemini-2.5-pro",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                service_tier="flex",
-                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "GEMINI_2.5_FLASH_FLEX",
-        LLMConfig(
-            "gemini/gemini-2.5-flash",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                service_tier="flex",
-                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "GEMINI_2.5_FLASH_LITE",
-        LLMConfig(
-            "gemini/gemini-2.5-flash-lite",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "GEMINI_2.5_FLASH_LITE_FLEX",
-        LLMConfig(
-            "gemini/gemini-2.5-flash-lite",
-            ["GEMINI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65536,
-            litellm_params=LiteLLMParams(
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                service_tier="flex",
-                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
-            ),
-        ),
-    )
-    _register_builtin_config(
         "GEMINI_3.0_FLASH",
         LLMConfig(
             "gemini/gemini-3-flash-preview",
@@ -1680,6 +1560,8 @@ if settings.ENABLE_GEMINI:
     )
     # litellm prices the gemini/ flex tier itself (50% of standard), unlike the Vertex flex
     # configs whose discount is applied at the cost site in api_handler_factory.
+    # Gemini API (Google AI Studio) flex tier variants — 50% cheaper, best-effort latency.
+    # Docs: https://ai.google.dev/gemini-api/docs/flex-inference
     _register_builtin_config(
         "GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
@@ -1893,158 +1775,6 @@ if settings.ENABLE_VERTEX_AI:
         api_base = f"https://aiplatform.googleapis.com/v1/projects/{settings.VERTEX_PROJECT_ID}/locations/global/publishers/google/models"
 
     _register_builtin_config(
-        "VERTEX_GEMINI_2.5_PRO",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-pro",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-pro" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_PRO_PREVIEW",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-pro-preview-05-06",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-pro-preview-05-06" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_DEPRECATED",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_LITE_DEPRECATED",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-lite",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-lite" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_PREVIEW",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-preview-05-20",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_PREVIEW_04_17",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-preview-04-17",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-preview-04-17" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_PREVIEW_05_20",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-preview-05-20",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-preview-05-20" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
         "VERTEX_GEMINI_3_PRO",
         LLMConfig(
             "vertex_ai/gemini-3.1-pro-preview",
@@ -2144,25 +1874,6 @@ if settings.ENABLE_VERTEX_AI:
     # Bump VERTEX_GEMINI_3_PRO above when Google ships a newer version.
     LLMConfigRegistry.register_config_alias("VERTEX_GEMINI_3.0_PRO", "VERTEX_GEMINI_3_PRO")
     LLMConfigRegistry.register_config_alias("VERTEX_GEMINI_3.1_PRO", "VERTEX_GEMINI_3_PRO")
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_LITE",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-lite",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-lite" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
     # Flex tier variants — 50% cheaper, best-effort latency (1-15 min), sheddable.
     # Use for latency-tolerant workloads (script gen, extraction, validation).
     # Falls back to standard tier via router configs.
@@ -2170,72 +1881,6 @@ if settings.ENABLE_VERTEX_AI:
     # Without it, drop_params=True silently strips service_tier and requests go through at standard pricing.
     # TODO: If adding "priority" tier support, pass service_tier="priority" directly —
     # litellm maps "auto" to "priority", which may cause confusion.
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_FLEX",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-                service_tier="SERVICE_TIER_FLEX",
-                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_LITE_FLEX",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-lite",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-lite" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-                service_tier="SERVICE_TIER_FLEX",
-                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_PRO_FLEX",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-pro",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-pro" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-                service_tier="SERVICE_TIER_FLEX",
-                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
-            ),
-        ),
-    )
 
     _register_builtin_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
@@ -2353,44 +1998,6 @@ if settings.ENABLE_VERTEX_AI:
     )
     # Register old keys as aliases to prevent breaking existing tasks
     _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_PREVIEW_09_2025",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-preview-09-2025",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-preview-09-2025" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
-        "VERTEX_GEMINI_2.5_FLASH_LITE_PREVIEW_09_2025",
-        LLMConfig(
-            "vertex_ai/gemini-2.5-flash-lite-preview-09-2025",
-            [],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=65535,
-            litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-2.5-flash-lite-preview-09-2025" if api_base else None,
-                vertex_location=settings.VERTEX_LOCATION,
-                thinking={
-                    "budget_tokens": settings.GEMINI_THINKING_BUDGET,
-                    "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
-                },
-                vertex_credentials=settings.VERTEX_CREDENTIALS,
-            ),
-        ),
-    )
-    _register_builtin_config(
         "VERTEX_GEMINI_FLASH_2_0",
         LLMConfig(
             "vertex_ai/gemini-2.0-flash-001",
@@ -2482,13 +2089,16 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=False,
             add_assistant_prefix=False,
-            max_completion_tokens=65536,
+            max_completion_tokens=DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS,
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
-                extra_body={"provider": {"ignore": [OPENINFERENCE_PROVIDER_SLUG]}},
+                extra_body={
+                    **deepseek_v4_flash_provider_routing(),
+                    "reasoning": openrouter_reasoning_budget(DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS),
+                },
             ),
         ),
     )
@@ -2500,14 +2110,19 @@ if settings.ENABLE_OPENROUTER:
             ["OPENROUTER_API_KEY"],
             supports_vision=False,
             add_assistant_prefix=False,
-            max_completion_tokens=65536,
+            max_completion_tokens=DEEPSEEK_V4_FLASH_MAX_COMPLETION_TOKENS,
             litellm_params=LiteLLMParams(
                 api_key=settings.OPENROUTER_API_KEY,
                 api_base=settings.OPENROUTER_API_BASE,
                 api_version=None,
                 model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash-0731"},
                 extra_body={
+                    # Bounds reasoning by effort, not by openrouter_reasoning_budget: upstream treats
+                    # the two as mutually exclusive, and effort is this config's reason for existing.
                     "reasoning_effort": "high",
+                    # Serves no traffic today. Whoever revives it should know this order leads with
+                    # the upstream deepseek_v4_flash_provider_routing excludes, and pins it with no
+                    # fallback, so every call would land on the one that caps nothing (SKY-19198).
                     "provider": {
                         "order": ["cloudflare", "parasail"],
                         "allow_fallbacks": False,

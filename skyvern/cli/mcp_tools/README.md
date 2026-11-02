@@ -114,6 +114,12 @@ Supports Skyvern vault, Bitwarden, 1Password, and Azure Key Vault with automatic
 ### Organization
 `skyvern_folder_create`, `skyvern_folder_list`, `skyvern_folder_get`, `skyvern_folder_update`, `skyvern_folder_delete`
 
+### Feedback
+
+| Tool | Purpose |
+|------|---------|
+| `skyvern_feedback` | Report a Skyvern problem to the team operating the connected server. Available in every scope. |
+
 ## Switching Configs
 
 Use the CLI to switch between API keys or environments without manual editing:

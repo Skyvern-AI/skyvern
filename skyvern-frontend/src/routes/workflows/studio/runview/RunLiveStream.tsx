@@ -88,9 +88,6 @@ function RunLiveStreamTransport({
           browserSessionId={browserSessionId}
           interactive={interactive}
           showControlButtons={interactive}
-          // A recording can be live while this per-run stream mounts and unmounts;
-          // StudioBrowserStream owns the session-level reset.
-          resetRecordingOnUnmount={false}
           onClose={() => setVncFailed(true)}
           onStreamStateChange={onStreamStateChange}
         />

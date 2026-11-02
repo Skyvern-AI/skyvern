@@ -22,17 +22,17 @@ def _png(width: int, height: int) -> bytes:
 
 
 def test_empty_or_none_screenshots_are_zero() -> None:
-    assert estimate_image_tokens(None, "gemini-2.5-flash") == 0
-    assert estimate_image_tokens([], "gemini-2.5-flash") == 0
+    assert estimate_image_tokens(None, "gemini-3-flash-preview") == 0
+    assert estimate_image_tokens([], "gemini-3-flash-preview") == 0
 
 
 def test_gemini_tiling_scales_with_resolution() -> None:
     # 1920x1080 -> ceil(1920/768)=3 * ceil(1080/768)=2 = 6 tiles * 258
-    assert estimate_image_tokens([_png(1920, 1080)], "gemini-2.5-flash-lite") == 6 * 258
+    assert estimate_image_tokens([_png(1920, 1080)], "gemini-3.1-flash-lite") == 6 * 258
     # 1280x720 -> 2 * 1 = 2 tiles * 258
     assert estimate_image_tokens([_png(1280, 720)], "vertex_ai/gemini-3-flash") == 2 * 258
     # both sides <= 384 -> flat 258
-    assert estimate_image_tokens([_png(300, 300)], "gemini-2.5-flash") == 258
+    assert estimate_image_tokens([_png(300, 300)], "gemini-3-flash-preview") == 258
 
 
 def test_openai_tile_models_normalize_short_side_to_768() -> None:
@@ -68,8 +68,8 @@ def test_anthropic_caps_large_images() -> None:
 
 
 def test_multiple_screenshots_sum() -> None:
-    one = estimate_image_tokens([_png(1280, 720)], "gemini-2.5-flash")
-    three = estimate_image_tokens([_png(1280, 720)] * 3, "gemini-2.5-flash")
+    one = estimate_image_tokens([_png(1280, 720)], "gemini-3-flash-preview")
+    three = estimate_image_tokens([_png(1280, 720)] * 3, "gemini-3-flash-preview")
     assert three == 3 * one
 
 

@@ -184,6 +184,37 @@ function vendorInvoicesAfter() {
 }
 
 describe("diffWorkflowVersions", () => {
+  test("normalizes static Task V2 defaults after server conversion and non-code version metadata", () => {
+    const taskV2 = (maxIterations: number | null, maxSteps: number | null) =>
+      block("task_v2_step", "task_v2", {
+        prompt: "Check the page",
+        disable_cache: false,
+        max_iterations: maxIterations,
+        max_steps: maxSteps,
+      });
+    const diff = diffWorkflowVersions(
+      version([taskV2(null, 40)], { run_with: "agent", code_version: null }),
+      version([taskV2(50, 40)], { run_with: "agent", code_version: 2 }),
+    );
+
+    expect(diff.merged.get("task_v2_step")?.status).toBe("unchanged");
+    expect(diff.counts).toEqual({
+      unchanged: 1,
+      new: 0,
+      changed: 0,
+      removed: 0,
+    });
+    expect(diff.settings).toEqual([]);
+  });
+
+  test("does not guess a deployment max_steps default", () => {
+    const diff = diffWorkflowVersions(
+      version([block("research", "task_v2", { max_steps: null })]),
+      version([block("research", "task_v2", { max_steps: 25 })]),
+    );
+    expect(diff.merged.get("research")?.status).toBe("changed");
+  });
+
   test("an edit renders one canvas with the removed block where it ran", () => {
     const after = version(vendorInvoicesAfter());
     const diff = diffWorkflowVersions(version(vendorInvoicesBefore()), after);
@@ -273,6 +304,45 @@ describe("diffWorkflowVersions", () => {
     expect(diff.merged.get("check_row")?.status).toBe("removed");
     expect(diff.merged.get("save_row")?.status).toBe("changed");
     expect(diff.changeOrder).toEqual(["check_row", "save_row"]);
+  });
+
+  test("a step moved across a loop boundary changes the step and its loop", () => {
+    const loop = (children: Array<WorkflowBlock>) =>
+      block("each_row", "for_loop", {
+        loop_variable_reference: "rows",
+        loop_blocks: children,
+      });
+    const moved = () => step("moved_step", null);
+    const moves: Array<[Array<WorkflowBlock>, Array<WorkflowBlock>]> = [
+      [[loop([moved()])], [loop([]), moved()]],
+      [[loop([]), moved()], [loop([moved()])]],
+    ];
+    for (const [beforeBlocks, afterBlocks] of moves) {
+      const diff = diffWorkflowVersions(
+        version(beforeBlocks),
+        version(afterBlocks),
+      );
+      expect(diff.after.get("each_row")?.status).toBe("changed");
+      expect(diff.after.get("moved_step")?.status).toBe("changed");
+      expect(diff.counts).toMatchObject({ new: 0, changed: 2, removed: 0 });
+    }
+  });
+
+  test("a step moved into a new loop keeps its earlier version", () => {
+    const moved = () => step("moved_step", null);
+    const diff = diffWorkflowVersions(
+      version([moved(), step("kept_step", null)]),
+      version([
+        block("each_row", "for_loop", {
+          loop_variable_reference: "rows",
+          loop_blocks: [moved()],
+        }),
+        step("kept_step", null),
+      ]),
+    );
+    expect(diff.after.get("each_row")?.status).toBe("new");
+    expect(diff.after.get("moved_step")?.status).toBe("changed");
+    expect(diff.before.has("moved_step")).toBe(true);
   });
 
   test("removed first and last blocks stay at the ends, and a type change keeps both cards", () => {

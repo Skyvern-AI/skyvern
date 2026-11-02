@@ -12,12 +12,16 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 
+import structlog
+
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 
+LOG = structlog.get_logger()
+
 CredentialUrlTier = Literal["url_exact", "url_path", "url_host"]
-CredentialResolutionTier = Literal["url_exact", "url_path", "url_host", "urlless_sole"]
+CredentialResolutionTier = Literal["url_exact", "url_path", "url_host", "urlless_sole", "vault_site"]
 CredentialResolutionVerdict = Literal["resolved", "ambiguous", "unresolved"]
 
 _URL_TIERS: tuple[CredentialResolutionTier, ...] = ("url_exact", "url_path", "url_host")
@@ -226,13 +230,6 @@ def grounded_references(message: str, candidates: Iterable[str]) -> set[str]:
             for _other, other_start, other_end in occurrences
         )
     }
-
-
-def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
-    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
-    return grounded_references(
-        message, (value for credential in credentials for value in (credential.name, credential.credential_id))
-    )
 
 
 def _match_by_url_tiered(

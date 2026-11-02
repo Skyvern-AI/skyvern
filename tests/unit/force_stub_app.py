@@ -17,13 +17,25 @@ def admit_block_dispatch(status: WorkflowRunStatus = WorkflowRunStatus.running) 
 
 
 def released_session_stub() -> SimpleNamespace:
-    """A ``Session`` stand-in whose ``released()`` is the no-op the real one is outside a pinned scope."""
-    return SimpleNamespace(released=MagicMock(side_effect=lambda: nullcontext()))
+    """A ``Session`` stand-in whose ``released()`` and ``reading()`` scopes do nothing, as for mocked repositories."""
+    return SimpleNamespace(
+        released=MagicMock(side_effect=lambda: nullcontext()), reading=MagicMock(side_effect=lambda: nullcontext())
+    )
+
+
+def pending_stamp_session_stub(stamped_run_id: str | None = "wr_test") -> MagicMock:
+    """A callable ``Session`` whose session answers create_workflow_run's forced-session pending stamp."""
+    session = SimpleNamespace(scalar=AsyncMock(return_value=stamped_run_id), commit=AsyncMock())
+    factory = MagicMock(side_effect=lambda: nullcontext(session))
+    factory.released = MagicMock(side_effect=lambda: nullcontext())
+    factory.reading = MagicMock(side_effect=lambda: nullcontext())
+    factory.session = session
+    return factory
 
 
 def version_write_transaction_stub() -> MagicMock:
     """The save path's version/definition transaction, for workflow repositories faked without an engine."""
-    return MagicMock(side_effect=lambda: nullcontext())
+    return MagicMock(side_effect=lambda workflow_permanent_id=None: nullcontext())
 
 
 def create_forge_stub_app() -> ForgeApp:
@@ -35,8 +47,9 @@ def create_forge_stub_app() -> ForgeApp:
 
     fake_app_module = ForgeApp()
     fake_app_module.DATABASE = _LazyNamespace()
-    # Auto-mocked, Session.released() would hand `async with` a coroutine.
+    # Auto-mocked, Session.released() and Session.reading() would hand `async with` a coroutine.
     fake_app_module.DATABASE.workflow_runs.Session.released = released_session_stub().released
+    fake_app_module.DATABASE.Session = released_session_stub()
     # Same trap on the save path's version/definition transaction: no stub DB has an engine to
     # open one against, and the writes inside the block are mocked anyway.
     fake_app_module.DATABASE.workflows.version_write_transaction = version_write_transaction_stub()
@@ -67,11 +80,13 @@ def create_forge_stub_app() -> ForgeApp:
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace
     # would otherwise auto-mock it as an (awaitable) AsyncMock, breaking sync callers.
     fake_app_module.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+    fake_app_module.BROWSER_MANAGER.get_for_workflow_run = MagicMock(return_value=None)
     fake_app_module.PERSISTENT_SESSIONS_MANAGER = _LazyNamespace()
     # A synchronous capability check; auto-mocked, its un-awaited coroutine leaks into later tests.
     fake_app_module.PERSISTENT_SESSIONS_MANAGER.supports_evict_and_reconnect = MagicMock(return_value=False)
     fake_app_module.ARTIFACT_MANAGER = _LazyNamespace()
     fake_app_module.AGENT_FUNCTION = _LazyNamespace()
+    fake_app_module.AGENT_FUNCTION.get_workflow_run_retry_refusal = AsyncMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.is_block_scoped_workflow_run = AsyncMock(return_value=False)
     fake_app_module.AGENT_FUNCTION.validate_block_execution = AsyncMock()
     fake_app_module.AGENT_FUNCTION.validate_code_block = AsyncMock()
@@ -89,12 +104,16 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access
     fake_app_module.AGENT_FUNCTION.enforce_folder_access_for_runs = base_agent_function.enforce_folder_access_for_runs
     fake_app_module.AGENT_FUNCTION.on_folder_created = base_agent_function.on_folder_created
+    fake_app_module.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls = (
+        base_agent_function.copilot_browser_pattern_accepting_calls
+    )
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
     fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
     fake_app_module.AGENT_FUNCTION.task_v3_application_defaults = base_agent_function.task_v3_application_defaults
     fake_app_module.AGENT_FUNCTION.task_v3_answer_basis_audit = base_agent_function.task_v3_answer_basis_audit
+    fake_app_module.AGENT_FUNCTION.task_v3_justify_hold_enabled = base_agent_function.task_v3_justify_hold_enabled
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
     fake_app_module.AGENT_FUNCTION.redact_codeblock_parameter_values = (
         base_agent_function.redact_codeblock_parameter_values
@@ -121,10 +140,15 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(return_value=("full_org", None, True))
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.schedule_workflow_run_group_advance = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.generate_root_workflow_run_id = base_agent_function.generate_root_workflow_run_id
     # Sync method returning a key or None — _LazyNamespace would auto-mock it as a truthy
     # AsyncMock and hijack the TextPromptBlock llm_key. Match the OSS no-op.
     fake_app_module.AGENT_FUNCTION.get_fallback_llm_key = MagicMock(return_value=None)
+    fake_app_module.AGENT_FUNCTION.get_task_v3_llm_route_treatment_key = (
+        base_agent_function.get_task_v3_llm_route_treatment_key
+    )
     fake_app_module.AGENT_FUNCTION.supports_image_captcha_ocr = base_agent_function.supports_image_captcha_ocr
+    fake_app_module.AGENT_FUNCTION.challenge_solve_recording = base_agent_function.challenge_solve_recording
     # Credential write-lock gating — _LazyNamespace would auto-mock these as truthy AsyncMocks,
     # forcing the update/delete credential routes down the lock path and handing `async with` a
     # coroutine instead of a context manager. Match the real OSS base no-ops (unlocked path).
@@ -190,7 +214,6 @@ def make_workflow_run_attempts_fake() -> SimpleNamespace:
     return SimpleNamespace(
         Session=MagicMock(return_value=session_context),
         create_attempt=AsyncMock(return_value=SimpleNamespace(attempt_number=1)),
-        pin_first_attempt_browser_session_if_unset=AsyncMock(),
         get_attempts=AsyncMock(return_value=[]),
         get_interim_payload_snapshot=AsyncMock(return_value={}),
         get_latest_attempts_for_runs=AsyncMock(return_value={}),

@@ -140,6 +140,7 @@ def _wire_block_runtime(
     page = SimpleNamespace(context=SimpleNamespace(), url="https://example.test/")
     browser_state = SimpleNamespace(
         get_working_page=AsyncMock(return_value=page),
+        engine_selection=None,
         browser_artifacts=BrowserArtifacts(download_binding=download_binding),
     )
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
@@ -269,6 +270,7 @@ def _fake_storage_app(
             get_downloaded_file_signature_aliases=lambda _: [],
             list_downloading_files_in_browser_session=in_flight or AsyncMock(return_value=[]),
         ),
+        BROWSER_MANAGER=SimpleNamespace(get_for_workflow_run=lambda *_args, **_kwargs: None),
         AGENT_FUNCTION=SimpleNamespace(
             validate_code_block=AsyncMock(),
             validate_block_execution=AsyncMock(),
@@ -829,6 +831,7 @@ async def test_two_file_inputs_sharing_a_basename_each_keep_their_own_bytes_and_
         AsyncMock(
             return_value=SimpleNamespace(
                 get_working_page=AsyncMock(return_value=UploadPage()),
+                engine_selection=None,
                 browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.RUN_DIR),
             )
         ),
@@ -888,6 +891,7 @@ async def test_a_setup_failure_stops_the_block_download_log_listening(
         AsyncMock(
             return_value=SimpleNamespace(
                 get_working_page=AsyncMock(return_value=SimpleNamespace(context=context, url="https://example.test/")),
+                engine_selection=None,
                 browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR),
             )
         ),
@@ -997,6 +1001,7 @@ async def test_an_inline_session_block_uploads_the_download_it_claimed_from_the_
         AsyncMock(
             return_value=SimpleNamespace(
                 get_working_page=AsyncMock(return_value=page),
+                engine_selection=None,
                 browser_artifacts=BrowserArtifacts(download_binding=DownloadBinding.SESSION_DIR),
             )
         ),
@@ -1019,6 +1024,7 @@ async def test_an_inline_session_block_uploads_the_download_it_claimed_from_the_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unresolvable_dns")
 async def test_a_parameter_named_after_the_attach_helper_still_wins(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:

@@ -2,20 +2,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI, HTTPException, status
+from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes import ui_session
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from tests.unit.shared_route_app import shared_route_app
 
 
 @pytest.fixture
-def client() -> TestClient:
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
-    return TestClient(fastapi_app)
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return TestClient(shared_route_app(monkeypatch))
 
 
 @pytest.mark.parametrize("prefix", ["/v1", "/api/v1"])

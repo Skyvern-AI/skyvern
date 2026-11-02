@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -130,6 +131,18 @@ def test_executed_source_parameters_are_advertised_only_with_the_tool_that_produ
     assert with_code_tool["update_and_run_blocks"]["executed_source_references"]["description"]
     assert "executed_source_reference" not in without_code_tool["edit_block_and_run"]
     assert "executed_source_references" not in without_code_tool["update_and_run_blocks"]
+
+
+def test_oss_browser_code_description_keeps_the_url_wait_line_without_a_pattern_list() -> None:
+    tools = copilot_native_tools(
+        supports_question_tool=True,
+        browser_code_available=True,
+        run_tools_available=True,
+        browser_pattern_accepting_calls=AgentFunction().copilot_browser_pattern_accepting_calls(),
+    )
+    description = next(tool for tool in tools if tool.name == browser_code_module.TOOL_NAME).description
+    assert "wait_for_url" in description and re.search(r"\bglob\b", description)
+    assert "Compiled" not in description
 
 
 class _LeaseProbeSession:
@@ -844,7 +857,8 @@ async def test_fresh_namespace_rebinds_to_the_current_browser_before_resetting(
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_replacement"
     order: list[str] = []
-    session = MagicMock(session_id="browser_code_session", page=object())
+    # No confirmed tab, so frame staging stops before it resolves the browser through the API.
+    session = MagicMock(session_id="browser_code_session", page=object(), confirmed_page=None)
 
     async def reset_namespace() -> None:
         order.append("reset")
@@ -893,7 +907,7 @@ async def test_fresh_namespace_does_not_reset_a_session_opened_for_a_replacement
     ctx = make_copilot_context()
     ctx.browser_session_id = "pbs_replacement"
     old_session = MagicMock(session_id="old_browser_code_session")
-    replacement_session = MagicMock(session_id="replacement_browser_code_session")
+    replacement_session = MagicMock(session_id="replacement_browser_code_session", confirmed_page=None)
     replacement_session.reset_namespace = AsyncMock()
     ctx.browser_code_host.session = old_session
 

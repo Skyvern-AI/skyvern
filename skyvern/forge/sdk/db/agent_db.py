@@ -24,12 +24,14 @@ except ImportError:  # opentelemetry-api ships with the server extra only
 from skyvern.config import settings
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError, is_connection_failure  # noqa: F401
+from skyvern.forge.sdk.db.repositories.agent_feedback import AgentFeedbackRepository
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
 from skyvern.forge.sdk.db.repositories.browser_recordings import BrowserRecordingsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.db.repositories.debug import DebugRepository
+from skyvern.forge.sdk.db.repositories.email_forwarding import EmailForwardingRepository
 from skyvern.forge.sdk.db.repositories.folders import FoldersRepository
 from skyvern.forge.sdk.db.repositories.google_oauth import GoogleOAuthRepository
 from skyvern.forge.sdk.db.repositories.microsoft_oauth import MicrosoftOAuthRepository
@@ -418,6 +420,7 @@ class AgentDB(BaseAlchemyDB):
         self.workflow_run_groups = WorkflowRunGroupsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credentials = CredentialRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credential_folders = CredentialFoldersRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.email_forwarding = EmailForwardingRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.otp = OTPRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.sms = SMSRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.debug = DebugRepository(self.Session, debug_enabled, self.is_retryable_error)
@@ -429,6 +432,7 @@ class AgentDB(BaseAlchemyDB):
         self.browser_recordings = BrowserRecordingsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.uploaded_files = UploadedFilesRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.run_feedback = RunFeedbackRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.agent_feedback = AgentFeedbackRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.microsoft_oauth = MicrosoftOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(

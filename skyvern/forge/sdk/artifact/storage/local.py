@@ -9,7 +9,7 @@ import aiofiles
 import structlog
 
 from skyvern.config import settings
-from skyvern.constants import DOWNLOAD_FILE_PREFIX
+from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
 from skyvern.exceptions import DownloadSaveIncompleteError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import (
@@ -441,6 +441,8 @@ class LocalStorage(BaseStorage):
         saved = download_checksums_by_uri(artifacts)
         skipped: list[str] = []
         for filename in files:
+            if filename.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             source = Path(download_dir) / filename
             if not source.is_file():
                 continue
@@ -605,6 +607,7 @@ class LocalStorage(BaseStorage):
             if uri.startswith("file://")
             and (snapshot_path := Path(parse_uri_to_path(uri))).is_relative_to(snapshot_root)
             and snapshot_path.is_file()
+            and not snapshot_path.name.endswith(BROWSER_DOWNLOADING_SUFFIX)
         }
         snapshot_contents = {
             (Path(parse_uri_to_path(artifact.uri)).name, artifact.checksum) for artifact in snapshots.values()
@@ -622,6 +625,8 @@ class LocalStorage(BaseStorage):
         ]
         files_and_folders = os.listdir(download_dir)
         for file_or_folder in files_and_folders:
+            if file_or_folder.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             path = os.path.join(download_dir, file_or_folder)
             if os.path.isfile(path):
                 checksum = calculate_sha256_for_file(path)

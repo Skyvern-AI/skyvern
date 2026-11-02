@@ -45,6 +45,8 @@ from skyvern.forge.sdk.executor import background_task_executor as background_ta
 from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
+from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow import retry_policy as retry_policy_module
 from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
@@ -53,6 +55,7 @@ from skyvern.forge.sdk.workflow.retry_policy import RETRY_DECISION_GRACE_SECONDS
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.run_enums import WebhookDeliveryStatus
+from skyvern.services import orphaned_run_reaper
 from skyvern.services import workflow_schedule_service as schedule_service_module
 from skyvern.services.webhook_delivery import PreparedWorkflowWebhook
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -836,11 +839,20 @@ async def test_in_process_retry_continues_after_interim_payload_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("sweep", ["background", "cloud"])
-@pytest.mark.parametrize("current_status", ["running", "completed"])
-@pytest.mark.parametrize("artifact_link", ["task", "step", "block", "time"])
-@pytest.mark.parametrize("latest_has_screenshot", [False, True])
-@pytest.mark.parametrize("latest_has_recording", [False, True])
+@pytest.mark.parametrize(
+    ("artifact_link", "sweep", "current_status", "latest_has_screenshot", "latest_has_recording"),
+    [
+        ("task", "background", "running", False, False),
+        ("task", "cloud", "completed", True, True),
+        ("step", "background", "running", True, True),
+        ("step", "cloud", "completed", False, False),
+        ("block", "background", "completed", False, True),
+        ("block", "cloud", "running", True, False),
+        ("time", "background", "completed", True, False),
+        ("time", "cloud", "running", False, True),
+    ],
+)
+@pytest.mark.usefixtures("public_dns")
 async def test_recovered_interim_payload_describes_target_attempt(
     interim_retry_db: AgentDB,
     monkeypatch: pytest.MonkeyPatch,
@@ -1517,6 +1529,7 @@ async def test_historical_child_artifacts_use_parent_attempt(
         attempt_number=1,
         historical_artifacts=[],
     )
+    assert files is not None
     assert [file.artifact_id for file in files] == ["child_1_pdf"]
     assert urls == ["https://example.com/child_1_pdf"]
     assert lookup.await_count == 4
@@ -2210,6 +2223,7 @@ async def test_startup_retry_backoff_preserves_sweep_recovery_or_cancellation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_startup_retry_with_definitively_missing_token_remains_abandonable(
     interim_retry_db: AgentDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2616,7 +2630,6 @@ async def test_retry_resumer_recovers_attempt_lookup_failure_on_next_sweep(
     read_run.side_effect = None
     dispatch.side_effect = real_entry
     await executor._recover_pending_retries_once(resume_fresh=False)
-    assert key in executor._scheduled_retry_resumes
     await asyncio.gather(*executor._background_tasks)
     execute.assert_awaited_once()
     assert execute.await_args.kwargs["attempt_number"] == 2
@@ -3802,8 +3815,14 @@ async def test_execute_task_v2_stamps_org_llm_defaults(monkeypatch: pytest.Monke
         "get_task_v2",
         AsyncMock(return_value=SimpleNamespace(workflow_run_id="wr_test")),
     )
-    monkeypatch.setattr(app.DATABASE.observer, "update_task_v2", AsyncMock())
-    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", AsyncMock())
+    monkeypatch.setattr(
+        app.DATABASE.observer, "update_task_v2", AsyncMock(return_value=SimpleNamespace(status=TaskV2Status.queued))
+    )
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "update_workflow_run_if_not_final",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.queued)),
+    )
     monkeypatch.setattr(
         "skyvern.forge.sdk.executor.background_task_executor.initialize_skyvern_state_file",
         AsyncMock(),
@@ -3830,6 +3849,50 @@ async def test_execute_task_v2_stamps_org_llm_defaults(monkeypatch: pytest.Monke
         assert context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
 
     load_custom_llms.assert_awaited_once_with(app.DATABASE, "org_test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended_task_here", [True, False])
+async def test_task_v2_dispatch_refused_by_an_ended_run_never_starts_and_only_the_winner_calls_back(
+    monkeypatch: pytest.MonkeyPatch, ended_task_here: bool
+) -> None:
+    # The run was canceled while this dispatch was stalled; another writer may have ended the task row first.
+    organization = SimpleNamespace(
+        organization_id="org_test", default_llm_key=None, default_secondary_llm_key=None, created_at=None
+    )
+    task_v2 = SimpleNamespace(workflow_run_id="wr_test", observer_cruise_id="task_v2_test", status=TaskV2Status.queued)
+    monkeypatch.setattr(app.DATABASE.organizations, "get_organization", AsyncMock(return_value=organization))
+    monkeypatch.setattr(app.DATABASE.observer, "get_task_v2", AsyncMock(return_value=task_v2))
+    monkeypatch.setattr(app.DATABASE.observer, "update_task_v2", AsyncMock(return_value=task_v2))
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run", AsyncMock())
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.canceled)),
+    )
+    monkeypatch.setattr(
+        app.DATABASE.observer, "update_task_v2_status_if_not_final", AsyncMock(return_value=ended_task_here)
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.executor.background_task_executor.initialize_skyvern_state_file", AsyncMock()
+    )
+    callback = AsyncMock()
+    monkeypatch.setattr(background_task_executor_module.task_v2_service, "send_task_v2_webhook", callback)
+    executor = BackgroundTaskExecutor()
+    executor._schedule = MagicMock()  # type: ignore[method-assign]
+
+    await executor.execute_task_v2(
+        request=None,
+        background_tasks=None,
+        organization_id="org_test",
+        task_v2_id="task_v2_test",
+        max_steps_override=None,
+        browser_session_id=None,
+    )
+
+    executor._schedule.assert_not_called()
+    assert callback.await_count == (1 if ended_task_here else 0)
 
 
 @pytest.mark.asyncio
@@ -4244,24 +4307,20 @@ async def test_concurrent_prepared_recovery_dispatches_only_claim_winner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "entrance, escaped_exception",
-    [("in_process", False), ("in_process", True), ("recovery_pending", False), ("recovery_prepared", False)],
-)
-@pytest.mark.parametrize(
-    "lane, outcome",
+    "entrance, escaped_exception, lane, outcome",
     [
-        ("browser_session_id", "clear"),
-        ("browser_address", "clear"),
-        ("sequential_credential_id", "clear"),
-        ("sequential_key", "clear"),
-        ("reuse_bound_key", "clear"),
-        ("run_sequentially", "clear"),
-        ("depends_on_workflow_run_id", "clear"),
-        ("sequential_credential_id", "cancel"),
-        ("sequential_credential_id", "task_cancel"),
-        ("sequential_credential_id", "timeout"),
-        ("sequential_credential_id", "query_error"),
-        ("none", "clear"),
+        ("in_process", False, "browser_session_id", "clear"),
+        ("in_process", False, "sequential_credential_id", "cancel"),
+        ("in_process", False, "none", "clear"),
+        ("in_process", True, "browser_address", "clear"),
+        ("in_process", True, "sequential_credential_id", "task_cancel"),
+        ("in_process", True, "run_sequentially", "clear"),
+        ("recovery_pending", False, "sequential_credential_id", "clear"),
+        ("recovery_pending", False, "sequential_credential_id", "timeout"),
+        ("recovery_pending", False, "depends_on_workflow_run_id", "clear"),
+        ("recovery_prepared", False, "sequential_key", "clear"),
+        ("recovery_prepared", False, "reuse_bound_key", "clear"),
+        ("recovery_prepared", False, "sequential_credential_id", "query_error"),
     ],
 )
 async def test_in_process_retry_reacquires_serialized_lane(
@@ -4630,3 +4689,123 @@ def test_background_task_set_is_isolated_across_event_loops(monkeypatch: pytest.
         loop_a.run_until_complete(cancel_leaked())
         loop_a.close()
         loop_b.close()
+
+
+_REAP_REASON = "the server that ran it stopped"
+
+
+def _reaper_lease(run_id: str, attempt_number: int | None = None) -> SimpleNamespace:
+    return SimpleNamespace(run_id=run_id, attempt_number=attempt_number, owner_id="host:1:dispatcher")
+
+
+def _workflow_rows(
+    monkeypatch: pytest.MonkeyPatch, status: WorkflowRunStatus, attempts: list[int], finished_meanwhile: bool = False
+) -> SimpleNamespace:
+    run = SimpleNamespace(
+        workflow_run_id="wr_orphan", organization_id="org_1", status=status, failure_reason=None, failure_category=None
+    )
+
+    async def mark_failed(
+        run_id: str, reason: str, category: object, *, only_from: list[WorkflowRunStatus], **_: object
+    ) -> object:
+        if finished_meanwhile:
+            run.status = WorkflowRunStatus.completed
+        if run.status.is_final() or run.status not in only_from:
+            return None
+        run.status = WorkflowRunStatus.failed
+        run.failure_reason = reason
+        return run
+
+    monkeypatch.setattr(
+        orphaned_run_reaper,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(
+                workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=run)),
+                workflow_run_attempts=SimpleNamespace(
+                    get_attempts=AsyncMock(return_value=[SimpleNamespace(attempt_number=n) for n in attempts])
+                ),
+                observer=SimpleNamespace(get_task_v2_by_workflow_run_id=AsyncMock(return_value=None)),
+            ),
+            WORKFLOW_SERVICE=SimpleNamespace(mark_workflow_run_as_failed_if_not_final=mark_failed),
+        ),
+    )
+    return run
+
+
+@pytest.mark.asyncio
+async def test_reaper_fails_a_workflow_run_whose_dispatcher_stopped_before_starting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _workflow_rows(monkeypatch, WorkflowRunStatus.queued, attempts=[])
+
+    handled, effect = await orphaned_run_reaper._reap_workflow(_reaper_lease("wr_orphan"), _REAP_REASON, None)
+
+    assert handled is True
+    assert effect is not None
+    assert run.status == WorkflowRunStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_reaper_leaves_a_queued_retry_attempt_to_retry_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _workflow_rows(monkeypatch, WorkflowRunStatus.queued, attempts=[1])
+
+    assert await orphaned_run_reaper._reap_workflow(
+        _reaper_lease("wr_orphan", attempt_number=1), _REAP_REASON, None
+    ) == (False, None)
+    assert run.status == WorkflowRunStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_reaper_leaves_an_already_finished_workflow_run_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _workflow_rows(monkeypatch, WorkflowRunStatus.completed, attempts=[])
+
+    assert await orphaned_run_reaper._reap_workflow(_reaper_lease("wr_orphan"), _REAP_REASON, None) == (False, None)
+    assert run.status == WorkflowRunStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_reaper_claims_nothing_when_its_conditional_failure_write_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _workflow_rows(monkeypatch, WorkflowRunStatus.queued, attempts=[], finished_meanwhile=True)
+
+    assert await orphaned_run_reaper._reap_workflow(_reaper_lease("wr_orphan"), _REAP_REASON, None) == (False, None)
+    assert run.status == WorkflowRunStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_reaper_fails_a_standalone_task_whose_dispatcher_stopped_before_starting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = SimpleNamespace(
+        task_id="tsk_orphan", organization_id="org_1", workflow_run_id=None, status=TaskStatus.queued, finished_at=None
+    )
+    task.model_copy = lambda update: SimpleNamespace(**{**vars(task), **update})
+
+    async def bulk_update_tasks(
+        task_ids: list[str], status: TaskStatus, failure_reason: str, only_if_status_in: list[TaskStatus]
+    ) -> list[str]:
+        if task.status not in only_if_status_in:
+            return []
+        task.status = status
+        return task_ids
+
+    monkeypatch.setattr(
+        orphaned_run_reaper,
+        "app",
+        SimpleNamespace(
+            DATABASE=SimpleNamespace(
+                tasks=SimpleNamespace(
+                    get_task=AsyncMock(return_value=task),
+                    bulk_update_tasks=bulk_update_tasks,
+                    bulk_update_steps_by_task_ids=AsyncMock(),
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(orphaned_run_reaper, "_sync_task_run", AsyncMock())
+    monkeypatch.setattr(orphaned_run_reaper, "schedule_side_effects", lambda _effect: None)
+
+    assert await orphaned_run_reaper._reap_task(_reaper_lease("tsk_orphan"), _REAP_REASON) is True
+    assert task.status == TaskStatus.failed

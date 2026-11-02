@@ -24,18 +24,18 @@ from skyvern.forge.sdk.db.models import (
 )
 from skyvern.forge.sdk.db.repositories import organizations as organizations_repository_module
 from skyvern.forge.sdk.db.repositories import sms as sms_repository_module
-from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from skyvern.forge.sdk.encrypt.base import DEFAULT_ENCRYPT_METHOD, EncryptMethod
 from skyvern.forge.sdk.schemas.organizations import TwilioCredential
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 
 
 class _FakeEncryptor:
     async def encrypt(self, plaintext: str, method: object) -> str:
-        assert getattr(method, "value", None) == "aes"
+        assert method is DEFAULT_ENCRYPT_METHOD
         return f"encrypted::{plaintext}"
 
     async def decrypt(self, ciphertext: str, method: object) -> str:
-        assert getattr(method, "value", None) == "aes"
+        assert method is DEFAULT_ENCRYPT_METHOD
         return ciphertext.removeprefix("encrypted::")
 
 
@@ -103,7 +103,7 @@ def fake_sms_encryptor(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_twilio_org_credentials_default_to_aes_and_reject_other_methods(
+async def test_twilio_org_credentials_default_to_aes_gcm_and_reject_other_methods(
     agent_db: AgentDB,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -127,10 +127,10 @@ async def test_twilio_org_credentials_default_to_aes_and_reject_other_methods(
         )
     assert row is not None
     assert row.token == ""
-    assert row.encrypted_method == EncryptMethod.AES.value
+    assert row.encrypted_method == DEFAULT_ENCRYPT_METHOD.value
     assert row.encrypted_token == f"encrypted::{credential.model_dump_json()}"
 
-    with pytest.raises(ValueError, match="AES"):
+    with pytest.raises(ValueError, match=DEFAULT_ENCRYPT_METHOD.value):
         await agent_db.organizations.replace_org_auth_token(
             "o_test",
             OrganizationAuthTokenType.twilio_credential,
@@ -184,7 +184,7 @@ async def test_invalid_sms_config_mode_leaves_no_poisoned_row(agent_db: AgentDB)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["create", "update", "disable", "delete"])
+@pytest.mark.parametrize("operation", ["create", "update", "disable", "delete", "claimed", "expected"])
 async def test_sms_timestamp_writes_are_naive_utc(agent_db: AgentDB, db_engine: Any, operation: str) -> None:
     writes: list[dict[str, datetime]] = []
 
@@ -200,6 +200,35 @@ async def test_sms_timestamp_writes_are_naive_utc(agent_db: AgentDB, db_engine: 
     expected = datetime(2026, 9, 10, 9, 30)
     if operation == "update":
         await agent_db.sms.update_phone_number(phone.phone_number_id, "o_test", quarantined_until=timestamp)
+    elif operation in {"claimed", "expected"}:
+        await agent_db.sms.update_phone_number(phone.phone_number_id, "o_test", status="provisioning")
+        claimed = await agent_db.sms.claim_phone_number_provisioning(phone.phone_number_id, "o_test")
+        writer = getattr(agent_db.sms, f"update_phone_number_if_{operation}")
+        conditions = (
+            {"claim_token": claimed.provisioning_claimed_at}
+            if operation == "claimed"
+            else {"expected_status": "provisioning"}
+        )
+        with pytest.raises(sms_repository_module.InvalidPhoneNumberStatus):
+            await writer(phone.phone_number_id, "o_test", status="bogus", **conditions)
+        updated = await writer(
+            phone.phone_number_id,
+            "o_test",
+            status="reversal_pending",
+            current_period_start=timestamp,
+            current_period_end=timestamp,
+            cancel_at=timestamp,
+            maintenance_checked_at=timestamp,
+            **conditions,
+        )
+        assert updated.status == "reversal_pending"
+        assert (
+            updated.current_period_start
+            == updated.current_period_end
+            == updated.cancel_at
+            == updated.maintenance_checked_at
+            == expected
+        )
     elif operation == "disable":
         await agent_db.sms.update_phone_number(phone.phone_number_id, "o_test", status="disabled")
     elif operation == "delete":
@@ -254,7 +283,7 @@ async def test_sms_config_create_get_list_and_delete(agent_db: AgentDB) -> None:
         )
     assert stored is not None
     assert stored.encrypted_webhook_secret == "encrypted::secret-token"
-    assert stored.webhook_secret_encrypted_method == "aes"
+    assert stored.webhook_secret_encrypted_method == DEFAULT_ENCRYPT_METHOD.value
 
     loaded = await agent_db.sms.get_sms_config_with_secret(
         organization_id="o_test", sms_config_id=created.sms_config_id
@@ -455,6 +484,40 @@ async def test_phone_number_create_normalizes_and_validates_e164(agent_db: Agent
             sms_config_id=config.sms_config_id,
             phone_number="+1-EXT-415-555-2673",
         )
+
+
+@pytest.mark.asyncio
+async def test_list_active_managed_phone_numbers_orders_null_and_oldest_maintenance_first(
+    agent_db: AgentDB,
+) -> None:
+    config, _ = await agent_db.sms.create_sms_config(
+        organization_id="o_reconcile",
+        mode="managed",
+        webhook_secret="secret-token",
+    )
+    first = await agent_db.sms.create_phone_number(
+        organization_id="o_reconcile",
+        sms_config_id=config.sms_config_id,
+        phone_number="+14155550121",
+        provider="skyvern",
+        provider_number_sid="PN_first",
+    )
+    second = await agent_db.sms.create_phone_number(
+        organization_id="o_reconcile",
+        sms_config_id=config.sms_config_id,
+        phone_number="+14155550122",
+        provider="skyvern",
+        provider_number_sid="PN_second",
+    )
+    await agent_db.sms.update_phone_number(
+        first.phone_number_id,
+        "o_reconcile",
+        maintenance_checked_at=datetime.now(timezone.utc),
+    )
+
+    rows = await agent_db.sms.list_active_managed_phone_numbers(limit=2)
+
+    assert [row.phone_number_id for row in rows] == [second.phone_number_id, first.phone_number_id]
 
 
 @pytest.mark.parametrize(

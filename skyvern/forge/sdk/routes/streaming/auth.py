@@ -17,6 +17,43 @@ LOG = structlog.get_logger()
 
 EXPECTED_AUTH_FAILURE_STATUS_CODES = frozenset({status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN})
 
+STREAM_SUBPROTOCOL = "skyvern.v1"
+_BEARER_SUBPROTOCOL_PREFIX = "bearer."
+_APIKEY_SUBPROTOCOL_PREFIX = "apikey."
+
+
+class StreamCredentials(t.NamedTuple):
+    apikey: str | None
+    # Full `Authorization` header value (`Bearer <jwt>`), as `get_current_org` expects.
+    authorization: str | None
+    subprotocol: str | None
+
+
+def credentials_from_websocket(websocket: WebSocket, apikey: str | None, token: str | None) -> StreamCredentials:
+    """Read the stream credential from `Sec-WebSocket-Protocol`, falling back to the deprecated query params.
+
+    Browsers cannot set headers on a WebSocket handshake, so the web app offers
+    `skyvern.v1, bearer.<jwt>` / `apikey.<key>` as subprotocols instead of putting the credential in the URL.
+    """
+    header_apikey: str | None = None
+    header_authorization: str | None = None
+    subprotocol: str | None = None
+    for item in websocket.headers.get("sec-websocket-protocol", "").split(","):
+        item = item.strip()
+        if item == STREAM_SUBPROTOCOL:
+            subprotocol = STREAM_SUBPROTOCOL
+        elif item.startswith(_BEARER_SUBPROTOCOL_PREFIX) and len(item) > len(_BEARER_SUBPROTOCOL_PREFIX):
+            header_authorization = f"Bearer {item[len(_BEARER_SUBPROTOCOL_PREFIX) :]}"
+        elif item.startswith(_APIKEY_SUBPROTOCOL_PREFIX) and len(item) > len(_APIKEY_SUBPROTOCOL_PREFIX):
+            header_apikey = item[len(_APIKEY_SUBPROTOCOL_PREFIX) :]
+
+    # Any credential in the header wins outright; query values are not merged in.
+    if header_apikey or header_authorization:
+        return StreamCredentials(header_apikey, header_authorization, subprotocol)
+    if apikey or token:
+        LOG.info("Streaming credential supplied in query string (deprecated)", path=websocket.url.path)
+    return StreamCredentials(apikey, token, subprotocol)
+
 
 def require_client_id(client_id: str | None, **log_kwargs: t.Any) -> bool:
     if client_id:
@@ -118,9 +155,10 @@ async def auth(
     determined.
     """
 
+    credentials = credentials_from_websocket(websocket, apikey, token)
     try:
-        await websocket.accept()
-        if not token and not apikey:
+        await websocket.accept(subprotocol=credentials.subprotocol)
+        if not credentials.authorization and not credentials.apikey:
             await websocket.close(code=1002)
             return None
     except ConnectionClosedOK:
@@ -128,7 +166,7 @@ async def auth(
         return None
 
     try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
+        organization = await get_current_org(x_api_key=credentials.apikey, authorization=credentials.authorization)
         organization_id = organization.organization_id
 
         if not organization_id:

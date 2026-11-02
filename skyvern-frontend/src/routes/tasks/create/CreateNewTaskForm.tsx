@@ -32,7 +32,7 @@ import { ToastAction } from "@/components/ui/toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useState } from "react";
-import { useForm, useFormState } from "react-hook-form";
+import { useForm, useFormState, Resolver } from "react-hook-form";
 import { Link } from "react-router-dom";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { TaskFormSection } from "./TaskFormSection";
@@ -125,13 +125,16 @@ function CreateNewTaskForm({ initialValues }: Props) {
   const organization = organizations?.[0];
 
   const form = useForm<CreateNewTaskFormValues>({
-    resolver: zodResolver(createNewTaskFormSchema),
+    resolver: zodResolver(
+      createNewTaskFormSchema,
+    ) as Resolver<CreateNewTaskFormValues>,
     defaultValues: {
       ...initialValues,
       maxStepsOverride: initialValues.maxStepsOverride ?? null,
       proxyLocation: initialValues.proxyLocation ?? ProxyLocation.Residential,
       maxScreenshotScrolls: initialValues.maxScreenshotScrolls ?? null,
       cdpAddress: initialValues.cdpAddress ?? null,
+      extraHttpHeaders: initialValues.extraHttpHeaders ?? null,
     },
   });
   const { errors } = useFormState({ control: form.control });

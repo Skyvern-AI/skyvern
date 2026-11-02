@@ -1,4 +1,4 @@
-import { useFeatureFlagEnabled } from "posthog-js/react";
+import { usePostHogFeatureFlagEnabled as useFeatureFlagEnabled } from "@/hooks/usePostHogFeatureFlag";
 import { ANALYTICS_ANOMALY_DETECTION_FLAG } from "@/util/featureFlags";
 
 // Same VITE_MOCK_ANALYTICS override as useAnalyticsDashboardFlag: mock-mode

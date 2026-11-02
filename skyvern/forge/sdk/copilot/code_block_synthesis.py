@@ -25,6 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
+from skyvern.forge.sdk.copilot.agent_context import ScoutedDynamicRowEvidence, ScoutedDynamicRowPeriodMatch
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
     SameMonthFileMatchTransform,
@@ -38,10 +39,6 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_CLAIM_HELPER_NAME,
     ReachedDownloadTarget,
     can_deliver_registered_download,
-)
-from skyvern.forge.sdk.copilot.runtime import (
-    ScoutedDynamicRowEvidence,
-    ScoutedDynamicRowPeriodMatch,
 )
 
 LOG = structlog.get_logger()
@@ -297,7 +294,7 @@ def credential_scout_gap(
 
 
 _ENTRY_TARGET_TOOLS = frozenset(
-    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key"}
+    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key", "drag"}
 )
 _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset(
     {"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file"}

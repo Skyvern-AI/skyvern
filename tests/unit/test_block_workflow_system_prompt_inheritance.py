@@ -3,6 +3,9 @@
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
+from skyvern.config import settings
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     FileParserBlock,
@@ -10,6 +13,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     TaskBlock,
     TaskV2Block,
     TextPromptBlock,
+    render_failure_reason,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
@@ -109,6 +113,41 @@ class TestTaskBlockSystemPromptInheritance:
         block.format_potential_template_parameters(ctx)
 
         assert block.workflow_system_prompt == "Respond in the style of a formal English butler."
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_cause"),
+    [
+        (
+            "Be brief.\nUse {{ style.values | tojson }}.",
+            "Wrong value type in `style.values | tojson` (field workflow_system_prompt, line 2).",
+        ),
+        ("Be brief.\nUse {{ style. }}.", "Syntax error in `style.` (field workflow_system_prompt, line 2)."),
+    ],
+)
+def test_workflow_system_prompt_render_failure_names_kind_and_line(prompt: str, expected_cause: str) -> None:
+    block = _make_task_block(workflow_system_prompt=None)
+    ctx = _make_workflow_run_context(prompt)
+    ctx.values["style"] = {"values": ["formal"]}
+
+    with pytest.raises(Exception) as excinfo:
+        block.format_potential_template_parameters(ctx)
+
+    reason = render_failure_reason("Failed to format jinja template:", excinfo.value, block.secret_redactor(ctx))
+    assert reason == f"Failed to format jinja template: {expected_cause}"
+
+
+def test_strict_workflow_system_prompt_failure_names_the_missing_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_TEMPLATING_STRICTNESS", "strict")
+    block = _make_task_block(workflow_system_prompt=None)
+    ctx = _make_workflow_run_context("Be brief.\nUse {{ persona }} and {{ style.values }}.")
+    ctx.values["style"] = {"values": ["formal"]}
+
+    with pytest.raises(Exception) as excinfo:
+        block.format_potential_template_parameters(ctx)
+
+    reason = render_failure_reason("Failed to format jinja template:", excinfo.value, block.secret_redactor(ctx))
+    assert reason == "Failed to format jinja template: Missing reference: persona (field workflow_system_prompt)."
 
 
 class TestTaskV2BlockSystemPromptInheritance:

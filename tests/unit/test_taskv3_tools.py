@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import dataclasses
 import decimal
 import html
 import html as html_lib
@@ -27,13 +28,13 @@ from html import escape as html_escape
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, NoReturn
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
 import pyotp
 import pytest
 import pytest_asyncio
-from playwright.async_api import Browser, BrowserContext
+from playwright.async_api import Browser, BrowserContext, ElementHandle
 from playwright.async_api import Error as _PlaywrightError
 from playwright.async_api import Frame, Page, Playwright, Route
 from playwright.async_api import TimeoutError as _PlaywrightTimeout
@@ -42,6 +43,8 @@ from structlog.testing import capture_logs
 
 import skyvern.forge.taskv3.loop as taskv3_loop
 import skyvern.forge.taskv3.tools as taskv3_tools
+import skyvern.webeye.action_deadline as action_deadline
+import skyvern.webeye.cdp_download_interceptor as cdp_download_interceptor
 import skyvern.webeye.navigation as navigation_module
 from skyvern.config import settings
 from skyvern.exceptions import NO_ADDRESS_RECORD_NAV_ERROR_CODE
@@ -76,6 +79,7 @@ from skyvern.forge.taskv3.loop import (
     UnseenPageText,
     _navigate_record_fields,
 )
+from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.forge.taskv3.run_arms import LOGIN_PACE_FLAG
 
 # Captured at import (before the _fast_upload_settle autouse fixture rebinds the module attr) so the
@@ -87,17 +91,22 @@ from skyvern.forge.taskv3.tools import (
     _SEMANTIC_COMMIT_STATE_JS,
     _TYPE_TARGET_PROBE_JS,
     _TYPING_REACH_PROBE_JS,
+    DOWNLOAD_NO_FILE_THIS_ACTION,
+    DOWNLOAD_NO_SESSION_FILE_YET,
     NAVIGATION_DEAD_END_STATUSES,
+    NO_ONE_TIME_CODE_SOURCE,
     OBSERVE_DISPLAY_WIDTHS,
     OBSERVE_POINTER_ROOT_CAP,
     OBSERVE_RETAIN_WIDTH_MIN,
     OBSERVE_SELECTED_OPTIONS_TOTAL_CAP,
     PAGE_UNAVAILABLE_ERROR,
     BlankWorkingPageGuard,
+    DownloadFailureWatch,
     _annotate_screenshot,
     _exact_tier_key,
     _invalid_selector_result,
     _is_host_anchored_selector,
+    _locator_never_resolved,
     _normalize_selector,
     _same_cell_value,
 )
@@ -108,6 +117,8 @@ from skyvern.forge.taskv3.tools import (
     pending_marker,
 )
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
+from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit.copilot_test_helpers import page_with_unprobeable_vendor_embedder
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 
@@ -297,6 +308,7 @@ class _FakeRequest:
         self.resource_type = resource_type
         self.url = url
         self.post_data: str | None = None
+        self.failure: str | None = None
 
 
 class _FakeObserveElementProperty:
@@ -605,6 +617,21 @@ def expected_action_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 500)
 
 
+@pytest.fixture
+def short_suggestion_row_click(monkeypatch: pytest.MonkeyPatch) -> None:
+    # For a row built so its click never lands, the production wait for it is idle time; a row that can be
+    # clicked still lands well inside this.
+    monkeypatch.setattr(taskv3_tools, "_SUGGESTION_ROW_CLICK_TIMEOUT_MS", 1500)
+
+
+@pytest.fixture
+def short_list_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The list poll budget scaled down; a test using it scales its page's timers to fit between the two. It no longer
+    # proves the production cap's value, only that the wait extends past the soft deadline and stops at the cap.
+    monkeypatch.setattr(taskv3_tools, "_LIST_POLL_SOFT_S", 0.6)
+    monkeypatch.setattr(taskv3_tools, "_LIST_POLL_HARD_S", 4.0)
+
+
 @pytest.mark.asyncio
 async def test_tool_set_and_no_task_ecosystem_tools() -> None:
     tools = build_browser_tools(_fixed_page_provider(_FakePage()))
@@ -739,8 +766,8 @@ async def test_click_refuses_a_natively_disabled_target_before_the_actionability
         blinked = await click({"selector": "#blink-on"})
         # The gate stands in for the driver's own enabled check, so the contract is agreement with it,
         # asserted against `is_enabled` rather than against a hardcoded rule. Which shapes the driver
-        # refuses is version-dependent (`aria-disabled` on an ANCESTOR is refused by 1.61 and clicked
-        # by 1.58), and a test naming the shapes pins the gate to whichever driver it was written on.
+        # refuses is version-dependent (`aria-disabled` on a role-less ANCESTOR is clicked by 1.46 and
+        # refused by 1.56), and a test naming the shapes pins the gate to the driver it was written on.
         aria: dict[str, tuple[bool, str | None, str, float]] = {}
         for selector in ("#aria-off", "#aria-under-wrapper", "#declared-off"):
             driver_refuses = not await page.locator(selector).is_enabled()
@@ -1173,7 +1200,8 @@ async def test_navigate_reports_a_ready_document_whose_load_never_fired_in_budge
     # keeps `load` from firing. The wait for load is still made — the readiness budget is the bound,
     # not the event — and when that budget runs out the tool reports what the document actually
     # reached instead of raising. RED with the load wait removed: one wait, and no time spent on it.
-    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 150)
+    monkeypatch.setattr(taskv3_tools, "_NAVIGATE_READINESS_PROBE_RESERVE_MS", 100)
     page, tools = _readiness_tools(monkeypatch, "interactive")
 
     async def _load_starves(state: str = "load", timeout: float | None = None) -> None:
@@ -1190,7 +1218,7 @@ async def test_navigate_reports_a_ready_document_whose_load_never_fired_in_budge
     assert r.status == "ok", r.content
     assert r.ok_class == "document_ready"
     assert [wait["state"] for wait in _load_state_waits(page)] == ["domcontentloaded", "load"]
-    assert waited >= 0.4  # the load wait was made and spent its budget, not skipped
+    assert waited >= 0.045  # the load wait was made and spent its budget, not skipped
     assert "https://jobs.example.test/acme/123" in r.content and "(HTTP 200)" in r.content
     assert "the document is ready" in r.content and "still loading its scripts and resources" in r.content
     assert "act on what has rendered, or wait for the rest" in r.content
@@ -1209,7 +1237,8 @@ async def test_navigate_reports_a_ready_document_whose_readystate_read_never_ans
     # evaluate could not complete inside its reserve. The domcontentloaded wait had already RETURNED,
     # so the document was ready and the tool knew it; deriving the class from the read instead threw
     # that away and told the model the state was unknown, stopping the rest of its batch.
-    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 150)
+    monkeypatch.setattr(taskv3_tools, "_NAVIGATE_READINESS_PROBE_RESERVE_MS", 100)
     page, tools = _readiness_tools(monkeypatch, "interactive")
     page_evaluate = page.evaluate
 
@@ -1311,7 +1340,8 @@ async def test_navigate_does_not_read_an_advisory_waits_timeout_as_the_event(
     # `document_ready`, with the batch behind it left to run against it.
     # The readyState read never answers here, so the class rests on the waits alone: this is the arm
     # where the deadline guard is the only thing between an advisory timeout and a false witness.
-    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 1500)
+    monkeypatch.setattr(settings, "TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS", 150)
+    monkeypatch.setattr(taskv3_tools, "_NAVIGATE_READINESS_PROBE_RESERVE_MS", 100)
     page, tools = _readiness_tools(monkeypatch, "loading")
     page_evaluate = page.evaluate
 
@@ -1706,6 +1736,7 @@ def test_preflight_tool_set_matches_builder() -> None:
     assert PREFLIGHT_TOOL_NAMES == {
         "click",
         "hover",
+        "drag",
         "type",
         "select_combobox",
         "select_option",
@@ -1716,6 +1747,7 @@ def test_preflight_tool_set_matches_builder() -> None:
     rep = {
         "click": {"selector": "#x"},
         "hover": {"selector": "#x"},
+        "drag": {"selector": "#x", "target": "#y"},
         "type": {"selector": "#x", "text": "y"},
         "select_combobox": {"selector": "#x", "value": "v"},
         "select_option": {"selector": "#x", "value": "v"},
@@ -1861,6 +1893,7 @@ async def test_navigate_refuses_a_url_carrying_a_resolved_credential_off_site() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("unresolvable_dns")
 async def test_file_upload_from_a_local_path_carrying_the_username_is_not_refused(tmp_path: Path) -> None:
     # The tool takes "a local path or URL", and a file downloaded earlier in the run is routinely named
     # after the account. A path names no site, so reading it releases nothing and must not be refused.
@@ -2101,7 +2134,7 @@ async def test_type_of_a_credential_totp_placeholder_enters_a_real_code(monkeypa
     assert typed[0] in {totp.at(before), totp.at(after)}
     assert re.fullmatch(r"\d{6}", typed[0])
     assert run.state.values_delivered == 1
-    assert run.state.totp_source_missing is False
+    assert run.state.last_status is None
     assert typed[0] in run.context.runtime_secret_values
     assert "BW_TOTP" not in result.content and _TOTP_PLACEHOLDER not in result.content
 
@@ -2130,10 +2163,10 @@ async def test_type_of_a_totp_placeholder_with_no_usable_secret_types_nothing(
     type_messages = [m for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "type"]
     assert len(type_messages) == 1
     content = type_messages[0]["content"]
-    assert "one-time" in content and "Never invent or guess a code" in content
+    assert NO_ONE_TIME_CODE_SOURCE in content
     assert "BW_TOTP" not in content and _TOTP_PLACEHOLDER not in content and "tool_error" not in content
     assert not re.search(r"\d", content)
-    assert run.state.totp_source_missing is True
+    assert run.state.last_status == NO_ONE_TIME_CODE_SOURCE
     assert run.state.values_delivered == 0
 
 
@@ -2207,7 +2240,7 @@ async def test_type_enters_the_code_of_a_credential_other_than_the_blocks_pinned
     typed = [c[1]["text"] for c in run.page.calls if c[0] == "fill"]
     assert len(typed) == 1 and re.fullmatch(r"\d{6}", typed[0])
     assert run.state.values_delivered == 1
-    assert run.state.totp_source_missing is False
+    assert run.state.last_status is None
 
 
 @pytest.mark.asyncio
@@ -2232,6 +2265,31 @@ async def test_a_totp_code_is_judged_on_the_page_it_is_typed_into_after_the_wind
     run.sleep.assert_awaited_once()
     assert [c for c in run.page.calls if c[0] == "fill"] == []
     assert run.state.values_delivered == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enforced", "whole_site", "page_url", "refused"),
+    [
+        (False, True, "https://phisher-signin.net/mfa", False),
+        (True, False, "https://accounts.portal-example.com/mfa", True),
+    ],
+    ids=["log-only-login-off-site", "host-only-login-on-sibling-host"],
+)
+async def test_a_vault_logins_totp_code_keeps_the_logins_own_scope(
+    monkeypatch: pytest.MonkeyPatch, enforced: bool, whole_site: bool, page_url: str, refused: bool
+) -> None:
+    guard = CredentialReleaseGuard(workflow_run_id="wr_totp", block_label="sign_in")
+    assert guard.arm("BW_TOTP", "https://login.portal-example.com", "login", enforced=enforced, whole_site=whole_site)
+    with _credential_totp_run(
+        monkeypatch, seed=_TOTP_SEED, guard=guard, page_url=page_url, window_wait=lambda _page: None
+    ) as run:
+        if refused:
+            with pytest.raises(CodeBlockCredentialReleaseError):
+                await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+        else:
+            await _tool(run.tools, "type").handler({"selector": "#otp", "text": _TOTP_PLACEHOLDER})
+    assert run.state.values_delivered == (0 if refused else 1)
 
 
 @pytest.mark.asyncio
@@ -2270,7 +2328,7 @@ async def test_a_totp_placeholder_not_typed_alone_is_refused_without_blaming_the
     assert "typed alone" in refused.content
     assert "no usable" not in refused.content and "BW_TOTP" not in refused.content
     assert [c for c in run.page.calls if c[0] == "fill"] == []
-    assert run.state.totp_source_missing is False
+    assert run.state.last_status is None
     assert run.state.values_delivered == 0
 
 
@@ -2334,6 +2392,7 @@ async def test_a_url_argument_never_carries_a_totp_placeholder(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_navigate_to_a_url_that_merely_spells_a_vault_marker_goes_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3470,6 +3529,81 @@ async def test_hover_tool_dispatches_and_is_billable() -> None:
     assert spec.billable is True
 
 
+_DRAG_LIST_HTML = """<!doctype html><html><body>
+  <ul id="list">
+    <li role="button" draggable="true" style="height:30px">Alpha</li>
+    <li role="button" draggable="true" style="height:30px">Beta</li>
+    <li role="button" draggable="true" style="height:30px">Gamma</li>
+  </ul>
+  <script>
+    let dragged = null;
+    for (const item of document.querySelectorAll('#list li')) {
+      item.addEventListener('dragstart', (e) => { dragged = item; e.dataTransfer.setData('text/plain', ''); });
+      item.addEventListener('dragover', (e) => e.preventDefault());
+      item.addEventListener('drop', (e) => { e.preventDefault(); item.before(dragged); });
+    }
+  </script>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_drag_tool_moves_an_element_onto_its_target() -> None:
+    # Copilot authors an agent block for a demonstrated drag when the org cannot author code blocks; with
+    # no drag tool the block cannot repeat it. Both ends are observe refs, so each resolves server-side.
+    async with _content_page(_DRAG_LIST_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        spec = _tool(tools, "drag")
+        result = await spec.handler(
+            {"selector": _ref_line(observed.content, "Gamma"), "target": _ref_line(observed.content, "Alpha")}
+        )
+        assert result.status == "ok", result.content
+        order = await page.evaluate("[...document.querySelectorAll('#list li')].map((li) => li.textContent)")
+    assert order == ["Gamma", "Alpha", "Beta"]
+    assert spec.billable is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_drag_tool_drags_within_a_frame_and_refuses_a_target_in_another() -> None:
+    # Playwright drags inside one document, so a pair inside one iframe must work and a drop target in
+    # the parent document must be refused before anything is dispatched, by ref and by CSS selector.
+    srcdoc = html.escape(_DRAG_LIST_HTML, quote=True)
+    page_html = f'<!doctype html><html><body><button id="outside">Outside</button><iframe srcdoc="{srcdoc}" style="width:400px;height:300px"></iframe></body></html>'
+    async with _content_page(page_html) as page:
+        await page.wait_for_function(
+            "document.querySelector('iframe').contentDocument?.querySelectorAll('li').length === 3"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        drag = _tool(tools, "drag").handler
+        gamma, alpha = _ref_line(observed.content, "Gamma"), _ref_line(observed.content, "Alpha")
+        frame = page.frames[1]
+        # A drop handler can start a save: the drop target inside the frame must then read as still in flight.
+        await frame.evaluate(
+            "[...document.querySelectorAll('li')][0].addEventListener('drop', (e) => { e.target.textContent = 'Processing'; })"
+        )
+        result = await drag({"selector": gamma, "target": alpha})
+        assert result.status == "ok", result.content
+        assert await pending_marker(page, result.data["drop_target"]) == "Processing"
+        assert set(taskv3_tools._frame_work(page)["submitted"]) == {result.data["drop_target"]}
+        assert await frame.evaluate("[...document.querySelectorAll('li')].map((li) => li.textContent)") == [
+            "Gamma",
+            "Processing",
+            "Beta",
+        ]
+        observed = await _tool(tools, "observe").handler({})
+        source = _ref_line(observed.content, "Beta")
+        for target in (_ref_line(observed.content, "Outside"), "#outside"):
+            refused = await drag({"selector": source, "target": target})
+            assert refused.status == "error" and refused.error_class == "unreachable", (target, refused.content)
+        missing = await drag({"selector": source, "target": "#nowhere"})
+        assert missing.error_class == "stale_selector", missing.content
+        invalid = await drag({"selector": source, "target": "li[data-x"})
+        assert invalid.error_class == "invalid_selector" and "li[data-x" in invalid.content
+
+
 def test_perception_tools_are_compactable_and_actions_are_not() -> None:
     # Compaction only elides tools flagged `compactable` on the real factory output. If a rename or a
     # refactor of the flag loop in tools.py stops flagging observe/get_html, the transcript stops being
@@ -3573,7 +3707,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "phantom_dropped",
         "iframes_in_component_roots",
         "undiscovered_roots",
-        "omitted_unnameable",
+        "listed_by_handle_only",
         "invalid_fields",
         "markers_minted",
         "markers_reused",
@@ -3604,6 +3738,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "ready_state_when_empty",
         "icons_listed",
         "icons_truncated",
+        "unnamed_not_icon",
     }
     assert all(type(v) is int for v in summary.values())
     assert summary["invalid_fields"] == 1
@@ -3611,7 +3746,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
     assert summary["hidden_listed"] == 1
     assert summary["iframes_in_component_roots"] == 1
     assert summary["text_dropped"] > 0
-    assert summary["omitted_unnameable"] == 1
+    assert summary["listed_by_handle_only"] == 1
     assert summary["markers_minted"] == 1 and summary["markers_reused"] == 0
     # The census rides this same record, so it is pinned to values here rather than to key names:
     # `set_content` leaves the page on about:blank, where `location.origin` is "null" and the
@@ -5689,6 +5824,55 @@ async def test_click_on_a_choice_option_names_the_question_observe_bound_it_to()
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_yes_no_toggle_buttons_name_their_question_and_echo_it_but_page_toggles_do_not() -> None:
+    # Adjacent Yes/No pairs of pressable buttons: with the question on the "No" alone, the model paired the
+    # unlabeled "Yes" with the question beside it and pressed the wrong button.
+    questions = (
+        "Are you legally authorized to work in this country?",
+        "Will you now or in the future require visa sponsorship?",
+    )
+    pair = (
+        "<div class='yesno'><button type='button' aria-pressed='false'>Yes</button>"
+        "<button type='button' aria-pressed='false'>No</button><input type='checkbox' hidden></div>"
+    )
+    # Both questions share one hint between their label and their buttons; the hint names neither question.
+    hint = "<div class='hint'><p>Answer for the country where this role is located.</p></div>"
+    # The second label sits in a title box of its own, a common layout.
+    labels = (f"<label>{questions[0]}</label>", f"<div class='title'><label>{questions[1]}</label></div>")
+    entries = "".join(f"<div class='entry'>{label}{hint}{pair}</div>" for label in labels)
+    # A pair whose question is plain text, in a section whose legend titles the section and asks nothing.
+    unlabeled = "Are you at least 18 years old?"
+    section = (
+        f"<fieldset><legend>Work eligibility</legend><div class='entry'><div>{unlabeled}</div>{pair}</div></fieldset>"
+    )
+    # Pressable buttons that set no form value are page controls; the card title beside them is not a question.
+    card = (
+        "<div class='card'><h3>Blue road bike</h3><div class='actions'>"
+        "<button type='button' aria-pressed='false'>Save this bike</button>"
+        "<button type='button' aria-pressed='false'>Track price on this bike</button></div></div>"
+    )
+    async with _live_page(f"<!doctype html><html><body><form>{entries}{section}</form>{card}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        buttons = re.findall(r"^ref=(\d+) button\S* '(Yes|No)'.*?(?: group='([^']*)')?$", r.content, re.M)
+        assert [(label, group) for _, label, group in buttons] == [
+            (label, q) for q in (*questions, unlabeled) for label in ("Yes", "No")
+        ], r.content
+        page_toggles = [line for line in r.content.splitlines() if line.startswith("ref=") and "this bike'" in line]
+        assert len(page_toggles) == 2 and not any(" group=" in line for line in page_toggles), r.content
+        sponsorship_yes = next(ref for ref, label, group in buttons if label == "Yes" and group == questions[1])
+        clicked = await _tool(tools, "click").handler({"selector": f"ref={sponsorship_yes}"})
+        save = re.search(r"^ref=(\d+) button\S* 'Save this bike'", r.content, re.M)
+        assert save, r.content
+        saved = await _tool(tools, "click").handler({"selector": f"ref={save.group(1)}"})
+    assert clicked.status == "ok" and clicked.content.endswith(f"\nclicked 'Yes' for question {questions[1]!r}"), (
+        clicked.content
+    )
+    assert saved.status == "ok" and "question" not in saved.content, saved.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_click_echo_stays_silent_when_the_pick_could_not_be_confirmed() -> None:
     # The card leaves the page on click, so its state cannot be read back.
     html = (
@@ -7301,23 +7485,25 @@ async def test_label_readback_agrees_with_the_driver_across_whitespace_forms() -
             assert "did NOT commit" not in r.content, (dom_text, r.content)
 
 
+@_skip_no_browser
 @pytest.mark.asyncio
-async def test_get_html_falls_back_to_outer_html_for_empty_leaf() -> None:
-    # inner_html of a void/leaf element ("", e.g. <input>) used to return ok("") — no signal at all.
-    # The element's own tag+attributes are the useful answer for a leaf.
-    class _LeafElement(_FakeElement):
-        async def inner_html(self) -> str:
-            return ""
+async def test_get_html_on_one_element_returns_its_own_tag_and_attributes() -> None:
+    # A link's destination and a date's full timestamp live only in the element's own attributes;
+    # its children show neither.
+    async with _content_page(
+        '<a href="https://example.com/releases/download/v1.2.0/tool.tar.gz"><span>tool.tar.gz</span></a>'
+        '<relative-time datetime="2026-07-15T16:26:10Z">15 Jul</relative-time>'
+        '<input id="email" type="email">'
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        get_html = _tool(tools, "get_html").handler
+        link_ref = _ref_line((await _tool(tools, "observe").handler({})).content, "tool.tar.gz")
 
-        async def evaluate(self, js: str) -> dict:
-            return '<input id="email" type="email">'
-
-    page = _FakePage()
-    page.element = _LeafElement()
-    tools = build_browser_tools(_fixed_page_provider(page))
-    r = await _tool(tools, "get_html").handler({"selector": "#email"})
-    assert r.status == "ok"
-    assert r.content == '<input id="email" type="email">'
+        link = await get_html({"selector": link_ref})
+        assert 'href="https://example.com/releases/download/v1.2.0/tool.tar.gz"' in link.content, link.content
+        date = await get_html({"selector": "relative-time"})
+        assert 'datetime="2026-07-15T16:26:10Z"' in date.content, date.content
+        assert (await get_html({"selector": "#email"})).content == '<input id="email" type="email">'
 
 
 @pytest.mark.asyncio
@@ -8956,6 +9142,113 @@ async def _prime(tools: list[Any]) -> None:
     await _tool(tools, "wait").handler({"time_ms": 1})
 
 
+class _GeneratedNameDownloadPage(_DownloadFakePage):
+    """A browser that owns its downloads: the file lands under a generated id while the page named it."""
+
+    def __init__(self, downloads_dir: Path) -> None:
+        super().__init__(downloads_dir)
+        self._download_listeners: list[Any] = []
+        self.context = MagicMock(spec=BrowserContext)
+
+    def on(self, event: str, callback: Any) -> None:
+        if event == "download":
+            self._download_listeners.append(callback)
+        super().on(event, callback)
+
+    def remove_listener(self, event: str, callback: Any) -> None:
+        if event == "download":
+            self._download_listeners.remove(callback)
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        download = SimpleNamespace(
+            suggested_filename="dl1_receipt.txt", path=AsyncMock(return_value=str(self._downloads_dir / "c5cf4832"))
+        )
+        for listener in self._download_listeners:
+            listener(download)
+        (self._downloads_dir / "c5cf4832.txt").write_bytes(b"x" * 46)
+        await super().click(selector, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_a_download_saved_under_a_generated_id_is_reported_by_the_pages_name(tmp_path: Path) -> None:
+    page = _GeneratedNameDownloadPage(tmp_path)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+    result = await _tool(tools, "click").handler({"selector": "#dl"})
+    watch.close()
+
+    assert "Downloaded: dl1_receipt.txt (46 B)" in result.content, result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block", ["complete_on_download", "download_timeout_only"])
+async def test_a_download_stored_only_in_the_browser_session_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block: str
+) -> None:
+    earlier = "s3://bucket/o_1/pbs_1/earlier.pdf"
+    listings = [[earlier], [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"]]
+    listing = AsyncMock(side_effect=lambda **_kwargs: listings.pop(0) if len(listings) > 1 else listings[0])
+    monkeypatch.setattr("skyvern.forge.taskv3.tools.app.STORAGE.list_downloaded_files_in_browser_session", listing)
+    page = _DownloadFakePage(tmp_path)
+
+    async def download_wait() -> None:
+        return None
+
+    # A download_timeout-only block waits on downloads but has no failure watch.
+    watch = DownloadFailureWatch(_fixed_page_provider(page)) if block == "complete_on_download" else None
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
+        result = await _tool(tools, "click").handler({"selector": "#dl"})
+    if watch is not None:
+        watch.close()
+
+    assert "Downloaded: statement.pdf (in the browser session's storage)" in result.content, result.content
+    assert "earlier.pdf" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_a_session_baseline_hides_old_files_and_absence_is_claimed_only_after_a_read_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    earlier = "s3://bucket/o_1/pbs_1/earlier.pdf"
+    listings: list[list[str] | Exception] = [
+        TimeoutError(),
+        [earlier],
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+        [earlier, "s3://bucket/o_1/pbs_1/statement.pdf"],
+    ]
+
+    async def listing(**_kwargs: str) -> list[str]:
+        item = listings.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def download_wait() -> None:
+        return None
+
+    monkeypatch.setattr("skyvern.forge.taskv3.tools.app.STORAGE.list_downloaded_files_in_browser_session", listing)
+    page = _DownloadFakePage(tmp_path)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_1", browser_session_id="pbs_1")):
+        first = await _tool(tools, "click").handler({"selector": "#go"})
+        second = await _tool(tools, "click").handler({"selector": "#dl"})
+        third = await _tool(tools, "click").handler({"selector": "#again"})
+    watch.close()
+
+    assert "earlier.pdf" not in first.content + second.content
+    # The first click's listing only set the baseline, so what is missing is unknown and nothing is said.
+    assert DOWNLOAD_NO_FILE_THIS_ACTION not in first.content and DOWNLOAD_NO_SESSION_FILE_YET not in first.content
+    assert "Downloaded: statement.pdf (in the browser session's storage)" in second.content, second.content
+    # A session's storage can get a file after the call returns, so its absence is stated as "yet".
+    assert DOWNLOAD_NO_SESSION_FILE_YET in third.content and DOWNLOAD_NO_FILE_THIS_ACTION not in third.content
+
+
 @pytest.mark.asyncio
 async def test_download_signal_reports_completed_download_then_is_absent(tmp_path: Path) -> None:
     page = _DownloadFakePage(tmp_path)
@@ -9045,6 +9338,29 @@ async def test_download_signal_lifecycle_started_then_completed_or_never(tmp_pat
     (tmp_path / ("export." + "f" * 32 + ".crdownload")).write_bytes(b"partial")
     r6 = await _tool(tools, "wait").handler({"time_ms": 1})
     assert "Download started: export (in progress — not yet complete)" in r6.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait_fails", [False, True])
+async def test_a_click_result_reports_the_download_its_wait_saw_finish(tmp_path: Path, wait_fails: bool) -> None:
+    temp_name = "report.pdf." + "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" + ".crdownload"
+    page = _DownloadFakePage(tmp_path)
+    page._click_writes = temp_name
+
+    async def download_wait() -> None:
+        if wait_fails:
+            raise RuntimeError("download wait broke")
+        if (tmp_path / temp_name).exists():
+            (tmp_path / temp_name).rename(tmp_path / "report.pdf")
+
+    tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_wait=download_wait)
+    await _prime(tools)
+    result = await _tool(tools, "click").handler({"selector": "#dl"})
+
+    if wait_fails:
+        assert "Download started: report.pdf (in progress — not yet complete)" in result.content
+    else:
+        assert "Downloaded: report.pdf" in result.content and "Download started" not in result.content
 
 
 @pytest.mark.asyncio
@@ -9185,6 +9501,241 @@ async def test_download_signal_survives_compaction_end_to_end_through_loop(tmp_p
     elided = [m for m in observe_msgs if m["content"].startswith("[superseded ")]
     assert len(elided) >= 1  # compaction actually ran on an earlier observe
     assert any("Downloaded: report.pdf" in m["content"] for m in observe_msgs)  # notice survives on a live message
+
+
+_SIGNED_EXPORT_URL = (
+    "https://files.example.test/exports/tok-9f8e7d6c5b4a3f2e/report.csv"
+    "?X-Amz-Signature=3f9a1c7e5b2d8f4a6c0e9b1d3f5a7c9e&X-Amz-Expires=300"
+)
+_EXPORT_PAGE = f"""<!doctype html><html><body>
+<button id="export" type="button" onclick="fetch('/api/export', {{method: 'POST'}}).catch(() => {{}})">Export</button>
+<button id="burst" type="button" onclick="['a', 'b', 'c', 'd'].forEach((p) => fetch('/api/' + p).catch(() => {{}}))">Burst</button>
+<a id="report" href="/report">Report</a>
+<a id="download" href="/download">Download</a>
+<a id="signed" href="{_SIGNED_EXPORT_URL}">Signed report</a>
+<a id="wrapped" href="/report?src={_SIGNED_EXPORT_URL}">Wrapped report</a>
+<button id="hang" type="button" onclick="fetch('/api/hang').catch(() => {{}})">Hang</button>
+<button id="noop" type="button">Noop</button>
+<ul id="rows"></ul>
+</body></html>"""
+
+
+async def _serve_export(route: Route) -> None:
+    path = urlparse(route.request.url).path
+    if path == "/":
+        await route.fulfill(status=200, content_type="text/html", body=_EXPORT_PAGE)
+        return
+    if path == "/download":
+        await route.fulfill(
+            status=200, headers={"content-disposition": "attachment; filename=report.csv"}, body="a,b\n"
+        )
+        return
+    if path == "/api/export":
+        # Answers well after the click's own handler returns.
+        await asyncio.sleep(1.2)
+    await route.fulfill(status=503, body="unavailable")
+
+
+@contextlib.asynccontextmanager
+async def _export_page() -> AsyncIterator[Page]:
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        await context.route("**/*", _serve_export)
+        page = await context.new_page()
+        await page.goto("http://app.example.test/")
+        yield page
+
+
+def _failure_tail(result: ToolResult) -> str:
+    return result.content[(result.data or {})["download_failure_at"] :]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["click", "press_key"])
+async def test_a_download_action_whose_request_fails_late_reports_the_status(tmp_path: Path, action: str) -> None:
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        if action == "press_key":
+            await page.focus("#export")
+            result = await _tool(tools, "press_key").handler({"key": "Enter"})
+        else:
+            result = await _tool(tools, "click").handler({"selector": "#export"})
+        watch.close()
+
+    tail = _failure_tail(result)
+    assert "Request failed: POST /api/export returned HTTP 503" in tail, result.content
+    assert tail.endswith(DOWNLOAD_NO_FILE_THIS_ACTION), tail
+    assert not (result.data or {}).get("download_notice") and not (result.data or {}).get("download_new")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", ["report", "signed", "wrapped"])
+async def test_a_link_click_to_a_failing_document_reports_only_its_path(tmp_path: Path, link: str) -> None:
+    refs = mask_opaque_urls({"export": _SIGNED_EXPORT_URL})
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page), refs)
+        tools = build_browser_tools(
+            _fixed_page_provider(page), downloads_dir=str(tmp_path), opaque_refs=refs, download_failures=watch
+        )
+        result = await _tool(tools, "click").handler({"selector": f"#{link}"})
+        watch.close()
+
+    tail = _failure_tail(result)
+    if link == "signed":
+        assert f"Request failed: GET {refs.mask(_SIGNED_EXPORT_URL)} returned HTTP 503" in tail, result.content
+    else:
+        assert "Request failed: GET /report returned HTTP 503" in tail, result.content
+    assert "tok-9f8e7d6c5b4a3f2e" not in tail and "example.test" not in tail and "src=" not in tail
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_healthy_download_link_reports_no_failure(tmp_path: Path) -> None:
+    # The browser aborts a navigation it turns into a download after the response arrived.
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        result = await _tool(tools, "click").handler({"selector": "#download"})
+        await _tool(tools, "wait").handler({"time_ms": 500})
+        watch.close()
+
+    assert "Request failed" not in result.content, result.content
+    assert watch.facts.delivered == set()
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_failures_are_reported_past_a_full_file_notice_and_capped(tmp_path: Path) -> None:
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        await _prime(tools)
+        for i in range(6):
+            (tmp_path / f"part{i}.csv").write_text("a,b\n")
+        result = await _tool(tools, "click").handler({"selector": "#burst"})
+        watch.close()
+
+    assert "+1 more files downloaded" in result.content
+    tail = _failure_tail(result)
+    assert tail.count("Request failed: GET /api/") == 3 and "+1 more failures" in tail, tail
+    assert (result.data or {}).get("download_new") is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_failure_between_calls_reaches_the_next_read_without_changing_its_digest(tmp_path: Path) -> None:
+    async with _export_page() as page:
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        observe = _tool(tools, "observe")
+        await observe.handler({})
+        await page.evaluate(
+            "async () => { const li = document.createElement('li'); li.textContent = 'Export queued';"
+            " document.getElementById('rows').appendChild(li); await fetch('/api/poll'); }"
+        )
+        with_failure = await observe.handler({})
+        without_failure = await observe.handler({})
+        watch.close()
+
+    assert _delta_lines(with_failure) == ["Export queued"], with_failure.content
+    assert "Request failed: GET /api/poll returned HTTP 503" in _failure_tail(with_failure)
+    assert "download_failure_at" not in (without_failure.data or {})
+
+    def digest(r: ToolResult) -> str:
+        data = r.data or {}
+        return taskv3_loop._canonical_perception_content(
+            taskv3_loop.perception_digest_source(r.content, data.get("download_failure_at")),
+            is_observe=True,
+            clip_spans=data.get("clip_spans"),
+            delta_at=data.get("delta_at"),
+            delta_end=data.get("delta_end"),
+        )
+
+    assert digest(with_failure) == digest(without_failure)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_click_does_not_wait_on_a_request_an_earlier_click_started(tmp_path: Path) -> None:
+    release = asyncio.Event()
+
+    async def hang(route: Route) -> None:
+        await release.wait()
+        await route.fulfill(status=503, body="unavailable")
+
+    async with _export_page() as page:
+        await page.context.route("**/api/hang", hang)
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        click = _tool(tools, "click")
+        await click.handler({"selector": "#hang"})
+        started = time.monotonic()
+        await click.handler({"selector": "#noop"})
+        elapsed = time.monotonic() - started
+        release.set()
+        late = await _tool(tools, "wait").handler({"time_ms": 300})
+        watch.close()
+
+    assert elapsed < 2.0, elapsed
+    assert "Request failed: GET /api/hang returned HTTP 503" in _failure_tail(late), late.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_browser_download_the_interceptor_could_not_save_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    egress = MagicMock()
+    egress.authorize_request.return_value = True
+    interceptor = CDPDownloadInterceptor(network_egress_monitor=egress, redirect_hop_authorizer=AsyncMock())
+    async with _export_page() as page:
+        page.context._skyvern_cdp_download_interceptor = interceptor
+        watch = DownloadFailureWatch(_fixed_page_provider(page))
+        tools = build_browser_tools(_fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch)
+        await _prime(tools)
+        monkeypatch.setattr(cdp_download_interceptor, "MAX_DOWNLOAD_FILES_PER_RUN", 0)
+        assert interceptor._new_download_attempt() is None
+        result = await _tool(tools, "wait").handler({"time_ms": 1})
+        watch.close()
+
+    assert "Browser download not saved (file_count_limit): 1" in _failure_tail(result), result.content
+
+
+@pytest.mark.asyncio
+async def test_the_failure_watch_waits_only_on_its_own_call_and_reports_only_the_path() -> None:
+    refs = mask_opaque_urls({"export": _SIGNED_EXPORT_URL})
+    watch = DownloadFailureWatch(_fixed_page_provider(_FakePage()), refs)
+    on = watch._hooks
+    first = await watch.begin()
+    on["request"](_FakeRequest(method="GET", resource_type="fetch", url="https://app.example.test/api/hang"))
+    assert await watch.settle(first, wait=False) == []
+
+    second = await watch.begin()
+    export = _FakeRequest(resource_type="fetch", url="https://app.example.test/api/export?mode=fail")
+    signed = _FakeRequest(method="GET", resource_type="document", url=_SIGNED_EXPORT_URL)
+    saved = _FakeRequest(method="GET", resource_type="document", url="https://app.example.test/download")
+    for request, status in ((export, 503), (signed, 503), (saved, 200)):
+        on["request"](request)
+        on["response"](SimpleNamespace(request=request, status=status))
+    saved.failure = "net::ERR_ABORTED"
+    on["requestfailed"](saved)
+    facts = await asyncio.wait_for(watch.settle(second, wait=True), timeout=1.0)
+
+    assert facts == [
+        "Request failed: POST /api/export returned HTTP 503",
+        f"Request failed: GET {refs.mask(_SIGNED_EXPORT_URL)} returned HTTP 503",
+    ]
+
+    poll = _FakeRequest(method="GET", resource_type="fetch", url="https://app.example.test/api/poll")
+    reports: list[list[str]] = []
+    for _ in range(2):
+        on["request"](poll)
+        on["response"](SimpleNamespace(request=poll, status=503))
+        on["requestfinished"](poll)
+        reports.append(await watch.settle(await watch.begin(), wait=True))
+    assert reports == [["Request failed: GET /api/poll returned HTTP 503"], []]
 
 
 @pytest.mark.asyncio
@@ -12026,6 +12577,852 @@ async def test_observe_lists_every_unnamed_icon_control_and_its_ref_clicks_it() 
         assert await page.evaluate("() => window.__deleted") == [str(last)]
 
 
+# A "more actions" kebab drawn without a graphic element: a font ligature in a ::before, a background
+# image, and three styled dots. None holds an svg/img/canvas and none carries a name, so the icon rule
+# is the only thing that can list them -- and a reading that requires a graphic drops all three while
+# listing the row's link, which is the neighbour the model then clicks instead.
+_CSS_KEBAB_HTML = (
+    "<!doctype html><html><head><style>"
+    ".kebab{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    ".kebab.glyph::before{content:'\\22EE';font-size:18px}"
+    ".kebab.bg{background-image:url('data:image/gif;base64,"
+    "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7');background-repeat:no-repeat}"
+    ".kebab.dots span{cursor:pointer;display:block;width:4px;height:4px;border-radius:50%;background:#333;margin:2px auto}"
+    ".curtain{cursor:pointer;width:320px;height:220px;background:#ddd}"
+    ".curtain span{display:inline-block;width:2px;height:2px}"
+    ".too-small{cursor:pointer;width:4px;height:4px;background:#333}"
+    ".blank-icon{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    "</style></head><body><table>"
+    # One tag for all three, as a real table repeats: the lines are identical but for the row they sit
+    # in, so this exercises the row qualifier the listing needs to tell them apart as well.
+    '<tr><td><a href="/b/1">Bill 1</a></td><td><div class="kebab glyph"></div></td></tr>'
+    '<tr><td><a href="/b/2">Bill 2</a></td><td><div class="kebab bg"></div></td></tr>'
+    '<tr><td><a href="/b/3">Bill 3</a></td><td><div class="kebab dots">'
+    "<span></span><span></span><span></span></div></td></tr>"
+    "</table>"
+    # Unnamed, clickable, and far bigger than a glyph: its centre need not be on any control, so it
+    # stays unlisted and is counted instead.
+    '<div>Large curtain <div id="curtain" class="curtain"><span></span><span></span><span></span></div></div>'
+    '<div>Tiny target <div id="too-small" class="too-small"></div></div>'
+    '<div>Blank target <div id="blank" class="blank-icon"></div></div>'
+    "<script>window.__opened = [];document.addEventListener('click', (e) => {"
+    " const k = e.target.closest('.kebab');"
+    " if (k) window.__opened.push(k.closest('tr').querySelector('a').textContent); });</script>"
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_an_icon_control_however_the_page_draws_its_glyph() -> None:
+    async with _live_page(_CSS_KEBAB_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok"
+        lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        # One unnamed icon line per row, each told apart by the row it sits in.
+        icons = [line for line in lines if " '' in='Bill " in line]
+        assert len(icons) == 3, r.content
+        assert r.data["summary"]["icons_listed"] == 3, r.data["summary"]
+        assert r.data["summary"]["duplicate_digest_lines"] == 0, r.data["summary"]
+        # The inked curtain fails only the 48px ceiling, the inkless 24px box fails only ink, and
+        # the 4px inked control fails only the 6px floor. Nested layout spans count as one rejected root.
+        assert r.data["summary"]["unnamed_not_icon"] == 3, r.data["summary"]
+        listed = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert not any("in='Large curtain'" in line for line in listed), r.content
+        assert not any("in='Tiny target'" in line for line in listed), r.content
+        assert not any("in='Blank target'" in line for line in listed), r.content
+        # The ref opens the row's own menu, not the link beside it.
+        third = next(line for line in icons if "in='Bill 3'" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(third, "div ''")})
+        assert click.status == "ok", click.content
+        assert await page.evaluate("() => window.__opened") == ["Bill 3"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_nested_css_action_in_a_clickable_row() -> None:
+    html = """<!doctype html><html><head><style>
+      .row {
+        cursor: pointer;
+        .action {
+          cursor: pointer;
+          display: inline-block;
+          width: 24px;
+          height: 24px;
+          background: #333;
+        }
+      }
+      .outside { cursor:pointer; width:120px; height:40px }
+      .outside .action { display:inline-block; width:24px; height:24px; background:#333 }
+    </style></head><body>
+      <div class="row"><a href="#invoice">Invoice 9</a><div class="action" id="inside"></div></div>
+      <div class="outside"><a href="#other">Other</a><div class="action" id="outside"></div></div>
+      <script>
+        document.getElementById('inside').addEventListener('click', () => window.__clicked = 'inside');
+        document.getElementById('outside').addEventListener('click', () => window.__clicked = 'outside');
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        assert result.status == "ok", result.content
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        icon = next(line for line in lines if "div ''" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(icon, "div ''")})
+        clicked = await page.evaluate("() => window.__clicked")
+
+    assert sum("div ''" in line for line in result.content.splitlines()) == 1, result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert not any("id='outside'" in line for line in lines), result.content
+    assert click.status == "ok", click.content
+    assert clicked == "inside"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_nested_selector_list_scopes_each_pointer_rule_branch() -> None:
+    html = """<!doctype html><html><head><style>
+      .row {
+        display:flex; cursor:pointer; width:300px; height:36px; align-items:center;
+        &.selected, .action { cursor:pointer; }
+      }
+      .other-row { display:flex; cursor:pointer; width:300px; height:36px; align-items:center }
+      .action { display:inline-block; width:22px; height:20px; background:#333 }
+    </style></head><body>
+      <div class="row selected"><input type="checkbox"><a href="#selected">Selected</a>
+        <span id="real-action" class="action" onclick="window.__realAction=true"></span></div>
+      <div class="other-row"><input type="checkbox"><a href="#other">Other</a>
+        <span id="decorative-action" class="action"></span></div>
+      <script>window.__realAction=false;</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        # Expose the raw implicit branch form that some CSSOMs return for nested selector lists.
+        patched = await page.evaluate(
+            """() => {
+              const descriptor = Object.getOwnPropertyDescriptor(CSSStyleRule.prototype, 'selectorText');
+              if (!descriptor?.get || !descriptor.configurable) return false;
+              Object.defineProperty(CSSStyleRule.prototype, 'selectorText', {
+                configurable: true,
+                get() {
+                  const selector = descriptor.get.call(this);
+                  return selector === '&.selected, & .action' ? '&.selected, .action' : selector;
+                },
+              });
+              return true;
+            }"""
+        )
+        cursors = await page.evaluate(
+            "() => ['real-action','decorative-action'].map(id => getComputedStyle(document.getElementById(id)).cursor)"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        action_lines = [line for line in result.content.splitlines() if line.startswith("ref=") and "span ''" in line]
+        assert result.status == "ok", result.content
+        assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+        assert len(action_lines) == 1, result.content
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action_lines[0], "span ''")})
+        clicked = await page.evaluate("() => window.__realAction")
+
+    assert patched, "could not expose the unexpanded nested selector text to the collector"
+    assert cursors == ["pointer", "pointer"], cursors
+    assert click.status == "ok" and clicked is True, (click.content, clicked)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_cursor_action_from_imported_stylesheet() -> None:
+    html = """<!doctype html><html><head><style>
+      .row { cursor:pointer; width:200px; height:40px }
+      .action { display:inline-block; width:24px; height:24px; background:#333 }
+    </style></head><body>
+      <div class="row"><a href="#invoice">Invoice 9</a><div class="action"></div></div>
+      <script>
+        const css = new Blob(['.row .action { cursor:pointer }'], {type:'text/css'});
+        const url = URL.createObjectURL(css);
+        const imported = document.createElement('style');
+        imported.id = 'imported-style';
+        imported.textContent = `@import url("${url}");`;
+        document.head.append(imported);
+        document.querySelector('.action').addEventListener('click', () => window.__clicked = true);
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        await page.wait_for_function(
+            """() => {
+              const rule = document.querySelector('#imported-style').sheet.cssRules[0];
+              return rule.styleSheet?.cssRules?.length === 1
+                && getComputedStyle(document.querySelector('.action')).cursor === 'pointer';
+            }"""
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        icon = next(line for line in lines if "div ''" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(icon, "div ''")})
+        clicked = await page.evaluate("() => window.__clicked")
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert click.status == "ok", click.content
+    assert clicked
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_painted_wrapper_with_multiple_graphics_is_not_an_icon() -> None:
+    html = """<!doctype html><html><head><style>
+      .wrapper { cursor:pointer; display:inline-flex; width:24px; height:24px; background:#333 }
+      svg { width:8px; height:8px }
+    </style></head><body>
+      <div class="wrapper"><svg id="first"><rect width="8" height="8"></rect></svg>
+        <svg id="second"><rect width="8" height="8"></rect></svg></div>
+      <script>
+        window.__hits = [];
+        for (const id of ['first', 'second']) {
+          document.getElementById(id).addEventListener('click', () => window.__hits.push(id));
+        }
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        graphics = [line for line in lines if " svg ''" in line]
+        clicks = [await _tool(tools, "click").handler({"selector": _ref_line(line, "svg ''")}) for line in graphics]
+        hits = await page.evaluate("() => window.__hits")
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 2, result.data["summary"]
+    assert len(graphics) == 2, result.content
+    assert all(click.status == "ok" for click in clicks), [click.content for click in clicks]
+    assert sorted(hits) == ["first", "second"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_ignores_cursor_rules_under_inactive_conditions() -> None:
+    html = """<!doctype html><html><head><style>
+      .container { container-type:inline-size; width:100px }
+      .row { cursor:pointer }
+      .row .paint { display:inline-block; width:24px; height:24px; background:#333 }
+      @supports (display: unsupported-value) {
+        .row { .unsupported { cursor:pointer } }
+      }
+      @container (min-width: 800px) {
+        .row { .container-inactive { cursor:pointer } }
+      }
+      @media screen {
+        .row { .media-active { cursor:pointer } }
+      }
+    </style></head><body>
+      <div class="container"><div class="row">
+        <a href="#invoice">Invoice 9</a>
+        <div class="paint unsupported"></div>
+        <div class="paint container-inactive"></div>
+        <div class="paint media-active" id="media-active"></div>
+      </div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_unnamed_pointer_miss_dedup_stops_at_cursor_default() -> None:
+    html = """<!doctype html><html><head><style>
+      #outer, #inner { cursor:pointer; display:block; width:64px; height:64px; background:#333 }
+      #boundary { cursor:default; width:80px; height:80px }
+    </style></head><body>
+      <div id="outer"><div id="boundary"><div id="inner"></div></div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["unnamed_not_icon"] == 2, result.data["summary"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_does_not_list_a_slot_wrapper_for_its_light_dom_control() -> None:
+    html = """<!doctype html><html><body>
+      <x-action><button slot="action">Save</button></x-action>
+      <script>
+        customElements.define('x-action', class extends HTMLElement {
+          constructor() {
+            super();
+            this.attachShadow({mode: 'open'}).innerHTML =
+              '<div style="cursor:pointer"><slot name="action"></slot></div>';
+          }
+        });
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    save_lines = [line for line in result.content.splitlines() if line.startswith("ref=") and "'Save'" in line]
+    assert len(save_lines) == 1, result.content
+    assert "button/submit 'Save'" in save_lines[0], result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_uses_native_treewalker_when_document_name_shadows_it() -> None:
+    html = """<!doctype html><html><body>
+      <div style="cursor:pointer">Invoice 9</div>
+      <img name="createTreeWalker" src="data:,">
+    </body></html>"""
+    async with _live_page(html) as page:
+        assert await page.evaluate("() => document.createTreeWalker.tagName") == "IMG"
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert any("div 'Invoice 9'" in line for line in result.content.splitlines()), result.content
+
+
+_CSS_ICON_PAINT_HTML = (
+    "<!doctype html><html><head><style>"
+    ".icon{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    "#border-top{border-top:2px solid rgb(30,60,90)}"
+    "#border-right{border-right:2px solid rgb(30,60,90)}"
+    "#border-bottom{border-bottom:2px solid rgb(30,60,90)}"
+    "#border-left{border-left:2px solid rgb(30,60,90)}"
+    "#outline{outline:2px solid rgb(30,60,90)}"
+    "#shadow{box-shadow:0 0 3px 1px rgb(30,60,90)}"
+    "#gradient{background-image:linear-gradient(rgb(30,60,90),rgb(90,60,30))}"
+    "#pseudo::before{content:'\\22EE';color:rgb(30,60,90)}"
+    "#text-shadow-pseudo::before{content:'\\22EE';color:transparent;text-shadow:0 0 #333}"
+    "#empty-content-pseudo::before{content:'';display:block;width:8px;height:8px;background:#333}"
+    "#zero-area-pseudo::before{content:'';display:block;width:0;height:0;background:#333}"
+    "#whitespace-text-shadow-pseudo::before{content:' ';color:transparent;text-shadow:0 0 #333}"
+    "#transparent-border{border:2px solid rgba(0,0,0,0)}"
+    "#transparent-outline{outline:2px solid rgba(0,0,0,0)}"
+    "#transparent-shadow{box-shadow:0 0 0 0 rgba(0,0,0,0)}"
+    "#transparent-gradient{background-image:linear-gradient(transparent,transparent)}"
+    "#clip-hidden{background:#333;clip-path:inset(50%)}"
+    "#clip-circle-hidden{background:#333;clip-path:circle(0)}"
+    "#clip-ellipse-hidden{background:#333;clip-path:ellipse(0 50% at 50% 50%)}"
+    "#clip-polygon-hidden{background:#333;clip-path:polygon(0 0,100% 100%,50% 50%)}"
+    "#clip-polygon-visible{background:#333;clip-path:polygon(50% 0,100% 100%,0 100%)}"
+    ".child{display:inline-block;width:8px;height:8px;background:#f00}"
+    "#outside-descendant{position:relative}"
+    "#outside-descendant .child{position:absolute;left:32px;cursor:default}"
+    "#display-none .child{display:none}"
+    "#visibility-hidden .child{visibility:hidden}"
+    "#opacity-zero .child{opacity:0}"
+    "#transparent-pseudo::before{content:'\\22EE';color:transparent}"
+    "#hidden-pseudo::before{content:'\\22EE';visibility:hidden;color:#333}"
+    "#no-content-pseudo::before{content:normal;display:block;width:8px;height:8px;background:#333}"
+    "#whitespace-content-pseudo::before{content:' ';color:#333}"
+    "#clipped-pseudo::before{content:'';display:block;width:8px;height:8px;background:#333;clip-path:inset(50%)}"
+    "#zero-size-child .child{width:0;height:0}"
+    "</style></head><body>"
+    '<div>Paint border-top <div id="border-top" class="icon"></div></div>'
+    '<div>Paint border-right <div id="border-right" class="icon"></div></div>'
+    '<div>Paint border-bottom <div id="border-bottom" class="icon"></div></div>'
+    '<div>Paint border-left <div id="border-left" class="icon"></div></div>'
+    '<div>Paint outline <div id="outline" class="icon"></div></div>'
+    '<div>Paint shadow <div id="shadow" class="icon"></div></div>'
+    '<div>Paint gradient <div id="gradient" class="icon"></div></div>'
+    '<div>Paint pseudo <div id="pseudo" class="icon"></div></div>'
+    '<div>Paint text-shadow-pseudo <div id="text-shadow-pseudo" class="icon"></div></div>'
+    '<div>Paint empty-content-pseudo <div id="empty-content-pseudo" class="icon"></div></div>'
+    '<div>Paint zero-area-pseudo <div id="zero-area-pseudo" class="icon"></div></div>'
+    '<div>Paint whitespace-text-shadow-pseudo <div id="whitespace-text-shadow-pseudo" class="icon"></div></div>'
+    '<div>Paint transparent-border <div id="transparent-border" class="icon"></div></div>'
+    '<div>Paint transparent-outline <div id="transparent-outline" class="icon"></div></div>'
+    '<div>Paint transparent-shadow <div id="transparent-shadow" class="icon"></div></div>'
+    '<div>Paint transparent-gradient <div id="transparent-gradient" class="icon"></div></div>'
+    '<div>Paint clip-hidden <div id="clip-hidden" class="icon"></div></div>'
+    '<div>Paint clip-circle-hidden <div id="clip-circle-hidden" class="icon"></div></div>'
+    '<div>Paint clip-ellipse-hidden <div id="clip-ellipse-hidden" class="icon"></div></div>'
+    '<div>Paint clip-polygon-hidden <div id="clip-polygon-hidden" class="icon"></div></div>'
+    '<div>Paint clip-polygon-visible <div id="clip-polygon-visible" class="icon"></div></div>'
+    '<div>Paint outside-descendant <div id="outside-descendant" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint display-none <div id="display-none" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint visibility-hidden <div id="visibility-hidden" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint opacity-zero <div id="opacity-zero" class="icon"><span class="child"></span></div></div>'
+    '<div>Paint transparent-pseudo <div id="transparent-pseudo" class="icon"></div></div>'
+    '<div>Paint hidden-pseudo <div id="hidden-pseudo" class="icon"></div></div>'
+    '<div>Paint no-content-pseudo <div id="no-content-pseudo" class="icon"></div></div>'
+    '<div>Paint whitespace-content-pseudo <div id="whitespace-content-pseudo" class="icon"></div></div>'
+    '<div>Paint clipped-pseudo <div id="clipped-pseudo" class="icon"></div></div>'
+    '<div>Paint zero-size-child <div id="zero-size-child" class="icon"><span class="child"></span></div></div>'
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_requires_visible_ink() -> None:
+    async with _live_page(_CSS_ICON_PAINT_HTML) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    summary = result.data["summary"]
+    visible = {
+        "border-top",
+        "border-right",
+        "border-bottom",
+        "border-left",
+        "outline",
+        "shadow",
+        "gradient",
+        "pseudo",
+        "text-shadow-pseudo",
+        "empty-content-pseudo",
+        "clip-polygon-visible",
+    }
+    invisible = {
+        "transparent-border",
+        "transparent-outline",
+        "transparent-shadow",
+        "transparent-gradient",
+        "clip-hidden",
+        "clip-circle-hidden",
+        "clip-ellipse-hidden",
+        "clip-polygon-hidden",
+        "outside-descendant",
+        "display-none",
+        "visibility-hidden",
+        "opacity-zero",
+        "transparent-pseudo",
+        "zero-area-pseudo",
+        "hidden-pseudo",
+        "no-content-pseudo",
+        "whitespace-content-pseudo",
+        "whitespace-text-shadow-pseudo",
+        "clipped-pseudo",
+        "zero-size-child",
+    }
+    assert summary["icons_listed"] == len(visible), summary
+    lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+    assert all(any(f"id='{id}'" in line for line in lines) for id in visible), result.content
+    assert all(not any(f"id='{id}'" in line for line in lines) for id in invisible), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_covers_the_closed_paint_channel_set() -> None:
+    image = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='red'/%3E%3C/svg%3E"
+    html = f"""<!doctype html><html><head><style>
+      .channel {{ display:inline-block; cursor:pointer; width:24px; height:24px; margin:2px }}
+      #background-color {{ background-color:#333 }}
+      #background-image {{ background-image:linear-gradient(#333,#666) }}
+      #border {{ border:1px solid #333 }}
+      #outline {{ outline:1px solid #333 }}
+      #box-shadow {{ box-shadow:1px 1px 0 #333 }}
+      #before::before {{ content:'⋮'; color:#333; font-size:18px }}
+      #after::after {{ content:''; display:block; width:8px; height:8px; background:#333 }}
+      #text-glyph {{ color:#333; font-size:18px }}
+      #replaced {{ width:24px; height:24px }}
+    </style></head><body>
+      <span id="background-color" class="channel"></span>
+      <span id="background-image" class="channel"></span>
+      <span id="border" class="channel"></span>
+      <span id="outline" class="channel"></span>
+      <span id="box-shadow" class="channel"></span>
+      <span id="before" class="channel"></span>
+      <span id="after" class="channel"></span>
+      <span id="text-glyph" class="channel">⋮</span>
+      <img id="replaced" class="channel" alt="" src="{image}">
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+
+    assert result.status == "ok", result.content
+    names = (
+        "background-color",
+        "background-image",
+        "border",
+        "outline",
+        "box-shadow",
+        "before",
+        "after",
+    )
+    listed = [name for name in names if any(f"id='{name}'" in line for line in lines)]
+    assert result.data["summary"]["icons_listed"] == 8, result.data["summary"]
+    assert len(listed) == len(names), (result.content, listed)
+    assert len(lines) == 9 and any("span '⋮'" in line for line in lines), result.content
+    assert any("img ''" in line for line in lines), result.content
+
+
+@pytest.mark.usefixtures("expected_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_transparent_pointer_overlay_is_not_listed_or_clicked_as_an_icon() -> None:
+    html = """<!doctype html><html><head><style>
+      #pay, #overlay { position:absolute; left:0; top:0; width:40px; height:40px }
+      #overlay { cursor:pointer; border:2px solid transparent; z-index:1 }
+    </style></head><body>
+      <button id="pay">Pay</button>
+      <div id="overlay"></div>
+      <script>window.__clicks=[];document.addEventListener('click',e=>window.__clicks.push(e.target.id));</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        pay = next(line for line in lines if "button/submit 'Pay'" in line)
+        click = await _tool(tools, "click").handler({"selector": _ref_line(pay, "button/submit 'Pay'")})
+        clicks = await page.evaluate("() => window.__clicks")
+
+    assert result.status == "ok", result.content
+    assert not any("id='overlay'" in line for line in lines), result.content
+    assert click.status == "error", click.content
+    assert "covered by" in click.content, click.content
+    assert clicks == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_rejects_fully_clipped_ancestor() -> None:
+    html = """<!doctype html><html><head><style>
+      #pay, #clipper { position:absolute; left:0; top:0; width:24px; height:24px }
+      #clipper { clip-path:circle(0); z-index:1 }
+      #icon { cursor:pointer; width:24px; height:24px; background:#333 }
+    </style></head><body>
+      <button id="pay">Pay</button>
+      <div id="clipper"><div id="icon"></div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        facts = await page.evaluate(
+            "() => ({"
+            "clip:getComputedStyle(document.querySelector('#clipper')).clipPath,"
+            "visible:document.querySelector('#icon').checkVisibility(),"
+            "hit:document.elementFromPoint(12,12)?.id})"
+        )
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+
+    assert facts["clip"].startswith("circle(0"), facts
+    assert facts["visible"] is True, facts
+    assert facts["hit"] == "pay", facts
+    assert result.status == "ok", result.content
+    assert any("button/submit 'Pay'" in line for line in lines), result.content
+    assert not any("id='icon'" in line for line in lines), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_respects_clip_edges_and_hidden_scroll_reachability() -> None:
+    html = """<!doctype html><html><head><style>
+      #pay { position:absolute; left:0; top:0; width:300px; height:210px }
+      #clipper, #overflow-hidden, #overflow-clip, #overflow-margin, #overflow-scrollable, #overflow-unreachable {
+        position:absolute; left:0; width:100px; height:24px; z-index:1
+      }
+      #clipper { top:0; clip-path:inset(0 50% 0 0) }
+      #icon { position:absolute; left:70px; cursor:pointer; width:24px; height:24px; background:#333 }
+      #svg-icon { position:absolute; left:70px; top:0; cursor:pointer; width:24px; height:24px }
+      #overflow-hidden { top:30px; overflow:hidden }
+      #overflow-clip { top:60px; overflow:clip }
+      #overflow-margin { top:90px; overflow:clip; overflow-clip-margin:padding-box 30px }
+      #overflow-scrollable { top:120px; overflow:hidden }
+      #overflow-unreachable { top:150px; left:80px; overflow:hidden }
+      #hidden-icon, #clip-icon, #partial-clip-icon, #margin-icon, #scroll-icon, #unreachable-icon {
+        position:absolute; top:0; cursor:pointer; width:24px; height:24px; background:#333
+      }
+      #hidden-icon, #clip-icon, #margin-icon { left:110px }
+      #partial-clip-icon { left:90px }
+      #scroll-content, #unreachable-content { position:relative; width:220px; height:24px }
+      #scroll-icon { left:90px }
+      #unreachable-icon { left:-30px }
+    </style></head><body>
+      <button id="pay">Pay</button>
+      <div id="clipper"><div id="icon"></div><svg id="svg-icon" viewBox="0 0 24 24"><path fill="#333" d="M0 0h24v24H0z"/></svg></div>
+      <div id="overflow-hidden"><div id="hidden-icon"></div></div>
+      <div id="overflow-clip"><div id="clip-icon"></div><div id="partial-clip-icon"></div></div>
+      <div id="overflow-margin"><div id="margin-icon"></div></div>
+      <div id="overflow-scrollable"><div id="scroll-content"><div id="scroll-icon"></div></div></div>
+      <div id="overflow-unreachable"><div id="unreachable-content"><div id="unreachable-icon"></div></div></div>
+    </body></html>"""
+    async with _live_page(html) as page:
+        facts = await page.evaluate(
+            "() => ({clip:getComputedStyle(document.querySelector('#clipper')).clipPath,"
+            "clipMargin:getComputedStyle(document.querySelector('#overflow-margin')).overflowClipMargin,"
+            "scroll:[document.querySelector('#overflow-scrollable').scrollWidth,"
+            "document.querySelector('#overflow-scrollable').clientWidth],"
+            "unreachable:[document.querySelector('#overflow-unreachable').scrollWidth,"
+            "document.querySelector('#overflow-unreachable').clientWidth],"
+            "hits:[document.elementFromPoint(82,12)?.id,document.elementFromPoint(122,42)?.id,"
+            "document.elementFromPoint(122,72)?.id,document.elementFromPoint(102,72)?.id,"
+            "document.elementFromPoint(122,102)?.id,document.elementFromPoint(102,132)?.id,"
+            "document.elementFromPoint(62,162)?.id]})"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+
+    assert facts["clip"].startswith("inset("), facts
+    assert facts["clipMargin"] == "30px", facts
+    assert facts["scroll"][0] > facts["scroll"][1], facts
+    assert facts["unreachable"][0] > facts["unreachable"][1], facts
+    assert facts["hits"] == ["pay", "pay", "pay", "pay", "margin-icon", "pay", "pay"], facts
+    assert result.status == "ok", result.content
+    assert any("button/submit 'Pay'" in line for line in lines), result.content
+    assert not any("id='icon'" in line for line in lines), result.content
+    assert not any("id='svg-icon'" in line for line in lines), result.content
+    assert not any("id='clip-icon'" in line for line in lines), result.content
+    assert not any("id='partial-clip-icon'" in line for line in lines), result.content
+    assert not any("id='unreachable-icon'" in line for line in lines), result.content
+    assert any("id='hidden-icon'" in line for line in lines), result.content
+    assert any("id='margin-icon'" in line for line in lines), result.content
+    assert any("id='scroll-icon'" in line for line in lines), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_detection_rejects_zero_opacity_filters() -> None:
+    html = """<!doctype html><html><head><style>
+      .target { cursor:pointer; display:inline-block; width:24px; height:24px; background:#333 }
+      #filtered-child span { filter:opacity(0); background:#333; display:inline-block; width:8px; height:8px }
+      #filtered-pseudo::before { content:'\\22EE'; filter:opacity(0); background:#333 }
+      #hidden-ancestor { filter:opacity(0) }
+    </style></head><body>
+      <div id="filtered-target" class="target" style="filter:opacity(0)"></div>
+      <div id="filtered-child" class="target" style="background:none"><span></span></div>
+      <div id="filtered-pseudo" class="target" style="background:none"></div>
+      <div id="hidden-ancestor"><div id="filtered-descendant" class="target"></div></div>
+      <x-hidden><div id="filtered-slotted" slot="target" class="target"></div></x-hidden>
+      <script>
+        customElements.define('x-hidden', class extends HTMLElement {
+          constructor() {
+            super();
+            this.attachShadow({mode:'open'}).innerHTML =
+              '<div style="filter:opacity(0)"><slot name="target"></slot></div>';
+          }
+        });
+      </script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+    assert result.data["summary"]["icons_listed"] == 0, result.data["summary"]
+    assert not any(
+        f"id='{id}'" in line
+        for line in lines
+        for id in ("filtered-target", "filtered-child", "filtered-pseudo", "filtered-descendant", "filtered-slotted")
+    ), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_nested_pointer_scan_work_is_bounded() -> None:
+    count = 200
+    html = (
+        "<!doctype html><html><head><style>"
+        ".pointer{cursor:pointer;display:block;width:24px;height:24px}"
+        "</style></head><body>" + '<div class="pointer">' * count + "</div>" * count + "</body></html>"
+    )
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        started = time.monotonic()
+        result = await _tool(tools, "observe").handler({})
+        elapsed = time.monotonic() - started
+
+    assert result.status == "ok", result.content
+    assert elapsed < 5, f"nested pointer scan took {elapsed:.2f}s"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_nested_pointer_scan_caches_each_descendants_pseudo_ink_result() -> None:
+    count = 12
+    html = (
+        "<!doctype html><html><head><style>"
+        ".pointer{cursor:pointer;display:block;width:24px;height:24px}"
+        "#ink::before{content:'\\22EE';color:transparent}"
+        "</style></head><body>"
+        + '<div class="pointer">' * count
+        + '<span id="ink"></span>'
+        + "</div>" * count
+        + "</body></html>"
+    )
+    async with _live_page(html) as page:
+        await page.evaluate(
+            """() => {
+              const native = window.getComputedStyle;
+              window.__inkPseudoReads = 0;
+              window.getComputedStyle = function (element, pseudo) {
+                if (element.id === 'ink' && pseudo === '::before') window.__inkPseudoReads++;
+                return native.call(window, element, pseudo);
+              };
+            }"""
+        )
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        reads = await page.evaluate("() => window.__inkPseudoReads")
+
+    assert result.status == "ok", result.content
+    assert reads == 1, f"descendant pseudo ink was recomputed {reads} times"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_icon_budget_overflow_is_not_reported_as_an_ink_miss() -> None:
+    icons = "".join(f'<span id="icon-{i}" class="icon"></span>' for i in range(400))
+    icons += "<span id=icon-400 class=icon><svg width=24 height=24><rect width=24 height=24></rect></svg></span>"
+    html = (
+        "<!doctype html><html><head><style>"
+        ".icon{cursor:pointer;display:inline-block;width:24px;height:24px;background:#333}"
+        "</style></head><body>" + icons + "</body></html>"
+    )
+    async with _live_page(html) as page:
+        result = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 250, result.data["summary"]
+    assert result.data["summary"]["unnamed_not_icon"] == 0, result.data["summary"]
+    assert result.data["summary"]["icons_truncated"] == 151, result.data["summary"]
+
+
+_ROW_CSS_ACTIONS_HTML = (
+    "<!doctype html><html><head><style>"
+    ".row{display:flex;cursor:pointer;width:300px;height:36px;align-items:center}"
+    ".status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#e33}"
+    ".actions{display:inline-flex;cursor:pointer;width:44px;height:20px}"
+    ".action{display:inline-block;cursor:pointer;width:22px;height:20px}"
+    ".action::before{color:#333;font-size:12px}"
+    ".copy::before{content:'C'}.delete::before{content:'D'}"
+    "</style></head><body>"
+    '<div class="row"><input type="checkbox"><span id="status-dot" class="status-dot"></span>'
+    '<span>Invoice</span><div id="actions" class="actions">'
+    '<span id="copy-action" class="action copy"></span>'
+    '<span id="delete-action" class="action delete"></span></div></div>'
+    "<script>window.__actions=[];document.addEventListener('click',e=>{"
+    "const a=e.target.closest('.action');if(a)window.__actions.push(a.id);});</script>"
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icons_in_clickable_rows_skip_decorations_and_keep_separate_actions() -> None:
+    async with _live_page(_ROW_CSS_ACTIONS_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        assert result.status == "ok", result.content
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        action_lines = [line for line in lines if "id='copy-action'" in line or "id='delete-action'" in line]
+
+        assert result.data["summary"]["icons_listed"] == 2, (result.data["summary"], result.content)
+        assert len(action_lines) == 2, result.content
+        assert not any("id='actions'" in line or "id='status-dot'" in line for line in lines), result.content
+        for line in action_lines:
+            click = await _tool(tools, "click").handler({"selector": _ref_line(line, "span ''")})
+            assert click.status == "ok", click.content
+        actions = await page.evaluate("() => window.__actions")
+
+    assert actions == ["copy-action", "delete-action"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_cursor_uses_the_winning_declaration() -> None:
+    html = """<!doctype html><html><head><style>
+      .row { display:flex; cursor:pointer; width:300px; height:36px; align-items:center }
+      .action { display:inline-block; cursor:pointer; width:22px; height:20px; background:#333 }
+      #real-action { cursor:pointer }
+      .row .action { cursor:inherit }
+    </style></head><body>
+      <div class="row"><input type="checkbox"><span>Invoice</span>
+        <span id="decorative-action" class="action"></span>
+        <span id="real-action" class="action"></span>
+      </div>
+      <script>window.__action=false;document.addEventListener('click',e=>{
+        if(e.target.id==='real-action')window.__action=true;
+      });</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        assert await page.locator("#decorative-action").evaluate("el => getComputedStyle(el).cursor") == "pointer"
+        assert await page.locator("#real-action").evaluate("el => getComputedStyle(el).cursor") == "pointer"
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        lines = [line for line in result.content.splitlines() if line.startswith("ref=")]
+        action_lines = [line for line in lines if "span ''" in line]
+        assert len(action_lines) == 1, result.content
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action_lines[0], "span ''")})
+        action = await page.evaluate("() => window.__action")
+
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert click.status == "ok", click.content
+    assert action is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_css_icon_cursor_fails_closed_for_layer_and_scope_rules() -> None:
+    html = """<!doctype html><html><head><style>
+      @layer early { #row .layered { cursor:pointer } }
+      @layer late { .row .layered { cursor:inherit } }
+      @scope (#outside) { .scoped { cursor:pointer } }
+      .row { display:flex; cursor:pointer; width:300px; height:36px; align-items:center }
+      .action { display:inline-block; width:22px; height:20px; background:#333 }
+    </style></head><body>
+      <div id="outside"></div>
+      <div id="row" class="row">
+        <input type="checkbox"><a href="/invoice">Invoice</a>
+        <span id="layered" class="action layered"></span>
+        <span id="scoped" class="action scoped"></span>
+        <span id="real-action" class="action layered scoped" style="cursor:pointer" onclick="window.__realAction=true"></span>
+      </div>
+      <script>window.__realAction=false;</script>
+    </body></html>"""
+    async with _live_page(html) as page:
+        cursors = await page.evaluate(
+            "() => ['layered','scoped','real-action'].map(id => getComputedStyle(document.getElementById(id)).cursor)"
+        )
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        action_lines = [line for line in result.content.splitlines() if line.startswith("ref=") and "span ''" in line]
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action_lines[0], "span ''")})
+        clicked = await page.evaluate("() => window.__realAction")
+
+    assert cursors == ["pointer", "pointer", "pointer"], cursors
+    assert result.status == "ok", result.content
+    assert result.data["summary"]["icons_listed"] == 1, result.data["summary"]
+    assert len(action_lines) == 1, result.content
+    assert click.status == "ok" and clicked is True, (click.content, clicked)
+
+
+_SHADOW_ROW_CSS_ACTION_HTML = (
+    "<!doctype html><html><body>"
+    '<div class="row" style="display:flex;cursor:pointer;width:300px;height:36px;align-items:center">'
+    '<a href="/invoice">Invoice</a><x-menu></x-menu></div>'
+    "<script>window.__shadowAction=false;customElements.define('x-menu',class extends HTMLElement{"
+    "constructor(){super();const root=this.attachShadow({mode:'open'});"
+    "root.innerHTML='<style>.action{cursor:pointer;display:inline-block;width:24px;height:24px}"
+    '.action::before{content:"⋮";color:#333}</style><span id="shadow-action" class="action"></span>\';'
+    "root.getElementById('shadow-action').addEventListener('click',()=>window.__shadowAction=true);}});</script>"
+    "</body></html>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_shadow_root_stylesheet_cursor_keeps_css_action_in_clickable_row() -> None:
+    async with _live_page(_SHADOW_ROW_CSS_ACTION_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "observe").handler({})
+        assert result.status == "ok", result.content
+        actions = [line for line in result.content.splitlines() if line.startswith("ref=") and " span ''" in line]
+        assert len(actions) == 1, result.content
+        action = actions[0]
+        click = await _tool(tools, "click").handler({"selector": _ref_line(action, "span ''")})
+        hit = await page.evaluate("() => window.__shadowAction")
+
+    assert click.status == "ok", click.content
+    assert hit is True
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_labels_an_icon_by_its_graphic_without_spending_a_named_root_slot() -> None:
@@ -12984,7 +14381,14 @@ async def _code_with_no_resolver(page: Any, mp: pytest.MonkeyPatch) -> tuple[lis
 
 
 async def _code_with_no_secret(page: Any, mp: pytest.MonkeyPatch) -> tuple[list[Any], str, dict[str, Any]]:
-    task = SimpleNamespace(task_id="tsk_otp", organization_id="o_1", workflow_run_id=None)
+    task = SimpleNamespace(
+        task_id="tsk_otp",
+        organization_id="o_1",
+        workflow_run_id=None,
+        totp_verification_url=None,
+        totp_identifier=None,
+        navigation_payload=None,
+    )
     tools = build_browser_tools(
         _fixed_page_provider(page),
         resolve_typed_text=lambda text: "BW_TOTP",
@@ -13491,10 +14895,9 @@ class _AliasTypeaheadPage(_FakeAliasPage):
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_reports_a_control_past_the_anchoring_depth_as_our_budget() -> None:
+async def test_a_control_past_the_anchoring_depth_is_listed_and_clickable() -> None:
     # Ten anonymous hosts deep, each inside the previous one's root: the chain to a markable host
-    # exceeds the recursion bound. That is our limit, not a fact about the control, and the note
-    # says so instead of claiming the control has no identity.
+    # exceeds the recursion bound, so no selector names the control and only its handle reaches it.
     async with _live_page(
         """<x-l0></x-l0>
         <script>
@@ -13504,15 +14907,16 @@ async def test_observe_reports_a_control_past_the_anchoring_depth_as_our_budget(
           r.innerHTML = '<x-l' + d + '></x-l' + d + '>';
           host = r.querySelector('x-l' + d);
         }
-        host.attachShadow({mode: 'open'}).innerHTML = '<button type="button" style="width:80px;height:20px">Deep</button>';
+        host.attachShadow({mode: 'open'}).innerHTML =
+          '<button type="button" onclick="window.deepHit = true" style="width:80px;height:20px">Deep</button>';
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
-        assert "Deep" not in r.content, r.content
-        assert "1 exceeded the naming budget for this page" in r.content, r.content
-        assert "have no id, name or data-testid" not in r.content, r.content
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'Deep'")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.deepHit") is True
 
 
 @_skip_no_browser
@@ -13790,33 +15194,33 @@ async def test_observe_lists_skinned_checkbox_with_visible_label() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_reports_a_reused_component_id_as_reused_not_as_anonymous() -> None:
+async def test_a_reused_component_id_is_listed_and_typed_per_instance() -> None:
     # A design system hard-codes the same internal id in every instance, because shadow encapsulation
     # scopes ids to their own root, so both instances resolve to a cross-root count of 2. Anchoring on
     # the host recovers that whenever something under the host singles the control out; here each
-    # instance slots a light-DOM twin of its own control beside it, so nothing does, which is what
-    # leaves the controls unnamed and keeps this the case the note has to describe correctly. The
-    # note must say "reused", not "no id of their own", because saying the latter about a control
-    # that DOES have an id misdescribes the page.
+    # instance slots a light-DOM twin of its own control beside it, so nothing does, and each inner
+    # control is reachable only through its own handle.
     async with _live_page(
         """<ds-form-field><input id="first-name" name="firstName" style="width:80px;height:20px"></ds-form-field>
         <ds-form-field><input id="first-name" name="firstName" style="width:80px;height:20px"></ds-form-field>
         <script>
-        for (const h of document.querySelectorAll('ds-form-field')) {
-          h.attachShadow({mode: 'open'}).innerHTML =
-            '<slot></slot><input id="first-name" name="firstName" style="width:80px;height:20px">';
-        }
+        document.querySelectorAll('ds-form-field').forEach((h, i) => {
+          h.attachShadow({mode: 'open'}).innerHTML = '<slot></slot><input id="first-name" name="firstName"'
+            + ' placeholder="Inner ' + (i + 1) + '" style="width:80px;height:20px">';
+        });
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert "#first-name" not in r.content, "a reused in-component id must not be listed as a selector"
-        assert (
-            "note: 2 control(s) inside components are not listed because we have no selector that "
-            "identifies them: 2 have one that is reused by another instance of the same component, "
-            "so it does not identify a single element"
-        ) in r.content
-        assert "have no id, name or data-testid of their own" not in r.content, r.content
+        assert _ref_line(r.content, "'Inner 1'")
+        typed = await _tool(tools, "type").handler({"selector": _ref_line(r.content, "'Inner 2'"), "text": "SECOND"})
+        assert typed.status == "ok", typed.content
+        values = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('ds-form-field'))"
+            ".flatMap((h) => [h.querySelector('input').value, h.shadowRoot.querySelector('input').value])"
+        )
+        assert values == ["", "", "", "SECOND"]
 
 
 # No <label> anywhere, deliberately: an earlier version of this fix keyed on "does the field have a
@@ -15256,6 +16660,7 @@ async def test_a_retry_after_an_unverified_write_is_judged_against_the_month_bef
     assert r.status == "error" or month == "03", (r.content, month)
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_put_back_ok_still_reports_another_field_the_keys_changed() -> None:
@@ -16218,7 +17623,7 @@ async def test_type_says_an_aria_disabled_field_is_disabled_instead_of_waiting_f
     # fill() waits on the driver's own rule, which is wider than `:disabled`, so a gate reading
     # `:disabled` alone pays the full timeout on a field the driver was never going to fill. Asserted
     # as agreement with `is_enabled` rather than per shape: which shapes it refuses moves between
-    # driver versions (`aria-disabled` on an ANCESTOR is refused by 1.61 and filled by 1.58).
+    # driver versions (`aria-disabled` on a role-less ANCESTOR is filled by 1.46 and refused by 1.56).
     html = (
         '<input id="own" type="text" aria-disabled="true" style="width:200px;height:30px">'
         '<div aria-disabled="true"><input id="under" type="text" style="width:200px;height:30px"></div>'
@@ -16349,6 +17754,7 @@ async def test_type_stops_when_leaving_the_focused_segment_navigates_away() -> N
             await browser.close()
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("origin", ["same", "cross"])
@@ -18660,8 +20066,9 @@ async def test_a_root_only_the_marker_gather_reaches_is_still_disclosed() -> Non
         r = await _tool(tools, "observe").handler({})
         # Armed only on the no-mint route: a minted marker re-checks uniqueness after the write and
         # would reach the throwing root by that path instead, disclosing it for the wrong reason.
-        assert "[data-tv3=" not in r.content, r.content
-        assert "2 have one that is reused by another instance" in r.content, r.content
+        assert r.data["summary"]["listed_by_handle_only"] == 2, r.data["summary"]
+        assert r.data["summary"]["markers_minted"] == 0, r.data["summary"]
+        assert len(re.findall(r"^ref=\d+ .*'Go'$", r.content, re.M)) == 2, r.content
         assert "part of this page could not be queried" in r.content, r.content
 
 
@@ -19120,8 +20527,9 @@ async def test_a_duplicated_identity_is_detected_however_deeply_it_is_nested() -
           }
           host.attachShadow({mode: 'open'}).innerHTML =
             '<style>button{display:block;width:120px;height:22px}</style>'
-            + '<button id="ctrl">' + text + '</button>';
+            + '<button id="ctrl" onclick="window.hits.push(this.textContent)">' + text + '</button>';
         }
+        window.hits = [];
         nest('deep', 12, 'DECOY');
         nest('shallow', 2, 'INTENDED');
         </script>"""
@@ -19135,9 +20543,11 @@ async def test_a_duplicated_identity_is_detected_however_deeply_it_is_nested() -
             assert await page.locator(sel).count() == 1, (
                 f"{sel!r} denotes {await page.locator(sel).count()}:\n{r.content}"
             )
-        # Named would be the wrong-element click; counted as a duplicate is the honest answer.
+        # Named would be the wrong-element click; each is reached through its own handle instead.
         assert "#ctrl" not in r.content, r.content
-        assert "2 have one that is reused by another instance" in r.content, r.content
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "'INTENDED'")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.hits") == ["INTENDED"]
 
 
 @_skip_no_browser
@@ -19621,42 +21031,39 @@ async def test_heading_digest_is_not_fed_by_a_named_getter_host() -> None:
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_discloses_controls_it_cannot_name_inside_components() -> None:
+async def test_observe_lists_a_component_control_no_selector_names_by_its_handle() -> None:
     # We do not write a marker inside a shadow root, so a component's control with no id or name of
     # its own is named through its host -- unless nothing under the host singles it out: here the
-    # host slots a light-DOM twin beside its own button, so every host-anchored tail matches both.
-    # The omission is disclosed rather than letting the component read as empty — and the note
-    # states OUR limitation, not a claim about the page, and offers no remedy, because re-observing
-    # returns the same omission.
+    # host slots a light-DOM twin beside its own button, so every host-anchored tail matches both,
+    # and the inner button is listed by its live handle alone.
     async with _live_page(
         """<button id="light-ok">Light Button</button>
-        <x-anon id="a"><button id="twin" type="button" style="width:80px;height:20px">Twin</button></x-anon>
+        <x-anon id="a"><button id="twin" type="button" onclick="window.hits.push('Twin')"
+          style="width:80px;height:20px">Twin</button></x-anon>
         <script>
-        document.getElementById('a').attachShadow({mode:'open'}).innerHTML =
-          '<slot></slot><button type="button" style="width:80px;height:20px">Inner Go</button>';
+        window.hits = [];
+        document.getElementById('a').attachShadow({mode:'open'}).innerHTML = '<slot></slot><button type="button"'
+          + ' onclick="window.hits.push(this.textContent)" style="width:80px;height:20px">Inner Go</button>';
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         first = await _tool(tools, "observe").handler({})
         assert first.status == "ok"
         assert _ref_line(first.content, "Light Button")
-        assert "Inner Go" not in first.content
         # "no marker may be written inside a component" is a property of the internal selector mint,
         # no longer anything the digest shows the model; read the raw per-element selectors.
         assert not any(e["selector"].startswith('[data-tv3="') for e in (await _observe_data(page))["elements"]), (
             "no marker may be written inside a component"
         )
-        assert (
-            "1 control(s) inside components are not listed because we have no selector that "
-            "identifies them: 1 have no id, name or data-testid of their own"
-        ) in first.content
-        assert "re-observe" not in first.content, "no remedy is offered because none exists"
         # Byte-identical across turns: the loop's perception-stall terminator compares whole
         # payloads, and a churning marker is what previously disabled it on exactly this page.
         again = await _tool(tools, "observe").handler({})
         assert first.content == again.content
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(again.content, "Inner Go")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.hits") == ["Inner Go"]
 
-    # And a component whose control HAS an id is listed as normal, with no note at all.
+    # And a component whose control HAS an id is named by it, not listed by handle.
     async with _live_page(
         """<x-named id="n"></x-named>
         <script>
@@ -19667,43 +21074,203 @@ async def test_observe_discloses_controls_it_cannot_name_inside_components() -> 
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         assert _ref_line(r.content, "Named")
-        assert "not listed because we have no selector" not in r.content
+        assert r.data["summary"]["listed_by_handle_only"] == 0
+
+
+_ANONYMOUS_MENU_VIEWER_HTML = """<x-viewer id="viewer"></x-viewer>
+<script>
+window.__clicked = [];
+const root = document.getElementById('viewer').attachShadow({mode: 'open'});
+root.innerHTML = '<div class="panel"></div><div class="toolbar">' +
+  ['Zoom out', 'Zoom in', 'Print', 'Menu'].map((n) =>
+    '<div><button type="button" class="btn ui" aria-label="' + n + '" style="width:40px;height:24px"></button></div>'
+  ).join('') + '</div>';
+const panel = root.querySelector('.panel');
+const menu = root.querySelector('button[aria-label="Menu"]');
+menu.addEventListener('click', () => {
+  if (!menu.classList.toggle('active')) { panel.innerHTML = ''; return; }
+  panel.innerHTML = ['Download', 'Save As'].map((t) =>
+    '<div><button type="button"><svg aria-hidden="true" width="10" height="10"></svg><span>' + t + '</span></button></div>'
+  ).join('');
+  for (const b of panel.querySelectorAll('button')) {
+    b.addEventListener('click', () => { window.__clicked.push(b.textContent); menu.click(); });
+  }
+});
+</script>"""
 
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_observe_logs_omission_only_when_something_was_actually_omitted() -> None:
-    # The LOG.info call is gated on a non-zero count; pin both directions, not just the firing case —
-    # a page that omits nothing must not emit this event at all. The log is also the instrument this
-    # limitation will be sized by in production, so its counts must equal the note's own counts.
-    event = "taskv3 observe omitted component controls it could not name"
-
-    async with _live_page("<button id='go'>Go</button>") as page:
+async def test_observe_lists_anonymous_menu_rows_inside_a_component_by_handle() -> None:
+    # Every toolbar button shares its tag, type, class and position in its own wrapper, and the rows
+    # differ only by text, so no selector scoped under the host names any of them.
+    async with _live_page(_ANONYMOUS_MENU_VIEWER_HTML, init_script=_WRITE_PROBE_JS) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        with capture_logs() as logs:
-            await _tool(tools, "observe").handler({})
-        assert not [entry for entry in logs if entry["event"] == event], logs
+        observe, click = _tool(tools, "observe").handler, _tool(tools, "click").handler
+        closed = await observe({})
+        menu = _ref_line(closed.content, "'Menu'")
+        assert (await observe({})).content == closed.content
+        residue = await page.evaluate(
+            "() => Array.from(document.getElementById('viewer').shadowRoot.querySelectorAll('*'))"
+            ".flatMap((e) => e.getAttributeNames().filter((n) => n.startsWith('data-tv3')))"
+        )
+        assert residue == []
+        assert not [w for w in await page.evaluate("() => window.__tv3_writes") if w["inRoot"] is not False]
 
+        assert (await click({"selector": menu})).status == "ok"
+        opened = await observe({})
+        assert _ref_line(opened.content, "'Menu'") == menu, opened.content
+        download = _ref_line(opened.content, "'Download'")
+        assert _ref_line(opened.content, "'Save As'") != download
+
+        hit = await click({"selector": download})
+        assert hit.status == "ok", hit.content
+        assert await page.evaluate("() => window.__clicked") == ["Download"]
+
+        gone = await click({"selector": download})
+        assert gone.error_class == "stale_ref", gone.content
+        assert await page.evaluate("() => window.__clicked") == ["Download"]
+
+
+_REPLACEABLE_FRAME_HTML = """<iframe id="f" style="width:420px;height:160px"
+  srcdoc="<button style='width:120px;height:30px'>Frame Go</button><input aria-label='Frame Name' style='width:200px;height:24px'>">
+</iframe>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "needle", "extra"), [("click", "Frame Go", {}), ("type", "Frame Name", {"text": "x"})]
+)
+async def test_a_ref_whose_document_was_replaced_is_stale_without_waiting_on_the_attribute_getter(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, needle: str, extra: dict[str, Any]
+) -> None:
+    # Patchright 1.61.2's ElementHandle.get_attribute polls ':scope' until the frame detaches once the
+    # handle's document was replaced, where stock Playwright raises at once; this getter stands in for it.
+    stock_get_attribute = ElementHandle.get_attribute
+
+    async def _getter_waiting_for_detach(self: ElementHandle, name: str) -> str | None:
+        try:
+            await self.evaluate("() => 0")
+        except _PlaywrightError:
+            await asyncio.Event().wait()
+        return await stock_get_attribute(self, name)
+
+    monkeypatch.setattr(ElementHandle, "get_attribute", _getter_waiting_for_detach)
+    async with _live_page(_REPLACEABLE_FRAME_HTML) as page:
+        await page.wait_for_function("() => !!document.getElementById('f').contentDocument?.querySelector('input')")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = _ref_line((await _tool(tools, "observe").handler({})).content, needle)
+        await page.evaluate("() => { document.getElementById('f').srcdoc = '<p>replaced</p>'; }")
+        await page.wait_for_function("() => !!document.getElementById('f').contentDocument?.querySelector('p')")
+        result = await asyncio.wait_for(_tool(tools, tool_name).handler({"selector": ref, **extra}), 10)
+    assert result.error_class == "stale_ref", result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["click", "type"])
+async def test_a_click_or_type_whose_action_never_settles_ends_at_the_tool_deadline(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ACT_TOOL_TIMEOUT_MS", 1000)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+
+    async def _never_settles(*args: Any, **kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    for primitive in ("click", "fill", "type_keys"):
+        monkeypatch.setattr(taskv3_tools.input_dispatch, primitive, _never_settles)
     async with _live_page(
-        """<x-anon id="a"><button id="twin" type="button" style="width:80px;height:20px">Twin</button></x-anon>
+        "<button style='width:120px;height:30px'>Go</button><input aria-label='Name' style='width:200px;height:24px'>"
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        seen = (await _tool(tools, "observe").handler({})).content
+        args = (
+            {"selector": _ref_line(seen, "'Go'")}
+            if tool_name == "click"
+            else {"selector": _ref_line(seen, "'Name'"), "text": "x"}
+        )
+        result = await asyncio.wait_for(_tool(tools, tool_name).handler(args), 10)
+    assert (result.status, result.error_class, result.refused) == ("error", "timeout_other", False), result.content
+    if tool_name == "click":
+        # The press may already have reached the page, so the loop must treat it as possibly landed.
+        assert (result.data or {}).get(taskv3_loop.CLICK_DISPATCHED_DATA_KEY) is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "needle", "extra", "address"),
+    [("click", "'Go'", {}, "ref"), ("type", "'Name'", {"text": "x"}, "ref"), ("click", "'Go'", {}, "mark")],
+)
+async def test_an_address_whose_reads_swallow_the_deadline_is_still_refused_as_stale_at_the_resolve_bound(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, needle: str, extra: dict[str, Any], address: str
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ADDRESS_RESOLVE_TIMEOUT_MS", 1000)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    monkeypatch.setattr(action_deadline, "DEADLINE_REARM_INTERVAL_SECONDS", 0.05)
+
+    released = asyncio.Event()
+
+    async def _reports_its_cancel_as_an_error(handle: Any) -> str | None:
+        # A driver can surface a cancellation as an ordinary error, which the resolver swallows before its
+        # next read; only a deadline that cancels again ends that read too.
+        try:
+            await released.wait()
+        except asyncio.CancelledError:
+            raise _PlaywrightError("Target page, context or browser has been closed") from None
+        return None
+
+    monkeypatch.setattr(taskv3_tools, "_act_token", _reports_its_cancel_as_an_error)
+    async with _live_page(
+        "<button style='width:120px;height:30px'>Go</button><input aria-label='Name' style='width:200px;height:24px'>"
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        if address == "ref":
+            target: dict[str, Any] = {
+                "selector": _ref_line((await _tool(tools, "observe").handler({})).content, needle)
+            }
+        else:
+            looked = (await _tool(tools, "look").handler({})).content
+            found = re.search(rf"^\[(\d+)\][^\n]*{needle}", looked, re.M)
+            assert found, looked
+            target = {"mark": int(found.group(1))}
+        call = asyncio.ensure_future(_tool(tools, tool_name).handler({**target, **extra}))
+        # Not wait_for: its own cancellation is swallowed the same way, so a missing re-arm would hang the test
+        # instead of failing it. Releasing the reads lets a call that outlived the bound finish before teardown.
+        done, _ = await asyncio.wait({call}, timeout=10)
+        released.set()
+        await asyncio.wait({call}, timeout=5)
+    assert call in done, "the resolve bound did not end a read that swallowed its cancellation"
+    result = call.result()
+    # Nothing was dispatched, so this is a stale address to re-read, not an action that may have landed.
+    assert (result.error_class, result.refused) == (f"stale_{address}", True), result.content
+    assert not (result.data or {}).get(taskv3_loop.CLICK_DISPATCHED_DATA_KEY)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_handle_only_control_survives_a_walk_the_page_mutated() -> None:
+    # The page answers our light-DOM marker write with a change of its own, so every record is
+    # re-checked after the walk; one with no selector has nothing to re-resolve and must not read as
+    # an unreadable root.
+    async with _live_page(
+        """<x-anon id="a"><button type="button" style="width:80px;height:20px">Twin</button></x-anon>
         <script>
+        new MutationObserver((recs) => {
+          if (recs.some((m) => m.attributeName === 'data-tv3')) document.body.setAttribute('data-seen', '1');
+        }).observe(document.body, {subtree: true, attributes: true});
         document.getElementById('a').attachShadow({mode:'open'}).innerHTML =
           '<slot></slot><button type="button" style="width:80px;height:20px">Inner Go</button>';
         </script>"""
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
-        with capture_logs() as logs:
-            r = await _tool(tools, "observe").handler({})
-        omissions = [entry for entry in logs if entry["event"] == event]
-        assert len(omissions) == 1, logs
-        entry = omissions[0]
-        assert entry["omitted_anonymous"] == 1
-        assert entry["omitted_duplicated"] == 0
-        assert entry["omitted_unverifiable"] == 0
-        assert entry["omitted_unsafe"] == 0
-        assert entry["omitted_in_components"] == 1
-        note = next(ln for ln in r.content.splitlines() if "not listed because we have no selector" in ln)
-        assert f"{entry['omitted_anonymous']} have no id, name or data-testid of their own" in note
+        r = await _tool(tools, "observe").handler({})
+        assert await page.evaluate("() => document.body.getAttribute('data-seen')") == "1"
+        assert _ref_line(r.content, "Inner Go")
+        assert r.data["summary"]["listed_by_handle_only"] == 1, r.data["summary"]
+        assert "could not be verified" not in r.content, r.content
 
 
 @_skip_no_browser
@@ -20010,8 +21577,7 @@ async def test_one_unreadable_root_does_not_cost_every_selector_on_the_page() ->
         # The condition itself must be disclosed too, not just its consequence (markers instead of
         # ids) — a reader who never sees this note has no way to tell the page just has few ids.
         assert (
-            "note: part of this page could not be queried, so selector uniqueness could not be "
-            "verified here; elements we could not name are not listed"
+            "note: part of this page could not be queried, so selector uniqueness could not be verified here\n"
         ) in first.content
 
 
@@ -20120,16 +21686,19 @@ async def test_select_option_drives_a_hidden_native_select_inside_an_open_shadow
         )
 
 
-# Two dropzones of the same component reuse one id, so neither is nameable and both are dropped
-# AFTER the styled-proxy gate already counted them. The note must count what it listed, not what it
-# retained, or it reports controls the model cannot find any line for.
+# Dropzones of one component that reuse an internal id. The note must count what it listed, not
+# what it retained, or it reports controls the model cannot find any line for.
 _SHARED_ID_DROPZONES_HTML = """
 <!doctype html><html><body>
   <ds-drop id="dz-single"></ds-drop>
   <ds-drop id="dz-a"></ds-drop>
   <ds-drop id="dz-b"></ds-drop>
   <ds-drop class="anon"></ds-drop>
+  <label style="display:inline-block;width:240px;height:40px">Upload references<input type="file" class="refused" style="position:absolute;width:0;height:0;opacity:0"></label>
   <script>
+    // A light-DOM control that swallows our marker write passes the hidden-native gate and is then
+    // dropped unnamed, so it is the one control retained but never listed.
+    document.querySelector('input.refused').setAttribute = function () {};
     // An immediate-upload form: attaching a file dispatches an upload request. Absolute URL so the
     // request is dispatched (and observed) even though it fails against no server.
     function upl() { fetch('https://api.example.test/upload', {method: 'POST', body: new FormData()}).catch(function () {}); }
@@ -20145,8 +21714,7 @@ _SHARED_ID_DROPZONES_HTML = """
     mk('dz-a', 'resume', 'Upload resume');
     mk('dz-b', 'resume', 'Upload cover letter');
     // An instance that slots a light-DOM twin of its own control beside it, so nothing under the
-    // host singles the inner one out: it stays retained-but-unlisted and the note keeps having
-    // something to count that the listing does not.
+    // host singles the inner one out and only its live handle reaches it.
     var anon = document.querySelector('ds-drop.anon');
     anon.innerHTML = '<input type="file" id="portfolio" style="position:absolute;width:0;height:0;opacity:0">';
     anon.attachShadow({mode: 'open'}).innerHTML = '<slot></slot>' +
@@ -20165,12 +21733,10 @@ async def test_hidden_native_note_counts_only_the_controls_it_actually_listed() 
         r = await _tool(tools, "observe").handler({})
         assert r.status == "ok"
         tagged = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
-        assert len(tagged) == 3, r.content
-        assert "note: 3 native control(s) hidden behind styled proxies" in r.content, r.content
-        # The one that nothing under its host singles out stays unlisted, and is said to be dropped
-        # rather than counted as listed: the note claims what it printed, not what it walked.
-        assert "reused by another instance of the same component" in r.content
-        assert "portfolio" not in r.content, r.content
+        assert len(tagged) == 4, r.content
+        assert "note: 4 native control(s) hidden behind styled proxies" in r.content, r.content
+        assert any("'Upload portfolio'" in ln for ln in tagged), r.content
+        assert "Upload references" not in r.content, r.content
 
 
 # Two instances of one component, each holding a control under the same id. Shadow encapsulation
@@ -20577,9 +22143,8 @@ async def test_verify_commit_reads_a_shadow_hosted_field() -> None:
 async def test_a_shadow_selector_is_never_handed_out_when_it_would_denote_a_sibling() -> None:
     # Unique is not enough, it must be THIS element, and that has to hold on the pierced path too: a
     # NULL id folds to U+FFFD when escaped, so a selector built from it denotes a sibling carrying
-    # the real U+FFFD id. observe declines to name the first control and says why, rather than
-    # handing out a selector that resolves to the second -- and the sibling it does name still
-    # resolves to itself.
+    # the real U+FFFD id. observe declines to name the first control, rather than handing out a
+    # selector that resolves to the second, and reaches it by its own handle instead.
     async with _live_page(
         """<x-host id="h"></x-host><script>
         var r = document.getElementById('h').attachShadow({mode: 'open'});
@@ -20596,11 +22161,9 @@ async def test_a_shadow_selector_is_never_handed_out_when_it_would_denote_a_sibl
     ) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
-        assert "Real Control" not in r.content, r.content
-        assert "identifier we cannot render safely" in r.content, r.content
-        ref = _ref_line(r.content, "Decoy")
-        text = await _tool(tools, "get_html").handler({"selector": ref, "format": "text"})
-        assert text.status == "ok" and text.content.strip() == "Decoy", text.content
+        for name in ("Real Control", "Decoy"):
+            text = await _tool(tools, "get_html").handler({"selector": _ref_line(r.content, name), "format": "text"})
+            assert text.status == "ok" and text.content.strip() == name, text.content
 
 
 # The seam between the two shipped halves: a styled listbox proxy AND the hidden native it writes
@@ -20772,6 +22335,69 @@ async def test_the_visible_text_a_reading_adds_is_bounded_across_frames_and_says
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_a_link_whose_label_does_not_name_its_destination_shows_where_it_goes() -> None:
+    links = (
+        '<a href="/optout/">Your Privacy Choices</a> '
+        '<a href="/do-not-sell?from=home#top">Do Not Sell My Info</a> '
+        '<a href="https://forms.example.org/requests/new?ref=home#top">Submit a request</a> '
+        '<a href="/">Home</a> <a href="mailto:help@example.org">Email us</a> <a href="#faq">Questions</a> '
+        '<a href="/state-public-records/">State</a>'
+    )
+
+    async def serve(route: Route) -> None:
+        await route.fulfill(
+            status=200, content_type="text/html", body=f"<!doctype html><html><body>{links}</body></html>"
+        )
+
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        page = await context.new_page()
+        await page.route("http://site.test/**", serve)
+        await page.goto("http://site.test/home")
+        observed = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    lines = {
+        name: next(line for line in observed.content.splitlines() if f" '{name}'" in line)
+        for name in (
+            "Your Privacy Choices",
+            "Do Not Sell My Info",
+            "Submit a request",
+            "Home",
+            "Email us",
+            "Questions",
+            "State",
+        )
+    }
+    assert lines["Your Privacy Choices"].endswith(" to='/optout/'"), observed.content
+    assert lines["Submit a request"].endswith(" to='forms.example.org/requests/new'"), observed.content
+    for same in ("Do Not Sell My Info", "Home", "Email us", "Questions", "State"):
+        assert " to=" not in lines[same], observed.content
+    assert "from=home" not in observed.content and "ref=home" not in observed.content, observed.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_link_destinations_past_the_reading_budget_are_reported_left_off() -> None:
+    cards = 120
+    many = "".join(f'<a href="/catalog/section-{i}/entry-{i}">Card {i}</a> ' for i in range(cards))
+
+    async def serve(route: Route) -> None:
+        await route.fulfill(
+            status=200, content_type="text/html", body=f"<!doctype html><html><body>{many}</body></html>"
+        )
+
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        page = await context.new_page()
+        await page.route("http://site.test/**", serve)
+        await page.goto("http://site.test/many")
+        crowded = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+
+    printed = re.findall(r" to='[^']*'", crowded.content)
+    assert 0 < len(printed) < cards, crowded.content
+    assert re.search(r"^\(to= left off \d+ more link destination", crowded.content, re.M), crowded.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 async def test_a_category_menu_item_whose_name_differs_from_its_text_shows_both() -> None:
     from skyvern.forge.taskv3.tools import _FIND_CATEGORIES_JS, _menu_mark_parts  # noqa: PLC0415
 
@@ -20811,30 +22437,44 @@ async def test_the_address_observe_prints_is_byte_identical_to_the_argument_the_
 
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_a_control_replaced_by_the_act_leaves_bookkeeping_an_address_that_re_resolves() -> None:
+@pytest.mark.parametrize("in_root", [False, True], ids=["named", "handle_only"])
+async def test_a_control_replaced_by_the_act_leaves_bookkeeping_an_address_that_re_resolves(in_root: bool) -> None:
     # The submit watch's in-flight probe, the repeat guard's key and the nudge all read the caller's
     # args AFTER dispatch, and turns later. The act token is a stamp on ONE node, so a control the
     # page replaces as it acts -- a submit button swapped for its "Submitting" version -- carries it
     # away; the probe fails open on a selector that resolves to nothing, which is exactly how a
     # submission still in flight reads as settled. What those readers get back has to re-resolve.
-    async with _live_page(
-        """<button id="send" style="width:120px;height:24px">Send</button>
-        <script>
-        window.hits = [];
-        document.getElementById('send').addEventListener('click', () => {
+    swap = """function () {
           window.hits.push('send');
-          const old = document.getElementById('send');
           const fresh = document.createElement('button');
-          fresh.id = 'send';
+          fresh.type = 'button';
+          if (this.id) fresh.id = this.id;
           fresh.textContent = 'Submitting';
           fresh.style.cssText = 'width:120px;height:24px';
-          old.parentNode.insertBefore(fresh, old);
-          old.remove();
-        });
+          this.parentNode.insertBefore(fresh, this);
+          this.remove();
+        }"""
+    page_html = (
+        f"""<x-form id="f"></x-form>
+        <script>
+        window.hits = [];
+        const root = document.getElementById('f').attachShadow({{mode: 'open'}});
+        root.innerHTML = '<div><button type="button" style="width:120px;height:24px">Send</button></div>'
+          + '<div><button type="button" style="width:120px;height:24px">Cancel</button></div>';
+        root.querySelector('button').addEventListener('click', {swap});
         </script>"""
-    ) as page:
+        if in_root
+        else f"""<button id="send" style="width:120px;height:24px">Send</button>
+        <script>
+        window.hits = [];
+        document.getElementById('send').addEventListener('click', {swap});
+        </script>"""
+    )
+    async with _live_page(page_html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
+        if in_root:
+            assert r.data["summary"]["listed_by_handle_only"] == 2, r.data["summary"]
         args = {"selector": _ref_line(r.content, "'Send'")}
 
         clicked = await _tool(tools, "click").handler(args)
@@ -21012,12 +22652,24 @@ async def test_a_coupled_transposition_is_the_one_form_still_open_and_this_pins_
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize("attack", sorted(_PAIRING_ATTACKS), ids=sorted(_PAIRING_ATTACKS))
-async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(attack: str) -> None:
+@pytest.mark.parametrize("in_root", [False, True], ids=["named", "handle_only"])
+async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(attack: str, in_root: bool) -> None:
     # The perceive->act identity invariant: whatever the page does to the intrinsics, the element the
     # engine acts on is the one the line the model read described. Failing closed is allowed -- acting
     # on Beta is not, because that is a wrong-element commit the PAGE chose.
-    async with _live_page(
-        """<button id="alpha" style="width:90px;height:22px">Alpha</button>
+    page_html = (
+        """<x-pair id="p"></x-pair>
+        <script>
+        window.hits = [];
+        const root = document.getElementById('p').attachShadow({mode: 'open'});
+        root.innerHTML = '<div><button type="button" style="width:90px;height:22px">Alpha</button></div>'
+          + '<div><button type="button" style="width:90px;height:22px">Beta</button></div>';
+        for (const b of root.querySelectorAll('button'))
+          b.addEventListener('click', (e) => window.hits.push(e.currentTarget.textContent.toLowerCase()));
+        const beta = root.querySelectorAll('button')[1];
+        """
+        if in_root
+        else """<button id="alpha" style="width:90px;height:22px">Alpha</button>
         <button id="beta" style="width:90px;height:22px">Beta</button>
         <script>
         window.hits = [];
@@ -21025,12 +22677,12 @@ async def test_no_poisoned_dispatch_can_pair_a_digest_line_with_a_decoy_element(
           b.addEventListener('click', (e) => window.hits.push(e.currentTarget.id));
         const beta = document.getElementById('beta');
         """
-        + _PAIRING_ATTACKS[attack]
-        + """
-        </script>"""
-    ) as page:
+    )
+    async with _live_page(page_html + _PAIRING_ATTACKS[attack] + "\n</script>") as page:
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
+        if in_root:
+            assert r.data["summary"]["listed_by_handle_only"] == 2, r.data["summary"]
         # Non-vacuous: the attack must not simply hide Alpha, or there would be nothing to mis-address.
         alpha_ref = _ref_line(r.content, "'Alpha'")
 
@@ -21199,7 +22851,7 @@ async def test_a_host_anchored_control_is_driven_rather_than_reported_gone() -> 
         tools = build_browser_tools(_fixed_page_provider(page))
         r = await _tool(tools, "observe").handler({})
         listed = [ln for ln in r.content.splitlines() if "[hidden-native" in ln and not ln.startswith("note:")]
-        assert len(listed) == 3, r.content
+        assert len(listed) == 4, r.content
         # dz-b's own dropzone, distinguished from dz-a's identical-shaped one by its label.
         chosen = _ref_line(r.content, "Upload cover letter")
         assert any("hidden-native" in ln for ln in listed if chosen in ln), r.content
@@ -21233,15 +22885,14 @@ async def test_a_host_anchored_selector_counts_what_the_host_slots_as_well_as_wh
         r = await _tool(tools, "observe").handler({})
         # Armed on the DIGEST too, not only on the fixture: the property below is quantified over what
         # was actually listed, so an empty or collapsed digest would satisfy it without protecting
-        # anything. The light-DOM twin is still named, and the one under the host is refused AND said
-        # to be.
-        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "1", r.content
-        assert "reused by another instance of the same component" in r.content, r.content
-        # Whatever selector the internal mint fell back to for the one control it DID list (no longer
-        # anything the digest shows the model), it must genuinely denote only that element.
+        # anything. The light-DOM twin is still named, and the one under the host is listed with no
+        # selector at all rather than an ambiguous one.
+        assert re.search(r"\((\d+) interactive elements\)", r.content).group(1) == "2", r.content
+        # Whatever selector the internal mint fell back to for a control it named (no longer anything
+        # the digest shows the model), it must genuinely denote only that element.
         selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
-        assert len(selectors) == 1, selectors
-        for sel in selectors:
+        assert len(selectors) == 2 and selectors.count("") == 1, selectors
+        for sel in filter(None, selectors):
             assert await page.locator(sel).count() == 1, f"{sel} denotes more than one element: {selectors}"
 
 
@@ -22049,6 +23700,90 @@ async def test_type_into_an_open_combobox_is_not_blocked_by_its_own_listbox() ->
         assert await page.eval_on_selector("#src", "el => el.value") == "Applicant Referral"
 
 
+# A searchable picker with no ARIA state: clicking the field opens its rows together with a transparent,
+# view-sized click-outside layer laid over the field itself. The caret stays in the field, so a person types
+# straight on; the rows filter into fresh nodes, and clicking one commits it and removes the layer.
+_FOCUSED_FIELD_UNDER_ITS_CLICK_OUTSIDE_LAYER_HTML = """
+<label for="acct" style="display:block">Account number</label>
+<input id="acct" type="text" autocomplete="off" style="width:240px;height:30px">
+<div id="rows" style="position:relative;z-index:2;width:240px;background:#fff"></div>
+<script>
+  const ACCOUNTS = ["(AC) 10000001", "(AC) 10000002", "(AC) 10000003", "(AC) 62017710"];
+  const input = document.querySelector("#acct");
+  const rows = document.querySelector("#rows");
+  let layer = null;
+  function close() {
+    rows.replaceChildren();
+    if (layer) layer.remove();
+    layer = null;
+  }
+  function render() {
+    const query = input.value.replace(/\\D/g, "");
+    const shown = query ? ACCOUNTS.filter((a) => a.replace(/\\D/g, "").includes(query)) : ACCOUNTS.slice(0, 3);
+    rows.replaceChildren(...shown.map((label) => {
+      const row = document.createElement("span");
+      row.textContent = label;
+      row.style.cssText = "display:block;padding:4px;cursor:pointer";
+      row.addEventListener("click", () => { input.value = label; close(); });
+      return row;
+    }));
+  }
+  input.addEventListener("click", () => {
+    if (layer) return;
+    layer = document.createElement("div");
+    layer.style.cssText = "position:fixed;left:0;top:0;width:100%;height:100%;z-index:1";
+    layer.addEventListener("click", close);
+    document.body.append(layer);
+    render();
+  });
+  input.addEventListener("input", render);
+</script>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_focused_field_under_its_own_click_outside_layer_picks_the_row() -> None:
+    # The click that opened the list left the caret in the field, so the invisible layer over it stops only the
+    # pointer. Refusing the field as covered sent the model to Escape and reloads in a loop.
+    async with _content_page(_FOCUSED_FIELD_UNDER_ITS_CLICK_OUTSIDE_LAYER_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        opened = await _tool(tools, "click").handler({"selector": "#acct"})
+        assert opened.status == "ok", opened.content
+        r = await _tool(tools, "type").handler({"selector": "#acct", "text": "62017710"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#acct", "el => el.value") == "(AC) 62017710"
+        assert taskv3_loop._TYPE_REACH.get()["caret_held"] is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_focused_plain_field_under_an_invisible_layer_fills_it() -> None:
+    # The fill path (no typeahead probe) takes the same rule: the keys reach the field that holds the caret.
+    async with _content_page(_INVISIBLE_RESIDUAL_BACKDROP_HTML.replace('type="text"', 'type="email"')) as page:
+        await page.focus("#city")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "ada@example.com"})
+        assert r.status == "ok", r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == "ada@example.com"
+        assert taskv3_loop._TYPE_REACH.get()["caret_held"] is True
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_focused_field_under_a_visible_wall_is_still_refused() -> None:
+    # Holding the caret does not license typing under a layer a person can SEE: that wall is what they would
+    # deal with first, so the refusal and its named controls stand.
+    async with _content_page(_CONSENT_WALL_HTML) as page:
+        await page.focus("#city")
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#city", "text": "Iowa City"})
+        assert r.status == "error", r.content
+        assert "Privacy Preference Center" in r.content, r.content
+        assert await page.eval_on_selector("#city", "el => el.value") == ""
+        assert "caret_held" not in (taskv3_loop._TYPE_REACH.get() or {})
+
+
 _SKINNED_COMBOBOX_BESIDE_A_FREE_FIELD_HTML = (
     _OPEN_COMBOBOX_OWN_LISTBOX_HTML
     + '<input id="free" type="text" style="position:absolute;left:400px;top:0;width:200px;height:30px">'
@@ -22501,6 +24236,71 @@ async def _mount_challenge_frame(
     await page.route(f"{_CHALLENGE_FRAME_URL}*", _fulfill)
     async with page.expect_event("framenavigated", lambda f: _CHALLENGE_FRAME_URL in (f.url or "")):
         await realm.eval_on_selector(host_selector, _MOUNT_CLOSED_SHADOW_FRAMES_JS, {"srcs": srcs, "style": style})
+
+
+_DISABLED_SUBMIT_UNDER_WIDGET_HTML = """
+<!doctype html><html><body style="margin:0">
+<div id="widget" style="position:absolute;left:40px;top:120px;width:300px;height:65px"></div>
+<button id="submit" disabled style="position:absolute;left:40px;top:220px;width:120px;height:40px">Submit</button>
+<button id="other" style="position:absolute;left:200px;top:220px;width:120px;height:40px">Other</button>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("widget_style", "hinted"),
+    [
+        ("width:300px;height:65px;border:0", True),
+        # A preloaded or invisible widget is merely present, which is no evidence it gates anything.
+        ("width:1px;height:1px;border:0", False),
+        (None, False),
+    ],
+    ids=["rendered", "placeholder", "absent"],
+)
+async def test_disabled_click_refusal_names_only_a_rendered_challenge_frame(
+    widget_style: str | None, hinted: bool
+) -> None:
+    async with _content_page(_DISABLED_SUBMIT_UNDER_WIDGET_HTML, extra_args=["--site-per-process"]) as page:
+        if widget_style is not None:
+            await _mount_challenge_frame(page, page, "#widget", style=widget_style)
+        click = _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler
+        refused = await click({"selector": "#submit"})
+        clicked = await click({"selector": "#other"})
+    unhinted = "#submit is disabled — it cannot be clicked until the page enables it"
+    assert refused.error_class == "disabled", refused.content
+    if hinted:
+        assert refused.content == (
+            f"{unhinted}. A challenge frame (challenges.cloudflare) is rendered on screen. solve_captcha acts on it."
+        )
+    else:
+        assert refused.content == unhinted
+    assert clicked.status == "ok", clicked.content
+    assert "solve_captcha" not in clicked.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_disabled_click_refusal_in_a_child_frame_names_the_challenge_frame_beside_it() -> None:
+    shell_html = (
+        '<!doctype html><html><body style="margin:0"><iframe id="shell" srcdoc=\''
+        + _DISABLED_SUBMIT_UNDER_WIDGET_HTML.replace("'", "&apos;").replace("\n", "")
+        + '\' style="position:absolute;left:0;top:0;width:1000px;height:880px;border:0"></iframe></body></html>'
+    )
+    async with _content_page(shell_html, extra_args=["--site-per-process"]) as page:
+        await page.frame_locator("#shell").locator("#widget").wait_for(state="attached")
+        child = next(f for f in page.frames if f.parent_frame is page.main_frame)
+        await _mount_challenge_frame(child, page, "#widget")
+        refused = await _tool(build_browser_tools(_fixed_page_provider(page)), "click").handler({"selector": "#submit"})
+    assert refused.error_class == "disabled", refused.content
+    assert "A challenge frame (challenges.cloudflare) is rendered on screen." in refused.content, refused.content
+
+
+@pytest.mark.asyncio
+async def test_disabled_click_refusal_names_no_challenge_frame_it_could_not_measure() -> None:
+    refused = await taskv3_tools._disabled_click_refusal(page_with_unprobeable_vendor_embedder(), "#submit")
+    assert refused.content == "#submit is disabled — it cannot be clicked until the page enables it"
 
 
 @pytest.mark.usefixtures("expected_action_timeout")
@@ -24323,6 +26123,50 @@ async def test_the_covered_record_separates_a_qualifying_layer_from_the_named_hi
             assert "no named controls" in r.content and "get_html of #wizard8" in r.content, r.content
             recorded = taskv3_loop._COVERED_LAYER.get() or {}
             assert recorded == {"branch": "named", "controls": 0, "layer_kind": "qualified"}, recorded
+
+
+# A closed <details> skips painting its content but still lays it out, so the field keeps a box and the hit test
+# lands on whatever is drawn there -- the next section. Nothing covers the field; it is not rendered.
+_FIELD_IN_A_CLOSED_DETAILS_HTML = """
+<details id="section"><summary>Address</summary><label for="city">City</label><input id="city" type="text"></details>
+<details><summary>Email</summary><input id="email" type="email"></details>
+"""
+_FIELD_IN_A_CONTENT_VISIBILITY_HIDDEN_BOX_HTML = """
+<div id="section" style="content-visibility:hidden;height:40px"><input id="city" type="text"></div>
+<button id="next" type="button">Next</button>
+"""
+
+
+@pytest.mark.usefixtures("expected_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("markup", "reveal"),
+    [
+        (_FIELD_IN_A_CLOSED_DETAILS_HTML, "document.getElementById('section').open = true"),
+        (
+            _FIELD_IN_A_CONTENT_VISIBILITY_HIDDEN_BOX_HTML,
+            "document.getElementById('section').style.contentVisibility = 'visible'",
+        ),
+    ],
+    ids=["closed_details", "content_visibility_hidden"],
+)
+async def test_type_into_a_field_the_browser_does_not_render_is_unreachable_not_covered(
+    markup: str, reveal: str
+) -> None:
+    async with _content_page(markup) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        taskv3_loop._COVERED_LAYER.set(None)
+        refused = await type_tool.handler({"selector": "#city", "text": "x"})
+        assert refused.status == "error" and refused.error_class == "unreachable", refused.content
+        assert "is not rendered" in refused.content and "covered by" not in refused.content, refused.content
+        assert taskv3_loop._COVERED_LAYER.get() is None
+        assert await page.evaluate("document.getElementById('city').value") == ""
+
+        await page.evaluate(reveal)
+        typed = await type_tool.handler({"selector": "#city", "text": "x"})
+        assert typed.status == "ok", typed.content
+        assert await page.evaluate("document.getElementById('city').value") == "x"
 
 
 _DISMISSIBLE_DIALOG_BESIDE_A_COVERED_ROW_HTML = """
@@ -27937,10 +29781,12 @@ def _cc_walk_shape_script(shape: dict[str, Any] | None, row_h: float) -> str:
     # `prepend` inserts rows at the top on the `prepend_at`-th scroll; `grow` appends rows on the first scroll
     # away from the bottom; `enter_ms` slides every mounted row in from 40px below; `overscan` mounts that
     # many rows past each end of the viewport, `drop_blanks` renders a blank row as no element at all, and `jitter` nudges the row labelled `jitter_label` down that
-    # many px on every other render.
+    # many px on every other render. `drop_dup` removes the LAST row wearing that label once the scroller passes
+    # `drop_dup_past` px, the way a list reconciles a row it rendered twice while its own fetch was in flight.
     return (
         "  var SHAPE = " + json.dumps(shape) + ";\n"
         "  var TOPS = [], shapeScrolls = 0, shapeRenders = 0, shapeAtEnd = false, shapeGrown = false;\n"
+        "  var shapeDropped = false;\n"
         '  var STICKY_HTML = \'<li role="option" aria-disabled="true" style="position:sticky;top:0;height:22px;\' +\n'
         "    'width:40px;margin-left:200px;z-index:3;background:#fff;line-height:16px\">Top</li>' +\n"
         '    \'<li role="separator" style="position:sticky;top:22px;height:4px;width:40px;margin-left:200px;\' +\n'
@@ -27959,6 +29805,13 @@ def _cc_walk_shape_script(shape: dict[str, Any] | None, row_h: float) -> str:
         "  function shapeScrolled() {\n"
         "    shapeScrolls++;\n"
         "    if (SHAPE.prepend && shapeScrolls === SHAPE.prepend_at) { COUNTRIES = SHAPE.prepend.concat(COUNTRIES); shapeLayout(); }\n"
+        "    if (SHAPE.drop_dup && !shapeDropped && scroller.scrollTop > SHAPE.drop_dup_past) {\n"
+        "      shapeDropped = true;\n"
+        "      for (var d = N - 1; d >= 0; d--) {\n"
+        "        if (COUNTRIES[d][0] === SHAPE.drop_dup) { COUNTRIES.splice(d, 1); break; }\n"
+        "      }\n"
+        "      shapeLayout();\n"
+        "    }\n"
         "    if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) shapeAtEnd = true;\n"
         "    else if (shapeAtEnd && SHAPE.grow && !shapeGrown) {\n"
         "      shapeGrown = true; COUNTRIES = COUNTRIES.concat(SHAPE.grow); shapeLayout();\n"
@@ -28110,6 +29963,26 @@ async def test_select_combobox_refuses_an_exact_hit_whose_twin_the_walk_saw_at_t
         assert r.status == "error", r.content
         assert "ambiguous" in r.content, r.content
         assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_refuses_a_twin_a_window_read_before_the_list_dropped_it() -> None:
+    # Two "Canada" rows nothing in the DOM tells apart sit at the top of a virtualized list that reconciles to one
+    # once the walk has scrolled past them. The move restarts the walk, so the rows the walk finally reports hold a
+    # single "Canada" and the matcher's own duplicate check has nothing to refuse — the only thing left between
+    # this and committing a row whose rival a window already read is the twin count kept per frame.
+    rows = [(f"Option {i:02d}", f"+{200 + i}") for i in range(40)]
+    rows[2], rows[4] = ("Canada", "+1"), ("Canada", "+2")
+    html = _cc_widget_html(rows, 0, walk_shape={"drop_dup": "Canada", "drop_dup_past": 600})
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        assert r.status == "error", r.content
+        assert "share the exact label" in r.content, r.content
+        assert await page.eval_on_selector("#phone", "el => el.value") == "", r.content
+        # 39 rows of 58px: the page really did drop one of the two "Canada" rows mid-walk.
+        assert await page.eval_on_selector("#cc-spacer", "el => el.style.height") == "2262px", r.content
 
 
 @_skip_no_browser
@@ -28356,84 +30229,89 @@ def test_list_coverage_refuses_a_declared_size_too_large_to_hold() -> None:
     assert coverage(float("inf")) == "declares_more"
 
 
+class _WalkScriptLog:
+    # Records which probe each evaluate ran, so a case can count the row reads each walk window took.
+    def __init__(self, page: Any) -> None:
+        self._page = page
+        self.scripts: list[str] = []
+        self.steps: list[Any] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._page, name)
+
+    async def evaluate(self, script: str, arg: Any = None) -> Any:
+        self.scripts.append(script)
+        result = await self._page.evaluate(script, arg)
+        if script == taskv3_tools._MENU_SCROLLER_STEP_JS:
+            self.steps.append((arg, {k: v for k, v in (result or {}).items() if k != "fillers"}))
+        return result
+
+
+def _walk_reread_windows(log: _WalkScriptLog) -> list[Any]:
+    # The scroller reads of every walk window that read its rows more than once.
+    steps = iter(log.steps)
+    out: list[Any] = []
+    window: list[Any] = []
+    reads = 0
+    for i, script in enumerate(log.scripts):
+        if script == taskv3_tools._MENU_SCROLLER_STEP_JS:
+            if i + 1 < len(log.scripts) and log.scripts[i + 1] == taskv3_tools._MENU_WINDOW_FINGERPRINT_JS:
+                if reads > 1:
+                    out.append(window)
+                window, reads = [], 0
+            window.append(next(steps))
+        elif script == _MENU_OPTION_TEXTS_JS:
+            reads += 1
+    return [*out, *([window] if reads > 1 else [])]
+
+
+_WALK_CASES = _walk_property_cases()
+# Rows that never move during a read: each window is read once, and a missing row still refuses.
+_WALK_STILL_FAMILIES = (
+    "plain",
+    "mixed_heights",
+    "inner_offsets",
+    "sticky",
+    "ancestor_scale",
+    "double_counted",
+    "holes_",
+)
+
+
+def _case_id(*parts: object) -> str:
+    return re.sub(r"[^A-Za-z0-9_.=]+", "-", "-".join(map(str, parts))).strip("-")
+
+
+def test_walk_property_cases_cross_every_family_with_every_slot() -> None:
+    ids = [_case_id(family, slot) for family, slot, _, _ in _WALK_CASES]
+    assert len(_WALK_CASES) >= 64 and len(set(ids)) == len(ids), ids
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_select_combobox_walk_commits_only_a_list_it_read_whole() -> None:
+@pytest.mark.parametrize(
+    ("family", "slot", "html", "commits"), _WALK_CASES, ids=[_case_id(f, s) for f, s, _, _ in _WALK_CASES]
+)
+async def test_select_combobox_walk_commits_only_a_list_it_read_whole(
+    family: str, slot: str, html: str, commits: bool
+) -> None:
     # Generated: every family crossed with a missing row at the start, middle, end or nowhere. A missing row
     # refuses and leaves the field empty; a list with none commits "Canada".
-    from playwright.async_api import async_playwright  # noqa: PLC0415
-
-    from skyvern.forge.taskv3.tools import (  # noqa: PLC0415
-        _MENU_OPTION_TEXTS_JS,
-        _MENU_SCROLLER_STEP_JS,
-        _MENU_WINDOW_FINGERPRINT_JS,
+    async with _page_context(viewport={"width": 1024, "height": 900}) as context:
+        page = await context.new_page()
+        await page.set_content(html)
+        logged = _WalkScriptLog(page)
+        tools = build_browser_tools(_fixed_page_provider(logged))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
+        phone = await page.eval_on_selector("#phone", "el => el.value")
+    # A scroll can land between two frames once in a walk; more than one re-read means still rows are being read twice.
+    if family.startswith(_WALK_STILL_FAMILIES):
+        reread = _walk_reread_windows(logged)
+        assert len(reread) <= 1, f"{len(reread)} still windows read twice: {reread[:2]}"
+    got = r.status == "ok" and phone == "+1"
+    assert got == commits and (commits or phone == ""), (
+        f"want {'commit' if commits else 'refuse'}, {r.status} phone={phone!r}: {r.content[:140]}"
     )
-
-    class _ScriptLog:
-        # Records which probe each evaluate ran, so a case can count the row reads each walk window took.
-        def __init__(self, page: Any) -> None:
-            self._page = page
-            self.scripts: list[str] = []
-            self.steps: list[Any] = []
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._page, name)
-
-        async def evaluate(self, script: str, arg: Any = None) -> Any:
-            self.scripts.append(script)
-            result = await self._page.evaluate(script, arg)
-            if script == _MENU_SCROLLER_STEP_JS:
-                self.steps.append((arg, {k: v for k, v in (result or {}).items() if k != "fillers"}))
-            return result
-
-    def reread_windows(log: _ScriptLog) -> list[Any]:
-        # The scroller reads of every walk window that read its rows more than once.
-        steps = iter(log.steps)
-        out: list[Any] = []
-        window: list[Any] = []
-        reads = 0
-        for i, script in enumerate(log.scripts):
-            if script == _MENU_SCROLLER_STEP_JS:
-                if i + 1 < len(log.scripts) and log.scripts[i + 1] == _MENU_WINDOW_FINGERPRINT_JS:
-                    if reads > 1:
-                        out.append(window)
-                    window, reads = [], 0
-                window.append(next(steps))
-            elif script == _MENU_OPTION_TEXTS_JS:
-                reads += 1
-        return [*out, *([window] if reads > 1 else [])]
-
-    # Rows that never move during a read: each window is read once, and a missing row still refuses.
-    still = ("plain", "mixed_heights", "inner_offsets", "sticky", "ancestor_scale", "double_counted", "holes_")
-    cases = _walk_property_cases()
-    assert len(cases) >= 64, len(cases)
-    wrong: list[str] = []
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
-        try:
-            for family, slot, html, commits in cases:
-                context = await browser.new_context(viewport={"width": 1024, "height": 900})
-                try:
-                    page = await context.new_page()
-                    await page.set_content(html)
-                    logged = _ScriptLog(page)
-                    tools = build_browser_tools(_fixed_page_provider(logged))
-                    r = await _tool(tools, "select_combobox").handler({"selector": "#cc", "value": "Canada"})
-                    phone = await page.eval_on_selector("#phone", "el => el.value")
-                finally:
-                    await context.close()
-                # A scroll can land between two frames once in a walk; more than one re-read means still rows
-                # are being read twice.
-                if family.startswith(still) and len(reread := reread_windows(logged)) > 1:
-                    wrong.append(f"{family} slot={slot}: {len(reread)} still windows read twice: {reread[:2]}")
-                got = r.status == "ok" and phone == "+1"
-                if got != commits or (not commits and phone != ""):
-                    wrong.append(
-                        f"{family} slot={slot}: want {'commit' if commits else 'refuse'}, {r.status} phone={phone!r}: {r.content[:140]}"
-                    )
-        finally:
-            await browser.close()
-    assert not wrong, f"{len(wrong)}/{len(cases)} wrong:\n" + "\n".join(wrong)
 
 
 def _remounting_list_html(*, target: int, scroll_top: int, sticky_header: bool, fade_mask: bool) -> str:
@@ -28768,6 +30646,7 @@ def _popup_search_combobox_html(
     spinner_class: str = "spinner",
     roleless: bool = False,
     bare_div_note: str = "",
+    dead_search: bool = False,
 ) -> str:
     # A click-to-open anchor (not typeable) whose popup renders only the first `window` matching rows and,
     # optionally, its own filter input. The form also holds an unrelated text input, plus one the open-click
@@ -28787,7 +30666,8 @@ def _popup_search_combobox_html(
     # builds the filtered rows from that element instead of <li>; `row_class` sets every row's class attribute.
     # `roleless` declares no role on the list or its rows. `bare_div_note` ("header" or "footer") builds the list
     # and its rows from <div>s that do not scroll, with a match count inside the list: a <p> above the rows, or a bare
-    # text node below them.
+    # text node below them. `dead_search` renders the popup's search box above the rows and focuses it, but wires it
+    # to nothing, so it takes the text typed into it and never filters.
     states = json.dumps(items or _POPUP_SEARCH_STATES[:rows])
     return f"""
 <!doctype html><html><body style="margin:0">
@@ -28832,6 +30712,7 @@ def _popup_search_combobox_html(
   var SPINNER_CLASS = {json.dumps(spinner_class)};
   var ROLELESS = {"true" if roleless else "false"};
   var BARE_NOTE = {json.dumps(bare_div_note)};
+  var DEAD_SEARCH = {"true" if dead_search else "false"};
   var pending = null, twin = null, queryAt = 0, tripped = false;
   var anchor = document.getElementById('state');
   var hidden = document.getElementById('state-value');
@@ -28936,7 +30817,7 @@ def _popup_search_combobox_html(
         box = document.createElement('input');
         box.type = 'text';
         box.placeholder = 'Type to Search';
-        box.addEventListener('input', onQuery);
+        if (!DEAD_SEARCH) box.addEventListener('input', onQuery);
         if (FLAT) box.style.cssText = 'position:absolute;left:0;top:32px;width:236px;z-index:5';
         popup.appendChild(box);
       }}
@@ -29029,6 +30910,23 @@ async def test_select_combobox_popup_filter_refusal_takes_back_its_query() -> No
         assert await page.eval_on_selector("#state-wrap input[type=text]", "el => el.value") == "", r.content
         assert await page.eval_on_selector("#notes", "el => el.value") == "", r.content
         assert await page.eval_on_selector("#other-note", "el => el.value") == "", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_takes_back_a_popup_box_whose_typing_never_moved_the_rows() -> None:
+    # The popup renders its search box above the rows and focuses it, but nothing is wired to it (its handler never
+    # hydrated), so it takes the query and the list never moves. "Delaware" IS one of the rows it rendered, and the
+    # list declares more rows than those, so a box taken for the filter reads this unchanged window as a filtered
+    # one: the refusal must name the box as not the list's filter instead of offering its row as what a search
+    # answered, and the query must come back out of the box.
+    async with _content_page(_popup_search_combobox_html(dead_search=True, declared_rows=60)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": "#state", "value": "Delaware"})
+        assert r.status == "error", r.content
+        assert await page.eval_on_selector("#state-value", "el => el.value") == "", r.content
+        assert await page.eval_on_selector("#state-wrap input[type=text]", "el => el.value") == "", r.content
+        assert "the list did not change" in r.content and "own search box" not in r.content, r.content
 
 
 @_skip_no_browser
@@ -29194,39 +31092,46 @@ def _key_twin_cases() -> list[tuple[str, list[str], str]]:
     return cases
 
 
+_KEY_TWIN_CASES = _key_twin_cases()
+
+
+def test_key_twin_cases_reach_every_path() -> None:
+    cases = _KEY_TWIN_CASES
+    assert len(cases) >= 50 and sum(1 for c in cases if c[2] == "twin_shown_hit_filtered") >= 3
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_select_combobox_refuses_distinct_rows_sharing_an_identity_key_on_every_path() -> None:
-    cases = _key_twin_cases()
-    assert len(cases) >= 50 and sum(1 for c in cases if c[2] == "twin_shown_hit_filtered") >= 3
-    failures = []
-    for value, labels, path in cases:
-        if path == "walk":
-            rows = [(f"Row {i:03d}", f"+{3000 + i}") for i in range(1, 71)]
-            for label, at in zip(labels, (5, 35, 60)):
-                rows[at] = (label, f"+{9000 + at}")
-            html, selector, field = _cc_widget_html(rows, 30), "#cc", "#phone"
+@pytest.mark.parametrize(
+    ("value", "labels", "path"),
+    _KEY_TWIN_CASES,
+    ids=[_case_id(f"{i:02d}", path, value) for i, (value, _, path) in enumerate(_KEY_TWIN_CASES)],
+)
+async def test_select_combobox_refuses_distinct_rows_sharing_an_identity_key_on_every_path(
+    value: str, labels: list[str], path: str
+) -> None:
+    if path == "walk":
+        rows = [(f"Row {i:03d}", f"+{3000 + i}") for i in range(1, 71)]
+        for label, at in zip(labels, (5, 35, 60)):
+            rows[at] = (label, f"+{9000 + at}")
+        html, selector, field = _cc_widget_html(rows, 30), "#cc", "#phone"
+    else:
+        states = _POPUP_SEARCH_STATES[:30]
+        own = [(label, f"V{i}") for i, label in enumerate(labels)]
+        if path == "full_read":
+            html = _popup_search_combobox_html(items=[*own, *states[:5]], values=True)
+        elif path == "overflowed_window":
+            html = _popup_search_combobox_html(items=[*own, *states], values=True, declared_rows=60, filtered_window=1)
         else:
-            states = _POPUP_SEARCH_STATES[:30]
-            own = [(label, f"V{i}") for i, label in enumerate(labels)]
-            if path == "full_read":
-                html = _popup_search_combobox_html(items=[*own, *states[:5]], values=True)
-            elif path == "overflowed_window":
-                html = _popup_search_combobox_html(
-                    items=[*own, *states], values=True, declared_rows=60, filtered_window=1
-                )
-            else:
-                html = _popup_search_combobox_html(
-                    items=[*own[:-1], *states, own[-1]], values=True, declared_rows=60, filtered_window=1
-                )
-            selector, field = "#state", "#state-value"
-        async with _content_page(html) as page:
-            tools = build_browser_tools(_fixed_page_provider(page))
-            r = await _tool(tools, "select_combobox").handler({"selector": selector, "value": value})
-            committed = await page.eval_on_selector(field, "el => el.value")
-            if r.status != "error" or committed:
-                failures.append(f"{path} {value!r} {labels!r}: {r.status} committed={committed!r}")
-    assert not failures, "\n".join(failures)
+            html = _popup_search_combobox_html(
+                items=[*own[:-1], *states, own[-1]], values=True, declared_rows=60, filtered_window=1
+            )
+        selector, field = "#state", "#state-value"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler({"selector": selector, "value": value})
+        committed = await page.eval_on_selector(field, "el => el.value")
+    assert r.status == "error" and not committed, f"{labels!r}: {r.status} committed={committed!r}"
 
 
 @_skip_no_browser
@@ -29269,10 +31174,11 @@ async def test_select_combobox_popup_filter_incomplete_refusal_names_the_visible
         assert await page.eval_on_selector(row, "el => el.textContent") == "North Carolina", r.content
 
 
+@pytest.mark.usefixtures("short_list_poll")
 @_skip_no_browser
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("late_twin_ms", "why"), [(3500, "several"), (60000, "still loading")], ids=["twin_lands", "never_clears"]
+    ("late_twin_ms", "why"), [(1500, "several"), (60000, "still loading")], ids=["twin_lands", "never_clears"]
 )
 @pytest.mark.parametrize(
     "spinner_class",
@@ -29281,7 +31187,8 @@ async def test_select_combobox_popup_filter_incomplete_refusal_names_the_visible
 async def test_select_combobox_popup_filter_waits_out_a_spinner_inside_its_popup(
     late_twin_ms: int, why: str, spinner_class: str
 ) -> None:
-    # The popup's only loading cue is a class-only spinner, shown until a second "Texas" lands after typing.
+    # The popup's only loading cue is a class-only spinner, shown until a second "Texas" lands after typing: past the
+    # filter's soft deadline and inside its hard cap, or never.
     html = _popup_search_combobox_html(late_twin_ms=late_twin_ms, spinner_until_twin=True, spinner_class=spinner_class)
     async with _content_page(html) as page:
         tools = build_browser_tools(_fixed_page_provider(page))
@@ -30317,9 +32224,22 @@ async def test_select_combobox_acts_past_a_chip_it_cannot_prove_is_its_own() -> 
     assert not failures, "\n".join(failures)
 
 
+_POPUP_PROPERTY_SHAPES = _generated_popup_shapes() + _generated_commit_state_shapes()
+_POPUP_PROPERTY_CHUNKS = 8
+
+
+def test_popup_filter_property_covers_every_generated_shape() -> None:
+    assert len(_POPUP_PROPERTY_SHAPES) >= 295
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
-async def test_select_combobox_popup_filter_property_over_generated_widget_shapes() -> None:
+@pytest.mark.parametrize(
+    "chunk",
+    range(_POPUP_PROPERTY_CHUNKS),
+    ids=[f"chunk-{c + 1}-of-{_POPUP_PROPERTY_CHUNKS}" for c in range(_POPUP_PROPERTY_CHUNKS)],
+)
+async def test_select_combobox_popup_filter_property_over_generated_widget_shapes(chunk: int) -> None:
     """Over generated widgets, typing into a popup's filter box never commits or reports anything false.
 
     Which box is tried is chosen by ownership evidence, but a missing signal can only cost coverage (a
@@ -30337,7 +32257,7 @@ async def test_select_combobox_popup_filter_property_over_generated_widget_shape
     """
     from playwright.async_api import async_playwright  # noqa: PLC0415
 
-    shapes = _generated_popup_shapes() + _generated_commit_state_shapes()
+    shapes = _POPUP_PROPERTY_SHAPES[chunk::_POPUP_PROPERTY_CHUNKS]
     gate = asyncio.Semaphore(6)
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--use-mock-keychain", "--password-store=basic"])
@@ -30353,7 +32273,6 @@ async def test_select_combobox_popup_filter_property_over_generated_widget_shape
         finally:
             await browser.close()
     failures = [f for r in results for f in r]
-    assert len(shapes) >= 295
     assert not failures, "\n".join(failures)
 
 
@@ -35482,6 +37401,137 @@ async def test_type_row_shape_classification(shape: str) -> None:
             assert got == outcome, r.content
 
 
+# A transparent layer the typing reveals covers the list ("on"), or covers it until the field is emptied.
+# __ROW_CLICK__: "commit" commits and closes, "inert" writes nothing, "revert_on_escape" commits and Escape reverts.
+_UNLANDED_CLICK_HTML = """
+<!doctype html><html><body style="margin:0;font:14px sans-serif">
+<label for="q">Code</label>
+<input id="q" type="text" autocomplete="off"
+       style="position:absolute;top:100px;left:40px;width:340px;height:26px">
+<div id="dd" __LIST__ style="position:absolute;top:132px;left:40px;width:340px;background:#fff"></div>
+<div id="shield" style="position:absolute;top:128px;left:0;width:600px;height:400px;display:none"></div>
+<script>
+var DATA = ['Alpha Ridge, North Unit, 1001', 'Alpha Ridge, South Unit, 1002', 'Birch Hollow, East Unit, 2001'];
+var SHIELD = '__SHIELD__';
+var ROW_CLICK = '__ROW_CLICK__';
+var TABLE = __TABLE__;
+var shieldGone = SHIELD === 'off';
+var input = document.getElementById('q');
+var dd = document.getElementById('dd');
+var shield = document.getElementById('shield');
+function commit(d) {
+  input.value = d;
+  input.setAttribute('data-committed', d);
+  if (ROW_CLICK === 'commit') { dd.innerHTML = ''; input.setAttribute('aria-expanded', 'false'); }
+}
+input.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' && ROW_CLICK === 'revert_on_escape') {
+    input.value = 'Birch Hollow';
+    dd.innerHTML = '';
+    input.setAttribute('aria-expanded', 'false');
+  }
+});
+input.addEventListener('input', function () {
+  var q = input.value.trim().toLowerCase();
+  dd.innerHTML = '';
+  if (!q) {
+    if (SHIELD === 'until_clear') shieldGone = true;
+    shield.style.display = 'none';
+    return;
+  }
+  shield.style.display = shieldGone ? 'none' : 'block';
+  var body = dd;
+  if (TABLE) {
+    dd.innerHTML = '<table style="width:100%;border-collapse:collapse"><tbody></tbody></table>';
+    body = dd.querySelector('tbody');
+  }
+  DATA.filter(function (d) { return d.toLowerCase().indexOf(q) === 0; }).forEach(function (d) {
+    var wrap = document.createElement(TABLE ? 'tbody' : 'div');
+    wrap.innerHTML = __ROW__;
+    var row = wrap.firstElementChild;
+    row.addEventListener('click', function () { if (ROW_CLICK !== 'inert') commit(d); });
+    body.appendChild(row);
+  });
+  input.setAttribute('aria-expanded', 'true');
+});
+</script>
+</body></html>
+"""
+
+_UNLANDED_ROWS: dict[str, tuple[str, dict[str, str]]] = {
+    "tr-onclick": (
+        "'<tr onclick=\"void 0\" style=\"cursor:pointer;height:24px;background:#eee\"><td>' + d + '</td></tr>'",
+        {"table": "true"},
+    ),
+    "role-option": (
+        "'<div role=\"option\" style=\"cursor:pointer;height:24px;background:#eee\">' + d + '</div>'",
+        {"table": "false", "list": 'role="listbox"'},
+    ),
+}
+
+_UNLANDED_TARGET = "Alpha Ridge, North Unit, 1001"
+
+
+def _unlanded_click_html(rows: str, *, shield: str, row_click: str = "commit") -> str:
+    row_js, opts = _UNLANDED_ROWS[rows]
+    return (
+        _UNLANDED_CLICK_HTML.replace("__ROW__", row_js)
+        .replace("__TABLE__", opts["table"])
+        .replace("__LIST__", opts.get("list", ""))
+        .replace("__SHIELD__", shield)
+        .replace("__ROW_CLICK__", row_click)
+    )
+
+
+_UNLANDED_TOOL_ARGS = {
+    "type": {"selector": "#q", "text": _UNLANDED_TARGET},
+    "select_option": {"selector": "#q", "label": _UNLANDED_TARGET},
+    "select_combobox": {"selector": "#q", "value": _UNLANDED_TARGET},
+}
+
+
+@pytest.mark.usefixtures("short_suggestion_row_click")
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shield", ["on", "off"])
+@pytest.mark.parametrize("rows", list(_UNLANDED_ROWS))
+@pytest.mark.parametrize("tool", list(_UNLANDED_TOOL_ARGS))
+async def test_a_suggestion_click_that_never_lands_is_not_reported_as_selected(
+    tool: str, rows: str, shield: str
+) -> None:
+    async with _live_page(_unlanded_click_html(rows, shield=shield)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, tool).handler(_UNLANDED_TOOL_ARGS[tool])
+        committed = await page.eval_on_selector("#q", "el => el.getAttribute('data-committed')")
+    content = _without_delta(r)
+    if shield == "off":
+        assert (r.status, committed) == ("ok", _UNLANDED_TARGET), content
+        return
+    assert r.error_class == "click_failed", content
+    assert committed is None, content
+    assert repr(_UNLANDED_TARGET) in content, content
+    assert "did not land" in content, content
+    assert "nothing was selected" in content, content
+    assert "clicked suggestion" not in content, content
+    assert "selected suggestion" not in content, content
+
+
+@pytest.mark.usefixtures("short_suggestion_row_click")
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_click", "error_class"), [("inert", "did_not_commit"), ("revert_on_escape", "commit_reverted")]
+)
+async def test_a_coarser_query_click_that_lands_reports_its_own_outcome(row_click: str, error_class: str) -> None:
+    # The first click is intercepted; the shield drops when the field is cleared, so the coarser
+    # query's row click lands and its own commit outcome is the one to report.
+    async with _live_page(_unlanded_click_html("role-option", shield="until_clear", row_click=row_click)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "select_combobox").handler(_UNLANDED_TOOL_ARGS["select_combobox"])
+    assert r.error_class == error_class, r.content
+    assert "did not land" not in r.content, r.content
+
+
 # A declared grid-combobox (aria-controls -> role=grid of role=gridcell rows) whose row click writes
 # the value back into the input and re-renders its own list OPEN, covering the field below it.
 _DECLARED_LIST_LINGERS_HTML = """
@@ -39282,6 +41332,7 @@ _SURFACE_OFF_TOOL_NAMES = frozenset(
         "look",
         "click",
         "hover",
+        "drag",
         "type",
         "select_option",
         "select_combobox",
@@ -41759,6 +43810,127 @@ document.getElementById('go').addEventListener('click', () => {
 
 @_skip_no_browser
 @pytest.mark.asyncio
+async def test_a_delta_whose_cap_only_held_old_lines_is_not_a_fresh_page_read() -> None:
+    # Held lines go out first and can fill the whole section, so this call's own new line is left out: the model
+    # still has not seen the page after the response, though the call's own read succeeded and found the line.
+    from skyvern.forge.taskv3.loop import ActivityRecency, make_finish_tool, run_agent_tool_loop  # noqa: PLC0415
+    from tests.unit.test_taskv3_loop import _FakeSubmissions  # noqa: PLC0415
+
+    html_page = """<!doctype html><html><body><button id="go" type="button">Load</button>
+<button id="more" type="button">Send</button><ul id="rows"></ul><script>
+document.getElementById('go').addEventListener('click', () => {
+  for (let i = 0; i < 40; i++) {
+    const li = document.createElement('li'); li.textContent = 'Row ' + i + ' ' + 'x'.repeat(40);
+    document.getElementById('rows').appendChild(li);
+  }
+});
+document.getElementById('more').addEventListener('click', () => {
+  const li = document.createElement('li'); li.textContent = 'Submission received ' + 'y'.repeat(90);
+  document.getElementById('rows').appendChild(li);
+});
+</script></body></html>"""
+    async with _live_page(html_page) as page:
+        submissions, activity = _FakeSubmissions(), ActivityRecency()
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+
+        async def click_then_response_lands(args: dict[str, Any]) -> Any:
+            result = await click.handler(args)
+            if args.get("selector") == "#go":
+                submissions.deliver()
+                await asyncio.sleep(taskv3_loop.SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            return result
+
+        tools = [dataclasses.replace(t, handler=click_then_response_lands) if t.name == "click" else t for t in tools]
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#go"})],
+            [("click", {"selector": "#more"})],
+            [("finish", {"status": "terminated", "reason": "r1"})],
+            [("finish", {"status": "terminated", "reason": "r2"})],
+        ]
+        outcome = await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools + [make_finish_tool(activity=activity, intercepted_submissions=submissions)],
+            max_turns=10,
+            max_tool_calls=20,
+            activity=activity,
+        )
+        clicks = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+        assert "Submission received" not in clicks[1] and "Row " in clicks[1], clicks[1]
+        assert (outcome.status, outcome.reason) == ("terminated", "r2")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_held_lines_flushed_after_a_failed_read_do_not_count_as_a_fresh_page_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lines held from an earlier read go out with the next call even when that call cannot read the page; that
+    # result shows old text, so a submission response that landed in between is still one the model has not seen.
+    import skyvern.utils.url_validators as urlv  # noqa: PLC0415
+    from skyvern.forge.taskv3.loop import ActivityRecency, make_finish_tool, run_agent_tool_loop  # noqa: PLC0415
+    from tests.unit.test_taskv3_loop import _FakeSubmissions  # noqa: PLC0415
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    served = {
+        "/": """<!doctype html><html><body><button id="go" type="button">Load</button>
+<a id="broken" href="/broken">Broken</a><ul id="rows"></ul><script>
+document.getElementById('go').addEventListener('click', () => {
+  for (let i = 0; i < 40; i++) {
+    const li = document.createElement('li'); li.textContent = 'Row ' + i; document.getElementById('rows').appendChild(li);
+  }
+});
+</script></body></html>""",
+        "/broken": """<!doctype html><html><body><p>Broken page</p><script>
+Object.defineProperty(window, '__skyvern_doc_nonce', { configurable: true, get() { throw new Error('x'); }, set() {} });
+</script></body></html>""",
+    }
+    async with _live_page("") as page:
+        await page.route(
+            "http://rows.test/**",
+            lambda route: route.fulfill(body=served[urlparse(route.request.url).path], content_type="text/html"),
+        )
+        await page.goto("http://rows.test/")
+        submissions, activity = _FakeSubmissions(), ActivityRecency()
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click")
+
+        async def click_then_response_lands(args: dict[str, Any]) -> Any:
+            result = await click.handler(args)
+            if args.get("selector") == "#go":
+                submissions.deliver()
+                await asyncio.sleep(taskv3_loop.SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            return result
+
+        tools = [dataclasses.replace(t, handler=click_then_response_lands) if t.name == "click" else t for t in tools]
+        script = [
+            [("observe", {})],
+            [("click", {"selector": "#go"})],
+            [("click", {"selector": "#broken"})],
+            [("finish", {"status": "terminated", "reason": "r1"})],
+            [("finish", {"status": "terminated", "reason": "r2"})],
+        ]
+        outcome = await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools + [make_finish_tool(activity=activity, intercepted_submissions=submissions)],
+            max_turns=10,
+            max_tool_calls=20,
+            activity=activity,
+        )
+        clicks = [m["content"] for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "click"]
+        # The second click's own read failed; all it carries is what the first click's read held back.
+        assert "before this call ran, the page newly showed" in clicks[1] and "Row 39" in clicks[1], clicks[1]
+        assert page.url == "http://rows.test/broken"
+        assert (outcome.status, outcome.reason) == ("terminated", "r2")
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "leave",
     ["click_link", "between_calls", "navigate_tool", "get_html", "same_document", "unreadable_landing", "past_bound"],
@@ -42180,6 +44352,7 @@ document.getElementById('email').addEventListener('input', () => {
 </script></body></html>"""
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_text_delta_reports_what_a_partial_read_did_not_show_and_says_how_many_calls_it_spans() -> None:
@@ -42699,6 +44872,7 @@ document.getElementById('pay').addEventListener('click', () => { document.getEle
 </script></body></html>"""
 
 
+@pytest.mark.usefixtures("short_action_timeout")
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_a_new_document_whose_first_read_times_out_is_seeded_by_the_next_action(
@@ -43419,6 +45593,126 @@ async def test_type_reads_every_field_back_and_names_what_it_holds(
         assert f"'{held}'" in r.content, r.content
 
 
+# A text field in a canvas-drawn app's accessibility tree: the app owns the value, starts editing the field on the
+# first animation frame after it gains focus, and then writes its own copy over the input. Text that lands in the
+# input before that frame never reaches the app. Frames are paced slow, as on an app painting in software, so a
+# single fill always lands before that frame. With window.__refuse set, the app also drops every edit it receives.
+_DEFERRED_EDITING_FIELD_HTML = """
+<flt-semantics-host>
+  <flt-semantics data-semantics-role="text-field"><input id="field" type="password" aria-label="Password"></flt-semantics>
+</flt-semantics-host>
+<input id="plain" type="password" aria-label="Other password">
+<script>
+  let frame = [];
+  window.requestAnimationFrame = (callback) => {
+    if (!frame.length) {
+      setTimeout(() => { const run = frame; frame = []; run.forEach((cb) => cb(performance.now())); }, 500);
+    }
+    frame.push(callback);
+    return frame.length;
+  };
+  const field = document.getElementById("field");
+  let held = "";
+  let editing = false;
+  field.addEventListener("focus", () => requestAnimationFrame(() => {
+    editing = true;
+    field.value = held;
+  }));
+  field.addEventListener("blur", () => { editing = false; });
+  field.addEventListener("input", () => {
+    if (!editing) return;
+    held = window.__refuse ? "" : field.value;
+    if (window.__refuse) requestAnimationFrame(() => { field.value = held; });
+  });
+</script>
+"""
+_SYNTHETIC_SECRET = "Zx9-synthetic-pass"
+_NEXT_TWO_FRAMES_JS = "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+_NO_FRAME_JS = "() => new Promise(() => {})"
+
+
+def _deferred_editing_tools(page: Any) -> Any:
+    return build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: _SYNTHETIC_SECRET if text == "placeholder_pw" else text,
+    )
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_keeps_a_secret_in_a_field_that_starts_editing_a_frame_after_focus() -> None:
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        r = await _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+        await page.evaluate(_NEXT_TWO_FRAMES_JS)
+        held = await page.eval_on_selector("#field", "el => el.value")
+    assert (r.status, held) == ("ok", _SYNTHETIC_SECRET), r.content
+    assert _SYNTHETIC_SECRET not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_reports_a_secret_a_deferred_editing_field_drops_as_not_held() -> None:
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        await page.evaluate("() => { window.__refuse = true; }")
+        r = await _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), r.content
+    assert _SYNTHETIC_SECRET not in r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_deferred_editing_field_fails_closed_when_no_frame_comes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "TWO_FRAMES_JS", _NO_FRAME_JS)
+    monkeypatch.setattr(taskv3_tools, "FRAME_SETTLE_TIMEOUT_SECONDS", 0.2)
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        started = time.monotonic()
+        r = await _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+        elapsed = time.monotonic() - started
+        held = await page.eval_on_selector("#field", "el => el.value")
+    assert (r.status, r.error_class) == ("error", "text_not_held"), r.content
+    assert held == "" and _SYNTHETIC_SECRET not in r.content
+    assert elapsed < 10, elapsed
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_a_deferred_editing_field_stops_when_cancelled_while_waiting_for_a_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "TWO_FRAMES_JS", _NO_FRAME_JS)
+    monkeypatch.setattr(taskv3_tools, "FRAME_SETTLE_TIMEOUT_SECONDS", 60.0)
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        typing = asyncio.ensure_future(
+            _tool(_deferred_editing_tools(page), "type").handler({"selector": "#field", "text": "placeholder_pw"})
+        )
+        for _ in range(200):
+            if await page.evaluate("() => document.activeElement?.id === 'field'"):
+                break
+            await asyncio.sleep(0.05)
+        typing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(typing, timeout=5)
+        held = await page.eval_on_selector("#field", "el => el.value")
+    assert held == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_type_into_an_ordinary_password_field_does_not_wait_for_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No frame ever comes, so a frame wait here would fail the type: an ordinary input must not take that path.
+    monkeypatch.setattr(taskv3_tools, "TWO_FRAMES_JS", _NO_FRAME_JS)
+    monkeypatch.setattr(taskv3_tools, "FRAME_SETTLE_TIMEOUT_SECONDS", 60.0)
+    async with _content_page(_DEFERRED_EDITING_FIELD_HTML) as page:
+        r = await asyncio.wait_for(
+            _tool(_deferred_editing_tools(page), "type").handler({"selector": "#plain", "text": "placeholder_pw"}),
+            timeout=30,
+        )
+        held = await page.eval_on_selector("#plain", "el => el.value")
+    assert (r.status, held) == ("ok", _SYNTHETIC_SECRET), r.content
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_type_does_not_press_enter_on_a_value_the_field_did_not_keep() -> None:
@@ -43859,3 +46153,1004 @@ async def test_select_combobox_reads_a_declared_sentence_row_longer_than_a_capti
     # The full value's own read admits the row; a shorter search reaching it would be a "searched" gate.
     gates = [e["gate"] for e in logs if e["event"] == "taskv3 choice match" and e["path"] == "typeahead"]
     assert gates == ["overlap"], gates
+
+
+def _replay_holding_page(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, CDPDownloadInterceptor]:
+    monkeypatch.setattr(cdp_download_interceptor, "_REPLAY_CANDIDATE_HANDLES", itertools.count(1))
+    monitor = MagicMock()
+    monitor.authorize_request.return_value = True
+    interceptor = CDPDownloadInterceptor(
+        output_dir=str(tmp_path), network_egress_monitor=monitor, redirect_hop_authorizer=AsyncMock()
+    )
+    context = MagicMock()
+    context.cookies = AsyncMock(return_value=[])
+    context._skyvern_cdp_download_interceptor = interceptor
+    interceptor._browser_context = context
+    page = MagicMock()
+    page.context = context
+    reply = MagicMock(body=b"account,amount\nA-1,12.50\n", content_type="text/csv", filename="export.csv", status=200)
+    monkeypatch.setattr(
+        cdp_download_interceptor.file_api, "fetch_file_bytes", AsyncMock(return_value=reply), raising=False
+    )
+    return page, interceptor
+
+
+@pytest.mark.parametrize("run_holds", [True, False], ids=["run-held", "watch-held"])
+@pytest.mark.asyncio
+async def test_closing_the_download_watch_ends_only_a_hold_it_began(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_holds: bool
+) -> None:
+    page, interceptor = _replay_holding_page(tmp_path, monkeypatch)
+    interceptor.set_replay_candidate_mode(run_holds)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    await watch.attach()
+    if not run_holds:
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    watch.close()
+    if run_holds:
+        # Admitted by the browser after the loop ended, while the run is still cleaning up.
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+
+    assert interceptor._replay_candidate_mode is run_holds
+    assert list(tmp_path.iterdir()) == [] and list(interceptor.replay_candidates()) == ["c1"]
+    if run_holds:
+        interceptor.set_replay_candidate_mode(False)
+        interceptor.invalidate_download_scope()
+        assert list(tmp_path.iterdir()) == [] and interceptor.replay_candidates() == {}
+    else:
+        await interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+        assert (tmp_path / "export.csv").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_reconnected_download_watch_ends_only_the_hold_it_began(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, original = _replay_holding_page(tmp_path / "a", monkeypatch)
+    second, reconnected = _replay_holding_page(tmp_path / "b", monkeypatch)
+    original.set_replay_candidate_mode(True)
+    pages = iter([first, second])
+
+    async def _provider() -> Any:
+        return next(pages)
+
+    watch = DownloadFailureWatch(_provider)
+    await watch.attach()
+    await watch.attach()
+    assert original._replay_candidate_mode and reconnected._replay_candidate_mode
+    watch.close()
+
+    assert original._replay_candidate_mode and not reconnected._replay_candidate_mode
+
+
+@pytest.mark.asyncio
+async def test_a_replay_from_an_earlier_hold_is_offered_unowned_once_the_watch_is_attached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page, interceptor = _replay_holding_page(tmp_path, monkeypatch)
+    released = asyncio.Event()
+    reply = MagicMock(body=b"account,amount\nA-1,12.50\n", content_type="text/csv", filename="export.csv", status=200)
+
+    async def _slow_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        await released.wait()
+        return reply
+
+    monkeypatch.setattr(cdp_download_interceptor.file_api, "fetch_file_bytes", _slow_fetch, raising=False)
+    interceptor.set_replay_candidate_mode(True)
+    in_flight = asyncio.ensure_future(
+        interceptor._download_url_directly("https://site.example/export.csv", "export.csv")
+    )
+    await asyncio.sleep(0)
+    interceptor.set_replay_candidate_mode(False)
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    await watch.attach()
+    released.set()
+    await in_flight
+
+    assert list(tmp_path.iterdir()) == [] and list(interceptor.replay_candidates()) == ["c1"]
+    delivered = watch.facts.deliver()
+    assert any(
+        "Download candidate c1 held" in fact and "its request began during an earlier block's hold" in fact
+        for fact in delivered
+    ), delivered
+    watch.close()
+
+
+# A one-time-code field that drops a key arriving too soon after the previous one: keystroke entry lands a partial code.
+_OTP_DROPPING_HTML = (
+    '<input id="code" type="text" maxlength="8" {ac}>'
+    "<script>let last = 0; document.getElementById('code').addEventListener('keydown', (e) => {"
+    " const now = performance.now(); if (now - last < 40) e.preventDefault(); else last = now; });</script>"
+)
+_OTP_FIELD = '<input id="code" type="text" autocomplete="one-time-code">'
+_OTP_TRUNCATING_HTML = (
+    _OTP_FIELD + "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    " e.target.value = e.target.value.slice(0, 3); });</script>"
+)
+
+
+def _no_code_digits(content: str, code: str) -> bool:
+    return not any(code[i : i + 3] in content for i in range(len(code) - 2))
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_that_drops_keys_ends_holding_the_whole_code() -> None:
+    async with _content_page(_OTP_DROPPING_HTML.replace("{ac}", 'autocomplete="one-time-code"')) as page:
+        with skyvern_context.scoped(SkyvernContext(task_id="tsk_v3", runtime_secret_values={"482913"})):
+            tools = build_browser_tools(_fixed_page_provider(page))
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+        assert await page.eval_on_selector("#code", "el => el.value") == "482913"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert _no_code_digits(r.content, "482913"), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_that_keeps_truncating_fails_closed_without_echoing() -> None:
+    async with _content_page(_OTP_TRUNCATING_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), (r.status, r.ok_class, r.content)
+    assert _no_code_digits(r.content, "012345") and "012" not in r.content, r.content
+    assert "012" not in json.dumps(logs, default=str)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_rewritten_after_the_write_settles_fails_closed() -> None:
+    html = _OTP_FIELD + "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    html += (
+        " if (e.target.value.length === 6) setTimeout(() => { e.target.value = e.target.value.slice(0, 3); }, 100); });"
+    )
+    html += "</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), (r.status, r.ok_class, r.content)
+    assert _no_code_digits(r.content, "482913"), r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_that_unmounts_itself_is_not_reported_entered() -> None:
+    html = '<div id="wrap">' + _OTP_FIELD + "</div><script>document.getElementById('code').addEventListener('input',"
+    html += " (e) => { if (e.target.value.length >= 3) document.getElementById('wrap').innerHTML = '<span>Checking</span>'; });"
+    html += "</script>"
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+    assert r.status == "error" and _no_code_digits(r.content, "482913"), (r.status, r.ok_class, r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_literal_one_time_code_with_a_leading_zero_lands_exactly_and_is_never_shown() -> None:
+    async with _content_page(_OTP_FIELD) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with capture_logs() as logs:
+            r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+            observed = await _tool(tools, "observe").handler({})
+        assert await page.eval_on_selector("#code", "el => el.value") == "012345"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert "12345" not in r.content and "12345" not in observed.content, observed.content
+    assert "12345" not in json.dumps(logs, default=str)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_too_short_for_the_code_keeps_the_ordinary_entry() -> None:
+    async with _content_page('<input id="code" type="text" maxlength="4" autocomplete="one-time-code">') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+        assert await page.eval_on_selector("#code", "el => el.value") == "4829"
+    assert r.ok_class == "held_differs", r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_ordinary_text_in_a_key_dropping_field_keeps_reporting_what_it_holds() -> None:
+    async with _content_page(_OTP_DROPPING_HTML.replace("{ac}", "")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "123456"})
+        held = await page.eval_on_selector("#code", "el => el.value")
+    assert held != "123456" and r.ok_class == "held_differs", (held, r.content)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_the_field_will_not_hold_withholds_the_verify_click_in_its_batch() -> None:
+    html = (
+        _OTP_TRUNCATING_HTML
+        + '<button id="verify" onclick="window.verified = (window.verified || 0) + 1">Verify</button>'
+    )
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        script = [
+            [("type", {"selector": "#code", "text": "012345"}), ("click", {"selector": "#verify"})],
+            [("finish", {"status": "failed", "reason": "code not entered"})],
+        ]
+        outcome = await taskv3_loop.run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools + [taskv3_loop.make_finish_tool()],
+            max_turns=10,
+            max_tool_calls=20,
+        )
+        verified = await page.evaluate("window.verified || 0")
+    assert verified == 0
+    messages = [m for m in outcome.messages if m.get("role") == "tool"]
+    assert any(m.get("name") == "click" and "skipped" in m["content"] for m in messages), messages
+    assert all("012" not in m["content"] for m in messages), messages
+
+
+_TRUNCATE_TO_3_JS = (
+    "<script>document.getElementById('code').addEventListener('input', (e) => {"
+    " e.target.value = e.target.value.slice(0, 3); });</script>"
+)
+# A field too small for a click to reach, so the type tool can only focus it; it also drops fast keys.
+_FOCUS_ONLY_DROPPING_HTML = (
+    '<input id="code" type="text" {ac} style="position:fixed;left:-200px;top:10px;width:120px">'
+    "<script>let last = 0; document.getElementById('code').addEventListener('keydown', (e) => {"
+    " const now = performance.now(); if (now - last < 40) e.preventDefault(); else last = now; });</script>"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_tel_one_time_code_field_that_keeps_truncating_fails_closed_without_echoing() -> None:
+    html = '<input id="code" type="tel" autocomplete="one-time-code">' + _TRUNCATE_TO_3_JS
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+    assert (r.status, r.error_class) == ("error", "text_not_held"), (r.status, r.ok_class, r.content)
+    assert _no_code_digits(r.content, "012345") and "012" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_literal_tel_one_time_code_lands_exactly_and_is_never_shown() -> None:
+    async with _content_page('<input id="code" type="tel" autocomplete="one-time-code">') as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345"})
+        observed = await _tool(tools, "observe").handler({})
+        assert await page.eval_on_selector("#code", "el => el.value") == "012345"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert "12345" not in r.content and "12345" not in observed.content, observed.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_ordinary_tel_field_that_truncates_keeps_reporting_what_it_holds() -> None:
+    async with _content_page('<input id="code" type="tel">' + _TRUNCATE_TO_3_JS) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "5551234"})
+    assert r.ok_class == "held_differs" and "'555'" in r.content, r.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_field_reached_only_by_focus_that_drops_keys_ends_holding_the_whole_code() -> None:
+    async with _content_page(_FOCUS_ONLY_DROPPING_HTML.replace("{ac}", 'autocomplete="one-time-code"')) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "482913"})
+        assert await page.eval_on_selector("#code", "el => el.value") == "482913"
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert _no_code_digits(r.content, "482913"), r.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_ordinary_text_reached_only_by_focus_that_drops_keys_is_reported_as_changed() -> None:
+    async with _content_page(_FOCUS_ONLY_DROPPING_HTML.replace("{ac}", "")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "123456"})
+        held = await page.eval_on_selector("#code", "el => el.value")
+    assert held != "123456" and (r.status, r.error_class) == ("error", "value_changed_by_page"), (held, r.content)
+
+
+# A form that never submits, recording every Enter it receives, around one field; `{field}` is the input's markup.
+_ENTER_FORM_HTML = (
+    '<form onsubmit="event.preventDefault()">{field}</form>'
+    "<script>window.enters = 0; document.addEventListener('keydown', (e) => { if (e.key === 'Enter') window.enters++; });"
+    "{script}</script>"
+)
+_TRUNCATE_LATER_JS = (
+    "document.getElementById('code').addEventListener('input', (e) => { if (e.target.value.length >= 6)"
+    " setTimeout(() => { e.target.value = e.target.value.slice(0, 3); }, 100); });"
+)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_literal_one_time_code_typed_with_enter_lands_exactly_is_never_shown_and_presses_enter() -> None:
+    field = '<input id="code" type="text" autocomplete="one-time-code">'
+    async with _content_page(_ENTER_FORM_HTML.replace("{field}", field).replace("{script}", "")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345", "press_enter": True})
+        observed = await _tool(tools, "observe").handler({})
+        assert await page.eval_on_selector("#code", "el => el.value") == "012345"
+        assert await page.evaluate("window.enters") == 1
+    assert r.status == "ok" and r.ok_class is None and not r.entry_unconfirmed, r.content
+    assert "12345" not in r.content and "12345" not in observed.content, observed.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_one_time_code_typed_with_enter_that_the_page_truncates_later_withholds_enter() -> None:
+    field = '<input id="code" type="text" autocomplete="one-time-code">'
+    html = _ENTER_FORM_HTML.replace("{field}", field).replace("{script}", _TRUNCATE_LATER_JS)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "012345", "press_enter": True})
+        enters = await page.evaluate("window.enters")
+    assert (r.status, r.error_class, enters) == ("error", "text_not_held", 0), (r.status, r.ok_class, enters, r.content)
+    assert "012" not in r.content and "345" not in r.content, r.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field_type", ["text", "tel"])
+async def test_an_ordinary_field_typed_with_enter_keeps_its_immediate_read_back(field_type: str) -> None:
+    field = f'<input id="code" type="{field_type}">'
+    html = _ENTER_FORM_HTML.replace("{field}", field).replace("{script}", _TRUNCATE_LATER_JS)
+    async with _content_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "type").handler({"selector": "#code", "text": "555123", "press_enter": True})
+        enters = await page.evaluate("window.enters")
+    assert (r.status, r.ok_class, enters) == ("ok", None, 1), (r.status, r.ok_class, enters, r.content)
+
+
+_MORE_BUTTON = "<button onclick='document.body.dataset.hit=1'>See more results</button>"
+_FRAMED_MORE_PAGE = (
+    "<!doctype html><html><body><h1>results</h1>"
+    + "".join(
+        f'<iframe srcdoc="<p>panel {i}</p><button>Open {i}</button>" width="400" height="80"></iframe>' for i in (1, 2)
+    )
+    + f'<iframe srcdoc="<p>panel 3</p>{_MORE_BUTTON}" width="400" height="80"></iframe></body></html>'
+)
+# The target two frames deep, below the fold, on a page that scrolls smoothly.
+_NESTED_SMOOTH_PAGE = (
+    "<!doctype html><html style='scroll-behavior:smooth'><body><h1>results</h1><div style='height:1400px'></div>"
+    "<iframe width='500' height='200' style='border:7px solid;padding:9px' srcdoc=\"<p>outer</p>"
+    "<iframe width='400' height='120' style='margin-left:40px' srcdoc='<p>inner</p>"
+    "<button onclick=&quot;document.body.dataset.hit=1&quot;>See more results</button>'></iframe>\"></iframe>"
+    "</body></html>"
+)
+
+
+def _transformed_frame_page(frame_style: str) -> str:
+    # A 400x200 frame whose target sits at (300, 100), with other controls at (200, 50) and (100, 100).
+    controls = (
+        "<button style='position:absolute;left:180px;top:40px;width:40px;height:20px' "
+        "onclick='document.body.dataset.hit=2'>Open other</button>"
+        "<button style='position:absolute;left:80px;top:90px;width:40px;height:20px' "
+        "onclick='document.body.dataset.hit=3'>Open mirrored</button>"
+        "<button style='position:absolute;left:280px;top:90px;width:40px;height:20px' "
+        "onclick='document.body.dataset.hit=1'>See more results</button>"
+    )
+    return (
+        "<!doctype html><html><body style='margin:0'><div style='height:250px'></div>"
+        f"<iframe width='400' height='200' style='border:0;{frame_style}' "
+        f'srcdoc="<body style=&quot;margin:0&quot;>{controls}"></iframe></body></html>'
+    )
+
+
+async def _framed_more_ref(tools: list[Any]) -> str:
+    observed = await _tool(tools, "observe").handler({})
+    match = re.search(r"^ref=(\d+) .*See more results", observed.content, re.MULTILINE)
+    assert match, observed.content
+    return f"ref={match.group(1)}"
+
+
+async def _hits(page: Any) -> list[str]:
+    return [h for h in [await frame.evaluate("() => document.body.dataset.hit || ''") for frame in page.frames] if h]
+
+
+def _driver_click_failure(monkeypatch: pytest.MonkeyPatch, call_log: str, before: Any = None) -> None:
+    # The driver's selector engine failing on a marker the resolver counts once, which offline Chromium never
+    # produces on its own; every other dispatch goes through unchanged.
+    real_click = input_dispatch.click
+
+    async def click(realm: Any, target: Any, **options: Any) -> None:
+        if isinstance(target, str) and target.startswith('[data-tv3-act="'):
+            if before is not None:
+                await before(realm, target)
+            raise _PlaywrightTimeout(
+                f'Timeout 15000ms exceeded.\nCall log:\n  - waiting for locator("{target}")\n{call_log}'
+            )
+        await real_click(realm, target, **options)
+
+    monkeypatch.setattr(input_dispatch, "click", click)
+
+
+def _spy_click_handle(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    calls: list[Any] = []
+    real_click_handle = input_dispatch.click_handle
+
+    async def click_handle(realm: Any, handle: Any, **options: Any) -> None:
+        calls.append(handle)
+        await real_click_handle(realm, handle, **options)
+
+    monkeypatch.setattr(input_dispatch, "click_handle", click_handle)
+    return calls
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "html",
+    [
+        _FRAMED_MORE_PAGE,
+        _NESTED_SMOOTH_PAGE,
+        _transformed_frame_page("transform:rotate(90deg);transform-origin:0 0;margin-left:300px"),
+        _transformed_frame_page("transform:scale(0.6);transform-origin:0 0"),
+        f"<!doctype html><html><body>{_MORE_BUTTON}</body></html>",
+    ],
+    ids=["child_frame", "nested_smooth_scroll", "rotated_frame", "scaled_frame", "main_frame"],
+)
+async def test_a_marker_the_driver_locator_cannot_find_is_clicked_through_its_live_handle(
+    monkeypatch: pytest.MonkeyPatch, html: str
+) -> None:
+    _driver_click_failure(monkeypatch, "")
+    handle_clicks = _spy_click_handle(monkeypatch)
+    async with _live_page(html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = await _framed_more_ref(tools)
+        started = time.monotonic()
+        result = await _tool(tools, "click").handler({"selector": ref})
+        elapsed = time.monotonic() - started
+        assert result.status == "ok", result.content
+        assert await _hits(page) == ["1"]
+    assert taskv3_loop._CLICK_PATH.get() == "handle"
+    assert len(handle_clicks) == 1
+    assert elapsed < 5
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_mark_the_driver_locator_cannot_find_is_clicked_through_its_live_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _driver_click_failure(monkeypatch, "")
+    handle_clicks = _spy_click_handle(monkeypatch)
+    async with _live_page(f"<!doctype html><html><body>{_MORE_BUTTON}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "look").handler({})
+        result = await _tool(tools, "click").handler({"mark": 1})
+        assert result.status == "ok", result.content
+        assert await _hits(page) == ["1"]
+    assert (taskv3_loop._CLICK_PATH.get(), len(handle_clicks)) == ("handle", 1)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_node_that_lost_its_token_before_the_fallback_is_stale_and_never_clicked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def strip_token(realm: Any, target: str) -> None:
+        await realm.evaluate("(sel) => document.querySelector(sel).removeAttribute('data-tv3-act')", target)
+
+    _driver_click_failure(monkeypatch, "", before=strip_token)
+    handle_clicks = _spy_click_handle(monkeypatch)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+        assert await _hits(page) == []
+    assert result.error_class == "stale_selector", result.content
+    assert handle_clicks == []
+
+
+async def _cover_marker(realm: Any, target: str) -> None:
+    await realm.evaluate(
+        "(sel) => { const r = document.querySelector(sel).getBoundingClientRect();"
+        " const d = document.createElement('div');"
+        " d.style.cssText = `position:fixed;left:${r.left - 4}px;top:${r.top - 4}px;"
+        "width:${r.width + 8}px;height:${r.height + 8}px;z-index:9`; document.body.appendChild(d); }",
+        target,
+    )
+
+
+async def _cover_hosting_frame_in_parent(realm: Any, target: str) -> None:
+    await realm.page.evaluate(
+        "() => { const r = document.querySelectorAll('iframe')[2].getBoundingClientRect();"
+        " const d = document.createElement('div');"
+        " d.style.cssText = `position:fixed;left:${r.left}px;top:${r.top}px;"
+        "width:${r.width}px;height:${r.height}px;z-index:9`; document.body.appendChild(d); }"
+    )
+
+
+async def _disable_marker(realm: Any, target: str) -> None:
+    await realm.evaluate("(sel) => { document.querySelector(sel).disabled = true; }", target)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "obstruct",
+    [_cover_marker, _cover_hosting_frame_in_parent, _disable_marker],
+    ids=["in_frame", "in_parent", "disabled"],
+)
+async def test_the_handle_fallback_clicks_nothing_the_driver_would_not_click(
+    monkeypatch: pytest.MonkeyPatch, obstruct: Any
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 800)
+    _driver_click_failure(monkeypatch, "", before=obstruct)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        ref = await _framed_more_ref(tools)
+        try:
+            result = await _tool(tools, "click").handler({"selector": ref})
+        except _PlaywrightTimeout:
+            result = None
+        assert result is None or result.status == "error", result.content
+        assert await _hits(page) == []
+    assert taskv3_loop._CLICK_PATH.get() == "handle_failed"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_cover_whose_text_says_not_attached_reads_as_covered_not_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def cover_with_text(realm: Any, target: str) -> None:
+        await _cover_marker(realm, target)
+        await realm.evaluate("() => { document.body.lastElementChild.textContent = 'Resume not attached'; }")
+
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 800)
+    _driver_click_failure(monkeypatch, "", before=cover_with_text)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result = await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+    assert result.status == "error" and result.error_class != "stale_selector", result.content
+    assert taskv3_loop._CLICK_PATH.get() == "handle_failed"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_marker_whose_element_is_gone_fails_fast_as_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def remove(realm: Any, target: str) -> None:
+        await realm.evaluate("(sel) => document.querySelector(sel).remove()", target)
+
+    _driver_click_failure(monkeypatch, "", before=remove)
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        gone = await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+    assert gone.error_class == "stale_selector", gone.content
+    assert taskv3_loop._CLICK_PATH.get() == "stale"
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_an_actionability_timeout_never_takes_the_handle_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    _driver_click_failure(
+        monkeypatch,
+        "  - locator resolved to <button>See more results</button>\n  - waiting for element to be visible\n",
+    )
+    async with _live_page(_FRAMED_MORE_PAGE) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        with pytest.raises(_PlaywrightTimeout):
+            await _tool(tools, "click").handler({"selector": await _framed_more_ref(tools)})
+        assert await _hits(page) == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_fallback_trigger_reads_the_installed_driver_call_log() -> None:
+    # The trigger matches call-log text, which is not driver API: this reds when a driver upgrade rewords it.
+    async with _live_page("<button style='display:none'>hidden</button>") as page:
+        with pytest.raises(_PlaywrightTimeout) as missing:
+            await page.click('[data-tv3-act="absent"]', timeout=300)
+        with pytest.raises(_PlaywrightTimeout) as hidden:
+            await page.click("button", timeout=300)
+    assert taskv3_tools._locator_never_resolved(missing.value)
+    assert not taskv3_tools._locator_never_resolved(hidden.value)
+
+
+def _remounting_typeahead_page(remount: str) -> str:
+    # A typeahead whose framework replaces its input node once and focuses the replacement: on focus, on Delete in the
+    # empty field, or on the input event that empties a stale query. "none" keeps one node throughout; "label" writes
+    # the committed label into the input on focus; "other" drops the field on focus and moves the caret elsewhere.
+    return (
+        "<!doctype html><html><body><span id='st-label'>State</span>"
+        "<div id='ctl' style='border:1px solid;width:300px'>"
+        f"<div id='single'>{'Utah' if remount == 'label' else ''}</div><span id='slot'></span></div>"
+        "<div id='menu' role='listbox' aria-labelledby='st-label'></div>"
+        "<span id='city-label'>City</span><input id='city' aria-labelledby='city-label'><script>"
+        f"const REMOUNT = {remount!r}; window.remounted = false; window.dropped = [];"
+        "const OPTIONS = ['Texas', 'Tennessee', 'Utah', 'Vermont'];"
+        "function mount(value, focus) {"
+        "  const old = document.getElementById('st'); const el = document.createElement('input');"
+        "  el.id = 'st'; el.autocomplete = 'off'; el.value = value; el.setAttribute('role', 'combobox');"
+        "  el.setAttribute('aria-autocomplete', 'list'); el.setAttribute('aria-labelledby', 'st-label');"
+        "  el.setAttribute('aria-controls', 'menu'); el.setAttribute('aria-expanded', 'false');"
+        "  el.addEventListener('focus', onFocus); el.addEventListener('input', onInput);"
+        "  el.addEventListener('keydown', onKey);"
+        "  el.addEventListener('keydown', e => { if (el.readOnly) window.dropped.push(e.key); });"
+        "  if (old) old.replaceWith(el); else document.getElementById('slot').appendChild(el);"
+        "  if (focus) el.focus(); return el; }"
+        "function remountOnce(el) {"
+        "  if (window.remounted) return el; window.remounted = true; return mount(el.value, true); }"
+        "function onFocus(e) {"
+        "  if (REMOUNT === 'focus') queueMicrotask(() => remountOnce(e.target));"
+        "  if (REMOUNT === 'label') e.target.value = document.getElementById('single').textContent;"
+        "  if (REMOUNT === 'readonly') {"
+        "    e.target.readOnly = true; setTimeout(() => { e.target.readOnly = false; }, 800); }"
+        "  if (REMOUNT === 'other')"
+        "    queueMicrotask(() => { e.target.remove(); document.getElementById('city').focus(); }); }"
+        "function onKey(e) { if (REMOUNT === 'delete' && e.key === 'Delete' && !e.target.value)"
+        "  queueMicrotask(() => remountOnce(e.target)); }"
+        "function onInput(e) {"
+        "  const el = REMOUNT === 'clear' && !e.target.value ? remountOnce(e.target) : e.target; render(el); }"
+        "function render(el) {"
+        "  const menu = document.getElementById('menu'); menu.innerHTML = ''; const q = el.value.toLowerCase();"
+        "  if (!q) { el.setAttribute('aria-expanded', 'false'); return; }"
+        "  for (const o of OPTIONS.filter(o => o.toLowerCase().startsWith(q))) {"
+        "    const row = document.createElement('div'); row.setAttribute('role', 'option'); row.textContent = o;"
+        "    row.addEventListener('mousedown', ev => { ev.preventDefault();"
+        "      document.getElementById('single').textContent = o; const cur = document.getElementById('st');"
+        "      cur.value = ''; menu.innerHTML = ''; cur.setAttribute('aria-expanded', 'false'); });"
+        "    menu.appendChild(row); }"
+        "  el.setAttribute('aria-expanded', 'true'); }"
+        f"mount({'Te' if remount == 'clear' else ''!r}, false);</script></body></html>"
+    )
+
+
+async def _select_state(page: Any) -> ToolResult:
+    tools = build_browser_tools(_fixed_page_provider(page))
+    observed = await _tool(tools, "observe").handler({})
+    match = re.search(r"^ref=(\d+) .*combobox", observed.content, re.MULTILINE)
+    assert match, observed.content
+    return await _tool(tools, "select_combobox").handler({"selector": f"ref={match.group(1)}", "value": "Texas"})
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remount", "replaced"),
+    [("focus", True), ("delete", False), ("clear", True), ("label", False), ("none", False)],
+)
+async def test_select_combobox_commits_on_a_typeahead_whose_input_node_is_replaced(
+    remount: str, replaced: bool
+) -> None:
+    # "delete" stays one node because an empty field is never cleared, so no Delete reaches it.
+    async with _live_page(_remounting_typeahead_page(remount)) as page:
+        result = await _select_state(page)
+        committed = await page.evaluate("document.getElementById('single').textContent")
+        remounted = await page.evaluate("window.remounted")
+    assert (result.status, committed, remounted) == ("ok", "Texas", replaced), result.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_types_into_a_different_field_that_took_the_caret() -> None:
+    async with _live_page(_remounting_typeahead_page("other")) as page:
+        with pytest.raises(_PlaywrightTimeout) as raised:
+            await _select_state(page)
+        city = await page.evaluate("document.getElementById('city').value")
+    assert (_locator_never_resolved(raised.value), city) == (True, "")
+
+
+def _sectioned_typeahead_page(layout: dict[str, Any]) -> str:
+    # Repeated sections, each a typeahead that commits into its own section, named by a shared name or aria-label or by
+    # its own generated id. On its first focus the addressed input is replaced, the replacement goes into its own slot
+    # or another section's, and the caret goes to the replacement, a sibling, a same-named decoy or nowhere.
+    decoy_naming = "name='q'" if layout["naming"] == "id" else layout["naming"]
+    sections = "".join(
+        f"<section><div class='single'></div><span class='slot'></span><div class='menu' role='listbox'></div>"
+        f"{'<input class=decoy ' + decoy_naming + '>' if i in layout['decoys'] else ''}</section>"
+        for i in range(layout["count"])
+    )
+    return (
+        f"<!doctype html><html><body>{sections}<script>"
+        f"const L = {json.dumps(layout)}; window.replaced = false;"
+        "const OPTIONS = ['Texas', 'Tennessee', 'Utah'];"
+        "const secs = [...document.querySelectorAll('section')];"
+        "function make(sec) {"
+        "  const el = document.createElement('input'); el.setAttribute('role', 'combobox'); el.autocomplete = 'off';"
+        "  if (L.naming === 'id') el.id = 'react-select-' + secs.indexOf(sec) + '-input';"
+        "  else { const [k, v] = L.naming.split('='); el.setAttribute(k, v.replace(/'/g, '')); }"
+        "  el.addEventListener('focus', onFocus); el.addEventListener('input', () => render(el, sec)); return el; }"
+        "function onFocus(e) {"
+        "  const el = e.target; if (window.replaced || el !== window.target) return;"
+        "  queueMicrotask(() => { window.replaced = true; const rep = make(window.targetSec);"
+        "    el.remove(); secs[L.into].querySelector('.slot').appendChild(rep);"
+        "    const sib = secs[L.sibling].querySelector(L.caret === 'decoy' ? '.decoy' : 'input[role=combobox]');"
+        "    if (L.caret === 'replacement') rep.focus(); else if (L.caret === 'none') document.activeElement.blur();"
+        "    else (sib || rep).focus(); }); }"
+        "function render(el, sec) {"
+        "  const menu = sec.querySelector('.menu'); menu.innerHTML = ''; const q = el.value.toLowerCase();"
+        "  if (!q) return;"
+        "  for (const o of OPTIONS.filter(o => o.toLowerCase().startsWith(q))) {"
+        "    const row = document.createElement('div'); row.setAttribute('role', 'option'); row.textContent = o;"
+        "    row.addEventListener('mousedown', ev => { ev.preventDefault();"
+        "      sec.querySelector('.single').textContent = o; el.value = ''; menu.innerHTML = ''; });"
+        "    menu.appendChild(row); } }"
+        "secs.forEach((sec, i) => { const el = make(sec); sec.querySelector('.slot').appendChild(el);"
+        "  if (i === L.target) { window.target = el; window.targetSec = sec; } });"
+        "</script></body></html>"
+    )
+
+
+def _sectioned_layouts(seed: int, n: int) -> list[dict[str, Any]]:
+    rng = random.Random(seed)
+    layouts = []
+    for _ in range(n):
+        count = rng.randint(2, 4)
+        layouts.append(
+            {
+                "count": count,
+                "target": rng.randrange(count),
+                "sibling": rng.randrange(count),
+                "into": rng.randrange(count),
+                "naming": rng.choice(["name='q'", "aria-label='Search'", "id"]),
+                "decoys": rng.sample(range(count), rng.randint(0, count)),
+                "caret": rng.choice(["replacement", "sibling", "decoy", "none"]),
+            }
+        )
+    return layouts
+
+
+async def _section_states(page: Any) -> list[tuple[str, list[str]]]:
+    return await page.evaluate(
+        "[...document.querySelectorAll('section')].map(s => [s.querySelector('.single').textContent,"
+        " [...s.querySelectorAll('input')].map(i => i.value)])"
+    )
+
+
+_SECTIONED_LAYOUTS = _sectioned_layouts(seed=19040, n=30)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", _SECTIONED_LAYOUTS, ids=[f"layout-{i:02d}" for i in range(len(_SECTIONED_LAYOUTS))])
+async def test_select_combobox_after_a_replaced_input_writes_only_to_the_addressed_section(
+    monkeypatch: pytest.MonkeyPatch, layout: dict[str, Any]
+) -> None:
+    # Property: whatever happens to the addressed input, no other section changes. A replacement is followed only when
+    # the ref's recorded selector (here the id) names it alone and it holds the caret; without one the call fails.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    async with _live_page(_sectioned_typeahead_page(layout)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        refs = re.findall(r"^ref=(\d+) .*combobox", observed.content, re.MULTILINE)
+        assert len(refs) == layout["count"], (layout, observed.content)
+        try:
+            result = await _tool(tools, "select_combobox").handler(
+                {"selector": f"ref={refs[layout['target']]}", "value": "Texas"}
+            )
+        except Exception:
+            result = None
+        states = await _section_states(page)
+    others = [state for i, state in enumerate(states) if i != layout["target"]]
+    assert all(single == "" and not any(values) for single, values in others), (layout, states)
+    if layout["naming"] != "id":
+        assert result is None and states[layout["target"]][0] == "", (layout, result, states)
+    elif layout["caret"] == "replacement" and layout["into"] == layout["target"]:
+        assert result is not None and result.status == "ok", (layout, result)
+        assert states[layout["target"]][0] == "Texas", (layout, states)
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_follows_a_replaced_input_into_a_same_named_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    layout = {"count": 2, "target": 1, "sibling": 0, "into": 1, "naming": "name='q'", "decoys": [], "caret": "sibling"}
+    async with _live_page(_sectioned_typeahead_page(layout)) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        refs = re.findall(r"^ref=(\d+) .*combobox", observed.content, re.MULTILINE)
+        with pytest.raises(_PlaywrightTimeout) as raised:
+            await _tool(tools, "select_combobox").handler({"selector": f"ref={refs[1]}", "value": "Texas"})
+        states = await _section_states(page)
+    assert (_locator_never_resolved(raised.value), states) == (True, [["", [""]], ["", [""]]])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_keeps_the_last_chip_of_an_empty_field_that_lost_the_caret_on_focus() -> None:
+    # The field gives the caret away on the tool's click and on its focus repair, so the caret probe reads false and only
+    # the chip check keeps the clear's Delete away from the last chip.
+    page_html = (
+        "<!doctype html><html><body><div id='box'><span class='chip'>Chile"
+        "<button type='button' aria-label='Remove'>x</button></span>"
+        "<input id='countries' role='combobox' aria-label='Countries' autocomplete='off'></div>"
+        "<input id='aux' aria-label='Notes'><script>let focuses = 0;"
+        "const f = document.getElementById('countries');"
+        "f.addEventListener('focus', () => { if (focuses++ < 2)"
+        "  queueMicrotask(() => document.getElementById('aux').focus()); });"
+        "f.addEventListener('keydown', e => { if ((e.key === 'Delete' || e.key === 'Backspace') && !f.value) {"
+        "  const chips = document.querySelectorAll('.chip'); if (chips.length) chips[chips.length - 1].remove(); } });"
+        "</script></body></html>"
+    )
+    async with _live_page(page_html) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        match = re.search(r"^ref=(\d+) .*combobox", observed.content, re.MULTILINE)
+        assert match, observed.content
+        with contextlib.suppress(Exception):
+            await _tool(tools, "select_combobox").handler({"selector": f"ref={match.group(1)}", "value": "Texas"})
+        chips = await page.evaluate("[...document.querySelectorAll('.chip')].map(c => c.firstChild.textContent)")
+    assert chips == ["Chile"]
+
+
+async def _select_texas_on(page: Any, line: str) -> ToolResult | None:
+    tools = build_browser_tools(_fixed_page_provider(page))
+    observed = await _tool(tools, "observe").handler({})
+    match = re.search(rf"^ref=(\d+) .*{line}", observed.content, re.MULTILINE)
+    assert match, observed.content
+    try:
+        return await _tool(tools, "select_combobox").handler({"selector": f"ref={match.group(1)}", "value": "Texas"})
+    except Exception:
+        return None
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_follows_a_positional_selector_off_a_still_connected_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A shadow-root tag field records an nth-of-type tail. On focus it strips its data attributes and focuses a draft
+    # input inserted before the addressed one, which the tail now names; the addressed field is still on the page.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    page_html = (
+        "<!doctype html><html><body><tag-field id='tags'></tag-field><script>window.draft = [];"
+        "customElements.define('tag-field', class extends HTMLElement { connectedCallback() {"
+        "  const root = this.attachShadow({mode: 'open'});"
+        "  root.innerHTML = \"<input role='combobox' aria-label='Primary tag'>\""
+        "    + \"<input role='combobox' aria-label='Secondary tag'>\";"
+        "  const target = root.querySelectorAll('input')[1];"
+        "  target.addEventListener('focus', () => queueMicrotask(() => { if (window.edited) return;"
+        "    window.edited = true;"
+        "    for (const a of target.getAttributeNames()) if (a.startsWith('data-')) target.removeAttribute(a);"
+        "    const d = document.createElement('input'); d.setAttribute('role', 'combobox');"
+        "    d.addEventListener('input', () => window.draft.push(d.value)); target.before(d); d.focus(); })); } });"
+        "</script></body></html>"
+    )
+    async with _live_page(page_html) as page:
+        await _select_texas_on(page, "Secondary tag")
+        draft = await page.evaluate("window.draft")
+    assert draft == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_follows_a_field_into_a_page_the_focus_click_navigated_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Focusing the field sends the page to a sign-in page whose autofocused field has the same id.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    pages = {
+        "form": "<!doctype html><html><body><input id='email' role='combobox' aria-label='Contact email'><script>"
+        "document.getElementById('email').addEventListener('focus',"
+        " () => location.assign('https://app.example.test/signin'));</script></body></html>",
+        "signin": "<!doctype html><html><body><input id='email' aria-label='Work email'><script>window.typed = [];"
+        "const f = document.getElementById('email'); f.addEventListener('input', () => window.typed.push(f.value));"
+        "f.focus();</script></body></html>",
+    }
+    async with _live_page("<!doctype html><html><body></body></html>") as page:
+        await page.route(
+            "https://app.example.test/**",
+            lambda route: route.fulfill(content_type="text/html", body=pages[route.request.url.rsplit("/", 1)[1]]),
+        )
+        await page.goto("https://app.example.test/form")
+        await _select_texas_on(page, "Contact email")
+        await page.wait_for_load_state()
+        landed = (page.url, await page.evaluate("window.typed"))
+    assert landed == ("https://app.example.test/signin", [])
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_follows_a_replaced_field_whose_marker_write_tags_two_elements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The replacement mirrors its data attributes onto a notes field earlier on the page, so the marker names two.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    page_html = (
+        "<!doctype html><html><body><input id='notes' aria-label='Notes'><span id='slot'></span><script>"
+        "window.notes = []; const notes = document.getElementById('notes');"
+        "notes.addEventListener('input', () => window.notes.push(notes.value));"
+        "function make() { const el = document.createElement('input'); el.id = 'st';"
+        "  el.setAttribute('role', 'combobox'); el.setAttribute('aria-label', 'State'); return el; }"
+        "const first = make(); document.getElementById('slot').appendChild(first);"
+        "first.addEventListener('focus', () => queueMicrotask(() => { const rep = make();"
+        "  rep.setAttribute = function (n, v) { if (n.startsWith('data-')) notes.setAttribute(n, v);"
+        "    return Element.prototype.setAttribute.call(this, n, v); };"
+        "  first.replaceWith(rep); rep.focus(); }));"
+        "</script></body></html>"
+    )
+    async with _live_page(page_html) as page:
+        await _select_texas_on(page, "State")
+        notes = await page.evaluate("window.notes")
+    assert notes == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_waits_out_a_field_that_turns_read_only_on_focus() -> None:
+    async with _live_page(_remounting_typeahead_page("readonly")) as page:
+        result = await _select_state(page)
+        committed = await page.evaluate("document.getElementById('single').textContent")
+        dropped = await page.evaluate("window.dropped")
+    assert (result.status, committed, dropped) == ("ok", "Texas", []), result.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_never_follows_a_field_into_a_reloaded_twin_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two frames share one url, so neither document can be named; focusing the field reloads its frame, whose new
+    # document autofocuses a field the same selector names.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    frame = (
+        "<input id='st' role='combobox' aria-label='Region'><script>const f = document.getElementById('st');"
+        "f.addEventListener('input', () => { if (parent.reloaded) parent.typed.push(f.value); });"
+        "f.addEventListener('focus', () => { if (!parent.reloaded) { parent.reloaded = true; location.reload(); } });"
+        "if (parent.reloaded) f.focus();</script>"
+    )
+    page_html = (
+        "<!doctype html><html><body><script>window.typed = []; window.reloaded = false;</script>"
+        f'<iframe srcdoc="{frame}"></iframe><iframe srcdoc="{frame}"></iframe></body></html>'
+    )
+    async with _live_page(page_html) as page:
+        await page.wait_for_function(
+            "() => [...document.querySelectorAll('iframe')].every(f => f.contentDocument"
+            " && f.contentDocument.getElementById('st'))"
+        )
+        await _select_texas_on(page, "Region")
+        typed = await page.evaluate("window.typed")
+    assert typed == []
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_write", ["no-op", "throw"])
+async def test_select_combobox_strips_the_marker_a_replaced_field_sent_to_another_element(
+    after_write: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The replacement sends its data attribute writes to a notes field only; "throw" also makes the write's
+    # connectedness read throw, so the follow fails by exception instead of by read-back.
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    page_html = (
+        "<!doctype html><html><body><input id='notes' aria-label='Notes' value='keep me'><span id='slot'></span>"
+        "<script>const notes = document.getElementById('notes');"
+        "function make() { const el = document.createElement('input'); el.id = 'st';"
+        "  el.setAttribute('role', 'combobox'); el.setAttribute('aria-label', 'State'); return el; }"
+        "const first = make(); document.getElementById('slot').appendChild(first);"
+        "first.addEventListener('focus', () => queueMicrotask(() => { const rep = make();"
+        "  rep.setAttribute = function (n, v) { return n.startsWith('data-') ? notes.setAttribute(n, v)"
+        "    : Element.prototype.setAttribute.call(this, n, v); };"
+        f"  if ({json.dumps(after_write == 'throw')})"
+        "    Object.defineProperty(rep, 'isConnected', { get() { throw 1; } });"
+        "  first.replaceWith(rep); rep.focus(); }));"
+        "</script></body></html>"
+    )
+    async with _live_page(page_html) as page:
+        await _select_texas_on(page, "State")
+        notes = await page.evaluate("[notes.value, notes.getAttribute('data-tv3-act')]")
+    assert notes == ["keep me", None]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_select_combobox_releases_the_handle_of_a_replaced_field_it_followed() -> None:
+    async with _live_page(_remounting_typeahead_page("focus")) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        ref = re.search(r"^ref=(\d+) .*combobox", observed.content, re.MULTILINE)
+        assert ref, observed.content
+        result = await _tool(tools, "select_combobox").handler({"selector": f"ref={ref.group(1)}", "value": "Texas"})
+        assert (result.status, await page.evaluate("window.remounted")) == ("ok", True), result.content
+        await page.evaluate("window.gone = new WeakRef(document.getElementById('st')); window.gone.deref().remove()")
+        await _tool(tools, "observe").handler({})
+        await (await page.context.new_cdp_session(page)).send("HeapProfiler.collectGarbage")
+        released = await page.evaluate("window.gone.deref() === undefined")
+    assert released

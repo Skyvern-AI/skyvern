@@ -65,6 +65,12 @@ def test_sanitize_postgres_text__unicode_text() -> None:
     assert result == unicode_text
 
 
+def test_sanitize_postgres_text__surrogates() -> None:
+    result = sanitize_postgres_text("high:\ud800 low:\udc00 pair:\ud83d\ude00 emoji:😀\x00")
+    assert result == "high:\ufffd low:\ufffd pair:😀 emoji:😀"
+    assert result.encode("utf-8")
+
+
 def test_sanitize_postgres_text__real_world_pdf_scenario() -> None:
     """Test a realistic scenario with PDF extraction artifacts."""
     # Simulate what might come from a PDF extraction

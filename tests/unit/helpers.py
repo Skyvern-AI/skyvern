@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,9 +21,11 @@ from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.models import LLMRouterConfig, LLMRouterModelConfig
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.executor.run_liveness import RunWriteAuthority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.taskv3.loop import JUSTIFY_HOLD_MESSAGE
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.action_redaction import REDACTED_INPUT_VALUE, REDACTED_OTP_VALUE
 from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
@@ -38,6 +41,22 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from tests.unit.scoped_asyncio import ScopedAsyncio
+
+
+def held_finish_restated(history: Sequence[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """The finish the justification hold answered in the last model turn, made again as a model with a real reason
+    would; an empty turn when the last turn had no held finish."""
+    calls: dict[str, Any] = {}
+    restated: list[tuple[str, dict[str, Any]]] = []
+    for message in history:
+        if message.get("role") == "assistant":
+            calls = {call["id"]: call["function"] for call in message.get("tool_calls") or []}
+            restated = []
+        elif message.get("role") == "tool" and message.get("content") == JUSTIFY_HOLD_MESSAGE:
+            function = calls.get(message.get("tool_call_id"))
+            if function is not None and function.get("name") == "finish":
+                restated = [("finish", json.loads(function.get("arguments") or "{}"))]
+    return restated
 
 
 class FakeLLMResponse:
@@ -429,7 +448,44 @@ class InMemoryTaskStepRepo:
                 setattr(task, key, value)
         return task, finish_claimed
 
-    async def update_step(self, task_id: str, step_id: str, organization_id: str | None = None, **updates: Any) -> Step:
+    async def update_task_and_claim_finish_for_cancel(
+        self,
+        task_id: str,
+        organization_id: str | None,
+        audit_actor: Any = None,
+        failure_reason: str | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        extracted_information: dict[str, Any] | list | str | None = None,
+        webhook_failure_reason: str | None = None,
+    ) -> tuple[Task, bool, bool]:
+        task = self.task
+        assert task is not None and task.task_id == task_id, f"no task {task_id}"
+        if task.status.is_final():
+            return task, False, False
+
+        finish_claimed = task.finished_at is None
+        task.status = TaskStatus.canceled
+        if finish_claimed:
+            task.finished_at = datetime.now(UTC)
+        if failure_reason is not None:
+            task.failure_reason = failure_reason
+        if errors is not None:
+            task.errors = [*(task.errors or []), *errors]
+        if extracted_information is not None:
+            task.extracted_information = extracted_information
+        if webhook_failure_reason is not None:
+            task.webhook_failure_reason = webhook_failure_reason
+        return task, finish_claimed, True
+
+    async def update_step(
+        self,
+        task_id: str,
+        step_id: str,
+        organization_id: str | None = None,
+        *,
+        write_authority_for_run: Callable[[str], RunWriteAuthority | None] | None = None,
+        **updates: Any,
+    ) -> Step:
         assert self.step is not None and self.step.step_id == step_id, f"no step {step_id}"
         for key, value in updates.items():
             if key in _STEP_COUNTER_COLUMNS:
@@ -460,6 +516,7 @@ class InMemoryTaskStepRepo:
             "get_task",
             "update_task",
             "update_task_and_claim_finish",
+            "update_task_and_claim_finish_for_cancel",
             "update_step",
             "get_first_step",
             "get_task_steps",

@@ -229,4 +229,4 @@ async def test_a_crashed_page_that_refuses_to_close_stays_watchable() -> None:
 
     assert crashed in state._crash_listener_pages
     state._register_disconnect_listeners(state.browser_context)
-    assert crashed.on.call_count == 1
+    assert [call.args for call in crashed.on.call_args_list].count(("crash", state._on_page_crashed)) == 1

@@ -79,6 +79,9 @@ class TranscriptContext(BaseModel):
     omitted_any: bool
 
 
+COPILOT_TESTS_ENDED_AFTER_THEIR_TURN_KEY = "copilot_tests_ended_after_their_turn"
+
+
 class RunContext(BaseModel):
     """The prior run, typed. A rendered sentence cannot say which error code fired or which line
     raised, and those are the facts a repair acts on."""
@@ -127,6 +130,7 @@ class TurnContextPacket(BaseModel):
     user_goal_context: UserGoalContext | None = None
     transcript_context: TranscriptContext
     run_context: RunContext | None = None
+    copilot_tests_ended_after_their_turn: list[RunContext] | None = None
     credential_context: CredentialContext | None = None
     attached_file_context: AttachedFileContext | None = None
     omissions: list[TurnContextOmission] = Field(default_factory=list)
@@ -139,6 +143,7 @@ class TurnContextPacket(BaseModel):
             "runnable_draft_context",
             "user_goal_context",
             "run_context",
+            "copilot_tests_ended_after_their_turn",
             "credential_context",
             "attached_file_context",
         )
@@ -161,6 +166,7 @@ class TurnContextInputs(BaseModel):
     prior_workflow_yaml: str = ""
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list)
     prior_run_packet: dict[str, Any] | None = None
+    copilot_test_packets: list[dict[str, Any]] = Field(default_factory=list)
     attached_files: list[CopilotAttachedFile] = Field(default_factory=list)
 
 
@@ -320,6 +326,9 @@ class TurnContextAssembler:
             user_goal_context=user_goal_context,
             transcript_context=transcript_context,
             run_context=run_context,
+            copilot_tests_ended_after_their_turn=(
+                [RunContext(packet=packet) for packet in inputs.copilot_test_packets] or None
+            ),
             credential_context=credential_context,
             attached_file_context=attached_file_context,
             omissions=omissions,

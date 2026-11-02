@@ -5,6 +5,9 @@ apply one policy (SKY-14103)."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
+
 import tldextract
 
 from skyvern.forge.sdk.browser_action_policy import _DEFAULT_PORTS, BrowserOrigin, canonicalize_origin
@@ -49,15 +52,28 @@ def same_site(current_url: str | None, granted_url: str) -> bool:
 
 def same_release_scope(current_url: str | None, granted_url: str) -> bool:
     """Same site, or same origin for hosts without a registrable domain (localhost, bare IPs)."""
-    if same_site(current_url, granted_url):
-        return True
+    return same_site(current_url, granted_url) or same_origin(current_url, granted_url)
+
+
+def same_origin(current_url: str | None, granted_url: str) -> bool:
     current, granted = origin_of(current_url), origin_of(granted_url)
     return bool(current and granted and current == granted)
 
 
-def describe_release_scope(url: str | None) -> str | None:
+@dataclass(frozen=True)
+class LoginSite:
+    """A website a login is saved for, covering either its whole site or only its own origin."""
+
+    url: str
+    whole_site: bool
+
+    def admits(self, page_url: str | None) -> bool:
+        return same_release_scope(page_url, self.url) if self.whole_site else same_origin(page_url, self.url)
+
+
+def describe_release_scope(url: str | None, *, whole_site: bool = True) -> str | None:
     """Human-readable name of a URL's release scope, for refusal messages and logs."""
-    parts = site_of(url)
+    parts = site_of(url) if whole_site else None
     if parts is not None:
         scheme, port, site = parts
         host = site
@@ -69,3 +85,8 @@ def describe_release_scope(url: str | None) -> str | None:
     if port is None or _DEFAULT_PORTS.get(scheme) == port:
         return f"{scheme}://{host}"
     return f"{scheme}://{host}:{port}"
+
+
+def describe_login_sites(sites: Iterable[LoginSite]) -> str:
+    scopes = {describe_release_scope(site.url, whole_site=site.whole_site) or site.url for site in sites}
+    return ", ".join(sorted(scopes)) or "no site"

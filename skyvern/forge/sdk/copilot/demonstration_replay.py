@@ -11,8 +11,10 @@ from typing import Any, cast
 import structlog
 from mcp.types import CallToolResult, TextContent
 
+from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.cache.base import BaseCache
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, safe_admitted_url
@@ -36,12 +38,11 @@ from skyvern.forge.sdk.copilot.llm_config import resolve_raw_secret_safety_handl
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm, summarize_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, screen_raw_secret_safety
-from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, ScoutedInteraction, staged_demonstrated_action
-from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, staged_demonstrated_action
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
 from skyvern.forge.sdk.copilot.tools.scouting import record_scouted_interaction_fact
-from skyvern.forge.sdk.experimentation.copilot_demonstration import shared_copilot_demonstration_cache
 
 LOG = structlog.get_logger()
 
@@ -54,9 +55,9 @@ _TYPED_VALUE_SCREEN_CONCURRENCY = 4
 
 
 async def replay_demonstration(ctx: CopilotContext, mcp_server: SkyvernOverlayMCPServer) -> list[dict[str, Any]]:
-    cache = shared_copilot_demonstration_cache()
+    cache = app.CACHE
     demonstration_id = ctx.demonstration_id
-    if cache is None or not demonstration_id:
+    if cache is None or not cache.is_shared or not demonstration_id:
         return []
     record = await _claim_replay(cache, ctx, demonstration_id)
     replay_token = record.replay_token
@@ -68,7 +69,8 @@ async def replay_demonstration(ctx: CopilotContext, mcp_server: SkyvernOverlayMC
     except BaseException:
         await finish_shielded(_finish_replay(cache, ctx, demonstration_id, replay_token, consumed=False))
         raise
-    await _finish_replay(cache, ctx, demonstration_id, replay_token, consumed=True)
+    if await _finish_replay(cache, ctx, demonstration_id, replay_token, consumed=True):
+        await _persist_demonstration(ctx, record.browser_session_id, history, len(events))
     return history
 
 
@@ -110,6 +112,7 @@ async def _replay_events(
     current_frame_path: tuple[tuple[str, str], ...] | None = None
     sensitive_count = 0
     credential_fill_count = 0
+    failed_call_count = 0
 
     def next_call_id() -> str:
         nonlocal call_counter
@@ -122,10 +125,13 @@ async def _replay_events(
         model_args: dict[str, Any],
         output: CallToolResult | dict[str, Any],
     ) -> None:
+        nonlocal failed_call_count
         call_id = next_call_id()
         parsed = parse_tool_output(output.content if isinstance(output, CallToolResult) else output)
         if isinstance(output, CallToolResult) and output.isError and parsed.get("ok") is not False:
             parsed = {**parsed, "ok": False}
+        if parsed.get("ok") is False:
+            failed_call_count += 1
         safe_output = scrub_secrets_from_structure(ctx, sanitize_tool_result_for_llm(alias, parsed))
         output_text = _call_tool_result_text(output) or json.dumps(safe_output, separators=(",", ":"))
         history.extend(
@@ -234,6 +240,31 @@ async def _replay_events(
             )
             await record_call("fill_credential_field", args, args, output)
             continue
+        if kind == "upload":
+            selector = str(event.get("selector") or "")
+            file_id = event.get("file_id")
+            if not isinstance(file_id, str):
+                seq = event.get("seq")
+                step = f"Demonstration step {seq}" if isinstance(seq, int) else "A demonstration step"
+                field_label = safe_label(event.get("field_label")) or "file input"
+                history.append(
+                    {
+                        "role": "user",
+                        "content": NUDGE_SENTINEL
+                        + f'{step} opened a file chooser for "{field_label}" ({selector}); the user chose no file.',
+                    }
+                )
+                continue
+            args = {"file_id": file_id, "selector": selector}
+            output = {
+                "ok": True,
+                "file_id": file_id,
+                "filename": redact_secretlike_filename(str(event.get("filename") or "")),
+                "size_bytes": event.get("size_bytes"),
+                "change_delivered": True,
+            }
+            await record_call("upload_attached_file", args, args, output)
+            continue
 
         translated = _translate_action(
             ctx,
@@ -254,6 +285,7 @@ async def _replay_events(
         action_count=action_count,
         sensitive_count=sensitive_count,
         credential_fill_count=credential_fill_count,
+        failed_call_count=failed_call_count,
         screen_detected_count=detected_count,
         screen_withheld_count=withheld_count,
         screen_unavailable_count=unavailable_count,
@@ -333,6 +365,31 @@ def _frame_path(frame: dict[str, Any]) -> tuple[tuple[str, str], ...] | None:
     return ((name, selector),) if name or selector else None
 
 
+async def _persist_demonstration(
+    ctx: CopilotContext,
+    browser_session_id: str,
+    history: list[dict[str, Any]],
+    action_count: int,
+) -> None:
+    try:
+        await app.DATABASE.browser_recordings.create_recording(
+            organization_id=ctx.organization_id,
+            recording_attempt_id=ctx.turn_id,
+            browser_session_id=browser_session_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            evidence=scrub_secrets_from_structure(ctx, history),
+            metadata={
+                "source": "demonstration",
+                "outcome": "done",
+                "action_count": action_count,
+                "workflow_copilot_chat_id": ctx.workflow_copilot_chat_id,
+                "turn_id": ctx.turn_id,
+            },
+        )
+    except Exception:
+        LOG.warning("Copilot demonstration recording persistence failed", turn_id=ctx.turn_id, exc_info=True)
+
+
 async def _claim_replay(cache: BaseCache, ctx: CopilotContext, demonstration_id: str) -> DemonstrationRecord:
     record_key = demonstration_record_key(ctx.organization_id, demonstration_id)
     async with cache.get_lock(demonstration_lock_key(ctx.organization_id, demonstration_id)):
@@ -382,12 +439,12 @@ async def _finish_replay(
     replay_token: str,
     *,
     consumed: bool,
-) -> None:
+) -> bool:
     record_key = demonstration_record_key(ctx.organization_id, demonstration_id)
     async with cache.get_lock(demonstration_lock_key(ctx.organization_id, demonstration_id)):
         record = decode_demonstration_record(await cache.get(record_key))
         if record is None or record.status != "replaying" or record.replay_token != replay_token:
-            return
+            return False
         record.status = "consumed" if consumed else "stopped"
         record.replay_started_at = None
         record.replay_token = None
@@ -401,6 +458,7 @@ async def _finish_replay(
         await expire_demonstration_payload(
             cache, ctx.organization_id, demonstration_id, event_count, DEMONSTRATION_CANCELLED_TTL
         )
+    return True
 
 
 def _translate_action(
@@ -423,6 +481,10 @@ def _translate_action(
         alias = "click"
         real_args = model_args = {"selector": selector}
         data: dict[str, Any] = {"selector": selector}
+    elif kind == "drag" and selector and isinstance(event.get("target_selector"), str):
+        alias = "drag"
+        real_args = model_args = {"source_selector": selector, "target_selector": event["target_selector"]}
+        data = dict(real_args)
     elif kind == "type" and selector:
         value = event.get("value")
         if not isinstance(value, str):
@@ -474,6 +536,7 @@ def _translate_action(
             "browser_context": {"url": result_url, "title": "", "url_changed": source_url != result_url},
         },
         readback=readback,
+        target_packet=event.get("target_packet") if kind == "drag" else None,
     )
     return alias, real_args, model_args, action
 

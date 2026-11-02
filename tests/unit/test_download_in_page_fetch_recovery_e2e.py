@@ -62,6 +62,7 @@ _GATE_HTML = (
     b"<body><form method='post' action='/login'>session expired</form></body></html>"
 )
 _LANDING_HTML = b"<!doctype html><html><body>ready</body></html>"
+_ERROR_JSON = b'{"message": "Export unavailable", "results": "SYSTEM_ERROR"}'
 _REDIRECT_FINAL_HITS = 0
 _CHUNKED_SERVED = 0
 
@@ -145,11 +146,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if parsed.path == "/receipt.pdf":
+        if parsed.path in ("/receipt.pdf", "/export.csv"):
             is_browser = (
                 self.headers.get("Sec-Fetch-Site") is not None or self.headers.get("Sec-Fetch-Mode") is not None
             )
             body, ctype = (_RECEIPT_PDF, "application/pdf") if is_browser else (_GATE_HTML, "text/html; charset=utf-8")
+            if parsed.path == "/export.csv" and is_browser:
+                body, ctype = _ERROR_JSON, "text/csv"
         else:
             body, ctype = _LANDING_HTML, "text/html; charset=utf-8"
         self.send_response(200)
@@ -267,6 +270,37 @@ async def test_download_url_directly_recovers_gated_download_in_page(cdp_https_s
     assert len(saved) == 1, "the gated download was not recovered via the in-page same-origin fetch"
     body = saved[0].read_bytes()
     assert body.startswith(b"%PDF-") and b"(Receipt)" in body
+
+
+# A JSON error refetched in the page under the export's CSV claim is held for the model like a replay, with no response
+# metadata claimed for it; outside a hold it saves as before. The guarded host fetch is a substitute returning the gate.
+@pytest.mark.parametrize("verdict", ["accepted", "rejected", "unheld"])
+@pytest.mark.asyncio
+async def test_a_csv_recovered_in_page_is_held_for_the_model(cdp_https_site: Any, tmp_path: Path, verdict: str) -> None:
+    context, page, port = cdp_https_site
+    interceptor = _make_interceptor(str(tmp_path))
+    interceptor._browser_context = context
+    interceptor.set_replay_candidate_mode(verdict != "unheld")
+    await interceptor.enable_for_page(page)
+    guarded_fetch = AsyncMock(return_value=MagicMock(body=_GATE_HTML, content_type="text/csv", filename="export.csv"))
+    try:
+        with patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True):
+            await interceptor._download_url_directly(f"https://127.0.0.1:{port}/export.csv", "export.csv")
+        held = interceptor.replay_candidates()
+        landed_before_verdict = sorted(p.name for p in tmp_path.iterdir())
+        if held:
+            interceptor.resolve_replay_candidates(frozenset(held) if verdict == "accepted" else frozenset())
+    finally:
+        await interceptor.disable()
+
+    assert (len(held), landed_before_verdict) == ((0, ["export.csv"]) if verdict == "unheld" else (1, []))
+    for fact in held.values():
+        assert "refetched in the page after the replay returned an HTML page" in fact
+        assert "HTTP status not recorded; media type not recorded" in fact and "JSON object with 2 members" in fact
+        assert "SYSTEM_ERROR" not in fact and "export" not in fact
+    saved = [p.read_bytes() for p in tmp_path.iterdir()]
+    assert saved == ([] if verdict == "rejected" else [_ERROR_JSON])
+    assert [p.name for p in tmp_path.iterdir()] == ([] if verdict == "rejected" else ["export.csv"])
 
 
 @pytest.mark.asyncio

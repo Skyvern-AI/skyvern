@@ -20,6 +20,7 @@ from sqlalchemy import (
     desc,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, deferred
 
@@ -28,6 +29,7 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.id import (
     generate_action_id,
+    generate_agent_feedback_id,
     generate_ai_suggestion_id,
     generate_artifact_id,
     generate_aws_secret_parameter_id,
@@ -41,11 +43,14 @@ from skyvern.forge.sdk.db.id import (
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
+    generate_email_config_id,
     generate_folder_id,
+    generate_forwarding_address_id,
     generate_gmail_send_dispatch_id,
     generate_google_oauth_credential_id,
     generate_heal_episode_id,
     generate_heal_proposal_id,
+    generate_inbound_email_id,
     generate_microsoft_oauth_credential_id,
     generate_onepassword_credential_parameter_id,
     generate_org_id,
@@ -341,8 +346,19 @@ class OrganizationPhoneNumberModel(Base):
             "organization_id",
             "phone_number",
             unique=True,
-            postgresql_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
-            sqlite_where=text("status IN ('active', 'provisioning', 'quarantined') AND deleted_at IS NULL"),
+            postgresql_where=text(
+                "status IN ('active', 'provisioning', 'quarantined', 'quarantining', 'releasing', 'surrendering', 'reversal_pending') AND deleted_at IS NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('active', 'provisioning', 'quarantined', 'quarantining', 'releasing', 'surrendering', 'reversal_pending') AND deleted_at IS NULL"
+            ),
+        ),
+        Index(
+            "uq_org_phone_numbers_stripe_subscription",
+            "stripe_subscription_id",
+            unique=True,
+            postgresql_where=text("stripe_subscription_id IS NOT NULL AND deleted_at IS NULL"),
+            sqlite_where=text("stripe_subscription_id IS NOT NULL AND deleted_at IS NULL"),
         ),
     )
 
@@ -360,7 +376,19 @@ class OrganizationPhoneNumberModel(Base):
     price_cents = Column(Integer, nullable=True)
     status = Column(String, nullable=False, default="active", server_default="active")
     quarantined_until = Column(DateTime, nullable=True)
+    stripe_subscription_id = Column(String, nullable=True)
+    stripe_subscription_item_id = Column(String, nullable=True)
+    stripe_payment_intent_id = Column(String, nullable=True)
+    stripe_invoice_id = Column(String, nullable=True)
+    stripe_refund_id = Column(String, nullable=True)
+    stripe_credit_note_id = Column(String, nullable=True)
+    purchase_generation = Column(String, nullable=True)
+    current_period_start = Column(DateTime, nullable=True)
+    current_period_end = Column(DateTime, nullable=True)
     provisioning_claimed_at = Column(DateTime, nullable=True)
+    cancel_at = Column(DateTime, nullable=True)
+    maintenance_checked_at = Column(DateTime, nullable=True)
+    billing_exempt = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1471,6 +1499,97 @@ class TOTPCodeModel(Base):
     parse_status = Column(String, nullable=False, server_default=sqlalchemy.text("'parsed'"))
 
 
+class OrganizationEmailConfigModel(Base):
+    __tablename__ = "organization_email_configs"
+    __table_args__ = (Index("ix_organization_email_configs_org", "organization_id"),)
+
+    email_config_id = Column(String, primary_key=True, default=generate_email_config_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    mode = Column(String, nullable=False)
+    webhook_secret_hash = Column(String, nullable=True)
+    daily_inbound_cap = Column(Integer, nullable=False, default=500, server_default="500")
+    drop_flagged_spam = Column(Boolean, nullable=False, default=True, server_default=sqlalchemy.true())
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationForwardingAddressModel(Base):
+    __tablename__ = "organization_forwarding_addresses"
+    __table_args__ = (
+        Index("ix_organization_forwarding_addresses_org", "organization_id"),
+        Index("ix_organization_forwarding_addresses_config", "email_config_id"),
+        Index(
+            "ix_organization_forwarding_addresses_revoked_email",
+            text("lower(email_address)"),
+            postgresql_where=text("status = 'revoked'"),
+            sqlite_where=text("status = 'revoked'"),
+        ),
+        Index(
+            "uq_organization_forwarding_addresses_email",
+            "email_address",
+            unique=True,
+            postgresql_where=text("status != 'revoked' AND deleted_at IS NULL"),
+            sqlite_where=text("status != 'revoked' AND deleted_at IS NULL"),
+        ),
+    )
+
+    forwarding_address_id = Column(String, primary_key=True, default=generate_forwarding_address_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    email_config_id = Column(String, ForeignKey("organization_email_configs.email_config_id"), nullable=False)
+    email_address = Column(String, nullable=False)
+    org_slug = Column(String, nullable=False)
+    match_mode = Column(String, nullable=False, default="dedicated")
+    credential_id = Column(String, ForeignKey("credentials.credential_id", ondelete="SET NULL"), nullable=True)
+    sender_allowlist = Column(JSON().with_variant(ARRAY(Text()), "postgresql"), nullable=True)
+    status = Column(String, nullable=False, default="pending")
+    last_received_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class OrganizationInboundEmailModel(Base):
+    __tablename__ = "organization_inbound_emails"
+    __table_args__ = (
+        Index("ix_organization_inbound_emails_address_created", "forwarding_address_id", "created_at"),
+        Index("ix_organization_inbound_emails_created_at", "created_at"),
+        UniqueConstraint(
+            "organization_id",
+            "external_message_id",
+            name="uq_organization_inbound_emails_external_message",
+        ),
+    )
+
+    inbound_email_id = Column(String, primary_key=True, default=generate_inbound_email_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    forwarding_address_id = Column(
+        String,
+        ForeignKey("organization_forwarding_addresses.forwarding_address_id"),
+        nullable=False,
+    )
+    external_message_id = Column(Text, nullable=True)
+    from_address = Column(Text, nullable=False)
+    original_recipient = Column(Text, nullable=True)
+    subject = Column(Text, nullable=False)
+    body_text = Column(Text, nullable=False)
+    links = Column(JSON, nullable=False, default=list)
+    category = Column(String, nullable=False)
+    verdicts = Column(JSON, nullable=True)
+    totp_code_id = Column(String, ForeignKey("totp_codes.totp_code_id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+
 class ActionModel(Base):
     __tablename__ = "actions"
     __table_args__ = (
@@ -1986,6 +2105,8 @@ class CredentialModel(Base):
     proxy_session_id = Column(String, nullable=True)
     folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
     created_by = Column(String, nullable=True)
+    is_test_login_temporary = Column(Boolean, nullable=True)
+    is_passkey_setup_pending = Column(Boolean, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -2558,3 +2679,18 @@ class RunFeedbackModel(Base):
         onupdate=datetime.datetime.utcnow,
         nullable=False,
     )
+
+
+class AgentFeedbackModel(Base):
+    __tablename__ = "agent_feedback"
+    __table_args__ = (Index("ix_agent_feedback_org_created_at", "organization_id", "created_at"),)
+
+    agent_feedback_id = Column(String, primary_key=True, default=generate_agent_feedback_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    category = Column(String, nullable=False)
+    severity = Column(String, nullable=True)
+    summary = Column(UnicodeText, nullable=False)
+    details = Column(UnicodeText, nullable=True)
+    tool_name = Column(String, nullable=True)
+    context = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

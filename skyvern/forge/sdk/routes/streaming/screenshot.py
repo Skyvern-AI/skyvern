@@ -24,7 +24,7 @@ from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
-from skyvern.forge.sdk.routes.streaming.auth import folder_access_denied
+from skyvern.forge.sdk.routes.streaming.auth import credentials_from_websocket, folder_access_denied
 from skyvern.forge.sdk.routes.streaming.client_disconnect import watch_for_client_disconnect
 from skyvern.forge.sdk.routes.streaming.run_stream_outcome import RunStreamConnection, RunStreamOutcome
 from skyvern.forge.sdk.routes.streaming.screencast import (
@@ -51,9 +51,10 @@ async def task_stream(
     apikey: str | None = None,
     token: str | None = None,
 ) -> None:
+    credentials = credentials_from_websocket(websocket, apikey, token)
     try:
-        await websocket.accept()
-        if not token and not apikey:
+        await websocket.accept(subprotocol=credentials.subprotocol)
+        if not credentials.authorization and not credentials.apikey:
             await websocket.send_text("No valid credential provided")
             return
     except ConnectionClosedOK:
@@ -61,7 +62,7 @@ async def task_stream(
         return
 
     try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
+        organization = await get_current_org(x_api_key=credentials.apikey, authorization=credentials.authorization)
         organization_id = organization.organization_id
     except Exception:
         LOG.exception("Error while getting organization", task_id=task_id)
@@ -199,9 +200,10 @@ async def workflow_run_streaming(
     apikey: str | None = None,
     token: str | None = None,
 ) -> None:
+    credentials = credentials_from_websocket(websocket, apikey, token)
     try:
-        await websocket.accept()
-        if not token and not apikey:
+        await websocket.accept(subprotocol=credentials.subprotocol)
+        if not credentials.authorization and not credentials.apikey:
             await websocket.send_text("No valid credential provided")
             return
     except ConnectionClosedOK:
@@ -209,13 +211,12 @@ async def workflow_run_streaming(
         return
 
     try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
+        organization = await get_current_org(x_api_key=credentials.apikey, authorization=credentials.authorization)
         organization_id = organization.organization_id
     except HTTPException:
         LOG.warning(
             "WofklowRun Streaming: Error while getting organization",
             workflow_run_id=workflow_run_id,
-            token=token,
         )
         try:
             await websocket.send_text("Invalid credential provided")
@@ -382,9 +383,10 @@ async def browser_session_streaming(
     token: str | None = None,
     force_cdp: bool = False,
 ) -> None:
+    credentials = credentials_from_websocket(websocket, apikey, token)
     try:
-        await websocket.accept()
-        if not token and not apikey:
+        await websocket.accept(subprotocol=credentials.subprotocol)
+        if not credentials.authorization and not credentials.apikey:
             await websocket.send_text("No valid credential provided")
             await websocket.close()
             return
@@ -393,7 +395,7 @@ async def browser_session_streaming(
         return
 
     try:
-        organization = await get_current_org(x_api_key=apikey, authorization=token)
+        organization = await get_current_org(x_api_key=credentials.apikey, authorization=credentials.authorization)
         organization_id = organization.organization_id
     except Exception:
         LOG.exception("Error while getting organization", browser_session_id=browser_session_id)

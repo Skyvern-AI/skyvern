@@ -24,7 +24,6 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.cancel_workflow_run": "workflow.cancel",
     "skyvern.forge.sdk.routes.agent_protocol.continue_workflow_run": "workflow.continue",
     "skyvern.forge.sdk.routes.agent_protocol.convert_curl_to_http": "utility.convert",
-    "skyvern.forge.sdk.routes.agent_protocol.convert_sop_to_blocks": "workflow.convert",
     "skyvern.forge.sdk.routes.agent_protocol.create_folder": "workflow_folder.create",
     "skyvern.forge.sdk.routes.agent_protocol.create_tag_value": "tag.create",
     "skyvern.forge.sdk.routes.agent_protocol.create_workflow": "workflow.create",
@@ -39,6 +38,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.delete_workflow_tag": "workflow.delete",
     "skyvern.forge.sdk.routes.agent_protocol.generate_task": "workflow.execute",
     "skyvern.forge.sdk.routes.agent_protocol.get_actions": "task.list",
+    "skyvern.forge.sdk.routes.agent_protocol.get_agent_step_tools": "workflow.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_api_keys": "api_key.list",
     "skyvern.forge.sdk.routes.agent_protocol.get_artifact": "artifact.read",
     "skyvern.forge.sdk.routes.agent_protocol.get_artifact_content": "artifact.read",
@@ -103,6 +103,10 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.update_workflow_folder": "workflow.update",
     "skyvern.forge.sdk.routes.agent_protocol.update_workflow_legacy": "workflow.update",
     "skyvern.forge.sdk.routes.agent_protocol.upload_file": "file.create",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_saved_workflow": "workflow.read",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_saved_workflow_trailing_slash": "workflow.read",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_workflow": "workflow.read",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_workflow_trailing_slash": "workflow.read",
     "skyvern.forge.sdk.routes.agent_protocol.webhook": "webhook.execute",
     "skyvern.forge.sdk.routes.browser_profiles.create_browser_profile": "browser_profile.create",
     "skyvern.forge.sdk.routes.browser_profiles.delete_browser_profile": "browser_profile.delete",
@@ -113,7 +117,6 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.browser_sessions.close_browser_session": "browser_session.execute",
     "skyvern.forge.sdk.routes.browser_sessions.create_browser_session": "browser_session.create",
     "skyvern.forge.sdk.routes.browser_sessions.create_browser_session_action_logs": "browser_session.create",
-    "skyvern.forge.sdk.routes.browser_sessions.delete_pending_recording": "browser_session.delete",
     "skyvern.forge.sdk.routes.browser_sessions.extend_browser_session": "browser_session.execute",
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_session": "browser_session.read",
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_session_metadata": "browser_session.read",
@@ -121,8 +124,6 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_sessions": "browser_session.list",
     "skyvern.forge.sdk.routes.browser_sessions.get_browser_sessions_all": "browser_session.read",
     "skyvern.forge.sdk.routes.browser_sessions.get_workflow_runs_for_browser_session": "browser_session.read",
-    "skyvern.forge.sdk.routes.browser_sessions.get_workflow_version_recording": "browser_session.read",
-    "skyvern.forge.sdk.routes.browser_sessions.process_recording": "browser_session.execute",
     "skyvern.forge.sdk.routes.browser_sessions.register_external_browser_session": "browser_session.create",
     "skyvern.forge.sdk.routes.browser_sessions.update_browser_session": "browser_session.update",
     "skyvern.forge.sdk.routes.credentials.cancel_credential_test": "credential.cancel",
@@ -172,7 +173,20 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.debug_sessions.get_or_create_debug_session_by_user_and_workflow_permanent_id": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.new_debug_session": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.prewarm_debug_session": "debug_session.execute",
+    "skyvern.forge.sdk.routes.email_forwarding.create_email_config": "email_forwarding_config.create",
+    "skyvern.forge.sdk.routes.email_forwarding.create_forwarding_address": "email_forwarding.create",
+    "skyvern.forge.sdk.routes.email_forwarding.delete_email_config": "email_forwarding_config.delete",
+    "skyvern.forge.sdk.routes.email_forwarding.disable_forwarding_address": "email_forwarding.update",
+    "skyvern.forge.sdk.routes.email_forwarding.enable_forwarding_address": "email_forwarding.update",
+    "skyvern.forge.sdk.routes.email_forwarding.list_email_configs": "email_forwarding_config.list",
+    "skyvern.forge.sdk.routes.email_forwarding.list_forwarded_emails": "email_forwarding.read",
+    "skyvern.forge.sdk.routes.email_forwarding.list_forwarding_addresses": "email_forwarding.list",
+    "skyvern.forge.sdk.routes.email_forwarding.receive_inbound_email": "email.webhook",
+    "skyvern.forge.sdk.routes.email_forwarding.revoke_forwarding_address": "email_forwarding.delete",
+    "skyvern.forge.sdk.routes.email_forwarding.rotate_email_config_secret": "email_forwarding_config.rotate_secret",
+    "skyvern.forge.sdk.routes.email_forwarding.rotate_forwarding_address": "email_forwarding.update",
     "skyvern.forge.sdk.routes.feedback.get_run_feedback": "feedback.read",
+    "skyvern.forge.sdk.routes.feedback.submit_agent_feedback": "feedback.create",
     "skyvern.forge.sdk.routes.feedback.submit_run_feedback": "feedback.create",
     "skyvern.forge.sdk.routes.google_oauth.delete_google_oauth_client_config": "google_oauth.delete",
     "skyvern.forge.sdk.routes.google_oauth.delete_google_oauth_credential": "google_oauth.delete",
@@ -189,6 +203,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.google_sheets.get_spreadsheet_headers": "google_sheet.list",
     "skyvern.forge.sdk.routes.google_sheets.get_spreadsheet_tabs": "google_sheet.list",
     "skyvern.forge.sdk.routes.google_sheets.list_spreadsheets": "google_sheet.list",
+    "skyvern.forge.sdk.routes.integrations.list_integrations": "integration.list",
     "skyvern.forge.sdk.routes.internal_auth.auth_status": "auth_session.read",
     "skyvern.forge.sdk.routes.internal_llms.llm_status": "model.read",
     "skyvern.forge.sdk.routes.microsoft_oauth.delete_microsoft_oauth_credential": "microsoft_oauth.delete",
@@ -269,6 +284,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_active": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_control": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_record": "workflow_copilot.manage",
+    "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_demonstration_upload": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_disable_auto_accept": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_message_feedback": "workflow_copilot.manage",
     "skyvern.forge.sdk.routes.workflow_copilot.workflow_copilot_question_response": "workflow_copilot.manage",
@@ -307,14 +323,17 @@ def _route_action(connection: HTTPConnection) -> tuple[str | None, dict[str, obj
     return action, resource
 
 
-def require_request_actions(actions: frozenset[str]) -> Callable[[], Awaitable[None]]:
+def require_request_actions(actions: frozenset[str], *, always_enforce: bool = False) -> Callable[[], Awaitable[None]]:
     if not actions:
         raise ValueError("require_request_actions needs at least one action")
 
     async def enforce_request_action() -> None:
         principal = get_request_principal()
         for action in actions:
-            await app.AGENT_FUNCTION.enforce_request_authorization(principal, action)
+            if always_enforce:
+                await app.AGENT_FUNCTION.enforce_request_authorization(principal, action, always_enforce=True)
+            else:
+                await app.AGENT_FUNCTION.enforce_request_authorization(principal, action)
 
     return enforce_request_action
 

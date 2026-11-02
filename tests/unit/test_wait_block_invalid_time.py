@@ -9,18 +9,17 @@ against the unfixed code, because which class is raised is the entire defect.
 from __future__ import annotations
 
 import datetime as dt
-import importlib
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from skyvern.config import settings
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
-from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -30,6 +29,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 from skyvern.forge.sdk.workflow.models.block import WaitBlock
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.workflows import WaitBlockYAML, WorkflowDefinitionYAML
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_test"
 BLOCK_LABEL = "let_page_settle"
@@ -99,23 +99,20 @@ class _ConvertOnlyWorkflowService:
 
 
 @pytest.fixture(scope="module")
-def client() -> TestClient:
-    importlib.import_module("skyvern.forge.sdk.routes.agent_protocol")
-    importlib.import_module("skyvern.forge.sdk.routes.workflow_copilot")
+def client() -> Iterator[TestClient]:
+    with pytest.MonkeyPatch.context() as module_patches:
+        app = shared_route_app(module_patches)
 
-    app = FastAPI()
-    app.include_router(base_router, prefix="/v1")
+        # Mirror api_app.py, so a SkyvernHTTPException renders as its own status code. Without this
+        # the pre-fix FailedToCreateWorkflow would surface as an unhandled error rather than its 500.
+        @app.exception_handler(SkyvernHTTPException)
+        async def _handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
-    # Mirror api_app.py, so a SkyvernHTTPException renders as its own status code. Without this
-    # the pre-fix FailedToCreateWorkflow would surface as an unhandled error rather than its 500.
-    @app.exception_handler(SkyvernHTTPException)
-    async def _handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+        app.dependency_overrides[org_auth_service.get_current_org] = _make_org
+        app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: None
 
-    app.dependency_overrides[org_auth_service.get_current_org] = _make_org
-    app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: None
-
-    return TestClient(app)
+        yield TestClient(app)
 
 
 def test_create_workflow_route_returns_422(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,3 +1,4 @@
+import { WorkflowFindingsBoundary } from "@/components/WorkflowFindingsSlot";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import { SelectionHeaderCheckboxCell } from "@/components/SelectionCheckbox";
@@ -874,7 +875,7 @@ function WorkflowsTree() {
     );
   }
 
-  return (
+  const content = (
     <div className="space-y-10">
       <div className="flex h-32 justify-between gap-6">
         <div className="space-y-5">
@@ -1111,6 +1112,11 @@ function WorkflowsTree() {
         <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
+  );
+  return (
+    <WorkflowFindingsBoundary workflowPermanentIds={workflowIds}>
+      {content}
+    </WorkflowFindingsBoundary>
   );
 }
 

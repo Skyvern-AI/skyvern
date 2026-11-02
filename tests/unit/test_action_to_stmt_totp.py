@@ -18,6 +18,7 @@ from skyvern.core.script_generations.generate_script import (
     _actions_support_cached_scripts,
     _build_block_fn,
 )
+from skyvern.webeye.actions.action_types import ActionType
 
 
 def _render(stmt: cst.BaseStatement) -> str:
@@ -217,3 +218,17 @@ def test_multi_field_totp_action_makes_block_ineligible_for_cached_scripts() -> 
     assert not _actions_support_cached_scripts([action])
     with pytest.raises(ValueError, match="Multi-field TOTP"):
         _build_block_fn({"label": "verification", "parameters": []}, [action])
+
+
+def test_user_close_page_makes_block_ineligible_for_cached_scripts() -> None:
+    close_action = {"action_type": ActionType.CLOSE_PAGE, "tab_index": 1}
+    recovery_action = {"action_type": ActionType.CLOSE_PAGE, "is_internal_recovery": True}
+    actions = [
+        close_action,
+        {"action_type": ActionType.CLICK, "xpath": "/html/body/a", "element_id": "e1"},
+    ]
+
+    assert not _actions_support_cached_scripts(actions)
+    assert _actions_support_cached_scripts([recovery_action])
+    with pytest.raises(ValueError, match="CLOSE_PAGE"):
+        _build_block_fn({"label": "popup", "parameters": []}, actions)

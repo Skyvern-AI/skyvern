@@ -24,10 +24,7 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosedError
 
-from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
-from skyvern.forge.sdk.routes.streaming.channels.cdp import ChannelContext
 from skyvern.forge.sdk.routes.streaming.channels.execution import execution_for_message_channel
-from skyvern.forge.sdk.routes.streaming.channels.exfiltration import ExfiltratedEvent, ExfiltrationChannel
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_CLIPBOARD_PASTE_BYTES
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
@@ -42,8 +39,6 @@ from skyvern.forge.sdk.streaming.registries import (
     get_vnc_channel,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.services.browser_recording.session_registry import interpretation_registry
-from skyvern.services.browser_recording.types import RecordingDraftStep, RecordingInterpretationUpdate
 
 LOG = structlog.get_logger()
 _MAX_IN_FLIGHT_CLIPBOARD_TASKS = 2
@@ -53,7 +48,6 @@ Loops = list[asyncio.Task]  # aka "queue-less actors"; or "programs"
 
 class MessageKind(enum.StrEnum):
     ASK_FOR_CLIPBOARD_RESPONSE = "ask-for-clipboard-response"
-    BEGIN_EXFILTRATION = "begin-exfiltration"
     BROWSER_TABS = "browser-tabs"
     BROWSER_URL = "browser-url"
     CEDE_CONTROL = "cede-control"
@@ -62,27 +56,15 @@ class MessageKind(enum.StrEnum):
     CLEAR_HISTORY = "clear-history"
     CLIPBOARD_COPY = "clipboard-copy"
     CLIPBOARD_PASTE = "clipboard-paste"
-    END_EXFILTRATION = "end-exfiltration"
     ERROR = "error"
-    EXFILTRATED_EVENT = "exfiltrated-event"
     GET_BROWSER_URL = "get-browser-url"
     GO_BACK = "go-back"
     GO_FORWARD = "go-forward"
     NAVIGATE = "navigate"
     RELOAD = "reload"
-    RECORDING_CAPTURE_PAUSE = "recording-capture-pause"
-    RECORDING_CAPTURE_RESUME = "recording-capture-resume"
-    RECORDING_REARM_CAPTURE = "recording-rearm-capture"
-    RECORDING_INTERPRETATION_UPDATE = "recording-interpretation-update"
     SCREENSHOT = "screenshot"
     TAKE_CONTROL = "take-control"
     TAKE_SCREENSHOT = "take-screenshot"
-
-
-class ExfiltratedEventSource(enum.StrEnum):
-    CONSOLE = "console"
-    CDP = "cdp"
-    NOT_SPECIFIED = "[not-specified]"
 
 
 @dataclasses.dataclass
@@ -99,7 +81,6 @@ class TabInfo:
 
 MessageKinds = t.Literal[
     MessageKind.ASK_FOR_CLIPBOARD_RESPONSE,
-    MessageKind.BEGIN_EXFILTRATION,
     MessageKind.BROWSER_TABS,
     MessageKind.BROWSER_URL,
     MessageKind.CEDE_CONTROL,
@@ -108,18 +89,12 @@ MessageKinds = t.Literal[
     MessageKind.CLEAR_HISTORY,
     MessageKind.CLIPBOARD_COPY,
     MessageKind.CLIPBOARD_PASTE,
-    MessageKind.END_EXFILTRATION,
     MessageKind.ERROR,
-    MessageKind.EXFILTRATED_EVENT,
     MessageKind.GET_BROWSER_URL,
     MessageKind.GO_BACK,
     MessageKind.GO_FORWARD,
     MessageKind.NAVIGATE,
     MessageKind.RELOAD,
-    MessageKind.RECORDING_CAPTURE_PAUSE,
-    MessageKind.RECORDING_CAPTURE_RESUME,
-    MessageKind.RECORDING_REARM_CAPTURE,
-    MessageKind.RECORDING_INTERPRETATION_UPDATE,
     MessageKind.SCREENSHOT,
     MessageKind.TAKE_CONTROL,
     MessageKind.TAKE_SCREENSHOT,
@@ -129,42 +104,6 @@ MessageKinds = t.Literal[
 @dataclasses.dataclass
 class Message:
     kind: MessageKinds
-
-
-@dataclasses.dataclass
-class MessageInBeginExfiltration(Message):
-    kind: t.Literal[MessageKind.BEGIN_EXFILTRATION] = MessageKind.BEGIN_EXFILTRATION
-    workflow_permanent_id: str | None = None
-    live_interpretation_enabled: bool = False
-    # Client capability: true only when the frontend understands delta interpretation
-    # updates. Defaults false so older clients keep receiving full snapshots.
-    supports_interpretation_deltas: bool = False
-    # Per-recording id from the client. Distinguishes a reconnect (same id, reuse
-    # session) from a new recording (new id, fresh session). None on older clients.
-    recording_attempt_id: str | None = None
-
-
-@dataclasses.dataclass
-class MessageInEndExfiltration(Message):
-    kind: t.Literal[MessageKind.END_EXFILTRATION] = MessageKind.END_EXFILTRATION
-    discard: bool = False
-    interpretation_session_id: str | None = None
-    workflow_permanent_id: str | None = None
-
-
-@dataclasses.dataclass
-class MessageInRecordingCapturePause(Message):
-    kind: t.Literal[MessageKind.RECORDING_CAPTURE_PAUSE] = MessageKind.RECORDING_CAPTURE_PAUSE
-
-
-@dataclasses.dataclass
-class MessageInRecordingCaptureResume(Message):
-    kind: t.Literal[MessageKind.RECORDING_CAPTURE_RESUME] = MessageKind.RECORDING_CAPTURE_RESUME
-
-
-@dataclasses.dataclass
-class MessageInRecordingRearmCapture(Message):
-    kind: t.Literal[MessageKind.RECORDING_REARM_CAPTURE] = MessageKind.RECORDING_REARM_CAPTURE
 
 
 @dataclasses.dataclass
@@ -264,29 +203,6 @@ class MessageOutError(Message):
 
 
 @dataclasses.dataclass
-class MessageOutExfiltratedEvent(Message):
-    kind: t.Literal[MessageKind.EXFILTRATED_EVENT] = MessageKind.EXFILTRATED_EVENT
-    event_name: str = "[not-specified]"
-
-    # TODO(jdo): improve typing for params
-    params: dict = dataclasses.field(default_factory=dict)
-    source: ExfiltratedEventSource = ExfiltratedEventSource.NOT_SPECIFIED
-    timestamp: float = dataclasses.field(default_factory=lambda: 0.0)  # seconds since epoch
-
-
-@dataclasses.dataclass
-class MessageOutRecordingInterpretationUpdate(Message):
-    kind: t.Literal[MessageKind.RECORDING_INTERPRETATION_UPDATE] = MessageKind.RECORDING_INTERPRETATION_UPDATE
-    interpretation_session_id: str = ""
-    session_revision: int = 0
-    steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
-    changed_steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
-    is_snapshot: bool = True
-    pending: bool = False
-    finalized: bool = False
-
-
-@dataclasses.dataclass
 class MessageOutTabInfo(Message):
     kind: t.Literal[MessageKind.BROWSER_TABS] = MessageKind.BROWSER_TABS
     tabs: list[TabInfo] = dataclasses.field(default_factory=list)
@@ -294,35 +210,23 @@ class MessageOutTabInfo(Message):
 
 MessageIn = (
     MessageInAskForClipboardResponse
-    | MessageInBeginExfiltration
     | MessageInCedeControl
     | MessageInClearAllData
     | MessageInClearCookies
     | MessageInClearHistory
     | MessageInClipboardCopy
     | MessageInClipboardPaste
-    | MessageInEndExfiltration
     | MessageInGetBrowserUrl
     | MessageInGoBack
     | MessageInGoForward
     | MessageInNavigate
-    | MessageInRecordingCapturePause
-    | MessageInRecordingCaptureResume
-    | MessageInRecordingRearmCapture
     | MessageInReload
     | MessageInTakeControl
     | MessageInTakeScreenshot
 )
 
 
-MessageOut = (
-    MessageOutBrowserUrl
-    | MessageOutError
-    | MessageOutExfiltratedEvent
-    | MessageOutRecordingInterpretationUpdate
-    | MessageOutScreenshot
-    | MessageOutTabInfo
-)
+MessageOut = MessageOutBrowserUrl | MessageOutError | MessageOutScreenshot | MessageOutTabInfo
 
 
 def reify_channel_message(data: dict) -> MessageIn:
@@ -332,15 +236,6 @@ def reify_channel_message(data: dict) -> MessageIn:
         case MessageKind.ASK_FOR_CLIPBOARD_RESPONSE:
             text = data.get("text") or ""
             return MessageInAskForClipboardResponse(text=text)
-        case MessageKind.BEGIN_EXFILTRATION:
-            workflow_permanent_id = data.get("workflow_permanent_id")
-            recording_attempt_id = data.get("recording_attempt_id")
-            return MessageInBeginExfiltration(
-                workflow_permanent_id=workflow_permanent_id if isinstance(workflow_permanent_id, str) else None,
-                live_interpretation_enabled=bool(data.get("live_interpretation_enabled") or False),
-                supports_interpretation_deltas=bool(data.get("supports_interpretation_deltas") or False),
-                recording_attempt_id=recording_attempt_id if isinstance(recording_attempt_id, str) else None,
-            )
         case MessageKind.CEDE_CONTROL:
             return MessageInCedeControl()
         case MessageKind.CLEAR_ALL_DATA:
@@ -354,22 +249,6 @@ def reify_channel_message(data: dict) -> MessageIn:
         case MessageKind.CLIPBOARD_PASTE:
             text = data.get("text") or ""
             return MessageInClipboardPaste(text=text)
-        case MessageKind.END_EXFILTRATION:
-            interpretation_session_id = data.get("interpretation_session_id")
-            workflow_permanent_id = data.get("workflow_permanent_id")
-            return MessageInEndExfiltration(
-                discard=data.get("discard") is True,
-                interpretation_session_id=(
-                    interpretation_session_id if isinstance(interpretation_session_id, str) else None
-                ),
-                workflow_permanent_id=workflow_permanent_id if isinstance(workflow_permanent_id, str) else None,
-            )
-        case MessageKind.RECORDING_CAPTURE_PAUSE:
-            return MessageInRecordingCapturePause()
-        case MessageKind.RECORDING_CAPTURE_RESUME:
-            return MessageInRecordingCaptureResume()
-        case MessageKind.RECORDING_REARM_CAPTURE:
-            return MessageInRecordingRearmCapture()
         case MessageKind.GET_BROWSER_URL:
             return MessageInGetBrowserUrl()
         case MessageKind.GO_BACK:
@@ -505,28 +384,6 @@ class MessageChannel:
         self.out_queue.put_nowait({"kind": "copied-text", "text": copied_text})
 
 
-@dataclasses.dataclass
-class MessageChannelContext:
-    """ChannelContext for recording without a VNC channel. Delegates to the live
-    message channel so a browser_session the verifier swaps or clears mid-recording
-    is observed, matching how a VncChannel-backed context behaves."""
-
-    message_channel: MessageChannel
-    x_api_key: str
-
-    @property
-    def organization_id(self) -> str:
-        return self.message_channel.organization_id
-
-    @property
-    def browser_session(self) -> AddressablePersistentBrowserSession | None:
-        return self.message_channel.browser_session
-
-    @property
-    def identity(self) -> dict[str, t.Any]:
-        return dict(self.message_channel.identity)
-
-
 async def loop_stream_messages(message_channel: MessageChannel) -> None:
     """
     Stream messages and their results back and forth.
@@ -535,8 +392,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     """
 
     class_name = message_channel.class_name
-    exfiltration_channel: ExfiltrationChannel | None = None
-    live_interpretation_browser_session_id: str | None = None
     clipboard_tasks: set[asyncio.Task[None]] = set()
     clipboard_task_count = 0
 
@@ -559,14 +414,12 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
     async def send(message: MessageOut) -> None:
         # Single-writer: enqueue only; backend_to_frontend is the sole task that
-        # writes to the websocket, so responses and out-of-band messages (event
-        # echoes, interpretation updates) cannot interleave mid-frame.
+        # writes to the websocket, so responses and out-of-band messages
+        # cannot interleave mid-frame.
         message_channel.send_nowait(messages=[message])
 
     async def handle_data(data: object) -> None:
         nonlocal class_name
-        nonlocal exfiltration_channel
-        nonlocal live_interpretation_browser_session_id
         message: MessageIn
 
         # receive_json returns whatever the client's JSON parses to — a top-level
@@ -620,131 +473,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
                 if not run_clipboard_task(paste_clipboard_response):
                     await send_error(message.kind, "Clipboard is busy; try again.")
-
-            case MessageKind.BEGIN_EXFILTRATION:
-                vnc_channel = get_vnc_channel(message_channel.client_id)
-
-                if vnc_channel is None and message_channel.browser_session is None:
-                    LOG.warning(
-                        f"{class_name} no vnc channel and no browser session for message channel - cannot exfiltrate.",
-                        message=message,
-                        **message_channel.identity,
-                    )
-                    # Tell the client instead of dropping silently; it re-sends begin-exfiltration once the live view (re)connects.
-                    await send_error(
-                        message.kind, "Recording capture is not ready yet; retrying as live view connects."
-                    )
-                    return
-
-                browser_session_id = (
-                    message_channel.browser_session.persistent_browser_session_id
-                    if message_channel.browser_session
-                    else None
-                )
-
-                def on_interpretation_update(update: RecordingInterpretationUpdate) -> None:
-                    message_channel.send_nowait(
-                        messages=[
-                            MessageOutRecordingInterpretationUpdate(
-                                interpretation_session_id=update.interpretation_session_id,
-                                session_revision=update.session_revision,
-                                steps=update.steps,
-                                changed_steps=update.changed_steps,
-                                is_snapshot=update.is_snapshot,
-                                pending=update.pending,
-                                finalized=update.finalized,
-                            )
-                        ]
-                    )
-
-                def ensure_live_interpretation() -> None:
-                    nonlocal live_interpretation_browser_session_id
-
-                    if not (
-                        browser_session_id and message.workflow_permanent_id and message.live_interpretation_enabled
-                    ):
-                        return
-
-                    interpretation_registry.start_session(
-                        browser_session_id=browser_session_id,
-                        organization_id=message_channel.organization_id,
-                        workflow_permanent_id=message.workflow_permanent_id,
-                        on_update=on_interpretation_update,
-                        deltas_enabled=message.supports_interpretation_deltas,
-                        recording_attempt_id=message.recording_attempt_id,
-                    )
-                    live_interpretation_browser_session_id = browser_session_id
-
-                if exfiltration_channel is not None:
-                    ensure_live_interpretation()
-                    try:
-                        await exfiltration_channel.rearm_all_pages()
-                    except Exception:
-                        LOG.exception(
-                            f"{class_name} failed to re-arm recording capture.",
-                            **message_channel.identity,
-                        )
-                        await send_error(message.kind, "Failed to re-arm recording capture.")
-                    return
-
-                ensure_live_interpretation()
-
-                def on_event(events: list[ExfiltratedEvent]) -> None:
-                    for event in events:
-                        message_out_exfiltrated_event = MessageOutExfiltratedEvent(
-                            kind=t.cast(t.Literal[MessageKind.EXFILTRATED_EVENT], event.kind),
-                            event_name=event.event_name,
-                            params=event.params,
-                            source=t.cast(ExfiltratedEventSource, event.source or ExfiltratedEventSource.NOT_SPECIFIED),
-                            timestamp=event.timestamp,
-                        )
-
-                        message_channel.send_nowait(messages=[message_out_exfiltrated_event])
-
-                    if live_interpretation_browser_session_id:
-                        interpretation_registry.ingest_events(live_interpretation_browser_session_id, events)
-
-                if vnc_channel is not None:
-                    context: ChannelContext = vnc_channel
-                else:
-                    # A transient token-lookup failure must not escape handle_data
-                    # and kill the websocket loop; the client re-sends
-                    # begin-exfiltration on its next attempt.
-                    try:
-                        x_api_key = await get_x_api_key(message_channel.organization_id)
-                    except Exception:
-                        LOG.exception(
-                            f"{class_name} failed to resolve api key for recording capture.",
-                            **message_channel.identity,
-                        )
-                        await send_error(message.kind, "Failed to start recording capture.")
-                        return
-                    context = MessageChannelContext(message_channel=message_channel, x_api_key=x_api_key)
-
-                # A dead browser target (ECONNREFUSED / 502 from connect_over_cdp) must
-                # not escape handle_data: that kills the websocket loop, the frontend
-                # reconnects and re-sends begin-exfiltration, and the recording spins
-                # in a crash-loop capturing nothing.
-                new_channel = ExfiltrationChannel(
-                    on_event=on_event,
-                    context=context,
-                )
-                try:
-                    exfiltration_channel = await new_channel.start()
-                except Exception:
-                    LOG.exception(
-                        f"{class_name} failed to start recording capture.",
-                        **message_channel.identity,
-                    )
-                    try:
-                        await new_channel.stop()
-                    except Exception:
-                        LOG.debug(
-                            f"{class_name} failed to clean up after recording capture start failure.",
-                            **message_channel.identity,
-                            exc_info=True,
-                        )
-                    await send_error(message.kind, "Failed to start recording capture.")
 
             case MessageKind.CEDE_CONTROL:
                 vnc_channel = get_vnc_channel(message_channel.client_id)
@@ -837,67 +565,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
                 if not run_clipboard_task(paste_clipboard):
                     await send_error(message.kind, "Clipboard is busy; try again.")
-
-            case MessageKind.END_EXFILTRATION:
-                # Channel teardown is best-effort: a browser whose target already
-                # closed raises here, and that must never skip the interpretation
-                # flush below — losing every draft the user just recorded.
-                if exfiltration_channel is not None:
-                    try:
-                        await exfiltration_channel.stop()
-                    except Exception:
-                        # Expected race (target already closed), so warning, not error.
-                        LOG.warning(
-                            f"{class_name} failed to stop recording capture cleanly.",
-                            **message_channel.identity,
-                            exc_info=True,
-                        )
-
-                exfiltration_channel = None
-                if live_interpretation_browser_session_id:
-                    if message.discard:
-                        await interpretation_registry.stop_session(
-                            live_interpretation_browser_session_id,
-                            retain_finalized_actions=False,
-                        )
-                    else:
-                        await interpretation_registry.stop_session(live_interpretation_browser_session_id)
-                    live_interpretation_browser_session_id = None
-                elif (
-                    message.discard
-                    and message.interpretation_session_id
-                    and message.workflow_permanent_id
-                    and message_channel.browser_session
-                ):
-                    interpretation_registry.discard_finalized_actions_if_owned(
-                        interpretation_session_id=message.interpretation_session_id,
-                        browser_session_id=message_channel.browser_session.persistent_browser_session_id,
-                        organization_id=message_channel.organization_id,
-                        workflow_permanent_id=message.workflow_permanent_id,
-                    )
-
-            case MessageKind.RECORDING_CAPTURE_PAUSE:
-                if exfiltration_channel is not None:
-                    exfiltration_channel.pause_capture()
-                if live_interpretation_browser_session_id:
-                    interpretation_registry.pause_capture(live_interpretation_browser_session_id)
-
-            case MessageKind.RECORDING_CAPTURE_RESUME:
-                if exfiltration_channel is not None:
-                    exfiltration_channel.resume_capture()
-                if live_interpretation_browser_session_id:
-                    interpretation_registry.resume_capture(live_interpretation_browser_session_id)
-
-            case MessageKind.RECORDING_REARM_CAPTURE:
-                if exfiltration_channel is not None:
-                    try:
-                        await exfiltration_channel.rearm_all_pages()
-                    except Exception:
-                        LOG.exception(
-                            f"{class_name} failed to re-arm recording capture.",
-                            **message_channel.identity,
-                        )
-                        await send_error(message.kind, "Failed to re-arm recording capture.")
 
             case MessageKind.GET_BROWSER_URL:
                 try:
@@ -1036,7 +703,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
 
         # Sole websocket writer: wakes the moment a message is enqueued instead of
         # polling, and keeps sending while frontend_to_backend awaits a slow
-        # command handler (no head-of-line blocking for interpretation updates).
+        # command handler (no head-of-line blocking).
         while message_channel.is_open:
             message = await message_channel.out_queue.get()
 
@@ -1091,18 +758,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         if pending_clipboard_tasks:
             await asyncio.gather(*pending_clipboard_tasks, return_exceptions=True)
         LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
-        if exfiltration_channel is not None:
-            try:
-                await exfiltration_channel.stop()
-            except Exception:
-                # Expected race (target already closed), so warning, not error.
-                LOG.warning(
-                    f"{class_name} failed to stop recording capture during teardown.",
-                    **message_channel.identity,
-                    exc_info=True,
-                )
-        # Live interpretation is torn down only on explicit end-exfiltration so a
-        # disconnect→reconnect can resume the same in-flight recording session.
         await message_channel.close(reason="loop-channel-closed")
 
 

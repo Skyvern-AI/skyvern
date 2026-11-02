@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Annotated, Any
 
 import structlog
+from playwright.async_api import Page
 from pydantic import Field, TypeAdapter, ValidationError
 
 from skyvern.schemas.workflows import (
@@ -39,6 +40,7 @@ from skyvern.schemas.workflows import (
     NavigationBlockYAML,
     PdfFillBlockYAML,
     PDFParserBlockYAML,
+    PowerBIQueryBlockYAML,
     PrintPageBlockYAML,
     SendEmailBlockYAML,
     SplitPdfBlockYAML,
@@ -58,6 +60,25 @@ from skyvern.schemas.workflows import (
 from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
+
+
+def _powerbi_queries_available() -> bool:
+    from skyvern.forge.sdk.integrations.catalog import integration_is_live  # noqa: PLC0415
+
+    return integration_is_live("powerbi")
+
+
+def _contains_powerbi_query(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_contains_powerbi_query(block) for block in value if isinstance(block, dict))
+    if not isinstance(value, dict):
+        return False
+    if value.get("block_type") == BlockType.POWERBI_QUERY.value:
+        return True
+    if value.get("block_type") not in {BlockType.FOR_LOOP.value, BlockType.WHILE_LOOP.value}:
+        return False
+    return _contains_powerbi_query(value.get("loop_blocks", []))
+
 
 # ---------------------------------------------------------------------------
 # Block type → YAML class mapping
@@ -97,6 +118,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
     BlockType.EMAIL_INBOX.value: EmailInboxBlockYAML,
     BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
+    BlockType.POWERBI_QUERY.value: PowerBIQueryBlockYAML,
 }
 
 # ---------------------------------------------------------------------------
@@ -135,6 +157,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
     "email_inbox": "Read matching messages from a Gmail or Outlook inbox",
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
+    "powerbi_query": "Run one read-only DAX query against a user's authorized Power BI dataset",
 }
 
 # ---------------------------------------------------------------------------
@@ -393,6 +416,7 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "parameter_templating": "** PARAMETER TEMPLATING **",
     "error_handling_and_retries": "** ERROR HANDLING AND RETRIES **",
     "workflow_execution_flow": "** WORKFLOW EXECUTION FLOW **",
+    "notes_between_blocks": "** NOTES BETWEEN BLOCKS **",
     "best_practices": "** BEST PRACTICES **",
     "common_patterns": "** COMMON PATTERNS **",
     "validation_rules": "** VALIDATION RULES **",
@@ -403,13 +427,25 @@ _kb_cache: dict[str, dict[str, Any]] | None = None
 _knowledge_topic_cache: dict[str, dict[str, str]] | None = None
 
 CODE_BLOCK_RUNTIME_TOPIC = "code_block_runtime"
+NOTES_KNOWLEDGE_TOPIC = "notes_between_blocks"
 
 
 def _code_block_runtime_topic() -> dict[str, str]:
     """Render the names a CodeBlock may use from the executor's own namespace declaration."""
     # Keep workflow model imports deferred for the lightweight-install import contract.
     from skyvern.forge.sdk.workflow.models.block import CodeBlock  # noqa: PLC0415
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import (  # noqa: PLC0415
+        _LOCATOR_ACTION_MAP,
+        _LOCATOR_FACTORY_METHODS,
+        _PAGE_ACTION_MAP,
+    )
 
+    def on_page(name: str) -> bool:
+        # The secure runner refuses page.set_input_files; only the locator form is supported.
+        return hasattr(Page, name) and name != "set_input_files"
+
+    factories = sorted({"locator", *_LOCATOR_FACTORY_METHODS})
+    locator_actions = sorted(_LOCATOR_ACTION_MAP)
     safe_vars = CodeBlock.build_safe_vars()
     builtin_names = sorted(name for name in safe_vars["__builtins__"] if not name.startswith("__"))
     shims = {name: sorted(vars(value)) for name, value in safe_vars.items() if isinstance(value, SimpleNamespace)}
@@ -424,6 +460,21 @@ def _code_block_runtime_topic() -> dict[str, str]:
         *(f"- {name}: {', '.join(attrs)}" for name, attrs in sorted(shims.items())),
         "",
         "Helpers: page, " + ", ".join(helpers),
+        "",
+        "Page: `page` is a Playwright async Page.",
+        "Locator factories build a selector and make no browser call. On page or a locator: "
+        + ", ".join(name for name in factories if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in factories if not on_page(name)),
+        "`await page.evaluate(js, arg=None)` runs JavaScript in the page and returns a JSON-serializable result; "
+        "one call can read many elements.",
+        "Recorded as timeline actions, each with a screenshot: "
+        + ", ".join([*(f"page.{name}" for name in sorted(_PAGE_ACTION_MAP)), "page.keyboard.press"])
+        + "; on page or a locator: "
+        + ", ".join(name for name in locator_actions if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in locator_actions if not on_page(name)),
+        "Read methods such as inner_text, get_attribute, count, is_visible and wait_for run without a recorded action.",
         "",
         "For a date in a template field use {{current_date}}; inside code use datetime.date.today() "
         "or datetime.datetime.now(datetime.UTC).",
@@ -570,7 +621,8 @@ async def skyvern_workflow_knowledge(
                 "Knowledge topic IDs to retrieve. Omit to list every topic. Common IDs include "
                 "workflow_parameters, parameter_templating, workflow_execution_flow, choosing_a_block, "
                 "common_patterns, best_practices, captcha_solver, proxy_location, and code_block_runtime "
-                "(the builtins, module shims, and helpers a code block's Python may use)."
+                "(the builtins, module shims, helpers, and page object a code block's Python may use, "
+                "including which page calls are recorded as actions)."
             )
         ),
     ] = None,
@@ -583,7 +635,9 @@ async def skyvern_workflow_knowledge(
     """
 
     action = "skyvern_workflow_knowledge"
-    knowledge = _parse_knowledge_topics()
+    knowledge = {
+        topic: section for topic, section in _parse_knowledge_topics().items() if topic != NOTES_KNOWLEDGE_TOPIC
+    }
     if not knowledge:
         return make_result(
             action,
@@ -647,11 +701,14 @@ async def skyvern_block_schema(
     action = "skyvern_block_schema"
 
     if block_type is None:
+        block_types = dict(BLOCK_SUMMARIES)
+        if not _powerbi_queries_available():
+            block_types.pop(BlockType.POWERBI_QUERY.value, None)
         return make_result(
             action,
             data={
-                "block_types": BLOCK_SUMMARIES,
-                "count": len(BLOCK_SUMMARIES),
+                "block_types": block_types,
+                "count": len(block_types),
                 "hint": "Call skyvern_block_schema(block_type='navigation') for the full schema of a specific type",
             },
         )
@@ -661,6 +718,19 @@ async def skyvern_block_schema(
     task_redirect = normalized in ("task", "task_v2")
     if task_redirect:
         normalized = "navigation"
+
+    if normalized == BlockType.POWERBI_QUERY.value and not _powerbi_queries_available():
+        available_types = dict(BLOCK_SUMMARIES)
+        available_types.pop(BlockType.POWERBI_QUERY.value, None)
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Power BI queries are not currently available.",
+                f"Available types: {', '.join(sorted(available_types))}.",
+            ),
+        )
 
     cls = BLOCK_TYPE_MAP.get(normalized)
     if cls is None:
@@ -692,11 +762,33 @@ async def skyvern_block_schema(
             "summary": BLOCK_SUMMARIES.get(normalized, ""),
             "description": kb_entry.get("description"),
             "use_cases": kb_entry.get("use_cases"),
-            "schema": cls.model_json_schema(),
+            "schema": _without_internal_properties(cls.model_json_schema()),
             "example": BLOCK_EXAMPLES.get(normalized),
         },
         warnings=warnings,
     )
+
+
+def _without_internal_properties(value: Any) -> Any:
+    """Drop ``x-internal`` properties anywhere in a JSON schema, as the public OpenAPI doc does."""
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        internal = (
+            {name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")}
+            if isinstance(properties, dict)
+            else set()
+        )
+        cleaned = {key: _without_internal_properties(child) for key, child in value.items() if key != "properties"}
+        if isinstance(properties, dict):
+            cleaned["properties"] = {
+                name: _without_internal_properties(prop) for name, prop in properties.items() if name not in internal
+            }
+        if internal and isinstance(cleaned.get("required"), list):
+            cleaned["required"] = [name for name in cleaned["required"] if name not in internal]
+        return cleaned
+    if isinstance(value, list):
+        return [_without_internal_properties(child) for child in value]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +847,17 @@ async def skyvern_block_validate(
                 ErrorCode.INVALID_INPUT,
                 f"Expected a JSON object, got {type(raw).__name__}",
                 "Provide a JSON object with at least block_type and label fields",
+            ),
+        )
+
+    if not _powerbi_queries_available() and _contains_powerbi_query(raw):
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Power BI queries are not currently available.",
+                "Use a currently available block type from skyvern_block_schema.",
             ),
         )
 

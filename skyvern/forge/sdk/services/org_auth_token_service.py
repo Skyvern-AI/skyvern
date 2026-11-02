@@ -9,6 +9,7 @@ from jwt.exceptions import PyJWTError
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.core import security
+from skyvern.forge.sdk.db.repositories.organizations import OrganizationsRepository
 from skyvern.forge.sdk.schemas.organizations import OrganizationAuthToken, OrganizationAuthTokenType
 
 LOG = structlog.get_logger()
@@ -35,6 +36,15 @@ def _ui_session_expiration(token: OrganizationAuthToken, org_id: str) -> int | N
     ):
         return None
     return int(expires_at)
+
+
+async def get_valid_org_api_token(
+    organizations: OrganizationsRepository, organization_id: str
+) -> OrganizationAuthToken | None:
+    return await organizations.get_valid_org_auth_token(
+        organization_id=organization_id,
+        token_type=OrganizationAuthTokenType.api.value,
+    )
 
 
 async def create_org_api_token(org_id: str) -> OrganizationAuthToken:

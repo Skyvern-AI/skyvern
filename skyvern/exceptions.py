@@ -317,12 +317,38 @@ class InvalidOpenAIResponseFormat(SkyvernException):
 
 
 class PhoneNumberInputMismatch(SkyvernException):
-    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int, message: str | None = None):
         self.expected_digit_count = expected_digit_count
         self.actual_digit_count = actual_digit_count
         super().__init__(
-            "Phone input read-back mismatch: "
-            f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+            message
+            or (
+                "Phone input read-back mismatch: "
+                f"expected {expected_digit_count} digits, found {actual_digit_count} digits."
+            )
+        )
+
+
+class PhoneNumberInputCountryCodeMismatch(PhoneNumberInputMismatch):
+    def __init__(self, *, expected_digit_count: int, actual_digit_count: int):
+        message = (
+            (
+                f"Phone input reads its value as an international number but holds {actual_digit_count} digits "
+                f"instead of the {expected_digit_count} entered, so its country calling code is gone and the "
+                "number now reads as another country. Enter the whole number, country calling code included, "
+                "into this field."
+            )
+            if actual_digit_count != expected_digit_count
+            else (
+                f"Phone input put a '+' in front of the {actual_digit_count} digits entered, so their leading "
+                "digits now read as a country calling code. Enter the number together with its country calling "
+                "code from the task data; do not guess one."
+            )
+        )
+        super().__init__(
+            expected_digit_count=expected_digit_count,
+            actual_digit_count=actual_digit_count,
+            message=message,
         )
 
 
@@ -349,7 +375,7 @@ class CardNumberInputMismatch(SkyvernException):
 class SecretInputMismatch(SkyvernException):
     def __init__(self) -> None:
         # No secret material in the message: not the value, its length, or its character classes.
-        super().__init__("Secret input read-back mismatch after atomic re-entry.")
+        super().__init__("Secret input read-back mismatch after re-entry.")
 
 
 class FreeTextInputMismatch(SkyvernException):
@@ -549,6 +575,9 @@ def _browser_state_diagnostic_suffix(
     if failure_reason:
         suffix += f" failure_reason={failure_reason}."
     return suffix
+
+
+BROWSER_CONNECTION_LOST_ERROR_CODE = "browser_connection_lost"
 
 
 class MissingBrowserState(SkyvernException):
@@ -1186,6 +1215,10 @@ class BitwardenLoginError(BitwardenBaseError):
         super().__init__(f"Error logging in to Bitwarden: {message}")
 
 
+class BitwardenCredentialsRejectedError(BitwardenLoginError):
+    pass
+
+
 class BitwardenUnlockError(BitwardenBaseError):
     def __init__(self, message: str) -> None:
         super().__init__(f"Error unlocking Bitwarden: {message}")
@@ -1380,6 +1413,15 @@ class InvalidElementForTextInput(SkyvernException):
         super().__init__(message)
 
 
+class InputElementCoveredByUntypeableElement(SkyvernException):
+    def __init__(self, element_id: str, blocking_element_id: str, blocking_tag_name: str):
+        super().__init__(
+            f"The element with id={element_id} is covered by the {blocking_tag_name} element with "
+            f"id={blocking_element_id}, which doesn't support text input. Dismiss or answer the pop-up "
+            f"that owns id={blocking_element_id} first, then type into id={element_id} again."
+        )
+
+
 class FailedToClearInputField(SkyvernException):
     def __init__(self, element_id: str, tag_name: str):
         super().__init__(
@@ -1424,6 +1466,24 @@ class FailToClick(SkyvernException):
         super().__init__(f"Failed to click({anchor}). element_id={element_id}, error_msg={msg}")
 
 
+class FailToOpenLink(SkyvernException):
+    """A cross-origin link followed as a same-tab navigation that failed.
+
+    Withholds the driver's error, which names a third-party URL the planner never asked to visit and
+    so reads in the action history as the agent having left the site its goal told it to stay on.
+    """
+
+    def __init__(self, page_moved: bool) -> None:
+        # Every clause here is either true by construction (the destination is cross-origin) or
+        # measured (page_moved); a failed goto can still commit an error page, so it is never assumed.
+        landed = (
+            "The browser is no longer on the page it was on before this action."
+            if page_moved
+            else "The current page is unchanged."
+        )
+        super().__init__(f"Failed to open the link: its destination is on another site. {landed}")
+
+
 class FailToHover(SkyvernException):
     def __init__(self, element_id: str, msg: str):
         super().__init__(f"Failed to hover. element_id={element_id}, error_msg={msg}")
@@ -1459,6 +1519,15 @@ class EmptySelect(SkyvernException):
         super().__init__(
             f"nothing is selected, try to select again. element_id={element_id}",
         )
+
+
+RUN_FINALIZED_ELSEWHERE_REASON = "Another server already finalized this run"
+
+
+class ChildStartRefusedAfterLeaseLoss(SkyvernException):
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(RUN_FINALIZED_ELSEWHERE_REASON)
 
 
 class TaskAlreadyCanceled(SkyvernHTTPException):
@@ -1605,6 +1674,8 @@ class InvalidUrl(SkyvernHTTPException):
     def __init__(
         self, url: str, *, field_name: str = "url", reason: Literal["malformed", "unsupported scheme"] = "malformed"
     ) -> None:
+        self.field_name = field_name
+        self.reason = reason
         super().__init__(f"Invalid {field_name}: {reason}. Use an HTTP or HTTPS URL with at most 2083 characters.")
 
 
@@ -1661,6 +1732,20 @@ class InputToReadonlyElement(SkyvernException):
     def __init__(self, element_id: str):
         super().__init__(
             f"The element(id={element_id}) now is readonly. Try to interact with other elements, or try to interact with it later when it's not readonly."
+        )
+
+
+class ScrollMadeNoProgress(SkyvernException):
+    def __init__(self, element_id: str, direction: str, boundary: str | None = None):
+        reason = (
+            f" because the content is already scrolled to the {boundary}"
+            if boundary
+            else " and the content did not move"
+        )
+        super().__init__(
+            f"Scrolling {direction} from element(id={element_id}) revealed no new content{reason}. "
+            "Repeating this scroll will not change the page: work with the content already visible, "
+            "scroll the other direction, or interact with a different element."
         )
 
 
@@ -2132,6 +2217,19 @@ class PDFParsingError(SkyvernException):
         self.pdfplumber_error = pdfplumber_error
         super().__init__(
             f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
+        )
+
+
+class SplitPdfTooManyPages(SkyvernException):
+    """Raised when a PDF has more pages than the split planner can excerpt within its input budget."""
+
+    def __init__(self, total_pages: int, max_pages: int, min_per_page_tokens: int) -> None:
+        self.total_pages = total_pages
+        self.max_pages = max_pages
+        super().__init__(
+            f"Cannot plan a split of a {total_pages}-page PDF: the planner reads at most {max_pages} pages, so that "
+            f"every page keeps the {min_per_page_tokens} tokens of text it needs to be assigned to a document. "
+            "Split the source PDF into smaller files first."
         )
 
 

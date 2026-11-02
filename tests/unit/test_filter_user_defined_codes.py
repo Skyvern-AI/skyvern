@@ -60,15 +60,14 @@ def test_filter_handles_empty_errors_input() -> None:
     assert dropped == []
 
 
-def test_filter_is_case_sensitive() -> None:
-    """Codes must match exactly — mapping is case-sensitive by design."""
-    errors = [_make_error("data_unavailable")]
-    mapping = {"DATA_UNAVAILABLE": "x"}
+def test_filter_returns_the_mapping_key_for_a_case_variant_and_drops_an_ambiguous_one() -> None:
+    errors = [_make_error("data_unavailable"), _make_error("Website_Down")]
+    mapping = {"DATA_UNAVAILABLE": "x", "website_down": "y", "WEBSITE_DOWN": "z"}
 
     kept, dropped = filter_to_user_defined_codes(errors, mapping)
 
-    assert kept == []
-    assert dropped == ["data_unavailable"]
+    assert [error.error_code for error in kept] == ["DATA_UNAVAILABLE"]
+    assert dropped == ["Website_Down"]
 
 
 @pytest.mark.parametrize(

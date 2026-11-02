@@ -1314,7 +1314,16 @@ async def _register(
         organizations = SimpleNamespace(
             get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="service-account-token"))
         )
-        monkeypatch.setattr(cm, "app", SimpleNamespace(DATABASE=SimpleNamespace(organizations=organizations)))
+        credentials = SimpleNamespace(get_onepassword_credentials=AsyncMock(return_value=[]))
+        agent_function = SimpleNamespace(enforce_credential_use=AsyncMock())
+        monkeypatch.setattr(
+            cm,
+            "app",
+            SimpleNamespace(
+                DATABASE=SimpleNamespace(organizations=organizations, credentials=credentials),
+                AGENT_FUNCTION=agent_function,
+            ),
+        )
         item = SimpleNamespace(fields=[], notes=None)
         client = SimpleNamespace(items=SimpleNamespace(get=AsyncMock(return_value=item)))
         monkeypatch.setattr(

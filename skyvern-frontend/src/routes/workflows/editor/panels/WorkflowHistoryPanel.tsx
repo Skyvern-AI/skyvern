@@ -2,10 +2,13 @@ import { Cross2Icon } from "@radix-ui/react-icons";
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { CreatorDirectoryBoundary } from "@/components/CreatorDirectoryBoundary";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { WorkflowCreatorLabel } from "@/routes/workflows/components/WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { basicLocalTimeFormat } from "@/util/timeFormat";
 import {
   useWorkflowVersionsQuery,
@@ -22,7 +25,7 @@ type Props = {
   ) => void;
 };
 
-function WorkflowHistoryPanel({
+function WorkflowHistoryPanelContent({
   workflowPermanentId,
   onClose,
   onCompare,
@@ -30,6 +33,7 @@ function WorkflowHistoryPanel({
   const { data: versions, isLoading } = useWorkflowVersionsQuery({
     workflowPermanentId,
   });
+  const showEditor = useCreatorColumnEnabled();
   const [selectedVersions, setSelectedVersions] = useState<Set<number>>(
     new Set(),
   );
@@ -182,7 +186,7 @@ function WorkflowHistoryPanel({
                         onChange={() => {}} // Handled by parent click
                       />
 
-                      <div className="flex-1">
+                      <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           <span className="font-medium">
                             Version {workflow.version}
@@ -194,6 +198,16 @@ function WorkflowHistoryPanel({
                         <div className="text-sm text-muted-foreground">
                           Modified: {basicLocalTimeFormat(workflow.modified_at)}
                         </div>
+                        {showEditor && (
+                          <div className="flex items-center gap-1 text-sm text-muted-foreground">
+                            <span className="shrink-0">Modified by:</span>
+                            <div className="min-w-0 flex-1">
+                              <WorkflowCreatorLabel
+                                createdBy={workflow.edited_by}
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -204,6 +218,16 @@ function WorkflowHistoryPanel({
         </ScrollAreaViewport>
       </ScrollArea>
     </div>
+  );
+}
+
+// The editor route is not inside a CreatorDirectoryBoundary, so the panel mounts its own; without
+// one, resolveMemberName has no directory and every version reads as unattributed.
+function WorkflowHistoryPanel(props: Props) {
+  return (
+    <CreatorDirectoryBoundary>
+      <WorkflowHistoryPanelContent {...props} />
+    </CreatorDirectoryBoundary>
   );
 }
 

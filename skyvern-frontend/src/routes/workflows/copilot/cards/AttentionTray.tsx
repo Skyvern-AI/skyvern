@@ -6,6 +6,8 @@ import { cn } from "@/util/utils";
 
 const TRAY_FRAME =
   "rounded-t-lg border border-b-0 border-amber-500/50 bg-amber-500/[0.06]";
+// Inside the composer, under the demonstration strip, the composer's own border frames it.
+const EMBEDDED_TRAY_FRAME = "border-b border-amber-500/30 bg-amber-500/[0.06]";
 const TRAY_TITLE = "font-semibold text-amber-700 dark:text-yellow-400";
 
 // How the chat asks a request card to render itself as the docked tray.
@@ -13,6 +15,7 @@ export interface AttentionTrayPresentation {
   collapsed: boolean;
   onCollapsedChange: (collapsed: boolean) => void;
   upNext?: string | null;
+  embedded?: boolean;
 }
 
 type AttentionTrayProps = Omit<HTMLAttributes<HTMLDivElement>, "title"> & {
@@ -28,6 +31,7 @@ type AttentionTrayProps = Omit<HTMLAttributes<HTMLDivElement>, "title"> & {
   minimizeLabel: string;
   // Another request waiting behind this one; the chat shows one at a time.
   upNext?: string | null;
+  embedded?: boolean;
   children: ReactNode;
 };
 
@@ -43,18 +47,15 @@ export function AttentionTray({
   onCollapsedChange,
   minimizeLabel,
   upNext,
+  embedded = false,
   children,
   className,
   ...groupProps
 }: AttentionTrayProps) {
+  const frame = embedded ? EMBEDDED_TRAY_FRAME : TRAY_FRAME;
   if (collapsed) {
     return (
-      <div
-        className={cn(
-          "flex items-center gap-2 px-3 py-1.5 text-xs",
-          TRAY_FRAME,
-        )}
-      >
+      <div className={cn("flex items-center gap-2 px-3 py-1.5 text-xs", frame)}>
         <span
           aria-hidden
           className="size-2 shrink-0 rounded-full bg-amber-500"
@@ -89,7 +90,7 @@ export function AttentionTray({
       {...groupProps}
       className={cn(
         "flex max-h-[50vh] min-w-0 flex-col overflow-hidden",
-        TRAY_FRAME,
+        frame,
         className,
       )}
     >

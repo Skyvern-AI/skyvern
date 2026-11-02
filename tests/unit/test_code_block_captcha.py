@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -43,6 +42,7 @@ from tests.unit.copilot_test_helpers import (
     challenge_browser_page,
     skip_no_browser,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 CHALLENGE_SUBDOMAIN_URL = "https://edge.challenges.cloudflare.com/cdn-cgi/challenge-platform/fake"
 SOLVED = ChallengeOutcome(ChallengeStatus.SOLVED, None, "extension")
@@ -1303,25 +1303,91 @@ async def test_nested_onscreen_match_after_an_offscreen_one_is_detected(monkeypa
     assert await solve_challenge_ladder(page, probe_child_frames=True) is True, "an on-screen match must count"
 
 
+class _InFlight:
+    def __init__(self) -> None:
+        self.count = 0
+        self.peaks: list[int] = []
+        self._peak = 0
+
+    def enter(self) -> None:
+        self.count += 1
+        self._peak = max(self._peak, self.count)
+
+    def leave(self) -> None:
+        self.count -= 1
+        if self.count == 0:
+            self.peaks.append(self._peak)
+            self._peak = 0
+
+
 class _WedgedFrame:
     url = "https://app.example/wedged"
     parent_frame = object()
 
+    def __init__(self, in_flight: _InFlight | None = None) -> None:
+        self.in_flight = in_flight if in_flight is not None else _InFlight()
+        self.release = asyncio.Event()
+
     async def frame_element(self) -> None:
-        await asyncio.Event().wait()
+        self.in_flight.enter()
+        try:
+            await self.release.wait()
+        finally:
+            self.in_flight.leave()
+
+
+class _WedgedChallengeFrame(_WedgedFrame):
+    url = CHALLENGE_URL
+
+
+def _unbounded_timeout(_delay: float | None) -> asyncio.Timeout:
+    return asyncio.timeout(None)
+
+
+async def _verdict_over_wedged_frames(
+    frames: list[_WedgedFrame], in_flight: _InFlight, *, probe_child_frames: bool = False
+) -> bool:
+    page = FakePage(frames=frames)  # type: ignore[arg-type]
+    try:
+        verdict = await asyncio.wait_for(solve_challenge_ladder(page, probe_child_frames=probe_child_frames), 30)
+        leaked = in_flight.count
+    except TimeoutError:
+        pytest.fail("no budget ended the probes of frames that never answer")
+    finally:
+        for frame in frames:
+            frame.release.set()
+    assert leaked == 0, f"{leaked} wedged frame probes outlived the verdict"
+    return verdict
 
 
 @pytest.mark.asyncio
 async def test_wedged_child_frames_cannot_outlast_the_scan_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Each frame is bounded on its own, so without a whole-scan budget five wedged frames would cost five
-    # full per-frame bounds before the ladder could even decide nothing is there.
+    # Every asyncio.timeout bound in the solver is lifted, so only the whole-scan budget can end a scan of frames
+    # that never answer.
     monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
-    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.3)
-    page = FakePage(frames=[_WedgedFrame() for _ in range(5)])
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.01)
+    monkeypatch.setattr(captcha_solver_module, "asyncio", ScopedAsyncio(timeout=_unbounded_timeout))
+    in_flight = _InFlight()
+    frames = [_WedgedFrame(in_flight) for _ in range(5)]
 
-    started = time.monotonic()
-    assert await solve_challenge_ladder(page, probe_child_frames=True) is False
-    assert time.monotonic() - started < 1.0
+    assert await _verdict_over_wedged_frames(frames, in_flight, probe_child_frames=True) is False
+    assert in_flight.peaks == [len(frames)], "the scan must hold every wedged frame at once, so five cost one budget"
+
+
+@pytest.mark.asyncio
+async def test_wedged_challenge_frames_read_absent_on_the_default_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An absent verdict costs one frame scan and one rendered-frame probe, and each holds every challenge frame at
+    # once, so five wedged frames cost each step's bound once.
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.01)
+    monkeypatch.setattr(challenge_signature, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", 0.01)
+    in_flight = _InFlight()
+    frames: list[_WedgedFrame] = [_WedgedChallengeFrame(in_flight) for _ in range(5)]
+
+    assert await _verdict_over_wedged_frames(frames, in_flight) is False, "frames that never answer must read absent"
+    assert in_flight.peaks == [len(frames)] * 2, (
+        "the frame scan and then the rendered-frame probe must each hold every challenge frame at once"
+    )
 
 
 class _DetachedFrame:
@@ -1363,7 +1429,7 @@ async def test_a_challenge_frame_behind_wedged_frames_is_still_found(monkeypatch
         },
     )()
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", 0.1)
     challenge = FakeFrame(url="https://app.example/challenge-frame", nested_marker=FakeLocator(count=1), visible=True)
     page = FakePage(frames=[*(_WedgedFrame() for _ in range(4)), challenge])  # type: ignore[list-item]
 
@@ -1407,7 +1473,7 @@ async def test_hcaptcha_arm_bound_cuts_extension_before_default_timeout(monkeypa
     monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 5)
 
     async def slow_solve(_page: FakePage) -> bool:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
         return True
 
     agent_function = type(
@@ -1438,7 +1504,7 @@ async def test_extension_arm_bound_falls_back_to_default_when_no_hcaptcha_marker
     monkeypatch.setattr(captcha_solver_module, "_EXTENSION_ARM_TIMEOUT_SECONDS", 0.05)
 
     async def slow_solve(_page: FakePage) -> bool:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.1)
         return True
 
     agent_function = type(
@@ -1789,24 +1855,6 @@ async def test_a_raising_challenge_frame_does_not_hide_a_visible_one(monkeypatch
     page = FakePage(frames=[_DetachedChallengeFrame(), FakeFrame(url=CHALLENGE_URL, visible=True)])  # type: ignore[list-item]
 
     assert await solve_challenge_ladder(page) is True
-
-
-class _WedgedChallengeFrame(_WedgedFrame):
-    url = CHALLENGE_URL
-
-
-@pytest.mark.asyncio
-async def test_wedged_challenge_frames_are_bounded_on_the_default_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An absent verdict costs one frame scan plus one rendered-frame probe, each spent once however many frames wedge.
-    scan, probe = 0.3, 0.2
-    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
-    monkeypatch.setattr(captcha_solver_module, "_CHILD_FRAME_SCAN_BUDGET_SECONDS", scan)
-    monkeypatch.setattr(challenge_signature, "_CHALLENGE_FRAME_PROBE_TIMEOUT_SECONDS", probe)
-    page = FakePage(frames=[_WedgedChallengeFrame() for _ in range(5)])
-
-    started = time.monotonic()
-    assert await solve_challenge_ladder(page) is False
-    assert time.monotonic() - started < scan + 2 * probe
 
 
 @pytest.mark.asyncio
@@ -2243,3 +2291,41 @@ async def test_failure_on_a_sign_in_form_is_recorded_without_changing_any_other_
     # Decisions, attribution and run tags read these entries (ADR 0028), so they must be what the run records today.
     assert run_category[:-1] == WorkflowService._classify_workflow_terminal_failure(run_status, run_reason)
     assert ("AUTH_FAILURE" in {entry["category"] for entry in run_category}) is (page_title == "Enter your password")
+
+
+_API2_ANCHOR = "https://www.google.com/recaptcha/api2/anchor?ar=1&k=key-a&size="
+_ENTERPRISE_ANCHOR = "https://www.recaptcha.net/recaptcha/enterprise/anchor?ar=1&k=key-a&size="
+
+
+@pytest.mark.parametrize(
+    ("anchor_url", "expected"),
+    (
+        (_API2_ANCHOR + "normal", "recaptcha_v2_checkbox"),
+        (_ENTERPRISE_ANCHOR + "compact", "recaptcha_enterprise"),
+        ("https://www.google.com/recaptcha/api2/anchor?k=key-a", "unknown"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_the_anchor_arm_reports_the_variant_of_the_frame_it_clicked(
+    monkeypatch: pytest.MonkeyPatch, anchor_url: str, expected: str
+) -> None:
+    agent_function = type(
+        "AgentFunctionStub",
+        (AgentFunction,),
+        {
+            "auto_solve_captchas": AsyncMock(return_value=False),
+            "solve_recaptcha_token": AsyncMock(return_value=False),
+        },
+    )()
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    parent_frame = FakePage(token_values=["", "opaque-token"])
+    frame = FakeFrame(url=anchor_url, anchor=FakeLocator(count=1), parent_frame=parent_frame)
+
+    outcome = await solve_challenge(FakePage(recaptcha=True, frames=[frame]))
+
+    assert (outcome.status, outcome.arm, outcome.recaptcha_target) == (
+        ChallengeStatus.SOLVED,
+        "recaptcha_anchor_frame",
+        expected,
+    )
+    assert set(outcome.receipt()) == {"status", "vendor", "arm", "page_state"}

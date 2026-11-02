@@ -625,18 +625,42 @@ describe("buildBlockStatusMap", () => {
     });
   });
 
+  test("scopes repeated labels and flattened Task V2 wrappers to the selected run", () => {
+    const child = blockItem({
+      workflow_run_id: "child",
+      label: "constructor",
+      status: Status.Completed,
+    });
+    const outer = blockItem({
+      workflow_run_id: "outer",
+      label: "constructor",
+      status: Status.Failed,
+    });
+    const wrapper = blockItem({
+      workflow_run_id: "outer",
+      label: "task",
+      block_type: "task_v2",
+    }).block;
+    child.task_v2_blocks = [wrapper];
+
+    const map = buildBlockStatusMap([child, outer], "outer");
+
+    expect(map["constructor"]).toMatchObject({ block: outer.block });
+    expect(map.task?.block).toBe(wrapper);
+  });
+
   test("latest occurrence wins for looped block labels", () => {
     const map = buildBlockStatusMap([
       blockItem({ block_type: "for_loop", label: "loop", actions: null }, [
         blockItem({
           label: "inner",
-          status: Status.Completed,
-          actions: [action()],
+          status: Status.Failed,
+          actions: [action(), action()],
         }),
         blockItem({
           label: "inner",
-          status: Status.Failed,
-          actions: [action(), action()],
+          status: Status.Completed,
+          actions: [action()],
         }),
       ]),
     ]);

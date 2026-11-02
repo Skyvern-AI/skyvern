@@ -12,7 +12,9 @@ import { AxiosError, AxiosHeaders } from "axios";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { getClient } from "@/api/AxiosClient";
 import type { CredentialApiResponse } from "@/api/types";
+import CloudContext from "@/store/CloudContext";
 import { PageSlotsProvider, type PermissionsState } from "@/store/PageSlots";
 
 import {
@@ -44,6 +46,8 @@ function permissionsForCredentialDelete(allowed: boolean): PermissionsState {
       role: allowed ? "admin" : "member",
       capabilities: [
         { capability: "credential.delete", allowed, reason: "role" },
+        { capability: "email_forwarding.list", allowed, reason: "role" },
+        { capability: "email_forwarding.create", allowed, reason: "role" },
       ],
     },
   };
@@ -195,6 +199,7 @@ function renderEditPasswordCredentialsModal(
   onCredentialCreated?: (id: string, name?: string) => void,
   defaultTotpType?: "authenticator",
   permissions: PermissionsState = adminPermissions,
+  isCloud = false,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -204,23 +209,25 @@ function renderEditPasswordCredentialsModal(
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <PageSlotsProvider value={{ permissions }}>
-        <CredentialAuthenticatorSupportProvider
-          value={{ additionalTwoFactorMethods }}
-        >
-          <MemoryRouter>
-            <CredentialsModal
-              isOpen
-              onOpenChange={vi.fn()}
-              overrideType={CredentialModalTypes.PASSWORD}
-              editingCredential={credential}
-              defaultTotpType={defaultTotpType}
-              onStartBackgroundTest={vi.fn()}
-              onCredentialCreated={onCredentialCreated}
-            />
-          </MemoryRouter>
-        </CredentialAuthenticatorSupportProvider>
-      </PageSlotsProvider>
+      <CloudContext.Provider value={isCloud}>
+        <PageSlotsProvider value={{ permissions }}>
+          <CredentialAuthenticatorSupportProvider
+            value={{ additionalTwoFactorMethods }}
+          >
+            <MemoryRouter>
+              <CredentialsModal
+                isOpen
+                onOpenChange={vi.fn()}
+                overrideType={CredentialModalTypes.PASSWORD}
+                editingCredential={credential}
+                defaultTotpType={defaultTotpType}
+                onStartBackgroundTest={vi.fn()}
+                onCredentialCreated={onCredentialCreated}
+              />
+            </MemoryRouter>
+          </CredentialAuthenticatorSupportProvider>
+        </PageSlotsProvider>
+      </CloudContext.Provider>
     </QueryClientProvider>,
   );
 }
@@ -229,6 +236,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  getMock.mockReset();
 });
 
 describe("getAuthenticatorKeyError", () => {
@@ -490,6 +498,8 @@ describe("CredentialsModal additional two-factor methods", () => {
           expect.objectContaining({ credentialId: "cred-passkey" }),
         );
       });
+      expect(postMock.mock.calls[0]?.[0]).toBe("/credentials/passkey/setup");
+      expect(getClient).toHaveBeenNthCalledWith(1, null, "sans-api-v1");
       await waitFor(() => {
         expect(deleteMock.mock.calls.map(([path]) => path)).toEqual(
           retry
@@ -676,106 +686,188 @@ describe("CredentialsModal authenticator save errors", () => {
   }, 10_000);
 });
 
-describe("CredentialsModal edit-mode inline test", () => {
-  it.each(["success", "404"] as const)(
-    "uses Member cleanup without interrupting save when cleanup returns %s",
-    async (cleanupResult) => {
-      // 1st POST: startTest's /credentials/test-login. 2nd POST: the real
-      // credential's /credentials/{id}/update once Save is clicked.
-      postMock
-        .mockResolvedValueOnce({
-          data: { credential_id: "temp-cred-id", workflow_run_id: "wr-1" },
-        })
-        .mockResolvedValueOnce({
-          data: { credential_id: "real-cred-id", name: "Acme Login" },
-        });
-      getMock.mockResolvedValueOnce({
-        data: {
-          status: "completed",
-          browser_profile_id: "new-profile-id",
-          tested_url: "https://example.com/login",
-        },
-      });
-      patchMock.mockResolvedValue({ data: {} });
-      if (cleanupResult === "404") {
-        deleteMock.mockRejectedValueOnce(
-          axiosErrorWithDetail("Credential not found", 404),
-        );
-      } else {
-        deleteMock.mockResolvedValue({ data: {} });
+describe("CredentialsModal email forwarding", () => {
+  it("mints after selecting Email on a saved credential without 2FA and keeps Update disabled until applied", async () => {
+    installEmailCredentialHooks();
+    const newAddress = {
+      forwarding_address_id: "fea_new",
+      organization_id: "org_1",
+      email_config_id: "emc_1",
+      email_address: "new-forwarding@example.test",
+      org_slug: "acme",
+      match_mode: "dedicated",
+      credential_id: "real-cred-id",
+      sender_allowlist: null,
+      status: "active",
+      last_received_at: null,
+      has_pending_confirmation: false,
+      created_at: "2026-10-01T00:00:00Z",
+      modified_at: "2026-10-01T00:00:00Z",
+    };
+    let addressReads = 0;
+    let releaseRefetch!: () => void;
+    let signalRefetch!: () => void;
+    const refetchGate = new Promise<void>((resolve) => {
+      releaseRefetch = resolve;
+    });
+    const refetchStarted = new Promise<void>((resolve) => {
+      signalRefetch = resolve;
+    });
+    getMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/availability")) return { data: { available: true } };
+      if (url.endsWith("/addresses") && ++addressReads > 1) {
+        signalRefetch();
+        await refetchGate;
       }
-      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      return { data: [] };
+    });
+    postMock.mockImplementation(async (url: string) =>
+      url === "/email-forwarding/addresses/managed"
+        ? { data: newAddress }
+        : { data: { credential_id: "real-cred-id", name: "Acme Login" } },
+    );
 
-      renderEditPasswordCredentialsModal(
-        editingPasswordCredential,
-        undefined,
-        undefined,
-        undefined,
-        memberPermissions,
-      );
+    renderEditPasswordCredentialsModal(
+      editingPasswordCredential,
+      undefined,
+      undefined,
+      undefined,
+      adminPermissions,
+      true,
+    );
+    const update = await screen.findByRole("button", { name: "Update" });
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    fireEvent.click(screen.getByText("Two-Factor Authentication"));
+    fireEvent.click(screen.getByRole("button", { name: "Email" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Generate a Skyvern forwarding address",
+      }),
+    );
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith(
+        "/email-forwarding/addresses/managed",
+        expect.objectContaining({ credential_id: "real-cred-id" }),
+      ),
+    );
+    await refetchStarted;
 
-      fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
-      const passwordInput = document.querySelector('input[type="password"]');
-      expect(passwordInput).toBeTruthy();
-      fireEvent.change(passwordInput as HTMLInputElement, {
-        target: { value: "rotated-password" },
-      });
+    expect((update as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getAllByDisplayValue("user@example.com")).toHaveLength(2);
+    fireEvent.change(screen.getAllByDisplayValue("user@example.com")[0]!, {
+      target: { value: "renamed@example.test" },
+    });
 
-      fireEvent.click(screen.getByRole("button", { name: "Test" }));
+    releaseRefetch();
+    expect(
+      await screen.findByDisplayValue("renamed@example.test"),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByDisplayValue(newAddress.email_address)).toBeTruthy(),
+    );
+    expect((update as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(update);
 
-      // Real 3s poll delay inside the component — wait for the button label
-      // to flip once testStatus reaches "completed".
-      await waitFor(
-        () => {
-          expect(screen.getByRole("button", { name: "Retest" })).toBeTruthy();
-        },
-        { timeout: 8000 },
-      );
-
-      // Uncheck "Save browser session" after the test completed — the checkbox
-      // has no side effect on testStatus/testCredentialId, so this must not be
-      // able to skip cleanup of the now-orphaned temp credential.
-      fireEvent.click(
-        screen.getByLabelText("Save browser session for future logins"),
-      );
-
-      fireEvent.click(screen.getByRole("button", { name: "Update" }));
-
-      await waitFor(() => {
-        expect(deleteMock).toHaveBeenCalledWith(
-          "/credentials/temp-cred-id/temporary",
-        );
-      });
-      if (cleanupResult === "404") {
-        expect(warning).toHaveBeenCalledWith(
-          "Credential cleanup returned 404; it may already be gone or no longer be eligible for cleanup.",
-        );
-      } else {
-        expect(warning).not.toHaveBeenCalledWith(
-          "Credential cleanup returned 404; it may already be gone or no longer be eligible for cleanup.",
-        );
-      }
-      await waitFor(() => {
-        expect(postMock).toHaveBeenCalledWith(
-          "/credentials/real-cred-id/update",
-          expect.objectContaining({
-            credential: expect.objectContaining({
-              password: "rotated-password",
-            }),
+    await waitFor(() =>
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id/update",
+        expect.objectContaining({
+          credential: expect.objectContaining({
+            username: "renamed@example.test",
+            totp_identifier: newAddress.email_address,
           }),
-        );
-      });
+        }),
+      ),
+    );
+  });
+});
 
-      // The bug this guards against: the old code renamed the throwaway temp
-      // credential in place of updating the real one. renameCredentialMutation
-      // is the only path that PATCHes a credential by the *temp* id — assert
-      // it never fired.
-      for (const call of patchMock.mock.calls) {
-        expect(call[0]).not.toBe("/credentials/temp-cred-id");
-      }
-    },
-    15_000,
-  );
+describe("CredentialsModal edit-mode inline test", () => {
+  it("uses Member cleanup without interrupting save when cleanup returns 404", async () => {
+    // 1st POST: startTest's /credentials/test-login. 2nd POST: the real
+    // credential's /credentials/{id}/update once Save is clicked.
+    postMock
+      .mockResolvedValueOnce({
+        data: { credential_id: "temp-cred-id", workflow_run_id: "wr-1" },
+      })
+      .mockResolvedValueOnce({
+        data: { credential_id: "real-cred-id", name: "Acme Login" },
+      });
+    getMock.mockResolvedValueOnce({
+      data: {
+        status: "completed",
+        browser_profile_id: "new-profile-id",
+        tested_url: "https://example.com/login",
+      },
+    });
+    patchMock.mockResolvedValue({ data: {} });
+    deleteMock.mockRejectedValueOnce(
+      axiosErrorWithDetail("Credential not found", 404),
+    );
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    renderEditPasswordCredentialsModal(
+      editingPasswordCredential,
+      undefined,
+      undefined,
+      undefined,
+      memberPermissions,
+    );
+
+    fireEvent.click(screen.getAllByLabelText("Edit credential values")[0]!);
+    const passwordInput = document.querySelector('input[type="password"]');
+    expect(passwordInput).toBeTruthy();
+    fireEvent.change(passwordInput as HTMLInputElement, {
+      target: { value: "rotated-password" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Test" }));
+
+    // Real 3s poll delay inside the component — wait for the button label
+    // to flip once testStatus reaches "completed".
+    await waitFor(
+      () => {
+        expect(screen.getByRole("button", { name: "Retest" })).toBeTruthy();
+      },
+      { timeout: 8000 },
+    );
+
+    // Uncheck "Save browser session" after the test completed — the checkbox
+    // has no side effect on testStatus/testCredentialId, so this must not be
+    // able to skip cleanup of the now-orphaned temp credential.
+    fireEvent.click(
+      screen.getByLabelText("Save browser session for future logins"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(deleteMock).toHaveBeenCalledWith(
+        "/credentials/temp-cred-id/temporary",
+      );
+    });
+    expect(warning).toHaveBeenCalledWith(
+      "Credential cleanup returned 404; it may already be gone or no longer be eligible for cleanup.",
+    );
+    await waitFor(() => {
+      expect(postMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id/update",
+        expect.objectContaining({
+          credential: expect.objectContaining({
+            password: "rotated-password",
+          }),
+        }),
+      );
+    });
+
+    // The bug this guards against: the old code renamed the throwaway temp
+    // credential in place of updating the real one. renameCredentialMutation
+    // is the only path that PATCHes a credential by the *temp* id — assert
+    // it never fired.
+    for (const call of patchMock.mock.calls) {
+      expect(call[0]).not.toBe("/credentials/temp-cred-id");
+    }
+  }, 15_000);
 
   it("shows only the partial-save toast, not a success toast, when the metadata PATCH fails", async () => {
     postMock.mockResolvedValueOnce({
@@ -1510,6 +1602,90 @@ describe("CredentialsModal run-sequentially toggle", () => {
     expect(toastMock).not.toHaveBeenCalledWith(
       expect.objectContaining({ title: "Credential saved" }),
     );
+  }, 10_000);
+});
+
+describe("CredentialsModal save-browser-session toggle", () => {
+  const saveSessionLabel = /Save browser session for future logins/i;
+
+  const noIntentNoSession: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    browser_profile_id: null,
+    save_browser_session_intent: false,
+  };
+  const intentWithoutSession: CredentialApiResponse = {
+    ...editingPasswordCredential,
+    browser_profile_id: null,
+    save_browser_session_intent: true,
+  };
+
+  it("persists the intent via PATCH when the checkbox is the only change", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditPasswordCredentialsModal(noIntentNoSession);
+    fireEvent.click(await screen.findByLabelText(saveSessionLabel));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ save_browser_session_intent: true }),
+      );
+    });
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Credential saved" }),
+      );
+    });
+  }, 10_000);
+
+  it("persists the cleared intent when the checkbox is unticked", async () => {
+    patchMock.mockResolvedValueOnce({
+      data: { credential_id: "real-cred-id", name: "Acme Login" },
+    });
+    renderEditPasswordCredentialsModal(intentWithoutSession);
+    const checkbox = await screen.findByLabelText(saveSessionLabel);
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(patchMock).toHaveBeenCalledWith(
+        "/credentials/real-cred-id",
+        expect.objectContaining({ save_browser_session_intent: false }),
+      );
+    });
+  }, 10_000);
+
+  it("tells the user a ticked box alone has not saved a session", async () => {
+    renderEditPasswordCredentialsModal(intentWithoutSession);
+    await screen.findByLabelText(saveSessionLabel);
+    expect(screen.getByText(/No session is saved yet/i)).toBeTruthy();
+
+    cleanup();
+    renderEditPasswordCredentialsModal(editingPasswordCredential);
+    await screen.findByLabelText(saveSessionLabel);
+    expect(screen.queryByText(/No session is saved yet/i)).toBeNull();
+  }, 10_000);
+
+  // A saved profile ticks the box even with the intent flag unset, so the change
+  // check has to compare against that same hydrated value or every bare Update
+  // would issue a no-op PATCH.
+  it("sends no request when a credential with a saved session is closed untouched", async () => {
+    renderEditPasswordCredentialsModal({
+      ...editingPasswordCredential,
+      save_browser_session_intent: false,
+    });
+    const checkbox = await screen.findByLabelText(saveSessionLabel);
+    expect(checkbox.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => {
+      expect(toastMock).not.toHaveBeenCalled();
+    });
+    expect(patchMock).not.toHaveBeenCalled();
+    expect(postMock).not.toHaveBeenCalled();
   }, 10_000);
 });
 

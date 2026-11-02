@@ -8,6 +8,11 @@ from pydantic import BaseModel
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 
+# `steps.created_by` of a Task V3 turn step: one row per loop turn, beside the block's own order-0 step. Turn
+# steps are observability only -- the order-0 step stays the block's billing unit and workflow step-budget unit,
+# so the warehouse invoice model and the budget count both skip rows carrying this marker.
+TASK_V3_TURN_STEP_CREATED_BY = "task_v3"
+
 
 class StepStatus(StrEnum):
     created = "created"

@@ -505,6 +505,10 @@
   let clickStart = null;
   let clickPointer = null;
   let pointerUp = false;
+  let press = null;
+  let nativeDrag = null;
+  let suppressClick = false;
+  let labelControl = null;
   let typing = null;
   let selectStart = null;
   let stopped = false;
@@ -571,6 +575,63 @@
       ? element.closest("select")
       : null;
   };
+  const dropSnapshot = (element) => {
+    let current = element;
+    let start = null;
+    while (current && !(start = snapshot(current)))
+      current = current.parentElement;
+    return start;
+  };
+  const emitDrag = (source, drop) => {
+    if (!source || !drop) return false;
+    // A drop on the source's own container is a move inside it, unless a sortable already reparented
+    // the source into the destination mid-drag.
+    const moved = source.element.parentElement !== source.origin;
+    if (!moved && drop.element.contains(source.element)) return false;
+    emit("drag", source, {
+      target_selector: drop.selector,
+      target_packet: drop.packet,
+    });
+    return true;
+  };
+  const emitDragGap = (start) => emit("freeform_drag", start || {});
+  const selectionText = () =>
+    String((globalThis.getSelection && globalThis.getSelection()) || "");
+  const endPointerDrag = (event) => {
+    const current = press;
+    press = null;
+    const source = current.element;
+    // A stroke or slider gesture is never a text selection or an element-to-element drag, wherever it
+    // is released.
+    if (source.closest && source.closest("canvas,[role=slider]")) {
+      suppressClick = true;
+      emitDragGap(current.start);
+      return;
+    }
+    // A drag that changed the text selection was selecting text; a highlight left from before is not.
+    const selected = selectionText();
+    if (selected && selected !== current.selected) return;
+    const hits = document.elementsFromPoint(event.clientX, event.clientY);
+    // ponytail: a drag library's floating copy of the source sits on top, so a same-tag, same-text hit is
+    // skipped; an identical-looking sibling target is skipped too and records a gap instead of a drag.
+    const hit = hits.find(
+      (element) =>
+        !source.contains(element) &&
+        !(
+          element.tagName === source.tagName &&
+          element.textContent === source.textContent &&
+          source.textContent.trim()
+        ),
+    );
+    if (emitDrag(current.start, dropSnapshot(hit))) {
+      suppressClick = true;
+      return;
+    }
+    // A release still over the source is a jittery click and keeps its native click.
+    if (!hits.length || source.contains(hits[0])) return;
+    suppressClick = true;
+    emitDragGap(current.start);
+  };
   const labelTextField = (element) =>
     element && element.matches && element.matches("label")
       ? textField(element.control)
@@ -589,7 +650,12 @@
   const snapshot = (element) => {
     const selector = getDurableSelector(element);
     return selector
-      ? { element, selector, packet: packetFor(element, selector) }
+      ? {
+          element,
+          selector,
+          packet: packetFor(element, selector),
+          origin: element.parentElement,
+        }
       : null;
   };
   const finishWaiter = (events) => {
@@ -848,6 +914,10 @@
     const field = textField(raw);
     if (typing && !typing.element.contains(raw)) commitTyping();
     cancelClick();
+    press = null;
+    nativeDrag = null;
+    suppressClick = false;
+    labelControl = null;
     if (event.button !== 0) return;
     const select = nativeSelect(raw);
     if (select) {
@@ -858,6 +928,14 @@
     const target = clickElement(raw);
     if (labelTextField(target)) return;
     clickStart = snapshot(target);
+    press = {
+      element: target,
+      start: clickStart,
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      selected: selectionText(),
+    };
     if (clickStart) {
       clickPointer = {
         id: event.pointerId,
@@ -887,6 +965,14 @@
   add(globalThis, "pointerup", (event) => {
     if (!event.isTrusted) return;
     if (
+      press &&
+      event.pointerId === press.id &&
+      Math.hypot(event.clientX - press.x, event.clientY - press.y) >
+        CLICK_DRAG_THRESHOLD
+    )
+      endPointerDrag(event);
+    press = null;
+    if (
       !clickPointer ||
       event.pointerId !== clickPointer.id ||
       event.button !== clickPointer.button
@@ -904,11 +990,46 @@
     pointerUp = true;
   });
   add(globalThis, "pointercancel", (event) => {
-    if (event.isTrusted && clickPointer && event.pointerId === clickPointer.id)
-      cancelClick();
+    if (!event.isTrusted) return;
+    if (press && event.pointerId === press.id) press = null;
+    if (clickPointer && event.pointerId === clickPointer.id) cancelClick();
+  });
+  add(globalThis, "dragstart", (event) => {
+    if (!event.isTrusted) return;
+    const raw = eventElement(event);
+    nativeDrag = snapshot(
+      (raw && raw.closest && raw.closest("[draggable=true]")) || raw,
+    );
+    press = null;
+  });
+  add(globalThis, "drop", (event) => {
+    if (!event.isTrusted || !nativeDrag) return;
+    const source = nativeDrag;
+    nativeDrag = null;
+    if (!emitDrag(source, dropSnapshot(eventElement(event))))
+      emitDragGap(source);
+  });
+  add(globalThis, "dragend", (event) => {
+    if (!event.isTrusted || !nativeDrag) return;
+    const source = nativeDrag;
+    nativeDrag = null;
+    emitDragGap(source);
   });
   add(globalThis, "click", (event) => {
     if (!event.isTrusted) return;
+    // A label's activation click on its control shares the label click's gesture (same pointerId, timeStamp and
+    // detail), so it is recognised by target until the next pointerdown or keydown starts a new gesture.
+    const forwarded = labelControl;
+    const clicked = eventElement(event);
+    labelControl =
+      clicked && clicked.closest
+        ? clicked.closest("label")?.control || null
+        : null;
+    if (forwarded && clicked === forwarded) return;
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
     if (event.detail === 0) return;
     const raw = eventElement(event);
     if (nativeSelect(raw)) return;
@@ -1016,6 +1137,7 @@
   });
   add(globalThis, "keydown", (event) => {
     if (!event.isTrusted || event.repeat) return;
+    labelControl = null;
     if (event.key === "Enter" || event.key === " ") watchEventRoots(event);
     const raw = eventElement(event);
     const target = clickElement(raw);
@@ -1177,6 +1299,7 @@
         waiter = finish;
       }),
     selectorFor: getDurableSelector,
+    labelFor: ownLabelText,
     flush,
     stop: () => {
       if (stopped) return [];

@@ -30,6 +30,13 @@ class LLMAPIHandler(Protocol):
     ) -> Awaitable[dict[str, Any] | Any]: ...
 
 
+def handler_llm_key(handler: LLMAPIHandler) -> str | None:
+    # Handlers are plain callables: the factory attaches .llm_key dynamically, and bound LLMCaller
+    # methods carry it on __self__ (mirrors LLMAPIHandlerFactory._maybe_get_flex_handler).
+    key = getattr(handler, "llm_key", None) or getattr(getattr(handler, "__self__", None), "llm_key", None)
+    return key if isinstance(key, str) else None
+
+
 async def dummy_llm_api_handler(
     prompt: str,
     prompt_name: str,

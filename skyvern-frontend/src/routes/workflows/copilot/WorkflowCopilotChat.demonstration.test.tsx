@@ -1,4 +1,5 @@
 import type { ComponentProps } from "react";
+import { AxiosError, type AxiosResponse } from "axios";
 import {
   act,
   cleanup,
@@ -11,6 +12,8 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { StudioPaneDefaultsProvider } from "@/routes/workflows/studio/StudioPaneDefaults";
+import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import {
@@ -41,7 +44,6 @@ const {
   credentials,
   historyResponse,
   sansApiGet,
-  demonstrationFlag,
 } = vi.hoisted(() => {
   const calls: StreamCall[] = [];
   const active = { value: null as Record<string, unknown> | null };
@@ -100,7 +102,6 @@ const {
     credentials: savedCredentials,
     historyResponse: history,
     sansApiGet: get,
-    demonstrationFlag: { value: true },
   };
 });
 
@@ -112,7 +113,7 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 vi.mock("@/hooks/useFeatureFlag", () => ({
-  useFeatureFlag: () => demonstrationFlag.value,
+  useFeatureFlag: () => true,
 }));
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -177,6 +178,8 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
   ),
 }));
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
@@ -186,7 +189,7 @@ async function renderChat(
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  render(
+  const { rerender } = render(
     <QueryClientProvider client={queryClient}>
       <WorkflowCopilotChat docked={false} {...props} />
     </QueryClientProvider>,
@@ -196,6 +199,42 @@ async function renderChat(
       screen.getByRole("group", { name: "Copilot message composer" }),
     ).toBeTruthy(),
   );
+  return (next: ComponentProps<typeof WorkflowCopilotChat>) =>
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowCopilotChat docked={false} {...next} />
+      </QueryClientProvider>,
+    );
+}
+
+function StudioPanesProbe() {
+  const { panes } = useStudioPanes();
+  return <output data-testid="studio-panes">{panes.join(",")}</output>;
+}
+
+// The docked chat as the studio hosts it: inside the pane layout, portalled into
+// the Copilot pane.
+async function renderStudioChat(
+  props: ComponentProps<typeof WorkflowCopilotChat> = {},
+) {
+  const portalTarget = document.body.appendChild(document.createElement("div"));
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <StudioPaneDefaultsProvider hasBlocks>
+        <StudioPanesProbe />
+        <WorkflowCopilotChat docked portalTarget={portalTarget} {...props} />
+      </StudioPaneDefaultsProvider>
+    </QueryClientProvider>,
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByRole("group", { name: "Copilot message composer" }),
+    ).toBeTruthy(),
+  );
+  return () => portalTarget.remove();
 }
 
 async function startDemonstration({
@@ -249,7 +288,6 @@ beforeEach(() => {
   sansApiPost.mockClear();
   sansApiPost.mockResolvedValue({ data: { seq: 1 } });
   activeDemonstration.value = null;
-  demonstrationFlag.value = true;
   sansApiGet.mockClear();
   credentials.value = [
     {
@@ -274,15 +312,92 @@ afterEach(() => {
 });
 
 describe("WorkflowCopilotChat demonstration", () => {
-  it("never looks for an active demonstration when the feature is off", async () => {
-    demonstrationFlag.value = false;
-    await renderChat({ liveBrowserSessionId: "browser-1" });
-    await waitFor(() => expect(sansApiGet).toHaveBeenCalled());
-    expect(
-      sansApiGet.mock.calls.some(
-        ([path]) => path === "/workflow/copilot/demonstration/active",
-      ),
-    ).toBe(false);
+  it("renders a persisted demonstration offer and starts recording from it", async () => {
+    const onRecordTask = vi.fn();
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Show me how you do it.",
+        narrative_payload: {
+          turnId: "turn-offer",
+          terminal: "response",
+          demonstrationOffer: true,
+        },
+        created_at: "2026-10-14T12:00:00Z",
+      },
+    ];
+
+    await renderChat({ onRecordTask, canRecordTask: true });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Start demonstration" }),
+    );
+    expect(onRecordTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables a demonstration offer once a later message follows it", async () => {
+    historyResponse.data.chat_history = [
+      {
+        sender: "ai",
+        content: "Show me how you do it.",
+        narrative_payload: {
+          turnId: "turn-offer",
+          terminal: "response",
+          demonstrationOffer: true,
+        },
+        created_at: "2026-10-14T12:00:00Z",
+      },
+      {
+        sender: "user",
+        content: "Actually, just build it.",
+        created_at: "2026-10-14T12:01:00Z",
+      },
+    ];
+
+    await renderChat({ onRecordTask: vi.fn(), canRecordTask: true });
+
+    const offer = (await screen.findByRole("button", {
+      name: "Start demonstration",
+    })) as HTMLButtonElement;
+    expect(offer.disabled).toBe(true);
+  });
+
+  it("swaps Editor for the Browser pane while demonstrating and brings Editor back for the build", async () => {
+    const removePortalTarget = await renderStudioChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    try {
+      const panes = () => screen.getByTestId("studio-panes").textContent;
+      expect(panes()).toBe("copilot,editor");
+
+      const call = await startDemonstration();
+      expect(panes()).toBe("copilot,browser");
+      act(() => {
+        call.onMessage({
+          type: "demonstration_action",
+          seq: 1,
+          label: "Open form",
+          tool_name: "click",
+        });
+      });
+
+      postStreaming.mockImplementationOnce((path, body, onMessage) => {
+        streamCalls.push({ path, body, onMessage });
+        return new Promise<void>(() => {});
+      });
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Done, build the workflow" }),
+      );
+      await waitFor(() =>
+        expect(
+          streamCalls.some((item) => item.path.endsWith("/chat-post")),
+        ).toBe(true),
+      );
+      // The build turn is still streaming; Editor must not wait for it to end.
+      await waitFor(() => expect(panes()).toBe("copilot,editor,browser"));
+    } finally {
+      removePortalTarget();
+    }
   });
 
   it("opens the recorder stream and renders recorded actions in the transcript", async () => {
@@ -447,9 +562,7 @@ describe("WorkflowCopilotChat demonstration", () => {
       useRecordingLauncherStore.getState()
         .demonstrationRecordingBrowserSessionId,
     ).toBeNull();
-    expect(
-      screen.getByText("I'll show you the task in the browser."),
-    ).toBeTruthy();
+    expect(screen.getByText("Showing you in the browser now.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Attach a file" }).title).toBe(
       "Use Build before attaching a file",
     );
@@ -528,13 +641,11 @@ describe("WorkflowCopilotChat demonstration", () => {
       useRecordingLauncherStore.getState().startDemonstration?.();
     });
     expect(
-      await screen.findByText("I'll show you the task in the browser."),
+      await screen.findByText("Showing you in the browser now."),
     ).toBeTruthy();
     act(() => rejectStart?.(new Error("Already recording elsewhere")));
     await waitFor(() =>
-      expect(
-        screen.queryByText("I'll show you the task in the browser."),
-      ).toBeNull(),
+      expect(screen.queryByText("Showing you in the browser now.")).toBeNull(),
     );
     streamCalls.length = 0;
 
@@ -675,7 +786,7 @@ describe("WorkflowCopilotChat demonstration", () => {
     act(() => {
       call.onMessage({
         type: "demonstration_action",
-        seq: 2,
+        seq: 1,
         label: 'Fill password from "Saved login"',
         tool_name: "fill_credential_field",
       });
@@ -693,8 +804,15 @@ describe("WorkflowCopilotChat demonstration", () => {
     await waitFor(() =>
       expect(screen.queryByLabelText("Sign-in request")).toBeNull(),
     );
+    expect(screen.queryByText(/value not recorded/)).toBeNull();
 
     act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 2,
+        label: 'Type "Test Applicant"',
+        tool_name: "type_text",
+      });
       call.onMessage({
         type: "demonstration_sensitive_field",
         field: "other",
@@ -712,7 +830,13 @@ describe("WorkflowCopilotChat demonstration", () => {
     act(() => {
       call.onMessage({
         type: "demonstration_action",
-        seq: 5,
+        seq: 3,
+        label: "Fill sensitive field (value not recorded)",
+        tool_name: "type_text",
+      });
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 4,
         label: "Submit form",
         tool_name: "click",
       });
@@ -723,10 +847,56 @@ describe("WorkflowCopilotChat demonstration", () => {
     const demonstration = screen.getByRole("group", {
       name: "Your demonstration",
     });
-    expect(within(demonstration).getAllByRole("listitem")).toHaveLength(5);
+    expect(within(demonstration).getAllByRole("listitem")).toHaveLength(4);
     expect(within(demonstration).getByText(/Fill password from/)).toBeTruthy();
     expect(
+      within(demonstration).getByText('Type "Test Applicant"'),
+    ).toBeTruthy();
+    expect(
       within(demonstration).getByText(/Fill sensitive field/),
+    ).toBeTruthy();
+  });
+
+  it("keeps a sensitive step the stop flush streams after Done", async () => {
+    await renderChat({ liveBrowserSessionId: "browser-1" });
+    const call = await startDemonstration();
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 1,
+        label: "Open form",
+        tool_name: "click",
+      });
+    });
+    sansApiPost.mockResolvedValueOnce({ data: { seq: 1, action_count: 2 } });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Done, build the workflow" }),
+    );
+    await waitFor(() =>
+      expect(sansApiPost).toHaveBeenCalledWith(
+        "/workflow/copilot/demonstration/control",
+        { demonstration_id: "demonstration-1", action: "stop" },
+      ),
+    );
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 2,
+        label: "Fill password (value not recorded)",
+        tool_name: "type_text",
+      });
+    });
+
+    await waitFor(() =>
+      expect(streamCalls.some((item) => item.path.endsWith("/chat-post"))).toBe(
+        true,
+      ),
+    );
+    const card = screen.getByRole("group", { name: "Your demonstration" });
+    fireEvent.click(within(card).getByRole("button", { expanded: false }));
+    expect(
+      within(card).getByText("Fill password (value not recorded)"),
     ).toBeTruthy();
   });
 
@@ -752,6 +922,62 @@ describe("WorkflowCopilotChat demonstration", () => {
     ).toBeTruthy();
   });
 
+  it("disables Demonstrate task when the backend refuses demonstrations", async () => {
+    const answer = sansApiGet.getMockImplementation()!;
+    sansApiGet.mockImplementation(((path: string) =>
+      path === "/workflow/copilot/demonstration/active"
+        ? Promise.reject(
+            new AxiosError(
+              "forbidden",
+              "ERR_BAD_REQUEST",
+              undefined,
+              undefined,
+              {
+                status: 403,
+              } as AxiosResponse,
+            ),
+          )
+        : answer(path)) as typeof answer);
+    try {
+      await renderChat({
+        liveBrowserSessionId: "browser-1",
+        onRecordTask: vi.fn(),
+        canRecordTask: true,
+      });
+      await waitFor(() =>
+        expect(
+          (
+            screen.getByRole("button", {
+              name: "Demonstrate task",
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(true),
+      );
+      expect(
+        useRecordingLauncherStore.getState().startDemonstration,
+      ).toBeNull();
+    } finally {
+      sansApiGet.mockImplementation(answer);
+    }
+  });
+
+  it("registers no demonstration launcher while a run owns the browser", async () => {
+    const rerender = await renderChat({ liveBrowserSessionId: "browser-1" });
+    await waitFor(() =>
+      expect(
+        useRecordingLauncherStore.getState().startDemonstration,
+      ).toBeTruthy(),
+    );
+
+    rerender({ liveBrowserSessionId: "browser-1", runOwnsBrowser: true });
+
+    await waitFor(() =>
+      expect(
+        useRecordingLauncherStore.getState().startDemonstration,
+      ).toBeNull(),
+    );
+  });
+
   it("hides Resume for a restored recording past its limit", async () => {
     activeDemonstration.value = {
       demonstration_id: "demonstration-recovered",
@@ -768,6 +994,111 @@ describe("WorkflowCopilotChat demonstration", () => {
       await screen.findByRole("button", { name: "Build the workflow" }),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+
+  it("keeps captured actions and says so when the browser restarts mid-demonstration", async () => {
+    const rerenderChat = await renderChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    const call = await startDemonstration();
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 1,
+        label: "Open form",
+        tool_name: "click",
+      });
+    });
+
+    rerenderChat({ liveBrowserSessionId: "browser-2" });
+
+    expect(
+      await screen.findByText(
+        /The browser restarted, so the demonstration was interrupted/,
+      ),
+    ).toBeTruthy();
+    expect(sansApiPost).toHaveBeenCalledWith(
+      "/workflow/copilot/demonstration/control",
+      {
+        demonstration_id: "demonstration-1",
+        action: "stop",
+        stop_reason: "browser_gone",
+      },
+    );
+    await waitFor(() =>
+      expect(
+        (
+          screen.getByRole("button", {
+            name: "Build the workflow",
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false),
+    );
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(
+      within(
+        screen.getByRole("group", { name: "Your demonstration" }),
+      ).getAllByRole("listitem"),
+    ).toHaveLength(1);
+  });
+
+  it("pauses on a stream gap and keeps the recording through a gap mid-resume or mid-build", async () => {
+    const rerenderChat = await renderChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    const call = await startDemonstration();
+    act(() => {
+      call.onMessage({
+        type: "demonstration_action",
+        seq: 1,
+        label: "Open form",
+        tool_name: "click",
+      });
+    });
+    const recordCalls = () =>
+      streamCalls.filter((item) => item.path.endsWith("/record"));
+
+    rerenderChat({ liveBrowserSessionId: null });
+    rerenderChat({ liveBrowserSessionId: "browser-1" });
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
+    await waitFor(() => expect(recordCalls()).toHaveLength(2));
+    expect(recordCalls()[1]?.body.demonstration_id).toBe("demonstration-1");
+    const resumeStream = postStreaming.mock.calls[
+      postStreaming.mock.calls.length - 1
+    ] as unknown[];
+
+    rerenderChat({ liveBrowserSessionId: null });
+    expect((resumeStream[3] as { signal: AbortSignal }).signal.aborted).toBe(
+      true,
+    );
+    rerenderChat({ liveBrowserSessionId: "browser-1" });
+    expect(
+      (
+        (await screen.findByRole("button", {
+          name: "Resume",
+        })) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+    expect(screen.queryByText(/The browser restarted/)).toBeNull();
+
+    let rejectSend: ((reason: Error) => void) | undefined;
+    postStreaming.mockImplementationOnce((path, body, onMessage) => {
+      streamCalls.push({ path, body, onMessage });
+      return new Promise((_, reject) => {
+        rejectSend = reject;
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Build the workflow" }));
+    await waitFor(() => expect(rejectSend).toBeDefined());
+    rerenderChat({ liveBrowserSessionId: null });
+    rerenderChat({ liveBrowserSessionId: "browser-1" });
+    act(() => {
+      rejectSend?.(new Error("send failed"));
+    });
+
+    expect(
+      await screen.findByText("Demonstration paused · 1 action"),
+    ).toBeTruthy();
   });
 
   it.each(["stopped", "stopping"] as const)(
