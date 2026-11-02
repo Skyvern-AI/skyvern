@@ -138,6 +138,30 @@ AKAMAI_BLOCK = _event("explicit_block", 10, vendor="akamai", http_status=403, ur
 AKAMAI_ASSET = _event("explicit_block", 20, vendor="akamai", http_status=403, url_class="static")
 
 
+def _site_captcha_refusal(before: float = 20) -> HarEvidenceEvent:
+    return _event("captcha_site_rejected", before, http_status=200, url_class="api", vendor="recaptcha")
+
+
+def test_a_site_captcha_refusal_alone_gives_the_user_error_model_no_network_facts() -> None:
+    # Not yet accepted as a model-facing fact: no facts means no user-error model call at all.
+    assert ffd.network_evidence(_evidence(_visit((_site_captcha_refusal(),))), _context()) is None
+
+
+def test_a_site_captcha_refusal_leaves_the_other_network_facts_exactly_as_they_were() -> None:
+    block = _event("explicit_block", 30, http_status=403, url_class="document", vendor="cloudflare")
+    failure = HarHttpFailure(at=_at(10), status=422, method="POST", url_class="api")
+
+    def evidence(*events: HarEvidenceEvent) -> HarEvidence:
+        return HarEvidence(
+            availability=HarEvidenceAvailability.available, visits=(_visit(events),), http_failures=(failure,)
+        )
+
+    without = ffd.network_evidence(evidence(block), _context())
+    assert without is not None
+    assert ffd.network_evidence(evidence(block, _site_captcha_refusal()), _context()) == without
+    assert ffd.network_evidence(evidence(_site_captcha_refusal(), block), _context()) == without
+
+
 @pytest.mark.parametrize(
     ("visits", "enforcement"),
     [
