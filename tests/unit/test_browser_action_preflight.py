@@ -11,6 +11,8 @@ from __future__ import annotations
 import ast
 import gc
 import inspect
+import re
+import unicodedata
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -52,6 +54,13 @@ HOME = "https://example.com/start"
 OWNER = "wr_12874"
 POLICY = declare_policy(owner_id=OWNER, origin_urls=[HOME])
 ESTABLISHED = RuntimeOriginAuthority(state=AuthorityState.ESTABLISHED, origins=POLICY.allowed_origins)
+
+# Between `.`, the attribute name and the call's `(`, Python allows only whitespace, line continuations, comments and
+# a parenthesized callee's `)`, so every `x.accept(...)` / `x.on(...)` call matches the NFKC form of its source, the
+# form Python reads identifiers in. They only pick the files to parse; the AST check of the raw source still decides.
+_TOKEN_GAP = r"(?:\s|\\|#[^\r\n]*[\r\n])*"
+_ACCEPT_CALL = re.compile(rf"\.{_TOKEN_GAP}accept(?:{_TOKEN_GAP}\))*{_TOKEN_GAP}\(")
+_ON_CALL = re.compile(rf"\.{_TOKEN_GAP}on(?:{_TOKEN_GAP}\))*{_TOKEN_GAP}\(")
 
 # Every action model that takes no required argument, so the surviving set can be measured rather
 # than asserted from memory.
@@ -676,13 +685,19 @@ class TestDialogAcceptBoundary:
         assert len(files) > 100, "the sweep found too few files — the scan is broken, not the tree"
         return files
 
-    def test_dialog_accepts_exist_only_in_the_dialog_handler(self) -> None:
-        accepting: dict[str, int] = {}
+    @pytest.fixture(scope="class")
+    def dialog_call_trees(self) -> dict[Path, ast.Module]:
+        trees: dict[Path, ast.Module] = {}
         for path in self._python_files():
             source = path.read_text()
-            if "dialog" not in source:
-                continue
-            tree = ast.parse(source)
+            text = unicodedata.normalize("NFKC", source)
+            if "dialog" in text and (_ACCEPT_CALL.search(text) or _ON_CALL.search(text)):
+                trees[path] = ast.parse(source)
+        return trees
+
+    def test_dialog_accepts_exist_only_in_the_dialog_handler(self, dialog_call_trees: dict[Path, ast.Module]) -> None:
+        accepting: dict[str, int] = {}
+        for path, tree in dialog_call_trees.items():
             count = sum(
                 1
                 for node in ast.walk(tree)
@@ -699,13 +714,9 @@ class TestDialogAcceptBoundary:
         # 3 = the alert direct accept + the two accept arms of the _respond choke point.
         assert accepting == {"skyvern/webeye/dialog_handler.py": 3}, accepting
 
-    def test_dialog_listener_registrations_are_pinned(self) -> None:
+    def test_dialog_listener_registrations_are_pinned(self, dialog_call_trees: dict[Path, ast.Module]) -> None:
         registering: list[str] = []
-        for path in self._python_files():
-            source = path.read_text()
-            if "dialog" not in source:
-                continue
-            tree = ast.parse(source)
+        for path, tree in dialog_call_trees.items():
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)

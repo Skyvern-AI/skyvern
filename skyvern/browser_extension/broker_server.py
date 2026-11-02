@@ -102,6 +102,7 @@ PAIRING_TTL_SECONDS = 120.0
 CONTROL_PING_INTERVAL_SECONDS = 20.0
 CONTROL_INBOUND_TIMEOUT_SECONDS = 45.0
 EXTENSION_RESET_TIMEOUT_SECONDS = 5.0
+BROKER_DRAINING_SEND_TIMEOUT_SECONDS = 2.0
 MAX_PENDING_TAB_EVENT_TABS = 64
 MAX_PENDING_TAB_EVENTS_PER_TAB = 16
 TAB_REQUEST_EXACT_TIMEOUT_TOLERANCE_SECONDS = 0.25
@@ -420,7 +421,9 @@ class BrowserExtensionBrokerServer:
         connections.update((id(connection), connection) for connection in self._clients.values())
         clients: tuple[_ClientConnection, ...] = tuple(connections.values())
         draining_tasks = [
-            asyncio.wait_for(self._send(client, event_frame("broker.draining", {})), 2.0)
+            asyncio.wait_for(
+                self._send(client, event_frame("broker.draining", {})), BROKER_DRAINING_SEND_TIMEOUT_SECONDS
+            )
             for client in clients
             if client.sender_task is not None and not client.closed
         ]

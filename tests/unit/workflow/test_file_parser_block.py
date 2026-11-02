@@ -1568,7 +1568,7 @@ class TestForceOcrOnTheCachedScriptPath:
         assert "force_ocr" not in without_force_ocr
 
 
-BLOCKING_PARSE_SECONDS = 0.3
+BLOCKING_PARSE_SECONDS = 0.1
 TICK_INTERVAL_SECONDS = 0.01
 
 

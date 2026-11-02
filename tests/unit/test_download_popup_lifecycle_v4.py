@@ -164,8 +164,14 @@ def _dispatched(inner: Any) -> Any:
     return _wrapped
 
 
+async def _capped_files_sleep(delay: float) -> None:
+    await asyncio.sleep(min(delay, 0.02))
+
+
 def _enter_patches(stack: ExitStack, app_mock: Any, ctx: SkyvernContext, download_dir: Path, inner: Any) -> None:
     stack.enter_context(patch.object(ActionHandler, "_handle_action", side_effect=_dispatched(inner)))
+    stack.enter_context(patch(f"{_HANDLER}.DOWNLOAD_IN_FLIGHT_POLL_INTERVAL_SECONDS", 0.02))
+    stack.enter_context(patch("skyvern.forge.sdk.api.files.asyncio", ScopedAsyncio(sleep=_capped_files_sleep)))
     stack.enter_context(patch(f"{_HANDLER}.app", app_mock))
     stack.enter_context(patch(f"{_HANDLER}.get_download_dir", MagicMock(return_value=str(download_dir))))
     stack.enter_context(patch(f"{_HANDLER}.settings.FILE_DOWNLOAD_FALSE_CLICK_POPUP_GRACE_SECONDS", 0.0))
