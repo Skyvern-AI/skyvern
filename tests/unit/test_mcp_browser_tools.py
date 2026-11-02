@@ -3348,6 +3348,34 @@ async def test_do_select_option_matches_observed_accessible_name(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "live_label", "live_value"),
+    [("Lakewood", "Lakewood", ""), ("lakewood", "Lakewood, OH", "lakewood")],
+    ids=["matched_on_label", "matched_on_value_only"],
+)
+async def test_do_select_option_reports_the_live_label_when_the_scanned_name_went_stale(
+    monkeypatch: pytest.MonkeyPatch, requested: str, live_label: str, live_value: str
+) -> None:
+    # A typeahead replaced its placeholder with the real options between the DOM scan and the live re-read, so
+    # the one positional selector carries the scanned placeholder name and the live option's label.
+    target = {"tag": "div", "role": "combobox", "haspopup": False, "editable": False}
+    page, control = make_select_like_page(target)
+    dom_options = [{"selector": "#results > div", "role": "option", "name": "Searching"}]
+    monkeypatch.setattr(browser_ops, "_get_dom_observe_elements", AsyncMock(return_value=dom_options))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(return_value=0)))
+    control.evaluate.side_effect = [
+        target,
+        [{"selector": "#results > div", "label": live_label, "value": live_value}],
+        {"text": "Select", "value": "", "dataValues": [""], "expanded": "true", "optionSelected": False},
+        {"text": live_label, "value": "", "dataValues": ["lakewood"], "expanded": "false", "optionSelected": False},
+    ]
+
+    result = await do_select_option(page, "#city", requested, timeout=100)
+
+    assert result == live_label
+
+
+@pytest.mark.asyncio
 async def test_do_select_option_rejects_substring_value_false_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
