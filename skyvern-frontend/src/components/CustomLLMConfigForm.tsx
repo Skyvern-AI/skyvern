@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useForm } from "react-hook-form";
+import { useForm, Resolver } from "react-hook-form";
 import * as z from "zod";
 import {
   CheckIcon,
@@ -214,7 +214,7 @@ export function CustomLLMConfigForm() {
   const canDelete = useHasCapability("custom_model.delete");
 
   const form = useForm<FormData>({
-    resolver: zodResolver(formSchema),
+    resolver: zodResolver(formSchema) as Resolver<FormData>,
     defaultValues: emptyFormValues(),
   });
   const provider = form.watch("config.provider");
@@ -421,7 +421,7 @@ export function CustomLLMConfigForm() {
                         : provider === "ollama"
                           ? "llama3.1"
                           : provider === "gemini"
-                            ? "gemini-2.5-flash"
+                            ? "gemini-3-flash-preview"
                             : "mistral"
                     }
                     disabled={formControlsDisabled}

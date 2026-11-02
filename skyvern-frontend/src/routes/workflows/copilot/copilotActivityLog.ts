@@ -134,7 +134,9 @@ function anchorRunRow(
     return undefined;
   }
   const timedRows = runRows.map((row) => ({ row, started: runStartedMs(row) }));
-  const blockStartedMs = parseUtcIsoMs(block.startedAt);
+  // A short block can be first polled finished, so live it has no start time
+  // while its reloaded payload does; its end still falls inside its own run.
+  const blockStartedMs = parseUtcIsoMs(block.startedAt ?? block.endedAt);
   if (blockStartedMs === null) {
     return (
       timedRows.reduce<ActivityRow | undefined>((latest, candidate) => {
@@ -459,7 +461,8 @@ export function condenseCalls(entries: ActivityEntry[]): CondensedCall[] {
       previous.entry.success !== false &&
       entry.toolName === previous.entry.toolName &&
       callLabel(entry) === callLabel(previous.entry) &&
-      entry.text === previous.entry.text
+      entry.text === previous.entry.text &&
+      entry.workflowRunId === previous.entry.workflowRunId
     ) {
       previous.count += 1;
       continue;
@@ -665,6 +668,58 @@ export function blocksByRunCall(row: ActivityRow): Map<string, BlockState[]> {
     byCall.set(id, [...(byCall.get(id) ?? []), block]);
   }
   return byCall;
+}
+
+export interface BlockAttempt {
+  // Null for a block saved without its run id, whose runs cannot be told apart.
+  attempt: number | null;
+  // The server stamps one run-level reason on every block of a run; it reads on the last failed one.
+  ownsRunReason: boolean;
+  newest: boolean;
+}
+
+export function blockIdentity(block: BlockState): string {
+  return block.workflowRunBlockId || block.label;
+}
+
+// Keyed by blockIdentity over the turn's own block order, so every view numbers a run alike. A turn
+// keeps its newest 200 block runs, so a longer one numbers from its oldest kept run.
+export function blockAttempts(
+  turn: TurnNarrativeState,
+): Map<string, BlockAttempt> {
+  const blocks = turn.blocks.filter(hasObservedBlockEvidence);
+  const runsOfLabel = new Map<string, string[]>();
+  const lastFailedOfRun = new Map<string, BlockState>();
+  const lastOfLabel = new Map<string, BlockState>();
+  for (const block of blocks) {
+    lastOfLabel.set(block.label, block);
+    const run = block.workflowRunId;
+    if (!run) continue;
+    const runs = runsOfLabel.get(block.label) ?? [];
+    if (!runs.includes(run)) runs.push(run);
+    runsOfLabel.set(block.label, runs);
+    if (block.state === "failed") lastFailedOfRun.set(run, block);
+  }
+  const attempts = new Map<string, BlockAttempt>();
+  for (const block of blocks) {
+    const run = block.workflowRunId;
+    const newestOfLabel = lastOfLabel.get(block.label)!;
+    attempts.set(
+      blockIdentity(block),
+      run
+        ? {
+            attempt: runsOfLabel.get(block.label)!.indexOf(run) + 1,
+            ownsRunReason: lastFailedOfRun.get(run) === block,
+            newest: newestOfLabel.workflowRunId === run,
+          }
+        : {
+            attempt: null,
+            ownsRunReason: true,
+            newest: newestOfLabel === block,
+          },
+    );
+  }
+  return attempts;
 }
 
 export function failedRowBlocks(row: ActivityRow): BlockState[] {

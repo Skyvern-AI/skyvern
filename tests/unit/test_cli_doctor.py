@@ -131,6 +131,7 @@ def test_credential_placeholder_set_is_stable() -> None:
         ("YOUR_API_KEY", True),
         ("__SKYVERN_API_KEY_PLACEHOLDER__", True),
         ("__VITE_API_BASE_URL_PLACEHOLDER__", True),
+        ("__VITE_API_BASE_URL_PLACEHOLDER__-__", True),
         ("real-value", False),
     ],
 )

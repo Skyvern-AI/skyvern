@@ -17,15 +17,25 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, List, NamedTuple, TypedDict, TypeGuard, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, List, Literal, NamedTuple, TypedDict, TypeGuard, cast
 
 import structlog
 from cachetools import TTLCache
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import BrowserContext, Download, FileChooser, Frame, Locator, Page, Request, Response
-from pydantic import BaseModel, field_validator
+from playwright.async_api import (
+    BrowserContext,
+    Download,
+    ElementHandle,
+    FileChooser,
+    Frame,
+    Locator,
+    Page,
+    Request,
+    Response,
+)
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -42,6 +52,7 @@ from skyvern.constants import (
 from skyvern.core.script_generations.fuzzy_matcher import match_option_exact_or_stem
 from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
 from skyvern.exceptions import (
+    BROWSER_CONNECTION_LOST_ERROR_CODE,
     ActionExecutionTimeout,
     BlockedHost,
     CaptchaSolveError,
@@ -56,6 +67,7 @@ from skyvern.exceptions import (
     FailedToTakeScreenshot,
     FailToClick,
     FailToHover,
+    FailToOpenLink,
     FailToSelectByIndex,
     FailToSelectByLabel,
     FailToSelectByValue,
@@ -64,11 +76,13 @@ from skyvern.exceptions import (
     IllegitComplete,
     ImaginaryFileUrl,
     ImaginarySecretValue,
+    InputElementCoveredByUntypeableElement,
     InputToInvisibleElement,
     InputToReadonlyElement,
     InteractWithDisabledElement,
     InteractWithDropdownContainer,
     InvalidElementForTextInput,
+    MissingBrowserState,
     MissingElement,
     MissingElementDict,
     MissingElementInCSSMap,
@@ -85,16 +99,18 @@ from skyvern.exceptions import (
     OptionIndexOutOfBound,
     PhoneNumberInputBrowserInteractionFailed,
     PhoneNumberInputBrowserValidityMismatch,
+    PhoneNumberInputCountryCodeMismatch,
     PhoneNumberInputMismatch,
     ScreenshotTargetClosed,
+    ScrollMadeNoProgress,
     SecretInputMismatch,
     SkyvernException,
     SkyvernHTTPException,
     SkyvernPageAnalysisTimeout,
-    UnresolvableHost,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
+from skyvern.forge.antibot_evidence import prompt_evidence_str
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     GuardedFileFetchHopResult,
@@ -117,6 +133,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
@@ -214,7 +231,8 @@ from skyvern.webeye.browser_factory import (
     resolve_artifact_path,
     was_download_cancelled_by_skyvern,
 )
-from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
+from skyvern.webeye.browser_object_predicates import is_page_like
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState, get_browser_connection_loss
 from skyvern.webeye.cdp_download_interceptor import (
     BROWSER_DOWNLOAD_EVENT_ADMISSION_GRACE_SECONDS,
     DOWNLOAD_MIME_TYPES,
@@ -225,11 +243,15 @@ from skyvern.webeye.cdp_download_interceptor import (
     false_click_download_attribution_is_quiescent,
     finish_requested_download_for_context,
     has_download_interceptor_for_context,
-    is_download_response,
+    has_download_response_headers,
     normalize_download_filename,
     publish_download_bytes_for_context,
     redacted_exception_origin,
     settle_browser_downloads_for_context,
+)
+from skyvern.webeye.dom_inspection import (
+    is_static_listbox_option_snapshot,
+    read_static_listbox_option_snapshot,
 )
 from skyvern.webeye.main_world_eval import evaluate_in_main_world
 from skyvern.webeye.navigation import (
@@ -260,12 +282,16 @@ from skyvern.webeye.utils.dom import (
     InteractiveElement,
     SkyvernElement,
     SkyvernOptionType,
+    bounded_lookup_call,
     is_element_detached_error,
+    is_engine_timeout_error,
     is_incompatible_text_input_error,
     is_post_dispatch_click_timeout,
     resolve_locator,
 )
+from skyvern.webeye.utils.flutter_semantics import FLUTTER_TEXT_FIELD_JS, FRAME_SETTLE_TIMEOUT_SECONDS, TWO_FRAMES_JS
 from skyvern.webeye.utils.page import (
+    ElementScrollMetrics,
     SkyvernFrame,
     _all_page_frames,
     _blob_url_origin,
@@ -1637,6 +1663,12 @@ _false_click_download_eligible: ContextVar[bool] = ContextVar("false_click_downl
 # them. Fails toward retention -- a missed suppression stays committed, degrading to base-equivalent
 # retention rather than releasing a genuinely-owned claim.
 _browser_dispatch_committed: ContextVar[bool] = ContextVar("browser_dispatch_committed", default=False)
+# Set by the step executor around a click or Enter on a one-time code group's submit or resend control: the
+# action may reach the page once, so no fallback runs after a click that might already have landed.
+otp_single_dispatch: ContextVar[bool] = ContextVar("otp_single_dispatch", default=False)
+# What such an action did to the page: "dispatched" once the click or key press returned, "unknown" from the
+# first await that may reach the page until then, None when it is known not to have reached the page.
+otp_dispatch_effect: ContextVar[str | None] = ContextVar("otp_dispatch_effect", default=None)
 
 
 def _suppress_redundant_desired_click() -> list[ActionResult]:
@@ -2422,6 +2454,15 @@ async def _recover_download_page(
     timeout_seconds: float,
     recovery_site: str,
 ) -> Page | None:
+    connection_loss = get_browser_connection_loss(browser_state)
+    if connection_loss is not None:
+        raise MissingBrowserState(
+            task_id=task.task_id,
+            workflow_run_id=task.workflow_run_id,
+            diagnostic=connection_loss,
+            detected_at=datetime.now(UTC),
+            failure_reason=BROWSER_CONNECTION_LOST_ERROR_CODE,
+        )
     LOG.warning(
         "Working page closed during download action; recreating it before continuing",
         workflow_run_id=task.workflow_run_id,
@@ -2494,6 +2535,9 @@ async def _recover_download_page(
                     recovery_site=recovery_site,
                     exc_info=True,
                 )
+        # A connection lost while recovery was in flight ends the action, so the caller never starts waiting.
+        if get_browser_connection_loss(browser_state) is not None:
+            raise
         return None
     return recovered_page
 
@@ -2640,36 +2684,10 @@ class CustomSingleSelectResult:
         if not isinstance(self.action_result, ActionSuccess):
             return True
 
-        if await self.dropdown_menu.get_locator().count() == 0:
+        if await bounded_lookup_call(self.dropdown_menu.get_locator().count) == 0:
             return True
 
         return not await self.skyvern_frame.get_element_visible(self.dropdown_menu.get_locator())
-
-
-def is_ul_or_listbox_element_factory(
-    incremental_scraped: IncrementalScrapePage, task: Task, step: Step
-) -> Callable[[dict], Awaitable[bool]]:
-    async def wrapper(element_dict: dict) -> bool:
-        element_id: str = element_dict.get("id", "")
-        try:
-            element = await SkyvernElement.create_from_incremental(incremental_scraped, element_id)
-        except Exception:
-            LOG.debug(
-                "Failed to element in the incremental page",
-                element_id=element_id,
-                exc_info=True,
-            )
-            return False
-
-        if element.get_tag_name() == "ul":
-            return True
-
-        if await element.get_attr("role") == "listbox":
-            return True
-
-        return False
-
-    return wrapper
 
 
 CheckFilterOutElementIDFunc = Callable[[dict, Page | Frame], Awaitable[bool]]
@@ -2683,7 +2701,7 @@ def check_existed_but_not_option_element_in_dom_factory(
         if not element_id:
             return False
         try:
-            locator = frame.locator(f"[{SKYVERN_ID_ATTR}={element_id}]")
+            locator = frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
             current_element = SkyvernElement(
                 locator=locator,
                 frame=frame,
@@ -2775,6 +2793,7 @@ async def check_phone_number_format(
     scraped_page: ScrapedPage,
     task: Task,
     step: Step,
+    field_current_value: str | None = None,
 ) -> str:
     # check the phone number format
     LOG.info(
@@ -2800,22 +2819,37 @@ async def check_phone_number_format(
     )
 
     check_phone_number_format_response = CheckPhoneNumberFormatResponse.model_validate(json_response)
+    recommended_phone_number = check_phone_number_format_response.recommended_phone_number
     if (
         not check_phone_number_format_response.is_phone_number_input
         or check_phone_number_format_response.is_current_format_correct
-        or not check_phone_number_format_response.recommended_phone_number
+        or not recommended_phone_number
     ):
+        return value
+
+    # A country picker next to an international field selects the same dial code the field holds, so
+    # dropping the dial code here leaves the picker to infer a country from the national digits.
+    if _recommendation_drops_dial_code(value, recommended_phone_number) and _tel_field_carries_dial_code(
+        field_value=field_current_value,
+        placeholder=await skyvern_element.get_attr("placeholder"),
+        autocomplete=await skyvern_element.get_attr("autocomplete"),
+    ):
+        LOG.info(
+            "Keeping the country calling code of an international phone input, ignoring the recommended number",
+            element_id=skyvern_element.get_id(),
+            source_digit_count=len(_phone_digits(value)),
+            recommended_digit_count=len(_phone_digits(recommended_phone_number)),
+        )
         return value
 
     LOG.info(
         "The current phone number format is incorrect, using the recommended phone number",
         element_id=skyvern_element.get_id(),
         source_digit_count=len(_phone_digits(value)),
-        recommended_digit_count=len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
-        digit_count_changed=len(_phone_digits(value))
-        != len(_phone_digits(check_phone_number_format_response.recommended_phone_number)),
+        recommended_digit_count=len(_phone_digits(recommended_phone_number)),
+        digit_count_changed=len(_phone_digits(value)) != len(_phone_digits(recommended_phone_number)),
     )
-    return check_phone_number_format_response.recommended_phone_number
+    return recommended_phone_number
 
 
 def _phone_digits(value: str | None) -> str:
@@ -2850,6 +2884,92 @@ def _phone_readback_digits_match(
 
 def _has_explicit_nanp_country_code(value: str | None) -> bool:
     return re.match(r"\+1|1[ \-.(]", (value or "").strip()) is not None
+
+
+_DIAL_CODE_PREFIX_RE = re.compile(r"^\s*\+\s*\d")
+# Shorter digit strings are more likely an extension or a local number than an international number
+# whose leading digits a widget could read as a country calling code.
+_MIN_INTERNATIONAL_PHONE_DIGITS = 8
+_NATIONAL_ONLY_AUTOCOMPLETE_TOKENS = frozenset({"tel-national", "tel-local", "tel-area-code", "tel-extension"})
+
+
+def _has_explicit_dial_code(value: str | None) -> bool:
+    return _DIAL_CODE_PREFIX_RE.match(value or "") is not None
+
+
+def _is_international_phone_form(value: str | None) -> bool:
+    # A leading "+" makes the digits that follow a country calling code plus the number. Unlike
+    # _has_explicit_dial_code this accepts a bare "+", which is a field's own international form
+    # before any digits are in it.
+    return (value or "").lstrip().startswith("+")
+
+
+def _tel_field_carries_dial_code(*, field_value: str | None, placeholder: str | None, autocomplete: str | None) -> bool:
+    """Whether this field takes the international number, so a paired country picker only mirrors it."""
+    autocomplete_tokens = (autocomplete or "").lower().split()
+    if _NATIONAL_ONLY_AUTOCOMPLETE_TOKENS.intersection(autocomplete_tokens):
+        return False
+    # A placeholder needs a dial code in it to be about phone format at all ("+ Add phone" is not); an
+    # example number in a national box can still read as one, which keeps a code the site may not want
+    # over dropping one it does. A value of bare "+" is what such a field holds before anything is typed.
+    return (
+        "tel" in autocomplete_tokens
+        or _has_explicit_dial_code(placeholder)
+        or _is_international_phone_form(field_value)
+    )
+
+
+def _recommendation_drops_dial_code(value: str, recommended: str) -> bool:
+    if not _has_explicit_dial_code(value) or _is_international_phone_form(recommended):
+        return False
+    value_digits = _phone_digits(value)
+    recommended_digits = _phone_digits(recommended)
+    return (
+        bool(recommended_digits)
+        and len(recommended_digits) < len(value_digits)
+        and (
+            value_digits.endswith(recommended_digits)
+            or (
+                recommended_digits.startswith("0")
+                and len(recommended_digits) > 1
+                and value_digits.endswith(recommended_digits[1:])
+            )
+        )
+    )
+
+
+def _tel_country_code_mismatch(
+    *, expected_value: str, actual_value: str | None, dial_code_withheld: bool = False
+) -> PhoneNumberInputCountryCodeMismatch | None:
+    """A field rendering its value in international form while reading digits of the number itself as the
+    country calling code. ``dial_code_withheld`` says the digits typed are a number whose own calling code
+    was taken off, which is the only evidence that a "+" in front of them is the wrong country: digits
+    that were never written with a "+" can equally be an international number given without one.
+    """
+    if not _is_international_phone_form(actual_value):
+        return None
+    expected_digits = _phone_digits(expected_value)
+    actual_digits = _phone_digits(actual_value)
+    if not actual_digits:
+        return None
+    if _has_explicit_dial_code(expected_value):
+        # A national trunk zero promoted to a false calling code also hides the lost dial code.
+        actual_without_trunk_prefix = (
+            actual_digits[1:] if actual_digits.startswith("0") and len(actual_digits) > 1 else actual_digits
+        )
+        if not (
+            len(actual_digits) < len(expected_digits)
+            and (expected_digits.endswith(actual_digits) or expected_digits.endswith(actual_without_trunk_prefix))
+        ):
+            return None
+    elif not dial_code_withheld or actual_digits != expected_digits:
+        return None
+    elif len(actual_digits) < _MIN_INTERNATIONAL_PHONE_DIGITS:
+        return None
+    return PhoneNumberInputCountryCodeMismatch(
+        expected_digit_count=len(expected_digits),
+        actual_digit_count=len(actual_digits),
+    )
 
 
 def _nanp_national_digits(value: str | None) -> str | None:
@@ -3098,6 +3218,7 @@ async def verify_phone_input_digits(
     locator: Locator,
     expected_value: str,
     allow_nanp_country_prefix: bool = False,
+    dial_code_withheld: bool = False,
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
@@ -3121,6 +3242,11 @@ async def verify_phone_input_digits(
             expected_digit_count=len(expected_digits),
             actual_digit_count=len(actual_digits),
         )
+    country_code_mismatch = _tel_country_code_mismatch(
+        expected_value=expected_value, actual_value=actual_value, dial_code_withheld=dial_code_withheld
+    )
+    if country_code_mismatch is not None:
+        raise country_code_mismatch
     LOG.info(
         "Phone input read-back verified",
         expected_digit_count=len(expected_digits),
@@ -3135,6 +3261,7 @@ async def _verify_tel_input_after_fill(
     tag_name: str,
     expected_value: str,
     allow_nanp_country_prefix: bool,
+    dial_code_withheld: bool = False,
     pattern: str | None = None,
     maxlength: str | None = None,
     engine_selection: BrowserEngineSelection | None = None,
@@ -3144,6 +3271,7 @@ async def _verify_tel_input_after_fill(
         locator=skyvern_element.get_locator(),
         expected_value=expected_value,
         allow_nanp_country_prefix=allow_nanp_country_prefix,
+        dial_code_withheld=dial_code_withheld,
         pattern=pattern,
         maxlength=maxlength,
         engine_selection=engine_selection,
@@ -3198,7 +3326,10 @@ async def _fill_nanp_tel_with_readback(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=national_digits,
+                # An E.164 retry exists only for a number written with its own "+1", so typing the
+                # national digits is both what permits a rendered "+1" and what withheld that code.
                 allow_nanp_country_prefix=e164_fallback is not None,
+                dial_code_withheld=e164_fallback is not None,
                 pattern=pattern,
                 maxlength=maxlength,
                 engine_selection=engine_selection,
@@ -3245,7 +3376,14 @@ async def _fill_nanp_tel_with_readback(
     return None
 
 
-async def _log_tel_fallback_fill_digit_counts(
+class TelFallbackReadback(NamedTuple):
+    expected_digit_count: int
+    actual_digit_count: int | None
+    country_code_mismatch: PhoneNumberInputCountryCodeMismatch | None = None
+    digits_match: bool = False
+
+
+async def _read_back_tel_fallback_fill(
     *,
     skyvern_element: SkyvernElement,
     tag_name: str,
@@ -3253,9 +3391,10 @@ async def _log_tel_fallback_fill_digit_counts(
     task_id: str | None,
     step_id: str | None,
     engine_selection: BrowserEngineSelection | None = None,
-) -> tuple[int, int | None]:
-    # Observability only: the LLM-fallback tel fill has no raising read-back, so a digit drop there is
-    # otherwise invisible. Count-only (values may be secrets) and never fails the action.
+) -> TelFallbackReadback:
+    # The LLM-fallback tel fill has no raising read-back, so a digit drop there is otherwise invisible.
+    # Counts are logged for every fill (values may be secrets); only a wrong international reading of
+    # the number is reported back as a failure.
     expected_digit_count = len(_phone_digits(expected_value))
     try:
         actual_value = await get_input_value(
@@ -3264,6 +3403,28 @@ async def _log_tel_fallback_fill_digit_counts(
             engine_selection=engine_selection,
         )
         actual_digit_count = len(_phone_digits(actual_value))
+        expected_digits = _phone_digits(expected_value)
+        actual_digits = _phone_digits(actual_value)
+        field_asserts_nanp = (
+            len(expected_digits) == 10
+            and actual_digits == f"1{expected_digits}"
+            and (actual_value or "").strip().startswith("+1")
+            and _tel_constraints_accept(
+                actual_value or "",
+                pattern=await skyvern_element.get_attr("pattern"),
+                maxlength=await skyvern_element.get_attr("maxlength"),
+            )
+        )
+        # `(0)` explicitly marks an optional national trunk prefix; all other digits must match.
+        optional_trunk_digits = _phone_digits(re.sub(r"\(\s*0\s*\)", "", expected_value))
+        digits_match = (
+            _phone_readback_digits_match(
+                expected_digits,
+                actual_digits,
+                allow_nanp_country_prefix=field_asserts_nanp,
+            )
+            or actual_digits == optional_trunk_digits
+        )
         LOG.info(
             "Tel fallback fill digit counts",
             expected_digit_count=expected_digit_count,
@@ -3273,7 +3434,17 @@ async def _log_tel_fallback_fill_digit_counts(
             task_id=task_id,
             step_id=step_id,
         )
-        return expected_digit_count, actual_digit_count
+        country_code_mismatch = _tel_country_code_mismatch(expected_value=expected_value, actual_value=actual_value)
+        if country_code_mismatch is not None:
+            LOG.warning(
+                "Phone input country calling code mismatch",
+                element_id=skyvern_element.get_id(),
+                expected_digit_count=expected_digit_count,
+                actual_digit_count=actual_digit_count,
+                task_id=task_id,
+                step_id=step_id,
+            )
+        return TelFallbackReadback(expected_digit_count, actual_digit_count, country_code_mismatch, digits_match)
     except Exception as exc:
         LOG.warning(
             "Failed to read back tel fallback fill",
@@ -3281,7 +3452,39 @@ async def _log_tel_fallback_fill_digit_counts(
             step_id=step_id,
             error_type=type(exc).__name__,
         )
-        return expected_digit_count, None
+        return TelFallbackReadback(expected_digit_count, None, digits_match=False)
+
+
+async def _tel_fill_recovers_with_source_number(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    source_value: str,
+    task_id: str | None,
+    step_id: str | None,
+    engine_selection: BrowserEngineSelection | None = None,
+) -> bool:
+    """Re-enter the number as the task gave it, once a recommended format left the field under another
+    country calling code. The field renders a "+", so it takes the number whole."""
+    try:
+        await skyvern_element.input_clear()
+        await skyvern_element.input_fill(text=source_value)
+    except Exception as exc:
+        LOG.warning(
+            "Failed to re-enter the phone number with its country calling code",
+            element_id=skyvern_element.get_id(),
+            error_type=type(exc).__name__,
+        )
+        return False
+    readback = await _read_back_tel_fallback_fill(
+        skyvern_element=skyvern_element,
+        tag_name=tag_name,
+        expected_value=source_value,
+        task_id=task_id,
+        step_id=step_id,
+        engine_selection=engine_selection,
+    )
+    return readback.digits_match and readback.country_code_mismatch is None
 
 
 _CARD_NUMBER_MIN_DIGITS = 13
@@ -3539,11 +3742,82 @@ def _secret_readback_matches(expected: str, actual_value: str | None) -> bool:
 def _is_navigation_teardown_error(exc: BaseException, engine_selection: BrowserEngineSelection | None) -> bool:
     # A read-back that races a form auto-submit sees the execution context torn down by navigation; the value
     # was accepted and submitted, so the caller treats it as success rather than a mismatch. Only THIS run's
-    # engine errors qualify, and the message set matches the incremental handler's navigation tolerance.
+    # engine errors qualify; recovery can also report that the old element's context no longer exists.
     if not _is_selected_engine_error(exc, engine_selection):
         return False
     message = str(exc).lower()
-    return "execution context was destroyed" in message or "navigation" in message or "target closed" in message
+    return any(
+        marker in message
+        for marker in ("execution context was destroyed", "cannot find context", "navigation", "target closed")
+    )
+
+
+async def _is_flutter_text_field(
+    skyvern_element: SkyvernElement, engine_selection: BrowserEngineSelection | None
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + 2
+    try:
+        return (
+            await SkyvernFrame.evaluate(
+                frame=skyvern_element.get_frame(),
+                expression=FLUTTER_TEXT_FIELD_JS,
+                arg=await skyvern_element.get_element_handler(timeout=2000),
+                engine_selection=engine_selection,
+                deadline=deadline,
+            )
+            is True
+        )
+    except Exception:
+        return False
+
+
+async def _two_frames_passed(
+    skyvern_element: SkyvernElement,
+    engine_selection: BrowserEngineSelection | None,
+    element_handle: ElementHandle | None = None,
+) -> bool:
+    # A supplied handle keeps the wait in the document that accepted the write, even if the locator now resolves anew.
+    deadline = asyncio.get_running_loop().time() + FRAME_SETTLE_TIMEOUT_SECONDS
+    try:
+        frames = await SkyvernFrame.evaluate(
+            frame=skyvern_element.get_frame(),
+            expression=TWO_FRAMES_JS,
+            arg=element_handle
+            if element_handle is not None
+            else await skyvern_element.get_element_handler(timeout=FRAME_SETTLE_TIMEOUT_SECONDS * 1000),
+            engine_selection=engine_selection,
+            deadline=deadline,
+        )
+    except SkyvernPageAnalysisTimeout as error:
+        # Recovery may exhaust its deadline after the document disappeared. Preserve the selected engine's
+        # teardown error so the post-write caller can distinguish a submission from a same-document no-frame wait.
+        cause = error.__context__
+        while cause is not None:
+            if _is_navigation_teardown_error(cause, engine_selection):
+                raise cause
+            cause = cause.__context__
+        return False
+    except Exception as error:
+        # The field did not resolve within the bound.
+        if _is_selected_engine_timeout(error, engine_selection):
+            return False
+        raise
+    return frames is True
+
+
+async def _clear_unverified_secret(skyvern_element: SkyvernElement) -> None:
+    # The ActionFailure only skips this step's submit, so a field left holding the unverified value lets a
+    # later step send a wrong credential toward an account lockout, and a non-password field's value reaches
+    # prompts through the scraper (a scramble is a reordering, so exact-value redaction misses it). Clearing
+    # is best effort: the mismatch stands whether or not it lands.
+    try:
+        await skyvern_element.input_clear()
+    except Exception as exc:
+        LOG.warning(
+            "Could not clear the credential field after a read-back mismatch",
+            element_id=skyvern_element.get_id(),
+            error_type=type(exc).__name__,
+        )
 
 
 async def _fill_secret_with_readback(
@@ -3578,6 +3852,23 @@ async def _fill_secret_with_readback(
     readback_expected = text
     date_recovered = False
     await skyvern_element.refresh_locator_if_stale()
+    deferred_editing = await _is_flutter_text_field(skyvern_element, engine_selection)
+    if deferred_editing:
+        # The field starts editing in the first frame after it is focused and writes its own copy of the value over
+        # the input then, so the write waits for that frame.
+        await skyvern_element.focus()
+        if not await _two_frames_passed(skyvern_element, engine_selection):
+            LOG.warning(
+                "Credential field drew no frame after it was focused; nothing was entered",
+                element_id=skyvern_element.get_id(),
+            )
+            return ActionFailure(SecretInputMismatch())
+    # Keep the original document's handle: a locator can resolve into a replacement, even at the same URL.
+    written_element = (
+        await skyvern_element.get_element_handler(timeout=FRAME_SETTLE_TIMEOUT_SECONDS * 1000)
+        if deferred_editing
+        else None
+    )
     if sequential_first:
         await skyvern_element.input_sequentially(text=text)
     else:
@@ -3606,6 +3897,11 @@ async def _fill_secret_with_readback(
         # Returns (value, navigated). A read-back that races a form auto-submit sees the context torn down;
         # navigated=True means the value was submitted, so the caller stops and treats it as success.
         try:
+            # The field's next frame can still overwrite the write, so a value read before it confirms nothing.
+            if written_element is not None and not await _two_frames_passed(
+                skyvern_element, engine_selection, written_element
+            ):
+                return None, False
             value = await get_input_value(
                 tag_name=tag_name, locator=skyvern_element.get_locator(), engine_selection=engine_selection
             )
@@ -3663,6 +3959,7 @@ async def _fill_secret_with_readback(
         "Secret input read-back mismatch after retry",
         element_id=skyvern_element.get_id(),
     )
+    await _clear_unverified_secret(skyvern_element)
     return ActionFailure(SecretInputMismatch())
 
 
@@ -4325,14 +4622,14 @@ class AutoCompletionResult(BaseModel):
     action_result: ActionResult = ActionSuccess()
 
 
-# Upstream HTTP statuses that count as download-failure evidence; adjacent 5xx (501/505/507/...) are excluded.
+# Common XHR/fetch statuses retained for diagnostics; Document responses accept every HTTP 5xx for attribution.
 _OBSERVED_DOWNLOAD_FAILURE_STATUSES = frozenset({500, 502, 503, 504})
 # Hard cap on the per-action set of xhr/fetch requests eligible for passive status observation. Bounds
 # retained request-object references under a request storm; at the cap we stop tracking new requests
 # (logging once) instead of growing without limit.
 _MAX_STATUS_OBSERVATION_REQUESTS = 64
-# Grace after seal_in_flight_requests() during which a newly initiated xhr/fetch can still enter status
-# observation. Bounds the observation window to the action plus a JS-initiated second hop, so an unrelated
+# Grace after seal_in_flight_requests() during which a newly initiated xhr/fetch or Document can still enter
+# status observation. Bounds the observation window to the action plus a JS-initiated second hop, so an unrelated
 # heartbeat/poll fired minutes into the long download-wait loop can never stamp download_failure_status.
 _STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS = 2.0
 
@@ -4354,20 +4651,24 @@ class ScopedXhrDownloadCapture:
         download_dir: Path,
         timeout_seconds: float = BROWSER_DOWNLOAD_TIMEOUT,
         monotonic: Callable[[], float] = time.monotonic,
+        target_frame: Page | Frame | None = None,
     ) -> None:
         self._page = page
         self._download_dir = download_dir
         self._timeout_seconds = timeout_seconds
         self._monotonic = monotonic
+        self._attributable_frames = {page.main_frame}
+        if target_frame is not None:
+            self._attributable_frames.add(target_frame.main_frame if is_page_like(target_frame) else target_frame)
         self._saved: set[str] = set()
         self._extra_pages: list[Page] = []
         self._capture_responses = False
         self._active = False
         self._accept_new_requests = False
-        # Passive, site-agnostic status observation: records only a server 5xx integer status for any
-        # xhr/fetch request initiated during this download action's window. No URL, host, header, body,
-        # or other request detail is ever retained.
+        # XHR/fetch status remains diagnostic; only a 5xx Document response in the main or action-target
+        # frame is attributable without initiator instrumentation.
         self._observed_download_failure_status: int | None = None
+        self._attributed_download_failure_status: int | None = None
         # Response-body drain count is separate from request-lifecycle tracking for the bounded wait extension.
         self._in_flight = 0
         self._response_tasks: set[asyncio.Task[None]] = set()
@@ -4379,10 +4680,9 @@ class ScopedXhrDownloadCapture:
         # flight before this action (never seen by _on_request) is excluded. Bounded by
         # _MAX_STATUS_OBSERVATION_REQUESTS; never gates wait extension.
         self._status_observation_requests: set[Request] = set()
-        # Child pages whose bootstrap provenance was established while inside the observation window.
-        # A bootstrap hop on such a page stays observation-eligible after the deadline (proven
-        # action-owned); a child page first seen at/after the deadline is admitted for wait extension
-        # but never grants observation provenance, so its 5xx cannot become action-caused evidence.
+        # Child pages whose bootstrap provenance and main frame were established inside the observation
+        # window. A bootstrap hop on such a page stays observation-eligible after the deadline (proven
+        # action-owned); a child page first seen at/after the deadline never grants either attribution.
         self._status_observation_child_pages: set[Page] = set()
         self._status_observation_capped = False
         # Monotonic deadline for admitting NEW requests into status observation. None until seal, meaning
@@ -4403,6 +4703,10 @@ class ScopedXhrDownloadCapture:
     def observed_download_failure_status(self) -> int | None:
         return self._observed_download_failure_status
 
+    @property
+    def attributed_download_failure_status(self) -> int | None:
+        return self._attributed_download_failure_status
+
     def _within_status_observation_window(self) -> bool:
         deadline = self._status_observation_deadline
         if deadline is None:
@@ -4410,7 +4714,22 @@ class ScopedXhrDownloadCapture:
         return self._monotonic() < deadline
 
     def _on_request(self, request: Request) -> None:
-        if not self._active or request.resource_type not in ("xhr", "fetch"):
+        if not self._active:
+            return
+
+        resource_type = request.resource_type
+        if resource_type == "document":
+            # A Document request is evidence only if it began during this action window; it never extends
+            # the download wait, and its redirects retain the initiating request's observation scope.
+            if request.redirected_from is None and not self._within_status_observation_window():
+                return
+            self._maybe_observe_request(
+                request,
+                child_page_has_bootstrap_allowance=False,
+                bootstrap_provenance_in_window=False,
+            )
+            return
+        if resource_type not in ("xhr", "fetch"):
             return
 
         redirected_from_admitted_request = request.redirected_from in self._admitted_requests
@@ -4505,15 +4824,19 @@ class ScopedXhrDownloadCapture:
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
 
-        Reuses ``is_download_response`` for attachment cases. For inline
+        Uses the shared response-header classifier for attachment cases. For inline
         responses, additionally accepts download MIME + explicit filename
-        (the case ``is_download_response`` intentionally rejects for the
-        global CDP path to avoid false positives on PDF previews).
+        (the case the global CDP path intentionally rejects to avoid false positives
+        on PDF previews).
         """
-        if is_download_response(headers, status, resource_type="XHR"):
-            return True
-        if status >= 400:
+        if status >= 300:
             return False
+        return self._has_xhr_download_response_headers(headers)
+
+    @staticmethod
+    def _has_xhr_download_response_headers(headers: dict[str, str]) -> bool:
+        if has_download_response_headers(headers, resource_type="XHR"):
+            return True
         content_type = headers.get("content-type", "").split(";")[0].strip().lower()
         content_disposition = headers.get("content-disposition", "")
         if content_type not in DOWNLOAD_MIME_TYPES:
@@ -4531,20 +4854,30 @@ class ScopedXhrDownloadCapture:
         task.add_done_callback(self._on_response_done)
 
     def _observe_download_failure_status(self, response: Response) -> None:
-        """Record a server 5xx status for an xhr/fetch request initiated during this download action's window.
+        """Record scoped xhr/fetch failures for diagnostics and frame-scoped Document 5xx attribution.
 
         Runs on Playwright's event loop for every response while the capture is attached, including the
-        CDP-interceptor lane where response-body capture is off. Observation is scoped by window
-        membership (_status_observation_requests), NOT by wait-extension admission: a JS-initiated second
-        hop that starts after seal is still observed, while a request already in flight before this action
-        (never seen by _on_request) is excluded so it cannot become action-caused evidence. Stores only
-        the integer status — no URL, host, or header — and never raises into the event loop.
+        CDP-interceptor lane where response-body capture is off. XHR/fetch status remains diagnostic;
+        Document status is attributable only in the main or action-target frame. No URL, header, or body
+        data is retained, and this callback never raises into the event loop.
         """
         try:
             if response.request not in self._status_observation_requests:
                 return
             status = response.status
-            if not isinstance(status, int) or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
+            if not isinstance(status, int):
+                return
+
+            resource_type = response.request.resource_type
+            if resource_type == "document":
+                if not 500 <= status < 600:
+                    return
+                self._observed_download_failure_status = status
+                if response.request.frame in self._attributable_frames:
+                    self._attributed_download_failure_status = status
+                return
+
+            if resource_type not in ("xhr", "fetch") or status not in _OBSERVED_DOWNLOAD_FAILURE_STATUSES:
                 return
             self._observed_download_failure_status = status
         except Exception:
@@ -5196,6 +5529,11 @@ class ActionHandler:
                         attempt_started_at=false_click_attempt_started_at,
                     )
             action.finished_at = naive_utc_now()
+            # _handle_action stamped the status from the results it returned, but the download
+            # lifecycle above can still downgrade the terminal result (a settled false-click close
+            # here, a replaced result on the download path). Re-derive before the row is written so
+            # the persisted status can never disagree with the result the run reports.
+            action.status = _terminal_action_status(results)
             persisted_action = await app.DATABASE.workflow_params.create_action(
                 action=skyvern_context.action_for_multi_field_totp_persistence(
                     action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
@@ -5367,12 +5705,26 @@ class ActionHandler:
         staging_dir = Path(
             tempfile.mkdtemp(prefix="xhr_staging_", dir=get_run_temp_dir(task.organization_id, run_id or task.task_id))
         )
+        download_target_frame: Page | Frame | None = None
+        if isinstance(action, WebAction) and action.element_id:
+            target_frame_id = scraped_page.id_to_frame_dict.get(action.element_id)
+            target_css = scraped_page.id_to_css_dict.get(action.element_id)
+            if target_frame_id and target_frame_id != "main.frame" and target_css:
+                try:
+                    _, download_target_frame = await resolve_locator(scraped_page, page, target_frame_id, target_css)
+                except Exception:
+                    LOG.debug(
+                        "Could not resolve download action target frame for HTTP failure attribution",
+                        element_id=action.element_id,
+                        exc_info=True,
+                    )
         xhr_capture = ScopedXhrDownloadCapture(
             page,
             staging_dir,
             timeout_seconds=float(task.download_timeout)
             if task.download_timeout is not None
             else BROWSER_DOWNLOAD_TIMEOUT,
+            target_frame=download_target_frame,
         )
         download_triggered = False
         working_page_recovery_attempted = False
@@ -5971,6 +6323,8 @@ class ActionHandler:
                 observed_failure_status = xhr_capture.observed_download_failure_status
                 if observed_failure_status is not None:
                     results[-1].download_failure_status = observed_failure_status
+                if (attributed_failure_status := xhr_capture.attributed_download_failure_status) is not None:
+                    results[-1].mark_download_failure_attributed(attributed_failure_status)
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
@@ -6009,11 +6363,16 @@ class ActionHandler:
             download_error = finish_requested_download_for_context(page.context, requested_download_token)
             if download_error is not None and "results" in locals() and results:
                 preserved_download_failure_status = results[-1].download_failure_status
+                preserved_attributed_failure_status = results[-1].attributed_download_failure_status
                 results[-1] = ActionFailure(
                     Exception(download_error["reasoning"]),
                     download_triggered=download_triggered,
                 )
                 results[-1].download_failure_status = preserved_download_failure_status
+                if preserved_attributed_failure_status is not None:
+                    results[-1].mark_download_failure_attributed(preserved_attributed_failure_status)
+            if "results" in locals() and results:
+                action.status = _terminal_action_status(results)
             persisted_action = await app.DATABASE.workflow_params.create_action(
                 action=skyvern_context.action_for_multi_field_totp_persistence(
                     action, app.WORKFLOW_CONTEXT_MANAGER.get_one_time_codes_for_run(action.workflow_run_id)
@@ -6260,6 +6619,10 @@ async def _is_paste_text_action_enabled(task: Task) -> bool:
         return False
 
 
+async def _has_static_option_role(element: SkyvernElement) -> bool:
+    return (await element.get_attr("role", mode="static") or "").strip().casefold() == "option"
+
+
 def check_for_invalid_web_action(
     action: actions.Action,
     page: Page,
@@ -6338,8 +6701,10 @@ async def _batched_target_stale_beyond_remap(
         return False  # only the main frame has a scrape-stable identity to reason about
     try:
         locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
-        if await locator.count() == 1:
+        if await bounded_lookup_call(locator.count) == 1:
             return False  # the exact injected node is still live -> not stale
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         return False  # cannot confirm staleness -> decline; legacy dispatch stays authoritative
     return True
@@ -6400,8 +6765,10 @@ async def _refresh_stale_web_action_before_dispatch(
         return None
     try:
         locator, frame_content = await resolve_locator(scraped_page, page, frame, css)
-        if await locator.count() == 1:
+        if await bounded_lookup_call(locator.count) == 1:
             return None  # the exact injected node is still live -> not stale -> dispatch unchanged
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         return None  # cannot confirm liveness / marker survival -> decline; legacy path authoritative
 
@@ -6546,9 +6913,66 @@ async def _is_single_select_option_highlight(element: SkyvernElement) -> bool:
     if (await element.get_attr("role", mode="dynamic") or "").strip().casefold() != "option":
         return False
     multiselectable = element.get_locator().locator("xpath=ancestor-or-self::*[@aria-multiselectable][1]")
-    if await multiselectable.count() == 0:
+    if await bounded_lookup_call(multiselectable.count) == 0:
         return True
     return (await multiselectable.get_attribute("aria-multiselectable") or "").strip().casefold() != "true"
+
+
+async def _is_static_listbox_option(element: SkyvernElement) -> bool:
+    try:
+        snapshot = await read_static_listbox_option_snapshot(element.get_frame(), await element.get_element_handler())
+    except Exception:
+        LOG.debug("Static listbox option snapshot read failed; treating as not static", element_id=element.get_id())
+        return False
+    is_static = is_static_listbox_option_snapshot(snapshot)
+    if (
+        isinstance(snapshot, dict)
+        and snapshot.get("isOption") is True
+        and snapshot.get("inListbox") is True
+        and not is_static
+    ):
+        LOG.info("Option is not a static listbox option", element_id=element.get_id(), snapshot=snapshot)
+    return is_static
+
+
+def _static_listbox_replan_failure(action: actions.ClickAction, message: str) -> ActionFailure:
+    result = ActionFailure(FailToClick(action.element_id, msg=message))
+    result.skip_remaining_actions = True
+    return result
+
+
+async def _resolve_static_listbox_container_target(
+    action: actions.ClickAction, element: SkyvernElement, dom: DomUtil
+) -> SkyvernElement | ActionFailure | None:
+    try:
+        options = await element.get_locator().locator('[role="option"]').all()
+        if not options:
+            return None
+        for option in options:
+            # A hidden option means the container is collapsed; its click may be what expands it.
+            if not await option.is_visible():
+                return None
+            snapshot = await read_static_listbox_option_snapshot(
+                element.get_frame(), await option.element_handle(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+            )
+            if not is_static_listbox_option_snapshot(snapshot):
+                return None
+        if len(options) != 1:
+            return _static_listbox_replan_failure(
+                action,
+                "This static listbox already exposes multiple options. Click the intended option directly; "
+                "clicking the container may select an arbitrary option.",
+            )
+        option_id = await options[0].get_attribute(SKYVERN_ID_ATTR)
+        target = await dom.safe_get_skyvern_element_by_id(option_id) if option_id else None
+        if target is None or not await _is_static_listbox_option(target) or await target.is_disabled(dynamic=True):
+            return _static_listbox_replan_failure(action, "The static listbox option is unavailable; rescrape it.")
+        return target
+    except SkyvernPageAnalysisTimeout:
+        raise
+    except Exception:
+        LOG.debug("Static listbox container inspection failed", element_id=element.get_id())
+        return None
 
 
 class _GridRowSelection(StrEnum):
@@ -6839,7 +7263,7 @@ async def _drive_grid_row_selection(
     click does not achieve the desired selection. Never loops, force-clicks, or mutates the DOM."""
     cell_locator = element.get_locator().locator('xpath=ancestor-or-self::*[@role="gridcell" or self::td][1]').first
     try:
-        if await cell_locator.count() == 0:
+        if await bounded_lookup_call(cell_locator.count) == 0:
             return None
         if await SkyvernElement._label_click_forwards_to_descendant(cell_locator, fail_closed=True):
             LOG.warning(
@@ -6855,6 +7279,8 @@ async def _drive_grid_row_selection(
             )
             return None
         await cell_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS, position=point)
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         LOG.warning(
             "Grid row-selection click failed, continuing the normal click", element_id=element.get_id(), exc_info=True
@@ -6896,7 +7322,9 @@ class _EffectiveClickState(NamedTuple):
     control_type: str | None
 
 
-async def _resolve_live_click_state(element: SkyvernElement) -> _EffectiveClickState:
+async def _resolve_live_click_state(
+    element: SkyvernElement, *, trust_static_listbox: bool = False
+) -> _EffectiveClickState:
     """Read one generic, live selected/checked state and control type snapshot.
     ``checked`` is None when no boolean observable is readable (unknown control, malformed value,
     or a detached/unreadable element), so the caller falls open to an ordinary click. Native radio
@@ -6919,11 +7347,15 @@ async def _resolve_live_click_state(element: SkyvernElement) -> _EffectiveClickS
             if parsed is None:
                 continue
             if aria_attr == "aria-selected" and parsed and await _is_single_select_option_highlight(element):
-                # A single-select option's aria-selected="true" is a keyboard highlight, not committed
-                # state, so leave it unreadable and let the physical click commit the selection.
-                return _EffectiveClickState(checked=None, control_type=None)
+                if not (trust_static_listbox and await _is_static_listbox_option(element)):
+                    # A single-select option's aria-selected="true" is a keyboard highlight, not committed
+                    # state, so leave it unreadable and let the physical click commit the selection.
+                    return _EffectiveClickState(checked=None, control_type=None)
+                LOG.info("Trusting aria-selected on a static listbox option", element_id=element.get_id())
             return _EffectiveClickState(checked=parsed, control_type=None)
         return _EffectiveClickState(checked=None, control_type=None)
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         LOG.debug("Failed to read live selected state; continuing with an ordinary click", element_id=element.get_id())
         return _EffectiveClickState(checked=None, control_type=None)
@@ -6935,7 +7367,7 @@ async def _resolve_live_selected_state(element: SkyvernElement) -> bool | None:
 
 async def _get_associated_checkbox_label_locator(element: SkyvernElement) -> Locator | None:
     ancestor_label_locator = element.get_locator().locator("xpath=ancestor::label[1]")
-    if await ancestor_label_locator.count() > 0:
+    if await bounded_lookup_call(ancestor_label_locator.count) > 0:
         return ancestor_label_locator
 
     input_id = await element.get_attr("id", mode="dynamic")
@@ -6943,7 +7375,7 @@ async def _get_associated_checkbox_label_locator(element: SkyvernElement) -> Loc
         return None
 
     explicit_label_locator = element.get_frame().locator(f"label[for={json.dumps(input_id)}]")
-    if await explicit_label_locator.count() > 0:
+    if await bounded_lookup_call(explicit_label_locator.count) > 0:
         return explicit_label_locator.first
 
     return None
@@ -7267,7 +7699,12 @@ async def _input_type_or_none(element: SkyvernElement) -> str | None:
 
 
 async def _apply_desired_click_state(
-    action: actions.ClickAction, element: SkyvernElement, desired_state: bool, dom: DomUtil
+    action: actions.ClickAction,
+    element: SkyvernElement,
+    desired_state: bool,
+    dom: DomUtil,
+    *,
+    trust_static_listbox: bool = False,
 ) -> list[ActionResult] | None:
     """Drive a selectable control to an explicit terminal state idempotently. Returns
     [ActionAbort()] to suppress the physical click -- when the control already matches the desired
@@ -7283,7 +7720,7 @@ async def _apply_desired_click_state(
         element_type = await _input_type_or_none(element)
     if element_type == "checkbox":
         return await _apply_checkbox_desired_click_state(action, element, desired_state)
-    state = await _resolve_live_click_state(element)
+    state = await _resolve_live_click_state(element, trust_static_listbox=trust_static_listbox)
     if state.checked is None:
         LOG.info("No readable selected state, continuing the normal click", action=action)
         return None
@@ -7376,6 +7813,7 @@ async def handle_click_action(
     action_phase.mark_action_phase(ActionPhase.RESOLVE_ELEMENT)
     skyvern_element = await dom.get_skyvern_element_by_id(action.element_id)
     action_phase.mark_action_phase(ActionPhase.PRE_CLICK_CHECKS)
+    static_listbox_fix = await _has_static_option_role(skyvern_element)
 
     # Wait after getting element to allow any dynamic changes
     await asyncio.sleep(get_wait_time(wait_config, "post_click_delay", default=0.3))
@@ -7386,7 +7824,11 @@ async def handle_click_action(
     # single ordinary click for a custom-control mismatch or an unreadable state.
     if action.click_context is not None and action.click_context.desired_state is not None:
         desired_state_result = await _apply_desired_click_state(
-            action, skyvern_element, action.click_context.desired_state, dom
+            action,
+            skyvern_element,
+            action.click_context.desired_state,
+            dom,
+            trust_static_listbox=static_listbox_fix and action.repeat == 1,
         )
         if desired_state_result is not None:
             return desired_state_result
@@ -7400,12 +7842,17 @@ async def handle_click_action(
         )
         if child is not None:
             skyvern_element = child
+            static_listbox_fix = await _has_static_option_role(skyvern_element)
             # Retarget moved the click to the descendant that will actually receive it, so re-run
             # the same guard on the child: the pre-retarget pass observed the (unreadable) wrapper
             # and fell open, and without this the retargeted child could still be re-toggled.
             if action.click_context is not None and action.click_context.desired_state is not None:
                 desired_state_result = await _apply_desired_click_state(
-                    action, skyvern_element, action.click_context.desired_state, dom
+                    action,
+                    skyvern_element,
+                    action.click_context.desired_state,
+                    dom,
+                    trust_static_listbox=static_listbox_fix and action.repeat == 1,
                 )
                 if desired_state_result is not None:
                     return desired_state_result
@@ -7416,6 +7863,47 @@ async def handle_click_action(
                 element_id=skyvern_element.get_id(),
             )
             return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
+
+    if (await skyvern_element.get_attr("role", mode="static") or "").strip().casefold() == "listbox":
+        target = await _resolve_static_listbox_container_target(action, skyvern_element, dom)
+        if isinstance(target, ActionFailure):
+            return [target]
+        if target is not None:
+            skyvern_element = target
+            action.element_id = target.get_id()
+            # Keep the persisted selector on the option that is clicked; scripts replay get_xpath().
+            action.xpath = None
+            action.skyvern_element_data = {
+                **target.get_element_dict(),
+                "page_url": (action.skyvern_element_data or {}).get("page_url"),
+            }
+            action.skyvern_element_hash = dom.scraped_page.id_to_element_hash.get(action.element_id)
+            static_listbox_fix = True
+            if action.click_context is not None and action.click_context.desired_state is not None:
+                desired_state_result = await _apply_desired_click_state(
+                    action,
+                    target,
+                    action.click_context.desired_state,
+                    dom,
+                    trust_static_listbox=action.repeat == 1,
+                )
+                if desired_state_result is not None:
+                    return desired_state_result
+
+    if (
+        static_listbox_fix
+        and action.repeat == 1
+        and (action.click_context is None or action.click_context.desired_state is None)
+        and await _is_static_listbox_option(skyvern_element)
+        and (await _resolve_live_click_state(skyvern_element, trust_static_listbox=True)).checked is True
+    ):
+        return [
+            _static_listbox_replan_failure(
+                action,
+                "This option is already selected. Set click_context.desired_state=true to keep it selected "
+                "or false to deselect it.",
+            )
+        ]
 
     # Skip scroll_into_view when a SCROLL action just completed on THIS element.
     # The scroll may have positioned the page or a container at the bottom to enable
@@ -7476,6 +7964,11 @@ async def handle_click_action(
                 remove_download_probe = _register_false_click_download_probe(page, false_click_download_observed)
 
             has_onclick_attr = await skyvern_element.has_attr("onclick", mode="static")
+            bypass_static_listbox_option = (
+                static_listbox_fix
+                and await _has_static_option_role(skyvern_element)
+                and await _is_static_listbox_option(skyvern_element)
+            )
             action_phase.mark_action_phase(ActionPhase.CLICK)
             results = await chain_click(
                 task,
@@ -7525,6 +8018,13 @@ async def handle_click_action(
                             element_id=skyvern_element.get_id(),
                         )
                         return results
+
+                if bypass_static_listbox_option:
+                    LOG.info(
+                        "Static listbox option click; bypassing the dropdown sequential-click rescrape",
+                        element_id=skyvern_element.get_id(),
+                    )
+                    return results
 
                 if sequential_click_result := await handle_sequential_click_with_submit_bypass(
                     action=action,
@@ -8025,6 +8525,12 @@ def _record_multi_field_totp_fill(
     if verified:
         state.observed_max_filled = state.expected_digits
     state.filled_code_hash = hashlib.sha256(code.encode()).hexdigest()
+    context = skyvern_context.current()
+    if state.code_source == "external" and context is not None and context.task_id:
+        # Recorded here, before any cleanup, restore or result handling, so no later failure undoes it.
+        context.note_external_otp_input(
+            context.task_id, state.filled_code_hash, state.expected_digits, settings.BROWSER_LOADING_TIMEOUT_MS / 1000
+        )
     state.filled_at = time.time()
     state.filled_url = filled_url
     state.filled_loader_id = filled_loader_id
@@ -8387,6 +8893,10 @@ async def _fill_multi_field_totp_group(
                 result.data = {"totp_group_filled": True, "verified": False, "totp_submission_observed": True}
                 return result
 
+        if state.code_source == "external" and stream_completed and state.observed_max_filled == state.expected_digits:
+            # Every digit already reached the boxes; typing them again box by box would enter the code twice.
+            return delivered_unverified_or_failure("keyboard_stream_delivered_unconfirmed")
+
         code_refresh_error = await refresh_code_if_expiring()
         if code_refresh_error is not None:
             strategy = "per_box_fill_code_refresh_failed"
@@ -8466,6 +8976,14 @@ async def _fill_multi_field_totp_group(
                 code_source=state.code_source,
                 verified=verified,
             )
+
+
+def _external_otp_reentry_refused() -> ActionFailure:
+    # Not stopping: the batch's other actions (a first Verify, the next page's steps) still run.
+    return ActionFailure(
+        SkyvernException("This one-time code was already entered and is not entered again."),
+        stop_execution_on_failure=False,
+    )
 
 
 def _normalize_dropdown_match_text(value: str) -> str:
@@ -8856,6 +9374,59 @@ def _emit_tel_input_outcome(
         action.tel_input_outcome = None
 
 
+async def _press_autocomplete_commit_tab(*, skyvern_element: SkyvernElement, action: actions.Action) -> None:
+    if not await skyvern_element.is_visible() or await skyvern_element.is_raw_input() or action.skip_auto_complete_tab:
+        return
+    LOG.debug(
+        "Trigger input-selection hack, pressing Tab to choose one",
+        action=action,
+    )
+    await skyvern_element.press_key("Tab")
+
+
+async def _autocomplete_left_field_empty(
+    *,
+    skyvern_element: SkyvernElement,
+    tag_name: str,
+    engine_selection: BrowserEngineSelection | None,
+    expected_value: str,
+    is_secret_value: bool,
+) -> bool:
+    try:
+        value = await get_input_value(
+            tag_name=tag_name,
+            locator=skyvern_element.get_locator(),
+            engine_selection=engine_selection,
+            # This runs on the already-slow exhausted-ladder path, so it must not inherit
+            # Playwright's 30s default wait on a control the commit may have detached.
+            read_timeout_ms=settings.BROWSER_ACTION_TIMEOUT_MS,
+        )
+    except Exception:
+        # A node that cannot be read -- detached, renavigated, or type-incompatible -- is no evidence
+        # of an empty field, and treating it as one would fail actions whose value did land.
+        LOG.info(
+            "Could not read the auto-completion field back, not treating it as empty",
+            element_id=skyvern_element.get_id(),
+            exc_info=True,
+        )
+        return False
+    if value is None:
+        return False
+    if value.strip():
+        return False
+
+    committed, _ = await _custom_select_scope_confirms_committed(
+        readback_scope_element=skyvern_element,
+        anchor_is_combobox_input=tag_name == InteractiveElement.INPUT,
+        matched_element_id=skyvern_element.get_id(),
+        matched_label="<secret>" if is_secret_value else expected_value,
+        expected_label=_normalize_select_shadow_text(expected_value),
+        allow_aria_selected_option_tokens=False,
+        allow_single_value_scope=tag_name == InteractiveElement.INPUT,
+    )
+    return not committed
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -8951,6 +9522,12 @@ async def _handle_input_text_action(
         code = await _resolve_multi_field_totp_code(task, attempt)
         if isinstance(code, ActionFailure):
             return [code]
+        if (
+            attempt.code_source == "external"
+            and context is not None
+            and context.external_otp_code_used(task.task_id, code)
+        ):
+            return [_external_otp_reentry_refused()]
         resolved_hint = code
     if not action.element_id:
         # This is a CUA type action
@@ -9016,6 +9593,9 @@ async def _handle_input_text_action(
         code = await _resolve_multi_field_totp_code(task, attempt)
         if isinstance(code, ActionFailure):
             return [code]
+        if attempt.code_source == "external" and context.external_otp_code_used(task.task_id, code):
+            LOG.info("Refused to enter a one-time code again", task_id=task.task_id)
+            return [_external_otp_reentry_refused()]
         return [await _fill_multi_field_totp_group(page, scraped_page, task, attempt, code)]
 
     dom = DomUtil(scraped_page, page)
@@ -9143,6 +9723,9 @@ async def _handle_input_text_action(
 
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
+    # Set when the auto-completion ladder ran every attempt and committed no option, so the plain
+    # fill below is typing text that matched nothing in the control's list.
+    autocomplete_ladder_unresolved: bool = False
     # Set when the typeahead prefilter (below) types the target into the field. If that pre-input
     # selection does not commit, the terminal fill must clear first so the typed-but-uncommitted value
     # is not doubled. `prefilter_attempted` stays set even when the typing raises mid-dispatch (leaving a
@@ -9373,9 +9956,9 @@ async def _handle_input_text_action(
                             "Find a blocking element to the current element, going to blur the blocking element first",
                             blocking_element=blocking_element.get_locator(),
                         )
-                        if await blocking_element.get_locator().count():
+                        if await bounded_lookup_call(blocking_element.get_locator().count):
                             await blocking_element.press_key("Escape")
-                        if await blocking_element.get_locator().count():
+                        if await bounded_lookup_call(blocking_element.get_locator().count):
                             await blocking_element.blur()
 
                 if try_to_quit_dropdown and await skyvern_element.is_visible():
@@ -9422,6 +10005,7 @@ async def _handle_input_text_action(
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                field_current_value=current_text,
             )
         except Exception as exc:
             LOG.warning(
@@ -9489,6 +10073,7 @@ async def _handle_input_text_action(
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
+                        field_current_value=current_text,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -9509,7 +10094,7 @@ async def _handle_input_text_action(
                 return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
             raise
         if tel_outcome is not None and is_tel:
-            expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+            readback = await _read_back_tel_fallback_fill(
                 skyvern_element=skyvern_element,
                 tag_name=tag_name,
                 expected_value=tel_source_text or text,
@@ -9518,8 +10103,23 @@ async def _handle_input_text_action(
                 engine_selection=engine_selection,
             )
             tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
-            tel_outcome.actual_digit_count = actual_digit_count
+            tel_outcome.actual_digit_count = readback.actual_digit_count
             tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+            if readback.country_code_mismatch is not None:
+                # The recommended format is what lost the calling code, so the number as given is a
+                # retry the field has not seen yet.
+                if tel_source_text is None or _phone_digits(tel_source_text) == _phone_digits(text):
+                    return [ActionFailure(readback.country_code_mismatch)]
+                if not await _tel_fill_recovers_with_source_number(
+                    skyvern_element=skyvern_element,
+                    tag_name=tag_name,
+                    source_value=tel_source_text,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    engine_selection=engine_selection,
+                ):
+                    return [ActionFailure(readback.country_code_mismatch)]
+                tel_outcome.attempt_count += 1
         return [ActionSuccess()]
 
     # `Locator.clear()` on a spin button could cause the cursor moving away, and never be back
@@ -9567,6 +10167,26 @@ async def _handle_input_text_action(
             dom=dom, incremental_page=incremental_scraped
         )
         if blocking_element and exist and await blocking_element.is_editable():
+            # is_editable() answers for a <label>'s control, so a pop-up's radio label covering the
+            # field reports editable while every fill routed through it is rejected by type. Refuse
+            # only on a positive read, so an unreadable blocker keeps the long-standing retarget.
+            if await blocking_element.accepts_text_fill() is False:
+                blocking_tag_name = blocking_element.get_tag_name().lower()
+                LOG.info(
+                    "The element is covered by a blocking element that can't take text; not typing into it",
+                    element_id=skyvern_element.get_id(),
+                    blocking_element_id=blocking_element.get_id(),
+                    blocking_tag_name=blocking_tag_name,
+                )
+                return [
+                    ActionFailure(
+                        InputElementCoveredByUntypeableElement(
+                            element_id=skyvern_element.get_id(),
+                            blocking_element_id=blocking_element.get_id(),
+                            blocking_tag_name=blocking_tag_name,
+                        )
+                    )
+                ]
             LOG.warning(
                 "Find a blocking element to the current element, going to input on the blocking element",
             )
@@ -9665,6 +10285,7 @@ async def _handle_input_text_action(
                         scraped_page=scraped_page,
                         task=task,
                         step=step,
+                        field_current_value=current_text,
                     )
                 except Exception as exc:
                     LOG.warning(
@@ -9753,6 +10374,9 @@ async def _handle_input_text_action(
                 ):
                     auto_complete_hacky_flag = False
                     return [result]
+                # A search bar legitimately keeps free text with nothing selected, so only a
+                # non-search-bar control can have been left blank by the exhausted ladder.
+                autocomplete_ladder_unresolved = not input_or_select_context.is_search_bar
 
         # Only the bare-digit NANP path uses the verified fallback ladder; other tel shapes remain
         # observational to preserve flag-off behavior.
@@ -9915,7 +10539,7 @@ async def _handle_input_text_action(
                     if isinstance(truncation_failure, ActionFailure):
                         return [truncation_failure]
                 if tel_outcome is not None and is_tel and not verify_tel_input_after_fill:
-                    expected_digit_count, actual_digit_count = await _log_tel_fallback_fill_digit_counts(
+                    readback = await _read_back_tel_fallback_fill(
                         skyvern_element=skyvern_element,
                         tag_name=tag_name,
                         expected_value=tel_source_text or text,
@@ -9924,8 +10548,21 @@ async def _handle_input_text_action(
                         engine_selection=engine_selection,
                     )
                     tel_outcome.attempt_count = max(tel_outcome.attempt_count, 1)
-                    tel_outcome.actual_digit_count = actual_digit_count
+                    tel_outcome.actual_digit_count = readback.actual_digit_count
                     tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
+                    if readback.country_code_mismatch is not None:
+                        if tel_source_text is None or _phone_digits(tel_source_text) == _phone_digits(text):
+                            return [ActionFailure(readback.country_code_mismatch)]
+                        if not await _tel_fill_recovers_with_source_number(
+                            skyvern_element=skyvern_element,
+                            tag_name=tag_name,
+                            source_value=tel_source_text,
+                            task_id=task.task_id,
+                            step_id=step.step_id,
+                            engine_selection=engine_selection,
+                        ):
+                            return [ActionFailure(readback.country_code_mismatch)]
+                        tel_outcome.attempt_count += 1
 
             incremental_cleanup = clean_and_remove_element_tree_factory(
                 task=task,
@@ -9977,7 +10614,7 @@ async def _handle_input_text_action(
                                 if restored
                                 else "its previous text could not be put back"
                             ),
-                            target_value=text,
+                            target_value="<secret>" if is_secret_value else text,
                         )
                     )
                 ]
@@ -10125,6 +10762,34 @@ async def _handle_input_text_action(
             # Always stop listening
             await incremental_scraped.stop_listen_dom_increment()
 
+        if autocomplete_ladder_unresolved:
+            # Commit here rather than in the outer finally: the Tab is what blurs the control, and an
+            # autocomplete that rejects unmatched text clears itself on blur. Only a read-back taken
+            # after the commit can confirm that a matching value was committed.
+            if auto_complete_hacky_flag:
+                auto_complete_hacky_flag = False
+            await _press_autocomplete_commit_tab(skyvern_element=skyvern_element, action=action)
+            if await _autocomplete_left_field_empty(
+                skyvern_element=skyvern_element,
+                tag_name=tag_name,
+                engine_selection=engine_selection,
+                expected_value=text,
+                is_secret_value=is_secret_value,
+            ):
+                LOG.info(
+                    "Auto completion committed no matching option, reporting a failed action",
+                    element_id=skyvern_element.get_id(),
+                )
+                failure = ActionFailure(
+                    NoSuitableAutoCompleteOption(
+                        reasoning="the auto-completion options matched no attempted value and no matching option was committed",
+                        target_value="<secret>" if is_secret_value else text,
+                    )
+                )
+                # Prevent a duplicate-element action such as Submit from following this failure.
+                failure.skip_remaining_actions = True
+                return [failure]
+
         return [ActionSuccess()]
     except (SkyvernPageAnalysisTimeout, InvalidElementForTextInput):
         raise
@@ -10151,17 +10816,8 @@ async def _handle_input_text_action(
             tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
 
         # HACK: force to finish missing auto completion input
-        if (
-            auto_complete_hacky_flag
-            and await skyvern_element.is_visible()
-            and not await skyvern_element.is_raw_input()
-            and not action.skip_auto_complete_tab
-        ):
-            LOG.debug(
-                "Trigger input-selection hack, pressing Tab to choose one",
-                action=action,
-            )
-            await skyvern_element.press_key("Tab")
+        if auto_complete_hacky_flag:
+            await _press_autocomplete_commit_tab(skyvern_element=skyvern_element, action=action)
 
 
 _URL_RECOVERY_EDIT_DISTANCE_FRACTION = 0.1
@@ -10294,7 +10950,17 @@ async def handle_upload_file_action(
 
     locator = skyvern_element.locator
 
-    file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+    try:
+        file_path = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+    except handler_utils.UploadFileDownloadError as exc:
+        context = skyvern_context.current()
+        if (
+            context is not None
+            and context.pending_file_chooser is not None
+            and context.pending_file_chooser.page is page
+        ):
+            context.cleanup_pending_file_chooser()
+        return [ActionFailure(Exception(f"Failed to download file from {action.file_url}: {exc}"))]
     is_file_input = await skyvern_element.is_file_input()
 
     if not is_file_input:
@@ -10943,13 +11609,13 @@ async def handle_terminate_action(
             extracted_errors = await extract_user_defined_errors(
                 task=task, step=step, scraped_page=scraped_page, reasoning=action.reasoning
             )
-        except Exception:
+        except Exception as exc:
             LOG.warning(
                 "extract_user_defined_errors failed, using errors from action reasoning",
                 task_id=task.task_id,
                 step_id=step.step_id,
-                action_errors=action.errors,
-                exc_info=True,
+                action_error_count=len(action.errors),
+                error_type=type(exc).__name__,
             )
         else:
             skyvern_codes = {error.error_code for error in skyvern_errors}
@@ -11068,6 +11734,34 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
+class ScrollContainerOutcome(BaseModel):
+    """What ``scrollNearestScrollableContainer()`` in domUtils.js did.
+
+    The metrics are absent for the "page" and "none" modes, where no container was scrolled.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    mode: Literal["container", "page", "none"]
+    scrolled: bool = False
+    scroll_top: float | None = Field(default=None, alias="scrollTop")
+    client_height: float | None = Field(default=None, alias="clientHeight")
+    scroll_height: float | None = Field(default=None, alias="scrollHeight")
+
+    def boundary(self, direction: str) -> str | None:
+        """The end the content is pinned against, or None when it stalled somewhere in between."""
+        if self.scroll_top is None or self.client_height is None or self.scroll_height is None:
+            return None
+        if direction == "up":
+            return "top" if self.scroll_top <= 0 else None
+        metrics = ElementScrollMetrics(
+            scroll_top=self.scroll_top,
+            client_height=self.client_height,
+            scroll_height=self.scroll_height,
+        )
+        return "bottom" if metrics.at_bottom else None
+
+
 @traced(name="skyvern.agent.action.scroll")
 async def handle_scroll_action(
     action: actions.ScrollAction,
@@ -11081,18 +11775,20 @@ async def handle_scroll_action(
     if action.element_id:
         # Element-based scrolling from extract-action prompt. Uses
         # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
-        # the nearest scrollable ancestor or sibling container relative to the element.
-        # Returns: truthy value if scrolled (true for sub-container, "page" for page-level),
-        # false if nothing was scrollable.
+        # the nearest scrollable container relative to the element — the element itself, a
+        # viewport inside it, an ancestor, or an ancestor's sibling — and reports whether
+        # that container's scroll position actually moved.
         scroll_direction = "down" if action.scroll_y >= 0 else "up"
-        scroll_result = False
+        scroll_result = ScrollContainerOutcome(mode="none")
         dom = DomUtil(scraped_page=scraped_page, page=page)
         skyvern_element = await dom.safe_get_skyvern_element_by_id(action.element_id)
         if skyvern_element:
             try:
-                scroll_result = await skyvern_element.locator.evaluate(
-                    "(el, direction) => scrollNearestScrollableContainer(el, direction)",
-                    scroll_direction,
+                scroll_result = ScrollContainerOutcome.model_validate(
+                    await skyvern_element.locator.evaluate(
+                        "(el, direction) => scrollNearestScrollableContainer(el, direction)",
+                        scroll_direction,
+                    )
                 )
             except Exception:
                 LOG.warning(
@@ -11103,7 +11799,28 @@ async def handle_scroll_action(
         else:
             LOG.warning("Could not resolve element for scroll action", element_id=action.element_id)
 
-        if scroll_result == "page":
+        if scroll_result.mode == "container" and not scroll_result.scrolled:
+            # The container was found but would not move, so the scrape after this action shows
+            # the same content. Reporting success here is what let a run spend its whole runtime
+            # re-scrolling an exhausted container; the planner needs to see that it is stuck.
+            LOG.info(
+                "Container scroll revealed no new content",
+                element_id=action.element_id,
+                direction=scroll_direction,
+                scroll_top=scroll_result.scroll_top,
+            )
+            return [
+                ActionFailure(
+                    ScrollMadeNoProgress(
+                        element_id=action.element_id,
+                        direction=scroll_direction,
+                        boundary=scroll_result.boundary(scroll_direction),
+                    ),
+                    stop_execution_on_failure=False,
+                )
+            ]
+
+        if scroll_result.mode == "page":
             # No scrollable sub-container found, but the page itself is scrollable.
             # Use incremental mouse.wheel events at the center of the viewport to
             # simulate natural user scrolling. This fires native wheel/scroll events
@@ -11123,8 +11840,13 @@ async def handle_scroll_action(
             # Dynamically compute iterations based on remaining scrollable distance
             # so we reach the bottom even on very long T&C pages.
             scroll_info = await page.evaluate(
-                "() => ({ scrollHeight: document.documentElement.scrollHeight,"
-                " scrollTop: window.pageYOffset, innerHeight: window.innerHeight })"
+                "() => { let node = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);"
+                " while (node && node !== document.body && node !== document.documentElement) {"
+                " const style = window.getComputedStyle(node);"
+                " if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) break;"
+                " node = node.parentElement; }"
+                " return { scrollHeight: document.documentElement.scrollHeight, scrollTop: window.pageYOffset,"
+                " innerHeight: window.innerHeight, centerScrollTop: node && node !== document.body && node !== document.documentElement ? node.scrollTop : null }; }"
             )
             if scroll_direction == "down":
                 remaining = scroll_info["scrollHeight"] - scroll_info["scrollTop"] - scroll_info["innerHeight"]
@@ -11148,6 +11870,42 @@ async def handle_scroll_action(
             # Wait for page JS to process scroll events (e.g. enabling buttons)
             await page.wait_for_timeout(500)
 
+            settled_scroll = await page.evaluate(
+                "() => { let node = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);"
+                " while (node && node !== document.body && node !== document.documentElement) {"
+                " const style = window.getComputedStyle(node);"
+                " if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && node.scrollHeight > node.clientHeight) break;"
+                " node = node.parentElement; }"
+                " return { scrollTop: window.pageYOffset,"
+                " centerScrollTop: node && node !== document.body && node !== document.documentElement ? node.scrollTop : null }; }"
+            )
+            settled_scroll_top = settled_scroll["scrollTop"]
+            center_container_moved = (
+                scroll_info["centerScrollTop"] is not None
+                and settled_scroll["centerScrollTop"] is not None
+                and settled_scroll["centerScrollTop"] != scroll_info["centerScrollTop"]
+            )
+            if settled_scroll_top == scroll_info["scrollTop"] and not center_container_moved:
+                LOG.info(
+                    "Page-level scroll revealed no new content",
+                    element_id=action.element_id,
+                    direction=scroll_direction,
+                    scroll_top=settled_scroll_top,
+                )
+                # A page that still had room but would not move is scroll-locked (an open modal
+                # or dropdown), which is a different thing to tell the planner than "at the end".
+                at_boundary = remaining <= 1
+                return [
+                    ActionFailure(
+                        ScrollMadeNoProgress(
+                            element_id=action.element_id,
+                            direction=scroll_direction,
+                            boundary=("bottom" if scroll_direction == "down" else "top") if at_boundary else None,
+                        ),
+                        stop_execution_on_failure=False,
+                    )
+                ]
+
             # Record which element was just deliberately scrolled. The click handler
             # checks this to skip scroll_into_view() for the SAME element, which
             # would use element.scrollIntoView() to center it — undoing the
@@ -11157,8 +11915,11 @@ async def handle_scroll_action(
                 "(id) => { window.__skyvernScrolledElementId = id; }",
                 action.element_id,
             )
+            if settled_scroll_top == scroll_info["scrollTop"]:
+                # The center-point wheel was consumed by an overlay rather than the page.
+                return [ActionSuccess(data={"container_scroll": True})]
             return [ActionSuccess(data={"page_level_scroll": True})]
-        elif scroll_result:
+        elif scroll_result.mode == "container":
             # Sub-container was scrolled successfully. Record the element ID so
             # the click handler skips scroll_into_view() for this element — same
             # protection as page-level scrolls. Without this, element.scrollIntoView()
@@ -11174,6 +11935,9 @@ async def handle_scroll_action(
                 "Could not find scrollable container near element, falling back to mouse wheel",
                 element_id=action.element_id,
             )
+            # No progress verdict on this path: the wheel lands wherever the cursor already is,
+            # so an unrelated container under it can absorb the scroll and the window offset
+            # alone cannot tell a real move from a no-op.
             await EventStrategyFactory.scroll_by(page, action.scroll_x, action.scroll_y)
     elif action.x and action.y:
         # Coordinate-based scrolling from CUA/UI-TARS agents
@@ -11192,7 +11956,9 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
+    otp_dispatch_effect.set("unknown")
     await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
+    otp_dispatch_effect.set("dispatched")
     return [ActionSuccess()]
 
 
@@ -11791,10 +12557,6 @@ def _get_click_count(action: ClickAction | UploadFileAction) -> int:
     return 1
 
 
-def _is_policy_blocked_host(error: Exception) -> bool:
-    return isinstance(error, BlockedHost) and not isinstance(error, UnresolvableHost)
-
-
 async def _locator_click(
     locator: Locator,
     click_count: int,
@@ -11837,7 +12599,17 @@ async def chain_click(
     file = pending_upload_files or []
     if not file and action.file_url:
         file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
-        file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+        try:
+            file = await handler_utils.download_file(file_url, action.model_dump(), task.organization_id)
+        except handler_utils.UploadFileDownloadError as exc:
+            context = skyvern_context.current()
+            if (
+                context is not None
+                and context.pending_file_chooser is not None
+                and context.pending_file_chooser.page is page
+            ):
+                context.cleanup_pending_file_chooser()
+            return [ActionFailure(Exception(f"Failed to download file from {action.file_url}: {exc}"))]
 
     is_filechooser_trigger = False
     is_upload_action = bool(action.file_url)
@@ -11875,6 +12647,8 @@ async def chain_click(
     engine_selection = resolve_engine_selection_for_task(task, app.BROWSER_MANAGER)
     # Tracks the return value so the finally block can inspect click success.
     action_results: list[ActionResult] = []
+    # Marked before the first await that may reach the page, so a cancellation mid-click keeps the press.
+    otp_dispatch_effect.set("unknown")
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             if resolved_href := await skyvern_element.resolve_http_href(page):
@@ -11889,10 +12663,20 @@ async def chain_click(
                 await EventStrategyFactory.move_to_element(page, locator)
                 await _locator_click(locator, click_count, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator, sampling=True)
+        otp_dispatch_effect.set("dispatched")
         action_results = [ActionSuccess()]
         return action_results
 
     except Exception as e:
+        if otp_single_dispatch.get():
+            # Only an actionability timeout is known to precede the click; anything else may follow
+            # it. A failed link hop is the other known-before case: it dispatched nothing at all.
+            post_dispatch = is_post_dispatch_click_timeout(e, engine_selection)
+            if post_dispatch:
+                otp_dispatch_effect.set("dispatched")
+            elif isinstance(e, FailToOpenLink) or is_engine_timeout_error(e, engine_selection):
+                otp_dispatch_effect.set(None)
+            return [ActionSuccess()] if post_dispatch else [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
         if is_post_dispatch_click_timeout(e, engine_selection):
             LOG.info(
                 "Chain click: physical click dispatched; navigation-wait timed out — skipping fallback",
@@ -11902,9 +12686,8 @@ async def chain_click(
             action_results = [ActionSuccess()]
             return action_results
 
-        # The browser resolves through the run proxy and may reach hosts the worker cannot;
-        # worker resolution failure is not a policy signal.
-        if _is_policy_blocked_host(e):
+        # A refused or unresolvable href cannot be made safe by dispatching a click fallback.
+        if isinstance(e, BlockedHost):
             action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
             return action_results
 
@@ -12060,9 +12843,8 @@ async def chain_click(
                     try:
                         navigated_href = await skyvern_element.try_navigate_via_href(page=page)
                     except BlockedHost as e:
-                        if _is_policy_blocked_host(e):
-                            action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
-                            return action_results
+                        action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
+                        return action_results
                     else:
                         if navigated_href:
                             LOG.info(
@@ -12341,7 +13123,7 @@ async def choose_auto_completion_dropdown(
             if not element_id:
                 continue
             locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-            cnt = await locator.count()
+            cnt = await bounded_lookup_call(locator.count)
             if cnt == 0:
                 continue
 
@@ -12381,7 +13163,7 @@ async def choose_auto_completion_dropdown(
                     matched_element_id = matched_candidate.get("element_id") or ""
                     matched_label = matched_candidate.get("label") or ""
                     matched_locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{matched_element_id}"]')
-                    if matched_element_id and matched_label and await matched_locator.count() > 0:
+                    if matched_element_id and matched_label and await bounded_lookup_call(matched_locator.count) > 0:
                         option_identity_matches = await _verify_autocomplete_option_identity(
                             skyvern_frame=skyvern_frame,
                             locator=matched_locator,
@@ -12510,7 +13292,7 @@ async def choose_auto_completion_dropdown(
                 input_normalized = " ".join(text.lower().split())
                 if fast_path_element_id and input_normalized and input_normalized in option_text:
                     fast_path_locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{fast_path_element_id}"]')
-                    if await fast_path_locator.count() > 0:
+                    if await bounded_lookup_call(fast_path_locator.count) > 0:
                         LOG.info(
                             "Location auto-completion fast path: single option found, skipping LLM",
                             element_id=fast_path_element_id,
@@ -12600,7 +13382,10 @@ async def choose_auto_completion_dropdown(
 
         if not element_id:
             reasoning = json_response.get("reasoning")
-            raise NoSuitableAutoCompleteOption(reasoning=reasoning, target_value=text)
+            raise NoSuitableAutoCompleteOption(
+                reasoning=reasoning,
+                target_value="<secret>" if is_secret_value else text,
+            )
 
         if relevance_float < relevance_threshold:
             LOG.info(
@@ -12622,7 +13407,7 @@ async def choose_auto_completion_dropdown(
         )
 
         locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{element_id}"]')
-        if await locator.count() == 0:
+        if await bounded_lookup_call(locator.count) == 0:
             raise MissingElement(element_id=element_id)
 
         # Use SkyvernElement.click() so we get the full fallback chain
@@ -12652,6 +13437,8 @@ async def choose_auto_completion_dropdown(
         clear_input = False
         return result
 
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception as e:
         LOG.info(
             "Failed to choose the auto completion dropdown",
@@ -12703,6 +13490,7 @@ async def input_or_auto_complete_input(
     collapse_autocomplete_fanout_enabled: bool = False,
     *,
     is_secret_value: bool,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> ActionResult | None:
     action_phase.mark_action_phase(ActionPhase.AUTOCOMPLETE)
     LOG.info(
@@ -12721,6 +13509,26 @@ async def input_or_auto_complete_input(
     current_value = text
     result = AutoCompletionResult()
 
+    ladder_started_at = monotonic()
+    retry_budget_seconds = settings.AUTO_COMPLETION_LADDER_BUDGET_SECONDS
+    # Per-attempt value and duration. An attempt is silent for its whole runtime -- no log, no span --
+    # so without this a ladder that spends minutes is indistinguishable from one that spends seconds.
+    attempt_timings: list[dict[str, str | float]] = []
+
+    def _elapsed_seconds() -> float:
+        return monotonic() - ladder_started_at
+
+    def _retry_budget_exhausted() -> bool:
+        return retry_budget_seconds > 0 and _elapsed_seconds() >= retry_budget_seconds
+
+    def _record_attempt(value: str, started_at: float) -> None:
+        attempt_timings.append(
+            {
+                "value": "<secret>" if is_secret_value else value,
+                "seconds": round(monotonic() - started_at, 1),
+            }
+        )
+
     while current_attemp < MAX_AUTO_COMPLETE_ATTEMP:
         current_attemp += 1
         whole_new_elements: list[dict] = []
@@ -12732,6 +13540,7 @@ async def input_or_auto_complete_input(
             input_value=current_value,
         )
         is_location = input_or_select_context.is_location_input or False
+        attempt_started_at = monotonic()
         result = await choose_auto_completion_dropdown(
             context=input_or_select_context,
             page=page,
@@ -12747,13 +13556,14 @@ async def input_or_auto_complete_input(
             action=action,
             is_secret_value=is_secret_value,
         )
+        _record_attempt(current_value, attempt_started_at)
         if isinstance(result.action_result, ActionSuccess):
             return result.action_result
 
         if input_or_select_context.is_search_bar:
             LOG.info(
                 "Stop generating potential values for the auto-completion since it's a search bar",
-                context=input_or_select_context,
+                **llm_response_log_metadata(input_or_select_context.model_dump()),
             )
             return None
 
@@ -12771,29 +13581,40 @@ async def input_or_auto_complete_input(
         )
 
         values: list[dict] = []
-        prompt = prompt_engine.load_prompt(
-            "auto-completion-potential-answers",
-            potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
-            field_information=field_information,
-            current_value=current_value,
-            navigation_goal=task.navigation_goal,
-            navigation_payload_str=json.dumps(task.navigation_payload),
-            local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-        )
+        if _retry_budget_exhausted():
+            # Guesses the ladder cannot afford to type are not worth asking an LLM for; the
+            # discovery fallback below opens the unfiltered control instead.
+            LOG.info(
+                "Auto completion retry budget already spent by the first probe, skipping the potential-value fanout",
+                element_id=skyvern_element.get_id(),
+                elapsed_seconds=round(_elapsed_seconds(), 1),
+                budget_seconds=retry_budget_seconds,
+                attempts=attempt_timings,
+            )
+        else:
+            prompt = prompt_engine.load_prompt(
+                "auto-completion-potential-answers",
+                potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
+                field_information=field_information,
+                current_value=current_value,
+                navigation_goal=task.navigation_goal,
+                navigation_payload_str=json.dumps(task.navigation_payload),
+                local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            )
 
-        LOG.info(
-            "Ask LLM to give potential values based on the current value",
-            current_value=current_value,
-            potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
-        )
-        if collapse_autocomplete_fanout_enabled and action is not None:
-            action.set_has_mini_agent()
-        json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
-            prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
-        )
-        values = json_respone.get("potential_values", [])
+            LOG.info(
+                "Ask LLM to give potential values based on the current value",
+                current_value=current_value,
+                potential_value_count=AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
+            )
+            if collapse_autocomplete_fanout_enabled and action is not None:
+                action.set_has_mini_agent()
+            json_respone = await get_org_aware_secondary_llm_api_handler(default=app.SECONDARY_LLM_API_HANDLER)(
+                prompt=prompt, step=step, prompt_name="auto-completion-potential-answers"
+            )
+            values = json_respone.get("potential_values", [])
 
-        for each_value in values:
+        for value_index, each_value in enumerate(values):
             value: str = each_value.get("value", "")
             if not value:
                 LOG.info(
@@ -12801,11 +13622,22 @@ async def input_or_auto_complete_input(
                     value=each_value,
                 )
                 continue
+            if _retry_budget_exhausted():
+                LOG.info(
+                    "Auto completion retry budget exhausted, skipping the remaining potential values",
+                    element_id=skyvern_element.get_id(),
+                    elapsed_seconds=round(_elapsed_seconds(), 1),
+                    budget_seconds=retry_budget_seconds,
+                    attempts=attempt_timings,
+                    skipped_value_count=len(values) - value_index,
+                )
+                break
             LOG.info(
                 "Try the potential value for auto completion",
                 sampling=True,
                 input_value=value,
             )
+            attempt_started_at = monotonic()
             result = await choose_auto_completion_dropdown(
                 context=input_or_select_context,
                 page=page,
@@ -12822,6 +13654,7 @@ async def input_or_auto_complete_input(
                 allow_full_page_rescrape=not initial_probe_found_no_options,
                 is_secret_value=is_secret_value,
             )
+            _record_attempt(value, attempt_started_at)
             if isinstance(result.action_result, ActionSuccess):
                 return result.action_result
 
@@ -12884,7 +13717,9 @@ async def input_or_auto_complete_input(
         LOG.info(
             "Auto completion didn't finish, this might leave the input value to be empty.",
             sampling=True,
-            context=input_or_select_context,
+            **llm_response_log_metadata(input_or_select_context.model_dump()),
+            attempts=attempt_timings,
+            total_seconds=round(_elapsed_seconds(), 1),
         )
         return None
 
@@ -13107,7 +13942,7 @@ async def sequentially_select_from_dropdown(
     if not force_select and input_or_select_context.is_search_bar:
         LOG.info(
             "Exit custom selection mode since it's a non-force search bar",
-            context=input_or_select_context,
+            **llm_response_log_metadata(input_or_select_context.model_dump()),
         )
         return None
 
@@ -13782,9 +14617,11 @@ async def _evaluate_element_scoped(
 
 async def _read_custom_select_matched_state(element: SkyvernElement) -> dict | None:
     try:
-        if await element.get_locator().count() != 1:
+        if await bounded_lookup_call(element.get_locator().count) != 1:
             return None
         state = await _evaluate_element_scoped(element, _CUSTOM_SELECT_MATCHED_STATE_JS)
+    except SkyvernPageAnalysisTimeout:
+        raise
     except Exception:
         LOG.info(
             "Failed to read custom-select matched element state",
@@ -14682,8 +15519,7 @@ async def select_from_emerging_elements(
     LOG.info(
         "LLM response for the matched element",
         sampling=True,
-        matched_value=value,
-        response=json_response,
+        **llm_response_log_metadata(json_response),
     )
 
     # Check the no-match shape before ``ActionType`` coercion — coercing an empty
@@ -14994,8 +15830,6 @@ async def select_from_dropdown(
         potential_scrollable_element = await try_to_find_potential_scrollable_element(
             skyvern_element=dropdown_menu_element,
             incremental_scraped=incremental_scraped,
-            step=step,
-            task=task,
         )
 
         if await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
@@ -15123,8 +15957,7 @@ async def select_from_dropdown(
         LOG.info(
             "LLM response for the matched element",
             sampling=True,
-            matched_value=value,
-            response=json_response,
+            **llm_response_log_metadata(json_response),
         )
 
         # Check the no-match shape before ``ActionType`` coercion — coercing an empty
@@ -15340,8 +16173,6 @@ async def select_from_dropdown_by_value(
     potential_scrollable_element = await try_to_find_potential_scrollable_element(
         skyvern_element=dropdown_menu_element,
         incremental_scraped=incremental_scraped,
-        task=task,
-        step=step,
     )
     if not await skyvern_frame.get_element_scrollable(await potential_scrollable_element.get_element_handler()):
         return _no_element_matched_failure(
@@ -15457,8 +16288,8 @@ async def locate_dropdown_menu(
             )
             continue
 
-        ul_or_listbox_element_id = await head_element.find_children_element_id_by_callback(
-            cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
+        ul_or_listbox_element_id = await incremental_scraped.find_option_list_element_id(
+            head_element.get_element_dict()
         )
 
         if ul_or_listbox_element_id:
@@ -15530,17 +16361,13 @@ async def locate_dropdown_menu(
 async def try_to_find_potential_scrollable_element(
     skyvern_element: SkyvernElement,
     incremental_scraped: IncrementalScrapePage,
-    task: Task,
-    step: Step,
 ) -> SkyvernElement:
     """
     check any <ul> or <role="listbox"> element in the chidlren.
     if yes, return the found element,
     else, return the orginal one
     """
-    found_element_id = await skyvern_element.find_children_element_id_by_callback(
-        cb=is_ul_or_listbox_element_factory(incremental_scraped=incremental_scraped, task=task, step=step),
-    )
+    found_element_id = await incremental_scraped.find_option_list_element_id(skyvern_element.get_element_dict())
     if found_element_id and found_element_id != skyvern_element.get_id():
         LOG.debug(
             "Found 'ul or listbox' element in children list",
@@ -15724,7 +16551,7 @@ async def normal_select(
     )
     LOG.debug(
         "Parsed input/select context",
-        context=input_or_select_context,
+        **llm_response_log_metadata(input_or_select_context.model_dump()),
     )
 
     select_options_result = await skyvern_element.refresh_select_options()
@@ -16568,7 +17395,7 @@ async def _get_input_or_select_context(
             original_response_type=type(json_response).__name__,
             original_response_length=len(json_response) if json_response else 0,
             first_item_type=type(json_response[0]).__name__ if json_response else None,
-            first_item_keys=list(json_response[0].keys())
+            first_item_keys_count=len(json_response[0])
             if json_response and isinstance(json_response[0], dict)
             else None,
         )
@@ -16578,12 +17405,14 @@ async def _get_input_or_select_context(
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
     LOG.debug(
         "Parsed input/select context",
-        context=input_or_select_context,
+        **llm_response_log_metadata(input_or_select_context.model_dump()),
     )
     return input_or_select_context
 
 
-def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: str) -> list[UserDefinedError]:
+def _match_user_defined_error_from_reasoning(
+    task: Task, step: Step, reasoning: str, codes_only: bool = False
+) -> list[UserDefinedError]:
     # If the LLM returns no structured errors but its terminate reasoning
     # explicitly mentions a configured code or description, preserve that
     # machine-readable code for task/run/webhook error aggregation.
@@ -16595,7 +17424,9 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
         code_matches = (
             "_" in error_code and re.search(rf"\b{re.escape(error_code.lower())}\b", normalized_reasoning) is not None
         )
-        description_matches = isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        description_matches = (
+            not codes_only and isinstance(error_description, str) and error_description.lower() in normalized_reasoning
+        )
         if code_matches or description_matches:
             matched_errors.append(
                 UserDefinedError(
@@ -16604,6 +17435,9 @@ def _match_user_defined_error_from_reasoning(task: Task, step: Step, reasoning: 
                     confidence_float=1.0,
                 )
             )
+    if codes_only and len(matched_errors) > 1:
+        # Naming several codes is weighing them, not concluding one.
+        return []
     if matched_errors:
         if len(matched_errors) > 1:
             LOG.warning(
@@ -16630,6 +17464,7 @@ async def extract_user_defined_errors(
         current_url=scraped_page_refreshed.url,
         action_history=json.dumps(action_history),
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
+        antibot_evidence_str=prompt_evidence_str(task),
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         reasoning=reasoning,
     )
@@ -16646,8 +17481,8 @@ async def extract_user_defined_errors(
             "Dropped LLM-returned error codes not in user error_code_mapping",
             task_id=task.task_id,
             step_id=step.step_id,
-            dropped_codes=dropped,
-            allowed_codes=sorted((task.error_code_mapping or {}).keys()),
+            dropped_count=len(dropped),
+            allowed_codes_count=len(task.error_code_mapping or {}),
         )
     if not kept and reasoning:
         return _match_user_defined_error_from_reasoning(task=task, step=step, reasoning=reasoning)

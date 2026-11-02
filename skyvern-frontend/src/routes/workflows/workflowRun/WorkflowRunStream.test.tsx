@@ -6,7 +6,7 @@ import type { StreamStateChangeHandler } from "@/routes/streaming/streamState";
 import { WorkflowRunStream } from "./WorkflowRunStream";
 
 vi.mock("@/util/env", () => ({
-  getCredentialParam: vi.fn(async () => "apikey=test"),
+  getWebSocketProtocols: vi.fn(async () => ["skyvern.v1", "apikey.test"]),
 }));
 
 vi.mock("@/hooks/useCredentialGetter", () => {

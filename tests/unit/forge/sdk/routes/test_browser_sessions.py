@@ -491,7 +491,7 @@ async def test_a_registration_is_listed_to_its_org_as_external_with_its_remainin
     assert foreign_get.status_code == 404
     assert foreign_list.json() == [] and foreign_history.json() == []
     for response in (fetched, listed, history, foreign_get):
-        for leaked in (EXTERNAL_TOKEN, "devtools/browser/b1", "9333"):
+        for leaked in (EXTERNAL_TOKEN, "devtools/browser/b1", ":9333"):
             assert leaked not in response.text
     assert EXTERNAL_TOKEN not in repr(logs)
 

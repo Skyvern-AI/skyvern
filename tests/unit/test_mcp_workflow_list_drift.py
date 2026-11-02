@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from skyvern.cli.mcp_tools import _workflow_http
+from skyvern.cli.mcp_tools import blocks as mcp_blocks
 from skyvern.cli.mcp_tools import workflow as mcp_workflow
 from skyvern.client.core.client_wrapper import AsyncClientWrapper
 from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
@@ -56,6 +57,14 @@ def _make_workflow_dict(workflow_id: str, block_type: str, *, label: str = "step
     elif block_type == "navigation":
         block["url"] = "https://example.com"
         block["navigation_goal"] = "do the thing"
+    elif block_type == "powerbi_query":
+        block.update(
+            connection_id="moc_user_123",
+            dataset_id="cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+            query="EVALUATE VALUES('{{ table_name }}')",
+            max_rows=500,
+            parameter_keys=["table_name"],
+        )
     elif block_type == "terminate":
         block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
         block["error_code"] = "ACCOUNT_NOT_FOUND"
@@ -98,20 +107,41 @@ def _patch_skyvern_list_response(
 
 
 @pytest.mark.asyncio
-async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Regression: a google_sheets_read block must not break list deserialization.
+async def test_list_succeeds_when_workflow_uses_unmodeled_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: a block absent from the vendored Fern union must not break list deserialization.
 
     Pre-fix behavior: ``skyvern.get_workflows(...)`` ran ``parse_obj_as(List[Workflow], ...)``
     on the response, and the stale Fern discriminated Union raised ValidationError
-    on ``google_sheets_read``, taking the entire page down. The bypass returns raw
-    dicts, so any block_type string round-trips through the tool untouched.
+    on a newer block type, taking the entire page down. The raw-HTTP bypass keeps
+    list retrieval independent of the stale union; list intentionally returns summaries only.
     """
+    nested = _make_workflow_dict("wpid_nested_powerbi", "navigation")
+    nested["workflow_definition"]["blocks"] = [
+        {
+            "block_type": "for_loop",
+            "label": "iterate",
+            "loop_over_parameter_key": "table_names",
+            "loop_blocks": [
+                {
+                    "block_type": "powerbi_query",
+                    "label": "query_sales",
+                    "connection_id": "moc_user_123",
+                    "dataset_id": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+                    "query": "EVALUATE VALUES('{{ table_name }}')",
+                    "max_rows": 500,
+                    "parameter_keys": ["table_name"],
+                }
+            ],
+        }
+    ]
     payload = [
         _make_workflow_dict("wpid_ok", "navigation"),
         _make_workflow_dict("wpid_sheets", "google_sheets_read"),
         _make_workflow_dict("wpid_pdf_fill", "pdf_fill"),
         _make_workflow_dict("wpid_search", "web_search"),
         _make_workflow_dict("wpid_stop", "terminate"),
+        _make_workflow_dict("wpid_powerbi", "powerbi_query"),
+        nested,
     ]
     request_mock = _patch_skyvern_list_response(monkeypatch, payload=payload)
 
@@ -119,10 +149,19 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
 
     assert result["ok"] is True, result
     data = result["data"]
-    assert data["count"] == 5
+    assert data["count"] == 7
     assert data["page"] == 1
     ids = {wf["workflow_permanent_id"] for wf in data["workflows"]}
-    assert ids == {"wpid_ok", "wpid_sheets", "wpid_pdf_fill", "wpid_search", "wpid_stop"}
+    assert ids == {
+        "wpid_ok",
+        "wpid_sheets",
+        "wpid_pdf_fill",
+        "wpid_search",
+        "wpid_stop",
+        "wpid_powerbi",
+        "wpid_nested_powerbi",
+    }
+    assert all("workflow_definition" not in wf for wf in data["workflows"])
 
     request_mock.assert_awaited_once()
     call = request_mock.await_args
@@ -135,18 +174,110 @@ async def test_list_succeeds_when_workflow_uses_google_sheets_block(monkeypatch:
     assert params["only_workflows"] is False
 
 
-@pytest.mark.parametrize("block_type", ["web_search", "terminate"])
+@pytest.mark.asyncio
+async def test_get_preserves_nested_powerbi_query_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow = _make_workflow_dict("wpid_nested_powerbi", "navigation")
+    workflow["workflow_definition"]["blocks"] = [
+        {
+            "block_type": "for_loop",
+            "label": "iterate",
+            "loop_over_parameter_key": "table_names",
+            "loop_blocks": [
+                {
+                    "block_type": "powerbi_query",
+                    "label": "query_sales",
+                    "connection_id": "moc_user_123",
+                    "dataset_id": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+                    "query": "EVALUATE VALUES('{{ table_name }}')",
+                    "max_rows": 500,
+                    "parameter_keys": ["table_name"],
+                }
+            ],
+        }
+    ]
+    get_workflow = AsyncMock(return_value=workflow)
+    monkeypatch.setattr(mcp_workflow, "get_workflow_by_id", get_workflow)
+
+    result = await mcp_workflow.skyvern_workflow_get("wpid_nested_powerbi")
+
+    assert result["ok"] is True, result
+    nested = result["data"]["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+    assert {key: nested[key] for key in ("connection_id", "dataset_id", "query", "max_rows")} == {
+        "connection_id": "moc_user_123",
+        "dataset_id": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+        "query": "EVALUATE VALUES('{{ table_name }}')",
+        "max_rows": 500,
+    }
+
+
+@pytest.mark.parametrize("block_type", ["web_search", "terminate", "powerbi_query"])
 def test_block_fields_survive_mcp_definition_normalization(block_type: str) -> None:
     workflow = _make_workflow_dict("wpid_block", block_type)
     if block_type == "web_search":
         workflow["workflow_definition"]["blocks"][0]["error_code_mapping"] = {"NO_RESULT": "No result fits."}
     workflow["workflow_definition"]["parameters"] = [
-        {"parameter_type": "workflow", "key": "terms", "workflow_parameter_type": "string", "default_value": "example"}
+        {
+            "parameter_type": "workflow",
+            "key": "table_name" if block_type == "powerbi_query" else "terms",
+            "workflow_parameter_type": "string",
+            "default_value": "example",
+        }
     ]
     normalized = mcp_workflow._normalize_json_definition(workflow)
     block = normalized["workflow_definition"]["blocks"][0]
     expected = workflow["workflow_definition"]["blocks"][0]
     assert {key: block[key] for key in expected} == expected
+
+
+def test_nested_powerbi_query_fields_survive_mcp_normalization() -> None:
+    powerbi_block = {
+        "block_type": "powerbi_query",
+        "label": "query_sales",
+        "connection_id": "moc_user_123",
+        "dataset_id": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+        "query": "EVALUATE VALUES('{{ table_name }}')",
+        "max_rows": 500,
+        "parameter_keys": ["table_name"],
+    }
+    workflow = {
+        "title": "Nested Power BI workflow",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "table_names",
+                    "workflow_parameter_type": "json",
+                    "default_value": ["Sales"],
+                },
+                {
+                    "parameter_type": "workflow",
+                    "key": "table_name",
+                    "workflow_parameter_type": "string",
+                    "default_value": "Sales",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "for_loop",
+                    "label": "iterate",
+                    "loop_over_parameter_key": "table_names",
+                    "loop_blocks": [powerbi_block],
+                }
+            ],
+        },
+    }
+
+    normalized = mcp_workflow._normalize_json_definition(workflow)
+
+    nested = normalized["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+    assert {key: nested[key] for key in powerbi_block} == powerbi_block
+
+
+def test_powerbi_query_is_registered_for_mcp_block_schema() -> None:
+    from skyvern.schemas.workflows import PowerBIQueryBlockYAML
+
+    assert mcp_blocks.BLOCK_TYPE_MAP["powerbi_query"] is PowerBIQueryBlockYAML
+    assert "powerbi_query" in mcp_blocks.BLOCK_SUMMARIES
 
 
 @pytest.mark.asyncio

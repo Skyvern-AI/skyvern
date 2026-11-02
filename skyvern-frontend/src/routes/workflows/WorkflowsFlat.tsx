@@ -1,3 +1,7 @@
+import {
+  WorkflowFindingsBoundary,
+  WorkflowFindingsButton,
+} from "@/components/WorkflowFindingsSlot";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import {
@@ -89,7 +93,6 @@ import { useTagValuesQuery } from "./hooks/useTagValuesQuery";
 import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { useWorkflowsReliabilityBatchQuery } from "./hooks/useWorkflowsReliabilityBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
-import { WorkflowReliabilityBadge } from "./WorkflowReliabilityBadge";
 import { TagChipList } from "./components/tagging/TagChipList";
 import { WorkflowTagFilter } from "./components/tagging/WorkflowTagFilter";
 import {
@@ -650,7 +653,7 @@ function WorkflowsFlat() {
     }
   }
 
-  return (
+  const content = (
     <div className="space-y-10">
       <div className="flex flex-col justify-between gap-6 xl:h-32 xl:flex-row">
         <div className="space-y-5">
@@ -1072,12 +1075,17 @@ function WorkflowsFlat() {
                                         </Tooltip>
                                       </TooltipProvider>
                                     )}
-                                    <WorkflowReliabilityBadge
+                                    <WorkflowFindingsButton
                                       reliability={
                                         workflowReliabilityMap[
                                           workflow.workflow_permanent_id
                                         ]
                                       }
+                                      workflowPermanentId={
+                                        workflow.workflow_permanent_id
+                                      }
+                                      title={workflow.title}
+                                      surface="list"
                                     />
                                   </div>
                                   {taggingEnabled &&
@@ -1389,6 +1397,11 @@ function WorkflowsFlat() {
         <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
+  );
+  return (
+    <WorkflowFindingsBoundary workflowPermanentIds={workflowIds}>
+      {content}
+    </WorkflowFindingsBoundary>
   );
 }
 

@@ -1,18 +1,22 @@
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes import credentials as routes
 from skyvern.forge.sdk.schemas.organizations import (
+    BitwardenCredential,
+    BitwardenOrganizationAuthToken,
     CreateOnePasswordTokenRequest,
     Organization,
     OrganizationAuthToken,
 )
+from skyvern.forge.sdk.services import org_auth_service
 
 
 class FakeOrganizationsRepository:
@@ -131,6 +135,54 @@ async def test_clear_org_auth_credential_succeeds_without_existing_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("redact", [True, False], ids=["status-only", "email-authorized"])
+async def test_get_bitwarden_credential_redacts_email_without_vault_read(
+    monkeypatch: pytest.MonkeyPatch,
+    redact: bool,
+) -> None:
+    organization = _org()
+    now = datetime.now(UTC)
+    token = BitwardenOrganizationAuthToken(
+        id="oat_bitwarden",
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.bitwarden_credential,
+        valid=True,
+        created_at=now,
+        modified_at=now,
+        credential=BitwardenCredential(email="test@example.com", master_password="test-password"),
+    )
+    get_token = AsyncMock(return_value=token)
+    monkeypatch.setattr(
+        routes.app,
+        "DATABASE",
+        SimpleNamespace(organizations=SimpleNamespace(get_valid_org_auth_token=get_token)),
+    )
+    should_redact = AsyncMock(return_value=redact)
+    monkeypatch.setattr(routes, "_should_redact_org_credential_secrets", should_redact)
+    app = FastAPI()
+    app.add_api_route("/bitwarden", routes.get_bitwarden_credential, methods=["GET"])
+    app.dependency_overrides[org_auth_service.get_current_org_for_credential_routes] = lambda: organization
+
+    with TestClient(app) as client:
+        response = client.get("/bitwarden")
+
+    assert response.status_code == 200, response.text
+    get_token.assert_awaited_once_with(
+        organization_id=organization.organization_id,
+        token_type=OrganizationAuthTokenType.bitwarden_credential.value,
+    )
+    should_redact.assert_awaited_once_with(organization.organization_id)
+    if redact:
+        redacted_token = response.json()["token"]
+        assert set(redacted_token) == {"id", "token_type", "valid", "created_at", "modified_at"}
+        assert redacted_token["id"] == "oat_bitwarden"
+        assert redacted_token["token_type"] == OrganizationAuthTokenType.bitwarden_credential.value
+        assert redacted_token["valid"] is True
+    else:
+        assert response.json()["token"]["credential"]["email"] == "test@example.com"
+
+
+@pytest.mark.asyncio
 async def test_clear_onepassword_without_existing_token_does_not_capture_success_event(
     monkeypatch: pytest.MonkeyPatch,
     fake_organizations: FakeOrganizationsRepository,
@@ -139,13 +191,33 @@ async def test_clear_onepassword_without_existing_token_does_not_capture_success
     monkeypatch.setattr(
         routes.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(capture_onepassword_telemetry=capture),
+        SimpleNamespace(capture_onepassword_telemetry=capture, enforce_request_authorization=AsyncMock()),
     )
 
     response = await routes.clear_org_auth_credential("onepassword", _org())
 
     assert response.success is True
     capture.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clear_onepassword_denial_stops_before_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_organizations: FakeOrganizationsRepository,
+) -> None:
+    enforce_request_authorization = AsyncMock(side_effect=HTTPException(status_code=403, detail="denied"))
+    monkeypatch.setattr(
+        routes.app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(enforce_request_authorization=enforce_request_authorization),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await routes.clear_org_auth_credential("onepassword", _org())
+
+    assert exc_info.value.status_code == 403
+    enforce_request_authorization.assert_awaited_once()
+    assert fake_organizations.invalidate_calls == []
 
 
 @pytest.mark.asyncio
@@ -158,7 +230,7 @@ async def test_onepassword_token_mutations_capture_safe_success_events(
     monkeypatch.setattr(
         routes.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(capture_onepassword_telemetry=capture),
+        SimpleNamespace(capture_onepassword_telemetry=capture, enforce_request_authorization=AsyncMock()),
     )
     monkeypatch.setattr(routes, "record_request_audit_event", AsyncMock())
     monkeypatch.setattr(routes, "_validate_onepassword_service_account_token", AsyncMock())
@@ -191,7 +263,7 @@ async def test_onepassword_token_mutation_failures_capture_only_error_class(
     monkeypatch.setattr(
         routes.app,
         "AGENT_FUNCTION",
-        SimpleNamespace(capture_onepassword_telemetry=capture),
+        SimpleNamespace(capture_onepassword_telemetry=capture, enforce_request_authorization=AsyncMock()),
     )
     monkeypatch.setattr(routes, "record_request_audit_event", AsyncMock())
     monkeypatch.setattr(routes, "_validate_onepassword_service_account_token", AsyncMock())

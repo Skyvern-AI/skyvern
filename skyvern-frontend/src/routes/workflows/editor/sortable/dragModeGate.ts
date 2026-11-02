@@ -1,9 +1,7 @@
 /**
  * Drag mode gate.
  *
- * Recording mode captures live browser events against the workflow graph,
- * and a reorder committed mid-record would shift block identities under the
- * recorder. Canvas lock (the Controls panel padlock) flips React Flow's
+ * Canvas lock (the Controls panel padlock) flips React Flow's
  * nodesDraggable/Connectable/Selectable off; drag-to-reorder should follow.
  * Debug mode (build view) used to gate drag too, but collapse and drag are
  * pure visual / structural toggles that don't change run state, so they
@@ -15,22 +13,18 @@
  */
 
 export type DragModeGateInputs = {
-  isRecording: boolean;
   isCanvasLocked: boolean;
 };
 
 export function isDragGatedByMode({
-  isRecording,
   isCanvasLocked,
 }: DragModeGateInputs): boolean {
-  return isRecording || isCanvasLocked;
+  return isCanvasLocked;
 }
 
 export function getDragGateReason({
-  isRecording,
   isCanvasLocked,
 }: DragModeGateInputs): string | null {
-  if (isRecording) return "Finish the demonstration to reorder blocks";
   if (isCanvasLocked) return "Unlock canvas to reorder blocks";
   return null;
 }

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from pydantic import TypeAdapter
 
@@ -14,15 +16,18 @@ from skyvern.forge import app
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.workflows import BlockType
-from skyvern.webeye.actions.actions import Action, ExtractAction
+from skyvern.webeye.actions.actions import Action, DownloadFileAction, ExtractAction
 from tests.unit.helpers import (
     ONE_TIME_CODE,
     assert_one_time_code_withheld,
     make_one_time_code_action_rows,
     make_session_factory_yielding,
 )
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _block(
@@ -161,6 +166,45 @@ async def test_timeline_attaches_actions_to_code_blocks(mock_db: AsyncMock) -> N
 
 
 @pytest.mark.asyncio
+async def test_native_download_url_survives_registered_timeline_response(
+    mock_db: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stamp = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    mock_db.return_value = [_block("wrb_download", created_at=stamp, block_type=BlockType.CODE, task_id="tsk_download")]
+    app.DATABASE.tasks.get_tasks_actions.return_value = [
+        DownloadFileAction(
+            action_id="act_download",
+            organization_id="o_test",
+            workflow_run_id="wr_test",
+            task_id="tsk_download",
+            step_id="stp_download",
+            status="completed",
+            file_name="report.pdf",
+            download_url="https://example.com/files/report.pdf?token=synthetic-private-query",
+            byte=b"PRIVATE_DOWNLOAD_BYTES",
+            created_by="script",
+        )
+    ]
+    monkeypatch.setattr(
+        app.DATABASE.tasks, "get_run", AsyncMock(return_value=SimpleNamespace(task_run_type=RunType.workflow_run))
+    )
+    monkeypatch.setattr(app.DATABASE.observer, "get_task_v2_by_workflow_run_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *_args, **_kwargs: None)
+    api = shared_route_app(monkeypatch)
+    api.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id="o_test")
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api), base_url="http://test") as client:
+        response = await client.get("/v1/runs/wr_test/timeline")
+
+    assert response.status_code == 200
+    action = response.json()[0]["block"]["actions"][0]
+    assert action["download_url"] == "https://example.com/files/report.pdf?token=synthetic-private-query"
+    assert action["file_name"] == "report.pdf" and action["created_by"] == "script"
+    assert "byte" not in action and "PRIVATE_DOWNLOAD_BYTES" not in response.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cap_output_values", [True, False])
 async def test_timeline_serves_the_typed_value_and_withholds_the_one_time_code(
     mock_db: AsyncMock, monkeypatch: pytest.MonkeyPatch, cap_output_values: bool
@@ -255,3 +299,60 @@ async def test_flatten_task_v2_timeline_inherits_enclosing_attempt(monkeypatch: 
     assert result[1].type == WorkflowRunTimelineType.thought
     assert result[0].children[0].children[0].block == leaf.block
     assert [item.attempt for item in [loop, thought, conditional, leaf]] == [1, 1, 1, 1]
+    # The first block row that replaced the task_v2 block carries it once; the thought row does not.
+    assert [item.task_v2_blocks for item in result] == [[parent_block], None]
+
+
+@pytest.mark.asyncio
+async def test_flatten_task_v2_keeps_wrapper_when_child_has_no_block_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    parent_block = _block("wrb_parent", created_at=base, block_type=BlockType.TaskV2).model_copy(
+        update={"block_workflow_run_id": "wr_child"}
+    )
+    parent = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block,
+        block=parent_block,
+        created_at=base,
+        modified_at=base,
+    )
+    thought = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.thought,
+        created_at=base,
+        modified_at=base,
+    )
+    monkeypatch.setattr(agent_protocol, "_flatten_workflow_run_timeline", AsyncMock(return_value=[thought]))
+
+    result = await agent_protocol._flatten_workflow_run_timeline_recursive(parent, organization_id="o_test")
+
+    assert [item.block for item in result] == [None, parent_block]
+
+
+@pytest.mark.asyncio
+async def test_flatten_nested_task_v2_keeps_both_replaced_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+
+    def task_v2_row(block_id: str, child_run_id: str) -> WorkflowRunTimeline:
+        block = _block(block_id, created_at=base, block_type=BlockType.TaskV2).model_copy(
+            update={"block_workflow_run_id": child_run_id}
+        )
+        return WorkflowRunTimeline(type=WorkflowRunTimelineType.block, block=block, created_at=base, modified_at=base)
+
+    outer, inner = task_v2_row("wrb_outer", "wr_outer_child"), task_v2_row("wrb_inner", "wr_inner_child")
+    leaf = WorkflowRunTimeline(
+        type=WorkflowRunTimelineType.block, block=_block("wrb_leaf", created_at=base), created_at=base, modified_at=base
+    )
+    runs = {"wr_outer_child": [inner], "wr_inner_child": [leaf]}
+
+    async def flatten_run(organization_id: str, workflow_run_id: str, cap_output_values: bool) -> list:
+        return [
+            row
+            for item in runs[workflow_run_id]
+            for row in await agent_protocol._flatten_workflow_run_timeline_recursive(item, organization_id)
+        ]
+
+    monkeypatch.setattr(agent_protocol, "_flatten_workflow_run_timeline", flatten_run)
+
+    result = await agent_protocol._flatten_workflow_run_timeline_recursive(outer, organization_id="o_test")
+
+    assert [item.block for item in result] == [leaf.block]
+    assert result[0].task_v2_blocks == [inner.block, outer.block]

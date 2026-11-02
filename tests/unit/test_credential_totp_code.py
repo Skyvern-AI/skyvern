@@ -38,7 +38,7 @@ def _mock_totp_preview_dependencies(
     credential_id: str = "cred_test",
     organization_id: str = "org_test",
     vault_type: CredentialVaultType | None = None,
-) -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace]:
+) -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace, AsyncMock]:
     db_credential = SimpleNamespace(
         credential_id=credential_id,
         organization_id=organization_id,
@@ -64,6 +64,7 @@ def _mock_totp_preview_dependencies(
         )
     )
     mock_credentials = SimpleNamespace(get_credential=AsyncMock(return_value=db_credential))
+    audit_writer = AsyncMock()
     monkeypatch.setattr(credentials.app, "DATABASE", SimpleNamespace(credentials=mock_credentials))
     monkeypatch.setattr(
         credentials.app,
@@ -71,11 +72,12 @@ def _mock_totp_preview_dependencies(
         SimpleNamespace(
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             parse_enterprise_totp_secret_result=AsyncMock(return_value=AuthenticatorTotpParseResult()),
+            record_audit_event=audit_writer,
         ),
     )
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
 
-    return db_credential, vault_service, mock_credentials
+    return db_credential, vault_service, mock_credentials, audit_writer
 
 
 def test_clear_cached_totp_code_preview_removes_entry() -> None:
@@ -324,7 +326,9 @@ def test_authenticator_totp_validation_ignores_non_authenticator_methods() -> No
 @pytest.mark.asyncio
 async def test_get_credential_totp_code_returns_current_generated_code(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "JBSWY3DPEHPK3PXP"
-    db_credential, vault_service, mock_credentials = _mock_totp_preview_dependencies(monkeypatch, secret=secret)
+    db_credential, vault_service, mock_credentials, audit_writer = _mock_totp_preview_dependencies(
+        monkeypatch, secret=secret
+    )
     monkeypatch.setattr(credentials.time, "time", lambda: 0)
 
     response = await credentials.get_credential_totp_code(
@@ -340,6 +344,14 @@ async def test_get_credential_totp_code_returns_current_generated_code(monkeypat
         organization_id="org_test",
     )
     vault_service.get_credential_item.assert_awaited_once_with(db_credential)
+    audit_writer.assert_awaited_once()
+    assert audit_writer.await_args is not None
+    event = audit_writer.await_args.args[1]
+    assert (event.action, event.resource_type, event.resource_id) == (
+        "credential.totp_code.read",
+        "credential",
+        "cred_test",
+    )
 
 
 @pytest.mark.asyncio
@@ -365,7 +377,9 @@ async def test_get_credential_totp_code_uses_otpauth_uri_parameters(monkeypatch:
 @pytest.mark.asyncio
 async def test_get_credential_totp_code_uses_cache_within_current_window(monkeypatch: pytest.MonkeyPatch) -> None:
     secret = "JBSWY3DPEHPK3PXP"
-    db_credential, vault_service, mock_credentials = _mock_totp_preview_dependencies(monkeypatch, secret=secret)
+    db_credential, vault_service, mock_credentials, audit_writer = _mock_totp_preview_dependencies(
+        monkeypatch, secret=secret
+    )
     current_time = 0
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
     monkeypatch.setattr(credentials.time, "time", lambda: current_time)
@@ -392,6 +406,7 @@ async def test_get_credential_totp_code_uses_cache_within_current_window(monkeyp
     )
     assert mock_credentials.get_credential.await_count == 2
     vault_service.get_credential_item.assert_awaited_once_with(db_credential)
+    assert audit_writer.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -476,7 +491,7 @@ async def test_onepassword_totp_preview_maps_item_list_failures(
     status_code: int,
     detail: str,
 ) -> None:
-    _db_credential, vault_service, _mock_credentials = _mock_totp_preview_dependencies(
+    _db_credential, vault_service, _mock_credentials, _audit_writer = _mock_totp_preview_dependencies(
         monkeypatch,
         secret="JBSWY3DPEHPK3PXP",
         vault_type=CredentialVaultType.ONEPASSWORD,
@@ -498,7 +513,7 @@ async def test_onepassword_totp_preview_maps_item_list_failures(
 async def test_onepassword_totp_preview_logs_unmapped_failure_without_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _db_credential, vault_service, _mock_credentials = _mock_totp_preview_dependencies(
+    _db_credential, vault_service, _mock_credentials, _audit_writer = _mock_totp_preview_dependencies(
         monkeypatch,
         secret="JBSWY3DPEHPK3PXP",
         vault_type=CredentialVaultType.ONEPASSWORD,

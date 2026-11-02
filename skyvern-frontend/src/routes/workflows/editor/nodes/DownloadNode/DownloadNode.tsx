@@ -3,7 +3,6 @@ import { useParams } from "react-router-dom";
 
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 
 import { useCollapseContext } from "../../collapse/CollapseContext";
@@ -17,7 +16,6 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
-  const recordingStore = useRecordingStore();
   const { open } = useCollapseContext();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -27,11 +25,7 @@ function DownloadNode({ id, data }: NodeProps<DownloadNode>) {
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
 
   return (
-    <div
-      className={cn({
-        "pointer-events-none opacity-50": recordingStore.isRecording,
-      })}
-    >
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}

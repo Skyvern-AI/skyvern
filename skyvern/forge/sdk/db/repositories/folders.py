@@ -26,6 +26,10 @@ class SoftDeletedFolder(NamedTuple):
     deleted_schedules: list[tuple[str, str | None]]
 
 
+class FolderWorkflowSetChangedError(ValueError):
+    """The folder's workflow membership changed after a caller authorized its cascade."""
+
+
 class FoldersRepository(BaseRepository):
     """Database operations for folder management."""
 
@@ -176,12 +180,14 @@ class FoldersRepository(BaseRepository):
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    @db_operation("soft_delete_folder")
+    @db_operation("soft_delete_folder", expected_errors=(FolderWorkflowSetChangedError,))
     async def soft_delete_folder(
         self,
         folder_id: str,
         organization_id: str,
         delete_workflows: bool = False,
+        *,
+        expected_workflow_permanent_ids: set[str] | None = None,
     ) -> SoftDeletedFolder | None:
         """Soft delete a folder, its workflows and their schedules in one transaction; None when there is no folder."""
         async with self.Session() as session:
@@ -190,12 +196,15 @@ class FoldersRepository(BaseRepository):
                 select(FolderModel)
                 .filter_by(folder_id=folder_id, organization_id=organization_id)
                 .filter(FolderModel.deleted_at.is_(None))
+                # Keep both delete modes in the folder -> workflow lock order used by workflow writers.
+                .with_for_update()
             )
             folder_result = await session.execute(folder_stmt)
             folder = folder_result.scalar_one_or_none()
             if not folder:
                 return None
 
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             workflow_permanent_ids: list[str] = []
             deleted_schedules: list[tuple[str, str | None]] = []
             # If delete_workflows is True, delete all workflows in the folder
@@ -225,9 +234,14 @@ class FoldersRepository(BaseRepository):
                         & (WorkflowModel.version == subquery.c.max_version),
                     )
                     .where(WorkflowModel.folder_id == folder_id)
+                    .with_for_update(of=WorkflowModel)
                 )
                 result = await session.execute(workflow_permanent_ids_stmt)
                 workflow_permanent_ids = list(result.scalars().all())
+                if expected_workflow_permanent_ids is not None and set(workflow_permanent_ids) != (
+                    expected_workflow_permanent_ids
+                ):
+                    raise FolderWorkflowSetChangedError("Folder workflows changed during delete; retry the request.")
 
                 # Soft delete all workflows with these permanent IDs in a single bulk update
                 if workflow_permanent_ids:
@@ -236,14 +250,14 @@ class FoldersRepository(BaseRepository):
                         .where(BrowserRecordingModel.workflow_permanent_id.in_(workflow_permanent_ids))
                         .where(BrowserRecordingModel.organization_id == organization_id)
                         .where(BrowserRecordingModel.deleted_at.is_(None))
-                        .values(deleted_at=datetime.now(timezone.utc))
+                        .values(deleted_at=now)
                     )
                     update_workflows_query = (
                         update(WorkflowModel)
                         .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
                         .where(WorkflowModel.organization_id == organization_id)
                         .where(WorkflowModel.deleted_at.is_(None))
-                        .values(deleted_at=datetime.now(timezone.utc))
+                        .values(deleted_at=now)
                     )
                     await session.execute(update_workflows_query)
                     schedules_result = await session.execute(
@@ -251,7 +265,7 @@ class FoldersRepository(BaseRepository):
                         .where(WorkflowScheduleModel.workflow_permanent_id.in_(workflow_permanent_ids))
                         .where(WorkflowScheduleModel.organization_id == organization_id)
                         .where(WorkflowScheduleModel.deleted_at.is_(None))
-                        .values(deleted_at=datetime.now(timezone.utc))
+                        .values(deleted_at=now)
                         .returning(
                             WorkflowScheduleModel.workflow_schedule_id, WorkflowScheduleModel.backend_schedule_id
                         )
@@ -263,12 +277,12 @@ class FoldersRepository(BaseRepository):
                     update(WorkflowModel)
                     .where(WorkflowModel.folder_id == folder_id)
                     .where(WorkflowModel.organization_id == organization_id)
-                    .values(folder_id=None, modified_at=datetime.now(timezone.utc))
+                    .values(folder_id=None, modified_at=now)
                 )
                 await session.execute(update_workflows_query)
 
             # Soft delete the folder
-            folder.deleted_at = datetime.now(timezone.utc)
+            folder.deleted_at = now
             await session.commit()
             return SoftDeletedFolder(workflow_permanent_ids, deleted_schedules)
 
@@ -382,6 +396,7 @@ class FoldersRepository(BaseRepository):
                     .where(FolderModel.folder_id == folder_id)
                     .where(FolderModel.organization_id == organization_id)
                     .where(FolderModel.deleted_at.is_(None))
+                    .with_for_update()
                 )
                 if (await session.scalar(stmt)) is None:
                     raise ValueError(f"Folder {folder_id} not found")

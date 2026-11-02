@@ -22,6 +22,10 @@ describe("blockTypeFromNode", () => {
     );
   });
 
+  it("maps powerBIQuery to powerbi_query", () => {
+    expect(blockTypeFromNode({ type: "powerBIQuery" })).toBe("powerbi_query");
+  });
+
   it("maps pdfFill to pdf_fill", () => {
     expect(blockTypeFromNode({ type: "pdfFill" })).toBe("pdf_fill");
   });

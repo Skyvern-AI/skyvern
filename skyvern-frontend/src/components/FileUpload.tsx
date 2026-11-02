@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
 import { Cross2Icon, FileIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation } from "@tanstack/react-query";
@@ -25,14 +26,14 @@ type Props = {
   required?: boolean;
 };
 
-const FILE_SIZE_LIMIT_IN_BYTES = 10 * 1024 * 1024; // 10 MB
+const FILE_SIZE_LIMIT_IN_BYTES = 30 * 1024 * 1024; // 30 MB
 
 function showFileSizeError() {
   toast({
     variant: "destructive",
     title: "File size limit exceeded",
     description:
-      "The file you are trying to upload exceeds the 10MB limit, please try again with a different file",
+      "The file you are trying to upload exceeds the 30MB limit, please try again with a different file",
   });
 }
 
@@ -71,7 +72,7 @@ function FileUpload({ value, onChange, required }: Props) {
       toast({
         variant: "destructive",
         title: "Failed to upload file",
-        description: `An error occurred while uploading the file: ${error.message}`,
+        description: `An error occurred while uploading the file: ${getErrorDetail(error)}`,
       });
     },
   });
@@ -175,7 +176,7 @@ function FileUpload({ value, onChange, required }: Props) {
               <span>
                 {file
                   ? file.name
-                  : "Drag and drop file here or click to select (Max 10MB)"}
+                  : "Drag and drop file here or click to select (Max 30MB)"}
               </span>
             </div>
           </Label>

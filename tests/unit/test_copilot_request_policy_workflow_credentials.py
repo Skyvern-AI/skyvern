@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from structlog.testing import capture_logs
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
 from skyvern.forge.sdk.copilot.context import (
     _MAX_PROPOSAL_CARRIES,
     ApprovedCredential,
@@ -40,7 +42,9 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     _serialize_credential,
     _typed_resume_arm,
 )
+from skyvern.forge.sdk.copilot.turn_outcome import connected_account_choice_context
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
+from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -341,12 +345,19 @@ async def test_list_credentials_exact_mode_accepts_typed_resume_reference() -> N
     assert [item.credential_id for item in policy.resolved_credentials] == ["cred_one"]
 
 
+def _database_without_vault(credentials: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        credentials=credentials,
+        organizations=SimpleNamespace(get_valid_org_auth_token=AsyncMock(return_value=None)),
+    )
+
+
 @pytest.mark.asyncio
 async def test_list_credentials_discovery_does_not_grant_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     policy = RequestPolicy()
     ctx = SimpleNamespace(organization_id="org-1", user_message="List credentials", request_policy=policy)
     credential = _cred("saved-login", "cred_one")
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=AsyncMock(return_value=[credential])))
+    database = _database_without_vault(SimpleNamespace(get_credentials=AsyncMock(return_value=[credential])))
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
     result = await _list_credentials({"page": 1, "page_size": 10}, ctx)
@@ -387,7 +398,7 @@ async def test_list_credentials_exact_result_includes_tested_url() -> None:
 async def test_list_credentials_page_includes_null_tested_url(monkeypatch: pytest.MonkeyPatch) -> None:
     credential = _cred("Saved Login", "cred_saved_login")
     get_credentials = AsyncMock(return_value=[credential])
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    database = _database_without_vault(SimpleNamespace(get_credentials=get_credentials))
     policy = RequestPolicy(canonical_user_message="List my credentials")
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
@@ -412,7 +423,7 @@ async def test_list_credentials_normalizes_pagination(
     expected_page_size: int,
 ) -> None:
     get_credentials = AsyncMock(return_value=[])
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    database = _database_without_vault(SimpleNamespace(get_credentials=get_credentials))
     policy = RequestPolicy(canonical_user_message="List my credentials")
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
@@ -433,7 +444,7 @@ async def test_list_credentials_normalizes_pagination(
 async def test_list_credentials_nonempty_full_page_reports_more_results(monkeypatch: pytest.MonkeyPatch) -> None:
     credential = _cred("Saved Login", "cred_saved_login")
     get_credentials = AsyncMock(return_value=[credential])
-    database = SimpleNamespace(credentials=SimpleNamespace(get_credentials=get_credentials))
+    database = _database_without_vault(SimpleNamespace(get_credentials=get_credentials))
     policy = RequestPolicy(canonical_user_message="List my credentials")
 
     monkeypatch.setattr(object.__getattribute__(app, "_inst"), "DATABASE", database, raising=False)
@@ -1057,13 +1068,11 @@ async def test_the_hydrated_proposal_is_not_promoted_to_durable_approval(
     policy = RequestPolicy()
     await _seed_proposed_credential(policy, organization_id="org-1", global_llm_context=seeded or "")
 
-    page_vouched = SimpleNamespace(request_policy=policy, credential_pause_connected_credential_id=None)
-    card_picked = SimpleNamespace(
-        request_policy=policy, credential_pause_connected_credential_id=credential.credential_id
-    )
+    ctx = SimpleNamespace(request_policy=policy)
 
-    after_page_vouch = record_approved_credentials_in_global_llm_context(page_vouched, seeded)
-    after_card_pick = record_approved_credentials_in_global_llm_context(card_picked, seeded)
+    after_page_vouch = record_approved_credentials_in_global_llm_context(ctx, seeded)
+    policy.credential_pause_connected_credential_ids = {credential.credential_id}
+    after_card_pick = record_approved_credentials_in_global_llm_context(ctx, seeded)
 
     assert StructuredContext.from_json_str(after_page_vouch).approved_credentials == []
     assert [
@@ -1419,3 +1428,79 @@ async def test_the_settled_profile_pick_comes_from_the_saved_row_not_the_submitt
     )
 
     assert policy.persisted_workflow_browser_profile_id == "bp_saved"
+
+
+_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+
+
+def _google_row(organization_id: str, state: str, scopes: list[str]) -> GoogleOAuthCredentialBase:
+    now = datetime.now(timezone.utc)
+    return GoogleOAuthCredentialBase(
+        id="goac_picked",
+        organization_id=organization_id,
+        credential_name="Picked",
+        state=state,
+        scopes_requested=scopes,
+        scopes_granted=scopes,
+        created_at=now,
+        modified_at=now,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "selected_scopes"),
+    [
+        ([_google_row("org-1", "active", [_GMAIL_READ_SCOPE])], [_GMAIL_READ_SCOPE]),
+        (
+            [_google_row("org-1", "active", [_GMAIL_READ_SCOPE, _GMAIL_SEND_SCOPE])],
+            [_GMAIL_READ_SCOPE, _GMAIL_SEND_SCOPE],
+        ),
+        ([_google_row("org-1", "active", [_SHEETS_SCOPE])], [_SHEETS_SCOPE]),
+        ([_google_row("org-other", "active", [_GMAIL_READ_SCOPE])], None),
+        ([_google_row("org-1", "error", [_GMAIL_READ_SCOPE])], None),
+        ([_google_row("org-1", "active", [_GMAIL_SEND_SCOPE])], None),
+        ([], None),
+    ],
+    ids=["gmail-read", "gmail-read-send", "sheets", "other-org", "inactive", "send-only", "deleted"],
+)
+async def test_picked_google_account_is_reported_when_valid_and_only_a_sheets_pick_gains_run_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[GoogleOAuthCredentialBase],
+    selected_scopes: list[str] | None,
+) -> None:
+    monkeypatch.setattr(
+        request_policy_module.google_oauth_service, "get_credentials_for_org", AsyncMock(return_value=rows)
+    )
+
+    policy = await _build_request_policy_bootstrap(
+        user_message="goac_picked",
+        workflow_yaml="workflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        selected_connected_account_id="goac_picked",
+    )
+    facts = connected_account_choice_context(
+        None,
+        explicit_selected_connection_id=policy.picked_connected_account_id,
+        explicit_selected_connection_scopes=policy.picked_connected_account_scopes,
+    )
+
+    if selected_scopes is None:
+        assert policy.picked_connected_account_id is None
+        assert policy.selected_connected_account_id is None
+        assert "goac_picked" not in policy.run_approved_google_connection_ids
+        assert facts == ""
+    else:
+        assert policy.picked_connected_account_id == "goac_picked"
+        assert json.loads(facts)["selected_connection"] == {
+            "connection_id": "goac_picked",
+            "state": "active",
+            "scopes_granted": selected_scopes,
+        }
+        sheets_pick = selected_scopes == [_SHEETS_SCOPE]
+        assert (policy.selected_connected_account_id == "goac_picked") is sheets_pick
+        assert ("goac_picked" in policy.run_approved_google_connection_ids) is sheets_pick

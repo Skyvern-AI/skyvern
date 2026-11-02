@@ -9,7 +9,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -30,10 +30,15 @@ from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.services.org_auth_service import resolve_org_from_api_key
-from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
+from skyvern.forge.sdk.services.request_principal import (
+    AuthKind,
+    RequestPrincipal,
+    extract_clerk_impersonator_user_id,
+)
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
+from .mcp_token_claims import MCPOrgRoleRequiredError, get_token_org_id
 from .session_manager import request_session_scope
 
 LOG = structlog.get_logger(__name__)
@@ -93,6 +98,7 @@ class _OAuthResolution:
     validation: MCPAPIKeyValidation
     api_key_token_id: str | None = None
     user_id: str | None = None
+    issued_at: float | None = None
 
 
 class MissingOrgContextError(HTTPException):
@@ -100,13 +106,6 @@ class MissingOrgContextError(HTTPException):
 
     def __init__(self) -> None:
         super().__init__(status_code=401, detail=_OAUTH_MISSING_ORG_CONTEXT_MSG)
-
-
-class MCPOrgRoleRequiredError(HTTPException):
-    """Raised when an organization session has no supported MCP sign-in role."""
-
-    def __init__(self) -> None:
-        super().__init__(status_code=403, detail="MCP sign-in requires an organization Admin or Member role.")
 
 
 def _canonical_mcp_url(base_url: str | None = None) -> str:
@@ -290,26 +289,6 @@ def _get_oauth_org_auth_methods(db: object) -> tuple[_OrgEntitiesGetter | None, 
     return None, None
 
 
-def get_token_org_id(payload: dict[str, object]) -> str | None:
-    """Return the Clerk org id from supported JWT claim shapes, if any.
-
-    Session tokens carry the organization either as top-level ``org_id`` (v1
-    shape, and our JWT template) or as compact claim ``o.id`` (v2 shape,
-    current since Clerk API version 2025-04-10).
-    """
-    org_id_claim = payload.get("org_id")
-    if isinstance(org_id_claim, str) and org_id_claim:
-        return org_id_claim
-
-    compact_org_claim = payload.get("o")
-    if isinstance(compact_org_claim, dict):
-        compact_org_id = compact_org_claim.get("id")
-        if isinstance(compact_org_id, str) and compact_org_id:
-            return compact_org_id
-
-    return None
-
-
 def _extract_explicit_oauth_org_id(payload: dict[str, object]) -> str:
     org_id = get_token_org_id(payload)
     if org_id is None:
@@ -359,7 +338,12 @@ async def _resolve_oauth_subject_to_org(
         api_token = await org_auth_token_service.create_org_api_token(org_id)
         LOG.info("MCP OAuth: auto-created API key for org", organization_id=org_id)
         await app.AGENT_FUNCTION.record_audit_event(
-            RequestPrincipal(organization_id=org_id, auth_kind=AuthKind.bearer, user_id=subject),
+            RequestPrincipal(
+                organization_id=org_id,
+                auth_kind=AuthKind.bearer,
+                user_id=subject,
+                impersonator_user_id=extract_clerk_impersonator_user_id(payload),
+            ),
             AuditEvent(
                 organization_id=org_id, action="api_key.create", resource_type="api_key", resource_id=api_token.id
             ),
@@ -505,6 +489,18 @@ def _oauth_cache_key(bearer_token: str) -> str:
 
 
 async def validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
+    resolution = await _validate_mcp_oauth_token(bearer_token)
+    # Checked on every call, cache hits included: a sign-out must stop a token the cache already holds.
+    if (
+        resolution.user_id
+        and resolution.issued_at is not None
+        and await app.AGENT_FUNCTION.is_mcp_oauth_token_signed_out(resolution.user_id, resolution.issued_at)
+    ):
+        raise HTTPException(status_code=401, detail="Session has been signed out")
+    return resolution
+
+
+async def _validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
     """Validate a Clerk-issued Bearer token and resolve the caller's org API key.
 
     Flow:
@@ -602,6 +598,9 @@ async def validate_mcp_oauth_token(bearer_token: str) -> _OAuthResolution:
             raise HTTPException(status_code=401, detail="Opaque Bearer tokens are not supported")
 
         resolution = await _resolve_oauth_subject_to_org(payload, db)
+        issued_at = payload.get("iat")
+        if isinstance(issued_at, (int, float)) and not isinstance(issued_at, bool):
+            resolution = replace(resolution, issued_at=float(issued_at))
     except HTTPException as exc:
         if exc.status_code in {401, 403} and not isinstance(exc, MCPOrgRoleRequiredError):
             _cache_negative_oauth(key)

@@ -67,6 +67,7 @@ async def test_execute_fails_early_when_first_block_has_no_url(blank_url: str) -
             status=TaskStatus.failed,
             organization_id="o_test",
             failure_reason=str(excinfo.value),
+            keep_final_status=False,
         )
 
 

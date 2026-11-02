@@ -154,8 +154,9 @@ class TestIsBlockTypeCacheable:
                     {"is_default": True, "next_block_label": None},
                 ],
             },
+            {"label": "query", "block_type": BlockType.POWERBI_QUERY},
         ],
-        ids=["terminate", "web_search", "conditional"],
+        ids=["terminate", "web_search", "conditional", "powerbi_query"],
     )
     def test_loop_containing_an_engine_only_block_is_not_cacheable(
         self, loop_type: BlockType, engine_only_child: dict

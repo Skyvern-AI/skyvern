@@ -4,7 +4,6 @@ import {
   COPILOT_ATTENTION_DOT,
   useCopilotHeaderStore,
 } from "@/store/useCopilotHeaderStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 
 import { WorkflowCopilotHistory } from "../copilot/WorkflowCopilotHistory";
@@ -57,19 +56,13 @@ export function CopilotPaneControls() {
 /**
  * Presence badge on the Copilot pane-header icon, replacing the old "● Active"
  * text chip (which was an always-on session indicator; the dot keeps that
- * meaning with the state voiced through the aria-label). A pending request
- * outranks recording here because recording keeps its own header label.
+ * meaning with the state voiced through the aria-label).
  */
 export function CopilotActiveDot() {
-  const recording = useRecordingStore(
-    (state) => state.isRecording || state.finishRequested || state.isCommitting,
-  );
   const attention = useCopilotHeaderStore((state) => state.attention);
   const label = attention
     ? COPILOT_ATTENTION_DOT[attention]
-    : recording
-      ? "Copilot demonstration active"
-      : "Copilot session active";
+    : "Copilot session active";
   return (
     <span
       role="img"
@@ -77,28 +70,8 @@ export function CopilotActiveDot() {
       title={attention ? label : undefined}
       className={cn(
         "absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full ring-2 ring-slate-elevation1",
-        attention ? "bg-amber-500" : recording ? "bg-red-500" : "bg-success",
+        attention ? "bg-amber-500" : "bg-success",
       )}
     />
-  );
-}
-
-export function CopilotPaneStatus() {
-  const recording = useRecordingStore((state) => state.isRecording);
-  const finishing = useRecordingStore(
-    (state) => state.finishRequested || state.isCommitting,
-  );
-  if (!recording && !finishing) return null;
-  return (
-    <span className="flex items-center gap-1 text-[10px] font-medium text-red-600 dark:text-red-400">
-      <span
-        className={cn(
-          "size-1 rounded-full bg-red-500",
-          !finishing && "animate-pulse motion-reduce:animate-none",
-        )}
-        aria-hidden="true"
-      />
-      {finishing ? "Finishing" : "Demonstrating"}
-    </span>
   );
 }

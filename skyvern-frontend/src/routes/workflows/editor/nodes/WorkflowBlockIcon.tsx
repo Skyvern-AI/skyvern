@@ -1,5 +1,6 @@
 import { ClickIcon } from "@/components/icons/ClickIcon";
 import { GoogleSheetsIcon } from "@/components/icons/GoogleSheetsIcon";
+import { PowerBIIcon } from "@/components/icons/PowerBIIcon";
 import { WorkflowBlockType } from "../../types/workflowTypes";
 import {
   CheckCircledIcon,
@@ -16,6 +17,7 @@ import {
   LockOpen1Icon,
   MagnifyingGlassIcon,
   StopwatchIcon,
+  TargetIcon,
   UpdateIcon,
   Share1Icon,
   UploadIcon,
@@ -93,6 +95,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "terminate": {
       return <CrossCircledIcon className={className} />;
     }
+    case "agent_step": {
+      return <TargetIcon className={className} />;
+    }
     case "pdf_parser": {
       return <FileTextIcon className={className} />;
     }
@@ -125,6 +130,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "google_sheets_write": {
       return <GoogleSheetsIcon className={className} />;
+    }
+    case "powerbi_query": {
+      return <PowerBIIcon className={className} />;
     }
   }
 }

@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { LightningBoltIcon } from "@radix-ui/react-icons";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TriggerType } from "@/api/types";
-import { TriggerTypeBadge } from "./TriggerTypeBadge";
+import { TriggerTypeFilterDropdown } from "./TriggerTypeFilterDropdown";
+import { getTriggerTypeLabel, TriggerTypeBadge } from "./TriggerTypeBadge";
 
 afterEach(cleanup);
 
@@ -32,6 +33,11 @@ describe("TriggerTypeBadge", () => {
       TriggerType.Mcp,
       TriggerType.Api,
       TriggerType.Scheduled,
+      TriggerType.Webhook,
+      TriggerType.Event,
+      TriggerType.JobRecipeExtract,
+      TriggerType.JobRecipeApply,
+      TriggerType.SeoRecipeSubmit,
     ].map((triggerType) => {
       const { container } = render(
         <TriggerTypeBadge triggerType={triggerType} />,
@@ -40,5 +46,24 @@ describe("TriggerTypeBadge", () => {
     });
 
     expect(new Set(glyphs).size).toBe(glyphs.length);
+  });
+
+  it("labels SEO recipe submissions and includes them in the run filter", async () => {
+    expect(getTriggerTypeLabel(TriggerType.SeoRecipeSubmit)).toBe(
+      "SEO recipe submit",
+    );
+
+    const onChange = vi.fn();
+    render(<TriggerTypeFilterDropdown values={[]} onChange={onChange} />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "All Runs" }), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(
+      await screen.findByRole("checkbox", { name: "SEO recipe submit" }),
+    );
+
+    expect(onChange).toHaveBeenCalledWith([TriggerType.SeoRecipeSubmit]);
   });
 });

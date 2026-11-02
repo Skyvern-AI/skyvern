@@ -91,10 +91,10 @@ def compute_selector_options(element_data: dict | None) -> list[tuple[str, str]]
     elem_id = attrs.get("id", "").strip()
     if elem_id:
         if not _looks_dynamic(elem_id):
-            options.append((f"#{_css_escape(elem_id)}", "HTML id"))
+            options.append((_id_selector(elem_id), "HTML id"))
         else:
             # Still include dynamic IDs but clearly marked — let the reviewer decide
-            options.append((f"#{_css_escape(elem_id)}", "HTML id (likely auto-generated — may change between runs)"))
+            options.append((_id_selector(elem_id), "HTML id (likely auto-generated — may change between runs)"))
 
     # Input type attribute (weak selector — many inputs share the same type)
     input_type = attrs.get("type", "").strip()
@@ -115,9 +115,19 @@ def _looks_dynamic(value: str) -> bool:
     return False
 
 
-def _css_escape(s: str) -> str:
-    """Escape a string for use as a CSS ID selector."""
-    return re.sub(r'([!"#$%&\'()*+,./:;<=>?@[\\\]^`{|}~])', r"\\\1", s)
+# A bare CSS identifier: no leading digit (or hyphen-digit), and only ident characters.
+_CSS_IDENTIFIER_RE = re.compile(r"^-?[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+def _id_selector(elem_id: str) -> str:
+    """Build a selector for an element id.
+
+    `#<id>` only parses when the id is a CSS identifier: `#123abc` is rejected as an
+    invalid selector, and `#a b` parses as `#a` descendant `b` — a different element.
+    """
+    if _CSS_IDENTIFIER_RE.match(elem_id):
+        return f"#{elem_id}"
+    return f'[id="{_css_escape_attr(elem_id)}"]'
 
 
 def _css_escape_attr(s: str) -> str:

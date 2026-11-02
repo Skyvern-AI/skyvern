@@ -39,6 +39,7 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "console_messages",
         "select_option",
         "press_key",
+        "drag",
         "wait_for_either_state",
         "skyvern_frame_list",
         "skyvern_frame_switch",
@@ -77,7 +78,8 @@ def _result_text_values(value: Any) -> list[str]:
 
 
 PAGE_REQUEST_FAILURES_KEY = "page_request_failures"
-PAGE_FACT_KEYS = frozenset({"page_state", PAGE_REQUEST_FAILURES_KEY})
+PAGE_CRASHES_KEY = "page_crashes"
+PAGE_FACT_KEYS = frozenset({"page_state", PAGE_REQUEST_FAILURES_KEY, PAGE_CRASHES_KEY})
 
 
 def _result_text_without_page_facts(output: dict[str, Any]) -> str:

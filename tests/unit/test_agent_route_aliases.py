@@ -6,24 +6,23 @@ schema while keeping it callable for backwards compatibility.
 """
 
 import importlib
+from collections.abc import Iterator
 
 import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 
-from skyvern.forge.api_app import register_agent_route_aliases
+from skyvern.forge.api_app import custom_openapi, register_agent_route_aliases
 from skyvern.forge.sdk.routes.routers import base_router
+from tests.unit.shared_route_app import shared_route_app
 
 
 @pytest.fixture(scope="module")
-def app() -> FastAPI:
-    # Import the route modules so base_router is fully populated before we mirror it.
-    for module in ("agent_protocol", "run_blocks", "workflow_schedules"):
-        importlib.import_module(f"skyvern.forge.sdk.routes.{module}")
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    register_agent_route_aliases(fastapi_app)
-    return fastapi_app
+def app() -> Iterator[FastAPI]:
+    with pytest.MonkeyPatch.context() as module_patches:
+        fastapi_app = shared_route_app(module_patches)
+        register_agent_route_aliases(fastapi_app)
+        yield fastapi_app
 
 
 def test_no_workflow_paths_remain_in_schema(app: FastAPI) -> None:
@@ -78,3 +77,13 @@ def test_task_endpoints_hidden_from_docs_but_kept_in_sdk(app: FastAPI) -> None:
     run_task = app.openapi()["paths"]["/v1/run/tasks"]["post"]
     assert run_task["x-hidden"] is True
     assert run_task["x-fern-sdk-method-name"] == "run_task"
+
+
+def test_block_note_fields_stay_out_of_the_public_schema() -> None:
+    importlib.import_module("skyvern.forge.sdk.routes.agent_protocol")
+    fastapi_app = FastAPI()
+    fastapi_app.include_router(base_router, prefix="/v1")
+    schemas = custom_openapi(fastapi_app)["components"]["schemas"]
+    for name in ("TaskBlockYAML", "TaskBlock", "ForLoopBlockYAML"):
+        assert name in schemas
+        assert {"notes", "trailing_notes", "description"}.isdisjoint(schemas[name]["properties"]), name

@@ -165,7 +165,7 @@ skyvern config get max_steps_per_run         # Show one setting
 skyvern config set max_steps_per_run 25      # Change one setting
 ```
 
-`config set` accepts `max_steps_per_run`, `max_steps_per_workflow_run`, `max_retries_per_step`, `webhook_callback_url`, `artifact_url_expiry_seconds` (3600 to 604800), `slug`, and the reset flags `clear_max_steps_per_workflow_run` and `clear_artifact_url_expiry_seconds`.
+`config set` accepts `max_steps_per_run`, `max_steps_per_workflow_run`, `max_retries_per_step`, `webhook_callback_url`, `artifact_url_expiry_seconds` (3600 to 604800), `slug`, `default_llm_key` and `default_secondary_llm_key` (custom LLM keys for the Smart and Fast models), and the reset flags `clear_max_steps_per_workflow_run`, `clear_artifact_url_expiry_seconds`, `clear_default_llm_key` and `clear_default_secondary_llm_key`. `skyvern config set --help` prints the current list.
 
 ### Credentials
 

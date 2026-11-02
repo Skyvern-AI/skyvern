@@ -1,3 +1,4 @@
+import type { WorkflowReliability } from "@/routes/workflows/types/reliabilityTypes";
 import { createContext, useContext } from "react";
 import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
@@ -47,6 +48,20 @@ export type PermissionsState =
   | Readonly<{ status: "ready"; data: PermissionsResponse }>;
 
 export type PageSlots = {
+  workflowFindingsScope?: React.ComponentType<
+    Readonly<{
+      workflowPermanentIds: readonly string[];
+      children: React.ReactNode;
+    }>
+  >;
+  workflowFindingsTrigger?: React.ComponentType<
+    Readonly<{
+      workflowPermanentId: string;
+      title?: string;
+      surface: "list" | "editor";
+      reliability?: WorkflowReliability;
+    }>
+  >;
   workflowCuratorSettings?: React.ComponentType<
     Readonly<{ workflowPermanentId: string; readOnly: boolean }>
   >;

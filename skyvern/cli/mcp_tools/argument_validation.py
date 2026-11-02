@@ -41,6 +41,7 @@ from mcp.types import TextContent
 from skyvern.cli.core.result import ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
+_VALUE_SAFE_TOOLS = frozenset({"skyvern_feedback"})
 _MAX_REPAIR_STRING_LENGTH = 50_000
 _MAX_REPAIR_LIST_ITEMS = 100
 # Repair only production-observed fields whose comma-delimited meaning is known;
@@ -105,32 +106,59 @@ def _millisecond_bounds(schema: Any, *, minimum_floor: float) -> tuple[float, fl
     return minimum, maximum
 
 
+def _millisecond_argument_bounds(name: str, schema: Any) -> tuple[float, float | None] | None:
+    if name == "timeout":
+        minimum_floor = _MILLISECOND_FLOOR
+    elif name.endswith("_ms"):
+        minimum_floor = 0
+    else:
+        return None
+    return _millisecond_bounds(schema, minimum_floor=minimum_floor)
+
+
+def _millisecond_input_error(name: str, schema: Any, value: Any) -> tuple[str, str] | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    bounds = _millisecond_argument_bounds(name, schema)
+    if bounds is None:
+        return None
+    minimum, maximum = bounds
+    if not 0 < value < minimum:
+        return None
+    rescaled = value * 1000
+    if rescaled >= minimum and (maximum is None or rescaled <= maximum):
+        return None
+    if maximum is None:
+        return (
+            f"{name} is in milliseconds (minimum {minimum:g}); got {value:g} - "
+            f"for seconds, use at least {minimum / 1000:g}",
+            f"Provide at least {minimum:g} milliseconds or {minimum / 1000:g} seconds for {name}.",
+        )
+    seconds_minimum, seconds_maximum = minimum / 1000, maximum / 1000
+    return (
+        f"{name} is in milliseconds ({minimum:g}-{maximum:g}); got {value:g} - "
+        f"for seconds, use {seconds_minimum:g}-{seconds_maximum:g}",
+        f"For seconds, pass {seconds_minimum:g}-{seconds_maximum:g}; otherwise provide milliseconds from "
+        f"{minimum:g}-{maximum:g}.",
+    )
+
+
 def _rescale_seconds_to_milliseconds(name: str, schema: Any, value: Any) -> Any:
-    """Scale a sub-floor value on a millisecond parameter, which callers undershoot in seconds.
+    """Scale a sub-floor value only when it is valid as seconds and milliseconds.
 
     The name gate matters as much as the bound: a non-duration parameter could legitimately
     carry a 1000 minimum, and multiplying its value by 1000 would be silent corruption.
     """
-    if name == "timeout":
-        minimum_floor = _MILLISECOND_FLOOR
-    elif name.endswith("_ms"):
-        # An explicit unit suffix identifies milliseconds even when the schema floor is < 1s.
-        minimum_floor = 0
-    else:
-        return value
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return value
-    bounds = _millisecond_bounds(schema, minimum_floor=minimum_floor)
+    bounds = _millisecond_argument_bounds(name, schema)
     if bounds is None:
         return value
     minimum, maximum = bounds
     if not 0 < value < minimum:
         return value
     rescaled = value * 1000
-    if rescaled < minimum:
-        return value
-    # Rescaling past the ceiling would swap one validation failure for a less recognizable one.
-    if maximum is not None and rescaled > maximum:
+    if rescaled < minimum or (maximum is not None and rescaled > maximum):
         return value
     return int(rescaled) if isinstance(rescaled, float) and rescaled.is_integer() else rescaled
 
@@ -145,16 +173,16 @@ def _encode_json_object(value: Any) -> Any:
     return encoded if len(encoded) <= _MAX_REPAIR_STRING_LENGTH else value
 
 
-def _repair_argument_types(tool_name: str, tool: Any, arguments: dict[str, Any]) -> None:
+def _repair_argument_types(tool_name: str, tool: Any, arguments: dict[str, Any]) -> tuple[str, str] | None:
     if tool_name == "skyvern_browser_session_create" and arguments.get("generate_browser_profile") is None:
         arguments.pop("generate_browser_profile", None)
 
     parameters = getattr(tool, "parameters", None)
     if not isinstance(parameters, dict):
-        return
+        return None
     properties = parameters.get("properties")
     if not isinstance(properties, dict):
-        return
+        return None
 
     for name, value in arguments.items():
         schema = properties.get(name)
@@ -167,7 +195,11 @@ def _repair_argument_types(tool_name: str, tool: Any, arguments: dict[str, Any])
         ):
             arguments[name] = _encode_json_object(value)
         else:
+            unit_error = _millisecond_input_error(name, schema, value)
+            if unit_error is not None:
+                return unit_error
             arguments[name] = _rescale_seconds_to_milliseconds(name, schema, value)
+    return None
 
 
 def _argument_contract(tool: Any) -> tuple[set[str], set[str]] | None:
@@ -213,6 +245,8 @@ class MCPArgumentValidationMiddleware(Middleware):
     async def _reject_bad_arguments(self, context: MiddlewareContext[Any]) -> ToolResult | None:
         tool_name = getattr(context.message, "name", None)
         arguments = getattr(context.message, "arguments", None)
+        if tool_name in _VALUE_SAFE_TOOLS and arguments is None:
+            arguments = {}
         if not tool_name or not isinstance(arguments, dict):
             return None
 
@@ -229,10 +263,12 @@ class MCPArgumentValidationMiddleware(Middleware):
 
         repaired = dict(arguments)
         try:
-            _repair_argument_types(tool_name, tool, repaired)
+            unit_error = _repair_argument_types(tool_name, tool, repaired)
         except Exception:
             LOG.warning("mcp_argument_type_repair_failed", tool=tool_name, exc_info=True)
         else:
+            if unit_error is not None:
+                return _invalid_input_result(tool_name, *unit_error)
             if repaired != arguments:
                 # FastMCP dispatch reads this same dict reference, so rebinding `arguments` would discard the repair.
                 arguments.clear()
@@ -245,9 +281,40 @@ class MCPArgumentValidationMiddleware(Middleware):
         provided = {str(key) for key in arguments}
         unsupported = sorted(provided - allowed)
         missing = sorted(required - provided)
-        if not unsupported and not missing:
-            return None
-        return _rejection_result(tool_name, sorted(allowed), unsupported, missing)
+        if unsupported or missing:
+            return _rejection_result(tool_name, sorted(allowed), unsupported, missing)
+        if tool_name in _VALUE_SAFE_TOOLS:
+            for name, value in arguments.items():
+                rule = _value_safe_argument_rule(tool.parameters["properties"][name], value)
+                if rule is not None:
+                    payload = make_result(
+                        tool_name,
+                        ok=False,
+                        error=make_error(
+                            ErrorCode.INVALID_INPUT,
+                            f"{tool_name} argument {name} {rule}.",
+                            f"Check {name} against {tool_name}'s documented parameters.",
+                        ),
+                    )
+                    return ToolResult(
+                        content=[TextContent(type="text", text=json.dumps(payload))], structured_content=payload
+                    )
+        return None
+
+
+def _value_safe_argument_rule(schema: dict[str, Any], value: Any) -> str | None:
+    options = schema.get("anyOf", [schema])
+    nullable = any(option.get("type") == "null" for option in options)
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str):
+        return "must be a string or null" if nullable else "must be a string"
+    for option in options:
+        if option.get("type") == "string":
+            choices = option.get("enum")
+            if choices is not None and value not in choices:
+                return f"must be one of: {', '.join(choices)}"
+    return None
 
 
 def _rejection_result(
@@ -258,25 +325,34 @@ def _rejection_result(
 ) -> ToolResult:
     problems: list[str] = []
     if unsupported:
-        problems.append(f"unsupported argument(s): {', '.join(unsupported)}")
+        if tool_name in _VALUE_SAFE_TOOLS:
+            problems.append(f"{len(unsupported)} unsupported argument(s)")
+        else:
+            problems.append(f"unsupported argument(s): {', '.join(unsupported)}")
     if missing:
         problems.append(f"missing required argument(s): {', '.join(missing)}")
     message = f"{tool_name} was called with {'; '.join(problems)}."
     expected_str = ", ".join(expected) if expected else "(none)"
 
+    return _invalid_input_result(
+        tool_name,
+        message,
+        f"Call {tool_name} using only its documented parameters: {expected_str}.",
+        details={
+            "unsupported_argument_count" if tool_name in _VALUE_SAFE_TOOLS else "unsupported_arguments": (
+                len(unsupported) if tool_name in _VALUE_SAFE_TOOLS else unsupported
+            ),
+            "missing_required_arguments": missing,
+            "expected_arguments": expected,
+        },
+    )
+
+
+def _invalid_input_result(tool_name: str, message: str, hint: str, details: dict[str, Any] | None = None) -> ToolResult:
     payload = make_result(
         tool_name,
         ok=False,
-        error=make_error(
-            ErrorCode.INVALID_INPUT,
-            message,
-            f"Call {tool_name} using only its documented parameters: {expected_str}.",
-            details={
-                "unsupported_arguments": unsupported,
-                "missing_required_arguments": missing,
-                "expected_arguments": expected,
-            },
-        ),
+        error=make_error(ErrorCode.INVALID_INPUT, message, hint, details=details),
     )
     text = json.dumps(payload, ensure_ascii=False, default=str)
     return ToolResult(content=[TextContent(type="text", text=text)], structured_content=payload)
@@ -289,7 +365,7 @@ def _validation_error_result(tool_name: str | None, exc: FastMCPValidationError)
         ok=False,
         error=make_error(
             ErrorCode.INVALID_INPUT,
-            str(exc),
+            f"{name} argument types must match the documented schema." if name in _VALUE_SAFE_TOOLS else str(exc),
             f"Check the argument types and values against {name}'s documented parameters.",
         ),
     )

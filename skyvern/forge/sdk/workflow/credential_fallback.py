@@ -3,14 +3,23 @@ from __future__ import annotations
 import structlog
 from sqlalchemy.exc import IntegrityError
 
-from skyvern.exceptions import WorkflowNotFound
+from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, WorkflowNotFound
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.failure_classifier import (
+    classify_from_failure_reason,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.har_evidence import (
+    without_final_har_user_match,
+)
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.exceptions import has_render_failure_record
+from skyvern.forge.sdk.workflow.models.block import WorkflowTriggerBlock
 from skyvern.forge.sdk.workflow.models.parameter import CredentialParameter
 from skyvern.forge.sdk.workflow.models.validators import is_reserved_tag_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.workflows import BlockStatus, BlockType
 
 LOG = structlog.get_logger()
 
@@ -22,6 +31,7 @@ CREDENTIAL_FALLBACK_RETRY_FLAG = "CREDENTIAL_FALLBACK_RETRY"
 # Terminal statuses that any fallback trigger may retry from. timed_out counts because it is a
 # failure elsewhere; credential_failures narrows further to failed/terminated in _trigger_matches.
 RETRYABLE_STATUSES = frozenset({WorkflowRunStatus.failed, WorkflowRunStatus.terminated, WorkflowRunStatus.timed_out})
+_ENDING_BLOCK_STATUSES = frozenset({BlockStatus.failed, BlockStatus.terminated, BlockStatus.timed_out})
 
 
 async def _retry_enabled_for_organization(organization_id: str, workflow_run: WorkflowRun) -> bool:
@@ -57,7 +67,7 @@ async def _retry_enabled_for_organization(organization_id: str, workflow_run: Wo
 
 
 def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
-    categories = workflow_run.failure_category
+    categories = without_final_har_user_match(workflow_run.failure_category)
     if not categories:
         categories = classify_from_failure_reason(workflow_run.failure_reason)
     return {
@@ -67,7 +77,7 @@ def _failure_category_names(workflow_run: WorkflowRun) -> set[str]:
     }
 
 
-def _trigger_matches(workflow_run: WorkflowRun, trigger: str | None) -> bool:
+def _trigger_matches(workflow_run: WorkflowRun, trigger: str | None, *, template_render_failed: bool = False) -> bool:
     effective_trigger = trigger or CREDENTIAL_FAILURES
     if effective_trigger == ANY_FAILURE:
         return workflow_run.status in RETRYABLE_STATUSES
@@ -76,7 +86,55 @@ def _trigger_matches(workflow_run: WorkflowRun, trigger: str | None) -> bool:
     # A timeout is not a credential failure, so credential_failures keeps rejecting timed_out.
     if workflow_run.status not in {WorkflowRunStatus.failed, WorkflowRunStatus.terminated}:
         return False
+    # A template that failed to render is not a credential failure, whatever words its failure text holds (ADR 0028).
+    if template_render_failed:
+        return False
     return bool(_failure_category_names(workflow_run) & CREDENTIAL_FAILURE_CATEGORIES)
+
+
+def _block_that_ended_the_run(
+    run_blocks: list[WorkflowRunBlock], run_failure_reason: str | None
+) -> WorkflowRunBlock | None:
+    """The row whose result set the run's outcome: WorkflowService._resolve_block_terminal_outcome ends the run's
+    failure reason with that block's own, verbatim. Rows come newest first, so a retried block's latest row wins."""
+    if not run_failure_reason:
+        return None
+    return next(
+        (
+            run_block
+            for run_block in run_blocks
+            if run_block.status in _ENDING_BLOCK_STATUSES
+            and run_block.failure_reason
+            and run_failure_reason.endswith(run_block.failure_reason)
+        ),
+        None,
+    )
+
+
+async def _ended_by_template_render_failure(
+    run_blocks: list[WorkflowRunBlock], run_failure_reason: str | None, organization_id: str
+) -> bool:
+    """A workflow-trigger block that ended the run reports its child run's failure as its own, so the lookup continues
+    into that child run."""
+    # The root run plus one pass per child a trigger chain may nest, so the deepest child's rows are inspected too.
+    for _ in range(WorkflowTriggerBlock.MAX_TRIGGER_DEPTH + 1):
+        ending_block = _block_that_ended_the_run(run_blocks, run_failure_reason)
+        if ending_block is None:
+            return False
+        if has_render_failure_record(ending_block.output):
+            return True
+        output = ending_block.output if isinstance(ending_block.output, dict) else {}
+        child_run_id = output.get("workflow_run_id") if ending_block.block_type == BlockType.WORKFLOW_TRIGGER else None
+        if not isinstance(child_run_id, str):
+            return False
+        child_run = await app.DATABASE.workflow_runs.get_workflow_run(child_run_id, organization_id=organization_id)
+        if child_run is None:
+            return False
+        run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+            workflow_run_id=child_run_id, organization_id=organization_id
+        )
+        run_failure_reason = child_run.failure_reason
+    return False
 
 
 async def _reload_user_run_metadata(workflow_run: WorkflowRun, organization_id: str) -> dict[str, str] | None:
@@ -117,6 +175,9 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
     # runs before the flag check and DB reads so the success path stays cheap. _trigger_matches
     # below still applies the finer per-parameter trigger (credential_failures vs any_failure).
     if workflow_run.status not in RETRYABLE_STATUSES:
+        return None
+
+    if await app.AGENT_FUNCTION.get_workflow_run_retry_refusal(workflow_run) is not None:
         return None
 
     # copilot_session_id marks a Copilot-scoped test run: it supplies block_labels directly without
@@ -174,10 +235,21 @@ async def _maybe_start_credential_fallback_retry(workflow_run: WorkflowRun, orga
     )
 
     next_attempt = (workflow_run.fallback_attempt or 0) + 1
+    run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
+        workflow_run_id=workflow_run.workflow_run_id, organization_id=organization_id
+    )
+    template_render_failed = await _ended_by_template_render_failure(
+        run_blocks, workflow_run.failure_reason, organization_id
+    )
     triggered_parameters = [
-        parameter for parameter in credential_parameters if _trigger_matches(workflow_run, parameter.fallback_trigger)
+        parameter
+        for parameter in credential_parameters
+        if _trigger_matches(workflow_run, parameter.fallback_trigger, template_render_failed=template_render_failed)
     ]
     if not triggered_parameters:
+        return None
+    # Another credential cannot help a run whose browser went away under it.
+    if any(BROWSER_CONNECTION_LOST_ERROR_CODE in run_block.error_codes for run_block in run_blocks):
         return None
 
     all_fallback_ids = list(

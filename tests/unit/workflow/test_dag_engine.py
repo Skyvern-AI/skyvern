@@ -1,21 +1,24 @@
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.block import (
+    BlockTypeVar,
     BranchCondition,
     ConditionalBlock,
     ExtractionBlock,
+    ForLoopBlock,
     JinjaBranchCriteria,
     NavigationBlock,
     PromptBranchCriteria,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -443,6 +446,7 @@ async def test_dag_conditional_fallback_to_own_next_block_label(monkeypatch: pyt
         blocks_to_update,
         parent_workflow_run_block_id=None,
         denied_cached_labels=frozenset(),
+        _on_terminal_write=None,
     ):
         executed_blocks.append(block.label)
         branch_metadata = None
@@ -572,6 +576,7 @@ async def test_dag_execution_continues_after_nested_conditional_branch(monkeypat
         blocks_to_update,
         parent_workflow_run_block_id=None,
         denied_cached_labels=frozenset(),
+        _on_terminal_write=None,
     ):
         executed_blocks.append(block.label)
         branch_metadata = branch_responses.get(block.label)
@@ -600,3 +605,181 @@ async def test_dag_execution_continues_after_nested_conditional_branch(monkeypat
     # All blocks should execute through to merge.
     # Before the fix, execution stalled at validate (next=null).
     assert executed_blocks == ["outer_cond", "nav", "inner_cond", "loop_block", "validate", "merge"]
+
+
+async def _run_listed_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    blocks: list[BlockTypeVar],
+    block_labels: list[str],
+    branch_responses: dict[str, dict] | None = None,
+    finally_block_label: str | None = None,
+) -> tuple[list[tuple[str, str | None]], AsyncMock]:
+    """Drives the real partial-run path, faking only block execution; records (label, parent run block id)."""
+    service = WorkflowService()
+    workflow = MagicMock()
+    workflow.workflow_definition = WorkflowDefinition(
+        version=2, parameters=[], blocks=blocks, finally_block_label=finally_block_label
+    )
+    workflow_run = MagicMock(workflow_run_id="wr_test", code_gen=None)
+    organization = MagicMock(organization_id="org_test")
+
+    monkeypatch.setattr(service, "should_run_script", AsyncMock(return_value=False))
+    monkeypatch.setattr(service, "mark_workflow_run_as_running", AsyncMock())
+    mark_failed = AsyncMock(return_value=workflow_run)
+    monkeypatch.setattr(service, "mark_workflow_run_as_failed", mark_failed)
+
+    executed: list[tuple[str, str | None]] = []
+
+    async def fake_execute_single_block(
+        *, block, workflow_run, blocks_to_update, parent_workflow_run_block_id=None, **_
+    ):
+        executed.append((block.label, parent_workflow_run_block_id))
+        branch_metadata = (branch_responses or {}).get(block.label)
+        result = BlockResult(
+            success=True,
+            output_parameter=block.output_parameter,
+            output_parameter_value=branch_metadata,
+            status=BlockStatus.completed,
+            workflow_run_block_id=f"wrb_{block.label}",
+        )
+        return workflow_run, blocks_to_update, result, False, branch_metadata
+
+    monkeypatch.setattr(service, "_execute_single_block", fake_execute_single_block)
+
+    await service._execute_workflow_blocks(
+        workflow=workflow,
+        workflow_run=workflow_run,
+        organization=organization,
+        block_labels=block_labels,
+    )
+    return executed, mark_failed
+
+
+@pytest.mark.asyncio
+async def test_partial_run_skips_listed_blocks_on_the_branch_the_conditional_did_not_take(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    #   a -> cond --flag----> x ---------> z
+    #             --default-> y -> y2 ---> z
+    blocks: list[BlockTypeVar] = [
+        _navigation_block("a", next_block_label="cond"),
+        _conditional_block(
+            "cond",
+            branch_conditions=[
+                BranchCondition(criteria=JinjaBranchCriteria(expression="{{ flag }}"), next_block_label="x"),
+                BranchCondition(criteria=None, next_block_label="y", is_default=True),
+            ],
+            next_block_label="z",
+        ),
+        _navigation_block("x"),
+        _navigation_block("y", next_block_label="y2"),
+        _navigation_block("y2"),
+        _extraction_block("z"),
+    ]
+
+    executed, mark_failed = await _run_listed_blocks(
+        monkeypatch,
+        blocks,
+        ["a", "cond", "x", "y", "y2", "z"],
+        branch_responses={"cond": {"branch_index": 0, "next_block_label": "x"}},
+    )
+
+    assert executed == [("a", None), ("cond", None), ("x", "wrb_cond"), ("z", None)]
+    mark_failed.assert_not_awaited()
+
+    # A branch aimed at the finally block continues at the merge point, as in a full run.
+    #   cond --flag----> fin (finally)
+    #        --default-> x -> z
+    finally_blocks: list[BlockTypeVar] = [
+        _conditional_block(
+            "cond",
+            branch_conditions=[
+                BranchCondition(criteria=JinjaBranchCriteria(expression="{{ flag }}"), next_block_label="fin"),
+                BranchCondition(criteria=None, next_block_label="x", is_default=True),
+            ],
+            next_block_label="z",
+        ),
+        _navigation_block("x"),
+        _extraction_block("z"),
+        _navigation_block("fin"),
+    ]
+
+    executed, mark_failed = await _run_listed_blocks(
+        monkeypatch,
+        finally_blocks,
+        ["cond", "x", "z"],
+        branch_responses={"cond": {"branch_index": 0, "next_block_label": "fin"}},
+        finally_block_label="fin",
+    )
+
+    assert [label for label, _ in executed] == ["cond", "z"]
+    mark_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_run_follows_a_conditional_nested_in_a_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    #   loop: [cond --flag----> x
+    #               --default-> y]
+    loop_body: list[BlockTypeVar] = [
+        _conditional_block(
+            "cond",
+            branch_conditions=[
+                BranchCondition(criteria=JinjaBranchCriteria(expression="{{ flag }}"), next_block_label="x"),
+                BranchCondition(criteria=None, next_block_label="y", is_default=True),
+            ],
+        ),
+        _navigation_block("x"),
+        _navigation_block("y"),
+    ]
+    blocks: list[BlockTypeVar] = [
+        ForLoopBlock(label="loop", loop_blocks=loop_body, output_parameter=_output_parameter("loop_output"))
+    ]
+
+    executed, mark_failed = await _run_listed_blocks(
+        monkeypatch,
+        blocks,
+        ["cond", "x", "y"],
+        branch_responses={"cond": {"branch_index": 0, "next_block_label": "x"}},
+    )
+
+    assert executed == [("cond", None), ("x", "wrb_cond")]
+    mark_failed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_partial_run_with_a_conditional_fails_on_an_invalid_graph_without_running_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocks: list[BlockTypeVar] = [
+        _conditional_block(
+            "cond",
+            branch_conditions=[
+                BranchCondition(criteria=JinjaBranchCriteria(expression="{{ flag }}"), next_block_label="x"),
+                BranchCondition(criteria=None, next_block_label=None, is_default=True),
+            ],
+        ),
+        _navigation_block("x"),
+        _navigation_block("orphan"),
+    ]
+    with pytest.raises(InvalidWorkflowDefinition) as graph_error:
+        WorkflowService()._build_workflow_graph(blocks)
+
+    executed, mark_failed = await _run_listed_blocks(monkeypatch, blocks, ["cond", "x"])
+
+    assert executed == []
+    assert mark_failed.await_args is not None
+    assert mark_failed.await_args.kwargs["failure_reason"] == str(graph_error.value)
+
+
+@pytest.mark.asyncio
+async def test_partial_run_without_a_conditional_runs_the_list_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The cycle would fail a graph build; a list with no conditional never builds one.
+    blocks: list[BlockTypeVar] = [
+        _navigation_block("a", next_block_label="b"),
+        _navigation_block("b", next_block_label="a"),
+    ]
+
+    executed, mark_failed = await _run_listed_blocks(monkeypatch, blocks, ["b", "a"])
+
+    assert executed == [("b", None), ("a", None)]
+    mark_failed.assert_not_awaited()

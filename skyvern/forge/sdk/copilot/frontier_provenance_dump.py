@@ -54,6 +54,7 @@ def _trust_snapshot(ctx: AgentContext) -> dict[str, Any]:
         ),
         "verified_prefix_labels": list(ctx.verified_prefix_labels or []),
         "composition_verified_labels": list(ctx.composition_verified_labels or []),
+        "untaken_branch_labels": dict(ctx.untaken_branch_labels),
         "verified_block_outputs": _json_safe(ctx.verified_block_outputs),
         "verified_prefix_block_end_urls": dict(ctx.verified_prefix_block_end_urls or {}),
         "verified_prefix_block_end_session_id": ctx.verified_prefix_block_end_session_id,

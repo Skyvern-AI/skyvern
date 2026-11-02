@@ -72,7 +72,11 @@ from skyvern.forge.sdk.db.utils import (
     summarize_copilot_chat_title,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    CopilotBrowserAllocation,
+    CopilotRequestBrowserAllocations,
+    TurnOutcome,
+)
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     COPILOT_PROPOSAL_METADATA_KEY,
@@ -1863,14 +1867,129 @@ class WorkflowParametersRepository(BaseRepository):
             if popped is None:
                 return
             chat.pending_turns = pending
+            entry = CopilotPendingTurn.model_validate(popped)
+            if entry.request_browser_allocations is not None:
+                terminal = (
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if terminal is None or not isinstance(terminal.turn_outcome, dict):
+                    raise ValueError("Copilot allocation receipt has no terminal row")
+                terminal.turn_outcome = {
+                    **terminal.turn_outcome,
+                    "request_browser_allocations": entry.request_browser_allocations.model_dump(mode="json"),
+                }
             # The turn's row was written from an earlier read, so a deletion claimed then may have resolved since.
             claimed = [
                 item
-                for item in CopilotPendingTurn.model_validate(popped).question_interactions
+                for item in entry.question_interactions
                 if item.credential_delete_review is not None and item.credential_delete_review.claimed_at is not None
             ]
             if claimed:
                 await self._patch_narrative_questions(session, organization_id, workflow_copilot_chat_id, claimed)
+            await session.commit()
+
+    @db_operation("record_copilot_browser_allocation")
+    async def record_copilot_browser_allocation(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_permanent_id: str,
+        turn_id: str,
+        request_cancel_token: str | None,
+        allocation_id: str,
+        browser_session_id: str | None,
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, workflow_copilot_chat_id)
+            if chat.workflow_permanent_id != workflow_permanent_id:
+                raise ValueError("Copilot allocation workflow does not match")
+            pending = dict(chat.pending_turns or {})
+            raw_entry = pending.get(turn_id)
+            message = None
+            if isinstance(raw_entry, dict):
+                entry = CopilotPendingTurn.model_validate(raw_entry)
+                if entry.cancel_token != request_cancel_token:
+                    raise ValueError("Copilot allocation request does not match")
+                receipt = entry.request_browser_allocations
+            else:
+                if browser_session_id is None:
+                    raise ValueError("The Copilot execution has ended")
+                message = (
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if message is None or not isinstance(message.turn_outcome, dict):
+                    raise ValueError("Copilot allocation request is unavailable")
+                outcome = TurnOutcome.model_validate(message.turn_outcome)
+                if outcome.request_cancel_token != request_cancel_token:
+                    raise ValueError("Copilot allocation request does not match")
+                receipt = outcome.request_browser_allocations
+            if receipt is None:
+                if browser_session_id is not None:
+                    raise ValueError("Copilot allocation has no recorded intent")
+                receipt = CopilotRequestBrowserAllocations(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_copilot_chat_id=workflow_copilot_chat_id,
+                    turn_id=turn_id,
+                    request_cancel_token=request_cancel_token,
+                )
+            if (
+                receipt.organization_id != organization_id
+                or receipt.workflow_permanent_id != workflow_permanent_id
+                or receipt.workflow_copilot_chat_id != workflow_copilot_chat_id
+                or receipt.turn_id != turn_id
+                or receipt.request_cancel_token != request_cancel_token
+            ):
+                raise ValueError("Copilot allocation receipt does not match")
+            allocations = list(receipt.allocations)
+            previous = next((row for row in allocations if row.allocation_id == allocation_id), None)
+            truncated = receipt.truncated
+            if browser_session_id is None:
+                if previous is None:
+                    if len(allocations) >= 64:
+                        truncated = True
+                    else:
+                        allocations.append(CopilotBrowserAllocation(allocation_id=allocation_id))
+            elif previous is None:
+                if not truncated:
+                    raise ValueError("Copilot allocation has no recorded intent")
+            elif previous.browser_session_id not in {None, browser_session_id}:
+                raise ValueError("Copilot allocation identity changed")
+            else:
+                allocations[allocations.index(previous)] = previous.model_copy(
+                    update={"browser_session_id": browser_session_id, "created_this_request": True}
+                )
+            receipt = receipt.model_copy(
+                update={
+                    "allocations": allocations,
+                    "truncated": truncated,
+                    "recording_incomplete": truncated or any(row.browser_session_id is None for row in allocations),
+                }
+            )
+            if message is not None:
+                message.turn_outcome = {
+                    **message.turn_outcome,
+                    "request_browser_allocations": receipt.model_dump(mode="json"),
+                }
+            else:
+                if not isinstance(raw_entry, dict):
+                    raise ValueError("Copilot allocation request is unavailable")
+                pending[turn_id] = {**raw_entry, "request_browser_allocations": receipt.model_dump(mode="json")}
+                chat.pending_turns = pending
             await session.commit()
 
     @db_operation("record_superseded_build_test_run")

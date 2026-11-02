@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterator, Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -36,6 +36,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
@@ -43,9 +44,24 @@ from sqlalchemy.orm import aliased, load_only, undefer
 from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.selectable import CompoundSelect, Join
 
-from skyvern.exceptions import WorkflowAttemptDispatchSuperseded, WorkflowParameterNotFound, WorkflowRunNotFound
+from skyvern.exceptions import (
+    InvalidWorkflowParameter,
+    WorkflowAttemptDispatchSuperseded,
+    WorkflowParameterNotFound,
+    WorkflowRunNotFound,
+)
 from skyvern.forge import app
-from skyvern.forge.failure_classifier import derive_failure_attribution
+from skyvern.forge.failure_classifier import (
+    DIAGNOSABLE_FAILURE_STATUSES,
+    derive_failure_attribution,
+    final_har_user_mapping_digest,
+    final_har_user_match_claimed,
+    final_har_user_match_spent,
+    has_classifier_primary,
+    with_diagnostic_entry,
+    with_final_har_user_match_claim,
+    with_final_har_user_match_result,
+)
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -53,7 +69,13 @@ from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import DispatchFinalizationStatus, WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError, RunsListSearchCanceled
-from skyvern.forge.sdk.db.id import BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX, PERSISTENT_BROWSER_SESSION_ID
+from skyvern.forge.sdk.db.id import (
+    BROWSER_PROFILE_PREFIX,
+    CREDENTIAL_PREFIX,
+    PERSISTENT_BROWSER_SESSION_ID,
+    TASK_PREFIX,
+    WORKFLOW_RUN_PREFIX,
+)
 from skyvern.forge.sdk.db.statement_timeout import apply_statement_timeout, is_statement_timeout
 from skyvern.forge.sdk.db.tag_filters import run_tag_run_id_subqueries
 
@@ -96,7 +118,8 @@ from skyvern.forge.sdk.db.utils import (
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs, workflow_log_attempt
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task
-from skyvern.forge.sdk.services.request_principal import api_key_actor_id, get_request_principal
+from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, api_key_actor_id, get_request_principal
 from skyvern.forge.sdk.workflow.constants import INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
 from skyvern.forge.sdk.workflow.credential_selection import clear_credential_selections_for_retry
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter
@@ -137,15 +160,31 @@ def _runs_list_search_id_prefix(search_key: str) -> str | None:
     return prefix if int_id.isdigit() else None
 
 
+# Every digit-form run and task id generated since March 2023 carries at least this many digits, so a shorter
+# one is a partial id still being typed and keeps the substring match. Ids reach 19 digits in November 2029,
+# after which an 18-digit prefix would read as complete unless this floor rises.
+_COMPLETE_RUN_ID_MIN_DIGITS = 18
+
+
+def _complete_run_id_prefix(search_key: str) -> str | None:
+    prefix, _, int_id = search_key.partition("_")
+    if prefix not in (WORKFLOW_RUN_PREFIX, TASK_PREFIX) or not (int_id.isascii() and int_id.isdigit()):
+        return None
+    return prefix if len(int_id) >= _COMPLETE_RUN_ID_MIN_DIGITS else None
+
+
 def is_indexed_runs_list_search_key(search_key: str) -> bool:
-    return _runs_list_search_id_prefix(search_key) in (BROWSER_PROFILE_PREFIX, PERSISTENT_BROWSER_SESSION_ID)
+    return (
+        _runs_list_search_id_prefix(search_key) in (BROWSER_PROFILE_PREFIX, PERSISTENT_BROWSER_SESSION_ID)
+        or _complete_run_id_prefix(search_key) is not None
+    )
 
 
 def _is_bounded_runs_list_read(session: AsyncSession, search_key: str | None) -> bool:
     """Whether a runs-list read runs under ``RUNS_LIST_STATEMENT_TIMEOUT_SECONDS``.
 
     Only the unindexed free-text search is capped: query plans for the other filter shapes are not
-    known, and a complete browser identifier resolves through an indexed equality lookup.
+    known, and a complete browser, run or task identifier resolves through an indexed equality lookup.
     """
     if not search_key or is_indexed_runs_list_search_key(search_key):
         return False
@@ -161,6 +200,48 @@ class WorkflowRunDispatchFinalization:
     pre_execution: bool
     transitioned: bool = False
     repaired: bool = False
+
+
+async def _pin_first_attempt_browser_session(
+    session: AsyncSession,
+    *,
+    workflow_run_id: str,
+    organization_id: str,
+    browser_session_id: str,
+    attempt_number: int,
+) -> bool:
+    attempt = await session.scalar(
+        select(WorkflowRunAttemptModel)
+        .filter_by(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            attempt_number=1,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    browser = await session.scalar(
+        select(PersistentBrowserSessionModel)
+        .filter_by(
+            persistent_browser_session_id=browser_session_id,
+            organization_id=organization_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        attempt_number != 1
+        or attempt is None
+        or browser is None
+        or browser.deleted_at is not None
+        or browser.completed_at is not None
+        or browser.close_requested_at is not None
+        or is_final_status(browser.status)
+        or attempt.pinned_browser_session_id not in (None, browser_session_id)
+    ):
+        return False
+    attempt.pinned_browser_session_id = browser_session_id
+    return True
 
 
 async def lock_workflow_run_for_dispatch(
@@ -452,6 +533,58 @@ def _final_webhook_claim_is_free(stale_before: datetime) -> ColumnElement[bool]:
 class WorkflowRunsRepository(BaseRepository):
     """Database operations for workflow runs."""
 
+    @db_operation("list_workflow_run_activity_for_export", log_errors=False)
+    async def list_for_activity_export(
+        self,
+        *,
+        organization_id: str,
+        since: datetime,
+        until: datetime,
+        before_created_at: datetime | None,
+        before_workflow_run_id: str | None,
+        limit: int,
+    ) -> list[RowMapping]:
+        filters = [
+            WorkflowRunModel.organization_id == organization_id,
+            WorkflowRunModel.created_at >= to_naive_utc(since),
+            WorkflowRunModel.created_at <= to_naive_utc(until),
+            WorkflowRunModel.parent_workflow_run_id.is_(None),
+        ]
+        before_created_at = to_naive_utc(before_created_at)
+        if before_created_at is not None and before_workflow_run_id is not None:
+            filters.append(
+                (WorkflowRunModel.created_at < before_created_at)
+                | (
+                    (WorkflowRunModel.created_at == before_created_at)
+                    & (WorkflowRunModel.workflow_run_id < before_workflow_run_id)
+                )
+            )
+            # Bound the index walk at the cursor instead of filtering every newer run.
+            filters.append(WorkflowRunModel.created_at <= before_created_at)
+
+        async with self.Session() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(
+                            WorkflowRunModel.workflow_run_id,
+                            WorkflowRunModel.created_at,
+                            WorkflowRunModel.workflow_permanent_id,
+                            WorkflowRunModel.trigger_type,
+                            WorkflowRunModel.created_by,
+                            WorkflowRunModel.requested_by,
+                            WorkflowRunModel.workflow_schedule_id,
+                            WorkflowRunModel.retried_from_workflow_run_id,
+                        )
+                        .where(*filters)
+                        .order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.workflow_run_id.desc())
+                        .limit(limit)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
     async def finalize_workflow_run_for_dispatch(
         self,
         *,
@@ -640,6 +773,39 @@ class WorkflowRunsRepository(BaseRepository):
             ~active_workflow_exists,
         ).label("workflow_deleted")
 
+    async def link_browser_session_for_dispatch(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        browser_session_id: str,
+        attempt_number: int,
+        dispatch_claim_started_at: datetime | None,
+        expected_browser_session_id: str | None,
+        pin_first_attempt: bool,
+    ) -> bool:
+        async with self.Session() as session:
+            run = await lock_workflow_run_for_dispatch(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                attempt_number=attempt_number,
+                dispatch_claim_started_at=dispatch_claim_started_at,
+            )
+            if run is None or run.browser_session_id not in (browser_session_id, expected_browser_session_id):
+                return False
+            run.browser_session_id = browser_session_id
+            if pin_first_attempt and not await _pin_first_attempt_browser_session(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                attempt_number=attempt_number,
+            ):
+                return False
+            await session.commit()
+            return True
+
     async def pin_browser_session_for_dispatch(
         self,
         *,
@@ -659,37 +825,14 @@ class WorkflowRunsRepository(BaseRepository):
             )
             if run is None or run.browser_session_id != browser_session_id:
                 return False
-            attempt = await session.scalar(
-                select(WorkflowRunAttemptModel)
-                .filter_by(
-                    workflow_run_id=workflow_run_id,
-                    organization_id=organization_id,
-                    attempt_number=1,
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            browser = await session.scalar(
-                select(PersistentBrowserSessionModel)
-                .filter_by(
-                    persistent_browser_session_id=browser_session_id,
-                    organization_id=organization_id,
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            if (
-                attempt_number != 1
-                or attempt is None
-                or browser is None
-                or browser.deleted_at is not None
-                or browser.completed_at is not None
-                or browser.close_requested_at is not None
-                or is_final_status(browser.status)
-                or attempt.pinned_browser_session_id not in (None, browser_session_id)
+            if not await _pin_first_attempt_browser_session(
+                session,
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+                attempt_number=attempt_number,
             ):
                 return False
-            attempt.pinned_browser_session_id = browser_session_id
             await session.commit()
             return True
 
@@ -1305,6 +1448,172 @@ class WorkflowRunsRepository(BaseRepository):
             else:
                 raise WorkflowRunNotFound(workflow_run_id)
 
+    @db_operation("set_final_failure_diagnostic")
+    async def set_final_failure_diagnostic(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+        entry: dict[str, Any],
+    ) -> WorkflowRun | None:
+        """Add a reporting-only failure_category entry to the failed attempt that produced it; None once the run was
+        reset or a newer attempt exists, so a late cleanup cannot write onto a newer execution, and when the run has no
+        classifier primary, which the entry would otherwise become."""
+        async with self.Session() as session:
+            run = (
+                await session.scalars(
+                    select(WorkflowRunModel)
+                    .filter_by(workflow_run_id=workflow_run_id, organization_id=organization_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if (
+                run is None
+                or run.status not in DIAGNOSABLE_FAILURE_STATUSES
+                or run.finished_at != finished_at
+                or not has_classifier_primary(run.failure_category)
+            ):
+                return None
+            newer_attempt = await session.scalar(
+                select(WorkflowRunAttemptModel.attempt_number)
+                .where(WorkflowRunAttemptModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunAttemptModel.attempt_number > attempt_number)
+                .limit(1)
+            )
+            if newer_attempt is not None:
+                return None
+            run.failure_category = with_diagnostic_entry(run.failure_category, entry)
+            await session.commit()
+            await session.refresh(run)
+            return convert_to_workflow_run(run)
+
+    async def _locked_failed_attempt(
+        self,
+        session: Any,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+    ) -> WorkflowRunModel | None:
+        run = (
+            await session.scalars(
+                select(WorkflowRunModel)
+                .filter_by(workflow_run_id=workflow_run_id, organization_id=organization_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).first()
+        if run is None or run.status not in DIAGNOSABLE_FAILURE_STATUSES or run.finished_at != finished_at:
+            return None
+        newer_attempt = await session.scalar(
+            select(WorkflowRunAttemptModel.attempt_number)
+            .where(WorkflowRunAttemptModel.workflow_run_id == workflow_run_id)
+            .where(WorkflowRunAttemptModel.attempt_number > attempt_number)
+            .limit(1)
+        )
+        return None if newer_attempt is not None else run
+
+    async def _mapping_source_is_current(
+        self, session: Any, run: WorkflowRunModel, attempt_number: int, source: dict[str, Any]
+    ) -> bool:
+        """Whether the row the match read its mapping from still belongs to this failed attempt and still holds that
+        mapping. Locked after the run row, in the same order at claim and result."""
+        mapping: dict[str, str] | None = None
+        if source.get("kind") == "task":
+            task = (
+                await session.scalars(
+                    select(TaskModel)
+                    .filter_by(
+                        task_id=source.get("root"),
+                        organization_id=run.organization_id,
+                        workflow_run_id=run.workflow_run_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            # Attempt-1 tasks written before attempts were numbered carry no attempt number.
+            if (
+                task is None
+                or task.status not in DIAGNOSABLE_FAILURE_STATUSES
+                or not (task.attempt_number == attempt_number or (attempt_number == 1 and task.attempt_number is None))
+            ):
+                return False
+            mapping = task.error_code_mapping
+        elif source.get("kind") == "task_v2":
+            root = (
+                await session.scalars(
+                    select(TaskV2Model)
+                    .filter_by(
+                        observer_cruise_id=source.get("root"),
+                        organization_id=run.organization_id,
+                        workflow_run_id=run.workflow_run_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).first()
+            if root is None:
+                return False
+            mapping = root.error_code_mapping
+        else:
+            return False
+        return mapping is not None and final_har_user_mapping_digest(mapping) == source.get("mapping")
+
+    @db_operation("claim_final_har_user_match")
+    async def claim_final_har_user_match(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+    ) -> bool:
+        """Spend the failed attempt's one final-recording match before its request; a run without a classifier
+        primary may hold it too, since the entry carries no category. False when spent, when the run moved on, or
+        when ``source`` no longer belongs to this attempt with that mapping."""
+        async with self.Session() as session:
+            run = await self._locked_failed_attempt(
+                session, workflow_run_id, organization_id, finished_at, attempt_number
+            )
+            if run is None or final_har_user_match_spent(run.failure_category, identity):
+                return False
+            if not await self._mapping_source_is_current(session, run, attempt_number, source):
+                return False
+            run.failure_category = with_final_har_user_match_claim(run.failure_category, identity, source)
+            await session.commit()
+            return True
+
+    @db_operation("record_final_har_user_match")
+    async def record_final_har_user_match(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+        finished_at: datetime | None,
+        attempt_number: int,
+        identity: dict[str, Any],
+        source: dict[str, Any],
+        user_errors: list[dict[str, Any]],
+    ) -> WorkflowRun | None:
+        """Store the claimed match's rows; None, leaving the claim spent, once the run or its mapping source moved."""
+        async with self.Session() as session:
+            run = await self._locked_failed_attempt(
+                session, workflow_run_id, organization_id, finished_at, attempt_number
+            )
+            if run is None or not final_har_user_match_claimed(run.failure_category, identity, source):
+                return None
+            if not await self._mapping_source_is_current(session, run, attempt_number, source):
+                return None
+            run.failure_category = with_final_har_user_match_result(
+                run.failure_category, identity, source, [], user_errors
+            )
+            await session.commit()
+            await session.refresh(run)
+            return convert_to_workflow_run(run)
+
     @db_operation("compare_and_set_reuse_admission")
     async def compare_and_set_reuse_admission(
         self,
@@ -1386,10 +1695,13 @@ class WorkflowRunsRepository(BaseRepository):
         depends_on_workflow_run_id: str | None = None,
         workflow_definition_sha256: str | None = None,
         require_latest_attempt_number: int | None = None,
+        audit_actor: RequestPrincipal | None = None,
+        on_transition: Callable[[], Awaitable[None]] | None = None,
+        on_committed: Callable[[], None] | None = None,
     ) -> WorkflowRun | None:
         """One conditional UPDATE to ``status`` from a non-terminal state (``only_from`` narrows it), so a late
         cancel cannot clobber a finalization; None when the row was terminal or missing. Timestamps follow
-        :meth:`update_workflow_run`."""
+        :meth:`update_workflow_run`. ``on_committed`` runs synchronously once this write has won and committed."""
         non_terminal = [
             s.value for s in WorkflowRunStatus if not s.is_final() and (only_from is None or s in only_from)
         ]
@@ -1458,20 +1770,30 @@ class WorkflowRunsRepository(BaseRepository):
                     WorkflowRunModel.status.in_(non_terminal),
                 )
                 .values(**values)
-                .returning(WorkflowRunModel.workflow_run_id)
+                .returning(WorkflowRunModel)
+                # The queued path (or a caller's ambient session) already holds this row in the identity map. The UPDATE
+                # autoflushes pending changes first, so only changes left unflushed (no_autoflush) are overwritten.
+                .execution_options(populate_existing=True)
             )
-            affected = result.scalar_one_or_none()
+            updated = result.scalar_one_or_none()
+            # Converted before the commits (this one and the one in save_workflow_run_logs) expire the row, so the
+            # result is the UPDATE-time snapshot. A later concurrent write such as a cancel is not in it;
+            # _execute_single_block reloads the run before each block.
+            workflow_run_result = convert_to_workflow_run(updated) if updated is not None else None
             await session.commit()
-            if affected is None:
+            if workflow_run_result is None:
                 return None
-            refreshed = (
-                await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))
-            ).one()
+            if on_committed is not None:
+                # Before every await below: the cancel audit, the transition hook and the log save.
+                on_committed()
+            if status == WorkflowRunStatus.canceled and audit_actor is not None:
+                await record_run_cancel_audit(
+                    audit_actor, workflow_run_result.organization_id, "workflow_run", workflow_run_id
+                )
+            if status == WorkflowRunStatus.canceled and on_transition is not None:
+                await on_transition()
             await save_workflow_run_logs(workflow_run_id)
-            # save_workflow_run_logs reuses this session and commits, expiring `refreshed`.
-            # Refresh before convert_to_workflow_run to avoid a greenlet-less lazy-load (MissingGreenlet).
-            await session.refresh(refreshed)
-            return convert_to_workflow_run(refreshed)
+            return workflow_run_result
 
     @asynccontextmanager
     async def admit_workflow_run_block_dispatch(self, workflow_run_id: str) -> AsyncIterator[WorkflowRun]:
@@ -1714,9 +2036,12 @@ class WorkflowRunsRepository(BaseRepository):
             )
             if search_key:
                 prefix = _runs_list_search_id_prefix(search_key)
+                complete_run_id_prefix = _complete_run_id_prefix(search_key)
                 if prefix == PERSISTENT_BROWSER_SESSION_ID:
                     task_query = task_query.filter(TaskModel.browser_session_id == search_key)
-                elif prefix in (BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX):
+                elif complete_run_id_prefix == TASK_PREFIX:
+                    task_query = task_query.filter(TaskModel.task_id == search_key)
+                elif prefix in (BROWSER_PROFILE_PREFIX, CREDENTIAL_PREFIX) or complete_run_id_prefix:
                     task_query = task_query.filter(false())
                 else:
                     # Standalone callback URLs are not part of workflow-run webhook search.
@@ -3038,6 +3363,19 @@ class WorkflowRunsRepository(BaseRepository):
         identifier_run_ids = self._indexed_identifier_run_ids(search_key, standalone_tasks=standalone_tasks)
         if identifier_run_ids is not None:
             return run_id_col.in_(identifier_run_ids)
+        # Like a browser identifier, a complete run or task id replaces the substring arms: a page of
+        # them around one match walks every run in the organization.
+        complete_run_id_prefix = _complete_run_id_prefix(search_key)
+        if complete_run_id_prefix == WORKFLOW_RUN_PREFIX:
+            return run_id_col == search_key
+        if complete_run_id_prefix == TASK_PREFIX:
+            task_workflow_run_id = select(TaskModel.workflow_run_id).where(TaskModel.task_id == search_key)
+            if not standalone_tasks:
+                return run_id_col.in_(task_workflow_run_id)
+            # A standalone task's task_runs row carries the task id as its run_id.
+            return run_id_col.in_(
+                union_all(task_workflow_run_id, select(TaskModel.task_id).where(TaskModel.task_id == search_key))
+            )
         return or_(*substring_clauses, *self._run_identifier_search_clauses(search_key, run_id_col))
 
     def _apply_workflow_run_search_key_filter(self, query, search_key: str | None):  # type: ignore[no-untyped-def]
@@ -3151,6 +3489,8 @@ class WorkflowRunsRepository(BaseRepository):
         ordering: tuple[str, str] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        created_at_start: datetime | None = None,
+        created_at_end: datetime | None = None,
     ) -> list[WorkflowRun]:
         await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
@@ -3178,6 +3518,11 @@ class WorkflowRunsRepository(BaseRepository):
 
             if status:
                 query = query.filter(WorkflowRunModel.status.in_(status))
+            # created_at is naive UTC; an aware bound compared as-is would shift by its offset.
+            if created_at_start is not None:
+                query = query.filter(WorkflowRunModel.created_at >= to_naive_utc(created_at_start))
+            if created_at_end is not None:
+                query = query.filter(WorkflowRunModel.created_at < to_naive_utc(created_at_end))
 
             allowed_ordering_fields = {
                 "created_at": WorkflowRunModel.created_at,
@@ -3215,6 +3560,18 @@ class WorkflowRunsRepository(BaseRepository):
                 convert_to_workflow_run(run, workflow_title=title, debug_enabled=self.debug_enabled)
                 for run, title in workflow_runs
             ]
+
+    @db_operation("count_recent_workflow_runs")
+    async def count_recent_workflow_runs(self, workflow_permanent_id: str, organization_id: str, days: int) -> int:
+        async with self.Session() as session:
+            count_query = (
+                select(func.count())
+                .select_from(WorkflowRunModel)
+                .filter(WorkflowRunModel.workflow_permanent_id == workflow_permanent_id)
+                .filter(WorkflowRunModel.organization_id == organization_id)
+                .filter(WorkflowRunModel.created_at >= naive_utc_now() - timedelta(days=days))
+            )
+            return (await session.execute(count_query)).scalar_one()
 
     @db_operation("get_workflow_runs_count")
     async def get_workflow_runs_count(
@@ -3296,7 +3653,7 @@ class WorkflowRunsRepository(BaseRepository):
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, optionally searching its title, run ID, inputs, webhook URL,
-        and complete browser or credential identifiers.
+        and complete browser, credential, run or task identifiers.
         """
         await _hidden_workflow_ids(organization_id)  # before checking out a connection
         async with self.Session() as session:
@@ -3631,12 +3988,14 @@ class WorkflowRunsRepository(BaseRepository):
             await session.commit()
             return converted
 
-    @db_operation("create_workflow_run_parameters")
+    @db_operation("create_workflow_run_parameters", expected_errors=(InvalidWorkflowParameter,))
     async def create_workflow_run_parameters(
         self,
         workflow_run_id: str,
         workflow_parameter_values: list[tuple[WorkflowParameter, Any]],
     ) -> list[WorkflowRunParameter]:
+        """The created parameters as get_workflow_run_parameters returns them, converted from the stored text, so a
+        stored value that a read cannot convert raises InvalidWorkflowParameter here too, after the commit."""
         if not workflow_parameter_values:
             return []
 
@@ -3654,15 +4013,23 @@ class WorkflowRunsRepository(BaseRepository):
         async with self.Session() as session:
             # One multi-VALUES statement. An ORM add_all + flush has no RETURNING here, so on psycopg it
             # becomes a pipelined executemany that waits on the event loop once per row.
-            await session.execute(insert(WorkflowRunParameterModel).values(rows))
-            converted = [
-                convert_to_workflow_run_parameter(
-                    WorkflowRunParameterModel(**row), workflow_parameter, self.debug_enabled
-                )
-                for row, (workflow_parameter, _) in zip(rows, workflow_parameter_values, strict=True)
-            ]
+            stored = await session.execute(
+                insert(WorkflowRunParameterModel)
+                .values(rows)
+                .returning(WorkflowRunParameterModel.workflow_parameter_id, WorkflowRunParameterModel.value)
+            )
+            stored_values = dict(stored.tuples().all())
             await session.commit()
-            return converted
+        # The value column is text and the driver renders a bool or number into it, so only the stored text converts
+        # as a read of it does.
+        return [
+            convert_to_workflow_run_parameter(
+                WorkflowRunParameterModel(**{**row, "value": stored_values[row["workflow_parameter_id"]]}),
+                workflow_parameter,
+                self.debug_enabled,
+            )
+            for row, (workflow_parameter, _) in zip(rows, workflow_parameter_values, strict=True)
+        ]
 
     @db_operation("get_workflow_run_parameters")
     async def get_workflow_run_parameters(

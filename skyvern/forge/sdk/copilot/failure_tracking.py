@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from skyvern.forge.sdk.copilot.challenge_evidence import ANTI_BOT_CHALLENGE_ALIAS_CATEGORIES
+from skyvern.forge.sdk.workflow.block_notes import annotate_notes_read, definition_step_notes, strip_inert_block_fields
 
 _FAILURE_REASON_MAX_CHARS = 200
 _ROOT_CAUSE_SIGNATURE_VERSION = "repair_root_cause:v1"
@@ -231,7 +232,15 @@ def _canonical_block_config(block: Any) -> dict[str, Any]:
         cfg = dict(block)
     else:
         return {"repr": repr(block)}
+    cfg = strip_inert_block_fields(cfg)
     cfg.pop("output_parameter", None)
+    return cfg
+
+
+def _execution_block_config(block: Any, notes_by_label: Mapping[str, str]) -> dict[str, Any]:
+    """Canonical config plus the notes this block reads, so a neighbour's note change counts as this block's change."""
+    cfg = _canonical_block_config(block)
+    annotate_notes_read([cfg], notes_by_label)
     return cfg
 
 
@@ -253,12 +262,13 @@ def _blocks_by_label(workflow_definition: object | None) -> dict[str, object]:
 def block_shape_hashes_by_label(labels: Sequence[str], workflow_definition: object | None) -> dict[str, str]:
     """Shape hash per label that resolves to a top-level block; unresolvable labels are omitted."""
     by_label = _blocks_by_label(workflow_definition)
+    notes_by_label = definition_step_notes(workflow_definition) if workflow_definition else {}
     hashes: dict[str, str] = {}
     for label in labels:
         block = by_label.get(label)
         if block is None:
             continue
-        shape = _canonical_block_config(block)
+        shape = _execution_block_config(block, notes_by_label)
         shape.pop("label", None)
         serialized = json.dumps(shape, sort_keys=True, default=str, separators=(",", ":"))
         hashes[label] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()

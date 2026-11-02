@@ -5,7 +5,13 @@ import { ActionsApiResponse, Status } from "@/api/types";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
+import type { CodeBlockUseKind } from "@/routes/workflows/editor/jinjaReferences";
 import { actionCodeLine } from "@/routes/workflows/workflowRun/codeBlockFailure";
+import {
+  GoalText,
+  Section,
+} from "@/routes/workflows/workflowRun/blockDetail/shared";
+import { isCappedValue } from "@/routes/workflows/workflowRun/responseValueCaps";
 import type {
   CodeBlockStep,
   WorkflowParameter,
@@ -19,7 +25,45 @@ type Props = {
   blockStatus?: Status | null;
   failureReason?: string | null;
   actions?: Array<ActionsApiResponse> | null;
+  uses?: Array<CodeBlockRunUse>;
 };
+
+type CodeBlockRunUse = {
+  name: string;
+  kind: CodeBlockUseKind;
+  found: boolean;
+  value?: unknown;
+};
+
+const MAX_VALUE_PREVIEW_CHARS = 2000;
+
+function UseValue({ use }: { use: CodeBlockRunUse }) {
+  if (!use.found) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        not available for this run
+      </p>
+    );
+  }
+  const text = JSON.stringify(use.value, null, 2) ?? String(use.value);
+  return (
+    <details className="mt-1 text-xs">
+      <summary className="cursor-pointer truncate text-tertiary-foreground">
+        {isCappedValue(use.value) ? (
+          <span className="mr-1.5 rounded border border-border px-1 py-0.5 text-[10px] text-muted-foreground">
+            Capped by the run
+          </span>
+        ) : null}
+        {text.slice(0, 120).replace(/\s+/g, " ")}
+      </summary>
+      <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation3 p-2 text-[11px] text-tertiary-foreground">
+        {text.length > MAX_VALUE_PREVIEW_CHARS
+          ? `${text.slice(0, MAX_VALUE_PREVIEW_CHARS)}…`
+          : text}
+      </pre>
+    </details>
+  );
+}
 
 function formatStepLines(step: CodeBlockStep): string {
   if (step.line_start == null) {
@@ -39,6 +83,7 @@ function CodeBlockParameters({
   blockStatus,
   failureReason,
   actions,
+  uses,
 }: Props) {
   // Actions arrive newest-first, so the first failed action carrying a code
   // line is the one that stopped the run.
@@ -66,16 +111,12 @@ function CodeBlockParameters({
     ];
   }, [failingLine]);
 
+  const upstreamUses = (uses ?? []).filter((use) => use.kind === "block");
+
   return (
-    <div className="space-y-4">
-      <div className="flex gap-16">
-        <div className="w-80">
-          <h1 className="text-lg">Code</h1>
-          <h2 className="text-base text-muted-foreground">
-            The Python snippet executed for this block
-          </h2>
-        </div>
-        <div className="flex w-full min-w-0 flex-col gap-2">
+    <div className="space-y-4 px-3 py-3">
+      <Section title="Code">
+        <div className="flex min-w-0 flex-col gap-2">
           {failingLine !== null && (
             <div className="rounded border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-xs leading-relaxed text-destructive">
               {`Failed at line ${failingLine}${failingReason ? `: ${failingReason}` : ""}`}
@@ -92,29 +133,15 @@ function CodeBlockParameters({
             extraExtensions={codeExtensions}
           />
         </div>
-      </div>
+      </Section>
       {prompt ? (
-        <div className="flex gap-16">
-          <div className="w-80">
-            <h1 className="text-lg">Goal</h1>
-            <h2 className="text-base text-muted-foreground">
-              What this block is meant to accomplish
-            </h2>
-          </div>
-          <div className="flex w-full min-w-0 items-start text-sm text-foreground dark:text-slate-200">
-            {prompt}
-          </div>
-        </div>
+        <Section title="Goal">
+          <GoalText text={prompt} />
+        </Section>
       ) : null}
       {steps && steps.length > 0 ? (
-        <div className="flex gap-16">
-          <div className="w-80">
-            <h1 className="text-lg">Steps</h1>
-            <h2 className="text-base text-muted-foreground">
-              Plain-language outline of the code
-            </h2>
-          </div>
-          <ol className="flex w-full min-w-0 flex-col gap-1">
+        <Section title="Steps">
+          <ol className="flex min-w-0 flex-col gap-1">
             {steps.map((step, index) => (
               <li
                 key={index}
@@ -137,17 +164,11 @@ function CodeBlockParameters({
               </li>
             ))}
           </ol>
-        </div>
+        </Section>
       ) : null}
       {parameters && parameters.length > 0 ? (
-        <div className="flex gap-16">
-          <div className="w-80">
-            <h1 className="text-lg">Inputs</h1>
-            <h2 className="text-base text-muted-foreground">
-              Inputs passed to this code block
-            </h2>
-          </div>
-          <div className="flex w-full flex-col gap-3">
+        <Section title="Inputs">
+          <div className="flex flex-col gap-3">
             {parameters.map((parameter) => (
               <div
                 key={parameter.key}
@@ -162,10 +183,47 @@ function CodeBlockParameters({
               </div>
             ))}
           </div>
-        </div>
+        </Section>
+      ) : null}
+      {uses && uses.length > 0 ? (
+        <Section title="Uses">
+          <ul
+            aria-label="Names this code reads"
+            className="flex flex-col gap-2"
+          >
+            {uses.map((use) => (
+              <li key={use.name} data-kind={use.kind} className="min-w-0">
+                <span className="font-mono text-xs text-foreground dark:text-slate-200">
+                  {use.name}
+                </span>
+                <span className="ml-1.5 text-xs text-muted-foreground">
+                  {use.kind}
+                </span>
+                {use.kind === "input" ? <UseValue use={use} /> : null}
+              </li>
+            ))}
+          </ul>
+        </Section>
+      ) : null}
+      {upstreamUses.length > 0 ? (
+        <Section title="Upstream outputs">
+          <ul
+            aria-label="Upstream outputs before this execution"
+            className="flex flex-col gap-2"
+          >
+            {upstreamUses.map((use) => (
+              <li key={use.name} className="min-w-0">
+                <span className="font-mono text-xs text-foreground dark:text-slate-200">
+                  {use.name}
+                </span>
+                <UseValue use={use} />
+              </li>
+            ))}
+          </ul>
+        </Section>
       ) : null}
     </div>
   );
 }
 
-export { CodeBlockParameters };
+export { CodeBlockParameters, type CodeBlockRunUse };

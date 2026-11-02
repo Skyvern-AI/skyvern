@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -98,102 +97,6 @@ class BrowserRecordingsRepository(BaseRepository):
             await session.refresh(model)
             return _to_browser_recording(model)
 
-    @db_operation("attach_browser_recording_to_workflow_version", expected_errors=(ValueError,))
-    async def attach_to_workflow_version(
-        self,
-        *,
-        recording_id: str,
-        workflow_id: str,
-        workflow_permanent_id: str,
-        organization_id: str,
-        workflow_save_fingerprint: str | None = None,
-    ) -> BrowserRecording:
-        async with self.Session() as session:
-            workflow = await session.scalar(
-                select(WorkflowModel).where(
-                    WorkflowModel.workflow_id == workflow_id,
-                    WorkflowModel.workflow_permanent_id == workflow_permanent_id,
-                    WorkflowModel.organization_id == organization_id,
-                    WorkflowModel.deleted_at.is_(None),
-                )
-            )
-            recording = await session.scalar(
-                select(BrowserRecordingModel)
-                .where(
-                    BrowserRecordingModel.recording_id == recording_id,
-                    BrowserRecordingModel.organization_id == organization_id,
-                    BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
-                    BrowserRecordingModel.deleted_at.is_(None),
-                )
-                .with_for_update()
-            )
-            if workflow is None or recording is None:
-                raise ValueError("Recording cannot be attached to this workflow version")
-            if recording.workflow_id is not None:
-                attached_version = await session.scalar(
-                    select(WorkflowModel.version).where(
-                        WorkflowModel.workflow_id == recording.workflow_id,
-                        WorkflowModel.workflow_permanent_id == workflow_permanent_id,
-                        WorkflowModel.organization_id == organization_id,
-                        WorkflowModel.deleted_at.is_(None),
-                    )
-                )
-                if attached_version is None:
-                    raise ValueError("Recording cannot be attached to this workflow version")
-                return _to_browser_recording(recording, attached_version)
-
-            workflow_version = workflow.version
-            recording.workflow_id = workflow_id
-            if workflow_save_fingerprint is not None:
-                metadata = dict(recording.recording_metadata)
-                metadata["workflow_save_fingerprint"] = workflow_save_fingerprint
-                recording.recording_metadata = metadata
-            await session.commit()
-            await session.refresh(recording)
-            return _to_browser_recording(recording, workflow_version)
-
-    @db_operation("delete_pending_browser_recording")
-    async def delete_pending_recording(self, recording_id: str, organization_id: str) -> None:
-        async with self.Session() as session:
-            await session.execute(
-                update(BrowserRecordingModel)
-                .where(
-                    BrowserRecordingModel.recording_id == recording_id,
-                    BrowserRecordingModel.organization_id == organization_id,
-                    BrowserRecordingModel.workflow_id.is_(None),
-                    BrowserRecordingModel.deleted_at.is_(None),
-                )
-                .values(deleted_at=datetime.now(UTC))
-            )
-            await session.commit()
-
-    @db_operation("detach_browser_recording_from_failed_workflow_version")
-    async def detach_from_workflow_version(
-        self,
-        *,
-        recording_id: str,
-        workflow_id: str,
-        organization_id: str,
-    ) -> None:
-        async with self.Session() as session:
-            recording = await session.scalar(
-                select(BrowserRecordingModel)
-                .where(
-                    BrowserRecordingModel.recording_id == recording_id,
-                    BrowserRecordingModel.organization_id == organization_id,
-                    BrowserRecordingModel.workflow_id == workflow_id,
-                    BrowserRecordingModel.deleted_at.is_(None),
-                )
-                .with_for_update()
-            )
-            if recording is None:
-                return
-            recording.workflow_id = None
-            metadata = dict(recording.recording_metadata)
-            metadata.pop("workflow_save_fingerprint", None)
-            recording.recording_metadata = metadata
-            await session.commit()
-
     @db_operation("get_browser_recording")
     async def get_recording(self, recording_id: str, organization_id: str) -> BrowserRecording | None:
         async with self.Session() as session:
@@ -205,34 +108,6 @@ class BrowserRecordingsRepository(BaseRepository):
                         BrowserRecordingModel.recording_id == recording_id,
                         BrowserRecordingModel.organization_id == organization_id,
                         BrowserRecordingModel.deleted_at.is_(None),
-                    )
-                )
-            ).first()
-            if row is None:
-                return None
-            return _to_browser_recording(row[0], row[1])
-
-    @db_operation("get_browser_recording_for_workflow_version")
-    async def get_for_workflow_version(
-        self,
-        *,
-        workflow_permanent_id: str,
-        version: int,
-        organization_id: str,
-    ) -> BrowserRecording | None:
-        async with self.Session() as session:
-            row = (
-                await session.execute(
-                    select(BrowserRecordingModel, WorkflowModel.version)
-                    .join(WorkflowModel, WorkflowModel.workflow_id == BrowserRecordingModel.workflow_id)
-                    .where(
-                        BrowserRecordingModel.organization_id == organization_id,
-                        BrowserRecordingModel.workflow_permanent_id == workflow_permanent_id,
-                        BrowserRecordingModel.deleted_at.is_(None),
-                        WorkflowModel.organization_id == organization_id,
-                        WorkflowModel.workflow_permanent_id == workflow_permanent_id,
-                        WorkflowModel.version == version,
-                        WorkflowModel.deleted_at.is_(None),
                     )
                 )
             ).first()

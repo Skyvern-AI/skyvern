@@ -15,6 +15,11 @@ import {
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
+import {
+  classifyUse,
+  codeBlockUses,
+  stripPythonComments,
+} from "@/routes/workflows/editor/jinjaReferences";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 import { pythonSyntaxExtensions } from "@/routes/workflows/editor/pythonSyntaxLinter";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
@@ -31,6 +36,7 @@ import {
   goalActionIsLocked,
   useCopilotActionStore,
 } from "@/store/useCopilotActionStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
   selectEditorMutationLocked,
   useWorkflowYamlEditorStore,
@@ -132,7 +138,7 @@ function CodeBlockEditorBody({
     editable &&
     !scopeReadOnly &&
     !mutationLocked;
-  const hasGenerated = steps.length > 0;
+  const hasCode = stripPythonComments(data.code ?? "").trim().length > 0;
   const isQueued = useCopilotActionStore((state) =>
     state.queuedBuilds.some((queued) => queued.blockLabel === data.label),
   );
@@ -189,6 +195,20 @@ function CodeBlockEditorBody({
     () => analyzeCodeBlockErrorCodes(data.code, effectiveManifest),
     [data.code, effectiveManifest],
   );
+  const workflowParameters = useWorkflowParametersStore(
+    (state) => state.parameters,
+  );
+  const uses = useMemo(() => {
+    const inputKeys = new Set(
+      workflowParameters.map((parameter) => parameter.key),
+    );
+    const blockLabels = new Set(
+      nodes.filter(isWorkflowBlockNode).map((other) => other.data.label),
+    );
+    return codeBlockUses(data.parameterKeys ?? [], data.code ?? "").map(
+      (name) => ({ name, kind: classifyUse(name, inputKeys, blockLabels) }),
+    );
+  }, [workflowParameters, nodes, data.parameterKeys, data.code]);
 
   const goalField = (
     <div className="space-y-2">
@@ -198,7 +218,7 @@ function CodeBlockEditorBody({
           <button
             type="button"
             disabled={!canGenerate}
-            aria-label={hasGenerated ? "Regenerate block" : "Generate block"}
+            aria-label={hasCode ? "Regenerate block" : "Generate block"}
             onClick={() =>
               requestBuild({
                 blockLabel: data.label,
@@ -213,11 +233,7 @@ function CodeBlockEditorBody({
             )}
           >
             <MagicWandIcon className="size-3" />
-            {isGenerating
-              ? "Generating…"
-              : hasGenerated
-                ? "Regenerate"
-                : "Generate"}
+            {isGenerating ? "Generating…" : hasCode ? "Regenerate" : "Generate"}
           </button>
         )}
       </div>
@@ -261,6 +277,31 @@ function CodeBlockEditorBody({
         disabled={isGenerating || isQueued}
         className="nopan text-xs"
       />
+      {uses.length > 0 && (
+        <div className="flex min-w-0 flex-wrap items-center gap-1 text-xs">
+          <span aria-hidden="true" className="text-muted-foreground">
+            Uses
+          </span>
+          <ul
+            aria-label="Names this code reads"
+            className="flex min-w-0 flex-wrap gap-1"
+          >
+            {uses.map(({ name, kind }) => (
+              <li
+                key={name}
+                data-kind={kind}
+                title={`${name} (${kind})`}
+                className="max-w-full truncate rounded border border-border bg-slate-elevation1 px-1.5 py-0.5 font-mono text-[10px] text-tertiary-foreground"
+              >
+                {name}
+                <span className="ml-1 font-sans text-muted-foreground">
+                  {kind}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 
@@ -620,6 +661,7 @@ function CodeBlockEditorBody({
           >
             <CodeBlockPlainCard
               steps={steps}
+              hasCode={hasCode}
               generating={isGenerating}
               onStop={requestCancel}
               stopBlockedReason={stopBlockedReason}

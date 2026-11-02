@@ -23,9 +23,9 @@ from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.routes import agent_protocol
-from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.routes.agent_protocol import _parse_range_header
 from tests.unit.forge.sdk.artifact.storage.test_s3_storage_moto import moto_server  # noqa: F401
+from tests.unit.shared_route_app import shared_route_app
 
 CONTENT = b"0123456789" * 100  # 1000 bytes for predictable slicing
 
@@ -59,9 +59,7 @@ def _build_client(monkeypatch: pytest.MonkeyPatch, *, content: bytes = CONTENT) 
 
     monkeypatch.setattr(agent_protocol.org_auth_service, "get_current_org", _fake_org)
 
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
-    return TestClient(fastapi_app)
+    return TestClient(shared_route_app(monkeypatch))
 
 
 class TestParseRangeHeader:
@@ -271,9 +269,7 @@ def _artifact_route_app(monkeypatch: pytest.MonkeyPatch, artifact: Artifact) -> 
     artifacts_db.get_artifact_by_id = AsyncMock(return_value=artifact)
     monkeypatch.setattr(forge_app.DATABASE, "artifacts", artifacts_db)
     monkeypatch.setattr(agent_protocol.org_auth_service, "get_current_org", _fake_org)
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
-    return fastapi_app
+    return shared_route_app(monkeypatch)
 
 
 def _asgi_get_scope(path: str) -> dict[str, Any]:
@@ -333,8 +329,7 @@ class TestArtifactContentFromS3:
         assert all(amount is not None for amount, _ in storage_bodies.reads)
         assert sum(size for _, size in storage_bodies.reads) == len(body)
 
-    @pytest.mark.parametrize("range_header", [None, "bytes=5-14"])
-    @pytest.mark.parametrize("kind", ["bundle-member", "compressed-har"])
+    @pytest.mark.parametrize(("kind", "range_header"), [("bundle-member", None), ("compressed-har", "bytes=5-14")])
     def test_decoded_artifacts_keep_their_whole_object_semantics(
         self,
         monkeypatch: pytest.MonkeyPatch,

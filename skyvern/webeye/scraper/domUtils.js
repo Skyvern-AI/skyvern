@@ -1895,27 +1895,38 @@ if (window.elementIdCounter === undefined) {
   window.elementIdCounter = new SafeCounter();
 }
 
-// generate a unique id for the element
-// length is 4, the first character is from the frame index, the last 3 characters are from the counter,
+const UNIQUE_ID_CHARACTERS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const UNIQUE_ID_COUNTER_LENGTH = 3;
+
+// The frame index in base 62 that starts every id this window mints, or null while it has no frame index.
+// Every window's counter starts at 1, so one character modulo 62 would give frame 62 the main frame's ids.
+function uniqueIdFramePrefix() {
+  const base = UNIQUE_ID_CHARACTERS.length;
+  let frameIndex = window.GlobalSkyvernFrameIndex;
+  if (frameIndex === undefined || frameIndex < 0) return null;
+  let prefix = UNIQUE_ID_CHARACTERS[frameIndex % base];
+  frameIndex = Math.floor(frameIndex / base);
+  // The page can overwrite the global: Infinity would never floor to 0, so the loop stops past safe integers.
+  while (Number.isSafeInteger(frameIndex) && frameIndex > 0) {
+    prefix = UNIQUE_ID_CHARACTERS[frameIndex % base] + prefix;
+    frameIndex = Math.floor(frameIndex / base);
+  }
+  return prefix;
+}
+
+// generate a unique id for the element: the frame prefix, then the last 3 characters from the counter
 async function uniqueId() {
-  const characters =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const characters = UNIQUE_ID_CHARACTERS;
   const base = characters.length;
 
   const extraCharacters = "~!@#$%^&*()-_+=";
   const extraBase = extraCharacters.length;
 
-  let result = "";
-
-  if (
-    window.GlobalSkyvernFrameIndex === undefined ||
-    window.GlobalSkyvernFrameIndex < 0
-  ) {
+  let result = uniqueIdFramePrefix();
+  if (result === null) {
     const randomIndex = Math.floor(Math.random() * extraBase);
-    result += extraCharacters[randomIndex];
-  } else {
-    const c1 = window.GlobalSkyvernFrameIndex % base;
-    result += characters[c1];
+    result = extraCharacters[randomIndex];
   }
 
   const countPart =
@@ -1928,6 +1939,28 @@ async function uniqueId() {
   result += characters[c4];
 
   return result;
+}
+
+// The shape of an id a frame below index 238,328 minted. Other values are left alone: the page's own, and the
+// symbol-led ids a window mints while it has no frame index.
+const MINTED_UNIQUE_ID = /^[A-Za-z0-9]{4,6}$/;
+
+// A child document can hold copies of nodes another frame already tagged, so a minted id is kept only when
+// this window minted it; a node the page moves between frames is given a new id once.
+async function ownUniqueId(element) {
+  const existing = element.getAttribute("unique_id");
+  const prefix = uniqueIdFramePrefix();
+  if (
+    existing &&
+    (prefix === null ||
+      !MINTED_UNIQUE_ID.test(existing) ||
+      existing.slice(0, -UNIQUE_ID_COUNTER_LENGTH) === prefix)
+  ) {
+    return existing;
+  }
+  const fresh = await uniqueId();
+  element.setAttribute("unique_id", fresh);
+  return fresh;
 }
 
 const ENRICHED_ELEMENT_TEXT_LIMIT = 120;
@@ -2363,8 +2396,7 @@ async function buildElementObject(
       budget.remaining -= maxOptions;
     }
   }
-  var element_id = element.getAttribute("unique_id") ?? (await uniqueId());
-  element.setAttribute("unique_id", element_id);
+  var element_id = await ownUniqueId(element);
   // Inputs can appear after the stamp pass while the asynchronous tree build runs.
   if (
     !element.hasAttribute("data-skyvern-otp-box") &&
@@ -2509,13 +2541,7 @@ async function buildElementObject(
   let isInShadowRoot = element.getRootNode() instanceof ShadowRoot;
   if (isInShadowRoot) {
     let shadowHostEle = element.getRootNode().host;
-    let shadowHostId = shadowHostEle.getAttribute("unique_id");
-    // assign shadowHostId to the shadowHost element if it doesn't have unique_id
-    if (!shadowHostId) {
-      shadowHostId = await uniqueId();
-      shadowHostEle.setAttribute("unique_id", shadowHostId);
-    }
-    elementObj.shadowHost = shadowHostId;
+    elementObj.shadowHost = await ownUniqueId(shadowHostEle);
   }
 
   // get options for select element or for listbox element
@@ -3262,14 +3288,38 @@ function isWindowScrollable() {
   return true;
 }
 
+const OPTION_LIST_ROLES = ["listbox", "menu", "combobox", "tree"];
+const OPTION_LIST_SELECTOR = OPTION_LIST_ROLES.map(
+  (role) => `[role="${role}"]`,
+).join(",");
+const OPTION_ITEM_SELECTOR = [
+  '[role="option"]',
+  '[role="menuitem"]',
+  '[role="menuitemradio"]',
+  '[role="menuitemcheckbox"]',
+  '[role="treeitem"]',
+].join(",");
+// A scroll viewport sits a level or two under the control that owns it, so a shallow sweep finds
+// it; the bounds keep getComputedStyle off every node of a large subtree.
+const SCROLLABLE_DESCENDANT_MAX_DEPTH = 5;
+const SCROLLABLE_DESCENDANT_MAX_NODES = 200;
+// One option row of the previous viewport stays on screen, so consecutive scrapes overlap and the
+// agent can tell the list moved rather than jumped.
+const OPTION_LIST_STEP_RATIO = 0.85;
+
 /**
  * Find the nearest scrollable container relative to the given element and scroll it.
- * Three strategies in priority order:
- *   1) Walk up from element to find a scrollable ancestor (element is inside container)
- *   2) Walk up the DOM checking siblings at each level (element is beside container)
- *   3) Fall back to page-level scrolling (for pages where the body itself scrolls,
+ * Strategies in priority order:
+ *   1) The element itself
+ *   2) A scrollable descendant of an option list (a virtualized listbox clips its content
+ *      and delegates scrollTop to a viewport DIV inside it)
+ *   3) Walk up from element to find a scrollable ancestor (element is inside container)
+ *   4) Walk up the DOM checking siblings at each level (element is beside container)
+ *   5) Fall back to page-level scrolling (for pages where the body itself scrolls,
  *      e.g. T&C pages with no scrollable sub-container)
- * Returns: true (sub-container scrolled), "page" (page-level scroll needed), or false (nothing scrollable).
+ * Returns {mode, scrolled, scrollTop, clientHeight, scrollHeight}, where mode is "container"
+ * (a sub-container was scrolled), "page" (the caller must scroll the page itself) or "none"
+ * (nothing scrollable). `scrolled` reports whether the scroll position actually moved.
  */
 function scrollNearestScrollableContainer(element, direction) {
   function isContainerScrollable(node) {
@@ -3283,16 +3333,64 @@ function scrollNearestScrollableContainer(element, direction) {
     );
   }
 
-  // Strategy 1: walk up from element to find a scrollable ancestor
-  let target = element;
-  while (target && target !== document.documentElement) {
-    if (isContainerScrollable(target)) break;
-    target = target.parentElement;
+  // Breadth-first so the outermost viewport inside `root` wins — for a virtualized list that is
+  // the node owning scrollTop, not the sized inner spacer it holds.
+  function findScrollableDescendant(root) {
+    let frontier = Array.from(root.children || []);
+    let visited = 0;
+    for (
+      let depth = 0;
+      depth < SCROLLABLE_DESCENDANT_MAX_DEPTH && frontier.length;
+      depth++
+    ) {
+      const next = [];
+      for (const node of frontier) {
+        if (visited++ >= SCROLLABLE_DESCENDANT_MAX_NODES) return null;
+        if (isContainerScrollable(node)) return node;
+        next.push(...Array.from(node.children || []));
+      }
+      frontier = next;
+    }
+    return null;
   }
 
-  // Strategy 2: walk up the DOM checking siblings at each level
-  if (!target || target === document.documentElement) {
-    target = null;
+  // Whether `node` presents a set of discrete options rather than prose.
+  function isOptionList(node) {
+    if (!node || !node.getAttribute) return false;
+    const role = (node.getAttribute("role") || "").toLowerCase();
+    if (OPTION_LIST_ROLES.includes(role)) return true;
+    if (node.tagName && node.tagName.toLowerCase() === "select") return true;
+    const item = node.querySelector && node.querySelector(OPTION_ITEM_SELECTOR);
+    return Boolean(item && !item.closest(OPTION_LIST_SELECTOR));
+  }
+
+  let target = isContainerScrollable(element) ? element : null;
+  const optionListItem = element.closest(OPTION_ITEM_SELECTOR);
+  let targetUsesOptionListPaging = Boolean(
+    optionListItem && optionListItem.closest(OPTION_LIST_SELECTOR),
+  );
+
+  // Strategy 2: a scroll viewport inside a targeted option list. Other wrappers keep
+  // the old ancestor-first behavior so an inner textarea cannot steal their scroll.
+  if (!target && isOptionList(element)) {
+    target = findScrollableDescendant(element);
+    targetUsesOptionListPaging = target !== null;
+  }
+
+  // Strategy 3: walk up from element to find a scrollable ancestor
+  if (!target) {
+    let level = element.parentElement;
+    while (level && level !== document.documentElement) {
+      if (isContainerScrollable(level)) {
+        target = level;
+        break;
+      }
+      level = level.parentElement;
+    }
+  }
+
+  // Strategy 4: walk up the DOM checking siblings at each level
+  if (!target) {
     let level = element.parentElement;
     while (level && level !== document.documentElement && !target) {
       for (const child of level.children) {
@@ -3307,25 +3405,40 @@ function scrollNearestScrollableContainer(element, direction) {
 
   // Scroll the sub-container if found
   if (target) {
-    if (direction === "down") {
-      target.scrollTop = target.scrollHeight;
+    const before = target.scrollTop;
+    let destination;
+    if (isOptionList(target) || targetUsesOptionListPaging) {
+      // A virtualized option list renders only the rows in view, so jumping to an extreme
+      // skips every option in between and a mid-list option can never be reached. Advance
+      // one viewport per call instead.
+      const stepPx = Math.max(
+        1,
+        Math.floor(target.clientHeight * OPTION_LIST_STEP_RATIO),
+      );
+      destination = direction === "down" ? before + stepPx : before - stepPx;
+    } else if (direction === "down") {
+      destination = target.scrollHeight;
     } else {
-      target.scrollTop = 0;
+      destination = 0;
     }
-    return true;
+    target.scrollTo({ top: destination, behavior: "instant" });
+    return {
+      mode: "container",
+      // Re-reading the clamped position tells us whether anything moved rather than whether we asked.
+      scrolled: target.scrollTop !== before,
+      scrollTop: target.scrollTop,
+      clientHeight: target.clientHeight,
+      scrollHeight: target.scrollHeight,
+    };
   }
 
-  // Strategy 3: fall back to page-level scrolling when no sub-container exists.
+  // Strategy 5: fall back to page-level scrolling when no sub-container exists.
   // Many pages (e.g. T&C agreements) render content inline with the page body
-  // as the only scrollable area. Return "page" to signal the Python handler to
+  // as the only scrollable area. Report "page" to signal the Python handler to
   // use mouse.wheel events for native browser scrolling, which reliably triggers
   // page JavaScript (IntersectionObserver, scroll listeners) that programmatic
   // scrollTo/scrollTop methods may not.
-  if (isWindowScrollable()) {
-    return "page";
-  }
-
-  return false;
+  return { mode: isWindowScrollable() ? "page" : "none", scrolled: false };
 }
 
 function scrollToElementBottom(element, page_by_page = false) {

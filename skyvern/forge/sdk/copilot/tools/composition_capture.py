@@ -69,6 +69,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import (
     enqueue_screenshot,
     screenshot_result_facts,
     screenshot_viewport_css_px,
+    withdraw_superseded_run_result_frame,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import (
     scrub_secrets_from_structure,
@@ -1123,6 +1124,7 @@ def store_post_run_page_evidence(
         stamped["current_url"] = current_url
     if _preserves_existing_post_run_page_evidence(copilot_ctx, stamped, run_id=run_id):
         return stamped, True
+    withdraw_superseded_run_result_frame(copilot_ctx, run_id)
     copilot_ctx.composition_page_evidence = stamped
     page_title = stamped.get("page_title")
     if isinstance(page_title, str) and page_title:

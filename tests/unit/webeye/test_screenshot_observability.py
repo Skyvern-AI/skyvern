@@ -11,7 +11,6 @@ import base64
 import contextlib
 from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +21,7 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetadata, BrowserEngineSelection
+from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import (
     ScreenshotEligibility,
@@ -32,6 +31,7 @@ from skyvern.webeye.utils.page import (
     _current_viewpoint_screenshot_helper,
     _screenshot_observation_fields,
 )
+from tests.unit.conftest import skycdp_engine_selection
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 # Read before the autouse fixture shrinks it, so a test can run detach under its real budget.
@@ -406,11 +406,7 @@ async def test_ineligible_paths_emit_decline_reason(kind: str, reason: str, monk
         page.context.browser.browser_type.name = "firefox"
     selection = None
     if kind == "skycdp":
-        selection = SimpleNamespace(
-            name=SKYCDP_ENGINE_NAME,
-            is_engine_error=lambda exc: isinstance(exc, PlaywrightError),
-            is_engine_timeout_error=lambda exc: isinstance(exc, PlaywrightTimeoutError),
-        )
+        selection = skycdp_engine_selection()
     page.screenshot.side_effect = [PlaywrightTimeoutError("first"), b"playwright-retry"]
     assert (
         await _current_viewpoint_screenshot_helper(page, full_page=kind == "full_page", engine_selection=selection)

@@ -8,6 +8,7 @@ from fastapi import status
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from typing_extensions import Self
 
+from skyvern.errors.errors import drop_unsolicited_download_errors
 from skyvern.exceptions import (
     InvalidTaskStatusTransition,
     SkyvernHTTPException,
@@ -419,7 +420,7 @@ class Task(TaskBase):
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             downloaded_file_urls=[file.url for file in downloaded_files] if downloaded_files else None,
-            errors=self.errors,
+            errors=drop_unsolicited_download_errors(self.errors, downloaded_files=downloaded_files),
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
             max_screenshot_scrolls=self.max_screenshot_scrolls,
@@ -494,7 +495,7 @@ class TaskOutput(BaseModel):
             status=task.status,
             extracted_information=task.extracted_information,
             failure_reason=task.failure_reason,
-            errors=task.errors,
+            errors=drop_unsolicited_download_errors(task.errors, downloaded_files=downloaded_files),
             failure_category=task.failure_category,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,

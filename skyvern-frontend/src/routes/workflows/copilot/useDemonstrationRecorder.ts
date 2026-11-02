@@ -5,12 +5,15 @@ import { getClient } from "@/api/AxiosClient";
 import { getSseClient } from "@/api/sse";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getErrorDetail } from "@/util/getErrorDetail";
 
 import type {
+  CopilotAttachedFile,
   WorkflowCopilotActiveDemonstration,
   WorkflowCopilotDemonstrationActionUpdate,
   WorkflowCopilotDemonstrationControlRequest,
   WorkflowCopilotDemonstrationControlResult,
+  WorkflowCopilotDemonstrationFileRequestedUpdate,
   WorkflowCopilotDemonstrationInsertion,
   WorkflowCopilotDemonstrationSensitiveFieldUpdate,
   WorkflowCopilotDemonstrationUpdate,
@@ -26,6 +29,7 @@ type DemonstrationAction = Pick<
 type DemonstrationDone = {
   demonstrationId: string;
   actions: DemonstrationAction[];
+  files: CopilotAttachedFile[];
 };
 
 type UseDemonstrationRecorderOptions = {
@@ -33,6 +37,7 @@ type UseDemonstrationRecorderOptions = {
   browserSessionId: string | null | undefined;
   onDone: (demonstration: DemonstrationDone) => boolean | Promise<boolean>;
   onStartFailed: () => void;
+  deleteFile: (fileId: string) => Promise<unknown>;
 };
 
 export function useDemonstrationRecorder({
@@ -40,6 +45,7 @@ export function useDemonstrationRecorder({
   browserSessionId,
   onDone,
   onStartFailed,
+  deleteFile,
 }: UseDemonstrationRecorderOptions) {
   const credentialGetter = useCredentialGetter();
   const [demonstrationId, setDemonstrationId] = useState<string | null>(null);
@@ -49,11 +55,22 @@ export function useDemonstrationRecorder({
   const [actionCount, setActionCount] = useState(0);
   const [sensitiveField, setSensitiveField] =
     useState<WorkflowCopilotDemonstrationSensitiveFieldUpdate | null>(null);
+  const [fileRequest, setFileRequest] =
+    useState<WorkflowCopilotDemonstrationFileRequestedUpdate | null>(null);
+  // Every file uploaded for this demonstration, so a discard can delete them.
+  const uploadedFileIdsRef = useRef<string[]>([]);
+  // The control only queues the attach; the tray stays locked until the recorder reports the outcome.
+  const [awaitingFileOutcome, setAwaitingFileOutcome] = useState(false);
+  // The files the recorder reports attached; they ride on the Done message.
+  const filesRef = useRef<CopilotAttachedFile[]>([]);
   const [busy, setBusy] = useState(false);
   const [canFillCredentials, setCanFillCredentials] = useState(false);
   const [hasSkippedSensitiveField, setHasSkippedSensitiveField] =
     useState(false);
   const [limitReached, setLimitReached] = useState(false);
+  const [browserRestarted, setBrowserRestarted] = useState(false);
+  // The backend refuses demonstrations with 403 when its cache is not shared (no Redis).
+  const [unavailable, setUnavailable] = useState(false);
   const busyRef = useRef(false);
   const streamControllerRef = useRef<AbortController | null>(null);
   const demonstrationIdRef = useRef<string | null>(null);
@@ -63,6 +80,9 @@ export function useDemonstrationRecorder({
   onDoneRef.current = onDone;
   const onStartFailedRef = useRef(onStartFailed);
   onStartFailedRef.current = onStartFailed;
+  const deleteFileRef = useRef(deleteFile);
+  deleteFileRef.current = deleteFile;
+  const sessionRef = useRef({ workflowPermanentId, browserSessionId });
 
   const updateBusy = useCallback((next: boolean) => {
     busyRef.current = next;
@@ -88,9 +108,14 @@ export function useDemonstrationRecorder({
     setActions([]);
     setActionCount(0);
     setSensitiveField(null);
+    setFileRequest(null);
+    setAwaitingFileOutcome(false);
+    uploadedFileIdsRef.current = [];
+    filesRef.current = [];
     setCanFillCredentials(false);
     setHasSkippedSensitiveField(false);
     setLimitReached(false);
+    setBrowserRestarted(false);
     updateBusy(false);
     insertionRef.current = undefined;
   }, [updateBusy, updateDemonstrationId, updatePhase]);
@@ -113,24 +138,25 @@ export function useDemonstrationRecorder({
           setActions(actionsRef.current);
           setActionCount((current) => Math.max(current, frame.seq));
           setSensitiveField(null);
+          if (frame.tool_name === "upload_attached_file") {
+            setAwaitingFileOutcome(false);
+            if (frame.file_id) {
+              filesRef.current = [
+                ...filesRef.current,
+                {
+                  file_id: frame.file_id,
+                  filename: frame.filename ?? "",
+                  available: true,
+                },
+              ];
+            }
+            setFileRequest(null);
+          }
+          return false;
+        case "demonstration_file_requested":
+          setFileRequest(frame);
           return false;
         case "demonstration_sensitive_field":
-          {
-            const seq =
-              Math.max(0, ...actionsRef.current.map((action) => action.seq)) +
-              1;
-            const fieldLabel =
-              frame.field === "other" ? "sensitive field" : frame.field;
-            actionsRef.current = [
-              ...actionsRef.current,
-              {
-                seq,
-                label: `Fill ${fieldLabel} (value not recorded)`,
-              },
-            ];
-            setActions(actionsRef.current);
-            setActionCount((current) => Math.max(current, seq));
-          }
           if (frame.field === "other") {
             setHasSkippedSensitiveField(true);
           }
@@ -138,6 +164,7 @@ export function useDemonstrationRecorder({
           return false;
         case "demonstration_notice":
           if (frame.level === "error") {
+            setAwaitingFileOutcome(false);
             toast({
               title: "Could not update the demonstration",
               description: frame.message,
@@ -151,6 +178,8 @@ export function useDemonstrationRecorder({
           }
           setActionCount(frame.action_count);
           setSensitiveField(null);
+          setFileRequest(null);
+          setAwaitingFileOutcome(false);
           setHasSkippedSensitiveField(false);
           if (frame.reason === "time_limit") setLimitReached(true);
           if (frame.reason === "event_limit") {
@@ -319,6 +348,55 @@ export function useDemonstrationRecorder({
     [runControl, sensitiveField],
   );
 
+  // The server stores the file for this demonstration and queues the attach itself, so the
+  // recorder never attaches a file the client merely names.
+  const uploadToDemonstration = useCallback(
+    async (file: File): Promise<string | null> => {
+      const id = demonstrationIdRef.current;
+      if (!id) throw new Error("No demonstration is active.");
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const formData = new FormData();
+      formData.append("demonstration_id", id);
+      formData.append("file", file);
+      const response =
+        await client.post<WorkflowCopilotDemonstrationControlResult>(
+          "/workflow/copilot/demonstration/upload",
+          formData,
+          { headers: { "Content-Type": "multipart/form-data" } },
+        );
+      return response.data.file_id ?? null;
+    },
+    [credentialGetter],
+  );
+
+  // null skips the requested file; the recorder still logs that the page asked for one.
+  const chooseFile = useCallback(
+    async (file: File | null) => {
+      if (busyRef.current || awaitingFileOutcome) return;
+      updateBusy(true);
+      // Set before the request: the recorder's outcome frame can arrive before the response does.
+      setAwaitingFileOutcome(true);
+      try {
+        if (!file) {
+          await sendControl({ action: "upload_file" });
+          return;
+        }
+        const fileId = await uploadToDemonstration(file);
+        if (fileId) uploadedFileIdsRef.current.push(fileId);
+      } catch (error) {
+        setAwaitingFileOutcome(false);
+        toast({
+          title: "Could not upload the file",
+          description: getErrorDetail(error) ?? "Please try again.",
+          variant: "destructive",
+        });
+      } finally {
+        updateBusy(false);
+      }
+    },
+    [awaitingFileOutcome, sendControl, updateBusy, uploadToDemonstration],
+  );
+
   const dismissSensitiveField = useCallback(() => {
     setSensitiveField(null);
   }, []);
@@ -330,9 +408,20 @@ export function useDemonstrationRecorder({
     try {
       if (phaseRef.current === "recording") {
         const stopped = await sendControl({ action: "stop" }, id);
-        streamControllerRef.current?.abort();
+        const stream = streamControllerRef.current;
         streamControllerRef.current = null;
+        // The stop flush can stream its last rows after the stop request returns.
+        for (
+          let waited = 0;
+          waited < 20 &&
+          actionsRef.current.length < (stopped?.action_count ?? 0);
+          waited++
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        stream?.abort();
         setSensitiveField(null);
+        setFileRequest(null);
         updatePhase("stopped");
         setHasSkippedSensitiveField(false);
         if (stopped?.action_count === 0) {
@@ -348,6 +437,7 @@ export function useDemonstrationRecorder({
       const sent = await onDoneRef.current({
         demonstrationId: id,
         actions: recordedActions,
+        files: filesRef.current,
       });
       if (sent) {
         clear();
@@ -367,6 +457,13 @@ export function useDemonstrationRecorder({
     }
   }, [clear, sendControl, updateBusy, updatePhase]);
 
+  // Discarded uploads were never sent with a message, so nothing else would delete them.
+  const discardUploads = useCallback(() => {
+    for (const fileId of uploadedFileIdsRef.current) {
+      void deleteFileRef.current(fileId);
+    }
+  }, []);
+
   const cancel = useCallback(async (): Promise<boolean> => {
     const id = demonstrationIdRef.current;
     if (!id || busyRef.current) return false;
@@ -376,6 +473,7 @@ export function useDemonstrationRecorder({
     } catch (error) {
       const status = isAxiosError(error) ? error.response?.status : undefined;
       if (status === 404 || status === 409) {
+        discardUploads();
         clear();
         return true;
       }
@@ -388,11 +486,56 @@ export function useDemonstrationRecorder({
       updateBusy(false);
       return false;
     }
+    discardUploads();
     clear();
     return true;
-  }, [clear, sendControl, updateBusy]);
+  }, [clear, discardUploads, sendControl, updateBusy]);
 
   useEffect(() => {
+    const previous = sessionRef.current;
+    const sameWorkflow = previous.workflowPermanentId === workflowPermanentId;
+    // A stream readiness gap reports a null session, so only a different real session is a restart.
+    sessionRef.current = {
+      workflowPermanentId,
+      browserSessionId:
+        browserSessionId ?? (sameWorkflow ? previous.browserSessionId : null),
+    };
+    const id = demonstrationIdRef.current;
+    const restarted =
+      !!browserSessionId && browserSessionId !== previous.browserSessionId;
+    // Done keeps the recording (phase idle, busy) until its send settles.
+    if (sameWorkflow && id && phaseRef.current === "idle" && busyRef.current) {
+      if (restarted) setBrowserRestarted(true);
+      return;
+    }
+    if (sameWorkflow && id && phaseRef.current !== "idle") {
+      // Early returns register no cleanup, and an aborted stream skips its busy reset once its ref is gone.
+      const resuming =
+        streamControllerRef.current !== null &&
+        phaseRef.current !== "recording";
+      streamControllerRef.current?.abort();
+      streamControllerRef.current = null;
+      if (resuming) updateBusy(false);
+      setSensitiveField(null);
+      if (!restarted) {
+        updatePhase("stopped");
+        return;
+      }
+      // The recording is bound to the old session: build or discard only.
+      const wasRecording = phaseRef.current === "recording";
+      setHasSkippedSensitiveField(false);
+      setBrowserRestarted(true);
+      updatePhase("stopped");
+      if (wasRecording) {
+        updateBusy(true);
+        void sendControl({ action: "stop", stop_reason: "browser_gone" }, id)
+          .catch(() => undefined)
+          .finally(() => {
+            if (demonstrationIdRef.current === id) updateBusy(false);
+          });
+      }
+      return;
+    }
     clear();
     if (!workflowPermanentId || !browserSessionId) return;
     const controller = new AbortController();
@@ -410,6 +553,7 @@ export function useDemonstrationRecorder({
               signal: controller.signal,
             },
           );
+        setUnavailable(false);
         if (
           !response.data ||
           typeof response.data.demonstration_id !== "string" ||
@@ -433,8 +577,9 @@ export function useDemonstrationRecorder({
         setLimitReached(!response.data.can_resume);
         insertionRef.current = response.data.insertion ?? undefined;
         updatePhase("stopped");
-      } catch {
-        return;
+      } catch (error) {
+        if (isAxiosError(error) && error.response?.status === 403)
+          setUnavailable(true);
       }
     })();
     return () => {
@@ -445,6 +590,8 @@ export function useDemonstrationRecorder({
     browserSessionId,
     clear,
     credentialGetter,
+    sendControl,
+    updateBusy,
     updateDemonstrationId,
     updatePhase,
     workflowPermanentId,
@@ -463,14 +610,19 @@ export function useDemonstrationRecorder({
     actions,
     actionCount,
     sensitiveField,
+    fileRequest,
+    fileBusy: busy || awaitingFileOutcome,
     canFillCredentials,
     hasSkippedSensitiveField,
     limitReached,
+    browserRestarted,
+    unavailable,
     busy,
     start,
     resume,
     navigate,
     fillCredential,
+    chooseFile,
     dismissSensitiveField,
     done,
     cancel,

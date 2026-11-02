@@ -189,6 +189,7 @@ class _SessionEntry:
     session: AsyncSession
     task: asyncio.Task[Any] | None
     pin: _Pin | None = None
+    read_only: bool = False
 
 
 class _SessionFactory:
@@ -202,6 +203,11 @@ class _SessionFactory:
 
     def __call__(self) -> AsyncContextManager[AsyncSession]:
         return self._session()
+
+    def reading(self) -> AsyncContextManager[AsyncSession]:
+        """Like calling the factory, for a scope that only reads, so ``released()`` can close its session and hand
+        the connection back to the pool. An existing ambient session is joined as it is."""
+        return self._session(read_only=True)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._sessionmaker, name)
@@ -269,12 +275,26 @@ class _SessionFactory:
 
     @asynccontextmanager
     async def released(self) -> AsyncIterator[None]:
-        """Hand a pinned scope's connection back to the pool for the block and pin a fresh one after it; a no-op
-        outside a pinned scope or inside a transaction. Inside the block the ambient session is hidden, so a
-        repository call opens its own short session and returns its connection, instead of joining the pinned
-        session and keeping a new connection checked out for the rest of the block."""
+        """Hand a pinned scope's connection back to the pool for the block and pin a fresh one after it, or close a
+        ``reading()`` scope's session, which stays usable; a no-op in any other scope or inside a pinned transaction.
+        Inside the block the ambient session is hidden, so a repository call opens its own short session instead of
+        joining the scope's and keeping a new connection checked out. A reading scope holding pending ORM changes
+        raises rather than discard them, a cheap check that cannot see flushed or Core writes."""
         entry = self._session_ctx.get()
-        if entry is None or entry.task is not asyncio.current_task() or entry.pin is None:
+        if entry is None or entry.task is not asyncio.current_task():
+            yield
+            return
+        if entry.read_only:
+            if entry.session.new or entry.session.dirty or entry.session.deleted:
+                raise RuntimeError("released() would discard pending ORM changes made inside a reading() scope")
+            await self._close(entry.session)
+            token = self._session_ctx.set(None)
+            try:
+                yield
+            finally:
+                self._session_ctx.reset(token)
+            return
+        if entry.pin is None:
             yield
             return
         pin, session = entry.pin, entry.session
@@ -300,7 +320,7 @@ class _SessionFactory:
         session.sync_session.bind = bind.sync_engine if isinstance(bind, AsyncEngine) else bind.sync_connection
 
     @asynccontextmanager
-    async def _session(self) -> AsyncIterator[AsyncSession]:
+    async def _session(self, read_only: bool = False) -> AsyncIterator[AsyncSession]:
         existing = self._session_ctx.get()
         current_task = asyncio.current_task()
         if existing is not None and current_task is not None and existing.task is current_task:
@@ -308,7 +328,7 @@ class _SessionFactory:
             return
 
         session = self._sessionmaker()
-        token = self._session_ctx.set(_SessionEntry(session=session, task=current_task))
+        token = self._session_ctx.set(_SessionEntry(session=session, task=current_task, read_only=read_only))
         try:
             yield session
         finally:

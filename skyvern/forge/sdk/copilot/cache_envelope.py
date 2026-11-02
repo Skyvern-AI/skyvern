@@ -37,6 +37,8 @@ ROUTER_HOP_FIELDS = (
     "service_tier",
 )
 _ROUTER_HOP_KEYS = frozenset({"model", "base_url", "timeout", *ROUTER_HOP_FIELDS})
+# Encrypted reasoning decrypts only on the model, endpoint and account that returned it.
+_REASONING_SCOPE_KEYS = ("model", "base_url", "api_key", "api_version")
 
 
 class CacheableSystemInstructions(str):
@@ -75,6 +77,8 @@ class ExplicitCacheEnvelope:
     responses_tools: list[Any]
     prompt_cache_key: str
     extra_body: dict[str, Any]
+    # Every hop can read reasoning any hop returns, so the response's reasoning is kept to send back.
+    replays_reasoning: bool = False
 
     @property
     def breakpoint_count(self) -> int:
@@ -129,6 +133,49 @@ def _chain_sends_responses(base: dict[str, Any], fallbacks: list[str | dict[str,
         return False
     hops = [base, *({**base, **({"model": hop} if isinstance(hop, str) else hop)} for hop in fallbacks)]
     return all(_gpt_cache_model(hop["model"]) and _hop_sends_responses(hop) for hop in hops)
+
+
+def _chain_shares_reasoning(base: dict[str, Any], fallbacks: list[str | dict[str, Any]]) -> bool:
+    hops = [base, *({**base, **({"model": hop} if isinstance(hop, str) else hop)} for hop in fallbacks)]
+    scope = [
+        {key: responses_route_model(hop[key]) if key == "model" else hop.get(key) for key in _REASONING_SCOPE_KEYS}
+        for hop in hops
+    ]
+    return all(hop_scope == scope[0] for hop_scope in scope)
+
+
+def _reasoning_origin(item: object) -> str | None:
+    reasoning = Converter.maybe_reasoning_message(item)
+    if reasoning is None or not reasoning.get("encrypted_content"):
+        return None
+    return (cast(dict[str, Any], reasoning).get("provider_data") or {}).get("model")
+
+
+def is_replayable_reasoning(item: object) -> bool:
+    """GPT reasoning the explicit cache envelope sends back to the model that returned it."""
+    origin = _reasoning_origin(item)
+    return origin is not None and _gpt_cache_model(origin) is not None
+
+
+def _attach_reasoning(items: list[TResponseInputItem], messages: list[Any], model: str) -> None:
+    """Give each assistant tool-call message the encrypted reasoning that came before its calls; LiteLLM's
+    chat-to-Responses conversion sends a message's reasoning_items back as reasoning items."""
+    by_call_id: dict[str, list[Any]] = {}
+    pending: list[Any] = []
+    for item in items:
+        if (reasoning := Converter.maybe_reasoning_message(item)) is not None:
+            if is_replayable_reasoning(reasoning) and _reasoning_origin(reasoning) == model:
+                pending.append(reasoning)
+        elif (call := Converter.maybe_function_tool_call(item)) is not None:
+            by_call_id[call["call_id"]], pending = pending, []
+        elif not (isinstance(item, dict) and item.get("role") == "assistant"):
+            pending = []
+    for message in messages:
+        reasoning_items = [
+            reasoning for call in message.get("tool_calls") or [] for reasoning in by_call_id.get(call["id"], [])
+        ]
+        if reasoning_items:
+            message["reasoning_items"] = reasoning_items
 
 
 def item_parts_key(item: dict[str, Any]) -> str:
@@ -209,6 +256,7 @@ def build_explicit_cache_envelope(
     reasoning_effort: Any = None,
     anchors: Sequence[int] = (),
     should_replay_reasoning_content: ShouldReplayReasoningContent | None = None,
+    api_key: str | None = None,
 ) -> ExplicitCacheEnvelope | None:
     """Build a GPT-5.6+ Responses API cache envelope when every hop already reaches LiteLLM's Responses route."""
 
@@ -237,9 +285,10 @@ def build_explicit_cache_envelope(
         return None
 
     preserve_thinking_blocks = model_settings.reasoning is not None and model_settings.reasoning.effort is not None
+    replays_reasoning = _chain_shares_reasoning({**base_hop, "api_key": api_key}, fallbacks)
 
     def to_messages(items: str | list[TResponseInputItem]) -> list[Any]:
-        return list(
+        messages = list(
             Converter.items_to_messages(
                 items,
                 base_url=base_url,
@@ -249,6 +298,10 @@ def build_explicit_cache_envelope(
                 should_replay_reasoning_content=should_replay_reasoning_content,
             )
         )
+        # The SDK's chat conversion drops GPT reasoning, which OpenAI asks callers to send back with tool calls.
+        if replays_reasoning and isinstance(items, list):
+            _attach_reasoning(items, messages, model)
+        return messages
 
     logical_messages = to_messages(input)
     wire_system = {
@@ -303,4 +356,5 @@ def build_explicit_cache_envelope(
             converted_tools=converted_tools,
         ),
         extra_body=extra_body,
+        replays_reasoning=replays_reasoning,
     )

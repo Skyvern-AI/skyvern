@@ -18,8 +18,6 @@ import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 type StreamBody = {
   message: string;
   workflow_run_id?: string | null;
-  recording_in_progress?: boolean;
-  recording_deleted_step_ids?: Array<string>;
 };
 type StreamCall = {
   body: StreamBody;
@@ -124,6 +122,8 @@ const { focusedRun, reopenEditor } = vi.hoisted(() => ({
   reopenEditor: vi.fn(),
 }));
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: ({ workflowRunId }: { workflowRunId?: string }) => ({
     data: workflowRunId ? focusedRun.current : undefined,
   }),
@@ -145,10 +145,6 @@ vi.mock(
     };
   },
 );
-
-vi.mock("@/routes/workflows/editor/recording/RecordingPanel", () => ({
-  RecordingPanel: () => <div data-testid="recording-chapter" />,
-}));
 
 const saveData = {
   title: "Test WF",
@@ -191,7 +187,6 @@ vi.mock("@/store/WorkflowHasChangesStore", () => {
 });
 
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
@@ -263,7 +258,6 @@ const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
 });
 
 beforeEach(() => {
-  useRecordingStore.getState().reset();
   switchStudioRun.mockClear();
   reopenEditor.mockClear();
   focusedRun.current = undefined;
@@ -784,66 +778,5 @@ describe("WorkflowCopilotChat — build follow", () => {
     );
 
     expect(focusBlock).not.toHaveBeenCalled();
-  });
-
-  it("keeps Copilot submission available while recording", async () => {
-    useRecordingStore.setState({ isRecording: true });
-    try {
-      await renderChat(makeDockedProps());
-
-      expect(
-        (screen.getByRole("textbox") as HTMLTextAreaElement).disabled,
-      ).toBe(false);
-      expect(screen.getByTestId("recording-chapter")).toBeTruthy();
-
-      await submit("Use the first available appointment.");
-
-      expect(streamCalls[0]?.body.message).toBe(
-        "Use the first available appointment.",
-      );
-      expect(focusBlock).not.toHaveBeenCalled();
-    } finally {
-      useRecordingStore.setState({ isRecording: false });
-    }
-  });
-
-  it("signals a capturing recording on a Copilot message", async () => {
-    useRecordingStore.setState({
-      isRecording: true,
-      deletedStepIds: ["step-deleted"],
-    });
-
-    try {
-      await renderChat(makeDockedProps());
-      await submit("do that one");
-
-      expect(streamCalls[0]?.body.recording_in_progress).toBe(true);
-      expect(streamCalls[0]?.body.recording_deleted_step_ids).toEqual([
-        "step-deleted",
-      ]);
-    } finally {
-      useRecordingStore.getState().reset();
-    }
-  });
-
-  it("mounts a fresh recording chapter for a later recording session", async () => {
-    await renderChat(makeDockedProps());
-
-    act(() => {
-      useRecordingStore.setState({ isRecording: true });
-    });
-    const firstChapter = screen.getByTestId("recording-chapter");
-
-    act(() => {
-      useRecordingStore.setState({ isRecording: false });
-    });
-    expect(screen.queryByTestId("recording-chapter")).toBeNull();
-
-    act(() => {
-      useRecordingStore.setState({ isRecording: true });
-    });
-    const secondChapter = screen.getByTestId("recording-chapter");
-
-    expect(secondChapter).not.toBe(firstChapter);
   });
 });

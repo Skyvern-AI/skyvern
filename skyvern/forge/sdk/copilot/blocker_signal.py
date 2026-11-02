@@ -84,9 +84,12 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "start_fresh_browser",
     "extend_browser_session",
     "upload_attached_file",
+    "read_attached_pdf",
     "get_browser_screenshot",
     "list_credentials",
     "list_integrations",
+    "request_google_connection",
+    "offer_demonstration",
     "read_google_sheet",
 )
 
@@ -189,6 +192,7 @@ class _ActiveRunEvidenceResetCtx(Protocol):
     last_run_binding_unavailable_reason: str | None
     recorded_persisted_block_run_workflow_run_id: str | None
     last_run_blocks_block_ids: list[str]
+    last_run_outcome_block_ids: list[str]
     last_run_blocks_block_labels: list[str]
     last_run_outcome: Any | None
     last_test_anti_bot: str | None
@@ -225,6 +229,7 @@ def clear_active_run_evidence_on_workflow_edit(ctx: _ActiveRunEvidenceResetCtx) 
     ctx.last_run_binding_unavailable_reason = None
     ctx.recorded_persisted_block_run_workflow_run_id = None
     ctx.last_run_blocks_block_ids = []
+    ctx.last_run_outcome_block_ids = []
     ctx.last_run_blocks_block_labels = []
     ctx.last_run_outcome = None
     ctx.last_test_anti_bot = None

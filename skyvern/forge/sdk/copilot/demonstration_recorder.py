@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
+import mimetypes
 import secrets
 import time
 from collections.abc import Awaitable, Coroutine
@@ -19,7 +21,9 @@ from playwright.async_api import Page
 from skyvern.cli.mcp_tools._localhost import is_localhost_url
 from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
+from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import BaseCache
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.config import ALL_BLOCK_FAMILIES, AuthoringCapability
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
@@ -27,7 +31,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, sa
 from skyvern.forge.sdk.copilot.demonstration_tap import DEMONSTRATION_MAX_EVENTS, PageTap, TapEvent
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
-    ScoutedInteraction,
+    end_minted_browser_renewals,
     record_attached_browser_driver,
     resolve_persistent_browser_state,
     start_browser_driver_release,
@@ -38,6 +42,7 @@ from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tools.credential_fill import fill_credential_field
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotDemonstrationControlRequest
+from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import validate_fetch_url
 
 LOG = structlog.get_logger()
@@ -61,6 +66,21 @@ DEMONSTRATION_OWNER_REFRESH_SECONDS = 5
 DEMONSTRATION_OWNER_LIVE_SECONDS = 20
 DEMONSTRATION_MAX_SECONDS = 30 * 60
 DEMONSTRATION_REPLAY_LEASE = timedelta(minutes=5)
+
+_DESCRIBE_FILE_INPUT = (
+    "function() { const tap = globalThis.__skyvernDemoTap; "
+    "return tap ? {selector: tap.selectorFor(this), label: tap.labelFor(this) || ''} : null; }"
+)
+# Built in the page rather than DOM.setFileInputFiles, which takes a path on the browser's host.
+_ATTACH_FILE = """function(name, type, data) {
+  const bytes = Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
+  const transfer = new DataTransfer();
+  transfer.items.add(new File([bytes], name, {type}));
+  this.files = transfer.files;
+  this.dispatchEvent(new Event("input", {bubbles: true, composed: true}));
+  this.dispatchEvent(new Event("change", {bubbles: true}));
+  return this.files.length;
+}"""
 
 DemonstrationStatus = Literal["recording", "stopping", "stopped", "replaying", "consumed", "cancelled"]
 DemonstrationStopReason = Literal[
@@ -414,6 +434,7 @@ async def append_demonstration_control(
     *,
     organization_id: str,
     request: WorkflowCopilotDemonstrationControlRequest,
+    file_id: str | None = None,
 ) -> int:
     record_key = demonstration_record_key(organization_id, request.demonstration_id)
     controls_key = demonstration_controls_key(organization_id, request.demonstration_id)
@@ -423,10 +444,13 @@ async def append_demonstration_control(
             raise DemonstrationRejection(HTTPStatus.NOT_FOUND, "Unknown demonstration")
         if record.status not in {"recording", "stopping", "stopped"}:
             raise DemonstrationRejection(HTTPStatus.CONFLICT, "Demonstration has ended")
+        # A stopping recorder may already have drained its controls, so an upload queued now would never run.
+        if file_id is not None and record.status != "recording":
+            raise DemonstrationRejection(HTTPStatus.CONFLICT, "Demonstration is not recording")
         if request.action == "stop":
             if record.status == "recording":
                 record.status = "stopping"
-                record.stop_reason = "stopped"
+                record.stop_reason = request.stop_reason or "stopped"
                 await cache.set(record_key, encode_demonstration_record(record), ex=DEMONSTRATION_TTL)
             return 0
         if request.action == "cancel":
@@ -448,6 +472,8 @@ async def append_demonstration_control(
                 raise DemonstrationRejection(HTTPStatus.CONFLICT, "Too many browser controls for this demonstration")
             seq = len(controls) + 1
             entry = {"seq": seq, **request.model_dump(exclude_none=True, exclude={"demonstration_id"})}
+            if file_id is not None:
+                entry["file_id"] = file_id
             controls.append(entry)
             await cache.set(controls_key, json.dumps(controls, separators=(",", ":")), ex=DEMONSTRATION_TTL)
             return seq
@@ -532,6 +558,26 @@ async def demonstration_action_labels(
     return labels
 
 
+async def demonstration_file_ids(
+    cache: BaseCache, organization_id: str, demonstration_id: str, event_count: int
+) -> list[str]:
+    events = await asyncio.gather(
+        *(
+            cache.get(demonstration_event_key(organization_id, demonstration_id, seq))
+            for seq in range(1, event_count + 1)
+        )
+    )
+    file_ids: list[str] = []
+    for raw in events:
+        try:
+            event = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(event, dict) and event.get("kind") == "upload" and isinstance(event.get("file_id"), str):
+            file_ids.append(event["file_id"])
+    return file_ids
+
+
 class DemonstrationRecorder:
     def __init__(
         self,
@@ -559,6 +605,9 @@ class DemonstrationRecorder:
         self.sensitive_count = 0
         self.event_limit_reached = False
         self.credential_filled_selectors: set[str] = set()
+        # The page keeps running while a request is open, so later choosers wait their turn.
+        self.file_requests: list[dict[str, Any]] = []
+        self.intercepting_file_chooser = False
         self.started_at = time.monotonic()
         self.recording_ctx = CopilotContext(
             organization_id=organization_id,
@@ -593,8 +642,11 @@ class DemonstrationRecorder:
                 self.page = pages[-1]
             self.tap = PageTap(browser_context, max_events=DEMONSTRATION_MAX_EVENTS)
             await self.tap.start(pages)
-            with contextlib.suppress(Exception):
+            try:
                 await self.tap.set_intercept_file_chooser_dialog(True)
+                self.intercepting_file_chooser = True
+            except Exception:
+                LOG.warning("copilot_demonstration_file_chooser_intercept_failed", exc_info=True)
             await self.stream.send(
                 {
                     "type": "demonstration_started",
@@ -646,6 +698,8 @@ class DemonstrationRecorder:
                     next_refresh = time.monotonic() + DEMONSTRATION_OWNER_REFRESH_SECONDS
                 await asyncio.sleep(DEMONSTRATION_POLL_SECONDS)
         finally:
+            # A credential fill can mint a browser into this context, and no turn finally ends its renewal.
+            end_minted_browser_renewals(self.recording_ctx)
             await finish_shielded(self._stop(reason))
 
     async def _append_event(self, event: dict[str, Any]) -> int | None:
@@ -701,6 +755,14 @@ class DemonstrationRecorder:
             frame["path"] = path
         kind = payload.get("kind")
         selector = payload.get("selector")
+        if kind == "file_click":
+            # With interception on, the chooser this click opens arrives as its own file_chooser event.
+            if not self.intercepting_file_chooser:
+                await self._record_gap_event(event, frame, "file_chooser")
+            return
+        if kind == "file_chooser":
+            await self._request_file(event, frame)
+            return
         if kind == "secret_focus":
             field = payload.get("field")
             await self.stream.send(
@@ -715,11 +777,12 @@ class DemonstrationRecorder:
             )
             return
         event_kind = "secret" if kind in {"secret", "secret_select"} else kind
-        if event_kind not in {"click", "type", "select", "key", "navigate", "secret"}:
-            gap_reason = (
-                "file_chooser" if kind in {"file_click", "upload"} else f"unsupported_event:{kind or 'unknown'}"
-            )
-            await self._record_gap_event(event, frame, gap_reason)
+        # skyvern_drag acts in page space on the top document, so a drag inside a frame cannot be replayed.
+        if kind == "freeform_drag" or (kind == "drag" and not event.is_main_frame):
+            await self._record_gap_event(event, frame, "freeform_drag", label="Drag not recorded")
+            return
+        if event_kind not in {"click", "type", "select", "key", "navigate", "secret", "drag"}:
+            await self._record_gap_event(event, frame, f"unsupported_event:{kind or 'unknown'}")
             return
         source_url = str(payload.get("url") or "") if event.is_main_frame else str(event.page.url or "")
         if event_kind == "navigate":
@@ -733,7 +796,18 @@ class DemonstrationRecorder:
             "source_url": source_url,
             "frame": frame,
         }
-        for key in ("selector", "packet", "value", "key", "url", "field", "field_label", "label"):
+        for key in (
+            "selector",
+            "packet",
+            "target_selector",
+            "target_packet",
+            "value",
+            "key",
+            "url",
+            "field",
+            "field_label",
+            "label",
+        ):
             value = payload.get(key)
             if value is not None and not (event_kind == "secret" and key == "value"):
                 stored[key] = value
@@ -744,10 +818,20 @@ class DemonstrationRecorder:
             if kind == "secret_select":
                 stored["control"] = "select"
                 stored["label"] = "Select a sensitive option"
+            else:
+                field_name = {"password": "password", "totp": "one-time code"}.get(
+                    str(stored.get("field")), "sensitive field"
+                )
+                stored["label"] = f"Fill {field_name} (value not recorded)"
             seq = await self._append_event(stored)
-            if seq is not None and kind == "secret_select":
+            if seq is not None:
                 await self.stream.send(
-                    {"type": "demonstration_action", "seq": seq, "label": stored["label"], "tool_name": "select_option"}
+                    {
+                        "type": "demonstration_action",
+                        "seq": seq,
+                        "label": stored["label"],
+                        "tool_name": "select_option" if kind == "secret_select" else "type_text",
+                    }
                 )
             return
         label = _event_label(stored)
@@ -765,18 +849,36 @@ class DemonstrationRecorder:
                         "select": "select_option",
                         "key": "press_key",
                         "navigate": "navigate_browser",
+                        "drag": "drag",
                     }[event_kind],
                 }
             )
 
-    async def _record_gap_event(self, event: TapEvent, frame: dict[str, Any], reason: str) -> None:
+    async def _request_file(self, event: TapEvent, frame: dict[str, Any]) -> None:
+        described = await self.tap.call_on_file_input(event, _DESCRIBE_FILE_INPUT) if self.tap is not None else None
+        if (
+            not isinstance(described, dict)
+            or not isinstance(described.get("selector"), str)
+            or not described["selector"]
+        ):
+            await self._record_gap_event(event, frame, "file_chooser")
+            return
+        selector = described["selector"]
+        field_label = safe_label(described.get("label")) or "file input"
+        self.file_requests.append({"event": event, "frame": frame, "selector": selector, "field_label": field_label})
+        if len(self.file_requests) == 1:
+            await self.stream.send({"type": "demonstration_file_requested", "label": field_label})
+
+    async def _record_gap_event(
+        self, event: TapEvent, frame: dict[str, Any], reason: str, label: str = "Step not recorded"
+    ) -> None:
         stored = {
             "ts": event.payload.get("ts"),
             "kind": "gap",
             "reason": reason,
             "source_url": (str(event.payload.get("url") or "") if event.is_main_frame else str(event.page.url or "")),
             "frame": frame,
-            "label": "Step not recorded",
+            "label": label,
         }
         seq = await self._append_event(stored)
         if seq is not None:
@@ -797,6 +899,8 @@ class DemonstrationRecorder:
                 await self._run_control_with_owner_heartbeat(self._navigate(entry))
             elif action == "fill_credential":
                 await self._run_control_with_owner_heartbeat(self._fill_credential(entry))
+            elif action == "upload_file":
+                await self._run_control_with_owner_heartbeat(self._upload_file(entry))
         return None
 
     async def _run_control_with_owner_heartbeat(self, control: Awaitable[None]) -> None:
@@ -923,6 +1027,75 @@ class DemonstrationRecorder:
                 }
             )
 
+    async def _upload_file(self, entry: dict[str, Any]) -> None:
+        file_id = entry.get("file_id")
+        if not self.file_requests or self.tap is None:
+            if isinstance(file_id, str):
+                await self._discard_upload(file_id)
+            await self._notice("The page is no longer waiting for a file.", level="error")
+            return
+        request = self.file_requests[0]
+        tap_event: TapEvent = request["event"]
+        field_label = request["field_label"]
+        event = _skipped_upload_event(request)
+        if isinstance(file_id, str):
+            uploaded = None
+            data: bytes | None = None
+            try:
+                uploaded = await app.DATABASE.uploaded_files.get_uploaded_file(
+                    file_id=file_id, organization_id=self.organization_id
+                )
+                if uploaded is not None:
+                    data = await app.STORAGE.download_managed_file(uploaded.storage_uri, self.organization_id)
+            except Exception:
+                # A failed read is the same outcome as a failed attach: the request stays open for a retry.
+                LOG.warning("copilot_demonstration_upload_read_failed", exc_info=True)
+            attached = (
+                uploaded is not None
+                and data is not None
+                and await self.tap.call_on_file_input(
+                    tap_event,
+                    _ATTACH_FILE,
+                    uploaded.filename,
+                    mimetypes.guess_type(uploaded.filename)[0] or "application/octet-stream",
+                    base64.b64encode(data).decode(),
+                )
+                == 1
+            )
+            if not attached or uploaded is None or data is None:
+                await self._discard_upload(file_id)
+                await self._notice("The file could not be attached to the page.", level="error")
+                return
+            event.update(
+                file_id=file_id,
+                filename=uploaded.filename,
+                size_bytes=len(data),
+                label=f'Upload file to "{field_label}"'[:60],
+            )
+        seq = await self._append_event(event)
+        if seq is not None:
+            await self.stream.send(
+                {
+                    "type": "demonstration_action",
+                    "seq": seq,
+                    "label": event["label"],
+                    "tool_name": "upload_attached_file",
+                    **({"file_id": event["file_id"], "filename": event["filename"]} if "file_id" in event else {}),
+                }
+            )
+        self.file_requests.pop(0)
+        if self.file_requests:
+            await self.stream.send(
+                {"type": "demonstration_file_requested", "label": self.file_requests[0]["field_label"]}
+            )
+
+    async def _discard_upload(self, file_id: str) -> None:
+        # The file was stored only for this attach, so nothing else references it once the attach is off.
+        try:
+            await uploaded_file_service.delete_uploaded_file(file_id=file_id, organization_id=self.organization_id)
+        except Exception:
+            LOG.warning("copilot_demonstration_upload_discard_failed", exc_info=True)
+
     async def _notice(self, message: str, *, level: Literal["info", "error"] = "info") -> None:
         await self.stream.send({"type": "demonstration_notice", "message": message, "level": level})
 
@@ -958,6 +1131,10 @@ class DemonstrationRecorder:
                 reason = await self._drain_tap() or reason
             with contextlib.suppress(Exception):
                 await tap.set_intercept_file_chooser_dialog(False)
+        # A request still open at stop was never answered; replay states it rather than dropping the step.
+        for request in self.file_requests:
+            await self._append_event(_skipped_upload_event(request))
+        self.file_requests.clear()
         final_url = str(self.page.url or "") if self.page is not None and not self.page.is_closed() else None
         record_key = demonstration_record_key(self.organization_id, self.demonstration_id)
         event_ttl: timedelta | None = None
@@ -1004,19 +1181,43 @@ class DemonstrationRecorder:
         )
 
 
+def _skipped_upload_event(request: dict[str, Any]) -> dict[str, Any]:
+    tap_event: TapEvent = request["event"]
+    return {
+        "ts": datetime.now(UTC).timestamp() * 1000,
+        "kind": "upload",
+        "selector": request["selector"],
+        "source_url": str(tap_event.page.url or ""),
+        "frame": request["frame"],
+        "field_label": request["field_label"],
+        "label": f'Skip file for "{request["field_label"]}"'[:60],
+    }
+
+
 def safe_label(value: str | None) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(redact_raw_secrets_for_prompt(value).replace('"', "").split())[:200]
 
 
+def _target_label(packet: Any, max_name: int = 200) -> str:
+    role_name = packet.get("role_name") if isinstance(packet, dict) else None
+    if not isinstance(role_name, dict):
+        role_name = {}
+    name = safe_label(role_name.get("accessible_name"))[:max_name].rstrip()
+    if name:
+        return f'"{name}"'
+    return f"an unlabeled {safe_label(role_name.get('role')) or 'item'}"
+
+
 def _event_label(event: dict[str, Any]) -> str:
     kind = event.get("kind")
-    packet = event.get("packet")
-    role_name = packet.get("role_name") if isinstance(packet, dict) else None
-    accessible_name = role_name.get("accessible_name") if isinstance(role_name, dict) else None
     if kind == "click":
-        return f'Click "{safe_label(accessible_name) or "element"}"'[:60]
+        return f"Click {_target_label(event.get('packet'))}"[:60]
+    if kind == "drag":
+        source = _target_label(event.get("packet"), max_name=20)
+        target = _target_label(event.get("target_packet"), max_name=20)
+        return f"Drag {source} to {target}"[:60]
     if kind == "type":
         value = event.get("value")
         text = redact_raw_secrets_for_prompt(value) if isinstance(value, str) else ""

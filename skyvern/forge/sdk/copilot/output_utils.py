@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     append_omission_notice,
     coerce_block_action_observations,
     coerce_block_end_urls,
+    recorded_failure_observation,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     INTERNAL_VALIDATION_FAILURE_PREFIX,
@@ -234,7 +235,7 @@ def _last_envelope_in(text: str) -> dict[str, Any] | None:
 def _text_looks_envelope_shaped(text: str) -> bool:
     # require leading `{` so prose that merely quotes the field names (e.g.,
     # "I see \"type\": \"REPLY\" but cannot find \"user_response\"") falls
-    # through to the plain-text tier instead of degrading to "Done."
+    # through to the plain-text tier instead of degrading to an empty reply.
     return text.startswith("{") and '"user_response"' in text and bool(_TYPE_VALUE_RE.search(text))
 
 
@@ -280,7 +281,7 @@ def parse_final_response(text: str) -> dict[str, Any]:
                 value = None
             if isinstance(value, str):
                 return {"type": sniffed_type, "user_response": value}
-        return {"type": sniffed_type, "user_response": "Done."}
+        return {"type": sniffed_type, "user_response": ""}
 
     return {"type": "REPLY", "user_response": text}
 
@@ -355,19 +356,54 @@ def _compacted(
     return values[-limit:] if keep == "last" else values[:limit]
 
 
-def _compacted_newest_labelled(
-    entries: list[tuple[str, _ItemT]], limit: int, *, field_name: str, notices: list[str]
-) -> list[tuple[str, _ItemT]]:
-    """Keeping the newest entries relies on producers inserting labels in execution order. Name the
-    blocks withheld, so a block this bound dropped is not read as one that recorded nothing."""
-    if len(entries) <= limit:
-        return entries
-    named = _bounded_labelled_names([(label, None) for label, _ in entries[:-limit]])
+def _newest_indexes_preferring(preferred: Sequence[bool], limit: int) -> list[int]:
+    """The ``limit`` newest positions, preferred ones first, back in chronological order."""
+    newest_first = range(len(preferred) - 1, -1, -1)
+    ranked = [index for index in newest_first if preferred[index]] + [
+        index for index in newest_first if not preferred[index]
+    ]
+    return sorted(ranked[:limit])
+
+
+def _compacted_failures_first(values: list[str], limit: int, *, field_name: str, notices: list[str]) -> list[str]:
+    """Keep the newest action observations, a recorded code-block failure ahead of any other."""
+    if len(values) <= limit:
+        return values
+    kept = _newest_indexes_preferring([recorded_failure_observation(value) for value in values], limit)
+    which = "oldest " if kept == list(range(len(values) - limit, len(values))) else ""
     append_omission_notice(
         notices,
-        f"{field_name} shortened at the aggregate packet limit: dropped the oldest block(s) {named}.",
+        f"{field_name} shortened at the aggregate packet limit: {len(values) - limit} {which}item(s) omitted, "
+        "recorded code-block failures kept first.",
     )
-    return entries[-limit:]
+    return [values[index] for index in kept]
+
+
+def _compacted_newest_labelled(
+    entries: list[tuple[str, _ItemT]],
+    limit: int,
+    *,
+    field_name: str,
+    notices: list[str],
+    prefer: Callable[[_ItemT], bool] | None = None,
+) -> list[tuple[str, _ItemT]]:
+    """Keeping the newest entries relies on producers inserting labels in execution order; ``prefer`` keeps its
+    entries ahead of newer ones. Name the blocks withheld, so a dropped block is not read as one that recorded
+    nothing."""
+    if len(entries) <= limit:
+        return entries
+    kept = _newest_indexes_preferring([prefer is not None and prefer(value) for _, value in entries], limit)
+    named = _bounded_labelled_names([(label, None) for index, (label, _) in enumerate(entries) if index not in kept])
+    which = "the oldest " if kept == list(range(len(entries) - limit, len(entries))) else ""
+    append_omission_notice(
+        notices,
+        f"{field_name} shortened at the aggregate packet limit: dropped {which}block(s) {named}.",
+    )
+    return [entries[index] for index in kept]
+
+
+def _reports_a_recorded_failure(observations: list[str]) -> bool:
+    return any(recorded_failure_observation(observation) for observation in observations)
 
 
 def screened_recorded_url(url: str) -> tuple[str | None, str | None]:
@@ -854,6 +890,7 @@ def _compact_block_fact_maps(packet: BuildTestEvidencePacket, notices: list[str]
                     2,
                     field_name="per_block_action_observations",
                     notices=notices,
+                    prefer=_reports_a_recorded_failure,
                 )
             ),
             "omission_notices": notices,
@@ -971,8 +1008,8 @@ def _compact_packet_for_aggregate_limit(
             ),
             "action_observations": [
                 value[:117] + "..." if len(value) > 120 else value
-                for value in _compacted(
-                    packet.action_observations, 2, field_name="action_observations", notices=notices, keep="last"
+                for value in _compacted_failures_first(
+                    packet.action_observations, 2, field_name="action_observations", notices=notices
                 )
             ],
             "observed_block_end_urls": dict(
@@ -984,14 +1021,15 @@ def _compact_packet_for_aggregate_limit(
                 )
             ),
             "per_block_action_observations": {
-                label: _compacted(
-                    values, 1, field_name=f"per_block_action_observations[{label}]", notices=notices, keep="last"
+                label: _compacted_failures_first(
+                    values, 1, field_name=f"per_block_action_observations[{label}]", notices=notices
                 )
                 for label, values in _compacted_newest_labelled(
                     list(packet.per_block_action_observations.items()),
                     2,
                     field_name="per_block_action_observations",
                     notices=notices,
+                    prefer=_reports_a_recorded_failure,
                 )
             },
             "failure": failure,
@@ -1976,9 +2014,9 @@ _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 # Every credential-shaped id prefix in skyvern/forge/sdk/db/id.py, so a new one does
 # not quietly become renderable: cred, the vault/parameter kinds, folders, OAuth,
-# and run credential selections.
+# and run credential selections, plus Copilot's refs for vault logins not saved yet.
 _CREDENTIAL_ID_RE = re.compile(
-    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
+    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|vlogin)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
 )
 # Punctuation an LLM-authored block label may keep. Everything outside this set and
 # the letter/digit categories becomes a space: a whitelist, because any quote-class
@@ -2152,7 +2190,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     if _is_unconfirmed_extension(result):
         return "Requested more browser session time; not confirmed and not retried"
     if not result.get("ok", False):
-        return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
+        message = _extract_failure_message(result)
+        reason = _result_data(result).get("reason")
+        if message == _UNKNOWN_ERROR_SENTINEL and isinstance(reason, str) and reason:
+            message = reason
+        return f"Failed: {_sanitize_failure_text(message)}"
 
     raw_data = result.get("data")
     data = raw_data if isinstance(raw_data, dict) else {}
@@ -2172,17 +2214,33 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return ran
     if tool_name == "list_credentials":
         if data.get("status") == "resolved":
-            credential = data.get("credential")
-            if isinstance(credential, dict):
-                name = credential.get("name")
+            match = data.get("credential")
+            if isinstance(match, dict):
+                name = match.get("name")
                 if isinstance(name, str) and name:
                     safe_name = sanitize_block_label_for_display(name)
                     if safe_name:
                         return f"Found 1 credential: {safe_name}"
                 return "Found 1 credential(s)"
-        return f"Found {data.get('count', 0)} credential(s)"
+        vault_logins = data.get("vault_logins")
+        count = data.get("count", 0) + (len(vault_logins) if isinstance(vault_logins, list) else 0)
+        return f"Found {count} credential(s)"
     if tool_name == "list_integrations":
-        return f"Found {data.get('count', 0)} connected integration(s)"
+        entries = data.get("integrations")
+        connected = (
+            sum(
+                1
+                for entry in entries
+                if isinstance(entry, dict)
+                and any(
+                    isinstance(account, dict) and account.get("state") == "active"
+                    for account in entry.get("accounts") or []
+                )
+            )
+            if isinstance(entries, list)
+            else 0
+        )
+        return f"Listed {data.get('count', 0)} integration(s), {connected} with an active account"
     if tool_name == "read_google_sheet":
         rows = data.get("connections")
         opened = (
@@ -2210,9 +2268,10 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         executed = _joined_block_labels(raw_executed, block_label, cap=for_display)
         status = data.get("overall_status", "?")
         requested = data.get("requested_block_labels") or []
-        if requested and raw_executed and list(raw_executed) != list(requested):
+        planned = data.get("planned_block_labels") or raw_executed
+        if requested and planned and list(planned) != list(requested):
             skipped = _joined_block_labels(
-                [label for label in requested if label not in set(raw_executed)], block_label, cap=for_display
+                [label for label in requested if label not in set(planned)], block_label, cap=for_display
             )
             suffix = f" (skipped prefix from cache: {skipped})" if skipped else ""
             return f"Run {executed}: {status}{suffix}"
@@ -2250,6 +2309,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"Selected '{data.get('value', '?')}'"
     if tool_name == "press_key":
         return f"Pressed '{data.get('key', '?')}'"
+    if tool_name == "drag":
+        return f"Dragged {data.get('source_selector', '?')} to {data.get('target_selector', '?')}"
     if tool_name == "discover_workflow_entrypoint":
         candidate_url = data.get("candidate_url")
         if isinstance(candidate_url, str) and candidate_url:
@@ -2271,6 +2332,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return f"Extended the browser session by {result.get('granted_minutes')} minutes"
     if tool_name == "upload_attached_file":
         return f"Placed {result.get('filename')} ({result.get('size_bytes')} bytes) in the page's file input"
+    if tool_name == "read_attached_pdf":
+        end = result.get("next_offset") or result.get("total_chars")
+        return (
+            f"Read characters {result.get('offset')}-{end} of {result.get('total_chars')} from {result.get('filename')}"
+        )
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0
@@ -2320,7 +2386,12 @@ def summarize_tool_result_detail(
     return _sanitize_failure_text(failure_message, max_chars=max_chars)
 
 
-_JINJA_ERROR_MARKERS: tuple[str, ...] = ("Failed to format jinja", "Jinja style parameter")
+_JINJA_ERROR_MARKERS: tuple[str, ...] = (
+    "Failed to format jinja",
+    "Jinja style parameter",
+    "Failed to resolve templates:",
+    "Failed to evaluate while-loop condition:",
+)
 # Markers are matched against a lower-cased copy of the error.
 _ENGINE_INSTRUCTION_MARKERS: tuple[str, ...] = (
     "invalid selector:",

@@ -69,6 +69,8 @@ export class TabScope {
     this.sendEvent = sendEvent;
     this.onScopeChange = onScopeChange;
     this.scopedTabIds = new Set();
+    this.scopeAdmissions = new Map();
+    this.pendingReleases = new Map();
     this.quarantinedTabIds = new Set();
     this.scopedGroupIds = new Map();
     this.createdTabIds = new Set();
@@ -157,6 +159,7 @@ export class TabScope {
   }
 
   notifyScopeChange(tabId, scoped) {
+    if (!scoped) this.debuggerRouter?.clearCommandFence?.(tabId);
     try {
       this.onScopeChange?.(tabId, scoped);
     } catch {}
@@ -183,6 +186,7 @@ export class TabScope {
     for (const tabId of storedIds) {
       if (Number.isInteger(tabId) && tabId >= 0) {
         this.scopedTabIds.add(tabId);
+        this.recordScopeAdmission(tabId);
       }
     }
     for (const tabId of storedCreatedIds) {
@@ -311,6 +315,34 @@ export class TabScope {
 
   isScoped(tabId) {
     return this.scopedTabIds.has(tabId);
+  }
+
+  recordScopeAdmission(tabId) {
+    this.scopeAdmissions.set(tabId, (this.scopeAdmissions.get(tabId) ?? 0) + 1);
+    this.pendingReleases.delete(tabId);
+  }
+
+  scopeAdmission(tabId) {
+    return this.scopeAdmissions.get(tabId) ?? 0;
+  }
+
+  beginRelease(tabId) {
+    const token = Symbol("release");
+    const releases = this.pendingReleases.get(tabId) ?? new Set();
+    releases.add(token);
+    this.pendingReleases.set(tabId, releases);
+    this.debuggerRouter?.cancelRecovery?.(tabId);
+    return token;
+  }
+
+  endRelease(tabId, token) {
+    const releases = this.pendingReleases.get(tabId);
+    releases?.delete(token);
+    if (releases?.size === 0) this.pendingReleases.delete(tabId);
+  }
+
+  isReleasePending(tabId) {
+    return this.pendingReleases.has(tabId);
   }
 
   isQuarantined(tabId) {
@@ -478,17 +510,22 @@ export class TabScope {
   }
 
   async unshareTab(tabId) {
-    await this.ready;
     const validTabId = requireTabId(tabId);
-    return this.runTabOperation(validTabId, async (lease) => {
-      if (this.activeCreation?.tabId === validTabId) {
-        this.activeCreation.lease.cancel(creationError());
-      }
-      await this.assertScoped(validTabId);
-      lease.assertCurrent();
-      await this.removeFromScopeLocked(validTabId, "unshared", true, lease);
-      return {};
-    });
+    const release = this.beginRelease(validTabId);
+    try {
+      await this.ready;
+      return await this.runTabOperation(validTabId, async (lease) => {
+        if (this.activeCreation?.tabId === validTabId) {
+          this.activeCreation.lease.cancel(creationError());
+        }
+        await this.assertScoped(validTabId);
+        lease.assertCurrent();
+        await this.removeFromScopeLocked(validTabId, "unshared", true, lease);
+        return {};
+      });
+    } finally {
+      this.endRelease(validTabId, release);
+    }
   }
 
   async create(args) {
@@ -576,6 +613,7 @@ export class TabScope {
         // One synchronous publication point. No failing work follows this commit.
         this.recordCreationOwnershipTransfer(tab.id);
         this.scopedTabIds.add(tab.id);
+        this.recordScopeAdmission(tab.id);
         this.quarantinedTabIds.delete(tab.id);
         creation.committed = true;
         try {
@@ -834,68 +872,73 @@ export class TabScope {
   async remove(args) {
     const values = requireArgs(args);
     const tabId = requireTabId(values.tabId);
-    return this.runTabOperation(tabId, async (lease) => {
-      const created = this.createdTabIds.has(tabId);
-      if (this.scopedTabIds.has(tabId)) {
-        await this.assertControllableLocked(tabId, lease);
-      } else if (!created) {
-        throw new ProtocolError(
-          ERROR_CODES.TAB_NOT_SCOPED,
-          "The requested tab is not shared.",
-        );
-      }
-      if (this.quarantinedTabIds.has(tabId)) {
-        throw new ProtocolError(
-          ERROR_CODES.COMMAND_TIMEOUT,
-          "The requested tab is still being reconciled after reset.",
-        );
-      }
-      this.quarantinedTabIds.add(tabId);
-      lease.assertCurrent();
-      let removePromise;
-      try {
-        removePromise = chrome.tabs.remove(tabId);
-      } catch (error) {
-        this.quarantinedTabIds.delete(tabId);
-        throw error;
-      }
-      const trackedRemove = Promise.resolve(removePromise).finally(() => {
-        this.quarantinedTabIds.delete(tabId);
-      });
-      void trackedRemove.catch(() => undefined);
-      try {
-        await trackedRemove;
-      } catch {
-        if (!this.scopedTabIds.has(tabId)) {
-          if (created) {
-            try {
-              await chrome.tabs.get(tabId);
-            } catch {
-              this.createdTabIds.delete(tabId);
-              await this.persistScope();
-              return {};
-            }
-            throw new ProtocolError(
-              ERROR_CODES.INTERNAL,
-              "Chrome could not close the created tab.",
-            );
-          }
-          return {};
+    const release = this.beginRelease(tabId);
+    try {
+      return await this.runTabOperation(tabId, async (lease) => {
+        const created = this.createdTabIds.has(tabId);
+        if (this.scopedTabIds.has(tabId)) {
+          await this.assertControllableLocked(tabId, lease);
+        } else if (!created) {
+          throw new ProtocolError(
+            ERROR_CODES.TAB_NOT_SCOPED,
+            "The requested tab is not shared.",
+          );
         }
-        throw new ProtocolError(
-          ERROR_CODES.TAB_NOT_FOUND,
-          "The requested tab was not found.",
-        );
-      }
-      lease.assertCurrent();
-      this.createdTabIds.delete(tabId);
-      if (this.scopedTabIds.has(tabId)) {
-        await this.removeFromScopeLocked(tabId, "closed", false, lease);
-      } else {
-        await this.persistScope(lease);
-      }
-      return {};
-    });
+        if (this.quarantinedTabIds.has(tabId)) {
+          throw new ProtocolError(
+            ERROR_CODES.COMMAND_TIMEOUT,
+            "The requested tab is still being reconciled after reset.",
+          );
+        }
+        this.quarantinedTabIds.add(tabId);
+        lease.assertCurrent();
+        let removePromise;
+        try {
+          removePromise = chrome.tabs.remove(tabId);
+        } catch (error) {
+          this.quarantinedTabIds.delete(tabId);
+          throw error;
+        }
+        const trackedRemove = Promise.resolve(removePromise).finally(() => {
+          this.quarantinedTabIds.delete(tabId);
+        });
+        void trackedRemove.catch(() => undefined);
+        try {
+          await trackedRemove;
+        } catch {
+          if (!this.scopedTabIds.has(tabId)) {
+            if (created) {
+              try {
+                await chrome.tabs.get(tabId);
+              } catch {
+                this.createdTabIds.delete(tabId);
+                await this.persistScope();
+                return {};
+              }
+              throw new ProtocolError(
+                ERROR_CODES.INTERNAL,
+                "Chrome could not close the created tab.",
+              );
+            }
+            return {};
+          }
+          throw new ProtocolError(
+            ERROR_CODES.TAB_NOT_FOUND,
+            "The requested tab was not found.",
+          );
+        }
+        lease.assertCurrent();
+        this.createdTabIds.delete(tabId);
+        if (this.scopedTabIds.has(tabId)) {
+          await this.removeFromScopeLocked(tabId, "closed", false, lease);
+        } else {
+          await this.persistScope(lease);
+        }
+        return {};
+      });
+    } finally {
+      this.endRelease(tabId, release);
+    }
   }
 
   async activate(args) {
@@ -1111,24 +1154,29 @@ export class TabScope {
   }
 
   async handleTabRemoved(tabId) {
-    await this.ready;
-    this.pendingAdoptions.delete(tabId);
-    await this.runTabOperation(
-      tabId,
-      async (lease) => {
-        lease.assertCurrent();
-        this.expectedGroupTransitions.delete(tabId);
-        const ownershipChanged = this.createdTabIds.delete(tabId);
-        this.quarantinedTabIds.delete(tabId);
-        if (this.scopedTabIds.has(tabId)) {
-          await this.removeFromScopeLocked(tabId, "closed", false, lease);
-        } else if (ownershipChanged) {
-          await this.persistScope(lease);
-        }
-      },
-      this.operationGeneration,
-      false,
-    );
+    const release = this.beginRelease(tabId);
+    try {
+      await this.ready;
+      this.pendingAdoptions.delete(tabId);
+      await this.runTabOperation(
+        tabId,
+        async (lease) => {
+          lease.assertCurrent();
+          this.expectedGroupTransitions.delete(tabId);
+          const ownershipChanged = this.createdTabIds.delete(tabId);
+          this.quarantinedTabIds.delete(tabId);
+          if (this.scopedTabIds.has(tabId)) {
+            await this.removeFromScopeLocked(tabId, "closed", false, lease);
+          } else if (ownershipChanged) {
+            await this.persistScope(lease);
+          }
+        },
+        this.operationGeneration,
+        false,
+      );
+    } finally {
+      this.endRelease(tabId, release);
+    }
   }
 
   async handleTabAttached(tabId) {
@@ -1327,6 +1375,7 @@ export class TabScope {
     }
     this.recordCreationOwnershipTransfer(tab.id);
     this.scopedTabIds.add(tab.id);
+    this.recordScopeAdmission(tab.id);
     try {
       await this.persistScope(lease);
       lease?.assertCurrent();
@@ -1363,6 +1412,7 @@ export class TabScope {
     }
     this.recordCreationOwnershipTransfer(tab.id);
     this.scopedTabIds.add(tab.id);
+    this.recordScopeAdmission(tab.id);
     this.scopedGroupIds.set(tab.id, groupId);
     await this.persistScope(lease);
     lease?.assertCurrent();

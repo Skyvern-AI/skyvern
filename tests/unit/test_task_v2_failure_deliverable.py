@@ -3,12 +3,15 @@ mark_task_v2_as_* terminal transitions refuse to overwrite a status that is alre
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
+from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.services import task_v2_service
 
 
@@ -151,6 +154,64 @@ async def test_mark_task_v2_as_canceled_keeps_prior_terminal_status(monkeypatch:
 
 
 @pytest.mark.asyncio
+async def test_mark_task_v2_as_canceled_finishes_propagation_before_request_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    running = _FakeTaskV2()
+    canceled = _FakeTaskV2()
+    canceled.status = TaskV2Status.canceled
+    reads = 0
+    transition_recorded = False
+
+    async def get_task_v2_impl(*_: object, **__: object) -> _FakeTaskV2:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return running
+        assert transition_recorded
+        return canceled
+
+    get_task_v2 = AsyncMock(side_effect=get_task_v2_impl)
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "get_task_v2", get_task_v2)
+    status_update = AsyncMock(return_value=True)
+    monkeypatch.setattr(task_v2_service.app.DATABASE.observer, "update_task_v2_status_if_not_final", status_update)
+    cancel_workflow = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_canceled", cancel_workflow)
+    send_webhook = AsyncMock()
+    monkeypatch.setattr(task_v2_service, "send_task_v2_webhook", send_webhook)
+    audit_started = asyncio.Event()
+    audit_release = asyncio.Event()
+
+    async def record_transition() -> None:
+        nonlocal transition_recorded
+        audit_started.set()
+        await audit_release.wait()
+        transition_recorded = True
+        raise asyncio.CancelledError
+
+    audit_actor = SimpleNamespace()
+    cancellation = asyncio.create_task(
+        task_v2_service.mark_task_v2_as_canceled(
+            task_v2_id="tsk_v2_test",
+            workflow_run_id="wr_test",
+            organization_id="o_test",
+            on_transition=record_transition,
+            audit_actor=audit_actor,
+        )
+    )
+    await audit_started.wait()
+    cancellation.cancel()
+    audit_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cancellation
+    cancel_workflow.assert_awaited_once_with("wr_test")
+    send_webhook.assert_awaited_once_with(canceled)
+    assert status_update.await_args is not None
+    assert status_update.await_args.kwargs["audit_actor"] is audit_actor
+
+
+@pytest.mark.asyncio
 async def test_mark_task_v2_as_failed_redrives_prior_terminal_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """The generic failure handler must not turn a canceled task into a failed one, but the canceled writer it
     reached may have died before its run write or webhook, so that writer is re-driven."""
@@ -215,5 +276,37 @@ async def test_mark_task_v2_as_failed_redrive_keeps_termination_metadata(monkeyp
     )
 
     terminate_run.assert_awaited_once_with(
-        "wr_test", "late failure", failure_category=[{"category": "unreachable_goal"}]
+        "wr_test", "late failure", failure_category=[{"category": "unreachable_goal"}], _on_terminal_write=ANY
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_codes", "fails_run"), [(["browser_connection_lost"], True), ([], False)], ids=["browser_lost", "other"]
+)
+async def test_failed_block_stops_the_planner_only_when_the_browser_was_lost(
+    monkeypatch: pytest.MonkeyPatch, error_codes: list[str], fails_run: bool
+) -> None:
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_failed_if_not_final", mark_failed)
+    monkeypatch.setattr(task_v2_service.app.WORKFLOW_SERVICE, "get_workflow_run", AsyncMock())
+    block = SimpleNamespace(block_type=BlockType.NAVIGATION, label="nav", continue_on_failure=True)
+    result = BlockResult(
+        success=False,
+        output_parameter=MagicMock(),
+        status=BlockStatus.failed,
+        failure_reason="Browser state page is missing.",
+        error_codes=error_codes,
+        can_continue_after_failure=not error_codes,
+    )
+
+    await task_v2_service.handle_block_result(
+        "tsk_v2_test",
+        block,  # type: ignore[arg-type]
+        result,
+        MagicMock(),
+        SimpleNamespace(workflow_run_id="wr_test", organization_id="o_test"),  # type: ignore[arg-type]
+        is_last_block=False,
+    )
+
+    assert mark_failed.await_count == (1 if fails_run else 0)

@@ -24,6 +24,7 @@ import {
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import {
   clearDeferredEdits,
   deferredEdits,
@@ -65,7 +66,6 @@ import { stringify as toYaml } from "yaml";
 
 import type { BlockYAML } from "@/routes/workflows/types/workflowYamlTypes";
 import { snapshotOf } from "@/routes/workflows/editor/workflowChangesSummary";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import {
   SaveRefusedError,
   SaveStaleError,
@@ -392,6 +392,7 @@ function renderSaveButton() {
 // list. Each case here has `contentDirty` stale-false to exercise that gap.
 describe("SaveButton confirmation gating", () => {
   afterEach(() => {
+    useCopilotProposalStore.setState({ proposal: null });
     useWorkflowSnapshotStore.getState().clearSnapshot();
     useWorkflowHasChangesStore.setState({
       getSaveData: () => null,
@@ -405,7 +406,6 @@ describe("SaveButton confirmation gating", () => {
       authoringInProgress: false,
       copilotAcceptance: null,
     });
-    useRecordingStore.setState({ isRecording: false });
   });
 
   test.each([
@@ -444,6 +444,23 @@ describe("SaveButton confirmation gating", () => {
       expect(save.matches(":disabled")).toBe(false);
     },
   );
+
+  test("disables Save while the Doc has a pending Copilot proposal", () => {
+    useCopilotProposalStore.setState({ proposal: {} as never });
+
+    renderSaveButton();
+    const save = screen.getByRole("button", {
+      name: "Save workflow",
+      description: "Resolve the Copilot proposal before saving.",
+    });
+    expect(save.matches(":disabled")).toBe(true);
+
+    fireEvent.click(save);
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+
+    act(() => useCopilotProposalStore.setState({ proposal: null }));
+    expect(save.matches(":disabled")).toBe(false);
+  });
 
   test("confirms a dirty draft even when contentDirty is stale-false", () => {
     const clean = saveData([block("a", { url: "x" })]);
@@ -693,7 +710,6 @@ describe("TitleSection title link + edit affordance", () => {
     });
     useWorkflowTitleStore.setState({ title: "My Workflow" });
     useWorkflowHasChangesStore.setState({ hasChanges: false });
-    useRecordingStore.setState({ isRecording: false });
   });
 
   function AutoTitleGenerator() {

@@ -150,7 +150,9 @@ function OnePasswordCredentialsList({ search, folderId }: Props) {
   const hasOrganizationAccount =
     data?.configured && data.source === "organization";
   const hasImportableItems = (data?.items ?? []).some(
-    (item) => !importedKeys.has(JSON.stringify([item.vault_id, item.item_id])),
+    (item) =>
+      item.importable !== false &&
+      !importedKeys.has(JSON.stringify([item.vault_id, item.item_id])),
   );
   const canImport =
     hasOrganizationAccount &&

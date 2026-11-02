@@ -1576,10 +1576,7 @@ async def test_client_enrollment_proceeds_when_extension_disconnects_during_rese
 
 
 @pytest.mark.asyncio
-async def test_late_extension_reconnect_is_reset_before_successor_sees_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(broker_server_module, "EXTENSION_RESET_TIMEOUT_SECONDS", 0.01)
+async def test_late_extension_reconnect_is_reset_before_successor_sees_snapshot() -> None:
     server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
     relay = ControlledResetRelay(
         "extension-secret",
@@ -1847,7 +1844,7 @@ async def test_reset_send_deadline_surfaces_structured_timeout(
 
 @pytest.mark.asyncio
 async def test_owner_release_allows_reenrollment_while_timed_out_request_awaits_terminal() -> None:
-    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), time_source=_frozen_broker_clock)
     relay = ExtensionRelayServer(
         "extension-secret",
         19777,
@@ -2478,7 +2475,7 @@ async def test_retained_timed_out_extension_requests_remain_bounded(
     limit_name: str,
 ) -> None:
     monkeypatch.setattr(broker_server_module, limit_name, 1)
-    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), time_source=_frozen_broker_clock)
     relay = ExtensionRelayServer(
         "extension-secret",
         19777,
@@ -2561,7 +2558,7 @@ async def test_retained_timed_out_extension_requests_remain_bounded(
 async def test_retained_timed_out_request_holds_inbound_bytes_until_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), time_source=_frozen_broker_clock)
     relay = ExtensionRelayServer(
         "extension-secret",
         19777,
@@ -2624,7 +2621,7 @@ async def test_retained_timed_out_requests_enforce_per_tab_limit_until_terminal(
 ) -> None:
     monkeypatch.setattr(broker_server_module, "MAX_REQUESTS_PER_TAB", 1)
     monkeypatch.setattr(broker_server_module, "TAB_REQUEST_QUEUE_WAIT_SECONDS", 0.01)
-    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), time_source=_frozen_broker_clock)
     relay = ExtensionRelayServer(
         "extension-secret",
         19777,
@@ -4741,6 +4738,7 @@ async def test_client_output_watchdog_global_cap_and_bounded_stop(monkeypatch: p
     assert any(event == "browser_extension_client_output_global_cap" for event, _fields in logs)
 
     monkeypatch.setattr(broker_server_module, "MAX_GLOBAL_OUTPUT_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(broker_server_module, "BROKER_DRAINING_SEND_TIMEOUT_SECONDS", 0.05)
     stop_server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
     stop_connection = _ClientConnection(
         "never-drains",
@@ -4986,6 +4984,12 @@ async def test_daemon_auto_enable_reports_unsafe_journal_without_touching_legacy
 
 async def _ignore_event(_event: str, _params: dict) -> None:
     return None
+
+
+def _frozen_broker_clock() -> float:
+    # Frozen so a runner stall before forwarding cannot expire a short request; the relay still
+    # times it out on real time.
+    return 0.0
 
 
 async def _eventually(predicate: Callable[[], bool]) -> None:

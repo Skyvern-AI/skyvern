@@ -122,9 +122,14 @@ def test_compare_text_never_accepts_extra_or_missing_alphanumerics() -> None:
         ("(555) 000-1234", "+5 550001234", EntryMatch.PLUS_ADDED),
         ("(555) 000-1234", "+(555) 000-1234", EntryMatch.PLUS_ADDED),
         ("004455500012", "+004455500012", EntryMatch.PLUS_ADDED),
+        # A field that groups digits with a no-break space.
+        ("5550001234", "+55\u00a050001234", EntryMatch.PLUS_ADDED),
+        ("5550001234", "+55\u202f50001234", EntryMatch.PLUS_ADDED),
         # The fix: the number retyped with its country code, regrouped by the field.
         ("+1 5550001234", "+1 555 000 1234", EntryMatch.REFORMATTED),
         ("+44 20 0000 1234", "+442000001234", EntryMatch.REFORMATTED),
+        ("+1 5550001234", "+1\u00a0555\u00a0000\u00a01234", EntryMatch.REFORMATTED),
+        ("\uff0b15551234567", "+1 (555) 123-4567", EntryMatch.REFORMATTED),
         # A decimal point still decides first, with "+" on both sides.
         ("+15.00", "+1500", EntryMatch.DIFFERENT),
         ("+1.5", "+15", EntryMatch.DIFFERENT),
@@ -132,6 +137,7 @@ def test_compare_text_never_accepts_extra_or_missing_alphanumerics() -> None:
         ("1500", "+1500", EntryMatch.DIFFERENT),
         # A country code the page added is not the same digits.
         ("5550001234", "+1 555 000 1234", EntryMatch.DIFFERENT),
+        ("5550001234", "+1\u00a0555\u00a0000\u00a01234", EntryMatch.DIFFERENT),
         # A mask placeholder is not a held value, with or without the picker's code left in it.
         ("5550001234", "(___) ___-____", EntryMatch.NOT_HELD),
         ("09/05/2026", "__/__/____", EntryMatch.NOT_HELD),

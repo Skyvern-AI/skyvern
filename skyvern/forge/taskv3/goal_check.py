@@ -142,10 +142,10 @@ class GoalVerdict:
     latency_s: float
 
 
-def goal_check_eligible(*, page_free: bool, completion_blocker_present: bool, extraction_requested: bool) -> bool:
-    """Blocks that verify their own completion (page-free validation, a download gate, the
-    missing-extraction veto) are left to that verifier."""
-    return not page_free and not completion_blocker_present and not extraction_requested
+def goal_check_eligible(*, page_free: bool, download_gated: bool, extraction_requested: bool) -> bool:
+    """Blocks with their own completion check (page-free validation, the missing-extraction veto) and download
+    blocks, whose outcome is a file the page-reading judges cannot see, get no goal judge."""
+    return not page_free and not download_gated and not extraction_requested
 
 
 def _truncate_result(text: str) -> str:

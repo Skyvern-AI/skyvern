@@ -175,7 +175,7 @@ def _usage(*, requests: int = 1, input_tokens: int = 0, output_tokens: int = 0) 
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=input_tokens + output_tokens,
-        input_tokens_details=InputTokensDetails(cached_tokens=0),
+        input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
         output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
     )
 

@@ -28,6 +28,8 @@ from skyvern.forge.sdk.artifact.signing import (
 )
 from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 
+pytestmark = pytest.mark.usefixtures("public_dns")
+
 
 class _FakeDownloadResponse:
     def __init__(

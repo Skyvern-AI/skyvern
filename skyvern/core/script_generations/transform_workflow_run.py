@@ -6,6 +6,7 @@ import structlog
 
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
@@ -169,6 +170,7 @@ def _process_forloop_children(
             loop_block_dump = loop_block_def.model_dump()
         else:
             loop_block_dump = dict(loop_block_def)
+        loop_block_dump = strip_inert_block_fields(loop_block_dump)
         loop_block_label = loop_block_dump.get("label")
 
         child_run_block = child_run_blocks_by_label.get(loop_block_label) if loop_block_label else None
@@ -250,7 +252,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
     )
     if not workflow:
         raise ValueError(f"Workflow {run_request.workflow_id} not found")
-    workflow_json = workflow.model_dump()
+    workflow_json = strip_inert_block_fields(workflow.model_dump())
 
     # get the original workflow definition blocks (with templated information)
     workflow_definition_blocks = workflow.workflow_definition.blocks
@@ -331,7 +333,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         final_dump = {}
         if run_block:
             # Start with the original templated definition block
-            final_dump = definition_block.model_dump()
+            final_dump = strip_inert_block_fields(definition_block.model_dump())
         else:
             # the run_block is not a top level block - for now we will skip non top level blocks, like any blocks defined inside a loop block
             continue

@@ -186,6 +186,7 @@ export function useGoogleOAuthCredentials({
     isLoading,
     isFetching,
     error,
+    refetch: refetchCredentials,
   } = useQuery<GoogleOAuthCredential[]>({
     queryKey: includeEmail
       ? ["googleOAuthCredentials", "includeEmail"]
@@ -343,6 +344,7 @@ export function useGoogleOAuthCredentials({
     isLoading,
     isFetching,
     error,
+    refetchCredentials,
     startAuthorize: authorizeMutation.mutateAsync,
     isStartingAuthorize: authorizeMutation.isPending,
     submitOAuthCallback: oauthCallbackMutation.mutate,

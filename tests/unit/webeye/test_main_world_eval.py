@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+import types
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,6 +12,7 @@ import pytest
 from skyvern.webeye.main_world_eval import (
     clear_main_world_prefix,
     configure_main_world_prefix,
+    default_evaluate_to_main_world,
     evaluate_in_main_world,
     get_main_world_prefix,
 )
@@ -522,3 +526,54 @@ class TestPrefixRegistry:
     def test_get_returns_none_when_unconfigured(self) -> None:
         context = _MockBrowserContext()
         assert get_main_world_prefix(context) is None
+
+
+class TestDefaultEvaluateToMainWorld:
+    @staticmethod
+    def _driver(monkeypatch: pytest.MonkeyPatch, *, offers_isolated_context: bool) -> tuple[Any, Any, list[Any]]:
+        received: list[Any] = []
+        api = types.ModuleType("fake_driver_api")
+
+        class IsolatedByDefaultPage:
+            async def evaluate(self, expression: str, arg: Any = None, *, isolated_context: bool = True) -> None:
+                received.append(isolated_context)
+
+        class MainWorldOnlyPage:
+            async def evaluate(self, expression: str, arg: Any = None) -> None:
+                received.append("no-option")
+
+        class Playwright:
+            pass
+
+        page_class = IsolatedByDefaultPage if offers_isolated_context else MainWorldOnlyPage
+        Playwright.__module__ = api.__name__
+        api.Page = page_class  # type: ignore[attr-defined]
+        api.Playwright = Playwright  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, api.__name__, api)
+        return Playwright(), page_class, received
+
+    @pytest.mark.asyncio
+    async def test_isolated_by_default_driver_defaults_to_main_world_and_keeps_an_explicit_choice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        driver, page_class, received = self._driver(monkeypatch, offers_isolated_context=True)
+        original = page_class.evaluate
+
+        default_evaluate_to_main_world(driver)
+        default_evaluate_to_main_world(driver)
+        await page_class().evaluate("() => 1")
+        await page_class().evaluate("() => 1", None, isolated_context=True)
+
+        assert received == [False, True]
+        assert page_class.evaluate.__wrapped__ is original
+
+    @pytest.mark.asyncio
+    async def test_driver_without_the_option_is_left_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        driver, page_class, received = self._driver(monkeypatch, offers_isolated_context=False)
+        original = page_class.evaluate
+
+        default_evaluate_to_main_world(driver)
+        await page_class().evaluate("() => 1")
+
+        assert page_class.evaluate is original
+        assert received == ["no-option"]

@@ -73,7 +73,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
     WorkflowCopilotStreamMessageType,
 )
-from tests.unit.copilot_test_helpers import FakeCopilotStream, ScriptedModel, scripted_call, scripted_text
+from tests.unit.copilot_test_helpers import (
+    FakeCopilotStream,
+    ScriptedModel,
+    scripted_call,
+    scripted_text,
+    tool_called_event,
+    tool_output_event,
+)
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -217,20 +224,8 @@ def _item_done_event(output_index: int, name: str, arguments: str, item_id: str 
     )
 
 
-def _tool_called_event(
-    call_id: str, name: str, arguments: str = "{}", agent: Agent[Any] | None = None
-) -> RunItemStreamEvent:
-    call_item = MagicMock(spec=RunItem)
-    call_item.raw_item = {"call_id": call_id, "name": name, "arguments": arguments}
-    call_item.agent = agent or Agent(name="no-tools")
-    return RunItemStreamEvent(name="tool_called", item=call_item)
-
-
 def _tool_output_event(call_id: str, ok: bool = True, block_count: int = 2) -> RunItemStreamEvent:
-    out_item = MagicMock(spec=RunItem)
-    out_item.raw_item = {"call_id": call_id}
-    out_item.output = [{"type": "text", "text": json.dumps({"ok": ok, "data": {"block_count": block_count}})}]
-    return RunItemStreamEvent(name="tool_output", item=out_item)
+    return tool_output_event(call_id, {"ok": ok, "data": {"block_count": block_count}})
 
 
 def _new_ctx() -> CopilotContext:
@@ -262,7 +257,7 @@ def _fixture_pending_identity(ctx: Any) -> None:
 async def test_tool_activity_entries_share_the_clock_read_of_their_sse_update() -> None:
     result = MagicMock()
     result.stream_events = lambda: _stream_events_from(
-        _tool_called_event("c1", "update_workflow"),
+        tool_called_event("c1", "update_workflow"),
         _tool_output_event("c1"),
     )
     result.cancel = MagicMock()
@@ -827,16 +822,16 @@ async def test_a_stored_work_plan_outlives_its_row_being_capped_away() -> None:
         event
         for index in range(MAX_DESIGN_ACTIVITY_ENTRIES)
         for event in (
-            _tool_called_event(f"f{index}", "evaluate"),
+            tool_called_event(f"f{index}", "evaluate"),
             tool_output(f"f{index}", {"ok": True}),
         )
     ]
     result = MagicMock()
     result.stream_events = lambda: _stream_events_from(
-        _tool_called_event("p1", "set_work_plan"),
+        tool_called_event("p1", "set_work_plan"),
         tool_output("p1", {"ok": True, "items": plan}),
         # A refused write echoes the plan still in force; it is not a new plan.
-        _tool_called_event("p2", "set_work_plan"),
+        tool_called_event("p2", "set_work_plan"),
         tool_output("p2", {"ok": False, "error": "too long", "items": ["something else"]}),
         *filler,
     )
@@ -876,9 +871,9 @@ async def test_browser_code_steps_ride_the_result_event_and_its_saved_row() -> N
     operations = [{"operation": "goto", "status": "ok"}, {"operation": "click", "status": "ok", "selector": "#next"}]
     result = MagicMock()
     result.stream_events = lambda: _stream_events_from(
-        _tool_called_event("b1", "run_browser_code"),
+        tool_called_event("b1", "run_browser_code"),
         tool_output("b1", {"ok": True, "operations": operations}),
-        _tool_called_event("b2", "run_browser_code"),
+        tool_called_event("b2", "run_browser_code"),
         tool_output("b2", {"ok": False, "error": "boom", "operations": operations}),
     )
     result.cancel = MagicMock()
@@ -910,9 +905,9 @@ async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() 
 
     result = MagicMock()
     result.stream_events = lambda: _stream_events_from(
-        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
         _tool_output_event("c1"),
-        _tool_called_event("c2", "inspect_page_for_composition"),
+        tool_called_event("c2", "inspect_page_for_composition"),
         _tool_output_event("c2"),
     )
     result.cancel = MagicMock()
@@ -944,6 +939,70 @@ async def test_a_stashed_write_diff_rides_one_result_and_no_later_foreign_one() 
 
 
 @pytest.mark.asyncio
+async def test_each_parallel_run_row_carries_only_its_own_runs_input_sources() -> None:
+    first = [{"key": "query", "source": "earlier_run", "sourceRunId": "wr_origin"}]
+    second = [{"key": "query", "source": "copilot"}, {"key": "login", "source": "placeholder"}]
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(
+        tool_called_event("r1", "update_and_run_blocks"),
+        tool_called_event("r2", "run_blocks_and_collect_debug"),
+        tool_called_event("r3", "run_blocks_and_collect_debug"),
+        tool_output_event("r2", {"ok": True, "data": {"workflow_run_id": "wr_2"}}),
+        tool_output_event("r1", {"ok": True, "data": {"workflow_run_id": "wr_1"}}),
+        tool_output_event("r3", {"ok": True, "data": {"workflow_run_id": "wr_3"}}),
+    )
+    result.cancel = MagicMock()
+    stream = FakeCopilotStream()
+    ctx = _test_copilot_context(
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        pending_test_inputs={"wr_1": first, "wr_2": second, "wr_3": []},
+    )
+
+    await stream_to_sse(result, stream, ctx)
+
+    frames = {
+        p.tool_call_id: p
+        for p in stream.sent
+        if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT
+    }
+    assert frames["r1"].test_inputs == first
+    assert frames["r2"].test_inputs == second
+    assert frames["r3"].test_inputs is None
+    rows = {row["id"]: row for row in ctx.narrator_state.design_activity if row["id"].startswith("tr-")}
+    assert (rows["tr-r1"]["workflowRunId"], rows["tr-r1"]["testInputs"]) == ("wr_1", first)
+    assert (rows["tr-r2"]["workflowRunId"], rows["tr-r2"]["testInputs"]) == ("wr_2", second)
+    assert rows["tr-r3"]["workflowRunId"] == "wr_3"
+    assert "testInputs" not in rows["tr-r3"]
+    assert ctx.pending_test_inputs == {}
+
+
+@pytest.mark.asyncio
+async def test_a_flushed_run_result_drains_its_own_input_sources() -> None:
+    sources = [{"key": "query", "source": "default"}]
+    stream = FakeCopilotStream()
+    ctx = _test_copilot_context(
+        narrator_state=NarratorState(),
+        in_flight_stream_tool_call=InFlightStreamToolCall(
+            call_id="r9", tool_name="run_blocks_and_collect_debug", iteration=2, display_label=None
+        ),
+        goal_satisfied_tool_output={"ok": True, "data": {"workflow_run_id": "wr_9"}},
+        last_artifact_health_blocker_reason=None,
+        completion_verification_result=None,
+        pending_test_inputs={"wr_9": sources, "wr_other": [{"key": "query", "source": "copilot"}]},
+    )
+    _fixture_pending_identity(ctx)
+
+    await flush_goal_satisfied_tool_result(stream, ctx)  # type: ignore[arg-type]
+
+    frame = next(p for p in stream.sent if p.type == WorkflowCopilotStreamMessageType.TOOL_RESULT)
+    assert frame.test_inputs == sources
+    assert ctx.narrator_state.design_activity[0]["testInputs"] == sources
+    assert list(ctx.pending_test_inputs) == ["wr_other"]
+
+
+@pytest.mark.asyncio
 async def test_two_writes_resolving_out_of_order_each_keep_their_own_diff() -> None:
     """Parallel tool calls are the provider default and results are not ordered by call. Draining
     by arrival handed the first result both writes' diffs, so a patch rendered — and persisted —
@@ -953,8 +1012,8 @@ async def test_two_writes_resolving_out_of_order_each_keep_their_own_diff() -> N
 
     result = MagicMock()
     result.stream_events = lambda: _stream_events_from(
-        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
-        _tool_called_event("c2", "add_block", '{"label": "parse_step"}'),
+        tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        tool_called_event("c2", "add_block", '{"label": "parse_step"}'),
         # c2 answers first: the stash must not hand c2 the diff c1 produced.
         _tool_output_event("c2"),
         _tool_output_event("c1"),
@@ -992,8 +1051,8 @@ async def test_a_write_that_failed_does_not_display_a_sibling_write_diff() -> No
 
     result = MagicMock()
     result.stream_events = lambda: _stream_events_from(
-        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
-        _tool_called_event("c2", "add_block", '{"label": "broken_step"}'),
+        tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        tool_called_event("c2", "add_block", '{"label": "broken_step"}'),
         _tool_output_event("c2"),
         _tool_output_event("c1"),
     )
@@ -1031,9 +1090,9 @@ async def test_a_foreign_result_arriving_first_does_not_cost_the_write_its_count
 
     result = MagicMock()
     result.stream_events = lambda: _stream_events_from(
-        _tool_called_event("c2", "inspect_page_for_composition"),
+        tool_called_event("c2", "inspect_page_for_composition"),
         _tool_output_event("c2"),
-        _tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
+        tool_called_event("c1", "edit_block", '{"label": "download_step"}'),
         _tool_output_event("c1"),
     )
     result.cancel = MagicMock()
@@ -1077,6 +1136,7 @@ class TestFlushGoalSatisfiedToolResult:
             goal_satisfied_tool_name="update_and_run_blocks",
             goal_satisfied_tool_output={"ok": True, "data": {"workflow_run_id": "wr_1"}},
             pending_code_write_diffs={},
+            pending_test_inputs={},
             pending_chat_screenshots=[],
             narrator_state=None,
         )
@@ -1481,7 +1541,7 @@ async def test_codegen_progress_pins_incremental_label_extraction_on_raw_deltas(
         _args_delta_event(0, delta4),
         _args_done_event(0, full_args, "update_and_run_blocks"),
         _item_done_event(0, "update_and_run_blocks", full_args),
-        _tool_called_event("c1", "update_and_run_blocks"),
+        tool_called_event("c1", "update_and_run_blocks"),
         _tool_output_event("c1"),
     ]
 
@@ -1625,7 +1685,7 @@ async def test_codegen_progress_disabled_by_kill_switch(monkeypatch: pytest.Monk
     events = [
         _item_added_event(0, "update_and_run_blocks"),
         _args_delta_event(0, '{"workflow_yaml": "blocks:\\n  label: open_page\\n"}'),
-        _tool_called_event("c1", "update_and_run_blocks"),
+        tool_called_event("c1", "update_and_run_blocks"),
         _tool_output_event("c1"),
     ]
 
@@ -2099,8 +2159,8 @@ async def test_reason_custody_reversed_results_iteration_reset_secret_scrub_and_
     secret = "safe-test-secret/value"
     register_secret_scrub_value(ctx, secret)
     a_arguments = json.dumps({"expression": "a", "user_facing_reason": f"Read {secret} {quote(secret, safe='')}"})
-    a = _tool_called_event("a", "evaluate", a_arguments)
-    b = _tool_called_event(
+    a = tool_called_event("a", "evaluate", a_arguments)
+    b = tool_called_event(
         "b",
         "evaluate",
         json.dumps({"expression": "b", "user_facing_reason": "The booking has completed successfully."}),
@@ -2186,7 +2246,7 @@ async def test_actor_dispatch_capture_writes_only_declared_names_and_no_model_au
         "user_facing_reason": f"I will sign in with {unregistered} at the café.",
     }
     result = MagicMock(
-        stream_events=lambda: _stream_events_from(_tool_called_event("typed", "probe", json.dumps(arguments), agent))
+        stream_events=lambda: _stream_events_from(tool_called_event("typed", "probe", json.dumps(arguments), agent))
     )
     try:
         await stream_to_sse(result, FakeCopilotStream(), ctx)
@@ -2225,7 +2285,7 @@ def _stage_frame(ctx: CopilotContext, image_format: str = "PNG", color: str = "w
 
 
 def _click_round_trip() -> list[RunItemStreamEvent]:
-    return [_tool_called_event("c1", "click"), _tool_output_event("c1")]
+    return [tool_called_event("c1", "click"), _tool_output_event("c1")]
 
 
 def _saved_screenshots(ctx: CopilotContext) -> list[dict[str, str]] | None:

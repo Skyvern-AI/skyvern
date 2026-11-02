@@ -1,7 +1,7 @@
 """The one place Task V3 sends pointer and keyboard input to a page.
 
 Each gesture runs the Playwright call each tool made before this module existed, argument for argument. The
-TASK_V3_LOGIN_PACE treatment holds the first click or Enter after a password fill until LOGIN_PACE_FLOOR_S after Task V3
+TASK_V3_LOGIN_PACE treatment holds the first click, drag or Enter after a password fill until LOGIN_PACE_FLOOR_S after Task V3
 started the block.
 """
 
@@ -233,6 +233,11 @@ async def click_at(page: Page, x: float, y: float) -> None:
 
 async def hover(realm: Realm, selector: str, *, timeout: float | None = None) -> None:
     await realm.hover(selector, **_opts(timeout=timeout))
+
+
+async def drag(realm: Realm, source: str, target: str, *, timeout: float | None = None) -> None:
+    await _hold_submit(realm)
+    await realm.drag_and_drop(source, target, **_opts(timeout=timeout))
 
 
 async def js_click(realm: Realm, root_query_js: str, arg: Any) -> Any:

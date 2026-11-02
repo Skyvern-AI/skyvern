@@ -1,11 +1,14 @@
 import asyncio
+import functools
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
+from fastapi import FastAPI
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -13,19 +16,24 @@ from sqlalchemy.pool import StaticPool
 from skyvern.config import settings
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.api_app import create_api_app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.models import Base, PersistentBrowserSessionModel
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.bootstrap import register_aes_encryptor
 from skyvern.forge.sdk.routes import browser_sessions as routes_mod
+from skyvern.forge.sdk.schemas import persistent_browser_sessions as persistent_browser_sessions_mod
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import EXTERNAL_CDP_BROWSER_VENDOR, PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.webeye import external_cdp_sessions as external_mod
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.shared_route_app import api_app_build_settings, lend_app
 
 TOKEN = "tok-9f3c1d7e5b"
 CDP_URL = f"wss://127.0.0.1:9333/devtools/browser/b1?token={TOKEN}"
@@ -84,6 +92,11 @@ def external_session_row(
     )
 
 
+@functools.cache
+def _registration_api_app() -> FastAPI:
+    return create_api_app()
+
+
 @asynccontextmanager
 async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
     """The registration route and the OSS manager over one in-memory database, authenticated as ORG_A."""
@@ -92,7 +105,9 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
         await conn.run_sync(Base.metadata.create_all, tables=[PersistentBrowserSessionModel.__table__])
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     repo = BrowserSessionsRepository(session_factory=session_factory)
-    http_app = create_api_app()
+    registration_app = _registration_api_app()
+    # create_api_app() installs a fresh forge app on every call, so a reused build still needs one per stack.
+    start_forge_app(load_api_modules=True)
     DefaultPersistentSessionsManager.instance = None
     DefaultPersistentSessionsManager._browser_sessions = {}
     DefaultPersistentSessionsManager._background_tasks = set()
@@ -101,13 +116,15 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
     DefaultPersistentSessionsManager._external_deadlines = {}
     manager = DefaultPersistentSessionsManager(database=SimpleNamespace(browser_sessions=repo))
     caller = SimpleNamespace(organization_id=ORG_A)
-    http_app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(
-        organization_id=caller.organization_id
-    )
     route_app = SimpleNamespace(
         DATABASE=manager.database, PERSISTENT_SESSIONS_MANAGER=manager, STORAGE=None, AGENT_FUNCTION=AgentFunction()
     )
+    app_patches = pytest.MonkeyPatch()
     try:
+        http_app = lend_app(registration_app, app_patches, api_app_build_settings())
+        http_app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(
+            organization_id=caller.organization_id
+        )
         with (
             patch.object(routes_mod, "app", route_app),
             patch.object(settings, "LOG_RAW_API_REQUESTS", True),
@@ -123,14 +140,44 @@ async def external_cdp_stack() -> AsyncIterator[SimpleNamespace]:
         for deadline in manager._external_deadlines.values():
             deadline.cancel()
         await engine.dispose()
+        app_patches.undo()
 
 
-async def backdate_registration(stack: SimpleNamespace, session_id: str, minutes: float) -> None:
+class DeadlineClock:
+    """The clock registration deadlines are read against and the deadline watcher's sleep: frozen until a test sets
+    ``ticking``, after which each watcher poll moves it by exactly what the poll slept. Concurrent watchers share it,
+    so it moves by the sum of their sleeps."""
+
+    def __init__(self) -> None:
+        self._now = datetime.now(UTC)
+        self.ticking = asyncio.Event()
+        self.polls: list[float] = []
+
+    def now(self, tz: tzinfo) -> datetime:
+        return self._now.astimezone(tz)
+
+    async def sleep(self, seconds: float) -> None:
+        self.polls.append(seconds)
+        await self.ticking.wait()
+        self._now += timedelta(seconds=seconds)
+
+
+def install_deadline_clock(monkeypatch: pytest.MonkeyPatch) -> DeadlineClock:
+    clock = DeadlineClock()
+    monkeypatch.setattr(persistent_browser_sessions_mod, "datetime", clock)
+    monkeypatch.setattr(external_mod, "asyncio", ScopedAsyncio(sleep=clock.sleep))
+    return clock
+
+
+async def backdate_registration(
+    stack: SimpleNamespace, session_id: str, minutes: float, *, clock: DeadlineClock | None = None
+) -> None:
+    now = naive_utc_now() if clock is None else clock.now(UTC).replace(tzinfo=None)
     async with stack.session_factory() as session:
         await session.execute(
             update(PersistentBrowserSessionModel)
             .where(PersistentBrowserSessionModel.persistent_browser_session_id == session_id)
-            .values(started_at=naive_utc_now() - timedelta(minutes=minutes))
+            .values(started_at=now - timedelta(minutes=minutes))
         )
         await session.commit()
 

@@ -60,6 +60,10 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => undefined,
   useFeatureFlagEnabled: () => false,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagVariantKey: () => undefined,
+  usePostHogFeatureFlagEnabled: () => false,
+}));
 
 const runsQueryCalls: Array<Record<string, unknown>> = [];
 

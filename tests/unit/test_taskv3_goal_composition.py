@@ -14,9 +14,10 @@ import pytest
 
 import skyvern.forge.taskv3
 from skyvern.forge.sdk.schemas.tasks import TaskType
-from skyvern.forge.sdk.workflow.models.block import ExtractionBlock
+from skyvern.forge.sdk.workflow.models.block import ExtractionBlock, FileDownloadBlock
 from skyvern.forge.sdk.workflow.page_derived_templates import OPEN, PageDerivedRender
 from skyvern.forge.taskv3.goal_composition import (
+    DOWNLOAD_BLOCK_FACT,
     CodeProgressRecord,
     CodeTypedValue,
     GoalDirectives,
@@ -381,3 +382,17 @@ def test_judging_blocks_extend_a_criterions_accepted_number_forms_to_the_same_ki
     for task in not_judging:
         assert marker not in render_block_context(task, _make_block("blk"))
     assert render_block_context(judging[0], None) == ""
+
+
+def test_only_download_block_framing_states_no_file_has_landed() -> None:
+    # finish states the file count only in its terminal result, so the model needs it before deciding.
+    now = datetime.now(UTC)
+    org = make_organization(now)
+    task = make_task(now, org, workflow_run_id="wr_1")
+    block = FileDownloadBlock(label="dl", output_parameter=output_param("dl"), complete_on_download=True)
+
+    framing = render_block_context(task, block)
+
+    assert DOWNLOAD_BLOCK_FACT in framing
+    assert DOWNLOAD_BLOCK_FACT not in render_block_context(make_task(now, org, workflow_run_id=None), block)
+    assert DOWNLOAD_BLOCK_FACT not in render_block_context(task, _make_block("blk"))

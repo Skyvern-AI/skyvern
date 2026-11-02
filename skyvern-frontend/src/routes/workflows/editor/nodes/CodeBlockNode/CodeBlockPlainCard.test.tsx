@@ -97,6 +97,15 @@ describe("CodeBlockPlainCard", () => {
     expect(screen.getByText(/No steps yet/)).toBeDefined();
   });
 
+  it("says no browser steps were found when the block has code but no steps", () => {
+    render(<CodeBlockPlainCard steps={[]} hasCode />);
+
+    expect(
+      screen.getByText("No browser steps found in this code."),
+    ).toBeDefined();
+    expect(screen.queryByText(/No steps yet/)).toBeNull();
+  });
+
   it("shows a generating indicator and stop control while generating", () => {
     render(<CodeBlockPlainCard steps={[]} generating onStop={() => {}} />);
 

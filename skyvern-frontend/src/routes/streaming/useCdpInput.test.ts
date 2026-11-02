@@ -5,7 +5,7 @@ import { useCdpInput } from "./useCdpInput";
 
 const mocks = vi.hoisted(() => ({
   credentialGetter: vi.fn(async () => null),
-  getCredentialParam: vi.fn(async () => "token=Bearer+test-token"),
+  getWebSocketProtocols: vi.fn(async () => ["skyvern.v1", "bearer.test-token"]),
 }));
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
@@ -18,7 +18,7 @@ vi.mock("@/store/useClientIdStore", () => ({
 }));
 
 vi.mock("@/util/env", () => ({
-  getCredentialParam: mocks.getCredentialParam,
+  getWebSocketProtocols: mocks.getWebSocketProtocols,
 }));
 
 type SocketListener = (event: Event) => void;

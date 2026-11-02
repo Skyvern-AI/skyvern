@@ -92,6 +92,29 @@ function EditableLabel() {
 }
 
 describe("useNodeLabelChangeHandler collapse migration", () => {
+  test("refuses a label whose generated output conflicts with a workflow parameter", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "invoice_output",
+          parameterType: "workflow",
+          dataType: "string",
+          defaultValue: "",
+        },
+      ],
+    });
+    const { result } = renderHook(
+      () =>
+        useNodeLabelChangeHandler({ id: "node-1", initialValue: "Old_Label" }),
+      { wrapper },
+    );
+
+    act(() => result.current[1]("invoice"));
+
+    expect(result.current[0]).toBe("Old_Label");
+    expect(xyflow.setNodes).not.toHaveBeenCalled();
+  });
+
   test("holds a reserved rename before local label or collapse changes", () => {
     useNodeCollapseStore.getState().toggleBlock("wf-rename", "Old_Label");
     const { result } = renderHook(

@@ -155,6 +155,40 @@ class TestScopedXhrDownloadCapture:
 
         assert not capture.has_in_flight_requests
 
+    def test_document_failure_observation_ends_after_action_window(self) -> None:
+        page = _make_page()
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"), monotonic=clock)
+        response = _make_response(resource_type="document", status=503, content_disposition="")
+        response.request.frame = page.main_frame
+        capture.enable()
+        capture.seal_in_flight_requests()
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS + 0.01)
+
+        capture._on_request(response.request)
+        capture._observe_download_failure_status(response)
+
+        assert response.request not in capture._status_observation_requests
+        assert capture.attributed_download_failure_status is None
+
+    def test_popup_created_after_action_window_is_not_attributable(self) -> None:
+        page = _make_page()
+        popup = _make_page()
+        clock = _FakeClock()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"), monotonic=clock)
+        response = _make_response(resource_type="document", status=503, content_disposition="")
+        response.request.frame = popup.main_frame
+        capture.enable()
+        capture.seal_in_flight_requests()
+        clock.advance(_STATUS_OBSERVATION_POST_SEAL_GRACE_SECONDS + 0.01)
+
+        capture._on_new_page(popup)
+        capture._on_request(response.request)
+        capture._observe_download_failure_status(response)
+
+        assert popup.main_frame not in capture._attributable_frames
+        assert capture.attributed_download_failure_status is None
+
     @pytest.mark.asyncio
     async def test_seal_admits_multi_hop_redirect_chain_and_captures_response(self, tmp_path: Path) -> None:
         capture = ScopedXhrDownloadCapture(_make_page(), tmp_path)
@@ -417,6 +451,31 @@ class TestScopedXhrDownloadCapture:
         await capture._on_response(response)
 
         assert (tmp_path / "invoice.pdf").exists()
+
+    @pytest.mark.asyncio
+    async def test_ignores_redirect_attachment_before_final_response_with_same_filename(self, tmp_path: Path) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, tmp_path)
+        redirect_request = _make_request()
+        redirect_response = _make_response(
+            status=302,
+            content_disposition='attachment; filename="report.pdf"',
+            body=b"redirect body",
+        )
+        redirect_response.request = redirect_request
+        final_response = _make_response(
+            content_disposition='attachment; filename="report.pdf"',
+            body=b"final download body",
+        )
+        final_response.request = _make_request(redirected_from=redirect_request)
+
+        capture.enable()
+        capture._on_request(redirect_request)
+        await capture._on_response(redirect_response)
+        capture._on_request(final_response.request)
+        await capture._on_response(final_response)
+
+        assert (tmp_path / "report.pdf").read_bytes() == b"final download body"
 
     @pytest.mark.asyncio
     async def test_ignores_non_xhr_response(self, tmp_path: Path) -> None:
@@ -824,6 +883,84 @@ class TestScopedXhrDownloadFailureStatusObserver:
         capture, response = self._admitted_capture(url="https://unrelated.example/api/export", status=503)
         capture._observe_download_failure_status(response)
         assert capture.observed_download_failure_status == 503
+        assert capture.attributed_download_failure_status is None
+
+    def test_xhr_5xx_is_diagnostic_even_with_download_headers(self) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response(
+            status=503,
+            content_type="application/pdf",
+            content_disposition='attachment; filename="report.pdf"',
+        )
+        _admit_response(capture, response)
+
+        capture._observe_download_failure_status(response)
+
+        assert capture.observed_download_failure_status == 503
+        assert capture.attributed_download_failure_status is None
+
+    @pytest.mark.parametrize("status", [500, 503, 599])
+    def test_attributes_json_error_from_main_document_response(self, status: int) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response(
+            resource_type="document",
+            status=status,
+            content_type="application/json",
+            content_disposition="",
+        )
+        response.request.frame = page.main_frame
+        _admit_response(capture, response)
+
+        capture._observe_download_failure_status(response)
+
+        assert capture.observed_download_failure_status == status
+        assert capture.attributed_download_failure_status == status
+
+    def test_attributes_document_error_from_action_target_frame(self) -> None:
+        page = _make_page()
+        target_frame = MagicMock()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"), target_frame=target_frame)
+        response = _make_response(
+            resource_type="document",
+            status=503,
+            content_type="text/plain",
+            content_disposition="",
+        )
+        response.request.frame = target_frame
+        _admit_response(capture, response)
+
+        capture._observe_download_failure_status(response)
+
+        assert capture.attributed_download_failure_status == 503
+
+    def test_does_not_attribute_document_error_from_action_created_popup(self) -> None:
+        page = _make_page()
+        popup = _make_page()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response(resource_type="document", status=503, content_disposition="")
+        response.request.frame = popup.main_frame
+        capture.enable()
+        capture._on_new_page(popup)
+        capture._on_request(response.request)
+
+        capture._observe_download_failure_status(response)
+
+        assert capture.observed_download_failure_status == 503
+        assert capture.attributed_download_failure_status is None
+
+    def test_does_not_attribute_document_error_from_unrelated_frame(self) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, Path("/tmp/downloads"))
+        response = _make_response(resource_type="document", status=503, content_disposition="")
+        response.request.frame = MagicMock()
+        _admit_response(capture, response)
+
+        capture._observe_download_failure_status(response)
+
+        assert capture.observed_download_failure_status == 503
+        assert capture.attributed_download_failure_status is None
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504])
     def test_observes_safe_5xx_variants(self, status: int) -> None:

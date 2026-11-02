@@ -6,6 +6,7 @@ from fastapi import status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.organizations import OnePasswordTokenSource
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.proxy_pinning import parse_proxy_location_input, validate_proxy_session_id
@@ -19,6 +20,7 @@ class CredentialVaultType(StrEnum):
     GCP = "gcp"
     CUSTOM = "custom"
     ONEPASSWORD = "onepassword"
+    BITWARDEN_CONNECTED = "bitwarden_connected"
 
 
 class CredentialType(StrEnum):
@@ -231,6 +233,8 @@ class CredentialItem(BaseModel):
         default_factory=list,
         description="Sites the vault item itself names, as saved by the user who stored it",
     )
+    # Set only by a vault whose items scope each site by match mode; a fill or release must then match one.
+    login_sites: list[LoginSite] | None = Field(default=None, exclude=True)
 
 
 class CreateCredentialRequest(BaseModel):
@@ -353,6 +357,7 @@ class OnePasswordItemOverview(BaseModel):
     vault_id: str = Field(..., description="The ID of the vault containing the item")
     vault_name: str = Field(..., description="The name of the vault containing the item")
     category: str = Field(..., description="The 1Password item category")
+    importable: bool = Field(..., description="Whether this item can be imported as a credential")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
 
 
@@ -427,6 +432,8 @@ class BitwardenItemOverview(BaseModel):
     )
     credential_type: CredentialType = Field(..., description="The item's credential type")
     url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+    urls: list[str] = Field(default_factory=list, exclude=True, description="Every website URL saved on the item")
+    sites: list[LoginSite] = Field(default_factory=list, exclude=True, description="The sites the item is saved for")
 
 
 class BitwardenItemsResponse(BaseModel):
@@ -496,6 +503,8 @@ class Credential(BaseModel):
         default=None,
         description="ID of the credential folder this credential belongs to, if any",
     )
+    is_test_login_temporary: bool | None = Field(default=None, exclude=True)
+    is_passkey_setup_pending: bool | None = Field(default=None, exclude=True)
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description="Optional proxy location used for the credential's pinned proxy identity.",

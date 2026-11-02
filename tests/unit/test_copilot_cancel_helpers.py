@@ -20,16 +20,20 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
+from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.runtime import browser_session_lock
 from skyvern.forge.sdk.copilot.tools import _cancel_run_task_if_not_final, _trusted_post_drain_status, run_execution
 from skyvern.forge.sdk.copilot.tools.run_execution import _run_blocks_and_collect_debug
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from tests.unit.copilot_test_helpers import (
     HANDBACK_WORKFLOW_YAML,
     OWNED_RUN_ID,
@@ -40,6 +44,8 @@ from tests.unit.copilot_test_helpers import (
     make_build_test_ctx,
     make_copilot_ctx,
     settle_cancelled_tools,
+    stamping_browser_manager,
+    stop_activity_renewer,
 )
 
 
@@ -280,6 +286,7 @@ async def test_backstop_detaches_an_inline_build_test_instead_of_cancelling_it(
     )
     owned = OwnedRunRow(monkeypatch, block_first_read=block_first_read)
     ctx = make_build_test_ctx(harness, monkeypatch)
+    ctx.minted_browser_sessions["pbs_run"] = None
     before = set(run_execution._DETACHED_CLEANUP_TASKS)
 
     with pytest.raises(TimeoutError):
@@ -292,6 +299,7 @@ async def test_backstop_detaches_an_inline_build_test_instead_of_cancelling_it(
         assert owned.cancel_writes == []
         assert harness["executor_cancelled"] is False
         assert len(adopted) == 1 and not adopted[0].done()
+        assert ctx.minted_browser_sessions == {"pbs_run": OWNED_RUN_ID}
         harness["clear"].assert_not_awaited()
     finally:
         for task in adopted:
@@ -360,3 +368,227 @@ async def test_backstop_after_the_run_ended_does_not_leave_it_to_an_owner(
     assert owned.row.status == ("completed" if ended_by == "worker" else "canceled")
     owned.draft_deletes.assert_awaited_once()
     harness["clear"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_id", [None, OWNED_RUN_ID])
+async def test_a_minted_browser_closes_at_turn_end_when_no_run_owns_it(
+    monkeypatch: pytest.MonkeyPatch, run_id: str | None
+) -> None:
+    """A minted browser with no outstanding run closes at the turn boundary (SKY-18904)."""
+    from skyvern.forge import app as forge_app
+
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(return_value=SimpleNamespace(runnable_id=None)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(
+            get_workflow_run=AsyncMock(return_value=SimpleNamespace(status=WorkflowRunStatus.completed)),
+            get_workflow_runs_by_parent_workflow_run_id=AsyncMock(return_value=[]),
+        ),
+    )
+    close = AsyncMock(return_value=True)
+    monkeypatch.setattr(run_execution, "close_browser_session_quietly", close)
+
+    ctx = make_copilot_ctx()
+    ctx.minted_browser_sessions["pbs_minted"] = run_id
+
+    await run_execution.close_minted_browser_sessions(ctx)
+
+    assert ctx.minted_browser_sessions == {}
+    close.assert_awaited_once_with(ctx.organization_id, "pbs_minted", reason=BrowserSessionCloseReason.turn_ended)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runnable_id", "runs", "children", "expected_live"),
+    [
+        pytest.param(
+            OWNED_RUN_ID,
+            {OWNED_RUN_ID: WorkflowRunStatus.completed},
+            {},
+            True,
+            id="terminal-row-still-holds-session-lease",
+        ),
+        pytest.param(
+            None,
+            {
+                OWNED_RUN_ID: WorkflowRunStatus.completed,
+                "wr_child": WorkflowRunStatus.completed,
+                "wr_grandchild": WorkflowRunStatus.running,
+            },
+            {OWNED_RUN_ID: ["wr_child"], "wr_child": ["wr_grandchild"]},
+            True,
+            id="live-grandchild-inherited-browser",
+        ),
+        pytest.param(
+            None,
+            {
+                OWNED_RUN_ID: WorkflowRunStatus.completed,
+                "wr_child": WorkflowRunStatus.completed,
+                "wr_grandchild": WorkflowRunStatus.completed,
+            },
+            {OWNED_RUN_ID: ["wr_child"], "wr_child": ["wr_grandchild"]},
+            False,
+            id="all-descendants-terminal-and-lease-released",
+        ),
+    ],
+)
+async def test_minted_browser_liveness_includes_lease_and_all_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+    runnable_id: str | None,
+    runs: dict[str, WorkflowRunStatus],
+    children: dict[str, list[str]],
+    expected_live: bool,
+) -> None:
+    from skyvern.forge import app as forge_app
+
+    async def _get_run(run_id: str, _organization_id: str) -> SimpleNamespace | None:
+        status = runs.get(run_id)
+        return SimpleNamespace(workflow_run_id=run_id, status=status) if status is not None else None
+
+    async def _get_children(*, parent_workflow_run_id: str, organization_id: str) -> list[SimpleNamespace]:
+        return [SimpleNamespace(workflow_run_id=child_id) for child_id in children.get(parent_workflow_run_id, [])]
+
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(return_value=SimpleNamespace(runnable_id=runnable_id)),
+    )
+    monkeypatch.setattr(
+        forge_app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(
+            get_workflow_run=AsyncMock(side_effect=_get_run),
+            get_workflow_runs_by_parent_workflow_run_id=AsyncMock(side_effect=_get_children),
+        ),
+    )
+
+    assert (
+        await run_execution._run_in_a_minted_browser_is_still_live("pbs_minted", OWNED_RUN_ID, "org-1")
+    ) is expected_live
+
+
+@pytest.mark.asyncio
+async def test_minted_browser_liveness_fails_closed_when_session_is_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from skyvern.forge import app as forge_app
+
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER,
+        "get_session",
+        AsyncMock(side_effect=RuntimeError("database is down")),
+    )
+
+    assert await run_execution._run_in_a_minted_browser_is_still_live("pbs_minted", OWNED_RUN_ID, "org-1")
+
+
+@pytest.mark.asyncio
+async def test_minted_browser_closes_after_a_leased_run_becomes_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    liveness = AsyncMock(side_effect=[True, False])
+    close = AsyncMock(return_value=True)
+    monkeypatch.setattr(run_execution, "_run_in_a_minted_browser_is_still_live", liveness)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(run_execution, "close_browser_session_quietly", close)
+    ctx = make_copilot_ctx()
+    ctx.minted_browser_sessions["pbs_minted"] = OWNED_RUN_ID
+
+    await run_execution.close_minted_browser_sessions(ctx)
+    await asyncio.sleep(0)
+
+    assert ctx.minted_browser_sessions == {}
+    assert liveness.await_count == 2
+    close.assert_awaited_once_with(ctx.organization_id, "pbs_minted", reason=BrowserSessionCloseReason.turn_ended)
+
+
+def _kept_run_reads(monkeypatch: pytest.MonkeyPatch, *, runs: dict[str, tuple[WorkflowRunStatus, str | None]]) -> None:
+    monkeypatch.setattr(
+        forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", AsyncMock(return_value=SimpleNamespace(runnable_id=None))
+    )
+
+    async def _children(*, parent_workflow_run_id: str, organization_id: str) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(workflow_run_id=rid)
+            for rid, (_, parent) in runs.items()
+            if parent == parent_workflow_run_id
+        ]
+
+    monkeypatch.setattr(
+        forge_app.DATABASE,
+        "workflow_runs",
+        SimpleNamespace(
+            get_workflow_run=AsyncMock(
+                side_effect=lambda run_id, _org: SimpleNamespace(workflow_run_id=run_id, status=runs[run_id][0])
+            ),
+            get_workflow_runs_by_parent_workflow_run_id=AsyncMock(side_effect=_children),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_kept_browser_stays_renewed_while_a_child_run_outlives_its_final_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(forge_app, "BROWSER_MANAGER", manager)
+    monkeypatch.setattr(run_execution, "RUN_BLOCKS_POLL_INTERVAL_SECONDS", 0)
+    runs = {OWNED_RUN_ID: (WorkflowRunStatus.completed, None), "wr_child": (WorkflowRunStatus.running, OWNED_RUN_ID)}
+    _kept_run_reads(monkeypatch, runs=runs)
+    closed = asyncio.Event()
+
+    async def _close(*_args: object, **_kwargs: object) -> bool:
+        closed.set()
+        return True
+
+    monkeypatch.setattr(run_execution, "close_browser_session_quietly", _close)
+    ctx = make_copilot_ctx()
+    ctx.minted_browser_sessions["pbs_kept"] = OWNED_RUN_ID
+
+    try:
+        await run_execution.close_minted_browser_sessions(ctx)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not closed.is_set()
+        assert "pbs_kept" in manager._renewable_session_ids()
+
+        runs["wr_child"] = (WorkflowRunStatus.completed, OWNED_RUN_ID)
+        await asyncio.wait_for(closed.wait(), timeout=1)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert "pbs_kept" not in manager._renewable_session_ids()
+    finally:
+        await stop_activity_renewer(manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_stamp_fails", [False, True])
+async def test_a_kept_browser_stops_renewing_at_the_cap(
+    monkeypatch: pytest.MonkeyPatch, first_stamp_fails: bool
+) -> None:
+    touch = AsyncMock(side_effect=[RuntimeError("db down"), None] if first_stamp_fails else None)
+    manager = stamping_browser_manager(monkeypatch, touch)
+    monkeypatch.setattr(forge_app, "BROWSER_MANAGER", manager)
+    monkeypatch.setattr(run_execution, "_KEPT_RUN_ACTIVITY_RENEWAL_CAP_SECONDS", 0.05)
+
+    renewal = asyncio.create_task(run_execution._renew_kept_browser_activity("pbs_kept"))
+    try:
+        await asyncio.sleep(0.01)
+        assert "pbs_kept" in manager._renewable_session_ids()
+        await asyncio.wait_for(renewal, timeout=1)
+        assert "pbs_kept" not in manager._renewable_session_ids()
+    finally:
+        renewal.cancel()
+        await stop_activity_renewer(manager)
+
+
+def test_a_build_test_acquisition_copy_records_into_the_turns_minted_browser_ledger() -> None:
+    """Build-test acquisition mints into a ``replace(ctx)`` copy, so the ledger the turn closes from
+    has to be the same object -- a copied one would silently leave every test browser open."""
+    ctx = make_copilot_ctx()
+    acquisition_ctx = replace(ctx)
+    acquisition_ctx.minted_browser_sessions["pbs_minted"] = None
+
+    assert ctx.minted_browser_sessions == {"pbs_minted": None}

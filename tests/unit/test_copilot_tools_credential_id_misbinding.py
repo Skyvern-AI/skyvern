@@ -12,6 +12,12 @@ from skyvern.forge.sdk.copilot.tools import (
     _list_credentials,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _google_connection_reference_ids,
+    bitwarden_binding_change_error,
+)
+from skyvern.forge.sdk.copilot.workflow_credential_utils import bitwarden_secret_bindings
+from tests.unit.conftest import ORG_VAULT_ITEM_ID
 
 
 def _yaml(body: str) -> str:
@@ -602,3 +608,101 @@ async def test_list_credentials_without_request_policy_is_inert() -> None:
         result = await _list_credentials({}, ctx)
 
     assert result["ok"] is True
+
+
+_BITWARDEN_SECRET_KEYS = """
+            bitwarden_client_id_aws_secret_key: SKYVERN_BITWARDEN_CLIENT_ID
+            bitwarden_client_secret_aws_secret_key: SKYVERN_BITWARDEN_CLIENT_SECRET
+            bitwarden_master_password_aws_secret_key: SKYVERN_BITWARDEN_MASTER_PASSWORD"""
+
+
+def _bitwarden_workflow(
+    parameter_fields: str, extra_parameters: str = "", secret_keys: str = _BITWARDEN_SECRET_KEYS
+) -> str:
+    return _yaml(
+        f"""
+        title: Sign in
+        workflow_definition:
+          parameters:
+          - key: portal_login
+            parameter_type: bitwarden_login_credential{secret_keys}{parameter_fields}{extra_parameters}
+          blocks:
+          - block_type: login
+            label: login_to_portal
+            url: https://portal.example.com/login
+            parameter_keys: [portal_login]
+        """
+    )
+
+
+_LITERAL_BINDING = _bitwarden_workflow(
+    f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1"
+)
+_CREDIT_CARD_BINDING = _bitwarden_workflow(
+    f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1",
+    f"""
+          - key: card
+            parameter_type: bitwarden_credit_card_data{_BITWARDEN_SECRET_KEYS}
+            bitwarden_collection_id: col_1
+            bitwarden_item_id: {ORG_VAULT_ITEM_ID}""",
+)
+
+
+@pytest.mark.parametrize(
+    "yaml",
+    [
+        pytest.param(_LITERAL_BINDING, id="literal"),
+        pytest.param(_bitwarden_workflow('\n            bitwarden_item_id: "{{ item_id }}"'), id="templated"),
+        pytest.param(_bitwarden_workflow("\n            url_parameter_key: portal_url"), id="url-only"),
+    ],
+)
+def test_a_new_bitwarden_login_parameter_is_refused_but_one_the_workflow_had_is_kept(yaml: str) -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(yaml)
+
+    assert bitwarden_binding_change_error(yaml, _ctx_with_policy().request_policy) is not None
+    assert bitwarden_binding_change_error(yaml, kept.request_policy) is None
+
+
+def test_a_kept_bitwarden_login_parameter_cannot_be_repointed() -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(_LITERAL_BINDING)
+    repointed = _bitwarden_workflow(
+        '\n            bitwarden_item_id: "{{ item_id }}"\n            bitwarden_collection_id: col_1'
+    )
+
+    assert bitwarden_binding_change_error(repointed, kept.request_policy) is not None
+
+
+def test_a_new_bitwarden_credit_card_binding_is_refused_but_one_the_workflow_had_is_kept() -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(_CREDIT_CARD_BINDING)
+
+    assert bitwarden_binding_change_error(_CREDIT_CARD_BINDING, _ctx_with_policy().request_policy) is not None
+    assert bitwarden_binding_change_error(_CREDIT_CARD_BINDING, kept.request_policy) is None
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_refuses_a_new_bitwarden_parameter_even_when_an_untested_draft_is_allowed() -> None:
+    ctx = _ctx_with_policy()
+    ctx.allow_untested_workflow_draft = True
+
+    result = await _update_workflow({"workflow_yaml": _LITERAL_BINDING}, ctx)
+
+    assert result["ok"] is False
+    assert result["error"] == bitwarden_binding_change_error(_LITERAL_BINDING, ctx.request_policy)
+
+
+def test_a_bitwarden_login_parameter_does_not_back_a_google_sheets_connection_slot() -> None:
+    definition = {
+        "parameters": [
+            {
+                "key": "portal_login",
+                "parameter_type": "bitwarden_login_credential",
+                "bitwarden_item_id": ORG_VAULT_ITEM_ID,
+            }
+        ],
+        "blocks": [{"block_type": "google_sheets_read", "label": "read_sheet", "credential_id": "{{ portal_login }}"}],
+    }
+
+    assert _google_connection_reference_ids(definition, None) == ["{{ portal_login }}"]

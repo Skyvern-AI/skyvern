@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import os
 import secrets
 import time
 import weakref
@@ -15,28 +14,30 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, TypedD
 import httpx
 import structlog
 
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
 from skyvern.config import settings
 from skyvern.exceptions import get_user_facing_exception_message, is_stalled_attach_handshake
-from skyvern.forge.sdk.copilot.turn_origin import is_self_heal_session_id
-from skyvern.forge.sdk.forge_log import current_codeblock_log_redactor
 from skyvern.webeye.browser_errors import is_context_lost_message, is_target_closed_message
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
+from .copilot_sessions import registered_copilot_session, unregister_copilot_session
 from .result import BrowserContext, ErrorCode, count_browser_attach, make_error
 from .trajectory_store import delete_session_trajectories
 
 LOG = structlog.get_logger(__name__)
 
 _BODY_SEMAPHORE_LIMIT = 5  # concurrent CDP body downloads (worst case: 5 * 10s timeout = 50s backlog)
+_TAB_RECONNECT_ADOPTION_TIMEOUT_SECONDS = 10.0
 
 if TYPE_CHECKING:
-    from playwright.async_api import Frame, Page, Request
+    from playwright.async_api import Frame, Page, Playwright, Request
 
-    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
     from skyvern.library.skyvern_browser import SkyvernBrowser
     from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
     from skyvern.webeye.browser_engine import EngineFrame
+
+    from .hosted_driver import HostedDriver
 
 
 @dataclass
@@ -126,6 +127,11 @@ class SessionState:
     _active_page: Page | None = None
     _implicit_page: Page | None = None
     selection_lost: bool = False
+    _selection_generation: int = 0
+    _selection_adoption_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _reconnect_request_failures: weakref.WeakKeyDictionary[Page, list[RequestFailure]] = field(
+        default_factory=weakref.WeakKeyDictionary
+    )
     # -- Page event buffer for tab_wait_for_new --
     _page_events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
     _page_event_signal: asyncio.Event = field(default_factory=lambda: asyncio.Event())
@@ -141,6 +147,7 @@ class SessionState:
     _body_store: dict[int, str] = field(default_factory=dict)
     _body_semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(_BODY_SEMAPHORE_LIMIT))
     _pending_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    _page_pending_tasks: dict[int, set[asyncio.Task[None]]] = field(default_factory=dict)
     # Routes keyed by page id — Playwright registers routes per-page, so tracking must match.
     active_routes: dict[int, set[str]] = field(default_factory=dict)
     # -- Iframe frame context --
@@ -156,9 +163,22 @@ class SessionState:
         return self._body_store.get(request_id)
 
 
+class StatelessCallEndedError(RuntimeError):
+    """A task that outlived its stateless MCP tool call asked for a browser driver."""
+
+
+@dataclass(eq=False)
+class _CallConnections:
+    """What one stateless tool call holds: the CDP connections it opened and its leases on shared drivers."""
+
+    browsers: list[SkyvernBrowser] = field(default_factory=list)
+    leases: list[HostedDriver] = field(default_factory=list)
+    ended: bool = False
+
+
 _current_session: ContextVar[SessionState | None] = ContextVar("mcp_session", default=None)
 _current_organization_id: ContextVar[str | None] = ContextVar("mcp_session_organization_id", default=None)
-_call_connections: ContextVar[list[SkyvernBrowser] | None] = ContextVar("mcp_call_connections", default=None)
+_call_connections: ContextVar[_CallConnections | None] = ContextVar("mcp_call_connections", default=None)
 _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS = 5
 _CALL_CONNECTION_DISCONNECTS: set[asyncio.Task[None]] = set()
 _global_session: SessionState | None = None
@@ -166,12 +186,6 @@ _organization_sessions: dict[str, SessionState] = {}
 _stateless_http_mode = False
 _stdio_local_file_access_enabled = False
 
-# Process-wide registry for copilot browser sessions. Keys always carry the
-# owning organization so authenticated HTTP requests cannot address another
-# tenant's entry even when the browser session ID is known.
-# This bypasses ContextVar propagation issues when FastMCP runs tool handlers
-# in a separate task whose context snapshot predates scoped_session().
-_copilot_sessions: dict[tuple[str, str], list[SessionState]] = {}
 # Ref snapshots and their invalidation generations, FIFO-capped like _body_store.
 # Capacity eviction can drop a live session's refs early; that fails safe (unknown
 # ref → the caller re-observes), which is why the tool contract doesn't mention it.
@@ -416,58 +430,6 @@ def clear_session_ref_map(
     return True
 
 
-def register_copilot_session(session_id: str, state: SessionState, *, organization_id: str) -> None:
-    """Register a pre-configured browser session for cross-task lookup.
-
-    The registry is process-local and in-memory: entries do not survive a
-    process restart and are not shared across uvicorn workers. Callers that
-    need cross-process continuity must reconnect via the cloud session API.
-    """
-    if not organization_id:
-        raise ValueError("organization_id is required for a copilot browser session")
-    if state.organization_id not in {None, organization_id}:
-        raise ValueError("session state belongs to a different organization")
-    if is_self_heal_session_id(session_id):
-        os.environ.pop("DEBUGP", None)
-        redactor = current_codeblock_log_redactor()
-        if redactor is not None:
-            state._codeblock_redactor = redactor
-    state.organization_id = organization_id
-    state.tab_state_persists = True
-    registrations = _copilot_sessions.setdefault((organization_id, session_id), [])
-    if not any(registered is state for registered in registrations):
-        registrations.append(state)
-
-
-def unregister_copilot_session(
-    session_id: str,
-    *,
-    organization_id: str,
-    expected_state: SessionState | None = None,
-) -> None:
-    """Remove one exact registration, or every registration for explicit cleanup callers."""
-    key = (organization_id, session_id)
-    if expected_state is None:
-        _copilot_sessions.pop(key, None)
-        return
-    registrations = _copilot_sessions.get(key)
-    if registrations is None:
-        return
-    registrations[:] = [registered for registered in registrations if registered is not expected_state]
-    if not registrations:
-        _copilot_sessions.pop(key, None)
-
-
-def active_copilot_session_ids() -> set[str]:
-    """Browser-session IDs currently bound to an active copilot turn."""
-    return {session_id for _, session_id in _copilot_sessions}
-
-
-def _registered_copilot_session(session_id: str, *, organization_id: str) -> SessionState | None:
-    registrations = _copilot_sessions.get((organization_id, session_id))
-    return registrations[-1] if registrations else None
-
-
 def _explicit_cloud_session_can_access_localhost() -> bool:
     return settings.ENV == "local"
 
@@ -549,32 +511,57 @@ async def scoped_session(state: SessionState) -> AsyncIterator[None]:
 
 @asynccontextmanager
 async def stateless_call_connection_scope() -> AsyncIterator[None]:
-    """Disconnect the CDP connections a stateless tool call opened when the call ends."""
+    """Disconnect the CDP connections a stateless tool call opened, then release its driver leases, when it ends."""
     # The call's SessionState lives only in its own ContextVar, so nothing else can close them; an open
     # connection keeps receiving and buffering the remote browser's events until that cloud session ends.
     if not _stateless_http_mode:
         yield
         return
-    connections: list[SkyvernBrowser] = []
-    token = _call_connections.set(connections)
+    owned = _CallConnections()
+    token = _call_connections.set(owned)
     try:
         yield
     finally:
         _call_connections.reset(token)
-        if connections:
-            # Shielded so a cancelled call still disconnects; the timeout only stops a hung close
-            # handshake from holding the response, and the close itself finishes in the background.
-            disconnect = asyncio.create_task(_disconnect_call_connections(connections))
-            _CALL_CONNECTION_DISCONNECTS.add(disconnect)
-            disconnect.add_done_callback(_CALL_CONNECTION_DISCONNECTS.discard)
+        owned.ended = True
+        if owned.browsers or owned.leases:
+            # Shielded so a cancelled call still cleans up. The release keeps itself within the same budget;
+            # the timeout only stops it from holding the response if that ever fails.
+            release = asyncio.create_task(_release_call_connections(owned))
+            _retain_call_cleanup(release)
             with suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(disconnect), _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
+                await asyncio.wait_for(asyncio.shield(release), _CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
 
 
 def _own_call_connection(browser: SkyvernBrowser) -> None:
-    connections = _call_connections.get()
-    if connections is not None:
-        connections.append(browser)
+    owned = _call_connections.get()
+    if owned is not None:
+        owned.browsers.append(browser)
+
+
+async def stateless_call_playwright(driver: HostedDriver) -> Playwright:
+    """``driver``'s Playwright, leased by the current stateless tool call until its connections are released."""
+    owned = _call_connections.get()
+    if owned is not None:
+        # Tasks the call spawned still see this object in their copied context after the scope resets the
+        # ContextVar, so this flag is what keeps them from using a driver no lease protects.
+        if owned.ended:
+            raise StatelessCallEndedError("This MCP tool call has already ended")
+        if driver not in owned.leases:
+            driver.acquire()
+            owned.leases.append(driver)
+    return await driver.playwright()
+
+
+def _retain_call_cleanup(task: asyncio.Task[None]) -> None:
+    _CALL_CONNECTION_DISCONNECTS.add(task)
+    task.add_done_callback(_finish_call_cleanup)
+
+
+def _finish_call_cleanup(task: asyncio.Task[None]) -> None:
+    _CALL_CONNECTION_DISCONNECTS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        LOG.warning("Stateless MCP call cleanup failed", error_type=type(task.exception()).__name__)
 
 
 async def _disconnect_browser(browser: SkyvernBrowser) -> None:
@@ -585,12 +572,26 @@ async def _disconnect_browser(browser: SkyvernBrowser) -> None:
         await playwright_browser.close()
 
 
-async def _disconnect_call_connections(connections: list[SkyvernBrowser]) -> None:
-    for browser in connections:
-        try:
-            await _disconnect_browser(browser)
-        except Exception:
-            LOG.warning("Failed to disconnect a stateless MCP browser connection", exc_info=True)
+async def _disconnect_call_connection(browser: SkyvernBrowser) -> None:
+    try:
+        await _disconnect_browser(browser)
+    except Exception:
+        LOG.warning("Failed to disconnect a stateless MCP browser connection", exc_info=True)
+
+
+async def _release_call_connections(owned: _CallConnections) -> None:
+    try:
+        if owned.browsers:
+            disconnects = [asyncio.create_task(_disconnect_call_connection(browser)) for browser in owned.browsers]
+            _, pending = await asyncio.wait(disconnects, timeout=_CALL_CONNECTION_DISCONNECT_TIMEOUT_SECONDS)
+            if pending:
+                # A hung close must not pin the shared driver; the idle sweep's driver stop also ends these.
+                LOG.warning("Stateless MCP browser connections did not disconnect in time", pending=len(pending))
+                for disconnect in pending:
+                    _retain_call_cleanup(disconnect)
+    finally:
+        for driver in owned.leases:
+            driver.release()
 
 
 def set_stateless_http_mode(enabled: bool) -> None:
@@ -743,7 +744,7 @@ async def resolve_browser(
     # does not propagate through FastMCP in-process transport).
     organization_id = _current_organization_id.get()
     registered = (
-        _registered_copilot_session(session_id, organization_id=organization_id)
+        registered_copilot_session(session_id, organization_id=organization_id)
         if session_id and organization_id
         else None
     )
@@ -838,8 +839,6 @@ async def _reconnect_extension_session(
     current: SessionState,
     active_api_key_hash: str | None,
 ) -> tuple[SkyvernBrowser, BrowserContext] | None:
-    from skyvern.browser_extension.runtime import BrowserExtensionRuntime
-
     runtime = BrowserExtensionRuntime.instance()
     if runtime is None:
         return None
@@ -890,6 +889,8 @@ async def _close_session_state(current: SessionState, *, close_via_active_client
                     session_id=current.context.session_id,
                     exc_info=True,
                 )
+        if current.context is not None and current.context.mode == "extension":
+            current._page_event_listener_installed = False
         # Cancel pending body-capture tasks before closing the browser to avoid
         # "target closed" noise from CDP calls against a defunct context.
         for task in current._pending_tasks:
@@ -953,6 +954,95 @@ async def close_all_sessions() -> None:
         raise errors[0][1]
 
 
+async def reconcile_extension_selection(browser: SkyvernBrowser, ctx: BrowserContext) -> bool:
+    """Return True when the caller must resolve the session and selection again."""
+    if ctx.mode != "extension" or (runtime := BrowserExtensionRuntime.instance()) is None:
+        return False
+    state = get_current_session()
+    if state.selection_lost:
+        return False
+    explicit = state._active_page is not None
+    selected = state._active_page if explicit else state._implicit_page
+    if selected is None:
+        return False
+    context = browser._browser_context
+    session_context = state.context
+    generation = state._selection_generation
+
+    def selection_is_current() -> bool:
+        return (
+            get_current_session() is state
+            and state.browser is browser
+            and state.context is session_context
+            and browser._browser_context is context
+            and (state._active_page if explicit else state._implicit_page) is selected
+            and (explicit or state._active_page is None)
+            and state._selection_generation == generation
+            and not state.selection_lost
+        )
+
+    if not selected.is_closed():
+        await runtime.page_target_id(selected)
+        return not selection_is_current()
+
+    target_id = runtime.last_page_target_id(selected)
+    record = runtime.tab_reconnect(target_id) if target_id is not None else None
+    if target_id is not None and record is not None and record.state in {"pending", "done"}:
+        deadline = asyncio.get_running_loop().time() + _TAB_RECONNECT_ADOPTION_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout_at(deadline):
+                async with state._selection_adoption_lock:
+                    while True:
+                        if not selection_is_current():
+                            return True
+                        record = runtime.tab_reconnect(target_id)
+                        if record is None or record.state == "failed":
+                            break
+                        if record.state == "pending":
+                            await runtime.wait_for_tab_reconnect(record, deadline - asyncio.get_running_loop().time())
+                            continue
+                        if record.new_target_id is None:
+                            await asyncio.sleep(0.05)
+                            continue
+                        replacement = await runtime.find_page_for_target(context, record.new_target_id)
+                        if not selection_is_current():
+                            return True
+                        if runtime.tab_reconnect(target_id) is not record or record.state != "done":
+                            continue
+                        if replacement is None:
+                            await asyncio.sleep(0.05)
+                            continue
+                        if explicit:
+                            state._active_page = replacement
+                        else:
+                            state._implicit_page = replacement
+                        state.selection_lost = False
+                        state._working_frame = None
+                        clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+                        state.active_routes.pop(id(selected), None)
+                        for task in state._page_pending_tasks.pop(id(selected), set()):
+                            task.cancel()
+                        for failure in state._reconnect_request_failures.pop(selected, []):
+                            state.request_failures.append({**failure, "tab_id": str(id(replacement))})
+                        state._page_events = deque(
+                            (event for event in state._page_events if event["page"] is not replacement),
+                            maxlen=state._page_events.maxlen,
+                        )
+                        state._selection_generation += 1
+                        ensure_browser_hooks(browser)
+                        return True
+        except TimeoutError:
+            pass
+
+    if not selection_is_current():
+        return True
+    if not explicit:
+        state._implicit_page = None
+        state.selection_lost = True
+        state._selection_generation += 1
+    return False
+
+
 async def get_page(
     session_id: str | None = None,
     cdp_url: str | None = None,
@@ -966,6 +1056,8 @@ async def get_page(
     change this page selection.
     """
     browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
+    while await reconcile_extension_selection(browser, ctx):
+        browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     state = get_current_session()
 
     if state.selection_lost:
@@ -1008,6 +1100,11 @@ async def get_page(
             page = await browser.get_working_page()
             context_pages = browser._browser_context.pages
             state._implicit_page = context_pages[-1] if context_pages else None
+            if ctx.mode == "extension" and (runtime := BrowserExtensionRuntime.instance()) is not None:
+                state._implicit_page = page.page
+                state._selection_generation += 1
+                if state._implicit_page is not None:
+                    await runtime.page_target_id(state._implicit_page)
     except Exception as exc:
         # The connect above can succeed and the target still die before this command
         # reaches it -- same failure family as resolve_browser's connect attempt.
@@ -1068,6 +1165,36 @@ def _install_page_event_listener(state: SessionState, browser: SkyvernBrowser) -
         event = {**event_data, "page": page}
         state._page_events.append(event)
         state._page_event_signal.set()
+
+        if (
+            state.context is not None
+            and state.context.mode == "extension"
+            and state._page_event_listener_installed
+            and state.browser is browser
+            and (runtime := BrowserExtensionRuntime.instance()) is not None
+        ):
+            event_context = state.context
+
+            async def discard_replacement_event() -> None:
+                try:
+                    await runtime.page_target_id(page)
+                    replacement = await runtime.is_reconnect_replacement(page)
+                    if (
+                        replacement
+                        and state._page_event_listener_installed
+                        and state.context is event_context
+                        and state.browser is browser
+                    ):
+                        state._page_events = deque(
+                            (e for e in state._page_events if e is not event),
+                            maxlen=state._page_events.maxlen,
+                        )
+                except Exception as exc:
+                    LOG.debug("browser_extension_page_event_identity_failed", error_type=type(exc).__name__)
+
+            task = asyncio.create_task(discard_replacement_event())
+            state._pending_tasks.add(task)
+            task.add_done_callback(state._pending_tasks.discard)
 
         # Eagerly clean up when the page closes
         def _on_close() -> None:

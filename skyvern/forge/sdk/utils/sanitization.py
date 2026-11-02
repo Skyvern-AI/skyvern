@@ -2,9 +2,12 @@
 Utility functions for sanitizing content before storing in the database.
 """
 
+import re
+
 import structlog
 
 LOG = structlog.get_logger(__name__)
+_SURROGATE_PATTERN = re.compile(r"[\ud800-\udfff]")
 
 
 def sanitize_postgres_text(text: str) -> str:
@@ -13,7 +16,7 @@ def sanitize_postgres_text(text: str) -> str:
 
     PostgreSQL text fields cannot contain:
     - NUL bytes (0x00)
-    - Other problematic control characters
+    - Other problematic control characters and unpaired surrogates
 
     This function removes these characters while preserving normal whitespace.
 
@@ -50,5 +53,8 @@ def sanitize_postgres_text(text: str) -> str:
             removed_count=removed_count,
             sanitized_length=len(sanitized),
         )
+
+    if not sanitized.isascii() and _SURROGATE_PATTERN.search(sanitized):
+        sanitized = sanitized.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
     return sanitized

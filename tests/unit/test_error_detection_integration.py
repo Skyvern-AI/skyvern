@@ -4,7 +4,7 @@ Integration tests for error detection across different failure scenarios.
 Tests the complete flow from task failure to error detection and storage.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,6 +16,12 @@ from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse
+from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER
+from skyvern.webeye.actions.actions import TerminateAction
+from skyvern.webeye.actions.handler import handle_terminate_action
+from skyvern.webeye.actions.models import DetailedAgentStepOutput
+from skyvern.webeye.actions.multi_field_totp import RetryOutcome
+from skyvern.webeye.actions.responses import ActionSuccess
 from tests.unit.helpers import make_organization, make_step, make_task
 
 
@@ -241,6 +247,138 @@ async def test_failed_step_with_non_terminal_output_errors_uses_retry_budget(age
             order=step.order,
             retry_index=step.retry_index + 1,
         )
+
+
+@pytest.mark.asyncio
+async def test_agent_planned_termination_persists_the_mapped_user_defined_error(agent):
+    """handle_terminate_action resolves the block's error_code_mapping against the page and leaves the
+    code on the action; the terminal write has to ship it like every other terminal path does.
+    Customers route on errors[0], and the status alone cannot separate a mapped "no record found"
+    from an unmapped stop."""
+    now = datetime.now()
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"profile_not_found": "No profile for the member"})
+    mapped = UserDefinedError(
+        error_code="profile_not_found",
+        reasoning="no profile listed for sk4829137765; terminating task",
+        confidence_float=1.0,
+    )
+    terminate = TerminateAction(reasoning="No profile found for the specific individual", errors=[mapped])
+    step = make_step(
+        now,
+        task,
+        step_id="step-terminated",
+        status=StepStatus.completed,
+        order=1,
+        output=AgentStepOutput(action_results=[], actions_and_results=[(terminate, [ActionSuccess()])]),
+    )
+
+    with patch.object(agent, "update_step", new_callable=AsyncMock):
+        with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+            mock_update_task.return_value = task
+            with patch.object(
+                agent, "_maybe_retry_multi_field_totp_after_rejection", new_callable=AsyncMock
+            ) as mock_retry:
+                mock_retry.return_value = RetryOutcome.NO_RETRY
+                with patch("skyvern.forge.agent.app") as mock_app:
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = True
+                    mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {"sk4829137765"}
+
+                    is_completed, _last_step, next_step = await agent.handle_completed_step(
+                        organization, task, step, None, complete_verification=False
+                    )
+
+    assert (is_completed, next_step) == (False, None)
+    call_kwargs = mock_update_task.call_args.kwargs
+    assert call_kwargs["status"] == TaskStatus.terminated
+    # The agent's own reasoning still owns the customer-visible reason; only `errors` is added.
+    assert call_kwargs["failure_reason"] == terminate.reasoning
+    (persisted,) = call_kwargs["errors"]
+    assert persisted["error_code"] == "profile_not_found"
+    assert "sk4829137765" not in persisted["reasoning"]
+    assert REDACTED_SECRET_PLACEHOLDER in persisted["reasoning"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action_starts_with_mapped_error",
+    [False, True],
+    ids=["handler-maps-before-write", "action-already-mapped"],
+)
+async def test_agent_planned_termination_does_not_append_step_errors_twice(agent, action_starts_with_mapped_error):
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization, error_code_mapping={"profile_not_found": "No profile for the member"})
+    run_secret = "private-run-secret-12345"
+    mapped = UserDefinedError(
+        error_code="profile_not_found",
+        reasoning=f"No matching profile was found for {run_secret}",
+        confidence_float=1.0,
+    )
+    terminate = TerminateAction(
+        reasoning="No profile found for the specific individual",
+        errors=[mapped] if action_starts_with_mapped_error else [],
+    )
+    step = make_step(
+        now,
+        task,
+        step_id="step-terminated",
+        status=StepStatus.completed,
+        order=1,
+        output=AgentStepOutput(action_results=[], actions_and_results=[(terminate, [ActionSuccess()])]),
+    )
+
+    if not action_starts_with_mapped_error:
+        with patch(
+            "skyvern.webeye.actions.handler.extract_user_defined_errors",
+            new_callable=AsyncMock,
+            return_value=[mapped],
+        ):
+            await handle_terminate_action(terminate, MagicMock(), MagicMock(), task, step)
+
+    detailed_output = DetailedAgentStepOutput(
+        scraped_page=None,
+        extract_action_prompt=None,
+        llm_response=None,
+        actions=[terminate],
+        action_results=[ActionSuccess()],
+        actions_and_results=[(terminate, [ActionSuccess()])],
+    )
+    stored_errors = []
+
+    async def append_step_errors(**kwargs):
+        stored_errors.extend(kwargs["errors"])
+        return task.model_copy(update={"errors": list(stored_errors)})
+
+    async def append_terminal_errors(task_arg, **kwargs):
+        stored_errors.extend(kwargs["errors"] or [])
+        return task_arg.model_copy(update={"errors": list(stored_errors)})
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.DATABASE.tasks.update_task = AsyncMock(side_effect=append_step_errors)
+        mock_app.WORKFLOW_CONTEXT_MANAGER.artifact_redaction_enabled.return_value = True
+        mock_app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run.return_value = {run_secret}
+        task = await agent.update_task_errors_from_detailed_output(task, detailed_output)
+
+        with (
+            patch.object(agent, "update_step", new_callable=AsyncMock),
+            patch.object(
+                agent, "update_task", new_callable=AsyncMock, side_effect=append_terminal_errors
+            ) as mock_update,
+            patch.object(agent, "_maybe_retry_multi_field_totp_after_rejection", new_callable=AsyncMock) as mock_retry,
+        ):
+            mock_retry.return_value = RetryOutcome.NO_RETRY
+            is_completed, _last_step, next_step = await agent.handle_completed_step(
+                organization, task, step, None, complete_verification=False
+            )
+
+    assert (is_completed, next_step) == (False, None)
+    expected_error = mapped.model_dump()
+    expected_error["reasoning"] = f"No matching profile was found for {REDACTED_SECRET_PLACEHOLDER}"
+    assert stored_errors == [expected_error]
+    assert run_secret not in repr(stored_errors)
+    assert mock_update.call_args.kwargs["errors"] is None
+    assert task.to_task_response().errors == [expected_error]
 
 
 @pytest.mark.asyncio

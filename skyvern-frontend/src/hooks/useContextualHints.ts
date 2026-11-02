@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import { driver, type Config } from "driver.js";
 import { useLocation } from "react-router-dom";
-import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { usePostHogFeatureFlagVariantKey as useFeatureFlagVariantKey } from "@/hooks/usePostHogFeatureFlag";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";

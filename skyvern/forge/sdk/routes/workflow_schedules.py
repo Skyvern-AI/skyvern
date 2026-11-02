@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.workflow.schedules import (
     validate_cron_expression,
     validate_timezone_name,
 )
+from skyvern.forge.sdk.workflow.service import BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS
 
 LOG = structlog.get_logger()
 SCHEDULE_SYNC_ERROR_DETAIL = "Failed to sync schedule with scheduling service"
@@ -867,7 +869,8 @@ async def delete_workflow_schedule_route(
         )
     else:
         try:
-            await app.AGENT_FUNCTION.delete_workflow_schedule(existing.backend_schedule_id)
+            async with asyncio.timeout(BACKEND_SCHEDULE_DELETE_TIMEOUT_SECONDS):
+                await app.AGENT_FUNCTION.delete_workflow_schedule(existing.backend_schedule_id)
         except Exception as e:
             LOG.exception(
                 "Failed to delete schedule on execution backend; leaving the schedule in place",
