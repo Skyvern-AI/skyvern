@@ -1252,6 +1252,22 @@ async def test_saved_workflow_validate_is_served_on_the_api_v1_prefix_the_ui_cal
     assert [problem["code"] for problem in response.json()["problems"]] == ["forward_reference"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["webapps/v1/workflows", "${772055+272300}", "42", "- a\n- b", "null"])
+async def test_workflow_create_rejects_yaml_that_is_not_a_mapping_with_422(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    body: str,
+) -> None:
+    async with idempotency_lab(monkeypatch, tmp_path / "non-mapping-yaml.db") as lab:
+        legacy = await lab.client.post("/api/v1/workflows", content=body, headers={"Content-Type": "text/plain"})
+        shared = await lab.client.post("/v1/workflows", json={"yaml_definition": body})
+        update = await lab.client.post("/v1/workflows/wpid_missing", json={"yaml_definition": body})
+
+    assert [legacy.status_code, shared.status_code, update.status_code] == [422, 422, 422]
+    assert "mapping" in legacy.json()["detail"]
+
+
 def _validation_request(body: bytes) -> Request:
     async def receive() -> dict[str, object]:
         return {"type": "http.request", "body": body, "more_body": False}

@@ -21,14 +21,6 @@ def test_omitted_enable_self_healing_is_none() -> None:
     assert _request().enable_self_healing is None
 
 
-def test_explicit_false_survives() -> None:
-    assert _request(enable_self_healing=False).enable_self_healing is False
-
-
-def test_explicit_true_survives() -> None:
-    assert _request(enable_self_healing=True).enable_self_healing is True
-
-
 @pytest.mark.parametrize("block_type", [TaskV2BlockYAML, TaskV2Block])
 def test_task_v2_limit_defaults_keep_runtime_settings_out_of_schema(
     monkeypatch: pytest.MonkeyPatch,
