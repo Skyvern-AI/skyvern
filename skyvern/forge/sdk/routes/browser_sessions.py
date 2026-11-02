@@ -34,6 +34,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     GET_BROWSER_SESSIONS_CODE_SAMPLE_PYTHON,
     GET_BROWSER_SESSIONS_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -202,7 +203,7 @@ def _decode_action_log_cursor(cursor: str | None) -> tuple[datetime | None, str 
 )
 async def get_browser_sessions_all(
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    page: int = Query(1, ge=1, description="Page number for pagination"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination"),
     page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
 ) -> list[BrowserSessionResponse]:
     """Get all browser sessions for the organization"""
@@ -720,7 +721,7 @@ async def get_workflow_runs_for_browser_session(
     browser_session_id: str = Path(
         ..., description="The ID of the browser session. browser_session_id starts with `pbs_`", examples=["pbs_123456"]
     ),
-    page: int = Query(1, ge=1, description="Page number for pagination"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination"),
     page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:

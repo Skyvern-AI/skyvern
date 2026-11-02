@@ -28,6 +28,7 @@ from skyvern.exceptions import (
     ActionDeadlineExceeded,
     ElementTreeBuildFailed,
     FailedToTakeScreenshot,
+    ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
     SkyvernPageAnalysisTimeout,
 )
@@ -856,6 +857,14 @@ def _is_screenshot_target_closed(
     return _is_engine_error(error, engine_selection) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
 
 
+def _is_screenshot_no_drawn_area(error: BaseException) -> bool:
+    """Chromium refuses to capture a viewport that has collapsed to zero in either axis. A reused
+    remote CDP context left at 0x0 is the usual source; see _apply_viewport_on_reused_context."""
+    with contextlib.suppress(Exception):
+        return "cannot take screenshot with 0 " in str(error).lower()
+    return False
+
+
 def screenshot_failure_outcome(
     exc: BaseException, engine_selection: BrowserEngineSelection | None
 ) -> ScreenshotFailureOutcome:
@@ -1285,6 +1294,8 @@ async def _current_viewpoint_screenshot_helper(
                 timeout_budget_ms=timeout,
             ),
         )
+        if _is_screenshot_no_drawn_area(e):
+            raise ScreenshotPageHasNoDrawnArea(error_message=str(e)) from e
         raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 
