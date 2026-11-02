@@ -232,6 +232,7 @@ async def _run_agent_block(
     max_turns: int = 25,
     prompt: str = "Find the answer.",
     tools: list[str] | None = sorted(agent_step_tools.tool_descriptions()),
+    parameter_keys: list[str] | None = None,
     **block_fields: bool,
 ) -> tuple[BlockResult, _FlagProvider]:
     """With no model, the block resolves the variant's real model, which sends through litellm.acompletion."""
@@ -242,8 +243,18 @@ async def _run_agent_block(
             agent_step_loop, "resolve_agent_model", lambda _key: (model, RunConfig(tracing_disabled=True))
         )
     block = block_yaml_to_block(
-        AgentStepBlockYAML(label="agent", prompt=prompt, max_turns=max_turns, tools=tools, **block_fields),
-        {"agent_output": make_block_output_parameter("agent_output")},
+        AgentStepBlockYAML(
+            label="agent",
+            prompt=prompt,
+            max_turns=max_turns,
+            tools=tools,
+            parameter_keys=parameter_keys,
+            **block_fields,
+        ),
+        {
+            "agent_output": make_block_output_parameter("agent_output"),
+            **app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters,
+        },
     )
     return await block.execute_safe(workflow_run_id=RUN, organization_id=ORG), provider
 
@@ -438,19 +449,21 @@ def _credential_parameter() -> WorkflowParameter:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tools", "credential", "offered", "block_types"),
+    ("tools", "credential", "listed", "offered", "block_types"),
     [
         (
             ["http_request", "web_search"],
             False,
+            False,
             ["web_search", "run_block", "read_run_data", "finish"],
             ["http_request"],
         ),
-        (None, False, ["read_run_data", "finish"], None),
-        ([], False, ["read_run_data", "finish"], None),
-        (["web_search"], False, ["web_search", "read_run_data", "finish"], None),
-        (["login", "page_goto"], False, ["read_run_data", "page_goto", "finish"], None),
-        (["login", "page_goto"], True, ["login", "read_run_data", "page_goto", "finish"], None),
+        (None, False, False, ["read_run_data", "finish"], None),
+        ([], False, False, ["read_run_data", "finish"], None),
+        (["web_search"], False, False, ["web_search", "read_run_data", "finish"], None),
+        (["login", "page_goto"], False, False, ["read_run_data", "page_goto", "finish"], None),
+        (["login", "page_goto"], True, False, ["read_run_data", "page_goto", "finish"], None),
+        (["login", "page_goto"], True, True, ["login", "read_run_data", "page_goto", "finish"], None),
     ],
 )
 async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_run_data(
@@ -458,6 +471,7 @@ async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_ru
     database: AgentDB,
     tools: list[str] | None,
     credential: bool,
+    listed: bool,
     offered: list[str],
     block_types: list[str] | None,
 ) -> None:
@@ -466,7 +480,9 @@ async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_ru
         app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters["login_credential"] = _credential_parameter()
     model = _ScriptedModel([VALID_FINISH])
 
-    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=tools)
+    await _run_agent_block(
+        monkeypatch, LUNA_MEDIUM, model, tools=tools, parameter_keys=["login_credential"] if listed else None
+    )
 
     (given,) = model.tools
     assert [tool.name for tool in given] == offered
