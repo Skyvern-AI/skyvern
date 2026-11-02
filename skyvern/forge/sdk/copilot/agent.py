@@ -340,6 +340,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     runner_code_block_associations,
     stored_block_code,
     stored_workflow_yaml,
+    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
@@ -1916,13 +1917,16 @@ def _draft_ran_on_current_source(facts: NarrativeTurnFacts) -> bool:
     return facts["runCompleted"] is not False and facts["evaluationState"] != "not_demonstrated"
 
 
-def _review_projection_for(ctx: CopilotContext, proposal_yaml: str | None) -> NarrativeReviewProjection | None:
+def _review_projection_for(
+    ctx: CopilotContext, proposal_yaml: str | None, candidate: Workflow | None = None
+) -> NarrativeReviewProjection | None:
     if not isinstance(proposal_yaml, str):
         return None
     review = build_review_projection(
         saved_workflow_canvas(ctx) or _EMPTY_REVIEW_BASELINE_YAML,
         proposal_yaml,
         ctx.executed_block_fingerprints,
+        workflow_to_copilot_yaml(candidate) if isinstance(candidate, Workflow) else None,
     )
     if review is None:
         return None
@@ -2132,7 +2136,7 @@ def _make_agent_result(
     if ctx is not None and narrative_payload is None:
         raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     if ctx is not None and isinstance(narrative_payload, dict) and isinstance(proposal_yaml, str):
-        review = _review_projection_for(ctx, proposal_yaml)
+        review = _review_projection_for(ctx, proposal_yaml, kwargs.get("updated_workflow"))
         narrative_payload = {key: value for key, value in narrative_payload.items() if key != "review"}
         if review is not None:
             narrative_payload["review"] = review
@@ -2425,7 +2429,7 @@ def _build_narrative_payload(
     if ctx.demonstration_items:
         payload["demonstrationItems"] = list(ctx.demonstration_items)
     if ctx.staged_workflow_yaml is not None:
-        review = _review_projection_for(ctx, ctx.staged_workflow_yaml)
+        review = _review_projection_for(ctx, ctx.staged_workflow_yaml, ctx.staged_workflow)
         if review is not None:
             payload["review"] = review
     payload["testedBlockFingerprints"] = serialize_execution_receipts(ctx.executed_block_fingerprints)
