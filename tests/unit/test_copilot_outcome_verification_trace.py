@@ -221,6 +221,7 @@ async def test_run_copilot_agent_finalizes_false_gate_on_turn_span(
             attached_browser_drivers={},
             minted_browser_sessions={},
             minted_browser_renewal_checks={},
+            pending_build_test_prestarts={},
             pending_scout_challenge_detachers=[],
         )
         record_gate_decision(

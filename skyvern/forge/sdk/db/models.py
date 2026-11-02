@@ -1896,6 +1896,8 @@ class PersistentBrowserSessionModel(Base):
     # workflow's cancellation to ride a throttled heartbeat. Write-once: it marks the first request.
     close_requested_at = Column(DateTime, nullable=True)
     cdp_unreachable_at = Column(DateTime, nullable=True)
+    # When a Copilot pre-started browser was claimed by a test; uptime is billed from this, not started_at.
+    claimed_at = Column(DateTime, nullable=True)
     # A BrowserSessionCloseReason, write-once; NULL when the session timed out, failed, or predates the column.
     close_reason = Column(String, nullable=True)
     # Retained, unwritten column: the asynchronous-create contract that populated it was reverted,

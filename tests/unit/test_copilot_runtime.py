@@ -56,6 +56,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     BrowserProbeOutcome,
     BrowserSessionReplacement,
     BuildTestBrowserSeed,
+    BuildTestPrestart,
     _browser_context_attachability,
     ensure_browser_session,
     ensure_build_test_browser_session,
@@ -65,6 +66,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.tools import mcp_hooks, run_execution
 from skyvern.forge.sdk.copilot.tools.scouting import PageState
+from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.unrecoverable_tool_error import (
     PAGE_CRASHES_KEY,
     _is_unrecoverable_browser_session_error,
@@ -73,7 +75,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrow
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import BROWSER_SESSION_RENEWAL_INTERVAL_SECONDS
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE, BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.webeye.browser_errors import (
     BrowserCdpConnectionError,
@@ -86,6 +88,7 @@ from skyvern.webeye.persistent_sessions_manager import (
     BrowserRetirement,
     BrowserSessionCreditAdmissionRefusal,
 )
+from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.real_browser_state import RealBrowserState
 from tests.unit._mcp_browser_fakes import page_crash_entry
 from tests.unit.copilot_test_helpers import (
@@ -376,6 +379,229 @@ async def test_a_minted_browser_is_renewed_from_mint(monkeypatch: pytest.MonkeyP
     finally:
         browser_manager.end_session_activity_renewal("pbs_fresh")
         await stop_activity_renewer(browser_manager)
+
+
+def _prestart_app(monkeypatch: pytest.MonkeyPatch, manager: MagicMock) -> RealBrowserManager:
+    manager.supports_evict_and_reconnect = MagicMock(return_value=False)
+    browser_manager = stamping_browser_manager(monkeypatch)
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager, BROWSER_MANAGER=browser_manager)
+    )
+    monkeypatch.setattr(settings, "ENV", "staging")
+    return browser_manager
+
+
+@pytest.mark.asyncio
+async def test_a_prestart_that_finishes_after_a_cancelled_teardown_closes_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    async def create(**kwargs: Any) -> SimpleNamespace:
+        await release.wait()
+        return SimpleNamespace(persistent_browser_session_id="pbs_fresh")
+
+    manager = _minting_manager()
+    manager.create_session = AsyncMock(side_effect=create)
+    browser_manager = _prestart_app(monkeypatch, manager)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_failed_test"
+
+    async def teardown() -> None:
+        ctx.prestart_teardown_started = True
+        runtime.end_minted_browser_renewals(ctx)
+        await asyncio.Event().wait()
+
+    finalizer = asyncio.create_task(teardown())
+    try:
+        runtime.start_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL)
+        prestart = ctx.build_test_prestart
+        assert prestart is not None
+        await asyncio.sleep(0)
+        finalizer.cancel()
+        release.set()
+
+        assert await asyncio.wait_for(prestart.task, timeout=5) is None
+        assert manager.create_session.await_args.kwargs["runnable_type"] == COPILOT_PRESTART_RUNNABLE_TYPE
+        manager.close_session.assert_awaited_once_with(
+            "org_1", "pbs_fresh", reason=BrowserSessionCloseReason.turn_ended
+        )
+        assert ctx.minted_browser_sessions == {} and ctx.minted_browser_renewal_checks == {}
+        assert ctx.attached_browser_drivers == {} and "pbs_fresh" not in runtime._ATTACHED_TURNS_PER_SESSION
+        assert browser_manager._renewable_session_ids() == set()
+        assert ctx.browser_session_id == "pbs_failed_test"
+    finally:
+        finalizer.cancel()
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+async def test_a_test_cancelled_while_waiting_on_the_prestart_discards_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = asyncio.Event()
+
+    async def create(**kwargs: Any) -> SimpleNamespace:
+        await release.wait()
+        return SimpleNamespace(persistent_browser_session_id="pbs_fresh")
+
+    manager = _minting_manager()
+    manager.create_session = AsyncMock(side_effect=create)
+    browser_manager = _prestart_app(monkeypatch, manager)
+    ctx = _make_ctx()
+    try:
+        runtime.start_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL)
+        prestart = ctx.build_test_prestart
+        assert prestart is not None
+        claim = asyncio.create_task(runtime.claim_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL))
+        await asyncio.sleep(0)
+        with capture_logs() as logs:
+            claim.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await claim
+            release.set()
+            await _wait_until(lambda: any(e["event"] == "copilot_build_test_browser_prestart_discarded" for e in logs))
+
+        discard = next(e for e in logs if e["event"] == "copilot_build_test_browser_prestart_discarded")
+        assert (discard["reason"], discard["prestart_browser_session_id"]) == ("cancelled", "pbs_fresh")
+        manager.close_session.assert_awaited_once_with("org_1", "pbs_fresh", reason=BrowserSessionCloseReason.aborted)
+        assert ctx.build_test_prestart is None
+    finally:
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+async def test_a_test_waiting_on_a_prestart_that_turn_end_cancels_falls_back_instead_of_cancelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def create(**kwargs: Any) -> SimpleNamespace:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    manager = _minting_manager()
+    manager.create_session = AsyncMock(side_effect=create)
+    browser_manager = _prestart_app(monkeypatch, manager)
+    ctx = _make_ctx()
+    try:
+        runtime.start_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL)
+        prestart = ctx.build_test_prestart
+        assert prestart is not None
+        claim = asyncio.create_task(runtime.claim_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL))
+        await asyncio.sleep(0)
+        prestart.task.cancel()
+
+        assert await claim is None
+    finally:
+        await stop_activity_renewer(browser_manager)
+
+
+async def _wait_until(condition: Callable[[], bool]) -> None:
+    async with asyncio.timeout(5):
+        while not condition():
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("discarded", [False, True])
+async def test_turn_end_cancels_a_prestart_still_waiting_for_its_browser_to_boot(
+    monkeypatch: pytest.MonkeyPatch, discarded: bool
+) -> None:
+    manager = _minting_manager()
+    manager.get_browser_state = AsyncMock(return_value=None)
+    browser_manager = _prestart_app(monkeypatch, manager)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.01)
+    ctx = _make_ctx()
+    ctx.browser_session_id = "pbs_failed_test"
+    try:
+        runtime.start_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL)
+        prestart = ctx.build_test_prestart
+        assert prestart is not None
+        await _wait_until(lambda: "pbs_fresh" in ctx.minted_browser_sessions)
+        with capture_logs() as logs:
+            if discarded:
+                runtime.discard_build_test_prestart(ctx, "seeded")
+            ctx.prestart_teardown_started = True
+            runtime.cancel_ledgered_build_test_prestarts(ctx)
+            runtime.end_minted_browser_renewals(ctx)
+            await run_execution.start_minted_browser_session_close(ctx)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(prestart.task, timeout=5)
+            if discarded:
+                await _wait_until(
+                    lambda: any(e["event"] == "copilot_build_test_browser_prestart_discarded" for e in logs)
+                )
+
+        assert prestart.task.cancelled() and ctx.pending_build_test_prestarts == {}
+        assert ("org_1", "pbs_fresh") in [c.args for c in manager.close_session.await_args_list]
+        assert not [e for e in logs if e["event"] == "Failed to auto-create browser session"]
+        if discarded:
+            discard = next(e for e in logs if e["event"] == "copilot_build_test_browser_prestart_discarded")
+            assert discard["reason"] == "seeded"
+            assert discard["prestart_browser_session_id"] == "pbs_fresh"
+        assert ctx.browser_session_id == "pbs_failed_test"
+    finally:
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+async def test_turn_end_leaves_an_unledgered_prestart_to_finish_closing_its_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _minting_manager()
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    closed: list[str] = []
+
+    async def close(organization_id: str, session_id: str, **kwargs: Any) -> None:
+        close_started.set()
+        await release_close.wait()
+        closed.append(session_id)
+
+    manager.close_session = AsyncMock(side_effect=close)
+    browser_manager = _prestart_app(monkeypatch, manager)
+    ctx = _make_ctx()
+
+    async def record(allocation_id: str, session_id: str | None) -> None:
+        if session_id is not None:
+            raise OSError("synthetic database failure")
+
+    ctx.browser_allocation_recorder = record
+    try:
+        runtime.start_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL)
+        prestart = ctx.build_test_prestart
+        assert prestart is not None
+        await asyncio.wait_for(close_started.wait(), timeout=5)
+
+        ctx.prestart_teardown_started = True
+        runtime.cancel_ledgered_build_test_prestarts(ctx)
+        release_close.set()
+
+        assert await asyncio.wait_for(prestart.task, timeout=5) is None
+        assert "pbs_fresh" in closed
+        assert ctx.minted_browser_sessions == {}
+    finally:
+        await stop_activity_renewer(browser_manager)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["local_env", "pending", "self_heal_turn", "teardown_started"])
+async def test_no_prestart_starts_beside_a_pending_one_locally_on_self_heal_or_after_teardown(
+    monkeypatch: pytest.MonkeyPatch, blocker: str
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local" if blocker == "local_env" else "staging")
+    provision = AsyncMock(return_value=None)
+    monkeypatch.setattr(runtime, "_provision_browser_session", provision)
+    ctx = _make_ctx()
+    pending = None
+    if blocker == "pending":
+        pending = BuildTestPrestart(task=asyncio.ensure_future(asyncio.sleep(0)), proxy_location=None)
+        ctx.build_test_prestart = pending
+    ctx.turn_origin = TurnOrigin.code_block_ai_fallback if blocker == "self_heal_turn" else ctx.turn_origin
+    ctx.prestart_teardown_started = blocker == "teardown_started"
+
+    runtime.start_build_test_prestart(ctx, ProxyLocation.RESIDENTIAL)
+    await asyncio.sleep(0)
+
+    assert ctx.build_test_prestart is pending
+    provision.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -800,7 +1026,7 @@ async def test_cancel_during_browser_create_closes_the_session_once_created(monk
     manager = _manager_reporting_fixed_deadline(None)
     manager.create_session = AsyncMock(side_effect=_slow_create)
     monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
-    monkeypatch.setattr(runtime, "_ABANDONED_DRIVER_RELEASES", set())
+    monkeypatch.setattr(runtime, "_DETACHED_TASKS", set())
 
     ctx = _make_ctx()
     task = asyncio.create_task(ensure_browser_session(ctx))
@@ -813,7 +1039,7 @@ async def test_cancel_during_browser_create_closes_the_session_once_created(monk
     manager.close_session.assert_not_awaited()
 
     release_create.set()
-    await asyncio.gather(*runtime._ABANDONED_DRIVER_RELEASES)
+    await asyncio.gather(*runtime._DETACHED_TASKS)
     manager.close_session.assert_awaited_once_with(
         "org_1", "pbs_cancelled_create", reason=BrowserSessionCloseReason.turn_ended
     )

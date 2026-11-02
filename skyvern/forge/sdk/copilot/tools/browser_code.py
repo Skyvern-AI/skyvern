@@ -20,6 +20,7 @@ from skyvern.cli.core.session_manager import get_page, resolve_browser
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.browser_code_contract import (
     DEMONSTRATED_OPERATIONS,
+    DENIED_WHILE_TAINTED,
     BrowserCodeCellResult,
     BrowserCodeHost,
     BrowserCodeOperation,
@@ -89,6 +90,15 @@ MAX_VALUE_CHARS = 32_000
 SESSION_LIFETIME_SECONDS = float(TOTAL_TIMEOUT_SECONDS + HARD_BACKSTOP_ALLOWANCE_SECONDS)
 
 
+_TAINTED_PAGE_SENTENCE = (
+    "After a test run that used a saved credential or a secret parameter in this browser, these are refused here "
+    "for the rest of the turn: "
+    + ", ".join(f"`{name}`" for name in sorted(DENIED_WHILE_TAINTED))
+    + ", `page.context.request.get` and `search_web`. Locator waits, `.count()`, `.is_visible()`, text reads, "
+    "clicks, fills and navigation still run; reading text is the way to inspect such a page."
+)
+
+
 def render_browser_code_description(pattern_calls: Sequence[str]) -> str:
     pattern_clause = (
         f" Compiled `re` patterns are accepted only by: {', '.join(pattern_calls)}." if pattern_calls else ""
@@ -125,8 +135,7 @@ Browser API (async, Playwright-shaped):
 - Navigation: `page.goto(url)`, `page.go_back()`, `page.reload()`. Internal, private-network, and
   non-web destinations are refused.
 - Frames: `page.frames`, `page.main_frame`, `page.frame_locator(css)`.
-- After a test run that used a saved secret in this browser, screenshots, `page.evaluate` and `search_web` are
-  refused here for the rest of the turn. Reading text still works; that is the way to inspect such a page.
+- {_TAINTED_PAGE_SENTENCE}
 - Tabs and popups: each call starts on the browser's current tab.
   `await tabs()` lists open tabs; `await switch_tab(index)` makes that tab `page` for the rest of the call;
   `await click_and_wait_for_popup(selector)` clicks and returns the new tab's `index` and `url`.

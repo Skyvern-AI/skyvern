@@ -2,6 +2,9 @@
 
 from enum import StrEnum
 
+# runnable_type of an unclaimed Copilot pre-started browser; uptime billing skips it until a test claims it.
+COPILOT_PRESTART_RUNNABLE_TYPE = "copilot_build_test_prestart"
+
 
 class BrowserSessionKind(StrEnum):
     """Which surface requested a browser session. Logged on its creation and Chrome-exit lines, never stored on
