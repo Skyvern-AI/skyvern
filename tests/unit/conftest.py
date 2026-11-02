@@ -39,7 +39,7 @@ from playwright.async_api import BrowserContext, Download
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import async_playwright
+from playwright.async_api import ViewportSize, async_playwright
 from playwright.sync_api import sync_playwright
 from sqlalchemy import Engine, create_engine, event, func, select
 from sqlalchemy.engine import URL, make_url
@@ -1476,11 +1476,11 @@ def requires_chromium(test: _T) -> _T:
 
 
 @asynccontextmanager
-async def chromium_context() -> AsyncIterator[BrowserContext]:
+async def chromium_context(viewport: ViewportSize | None = None) -> AsyncIterator[BrowserContext]:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         try:
-            yield await browser.new_context()
+            yield await browser.new_context(viewport=viewport)
         finally:
             await browser.close()
 
