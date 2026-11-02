@@ -5,12 +5,15 @@ import json
 from collections.abc import Callable, Collection, Mapping
 from typing import Any, Literal, get_args
 
+import structlog
 from jinja2 import Environment, nodes
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.exceptions import InvalidWorkflowParameter
 from skyvern.forge.sdk.copilot.data_write_defaults import DATA_WRITE_BLOCK_TYPES
+from skyvern.forge.sdk.copilot.input_references import block_read_keys
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
+from skyvern.forge.sdk.copilot.workflow_yaml import canonical_copilot_workflow
 from skyvern.forge.sdk.services import google_drive_service
 from skyvern.forge.sdk.workflow.block_notes import annotate_notes_read, definition_step_notes, strip_inert_block_fields
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType, WorkflowParameterType
@@ -24,10 +27,15 @@ ParameterDefault = str | int | float | bool
 DestinationIdentity = tuple[str, ...]
 DestinationAdapter = Callable[[dict[str, Any], Mapping[str, ParameterDefault]], DestinationIdentity | None]
 
+LOG = structlog.get_logger()
+
 _JINJA_ENV = Environment()
 _PARAMETER_IDENTITY_PREFIX = "\0workflow-parameter\0"
 _IGNORED_FINGERPRINT_KEYS = frozenset({"label"})
 _IGNORED_COMPARISON_KEYS = frozenset({"label", "next_block_label"})
+_PARAMETER_FIELDS_NOT_BINDINGS = frozenset(
+    {"key", "parameter_type", "workflow_parameter_type", "default_value", "description"}
+)
 
 
 class NarrativeReviewBlock(TypedDict):
@@ -316,6 +324,12 @@ def _parameters_by_key(parsed: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _parameter_signature(parameter: Mapping[str, Any], ignored_field: str | None = None) -> str:
+    return json.dumps(
+        {field: value for field, value in parameter.items() if field != ignored_field}, sort_keys=True, default=str
+    )
+
+
 def _input_changes(persisted: Mapping[str, Any], staged: Mapping[str, Any]) -> list[NarrativeReviewInput]:
     before = _parameters_by_key(persisted)
     after = _parameters_by_key(staged)
@@ -323,10 +337,95 @@ def _input_changes(persisted: Mapping[str, Any], staged: Mapping[str, Any]) -> l
     for key, parameter in after.items():
         if key not in before:
             rows.append({"key": key, "change": "added"})
-        elif json.dumps(before[key], sort_keys=True, default=str) != json.dumps(parameter, sort_keys=True, default=str):
+        elif _parameter_signature(before[key]) != _parameter_signature(parameter):
             rows.append({"key": key, "change": "changed"})
     rows.extend({"key": key, "change": "removed"} for key in before if key not in after)
     return rows
+
+
+def _changed_input_keys(
+    persisted: Mapping[str, Any], staged: Mapping[str, Any], input_rows: list[NarrativeReviewInput]
+) -> set[str]:
+    """The changed inputs, plus every parameter bound to one of them, transitively."""
+    before = _parameters_by_key(persisted)
+    after = _parameters_by_key(staged)
+    # Nothing at run time reads a description, so editing one leaves the blocks that read the input unchanged.
+    changed = {
+        row["key"]
+        for row in input_rows
+        if row["change"] != "changed"
+        or _parameter_signature(before[row["key"]], "description")
+        != _parameter_signature(after[row["key"]], "description")
+    }
+    bindings = [
+        (key, {field: value for field, value in parameter.items() if field not in _PARAMETER_FIELDS_NOT_BINDINGS})
+        for side in (before, after)
+        for key, parameter in side.items()
+    ]
+    grew = bool(changed)
+    while grew:
+        grew = False
+        for key, binding in bindings:
+            if key not in changed and block_read_keys(binding, changed):
+                changed.add(key)
+                grew = True
+    return changed
+
+
+def _workflow_settings(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    settings = {key: value for key, value in _workflow_execution_inputs(parsed).items() if key != "parameters"}
+    # The definition version only says how blocks link, which the position and next-block checks compare.
+    settings["definition"] = {key: value for key, value in settings["definition"].items() if key != "version"}
+    return settings
+
+
+def _loop_children_of_changed_loops(
+    blocks: list[dict[str, Any]], notes_by_label: Mapping[str, str], keys: set[str]
+) -> set[str]:
+    """Labels nested in a loop whose own fields read one of ``keys``: what they iterate over changed."""
+    labels: set[str] = set()
+    for block in blocks:
+        children = block.get("loop_blocks")
+        if not isinstance(children, list):
+            continue
+        own_fields = {
+            key: value for key, value in _comparison_value(block, notes_by_label).items() if key != "loop_blocks"
+        }
+        if block_read_keys(own_fields, keys):
+            labels.update(
+                child["label"]
+                for child in workflow_blocks({"workflow_definition": {"blocks": children}})
+                if isinstance(child.get("label"), str)
+            )
+    return labels
+
+
+def _comparison_documents(
+    persisted_workflow_yaml: str,
+    staged_workflow_yaml: str,
+    persisted: dict[str, Any],
+    staged: dict[str, Any],
+    candidate_settings: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Both sides as the save path would write them, so only meaning, not spelling, can differ."""
+    try:
+        canonical_persisted = canonical_copilot_workflow(persisted_workflow_yaml, bind_parameters=False)
+        canonical_staged = canonical_copilot_workflow(
+            staged_workflow_yaml, inherited={**canonical_persisted, **candidate_settings}
+        )
+    except Exception as exc:  # noqa: BLE001 - the card falls back to the written YAML rather than failing the turn.
+        # No exc_info: a validation error quotes workflow values, which can include input defaults.
+        LOG.warning("copilot_review_canonical_comparison_failed", error_type=type(exc).__name__)
+        return persisted, staged
+    for raw, canonical in ((persisted, canonical_persisted), (staged, canonical_staged)):
+        raw_index, canonical_index = _labeled_blocks(raw), _labeled_blocks(canonical)
+        if (
+            raw_index is None
+            or canonical_index is None
+            or [block["label"] for block in raw_index[0]] != [block["label"] for block in canonical_index[0]]
+        ):
+            return persisted, staged
+    return canonical_persisted, canonical_staged
 
 
 def _block_fingerprint(
@@ -438,11 +537,20 @@ def build_review_projection(
     persisted_workflow_yaml: str,
     staged_workflow_yaml: str,
     executed_blocks: Mapping[str, Collection[str] | str] | set[str],
+    candidate_workflow_yaml: str | None = None,
 ) -> NarrativeReviewProjection | None:
+    """``candidate_workflow_yaml`` is the processed proposal as saved; it supplies the settings the staged YAML
+    omits, which the save path takes from the draft rather than the persisted row."""
     if not isinstance(persisted_workflow_yaml, str) or not isinstance(staged_workflow_yaml, str):
         return None
     persisted = parse_workflow_yaml(persisted_workflow_yaml)
     staged = parse_workflow_yaml(staged_workflow_yaml)
+    candidate = parse_workflow_yaml(candidate_workflow_yaml) if candidate_workflow_yaml else None
+    candidate_settings = (
+        {key: value for key, value in candidate.items() if key != "workflow_definition"}
+        if isinstance(candidate, dict)
+        else {}
+    )
     if not isinstance(persisted, dict) or not isinstance(staged, dict):
         return None
     persisted_index = _labeled_blocks(persisted)
@@ -451,18 +559,37 @@ def build_review_projection(
         return None
     persisted_blocks, persisted_by_label = persisted_index
     staged_blocks, staged_by_label = staged_index
-    persisted_common = [block["label"] for block in persisted_blocks if block["label"] in staged_by_label]
-    staged_common = [block["label"] for block in staged_blocks if block["label"] in persisted_by_label]
+    persisted_compared, staged_compared = _comparison_documents(
+        persisted_workflow_yaml, staged_workflow_yaml, persisted, staged, candidate_settings
+    )
+    compared_persisted_blocks, compared_persisted_by_label = _labeled_blocks(persisted_compared) or persisted_index
+    compared_staged_blocks, compared_staged_by_label = _labeled_blocks(staged_compared) or staged_index
+    persisted_common = [block["label"] for block in compared_persisted_blocks if block["label"] in staged_by_label]
+    staged_common = [block["label"] for block in compared_staged_blocks if block["label"] in persisted_by_label]
     persisted_positions = {label: index for index, label in enumerate(persisted_common)}
     staged_positions = {label: index for index, label in enumerate(staged_common)}
     common_labels = set(persisted_common)
-    persisted_execution_inputs = _workflow_execution_inputs(persisted)
     staged_execution_inputs = _workflow_execution_inputs(staged)
-    execution_inputs_unchanged = persisted_execution_inputs == staged_execution_inputs
-    persisted_notes = _workflow_step_notes(persisted)
-    staged_notes = _workflow_step_notes(staged)
+    persisted_notes = _workflow_step_notes(persisted_compared)
+    staged_notes = _workflow_step_notes(staged_compared)
+    input_rows = _input_changes(persisted, staged)
+    changed_inputs = _changed_input_keys(persisted, staged, input_rows)
+    persisted_settings = _workflow_settings(persisted_compared)
+    staged_settings = _workflow_settings(staged_compared)
+    settings_unchanged = persisted_settings == staged_settings and not (
+        changed_inputs
+        and (block_read_keys(persisted_settings, changed_inputs) or block_read_keys(staged_settings, changed_inputs))
+    )
+    loop_children_changed = (
+        _loop_children_of_changed_loops(compared_persisted_blocks, persisted_notes, changed_inputs)
+        | _loop_children_of_changed_loops(compared_staged_blocks, staged_notes, changed_inputs)
+        if changed_inputs
+        else set()
+    )
+    staged_written_notes = _workflow_step_notes(staged)
     staged_fingerprints = {
-        block["label"]: _block_fingerprint(block, staged_execution_inputs, staged_notes) for block in staged_blocks
+        block["label"]: _block_fingerprint(block, staged_execution_inputs, staged_written_notes)
+        for block in staged_blocks
     }
 
     if isinstance(executed_blocks, Mapping):
@@ -485,19 +612,24 @@ def build_review_projection(
     review_blocks: list[NarrativeReviewBlock] = []
     for block in staged_blocks:
         label = block["label"]
-        prior = persisted_by_label.get(label)
-        if prior is None:
+        if label not in persisted_by_label:
             change: ReviewChange = "added"
-        elif (
-            execution_inputs_unchanged
-            and _comparison_value(prior, persisted_notes) == _comparison_value(block, staged_notes)
-            and persisted_positions[label] == staged_positions[label]
-            and _next_common_label(prior, persisted_by_label, common_labels)
-            == _next_common_label(block, staged_by_label, common_labels)
-        ):
-            change = "unchanged"
         else:
-            change = "changed"
+            prior_value = _comparison_value(compared_persisted_by_label[label], persisted_notes)
+            staged_value = _comparison_value(compared_staged_by_label[label], staged_notes)
+            reads_changed_input = bool(changed_inputs) and bool(
+                block_read_keys(prior_value, changed_inputs) | block_read_keys(staged_value, changed_inputs)
+            )
+            unchanged = (
+                settings_unchanged
+                and not reads_changed_input
+                and label not in loop_children_changed
+                and prior_value == staged_value
+                and persisted_positions[label] == staged_positions[label]
+                and _next_common_label(compared_persisted_by_label[label], compared_persisted_by_label, common_labels)
+                == _next_common_label(compared_staged_by_label[label], compared_staged_by_label, common_labels)
+            )
+            change = "unchanged" if unchanged else "changed"
         recorded = receipts.get(label)
         if recorded is None:
             coverage: BlockCoverage = "unknown" if staged_fingerprints[label] in orphan_fingerprints else "never_run"
@@ -522,5 +654,5 @@ def build_review_projection(
     return {
         "blocks": review_blocks,
         "duplicateWrites": _duplicate_writes(staged_blocks, _parameter_defaults(staged)),
-        "inputs": _input_changes(persisted, staged),
+        "inputs": input_rows,
     }
