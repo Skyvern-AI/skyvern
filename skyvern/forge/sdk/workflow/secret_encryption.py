@@ -111,11 +111,10 @@ def _secret_binding_signature(block: Any, secret_field: str) -> tuple[BlockType,
         "sftp_private_key_passphrase",
     }:
         fields = ("download_target", *fields)
-    values = {field: _value(block, field) for field in fields}
+    # The runtime reads every binding string by truthiness, so '' and None bind the secret to the same place.
+    values = {field: None if _value(block, field) == "" else _value(block, field) for field in fields}
     if "sftp_port" in values and values["sftp_port"] is None:
         values["sftp_port"] = 22
-    if "endpoint_url" in values:
-        values["endpoint_url"] = values["endpoint_url"] or None
     return block_type, json.dumps(values, sort_keys=True, default=str)
 
 
