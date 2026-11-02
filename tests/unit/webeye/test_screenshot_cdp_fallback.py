@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -292,33 +293,63 @@ async def test_single_viewport_timeout_reaches_the_terminal_mapper_with_one_stri
     monkeypatch: pytest.MonkeyPatch, kind: str, animations: Literal["allow", "disabled"]
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
+    spent: list[float] = []
+    bounds = _recorded_bounds(spent)
+    # The page module's loop clock advances only by each Playwright attempt's timeout, each page-module sleep and each
+    # bound that expires, and its timeout_at deadlines expire on that clock, so no check here depends on runner speed.
+    bounds.get_running_loop = lambda: SimpleNamespace(time=lambda: sum(spent))
+
+    @contextlib.asynccontextmanager
+    async def expires_on_the_virtual_clock(when: float | None) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if when is not None and sum(spent) >= when:
+                raise TimeoutError
+
+    bounds.timeout_at = expires_on_the_virtual_clock
+    monkeypatch.setattr(page_module, "asyncio", bounds)
     page, selection = _page_for(kind)
-    page.screenshot.side_effect = screenshot_stalls_until_its_own_timeout
+
+    async def spends_its_timeout_then_raises(*, timeout: float, **_kwargs: object) -> bytes:
+        spent.append(timeout / 1000)
+        raise PlaywrightTimeoutError("waiting for fonts to load")
+
+    page.screenshot.side_effect = spends_its_timeout_then_raises
 
     async def never_attaches(*_args: object) -> None:
         await asyncio.Event().wait()
 
     page.context.new_cdp_session.side_effect = never_attaches
-    loop = asyncio.get_running_loop()
-    started = loop.time()
 
-    with skyvern_context.scoped(SkyvernContext()) as context, pytest.raises(FailedToTakeScreenshot):
-        await SkyvernFrame.take_scrolling_screenshot(
-            page,
-            timeout=500,
-            mode=ScreenshotMode.LITE,
-            scrolling_number=0,
-            engine_selection=selection,
-            animations=animations,
+    with skyvern_context.scoped(SkyvernContext()) as context:
+        capture = asyncio.create_task(
+            SkyvernFrame.take_scrolling_screenshot(
+                page,
+                timeout=500,
+                mode=ScreenshotMode.LITE,
+                scrolling_number=0,
+                engine_selection=selection,
+                animations=animations,
+            )
         )
+        try:
+            # A hang guard only: bounds above the rescue's stage bounds never expire and the attach never answers.
+            await asyncio.wait({capture}, timeout=30)
+            assert capture.done(), "no bound ended the single-viewport capture"
+        finally:
+            capture.cancel()
+            await asyncio.gather(capture, return_exceptions=True)
 
+    with pytest.raises(FailedToTakeScreenshot):
+        capture.result()
     assert context.browser_health.stuck_operations == {BrowserOperation.SCREENSHOT}
     assert context.browser_health.consecutive_timeouts == 1
     if kind == "chromium":
-        assert loop.time() - started < 0.5
+        assert sum(spent) < 0.5
         page.screenshot.assert_awaited_once()
     elif animations == "allow":
-        assert loop.time() - started < 0.75
+        assert spent == [0.5]
         assert page.screenshot.await_args.kwargs["timeout"] == 500
         page.screenshot.assert_awaited_once()
         page.context.new_cdp_session.assert_not_awaited()

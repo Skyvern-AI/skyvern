@@ -1265,7 +1265,9 @@ class _StubIdentityProvider(AgentFunction):
     def __init__(self) -> None:
         self.resolved: list[tuple[str, str]] = []
 
-    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def resolve_bearer_identity(
+        self, bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         self.resolved.append((bearer_token, organization_id))
         if bearer_token == "stale-bearer":
             raise HTTPException(status_code=403, detail="Auth token is expired")
@@ -1718,7 +1720,9 @@ async def test_concurrent_principal_resolutions_keep_one_canonical_result(
     first_lookup_started = asyncio.Event()
     release_first_lookup = asyncio.Event()
 
-    async def resolve_identity(bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def resolve_identity(
+        bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         identity_provider.resolved.append((bearer_token, organization_id))
         if bearer_token == "admin-bearer":
             first_lookup_started.set()
@@ -1813,7 +1817,9 @@ async def test_a_hanging_identity_lookup_cannot_hold_up_an_authenticated_request
         monkeypatch, "api", "Bearer admin-bearer"
     )
 
-    async def hang(bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def hang(
+        bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         await asyncio.Event().wait()
         return BearerIdentityResolution(None, BearerIdentityStatus.lookup_failed)
 
