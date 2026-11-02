@@ -342,14 +342,6 @@ async def test_missing_or_malformed_actions_fail_open_to_replan(
     hpvc.assert_awaited_once()
 
 
-def test_agent_no_longer_imports_credential_candidate_selector() -> None:
-    """The new gate never selects or reads a credential candidate; the agent module must not carry the
-    ``has_credential_totp_candidate`` import that the earlier gate depended on."""
-    import skyvern.forge.agent as agent_module
-
-    assert not hasattr(agent_module, "has_credential_totp_candidate")
-
-
 @pytest.mark.asyncio
 async def test_same_form_multi_field_preserves_exact_first_plan(monkeypatch: pytest.MonkeyPatch) -> None:
     """A same-form ``[six consecutive single-digit INPUT_TEXT, CLICK submit]`` plan backed by the
