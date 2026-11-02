@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -130,6 +131,18 @@ def test_executed_source_parameters_are_advertised_only_with_the_tool_that_produ
     assert with_code_tool["update_and_run_blocks"]["executed_source_references"]["description"]
     assert "executed_source_reference" not in without_code_tool["edit_block_and_run"]
     assert "executed_source_references" not in without_code_tool["update_and_run_blocks"]
+
+
+def test_oss_browser_code_description_keeps_the_url_wait_line_without_a_pattern_list() -> None:
+    tools = copilot_native_tools(
+        supports_question_tool=True,
+        browser_code_available=True,
+        run_tools_available=True,
+        browser_pattern_accepting_calls=AgentFunction().copilot_browser_pattern_accepting_calls(),
+    )
+    description = next(tool for tool in tools if tool.name == browser_code_module.TOOL_NAME).description
+    assert "wait_for_url" in description and re.search(r"\bglob\b", description)
+    assert "Compiled" not in description
 
 
 class _LeaseProbeSession:

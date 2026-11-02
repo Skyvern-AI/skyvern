@@ -51,7 +51,7 @@ import {
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   ReloadIcon,
@@ -10689,6 +10689,25 @@ export function WorkflowCopilotChat({
                             handleConnectedAccountChoice(turnId, connectionId)
                           }
                         />
+                      ) : null}
+                      {message.narrative.canonicalWorkflowUnavailable ? (
+                        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                          <div className="font-medium">
+                            This agent is no longer available
+                          </div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            Copilot can&apos;t save or test changes to it. Open
+                            another agent or create a new one to continue.
+                          </div>
+                          <Button
+                            asChild
+                            size="sm"
+                            variant="secondary"
+                            className="mt-3"
+                          >
+                            <Link to="/agents">Open Agents</Link>
+                          </Button>
+                        </div>
                       ) : null}
                       {message.narrative.googleConnectionNotices.map(
                         (notice) => (

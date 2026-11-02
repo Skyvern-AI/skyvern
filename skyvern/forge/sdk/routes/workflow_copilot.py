@@ -145,6 +145,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _runs_in_list_order,
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
@@ -2854,6 +2855,7 @@ async def _new_copilot_chat_post(
                 if chat_request.product_action == "test_end_to_end"
                 else strip_copilot_yaml_headers(chat_request.workflow_yaml),
                 persisted_workflow_yaml=persisted_workflow_yaml,
+                saved_workflow=original_workflow,
                 browser_session_id=None,
                 stream=stream,
             )
@@ -3112,6 +3114,7 @@ async def _new_copilot_chat_post(
                         persist_browser_allocation if eval_llm_overrides is not None else None
                     ),
                     persisted_workflow_yaml=persisted_workflow_yaml,
+                    saved_workflow=original_workflow,
                     opening_workflow_title=original_workflow.title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=(
@@ -5661,7 +5664,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
         parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
-        _repair_next_block_label_chain(workflow_definition_yaml.blocks)
+        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=_runs_in_list_order(parsed_yaml))
 
         workflow_definition = convert_workflow_definition(
             workflow_definition_yaml=workflow_definition_yaml,

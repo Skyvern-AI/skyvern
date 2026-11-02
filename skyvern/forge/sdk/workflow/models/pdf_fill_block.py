@@ -52,6 +52,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     Block,
     capture_block_download_baseline,
     extract_file_url_from_block_output,
+    render_failure_reason,
     sanitize_filename,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
@@ -1076,7 +1077,9 @@ class PdfFillBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,

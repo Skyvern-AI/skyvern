@@ -3018,9 +3018,8 @@ async def test_finalize_does_not_record_html_error_page_saved_as_pdf(tmp_path) -
     task = _make_task()
     download_dir = tmp_path / "downloads"
     download_dir.mkdir()
-    (download_dir / "invoice.pdf").write_bytes(
-        b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
-    )
+    html_error = b"<!DOCTYPE html><html><head><title>Error</title></head><body><h1>Session expired</h1></body></html>"
+    (download_dir / "invoice.pdf").write_bytes(html_error)
     (download_dir / "statement.pdf").write_bytes(_VALID_TEST_PDF)
     (download_dir / "report.csv").write_text("name,total\ninvoice,12\n")
     with zipfile.ZipFile(download_dir / "workbook.xlsx", "w") as workbook:
@@ -3031,6 +3030,7 @@ async def test_finalize_does_not_record_html_error_page_saved_as_pdf(tmp_path) -
     with (
         patch("skyvern.forge.agent.get_path_for_workflow_download_directory", return_value=download_dir),
         patch("skyvern.forge.agent.skyvern_context.current", return_value=context),
+        capture_logs() as logs,
     ):
         recorded = await agent._finalize_downloaded_files_for_task(
             task,
@@ -3046,6 +3046,16 @@ async def test_finalize_does_not_record_html_error_page_saved_as_pdf(tmp_path) -
     assert not any(name.endswith("invoice.pdf") for name in recorded)
     assert not (download_dir / "invoice.pdf").exists()
     assert context.consume_download_failures(task.task_id) == ["The requested browser download could not be saved."]
+    rejected = [
+        event
+        for event in logs
+        if event["event"] == "Rejected downloaded file whose content contradicts its claimed type"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["reason"] == "html_login_masquerade"
+    assert rejected[0]["size"] == len(html_error)
+    assert rejected[0]["sniffed_type"] == "html"
+    assert not {"body", "content", "url", "filename"}.intersection(rejected[0])
 
 
 @pytest.mark.asyncio

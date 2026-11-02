@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import codecs
 import csv
 import errno
 import hashlib
@@ -556,10 +557,44 @@ def _percent_decode_payload(url: str, payload_start: int, decoded_length: int) -
 
 _HTML_FILENAME_EXTENSIONS = frozenset({".html", ".htm", ".xhtml"})
 _HTML_START_TAG_RE = re.compile(rb"^<(?:html|head|body)(?:[\t\n\f\r ]|>)")
+_HTML_TABLE_ROOT_RE = re.compile(rb"^<table(?:[\t\n\f\r />])", re.IGNORECASE)
+_HTML_TABLE_GRID_TAG_RE = re.compile(rb"<(?P<closing>/)?(?P<tag>table|tr|td|th)\b[^<>]*>", re.IGNORECASE)
+_HTML_FORM_BLOCK_RE = re.compile(rb"<form\b[^<>]*>.*?(?:</form\s*>|$)", re.IGNORECASE | re.DOTALL)
+_HTML_RAW_TEXT_START_RE = re.compile(rb"<(?P<tag>script|style)\b[^<>]*>", re.IGNORECASE)
+_HTML_RAW_TEXT_END_RE = {
+    b"script": re.compile(rb"</script\s*>", re.IGNORECASE),
+    b"style": re.compile(rb"</style\s*>", re.IGNORECASE),
+}
+_HTML_PASSWORD_INPUT_RE = re.compile(rb"<input\b[^<>]*\btype\s*=\s*['\"]?password\b", re.IGNORECASE)
+_HTML_LOGIN_FORM_HINT_RE = re.compile(
+    rb"(?:\btype\s*=\s*['\"]?password\b|\baction\s*=\s*['\"][^'\"]*"
+    rb"(?:login|signin|auth(?:enticate|entication)?)\b[^'\"]*|\b(?:log[\s-]*in|sign[\s-]*in|authenticate)\b)",
+    re.IGNORECASE,
+)
+_HTML_TABLE_START_LIMIT = 8
+_XML_ENCODING_RE = re.compile(rb"<\?xml\b[^>]*\bencoding\s*=\s*['\"]([a-z0-9._-]+)['\"]", re.IGNORECASE)
+_PAYLOAD_SNIFF_BYTES = 4096
+_HTML_TABLE_SNIFF_BYTES = 64 * 1024
+_SPREADSHEETML_NAMESPACE = "urn:schemas-microsoft-com:office:spreadsheet"
+_XML_TEXT_ENCODINGS = {
+    "ascii": "ascii",
+    "us-ascii": "ascii",
+    "utf-8": "utf-8-sig",
+    "utf8": "utf-8-sig",
+    "utf-8-sig": "utf-8-sig",
+    "utf-16": "utf-16",
+    "utf-16-le": "utf-16-le",
+    "utf-16-be": "utf-16-be",
+    "windows-1252": "cp1252",
+    "cp1252": "cp1252",
+    "iso-8859-1": "iso8859-1",
+    "latin-1": "latin-1",
+    "latin1": "latin-1",
+}
 
 
 def _body_starts_with_html(data: bytes) -> bool:
-    head = data[:4096].removeprefix(b"\xef\xbb\xbf").lstrip().lower()
+    head = data[:_PAYLOAD_SNIFF_BYTES].removeprefix(b"\xef\xbb\xbf").lstrip().lower()
     while True:
         if head.startswith(b"<!--"):
             marker_end = head.find(b"-->")
@@ -578,8 +613,179 @@ def _body_starts_with_html(data: bytes) -> bool:
     return head.startswith(b"<!doctype html") or bool(_HTML_START_TAG_RE.match(head))
 
 
+def _body_has_html_table(data: bytes) -> bool:
+    # shortcut: scans 64 KiB and at most 8 tables, increase if exports place the data grid later.
+    head = data[:_HTML_TABLE_SNIFF_BYTES].removeprefix(b"\xef\xbb\xbf").lstrip()
+    if not (_body_starts_with_html(head) or _HTML_TABLE_ROOT_RE.match(head)):
+        return False
+
+    visible = bytearray(head)
+    cursor = 0
+    while (tag_start := head.find(b"<", cursor)) >= 0:
+        if head.startswith(b"<!--", tag_start):
+            comment_end = head.find(b"-->", tag_start + 4)
+            end = len(head) if comment_end < 0 else comment_end + 3
+        else:
+            raw_text_start = _HTML_RAW_TEXT_START_RE.match(head, tag_start)
+            if raw_text_start is None:
+                cursor = tag_start + 1
+                continue
+            raw_text_end = _HTML_RAW_TEXT_END_RE[raw_text_start.group("tag").lower()].search(head, raw_text_start.end())
+            end = len(head) if raw_text_end is None else raw_text_end.end()
+        visible[tag_start:end] = b" " * (end - tag_start)
+        cursor = end
+
+    head = bytes(visible)
+    if _HTML_PASSWORD_INPUT_RE.search(head) or any(
+        _HTML_LOGIN_FORM_HINT_RE.search(form.group()) for form in _HTML_FORM_BLOCK_RE.finditer(head)
+    ):
+        return False
+
+    table_starts = 0
+    table_depth = populated_rows = row_cells = 0
+    in_row = False
+    for tag in _HTML_TABLE_GRID_TAG_RE.finditer(head):
+        name = tag.group("tag").lower()
+        closing = tag.group("closing") is not None
+        if name == b"table":
+            if closing:
+                if table_depth and in_row and row_cells:
+                    populated_rows += 1
+                    if populated_rows > 1:
+                        return True
+                in_row = False
+                row_cells = 0
+                table_depth = max(0, table_depth - 1)
+                if table_depth == 0:
+                    populated_rows = 0
+            else:
+                table_starts += 1
+                if table_starts > _HTML_TABLE_START_LIMIT:
+                    break
+                if table_depth == 0:
+                    populated_rows = 0
+                    in_row = False
+                    row_cells = 0
+                table_depth += 1
+        elif table_depth and name == b"tr":
+            if closing:
+                if in_row and row_cells:
+                    populated_rows += 1
+                    if populated_rows > 1:
+                        return True
+                in_row = False
+                row_cells = 0
+            else:
+                if in_row and row_cells:
+                    populated_rows += 1
+                    if populated_rows > 1:
+                        return True
+                in_row = True
+                row_cells = 0
+        elif table_depth and in_row and not closing and name in {b"td", b"th"}:
+            row_cells += 1
+            if row_cells > 1:
+                return True
+    return bool(table_depth and in_row and row_cells and populated_rows > 0)
+
+
+def _decode_payload_text_sample(data: bytes) -> str | None:
+    head = data[:_PAYLOAD_SNIFF_BYTES]
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings = ["utf-16"]
+    elif head.startswith(b"<\x00?\x00x\x00m\x00l\x00"):
+        encodings = ["utf-16-le"]
+    elif head.startswith(b"\x00<\x00?\x00x\x00m\x00l"):
+        encodings = ["utf-16-be"]
+    else:
+        xml_declaration = _XML_ENCODING_RE.match(head.removeprefix(b"\xef\xbb\xbf").lstrip())
+        if xml_declaration:
+            declared = xml_declaration.group(1).decode("ascii").lower().replace("_", "-")
+            encoding = _XML_TEXT_ENCODINGS.get(declared)
+            if encoding is None:
+                return None
+            encodings = [encoding]
+        else:
+            encodings = ["utf-8-sig", "cp1252"]
+    for encoding in encodings:
+        try:
+            decoder = codecs.getincrementaldecoder(encoding)()
+            return decoder.decode(head, final=False)
+        except Exception:
+            continue
+    return None
+
+
+def _looks_like_spreadsheetml_xml(data: bytes) -> bool:
+    sample = _decode_payload_text_sample(data)
+    if sample is None:
+        return False
+    return _SPREADSHEETML_NAMESPACE in sample
+
+
+def _looks_like_delimited_text(data: bytes) -> bool:
+    sample = _decode_payload_text_sample(data)
+    if sample is None:
+        return False
+    # JSON error envelopes can look like CSV because their properties are comma-terminated.
+    if sample.lstrip().startswith(("{", "[")):
+        return False
+    if any(ord(char) < 0x20 and char not in "\t\r\n" for char in sample):
+        return False
+    for delimiter in (",", "\t"):
+        rows = []
+        try:
+            for row in csv.reader(io.StringIO(sample), delimiter=delimiter, strict=True):
+                if row:
+                    rows.append(row)
+        except csv.Error:
+            # A bounded sample can end inside a quoted field; earlier complete rows still identify the export.
+            pass
+        if any(len(previous) > 1 and len(previous) == len(current) for previous, current in zip(rows, rows[1:])):
+            return True
+    return False
+
+
+def _looks_like_legacy_xls_text(data: bytes) -> bool:
+    return _body_has_html_table(data) or _looks_like_spreadsheetml_xml(data) or _looks_like_delimited_text(data)
+
+
+def _sniff_payload_type(data: bytes) -> str:
+    """Return a bounded, fixed-vocabulary payload label suitable for logs."""
+    sample = data[:_PAYLOAD_SNIFF_BYTES]
+    if not sample:
+        return "empty"
+    if _body_has_html_table(sample):
+        return "html_table"
+    if _body_starts_with_html(sample):
+        return "html"
+    if _looks_like_spreadsheetml_xml(sample):
+        return "spreadsheetml_xml"
+    if _looks_like_delimited_text(sample):
+        return "delimited_text"
+    if _looks_like_pdf(sample):
+        return "pdf"
+    if sample.startswith(_OLE_COMPOUND_FILE_MAGIC):
+        return "ole_container"
+    if sample.startswith(b"PK"):
+        return "zip"
+    stripped = sample.removeprefix(b"\xef\xbb\xbf").lstrip()
+    if stripped.startswith((b"{", b"[")):
+        return "json"
+    if stripped.startswith(b"<?xml"):
+        return "xml"
+    if _decode_payload_text_sample(sample) is None:
+        return "binary"
+    return "text"
+
+
 def _payload_is_html_login_masquerade(
-    data: bytes, content_type: str, filename: str, *, allow_typed_extensionless_html: bool = False
+    data: bytes,
+    content_type: str,
+    filename: str,
+    *,
+    allow_typed_extensionless_html: bool = False,
+    allow_legacy_xls_html_table: bool = True,
 ) -> bool:
     """True when a download's bytes are an HTML document but the download does not claim to be HTML.
 
@@ -590,10 +796,12 @@ def _payload_is_html_login_masquerade(
     """
     # The body is the ground truth: sniff it rather than trusting Content-Type, so a real binary
     # a server mislabels as text/html is not wrongly discarded.
-    if not _body_starts_with_html(data):
-        return False
     suffix = Path(filename).suffix.lower()
     if suffix in _HTML_FILENAME_EXTENSIONS:
+        return False
+    if suffix == ".xls" and _body_has_html_table(data):
+        return not allow_legacy_xls_html_table
+    if not _body_starts_with_html(data):
         return False
     if suffix:
         return True
@@ -758,10 +966,50 @@ def _replay_candidate_facts(handle: str, observations: str, admission: str | Non
 _NOT_JSON = object()
 
 
+def _payload_contradiction_reason(
+    data: bytes,
+    content_type: str,
+    filename: str,
+    *,
+    allow_typed_extensionless_html: bool = False,
+    allow_legacy_xls_html_table: bool = True,
+) -> str | None:
+    """Return a fixed reason when a download's bytes contradict its claimed type."""
+    fmt = _claimed_download_format(content_type, filename)
+    if _payload_is_html_login_masquerade(
+        data,
+        content_type,
+        filename,
+        allow_typed_extensionless_html=allow_typed_extensionless_html,
+        allow_legacy_xls_html_table=allow_legacy_xls_html_table,
+    ):
+        return "html_login_masquerade"
+    if fmt == "xls" and _looks_like_legacy_xls_text(data):
+        return None
+    if fmt is None:
+        return None
+    # Encrypted OOXML is an OLE container; accept its signature without parsing streams.
+    if fmt == "xlsx" and data.startswith(_OLE_COMPOUND_FILE_MAGIC):
+        return None
+    # Some servers label OOXML workbooks as legacy Excel; recognize the buffered workbook structure.
+    if fmt == "xls" and data.startswith(_OLE_COMPOUND_FILE_MAGIC):
+        return None
+    if fmt == "xls" and _is_valid_xlsx(data):
+        return None
+    if _DOWNLOAD_FORMAT_VALIDATORS[fmt](data):
+        return None
+    return f"invalid_{fmt}_payload"
+
+
 def _payload_contradicts_claimed_type(
-    data: bytes, content_type: str, filename: str, *, allow_typed_extensionless_html: bool = False
+    data: bytes,
+    content_type: str,
+    filename: str,
+    *,
+    allow_typed_extensionless_html: bool = False,
+    allow_legacy_xls_html_table: bool = True,
 ) -> bool:
-    """True when a download's bytes cannot be the type it claims to be.
+    """True when a download's bytes cannot be the type it claims.
 
     Catches masquerades that would otherwise be written as a "successful" but unopenable file: an
     HTML session-gate page returned for a binary download, and a body whose bytes fail the signature
@@ -770,40 +1018,45 @@ def _payload_contradicts_claimed_type(
     bytes satisfy the claim, is left untouched so ordinary downloads and honestly-typed files are
     unaffected. CSV is intentionally not validated (no reliable signature).
     """
-    if _payload_is_html_login_masquerade(
-        data, content_type, filename, allow_typed_extensionless_html=allow_typed_extensionless_html
-    ):
-        return True
+    return (
+        _payload_contradiction_reason(
+            data,
+            content_type,
+            filename,
+            allow_typed_extensionless_html=allow_typed_extensionless_html,
+            allow_legacy_xls_html_table=allow_legacy_xls_html_table,
+        )
+        is not None
+    )
+
+
+def _streamed_payload_contradiction_reason(payload: IO[bytes], content_type: str, filename: str) -> str | None:
     fmt = _claimed_download_format(content_type, filename)
+    payload.seek(0)
+    prefix = payload.read(_HTML_TABLE_SNIFF_BYTES if fmt == "xls" else _PAYLOAD_SNIFF_BYTES)
+    payload.seek(0)
+    if _payload_is_html_login_masquerade(prefix, content_type, filename, allow_typed_extensionless_html=True):
+        return "html_login_masquerade"
+    if fmt == "xls" and _looks_like_legacy_xls_text(prefix):
+        return None
     if fmt is None:
-        return False
-    # Encrypted OOXML is an OLE container; accept its signature without parsing streams.
-    if fmt == "xlsx" and data.startswith(_OLE_COMPOUND_FILE_MAGIC):
-        return False
-    # Some servers label OOXML workbooks as legacy Excel; recognize the buffered workbook structure.
-    if fmt == "xls" and data.startswith(_OLE_COMPOUND_FILE_MAGIC):
-        return False
-    if fmt == "xls" and _is_valid_xlsx(data):
-        return False
-    return not _DOWNLOAD_FORMAT_VALIDATORS[fmt](data)
-
-
-def _streamed_payload_contradicts_claimed_type(payload: IO[bytes], content_type: str, filename: str) -> bool:
-    payload.seek(0)
-    prefix = payload.read(4096)
-    payload.seek(0)
-    fmt = _claimed_download_format(content_type, filename)
+        return None
     zip_signature_matches = True
     if fmt in {"zip", "xls", "xlsx"}:
         # is_zipfile checks the bounded EOCD tail without enumerating or decompressing members.
         zip_signature_matches = zipfile.is_zipfile(payload)
         payload.seek(0)
-    return _payload_is_html_login_masquerade(prefix, content_type, filename, allow_typed_extensionless_html=True) or (
+    contradicted = (
         (fmt == "pdf" and not _looks_like_pdf(prefix))
         or (fmt == "xls" and not (prefix.startswith(_OLE_COMPOUND_FILE_MAGIC) or zip_signature_matches))
         or (fmt == "zip" and not zip_signature_matches)
         or (fmt == "xlsx" and not (zip_signature_matches or prefix.startswith(_OLE_COMPOUND_FILE_MAGIC)))
     )
+    return f"invalid_{fmt}_payload" if contradicted else None
+
+
+def _streamed_payload_contradicts_claimed_type(payload: IO[bytes], content_type: str, filename: str) -> bool:
+    return _streamed_payload_contradiction_reason(payload, content_type, filename) is not None
 
 
 def normalize_download_filename(filename: str, content_type: str = "") -> str:
@@ -2555,20 +2808,37 @@ class CDPDownloadInterceptor:
             return
 
         normalized_filename = _validated_download_basename(response_filename, content_type)
-        if (response_status is not None and response_status >= 400) or _payload_contradicts_claimed_type(
-            data, content_type, normalized_filename
-        ):
+        normalized_content_type = _normalized_content_type(content_type)
+        allow_legacy_xls_html_table = bool(normalized_content_type) and normalized_content_type != "text/html"
+        payload_rejection_reason = _payload_contradiction_reason(
+            data,
+            content_type,
+            normalized_filename,
+            allow_legacy_xls_html_table=allow_legacy_xls_html_table,
+        )
+        if (response_status is not None and response_status >= 400) or payload_rejection_reason is not None:
             # A browser-context fetch preserves same-origin session/request state; retain the
             # guard if recovery is unavailable or also contradicts the claimed type.
             if artifact_scope_generation is None:
                 artifact_scope_generation = self._artifact_scope_generation
             recovered = await self._fetch_download_bytes_in_page(
-                url, content_type, normalized_filename, recovery_allowance_bytes=remaining_run_bytes
+                url,
+                content_type,
+                normalized_filename,
+                recovery_allowance_bytes=remaining_run_bytes,
+                allow_legacy_xls_html_table=allow_legacy_xls_html_table,
             )
             if not self._artifact_scope_is_active(artifact_scope_generation):
                 return
-            if recovered is not None and not _payload_contradicts_claimed_type(
-                recovered, content_type, normalized_filename
+            if (
+                recovered is not None
+                and _payload_contradiction_reason(
+                    recovered,
+                    content_type,
+                    normalized_filename,
+                    allow_legacy_xls_html_table=allow_legacy_xls_html_table,
+                )
+                is None
             ):
                 # The masquerade bytes were reserved above; release them before reserving the real
                 # payload so this attempt is charged against the run-size budget only once.
@@ -2615,11 +2885,13 @@ class CDPDownloadInterceptor:
             LOG.error(
                 "Direct download payload does not match its claimed type; not saving "
                 "(an error page or session-gate response returned in place of the file)",
-                suggested_filename_fp=diagnostic_fingerprint(normalized_filename),
-                content_type=content_type,
+                content_type=_normalized_content_type(content_type),
                 claimed_format=_claimed_download_format(content_type, normalized_filename),
-                is_html_masquerade=_payload_is_html_login_masquerade(data, content_type, normalized_filename),
+                reason="http_error_status"
+                if response_status is not None and response_status >= 400
+                else payload_rejection_reason,
                 size=len(data),
+                sniffed_type=_sniff_payload_type(data),
             )
             self._record_download_failure(attempt, "capture_failed")
             return
@@ -2699,7 +2971,12 @@ class CDPDownloadInterceptor:
         return "; ".join(parts)
 
     async def _fetch_download_bytes_in_page(
-        self, url: str, content_type: str = "", filename: str = "", recovery_allowance_bytes: int | None = None
+        self,
+        url: str,
+        content_type: str = "",
+        filename: str = "",
+        recovery_allowance_bytes: int | None = None,
+        allow_legacy_xls_html_table: bool = True,
     ) -> bytes | None:
         """Read bytes through a same-origin HTTPS browser-context fetch, failing closed.
 
@@ -2749,10 +3026,18 @@ class CDPDownloadInterceptor:
                 except Exception:
                     LOG.debug("same-origin download recovery failed for browser page", exc_info=True)
                     continue
-                if (
-                    data is not None
-                    and not _body_starts_with_html(data)
-                    and not _payload_contradicts_claimed_type(data, content_type, filename)
+                if data is None:
+                    continue
+                claimed_format = _claimed_download_format(content_type, filename)
+                if _body_starts_with_html(data) and not (
+                    allow_legacy_xls_html_table and claimed_format == "xls" and _body_has_html_table(data)
+                ):
+                    continue
+                if not _payload_contradicts_claimed_type(
+                    data,
+                    content_type,
+                    filename,
+                    allow_legacy_xls_html_table=allow_legacy_xls_html_table,
                 ):
                     return data
         finally:

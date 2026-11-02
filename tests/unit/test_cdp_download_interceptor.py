@@ -720,6 +720,26 @@ async def test_recovery_returns_first_page_satisfying_claim_not_first_non_html()
 
 
 @pytest.mark.asyncio
+async def test_recovery_accepts_html_table_for_legacy_xls_but_not_html_login_page() -> None:
+    interceptor = _make_interceptor()
+    page = MagicMock()
+    interceptor._browser_context = MagicMock(pages=[page])
+    table_export = b"<html><body><table><tr><td>amount</td></tr><tr><td>total</td></tr></table></body></html>"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)):
+        result = await interceptor._fetch_download_bytes_in_page(
+            "https://x/export", "application/vnd.ms-excel", "report.xls"
+        )
+    assert result == table_export
+
+    login_page = b"<html><body><form>sign in</form></body></html>"
+    with patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=login_page)):
+        result = await interceptor._fetch_download_bytes_in_page(
+            "https://x/export", "application/vnd.ms-excel", "report.xls"
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_response_stage_missing_or_wrong_marker_intercepts_download(tmp_path: Path) -> None:
     interceptor = _make_interceptor(output_dir=str(tmp_path))
     interceptor._recovery_marker = "TOKEN"
@@ -4485,6 +4505,7 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
             "text/html",
             "report.pdf",
             recovery_allowance_bytes=len(recovered) + len(gate),
+            allow_legacy_xls_html_table=False,
         )
         assert len(list(tmp_path.iterdir())) == 1
         assert next(tmp_path.iterdir()).read_bytes() == recovered
@@ -4494,6 +4515,128 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         assert interceptor._run_download_bytes == mod.MAX_RUN_DOWNLOAD_BYTES - len(gate) - len(recovered) + len(
             recovered
         )
+
+    @pytest.mark.asyncio
+    async def test_html_gate_direct_download_recovers_legacy_xls_table(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        table_export = b"<html><body><table><tr><td>amount</td></tr><tr><td>total</td></tr></table></body></html>"
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(self._LOGIN_HTML, "application/vnd.ms-excel", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)),
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].name == "report.xls"
+        assert saved[0].read_bytes() == table_export
+
+    @pytest.mark.asyncio
+    async def test_direct_text_html_legacy_xls_table_is_rejected(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        table_export = b"<html><body><table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>"
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(table_export, "text/html", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)) as recovery,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        recovery.assert_awaited_once()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_direct_excel_content_type_accepts_legacy_xls_html_table(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        table_export = b"<html><body><table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>"
+        with patch.object(
+            mod.file_api,
+            "fetch_file_bytes",
+            self._guarded_fetch(table_export, "application/vnd.ms-excel", "report.xls"),
+            create=True,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        assert (tmp_path / "report.xls").read_bytes() == table_export
+
+    @pytest.mark.asyncio
+    async def test_form_free_password_login_table_recovers_legacy_xls_export(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        login_table = (
+            b"<html><body><table><tr><td>Username</td><td><input name='user'></td></tr>"
+            b"<tr><td>Password</td><td><input type='password'></td></tr></table></body></html>"
+        )
+        table_export = b"Name,Value\namount,42\ntotal,42\n"
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(login_table, "text/html", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=table_export)) as recovery,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        recovery.assert_awaited_once()
+        saved = list(tmp_path.iterdir())
+        assert len(saved) == 1
+        assert saved[0].read_bytes() == table_export
+
+    @pytest.mark.parametrize(
+        "error_body",
+        [
+            pytest.param(
+                b"<html><body><!-- <table><tr><td>A</td><td>B</td></tr></table> -->"
+                b"<h1>Session expired</h1></body></html>",
+                id="commented-table",
+            ),
+            pytest.param(
+                b'<html><body><script>const grid = "<table><tr><td>A</td><td>B</td></tr></table>";'
+                b"</script><h1>Session expired</h1></body></html>",
+                id="script-table-string",
+            ),
+            pytest.param(
+                b'<html><head><style>body::before { content: "<table><tr><td>A</td><td>B</td></tr></table>"; }'
+                b"</style></head><body><h1>Session expired</h1></body></html>",
+                id="style-table-string",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_html_fake_tables_are_rejected_by_download_recovery(self, tmp_path: Path, error_body: bytes) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        interceptor._browser_context = self._context()
+        interceptor._browser_context.pages = [MagicMock()]
+        with (
+            patch.object(
+                mod.file_api,
+                "fetch_file_bytes",
+                self._guarded_fetch(error_body, "text/html", "report.xls"),
+                create=True,
+            ),
+            patch.object(mod.SkyvernFrame, "read_http_url_bytes", new=AsyncMock(return_value=error_body)) as recovery,
+        ):
+            await interceptor._download_url_directly("https://site.example/report.xls", "report.xls")
+
+        recovery.assert_awaited_once()
+        assert list(tmp_path.iterdir()) == []
 
     @pytest.mark.asyncio
     async def test_extensionless_html_direct_download_uses_in_page_recovery(self, tmp_path: Path) -> None:
@@ -4800,10 +4943,23 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         with (
             patch.object(mod.file_api, "fetch_file_bytes", guarded_fetch, create=True),
             patch.object(interceptor, "_fetch_download_bytes_in_page", new=AsyncMock(return_value=body)),
+            capture_logs() as logs,
         ):
             await interceptor._download_url_directly(f"https://site.example/{filename}", filename)
         assert list(tmp_path.iterdir()) == []
         assert interceptor._active_download_attempts == {}
+        rejected = [
+            event
+            for event in logs
+            if event["event"].startswith("Direct download payload does not match its claimed type")
+        ]
+        assert len(rejected) == 1
+        assert rejected[0]["reason"] in {"html_login_masquerade", "invalid_pdf_payload"}
+        assert rejected[0]["size"] == len(body)
+        assert isinstance(rejected[0]["sniffed_type"], str)
+        assert rejected[0]["claimed_format"] == "pdf"
+        assert rejected[0]["content_type"] == content_type.split(";")[0].strip().lower()
+        assert not {"body", "content", "url", "filename"}.intersection(rejected[0])
 
     @pytest.mark.asyncio
     async def test_error_body_recovered_as_valid_pdf_is_saved(self, tmp_path: Path) -> None:
@@ -4921,6 +5077,239 @@ class TestDirectHttpDownloadAuthAndHtmlGuard:
         saved = list(tmp_path.iterdir())
         assert len(saved) == 1
         assert saved[0].read_bytes() == body
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(
+                b"<!doctype html><html><body><table><tr><th>Name</th></tr><tr><td>Ada</td></tr></table></body></html>",
+                id="html-table",
+            ),
+            pytest.param(
+                b"<html><body><form action='/logout'><input type='hidden' name='csrf' value='x'></form>"
+                b"<table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>",
+                id="html-table-with-logout-form",
+            ),
+            pytest.param(
+                b"<html><head><script>const grid = '<table><tr><td>not data</td></tr></table>';</script>"
+                b"<style>body::before { content: '<table><tr><td>not data</td></tr></table>'; }</style></head>"
+                b"<body><table><tr><td>Name</td><td>Value</td></tr><tr><td>Ada</td><td>42</td></tr></table></body></html>",
+                id="html-table-after-script-and-style-text",
+            ),
+            pytest.param(
+                b'<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet/></Workbook>',
+                id="spreadsheetml-2003",
+            ),
+            pytest.param(b"Name,Value\nAda,42\n", id="comma-delimited"),
+            pytest.param(b"Name\tValue\nAda\t42\n", id="tab-delimited"),
+        ],
+    )
+    def test_legacy_xls_text_exports_match_claimed_type(self, body: bytes) -> None:
+        assert not mod._payload_is_html_login_masquerade(body, "application/vnd.ms-excel", "export.xls")
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is None
+        )
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xlsx") is True
+
+    @pytest.mark.parametrize(
+        ("prefix", "suffix"),
+        [
+            pytest.param(b"Name,Value\nAda,42\n", b"", id="delimited-text"),
+            pytest.param(
+                b'<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"><!--',
+                b"--></Workbook>",
+                id="spreadsheetml-xml",
+            ),
+        ],
+    )
+    def test_legacy_xls_text_sniff_handles_split_utf8_codepoint(self, prefix: bytes, suffix: bytes) -> None:
+        body = prefix + b" " * (mod._PAYLOAD_SNIFF_BYTES - len(prefix) - 1) + b"\xc3\xa9" + suffix
+
+        assert body[: mod._PAYLOAD_SNIFF_BYTES].endswith(b"\xc3")
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param("Name,Price\nCoffee,€2\n".encode("cp1252"), id="windows-1252-csv"),
+            pytest.param("Name,City\nAndré,Montréal\n".encode("iso-8859-1"), id="iso-8859-1-csv"),
+            pytest.param(
+                b'<?xml version="1.0" encoding="windows-1252"?><Workbook '
+                b'xmlns="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet><Data>caf\xe9</Data>'
+                b"</Worksheet></Workbook>",
+                id="declared-windows-1252-spreadsheetml",
+            ),
+        ],
+    )
+    def test_legacy_xls_text_sniff_accepts_single_byte_encodings(self, body: bytes) -> None:
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+
+    @pytest.mark.parametrize(("declared_encoding", "codec"), [("UTF-16LE", "utf-16-le"), ("UTF-16BE", "utf-16-be")])
+    def test_legacy_xls_text_sniff_accepts_bomless_utf16_spreadsheetml(
+        self, declared_encoding: str, codec: str
+    ) -> None:
+        body = (
+            f'<?xml version="1.0" encoding="{declared_encoding}"?>'
+            '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet/></Workbook>'
+        ).encode(codec)
+
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is None
+        )
+        assert mod._sniff_payload_type(body) == "spreadsheetml_xml"
+
+    @pytest.mark.parametrize("encoding", ["hex", "base64", "rot13", "bz2"])
+    def test_legacy_xls_rejects_non_text_xml_codecs_without_raising(self, encoding: str) -> None:
+        body = (
+            f'<?xml version="1.0" encoding="{encoding}"?>'
+            '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"/>'
+        ).encode("ascii")
+
+        assert mod._payload_contradiction_reason(body, "application/vnd.ms-excel", "export.xls") == (
+            "invalid_xls_payload"
+        )
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "invalid_xls_payload"
+        )
+        assert mod._sniff_payload_type(body) == "xml"
+
+    def test_legacy_xls_delimited_sniff_keeps_rows_before_incomplete_sample_record(self) -> None:
+        prefix = b'Name,Value\nAda,42\n"'
+        body = prefix + b"x" * (mod._PAYLOAD_SNIFF_BYTES - len(prefix)) + b'complete"\n'
+
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradicts_claimed_type(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(b"Report generated Monday\nName,Value\nAda,42\n", id="csv-after-title"),
+            pytest.param(b"Report generated Monday\nName\tValue\nAda\t42\n", id="tsv-after-title"),
+        ],
+    )
+    def test_legacy_xls_delimited_sniff_scans_past_title_rows(self, body: bytes) -> None:
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradicts_claimed_type(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is False
+        )
+
+    def test_legacy_xls_html_without_table_is_still_rejected(self) -> None:
+        assert mod._payload_is_html_login_masquerade(_SMALL_HTML_ERROR, "application/vnd.ms-excel", "export.xls")
+        assert mod._payload_contradicts_claimed_type(_SMALL_HTML_ERROR, "application/vnd.ms-excel", "export.xls")
+
+    def test_legacy_xls_html_with_delimiter_like_css_is_still_rejected(self) -> None:
+        body = (
+            b"<html><head><style>body { font-family: Arial, sans-serif; }\n"
+            b"p { font-family: Arial, sans-serif; }</style></head><body>Sign in</body></html>"
+        )
+        assert (
+            mod._payload_contradiction_reason(body, "application/vnd.ms-excel", "export.xls") == "html_login_masquerade"
+        )
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "html_login_masquerade"
+        )
+
+    def test_legacy_xls_pretty_json_error_is_not_delimited_text(self) -> None:
+        body = b'{\n  "error": "download failed",\n  "message": "please retry",\n  "status": 500\n}\n'
+        assert mod._payload_contradiction_reason(body, "application/vnd.ms-excel", "export.xls") == (
+            "invalid_xls_payload"
+        )
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "invalid_xls_payload"
+        )
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param(
+                b"<html><body><table><tr><td>Username</td><td><input name='user'></td></tr>"
+                b"<tr><td>Password</td><td><input type='password'></td></tr></table>"
+                b"</body></html>",
+                id="password-input-layout-table-without-form",
+            ),
+            pytest.param(
+                b"<html><body><table><tr><td>Session expired. Please sign in.</td></tr></table></body></html>",
+                id="single-cell-error-table",
+            ),
+            pytest.param(
+                b"<html><body><!-- <table><tr><td>A</td><td>B</td></tr></table> -->"
+                b"<h1>Session expired</h1></body></html>",
+                id="commented-table-login-error",
+            ),
+            pytest.param(
+                b'<html><body><script>const grid = "<table><tr><td>A</td><td>B</td></tr></table>";'
+                b"</script><h1>Session expired</h1></body></html>",
+                id="script-table-login-error",
+            ),
+            pytest.param(
+                b'<html><head><style>body::before { content: "<table><tr><td>A</td><td>B</td></tr></table>"; }'
+                b"</style></head><body><h1>Session expired</h1></body></html>",
+                id="style-table-login-error",
+            ),
+        ],
+    )
+    def test_legacy_xls_html_layout_login_page_is_still_rejected(self, body: bytes) -> None:
+        assert mod._payload_is_html_login_masquerade(body, "application/vnd.ms-excel", "export.xls")
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls")
+        assert (
+            mod._streamed_payload_contradiction_reason(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            == "html_login_masquerade"
+        )
+
+    def test_large_delimited_legacy_xls_is_accepted_by_streamed_publish(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        body = b"Name,Value\n" + b"Ada,42\n" * 1024
+        with _stream_limits(threshold=len(body), cap=len(body) + 1):
+            saved = interceptor.publish_download_bytes(body, "export.xls", "application/vnd.ms-excel")
+
+        assert saved is not None and saved.read_bytes() == body
+
+    def test_large_html_table_legacy_xls_is_accepted_by_streamed_publish(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        body = (
+            b"<!doctype html><html><head><!--"
+            + b"x" * 8192
+            + b"--></head><body><table><tr><td>Ada</td></tr><tr><td>Grace</td></tr></table></body></html>"
+        )
+        with _stream_limits(threshold=len(body), cap=len(body) + 1):
+            saved = interceptor.publish_download_bytes(body, "export.xls", "application/vnd.ms-excel")
+
+        assert saved is not None and saved.read_bytes() == body
+
+    def test_legacy_xls_html_table_is_accepted_when_close_is_beyond_sniff_window(self, tmp_path: Path) -> None:
+        interceptor = _make_interceptor(output_dir=str(tmp_path))
+        body = (
+            b"<!doctype html><html><body><table><tr><td>Ada</td></tr><tr><td>Grace</td></tr>"
+            + b"x" * mod._HTML_TABLE_SNIFF_BYTES
+            + b"</table></body></html>"
+        )
+        assert b"</table>" not in body[: mod._HTML_TABLE_SNIFF_BYTES]
+        assert mod._payload_contradicts_claimed_type(body, "application/vnd.ms-excel", "export.xls") is False
+        assert (
+            mod._streamed_payload_contradicts_claimed_type(io.BytesIO(body), "application/vnd.ms-excel", "export.xls")
+            is False
+        )
+        with _stream_limits(threshold=len(body), cap=len(body) + 1):
+            saved = interceptor.publish_download_bytes(body, "export.xls", "application/vnd.ms-excel")
+
+        assert saved is not None and saved.read_bytes() == body
+
+    @pytest.mark.parametrize("tag", [b"<table><tr>", b"<table ", b"<form "])
+    def test_legacy_xls_html_sniff_bounds_repeated_tag_starts(self, tag: bytes) -> None:
+        body = b"<html><body>" + tag * (mod._HTML_TABLE_SNIFF_BYTES // len(tag))
+
+        assert not mod._body_has_html_table(body)
 
     @pytest.mark.asyncio
     async def test_error_body_recovered_as_valid_xlsx_is_saved(self, tmp_path: Path) -> None:
