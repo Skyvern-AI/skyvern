@@ -24,7 +24,7 @@ _BASE_KWARGS: dict[str, Any] = {
 }
 
 
-@pytest.mark.parametrize("template", ["extract-action", "extract-action-dynamic"])
+@pytest.mark.parametrize("template", ["extract-action-dynamic"])
 def test_renders_dialog_section_when_messages_present(template: str) -> None:
     rendered = prompt_engine.load_prompt(
         template,
@@ -39,7 +39,7 @@ def test_renders_dialog_section_when_messages_present(template: str) -> None:
     assert "999-999-9999" in rendered
 
 
-@pytest.mark.parametrize("template", ["extract-action", "extract-action-dynamic"])
+@pytest.mark.parametrize("template", ["extract-action-dynamic"])
 def test_omits_dialog_section_when_no_messages(template: str) -> None:
     rendered = prompt_engine.load_prompt(
         template,

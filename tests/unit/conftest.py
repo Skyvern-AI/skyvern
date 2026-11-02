@@ -6,6 +6,7 @@ import contextlib
 import functools
 import hashlib
 import itertools
+import json
 import logging
 import os
 import shutil
@@ -19,12 +20,14 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 import structlog
+from agents import FunctionTool
+from agents.tool_context import ToolContext
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
@@ -394,15 +397,25 @@ def make_block_output_parameter(key: str = "block_output", workflow_id: str = "w
     )
 
 
-def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
+def make_copilot_context(
+    workflow_yaml: str = "", *, organization_id: str = "o", workflow_permanent_id: str = "wp"
+) -> CopilotContext:
     return CopilotContext(
-        organization_id="o",
+        organization_id=organization_id,
         workflow_id="w",
-        workflow_permanent_id="wp",
+        workflow_permanent_id=workflow_permanent_id,
         workflow_yaml=workflow_yaml,
         browser_session_id=None,
         stream=SimpleNamespace(),  # type: ignore[arg-type]
     )
+
+
+async def invoke_copilot_tool(tool: FunctionTool, ctx: CopilotContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    raw_arguments = json.dumps(arguments)
+    tool_context = ToolContext(
+        context=ctx, tool_name=tool.name, tool_call_id=f"call_{tool.name}", tool_arguments=raw_arguments
+    )
+    return json.loads(await tool.on_invoke_tool(tool_context, raw_arguments))
 
 
 # -- shared helpers for repository unit tests --
@@ -473,9 +486,9 @@ def gpt56_litellm_models() -> Iterator[None]:
         yield
 
 
-# -- shared in-memory SQLite engine for repository/route unit tests --
+# -- shared SQLite engine for repository/route unit tests --
 #
-# ``Base.metadata.create_all`` issues DDL for every mapped table (~50) on every
+# ``Base.metadata.create_all`` issues DDL for every mapped table (~140) on every
 # call, so re-running it per test dominates the runtime of the repository suites.
 # We build the schema once per session into a template SQLite file and clone that
 # file per test — a byte copy is orders of magnitude cheaper than re-emitting the
@@ -501,28 +514,38 @@ def sqlite_schema_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return template_path
 
 
+class SqliteEngineFactory(Protocol):
+    def __call__(
+        self, *, template: Path | None = None, build_engine: Callable[[str], AsyncEngine] | None = None
+    ) -> AsyncEngine: ...
+
+
 @pytest_asyncio.fixture
-async def sqlite_engine_factory(
-    sqlite_schema_template: Path, tmp_path: Path
-) -> AsyncGenerator[Callable[[], AsyncEngine]]:
-    engines: list[AsyncEngine] = []
+async def sqlite_engine_factory(sqlite_schema_template: Path, tmp_path: Path) -> AsyncGenerator[SqliteEngineFactory]:
+    created: list[tuple[AsyncEngine, Path]] = []
     counter = itertools.count()
 
-    def _make() -> AsyncEngine:
+    def _make(*, template: Path | None = None, build_engine: Callable[[str], AsyncEngine] | None = None) -> AsyncEngine:
         db_path = tmp_path / f"db_{next(counter)}.db"
-        shutil.copyfile(sqlite_schema_template, db_path)
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", json_serializer=_custom_json_serializer)
-        engines.append(engine)
+        shutil.copyfile(template or sqlite_schema_template, db_path)
+        url = f"sqlite+aiosqlite:///{db_path}"
+        engine = (
+            build_engine(url) if build_engine else create_async_engine(url, json_serializer=_custom_json_serializer)
+        )
+        created.append((engine, db_path))
         return engine
 
     yield _make
 
-    for engine in engines:
+    # pytest keeps tmp_path for the last three sessions, and every copy is a full schema.
+    for engine, db_path in created:
         await engine.dispose()
+        for suffix in ("", "-wal", "-shm"):
+            db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
 
 
 @pytest_asyncio.fixture
-async def sqlite_engine(sqlite_engine_factory: Callable[[], AsyncEngine]) -> AsyncEngine:
+async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
     return sqlite_engine_factory()
 
 
@@ -716,7 +739,7 @@ def download_destinations(monkeypatch: pytest.MonkeyPatch) -> Iterator[DownloadD
 
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_port
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
 
     holder["internal"] = f"http://{internal_host}:{port}"

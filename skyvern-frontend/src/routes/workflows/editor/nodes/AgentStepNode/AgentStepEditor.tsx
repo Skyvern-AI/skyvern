@@ -8,9 +8,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { MultiSelect } from "@/components/ui/multi-select";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
+import { deepEqualStringArrays } from "@/util/equality";
 
 import { helpTooltips } from "../../helpContent";
 import { useUpdate } from "../../useUpdate";
@@ -113,6 +115,19 @@ function AgentStepEditorBody({
         suggestionContext={{ current_schema: data.dataSchema }}
         value={data.dataSchema}
       />
+      <div className="space-y-2">
+        <Label className="text-xs text-tertiary-foreground">Inputs</Label>
+        <WorkflowBlockInputSet
+          nodeId={blockId}
+          onChange={(parameterKeys) => {
+            const newParameterKeys = Array.from(parameterKeys);
+            if (!deepEqualStringArrays(data.parameterKeys, newParameterKeys)) {
+              update({ parameterKeys: newParameterKeys });
+            }
+          }}
+          values={new Set(data.parameterKeys ?? [])}
+        />
+      </div>
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label className="text-xs text-tertiary-foreground">Max Turns</Label>

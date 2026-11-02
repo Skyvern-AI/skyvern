@@ -196,7 +196,7 @@ async def site_browser() -> AsyncIterator[tuple[_Site, str, Any]]:
             pass
 
     server = _QuietServer(("127.0.0.1", 0), _handler(site))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     async with async_playwright() as p:
         browser = await p.chromium.launch(

@@ -26,6 +26,7 @@ from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import session as mcp_session
 from tests.unit.browser_extension.home_guard import _test_broker_base_dir
+from tests.unit.forked_scenarios import Scenario, run_forked_scenarios
 
 from .test_broker_client import _ignore_event, _mock_pre_upgrade_daemon
 
@@ -726,32 +727,7 @@ def test_extension_broker_commands_are_registered_unconditionally() -> None:
     assert broker_commands.issubset(registered)
 
 
-@pytest.mark.parametrize("env_location", ["legacy", "project", "global"])
-def test_extension_pair_opt_out_follows_env_file_chain(
-    tmp_path: Path,
-    env_location: str,
-) -> None:
-    working_directory = tmp_path / "project"
-    home_directory = tmp_path / "home"
-    working_directory.mkdir()
-    home_directory.mkdir()
-    env_paths = {
-        "legacy": working_directory / ".env",
-        "project": working_directory / ".skyvern" / ".env",
-        "global": home_directory / ".skyvern" / ".env",
-    }
-    env_path = env_paths[env_location]
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("SKYVERN_BROWSER_EXTENSION_BROKER=0\n")
-    environment = os.environ.copy()
-    environment.pop("SKYVERN_BROWSER_EXTENSION_BROKER", None)
-    environment.pop("SKYVERN_ENV_FILE", None)
-    environment["HOME"] = str(home_directory)
-    repository_root = Path(__file__).resolve().parents[3]
-    environment["PYTHONPATH"] = os.pathsep.join(
-        path for path in (str(repository_root), environment.get("PYTHONPATH", "")) if path
-    )
-    script = """
+_EXTENSION_PAIR_SCRIPT = """
 from typer.testing import CliRunner
 from skyvern.cli.commands import browser as commands
 
@@ -762,15 +738,54 @@ print(result.exit_code)
 print(result.stdout)
 """
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=working_directory,
-        env=environment,
+
+@pytest.fixture(scope="module")
+def extension_pair_runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, subprocess.CompletedProcess[str]]:
+    # The env-file chain loads when the command runs, so each location forks from one interpreter that imported the
+    # command module with the opt-out unset and no env file in its working directory or home.
+    root = tmp_path_factory.mktemp("env_file_chain")
+    scenarios = {}
+    for env_location in ("legacy", "project", "global"):
+        working_directory = root / env_location / "project"
+        home_directory = root / env_location / "home"
+        working_directory.mkdir(parents=True)
+        home_directory.mkdir()
+        env_paths = {
+            "legacy": working_directory / ".env",
+            "project": working_directory / ".skyvern" / ".env",
+            "global": home_directory / ".skyvern" / ".env",
+        }
+        env_path = env_paths[env_location]
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("SKYVERN_BROWSER_EXTENSION_BROKER=0\n")
+        scenarios[env_location] = Scenario(
+            _EXTENSION_PAIR_SCRIPT, env={"HOME": str(home_directory)}, cwd=working_directory
+        )
+    import_directory = root / "import" / "project"
+    import_home = root / "import" / "home"
+    import_directory.mkdir(parents=True)
+    import_home.mkdir()
+    environment = os.environ.copy()
+    environment.pop("SKYVERN_BROWSER_EXTENSION_BROKER", None)
+    environment.pop("SKYVERN_ENV_FILE", None)
+    environment["HOME"] = str(import_home)
+    repository_root = Path(__file__).resolve().parents[3]
+    environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(repository_root), environment.get("PYTHONPATH", "")) if path
+    )
+    return run_forked_scenarios(
+        "import typer.testing, skyvern.cli.commands.browser", scenarios, env=environment, cwd=import_directory
     )
 
+
+@pytest.mark.parametrize("env_location", ["legacy", "project", "global"])
+def test_extension_pair_opt_out_follows_env_file_chain(
+    extension_pair_runs: dict[str, subprocess.CompletedProcess[str]],
+    env_location: str,
+) -> None:
+    completed = extension_pair_runs[env_location]
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "BROKER_PATH" not in completed.stdout
     assert "Start your MCP server first: skyvern run mcp --browser-extension" in completed.stdout
 

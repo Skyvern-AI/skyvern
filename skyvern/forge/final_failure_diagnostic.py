@@ -334,6 +334,10 @@ def final_har_user_errors(categories: object, attempt_number: int | None) -> lis
     return []
 
 
+# Recorded for analytics but not yet accepted as a fact the user-error model may map to a customer error code.
+_NOT_MODEL_FACING_EVENT_TYPES = frozenset({"captcha_site_rejected"})
+
+
 def network_evidence(evidence: HarEvidence, context: FailureContext) -> str | None:
     """The attempt's ordinary network facts as class-level JSON (never a URL, host, header or body), or None."""
     if evidence.availability != HarEvidenceAvailability.available:
@@ -347,7 +351,7 @@ def network_evidence(evidence: HarEvidence, context: FailureContext) -> str | No
         {"event_type": e.event_type, "http_status": e.http_status, "url_class": e.url_class}
         for visit in _attempt_visits(evidence, context)
         for e in visit.events
-        if _in_attempt(_utc(e.event_at), context)
+        if _in_attempt(_utc(e.event_at), context) and e.event_type not in _NOT_MODEL_FACING_EVENT_TYPES
     ]
     if not http_failures and not events:
         return None

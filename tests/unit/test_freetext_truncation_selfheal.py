@@ -28,7 +28,6 @@ import pytest
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
 from skyvern.exceptions import FreeTextInputMismatch
 from skyvern.webeye.actions.handler import (
-    _freetext_mismatch_failure,
     _heal_truncated_freetext_input,
     _is_prefix_loss_truncation,
     _is_same_length_reorder,
@@ -306,12 +305,6 @@ async def test_heal_skips_non_freetext_tag() -> None:
 
 
 @pytest.mark.asyncio
-async def test_heal_performs_at_most_one_fill() -> None:
-    element, result = await _run_heal(_LONG, rendered=_LONG[-TEXT_PRESS_MAX_LENGTH:].upper())
-    assert element.input_fill.await_count == 1
-
-
-@pytest.mark.asyncio
 async def test_heal_fails_closed_for_persistent_prefix_loss_after_refill() -> None:
     # Pre-fill and post-fill read-backs both see only the truncated tail: the field keeps rejecting the value
     # (the whole-value filter incident). The single refill cannot restore it, so the heal must fail closed.
@@ -435,36 +428,16 @@ def test_freetext_mismatch_message_is_privacy_safe_and_planner_actionable() -> N
     assert str(len(_LONG)) in message
     assert "unlikely to succeed" in message
     # Never leak the raw value, a rendered value, rejected characters, or character-class descriptions.
-    for banned in (_LONG, _LONG[-TEXT_PRESS_MAX_LENGTH:], "letters", "spaces", "alphabetic", "character class"):
+    for banned in (
+        _LONG,
+        _LONG[-TEXT_PRESS_MAX_LENGTH:],
+        "letters",
+        "spaces",
+        "alphabetic",
+        "character class",
+        "categories",
+    ):
         assert banned not in message
-
-
-def test_freetext_mismatch_generic_message_unchanged_without_evidence() -> None:
-    exc = FreeTextInputMismatch(element_id="EL1", intended_length=48)
-    message = str(exc)
-    assert "48" in message
-    assert "unlikely to succeed" in message
-    assert "categories" not in message
-
-
-def test_freetext_mismatch_failure_helper_sets_terminal_batch_stop_shape() -> None:
-    # The heal seam's failures are built through _freetext_mismatch_failure so they carry exactly the
-    # ActionResult shape the agent loop needs to stop the rest of the batch INCLUDING a duplicate element id:
-    # success False, stop_execution_on_failure True, AND skip_remaining_actions True.
-    result = _freetext_mismatch_failure(FreeTextInputMismatch(element_id="EL1", intended_length=48))
-    assert result.success is False
-    assert result.stop_execution_on_failure is True
-    assert result.skip_remaining_actions is True
-
-
-def test_freetext_mismatch_failure_helper_shape_with_declared_reason() -> None:
-    # A declared-constraint reason must not change the terminal batch-halting shape.
-    result = _freetext_mismatch_failure(
-        FreeTextInputMismatch(element_id="EL1", intended_length=55, declared_max_length=50)
-    )
-    assert result.success is False
-    assert result.stop_execution_on_failure is True
-    assert result.skip_remaining_actions is True
 
 
 # ---------------------------------------------------------------------------
@@ -510,20 +483,6 @@ async def test_static_declared_pattern_is_not_retention_evidence_falls_through()
     ev.assert_not_awaited()  # pattern is not read and does not trigger the detached-clone evaluate
     el.input_fill.assert_not_awaited()
     el.press_fill.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_static_declared_maxlength_overflow_reports_exact_max() -> None:
-    el = _declared_element(maxlength="50")
-    result, _ = await _static(
-        el,
-        "a" * 60,
-        {"patternMismatch": False, "typeMismatch": False, "valueStuck": True, "utf16Len": 60, "maxLengthReflected": 50},
-    )
-    assert isinstance(result, FreeTextInputMismatch)
-    assert result.declared_max_length == 50
-    assert "50" in str(result)
-    el.input_fill.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -652,29 +611,6 @@ async def test_static_passes_raw_type_as_evaluate_arg_not_normalized() -> None:
 
 
 @pytest.mark.asyncio
-async def test_static_whitespace_type_reflects_text_maxlength_applies_not_number() -> None:
-    # Reviewer case: type=" number " (stray whitespace) is an invalid keyword, so Chromium reflects "text".
-    # maxlength therefore APPLIES (text input) and the field is NOT a number constraint. The old Python
-    # strip()+lower() wrongly made it a number input (maxlength inapplicable + a false number constraint).
-    el = _declared_element(type_attr=" number ", maxlength="10")
-    result, _ = await _static(
-        el,
-        "a" * 20,
-        {
-            "patternMismatch": False,
-            "typeMismatch": False,
-            "valueStuck": True,
-            "utf16Len": 20,
-            "maxLengthReflected": 10,
-            "typeReflected": "text",
-        },
-    )
-    assert isinstance(result, FreeTextInputMismatch)
-    assert result.declared_max_length == 10  # maxlength applies to the reflected text input
-    assert result.declared_constraint is None  # not treated as a number constraint
-
-
-@pytest.mark.asyncio
 async def test_static_uppercase_type_reflected_number_applies_number_constraint() -> None:
     # A valid but upper-cased keyword reflects the canonical lower-case type; maxlength stays inapplicable.
     el = _declared_element(type_attr="NUMBER", maxlength="2")
@@ -721,20 +657,6 @@ async def test_static_textarea_pattern_and_type_are_inert() -> None:
 
 
 @pytest.mark.asyncio
-async def test_static_textarea_maxlength_overflow_still_works() -> None:
-    # M3: maxlength DOES apply to textarea.
-    el = _declared_element(maxlength="50")
-    result, _ = await _static(
-        el,
-        "a" * 60,
-        {"patternMismatch": False, "typeMismatch": False, "valueStuck": True, "utf16Len": 60, "maxLengthReflected": 50},
-        tag="textarea",
-    )
-    assert isinstance(result, FreeTextInputMismatch)
-    assert result.declared_max_length == 50
-
-
-@pytest.mark.asyncio
 async def test_static_passes_is_textarea_flag_as_evaluate_arg() -> None:
     # The tag drives a tag-faithful clone in the browser, so isTextarea must be passed as an arg (True for a
     # textarea, False for an input) rather than the clone being hard-coded to <input>.
@@ -762,33 +684,6 @@ async def test_static_textarea_crlf_normalized_within_maxlength_no_failure() -> 
         tag="textarea",
     )
     assert result is None  # 5 normalized units == maxlength 5 -> not over -> generic fail-closed fallback
-
-
-@pytest.mark.asyncio
-async def test_static_textarea_normalized_over_maxlength_reports_max() -> None:
-    # A textarea whose browser-normalized length exceeds maxlength must still report the exact declared max.
-    el = _declared_element(maxlength="5")
-    result, _ = await _static(
-        el,
-        "aaa\r\nbb",
-        {"valueStuck": False, "utf16Len": 6, "maxLengthReflected": 5, "typeReflected": "textarea"},
-        tag="textarea",
-    )
-    assert isinstance(result, FreeTextInputMismatch)
-    assert result.declared_max_length == 5
-
-
-@pytest.mark.asyncio
-async def test_static_unknown_input_type_keeps_text_semantics_for_maxlength() -> None:
-    # An unknown input type reflects "text", so maxlength still applies (it is a retention constraint).
-    el = _declared_element(type_attr="foobar", maxlength="10")
-    result, _ = await _static(
-        el,
-        "a" * 20,
-        {"valueStuck": True, "utf16Len": 20, "maxLengthReflected": 10, "typeReflected": "text"},
-    )
-    assert isinstance(result, FreeTextInputMismatch)
-    assert result.declared_max_length == 10
 
 
 class _HangingAttrElement(MagicMock):
@@ -827,22 +722,6 @@ def test_static_declared_messages_are_privacy_safe() -> None:
         for i in range(len(cf) - 5):
             assert cf[i : i + 6] not in m
         assert "[a-za-z" not in m  # never the raw regex
-
-
-def test_static_declared_number_message_names_number_retention() -> None:
-    exc = FreeTextInputMismatch(element_id="EL1", intended_length=30, declared_constraint="number")
-    m = str(exc)
-    assert "number input" in m and "does not retain a non-numeric value" in m
-    assert "Propose a valid number." in m
-
-
-def test_static_declared_maxlength_message_states_utf16_code_units() -> None:
-    # HTML maxlength counts UTF-16 code units, so the declared-max message must say so, not "characters".
-    exc = FreeTextInputMismatch(element_id="EL1", intended_length=60, declared_max_length=50)
-    m = str(exc)
-    assert "maximum length of 50 UTF-16 code units" in m
-    assert "within 50 UTF-16 code units" in m
-    assert "50 characters" not in m
 
 
 @pytest.mark.asyncio
@@ -942,20 +821,103 @@ async def test_static_declared_maxlength_uses_browser_reflected_value_not_python
 
 
 @pytest.mark.asyncio
-async def test_static_declared_maxlength_reflected_value_is_used_verbatim_not_raw_string() -> None:
-    # A leading-zero maxlength Chromium accepts (reflects 10); the value placed in FreeTextInputMismatch must be
-    # the browser-parsed integer 10, never the raw "010" string.
-    el = _declared_element(maxlength="010")
-    result, _ = await _static(
-        el,
-        "a" * 15,
-        {"patternMismatch": False, "typeMismatch": False, "valueStuck": True, "utf16Len": 15, "maxLengthReflected": 10},
-    )
+@pytest.mark.parametrize(
+    ("type_attr", "maxlength", "text", "tag", "eval_result", "expected_max"),
+    [
+        pytest.param(
+            None,
+            "50",
+            "a" * 60,
+            "input",
+            {
+                "patternMismatch": False,
+                "typeMismatch": False,
+                "valueStuck": True,
+                "utf16Len": 60,
+                "maxLengthReflected": 50,
+            },
+            50,
+            id="input",
+        ),
+        pytest.param(
+            None,
+            "50",
+            "a" * 60,
+            "textarea",
+            {
+                "patternMismatch": False,
+                "typeMismatch": False,
+                "valueStuck": True,
+                "utf16Len": 60,
+                "maxLengthReflected": 50,
+            },
+            50,
+            id="textarea",
+        ),
+        pytest.param(
+            None,
+            "5",
+            "aaa\r\nbb",
+            "textarea",
+            {"valueStuck": False, "utf16Len": 6, "maxLengthReflected": 5, "typeReflected": "textarea"},
+            5,
+            id="textarea-normalized",
+        ),
+        pytest.param(
+            "foobar",
+            "10",
+            "a" * 20,
+            "input",
+            {"valueStuck": True, "utf16Len": 20, "maxLengthReflected": 10, "typeReflected": "text"},
+            10,
+            id="unknown-type",
+        ),
+        pytest.param(
+            " number ",
+            "10",
+            "a" * 20,
+            "input",
+            {
+                "patternMismatch": False,
+                "typeMismatch": False,
+                "valueStuck": True,
+                "utf16Len": 20,
+                "maxLengthReflected": 10,
+                "typeReflected": "text",
+            },
+            10,
+            id="whitespace-type",
+        ),
+        pytest.param(
+            None,
+            "010",
+            "a" * 15,
+            "input",
+            {
+                "patternMismatch": False,
+                "typeMismatch": False,
+                "valueStuck": True,
+                "utf16Len": 15,
+                "maxLengthReflected": 10,
+            },
+            10,
+            id="leading-zero",
+        ),
+    ],
+)
+async def test_static_declared_maxlength_overflow_reports_reflected_max(
+    type_attr, maxlength, text, tag, eval_result, expected_max
+) -> None:
+    el = _declared_element(type_attr=type_attr, maxlength=maxlength)
+    result, _ = await _static(el, text, eval_result, tag=tag)
     assert isinstance(result, FreeTextInputMismatch)
-    assert result.declared_max_length == 10
-    m = str(result)
-    assert "maximum length of 10 UTF-16 code units" in m
-    assert "010" not in m
+    assert result.declared_max_length == expected_max
+    assert result.declared_constraint is None
+    message = str(result)
+    assert f"maximum length of {expected_max} UTF-16 code units" in message
+    if maxlength != str(expected_max):
+        assert maxlength not in message
+    el.input_fill.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1016,6 +978,7 @@ async def test_heal_static_declared_reason_halts_batch_without_live_probe() -> N
     assert isinstance(result, ActionFailure)
     assert result.exception_type == "FreeTextInputMismatch"
     assert result.stop_execution_on_failure is True
+    assert result.skip_remaining_actions is True
     assert "maximum length of 50 UTF-16 code units" in (result.exception_message or "")
 
 

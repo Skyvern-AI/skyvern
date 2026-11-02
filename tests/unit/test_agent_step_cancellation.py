@@ -39,7 +39,16 @@ from skyvern.webeye.actions.actions import ClickAction, CompleteAction, ExtractA
 from skyvern.webeye.actions.responses import ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from tests.unit._task_block_fakes import lost_browser_state
-from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
+from tests.unit.conftest import settle_or_fail
+from tests.unit.helpers import (
+    ParkedOperation,
+    make_browser_state,
+    make_organization,
+    make_step,
+    make_task,
+    start_pooled_operation,
+    stop_pooled_operations,
+)
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -497,26 +506,109 @@ async def test_execute_step_ends_the_task_when_agent_step_stops_mid_batch(
     agent.handle_completed_step = AsyncMock()  # type: ignore[method-assign]
     agent.handle_failed_step = AsyncMock()  # type: ignore[method-assign]
 
+    own = ParkedOperation(task.task_id)
+    other = ParkedOperation("task-other")
+    pool = agent.async_operation_pool
+    settled_at_return: list[bool] = []
+
+    async def run_step():
+        returned = await agent.execute_step(
+            organization=organization, task=task, step=step, api_key="api-key", download_baseline_files=[]
+        )
+        settled_at_return.append(own.settled.is_set())
+        return returned
+
     skyvern_context.set(
         SkyvernContext(organization_id=organization.organization_id, task_id=task.task_id, tz_info=ZoneInfo("UTC"))
     )
     try:
-        returned_step, _output, next_step = await agent.execute_step(
-            organization=organization, task=task, step=step, api_key="api-key", download_baseline_files=[]
-        )
+        own_handle = await start_pooled_operation(pool, own)
+        other_handle = await start_pooled_operation(pool, other)
+        finished, _ = await settle_or_fail(run_step())
+        returned_step, _output, next_step = finished.result()
+
+        assert returned_step.status == StepStatus.canceled
+        assert next_step is None
+        agent.handle_completed_step.assert_not_awaited()
+        agent.handle_failed_step.assert_not_awaited()
+        assert not other_handle.done()
+        assert pool.get_aio_task(other.task_id, other.type) is other_handle
+        if parent_run_canceled:
+            assert update_task.await_args.kwargs["status"] == cancellation.task_status
+            clean_up_task.assert_not_awaited()
+            # The parent run tears the browser down without the task's cleanup, so the task stops its own job here.
+            assert settled_at_return == [True], "the task's pooled operation outlived the parent-run cancellation"
+            assert own_handle.done()
+            assert pool.get_aio_task(own.task_id, own.type) is None
+        else:
+            update_task.assert_not_awaited()
+            clean_up_task.assert_awaited_once()
     finally:
         skyvern_context.reset()
+        await stop_pooled_operations(pool, own.task_id, other.task_id)
 
-    assert returned_step.status == StepStatus.canceled
-    assert next_step is None
-    agent.handle_completed_step.assert_not_awaited()
-    agent.handle_failed_step.assert_not_awaited()
-    if parent_run_canceled:
-        assert update_task.await_args.kwargs["status"] == cancellation.task_status
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_status", "task_status"),
+    [(WorkflowRunStatus.canceled, TaskStatus.canceled), (WorkflowRunStatus.timed_out, TaskStatus.timed_out)],
+    ids=["parent-run-canceled", "parent-run-timed-out"],
+)
+async def test_execute_step_stops_the_tasks_pooled_operation_when_the_parent_run_ended_before_the_step(
+    monkeypatch: pytest.MonkeyPatch, run_status: WorkflowRunStatus, task_status: TaskStatus
+) -> None:
+    """A step that finds its parent run already canceled or timed out returns without the task's cleanup, which the
+    parent run owns; the task's own pooled job must still be stopped before it returns."""
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(now, organization, workflow_run_id="workflow-1")
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=1, output=None)
+
+    monkeypatch.setattr(
+        "skyvern.forge.agent.app.DATABASE.workflow_runs.get_workflow_run",
+        AsyncMock(return_value=_workflow_run(run_status)),
+    )
+    update_step = AsyncMock(side_effect=lambda step, status=None, **_kw: step.model_copy(update={"status": status}))
+    agent.update_step = update_step  # type: ignore[method-assign]
+    update_task = AsyncMock(side_effect=lambda task, status=None, **_kw: task.model_copy(update={"status": status}))
+    agent.update_task = update_task  # type: ignore[method-assign]
+    clean_up_task = AsyncMock(return_value=None)
+    agent.clean_up_task = clean_up_task  # type: ignore[method-assign]
+
+    own = ParkedOperation(task.task_id)
+    other = ParkedOperation("task-other")
+    pool = agent.async_operation_pool
+    settled_at_return: list[bool] = []
+
+    async def run_step():
+        returned = await agent.execute_step(
+            organization=organization, task=task, step=step, api_key="api-key", download_baseline_files=[]
+        )
+        settled_at_return.append(own.settled.is_set())
+        return returned
+
+    skyvern_context.set(
+        SkyvernContext(organization_id=organization.organization_id, task_id=task.task_id, tz_info=ZoneInfo("UTC"))
+    )
+    try:
+        own_handle = await start_pooled_operation(pool, own)
+        other_handle = await start_pooled_operation(pool, other)
+        finished, _ = await settle_or_fail(run_step())
+        returned_step, detailed_output, next_step = finished.result()
+
+        assert returned_step.status == StepStatus.canceled
+        assert detailed_output is None and next_step is None
+        assert update_task.await_args.kwargs["status"] == task_status
         clean_up_task.assert_not_awaited()
-    else:
-        update_task.assert_not_awaited()
-        clean_up_task.assert_awaited_once()
+        assert settled_at_return == [True], "the task's pooled operation outlived the parent-run cancellation"
+        assert own_handle.done()
+        assert pool.get_aio_task(own.task_id, own.type) is None
+        assert not other_handle.done()
+        assert pool.get_aio_task(other.task_id, other.type) is other_handle
+    finally:
+        skyvern_context.reset()
+        await stop_pooled_operations(pool, own.task_id, other.task_id)
 
 
 @pytest.mark.asyncio

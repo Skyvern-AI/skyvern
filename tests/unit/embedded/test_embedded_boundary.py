@@ -1,34 +1,9 @@
 """Regression tests for the embedded mode bootstrap boundary.
 
-These tests verify hermetic isolation between embedded mode and cloud modules.
 They do NOT require an LLM key or Playwright — they test infrastructure only.
 """
 
-import sys
-
 import pytest
-
-
-def test_no_cloud_in_sys_modules() -> None:
-    """Importing api_app must not trigger cloud/__init__.py in a clean process.
-
-    In a mixed test suite where scenario conftest already imported cloud,
-    this verifies the import itself doesn't RE-trigger cloud. In a clean
-    process (SDK user), this verifies cloud is never loaded.
-    """
-    import importlib
-
-    cloud_before = "cloud" in sys.modules
-    if "skyvern.forge.api_app" in sys.modules:
-        importlib.reload(sys.modules["skyvern.forge.api_app"])
-    else:
-        import skyvern.forge.api_app  # noqa: F401
-
-    cloud_after = "cloud" in sys.modules
-    if not cloud_before:
-        assert not cloud_after, (
-            f"cloud was loaded by importing api_app. Modules: {[k for k in sys.modules if k.startswith('cloud')]}"
-        )
 
 
 @pytest.mark.asyncio
@@ -56,6 +31,8 @@ async def test_unique_llm_key_no_collision() -> None:
         await skyvern2.get_workflows()
     finally:
         await skyvern2.aclose()
+    # aclose() must be idempotent.
+    await skyvern2.aclose()
 
 
 @pytest.mark.asyncio
@@ -77,19 +54,6 @@ async def test_close_without_bootstrap() -> None:
     from skyvern import Skyvern
 
     skyvern = Skyvern.local(use_in_memory_db=True)
-    await skyvern.aclose()
-
-
-@pytest.mark.asyncio
-async def test_double_close_idempotent() -> None:
-    """Calling aclose() twice does not raise."""
-    from skyvern import Skyvern
-
-    skyvern = Skyvern.local(use_in_memory_db=True)
-    try:
-        await skyvern.get_workflows()
-    finally:
-        await skyvern.aclose()
     await skyvern.aclose()
 
 

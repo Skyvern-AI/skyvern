@@ -17546,12 +17546,18 @@ async def test_type_still_refuses_a_field_covered_after_its_scroller_brings_it_i
         assert taskv3_loop._TYPE_REACH.get()["probe_scrolled"] is True
 
 
-def test_the_typing_probe_differs_from_the_click_probe_only_at_its_retest_flag() -> None:
-    # The typing probe is derived by a string replace; rewording the flag line would silently make it the click probe.
-    off, on = "const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"
-    assert (_TYPE_TARGET_PROBE_JS.count(off), _TYPE_TARGET_PROBE_JS.count(on)) == (1, 0)
-    assert (_TYPING_REACH_PROBE_JS.count(off), _TYPING_REACH_PROBE_JS.count(on)) == (0, 1)
-    assert _TYPING_REACH_PROBE_JS.replace(on, off) == _TYPE_TARGET_PROBE_JS
+def test_the_typing_probe_differs_from_the_click_probe_only_at_its_two_flags() -> None:
+    # The typing probe is derived by string replaces; rewording a flag line would silently make it the click probe.
+    flags = [
+        ("const RETEST_SCROLLABLE_CLIP = false;", "const RETEST_SCROLLABLE_CLIP = true;"),
+        ("const LAYER_IDENTITY = false;", "const LAYER_IDENTITY = true;"),
+    ]
+    reverted = _TYPING_REACH_PROBE_JS
+    for off, on in flags:
+        assert (_TYPE_TARGET_PROBE_JS.count(off), _TYPE_TARGET_PROBE_JS.count(on)) == (1, 0)
+        assert (_TYPING_REACH_PROBE_JS.count(off), _TYPING_REACH_PROBE_JS.count(on)) == (0, 1)
+        reverted = reverted.replace(on, off)
+    assert reverted == _TYPE_TARGET_PROBE_JS
 
 
 @_skip_no_browser
@@ -26208,6 +26214,302 @@ async def test_covered_result_preserves_real_dialog_recovery() -> None:
         assert again.error_class == "covered", again.content
         assert await page.locator("#state").input_value() == ""
         assert await page.locator("#row").count() == 1
+
+
+_DIALOG_OVER_TWO_FIELDS_HTML = """
+<input id="first" style="position:absolute;left:20px;top:60px;width:200px;height:30px">
+<input id="last" style="position:absolute;left:20px;top:120px;width:200px;height:30px">
+<input id="note" style="position:absolute;left:600px;top:60px;width:200px;height:30px">
+<span id="ticker" style="position:absolute;left:600px;top:300px">0</span>
+<div id="notice" role="dialog" aria-modal="true" aria-label="Before you continue"
+  style="position:fixed;left:0;top:0;width:500px;height:260px;background:#fff">
+  <label><input id="yes" type="radio" name="q"> Yes</label>
+  <input id="in-layer" style="position:absolute;left:20px;top:200px;width:150px;height:24px">
+  <button id="close" onclick="this.closest('[role=dialog]').remove()">Close</button>
+</div>
+"""
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_type_names_the_live_layer_that_refused_it_and_rechecks_each_field_against_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib.parse import quote  # noqa: PLC0415
+
+    BlockingLayer, LayerCheck = taskv3_loop.BlockingLayer, taskv3_loop.LayerCheck  # noqa: N806
+    key = taskv3_loop.BLOCKING_LAYER_DATA_KEY
+    async with _content_page("<p>start</p>") as page:
+        # A real document behind a URL, so a same-URL reload builds a new document.
+        await page.goto("data:text/html," + quote(_DIALOG_OVER_TWO_FIELDS_HTML))
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        check = type_tool.layer_probe
+        assert check is not None
+
+        first = await type_tool.handler({"selector": "#first", "text": "Ada"})
+        lease = (first.data or {}).get(key)
+        assert first.error_class == "covered" and isinstance(lease, BlockingLayer), first.content
+        # Minted on the probe's own isolated realm, the production path, not the patchable fallback.
+        assert taskv3_tools._probe_was_isolated() is True
+
+        same, refusal = await check({"selector": "#last", "text": "Lovelace"}, lease)
+        assert same is LayerCheck.SAME and refusal is not None
+        assert '"Before you continue"' in refusal.content and (refusal.data or {}).get(key) == lease
+        assert (await check({"selector": "#note", "text": "x"}, lease))[0] is LayerCheck.REACHABLE
+        assert (await check({"selector": "#in-layer", "text": "x"}, lease))[0] is LayerCheck.REACHABLE
+        assert (await check({"selector": "#gone", "text": "x"}, lease))[0] is LayerCheck.OTHER
+
+        await page.evaluate("for (let i = 1; i < 5; i++) document.getElementById('ticker').textContent = String(i)")
+        assert (await check({"selector": "#last", "text": "x"}, lease))[0] is LayerCheck.SAME
+        await page.evaluate("document.getElementById('notice').style.display = 'none'")
+        assert (await check({"selector": "#last", "text": "x"}, lease))[0] is LayerCheck.REACHABLE
+        await page.evaluate("document.getElementById('notice').style.display = ''")
+        assert (await check({"selector": "#last", "text": "x"}, lease))[0] is LayerCheck.SAME
+
+        # Answering inside the layer is progress on it: the old reading no longer holds anything.
+        await page.evaluate("document.getElementById('yes').checked = true")
+        assert (await check({"selector": "#last", "text": "x"}, lease))[0] is LayerCheck.OTHER
+        answered = await type_tool.handler({"selector": "#last", "text": "Lovelace"})
+        relet = (answered.data or {}).get(key)
+        assert isinstance(relet, BlockingLayer) and relet.token == lease.token and relet != lease, answered.content
+        assert (await check({"selector": "#first", "text": "x"}, relet))[0] is LayerCheck.SAME
+
+        # The same markup put back as a new node, then a new document at the same URL: neither is the leased layer.
+        await page.evaluate("const n = document.getElementById('notice'); n.replaceWith(n.cloneNode(true))")
+        assert (await check({"selector": "#first", "text": "x"}, relet))[0] is LayerCheck.OTHER
+        replaced = (await type_tool.handler({"selector": "#first", "text": "Ada"})).data or {}
+        assert isinstance(replaced.get(key), BlockingLayer) and replaced[key].token != relet.token
+        await page.reload()
+        assert (await check({"selector": "#first", "text": "x"}, replaced[key]))[0] is LayerCheck.OTHER
+
+        await page.click("#close")
+        assert (await check({"selector": "#first", "text": "x"}, replaced[key]))[0] is LayerCheck.REACHABLE
+        typed = await type_tool.handler({"selector": "#first", "text": "Ada"})
+        assert typed.status == "ok" and await page.locator("#first").input_value() == "Ada", typed.content
+
+        # A realm the page can patch names no layer, so nothing it answers can hold a call.
+        await page.reload()
+
+        async def no_isolated_world(*_args: Any) -> None:
+            return None
+
+        monkeypatch.setattr(taskv3_tools, "_evaluate_isolated", no_isolated_world)
+        fallback = await type_tool.handler({"selector": "#first", "text": "Ada"})
+        assert fallback.error_class == "covered" and key not in (fallback.data or {}), fallback.content
+        assert (await check({"selector": "#first", "text": "x"}, lease))[0] is LayerCheck.OTHER
+
+
+_DIALOG_OVER_A_MIRRORED_HOST_HTML = """
+<div id="cv" style="display:contents"></div>
+<input id="plain" style="position:fixed;left:260px;top:120px;width:200px;height:30px">
+<div id="notice" role="dialog" aria-modal="true" aria-label="Before you continue"
+  style="position:fixed;left:0;top:0;width:500px;height:260px;background:#fff">
+  <p id="question">Have you used this service before?</p>
+  <label><input id="yes" type="radio" name="q"> Yes</label>
+  <input id="in-layer" value="aa" style="position:absolute;left:20px;top:200px;width:150px;height:24px">
+  <button id="close" onclick="this.closest('[role=dialog]').remove()">Close</button>
+</div>
+<script>
+  document.getElementById('cv').attachShadow({mode: 'open'}).innerHTML =
+    '<input id="cv" type="text" style="position:fixed;left:20px;top:120px;width:200px;height:30px">';
+</script>
+"""
+
+
+async def _layer_lease(type_tool: ToolSpec, selector: str) -> Any:
+    refused = await type_tool.handler({"selector": selector, "text": "x"})
+    blocker = (refused.data or {}).get(taskv3_loop.BLOCKING_LAYER_DATA_KEY)
+    assert refused.error_class == "covered" and blocker is not None, refused.content
+    return blocker
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_layer_recheck_reads_the_control_the_typing_path_acts_on() -> None:
+    async with _content_page(_DIALOG_OVER_A_MIRRORED_HOST_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        assert type_tool.layer_probe is not None
+        # `#cv` names the shadow host; typing acts on the control mirrored inside it, so the recheck must too.
+        lease = await _layer_lease(type_tool, "#cv")
+        verdict, refusal = await type_tool.layer_probe({"selector": "#cv", "text": "y"}, lease)
+        assert verdict is taskv3_loop.LayerCheck.SAME and refusal is not None
+        assert 'input[id="cv"]' in refusal.content, refusal.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_any_change_a_person_could_make_or_see_in_the_layer_ends_its_lease() -> None:
+    LayerCheck = taskv3_loop.LayerCheck  # noqa: N806
+    async with _content_page(_DIALOG_OVER_A_MIRRORED_HOST_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        check = type_tool.layer_probe
+        assert check is not None
+        current = await _layer_lease(type_tool, "#plain")
+        # None of these flips a checkbox, and each leaves the same layer node in place.
+        for change in (
+            "document.getElementById('question').textContent = 'Have you ordered from us before?'",
+            "document.getElementById('in-layer').value = 'bb'",
+            "document.getElementById('in-layer').disabled = true",
+            "const r = document.getElementById('yes'); r.replaceWith(r.cloneNode(true))",
+        ):
+            assert (await check({"selector": "#plain", "text": "y"}, current))[0] is LayerCheck.SAME, change
+            await page.evaluate(change)
+            assert (await check({"selector": "#plain", "text": "y"}, current))[0] is LayerCheck.OTHER, change
+            current = await _layer_lease(type_tool, "#plain")
+
+
+_DIALOG_WITH_A_FIELDSET_AND_A_SHADOW_QUESTION_HTML = """
+<input id="plain" aria-label="Plain field" style="position:fixed;left:20px;top:120px;width:200px;height:30px">
+<div id="notice" role="dialog" aria-modal="true" aria-label="Before you continue"
+  style="position:fixed;left:0;top:0;width:500px;height:260px;background:#fff">
+  <div id="question-host"></div>
+  <fieldset id="answers" style="border:0;padding:0"><input id="reply" value="aa"></fieldset>
+  <button id="close" onclick="this.closest('[role=dialog]').remove()">Close</button>
+</div>
+<script>
+  document.getElementById('question-host').attachShadow({mode: 'open'}).innerHTML =
+    '<p id="question">Have you used this service before?</p>';
+</script>
+"""
+
+
+_DIALOG_THAT_IS_A_SHADOW_HOST_HTML = """
+<input id="plain" style="position:fixed;left:20px;top:120px;width:200px;height:30px">
+<div id="notice" role="dialog" aria-modal="true" aria-label="Before you continue"
+  style="position:fixed;left:0;top:0;width:500px;height:260px;background:#fff"></div>
+<script>
+  document.getElementById('notice').attachShadow({mode: 'open'}).innerHTML =
+    '<p id="question">Have you used this service before?</p><button id="close">Close</button>';
+</script>
+"""
+
+_DIALOG_WITH_DEEPLY_NESTED_ROOTS_HTML = """
+<input id="plain" style="position:fixed;left:20px;top:120px;width:200px;height:30px">
+<div id="notice" role="dialog" aria-modal="true" aria-label="Before you continue"
+  style="position:fixed;left:0;top:0;width:500px;height:260px;background:#fff"><div id="nest"></div></div>
+<script>
+  let host = document.getElementById('nest');
+  for (let i = 0; i < 18; i++) {
+    const root = host.attachShadow({mode: 'open'});
+    root.innerHTML = i === 17 ? '<p>Have you used this service before?</p><button>Close</button>' : '<div></div>';
+    host = root.firstElementChild;
+  }
+</script>
+"""
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_question_in_a_shadow_root_or_a_disabled_fieldset_is_a_change_to_the_layer() -> None:
+    LayerCheck = taskv3_loop.LayerCheck  # noqa: N806
+    async with _content_page(_DIALOG_WITH_A_FIELDSET_AND_A_SHADOW_QUESTION_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        check = type_tool.layer_probe
+        assert check is not None
+        current = await _layer_lease(type_tool, "#plain")
+        for change in (
+            "document.getElementById('question-host').shadowRoot.getElementById('question').textContent = "
+            "'Have you ordered from us before?'",
+            # The reply's own `disabled` stays false; the fieldset disables it.
+            "document.getElementById('answers').disabled = true",
+        ):
+            assert (await check({"selector": "#plain", "text": "y"}, current))[0] is LayerCheck.SAME, change
+            await page.evaluate(change)
+            assert (await check({"selector": "#plain", "text": "y"}, current))[0] is LayerCheck.OTHER, change
+            current = await _layer_lease(type_tool, "#plain")
+
+    # The dialog can be a component host itself, its question in its own shadow root.
+    async with _content_page(_DIALOG_THAT_IS_A_SHADOW_HOST_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        check = type_tool.layer_probe
+        assert check is not None
+        current = await _layer_lease(type_tool, "#plain")
+        assert (await check({"selector": "#plain", "text": "y"}, current))[0] is LayerCheck.SAME
+        await page.evaluate(
+            "document.getElementById('notice').shadowRoot.getElementById('question').textContent = "
+            "'Have you ordered from us before?'"
+        )
+        assert (await check({"selector": "#plain", "text": "y"}, current))[0] is LayerCheck.OTHER
+
+    # A layer nested deeper than the reading goes cannot be compared, so it names no layer to hold types against.
+    async with _content_page(_DIALOG_WITH_DEEPLY_NESTED_ROOTS_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        refused = await type_tool.handler({"selector": "#plain", "text": "x"})
+        assert refused.error_class == "covered", refused.content
+        assert taskv3_loop.BLOCKING_LAYER_DATA_KEY not in (refused.data or {}), refused.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_field_addressed_by_its_observe_ref_is_rechecked_like_its_selector() -> None:
+    async with _content_page(_DIALOG_WITH_A_FIELDSET_AND_A_SHADOW_QUESTION_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        ref = next(
+            (
+                m.group(1)
+                for line in observed.content.splitlines()
+                if "Plain field" in line
+                for m in [re.search(r"ref=(\d+)", line)]
+                if m
+            ),
+            None,
+        )
+        assert ref is not None, observed.content
+        type_tool = _tool(tools, "type")
+        assert type_tool.layer_probe is not None
+        lease = await _layer_lease(type_tool, f"ref={ref}")
+        verdict, refusal = await type_tool.layer_probe({"selector": f"ref={ref}", "text": "y"}, lease)
+        assert verdict is taskv3_loop.LayerCheck.SAME and refusal is not None, refusal
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_layer_recheck_the_page_cannot_answer_in_time_ends_the_lease(monkeypatch: pytest.MonkeyPatch) -> None:
+    LayerCheck = taskv3_loop.LayerCheck  # noqa: N806
+    async with _content_page(_DIALOG_OVER_A_MIRRORED_HOST_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        check = type_tool.layer_probe
+        assert check is not None
+        lease = await _layer_lease(type_tool, "#plain")
+        monkeypatch.setattr(taskv3_tools, "_LAYER_CHECK_TIMEOUT_SECONDS", 0.5, raising=False)
+        # A busy page thread holds the probe; a reading that does not arrive in time proves nothing.
+        await page.evaluate("setTimeout(() => { const t = Date.now(); while (Date.now() - t < 3000) {} }, 0)")
+        await asyncio.sleep(0.05)
+        started = time.monotonic()
+        verdict = (await check({"selector": "#plain", "text": "y"}, lease))[0]
+        assert verdict is LayerCheck.OTHER and time.monotonic() - started < 2.0, (verdict, time.monotonic() - started)
+        await asyncio.sleep(3)
+
+        # Cancelling the caller still cancels the recheck.
+        await page.evaluate("setTimeout(() => { const t = Date.now(); while (Date.now() - t < 1500) {} }, 0)")
+        await asyncio.sleep(0.05)
+        task = asyncio.ensure_future(check({"selector": "#plain", "text": "y"}, lease))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_only_a_qualified_layer_refusal_names_a_layer() -> None:
+    key = taskv3_loop.BLOCKING_LAYER_DATA_KEY
+    async with _content_page(_DISMISSIBLE_DIALOG_BESIDE_A_COVERED_ROW_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        row = await type_tool.handler({"selector": "#state", "text": "Iowa"})
+        assert row.error_class == "covered" and key not in (row.data or {}), row.content
+    async with _content_page(_FIELD_IN_A_CLOSED_DETAILS_HTML) as page:
+        type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
+        hidden = await type_tool.handler({"selector": "#city", "text": "x"})
+        assert hidden.error_class == "unreachable" and key not in (hidden.data or {}), hidden.content
 
 
 @_skip_no_browser

@@ -26,9 +26,8 @@ from skyvern.exceptions import FailedToNavigateToUrl
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.experimentation.billing_tier import BILLING_TIER_PROPERTY, BillingTier
 from skyvern.forge.sdk.experimentation.providers import BaseExperimentationProvider, NoOpExperimentationProvider
 from skyvern.forge.sdk.experimentation.workflow_block_engine import (
@@ -101,6 +100,7 @@ from tests.unit._workflow_block_engine_fakes import (
     consulted_flags,
     resolve_arm,
 )
+from tests.unit.conftest import SqliteEngineFactory
 from tests.unit.helpers import make_organization, make_task
 from tests.unit.test_agent_task_v3 import (
     _make_block,
@@ -2255,11 +2255,10 @@ async def test_a_saved_version_logs_only_when_it_adds_a_skyvern_v1_pin(
 @pytest.mark.parametrize("idempotent", [pytest.param(True, id="idempotent_create"), pytest.param(False, id="create")])
 @pytest.mark.asyncio
 async def test_a_first_version_created_with_a_v1_pin_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, idempotent: bool
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine_factory: SqliteEngineFactory, idempotent: bool
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'pin.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    engine = sqlite_engine_factory(build_engine=_build_engine)
+    database = AgentDB(str(engine.url), db_engine=engine)
     organization = await database.organizations.create_organization(organization_name="Test", organization_id="o_test")
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())

@@ -75,6 +75,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     DemonstratedAction,
     bound_call_browser_session,
     browser_session_lock,
+    effective_browser_session_id,
     mcp_to_copilot,
     staged_demonstrated_action,
 )
@@ -2681,6 +2682,43 @@ def test_a_run_that_shared_the_chats_browser_binds_no_override() -> None:
 
     assert (binding.target, binding.session_id_override) == ("last_run", None)
     assert binding.unavailable_reason is None
+
+
+@pytest.mark.parametrize(
+    ("properties", "expected"),
+    [({}, "pbs_debug"), ({BROWSER_TARGET_PARAM_NAME: {"type": "string"}}, "pbs_run")],
+    ids=["target-less-tool-ignores-target", "target-bearing-tool-honors-target"],
+)
+@pytest.mark.asyncio
+async def test_a_native_page_state_tool_runs_on_the_target_only_when_its_schema_offers_one(
+    properties: dict[str, Any], expected: str
+) -> None:
+    ctx = make_copilot_ctx(
+        browser_session_id="pbs_debug",
+        last_run_blocks_browser_session_id="pbs_run",
+        last_run_blocks_workflow_run_id="wr_1",
+    )
+    ran_on: list[str | None] = []
+
+    async def act(tool_ctx: ToolContext[AgentContext], _arguments: str) -> str:
+        ran_on.append(effective_browser_session_id(tool_ctx.context))
+        return "{}"
+
+    tool = _with_page_state(
+        FunctionTool(
+            name="solve_page_challenge",
+            description="",
+            params_json_schema={"type": "object", "properties": properties},
+            on_invoke_tool=act,
+        )
+    )
+    arguments = json.dumps({BROWSER_TARGET_PARAM_NAME: "last_run"})
+
+    await tool.on_invoke_tool(
+        ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call-1", tool_arguments=arguments), arguments
+    )
+
+    assert ran_on == [expected]
 
 
 def test_every_browser_overlay_offers_the_target_param() -> None:

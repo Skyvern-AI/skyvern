@@ -63,6 +63,7 @@ def _verify_routes_on_return(fastapi_app: FastAPI, monkeypatch: pytest.MonkeyPat
             _mutated_by[id(fastapi_app)] = borrower
             raise RuntimeError(f"{borrower} mutated shared route internals of {mutated}; give it a private FastAPI().")
 
+    # Relies on MonkeyPatch having no __slots__ and on its teardown and context() calling undo() by attribute.
     vars(monkeypatch)["undo"] = undo_then_verify
 
 

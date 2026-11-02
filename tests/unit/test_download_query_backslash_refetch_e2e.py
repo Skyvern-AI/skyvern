@@ -73,7 +73,7 @@ async def http_site(monkeypatch: pytest.MonkeyPatch) -> Any:
     _RECEIVED_QUERY.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     monkeypatch.setattr(settings, "ALLOWED_HOSTS", [*settings.ALLOWED_HOSTS, "127.0.0.1"])
 
     from playwright.async_api import async_playwright

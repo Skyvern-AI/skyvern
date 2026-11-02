@@ -32,6 +32,8 @@ from skyvern.webeye.actions.models import DetailedAgentStepOutput
 from skyvern.webeye.actions.responses import ActionSuccess
 from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER, CDPDownloadInterceptor
 from tests.unit._fingerprint_expectations import expected_fingerprint
+from tests.unit.conftest import settle_or_fail
+from tests.unit.helpers import ParkedOperation, start_pooled_operation, stop_pooled_operations
 
 
 @pytest.fixture(autouse=True)
@@ -2166,6 +2168,89 @@ async def test_clean_up_task_clears_download_popup_claims_even_on_early_error() 
             await agent.clean_up_task(task=task, last_step=step)
 
     assert task.task_id not in ctx.download_popup_claims
+
+
+def _workflow_cleanup_patches(task: MagicMock):
+    mock_app = MagicMock()
+    mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=task)
+    mock_app.BROWSER_MANAGER.get_for_task = MagicMock(return_value=None)
+    mock_app.STORAGE.save_downloaded_files = AsyncMock()
+    return (
+        patch("skyvern.forge.agent.app", mock_app),
+        patch("skyvern.forge.agent.analytics.capture"),
+        patch("skyvern.forge.agent.skyvern_context.current", return_value=SkyvernContext(task_id=task.task_id)),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.completed, TaskStatus.terminated])
+async def test_workflow_task_cleanup_stops_only_its_own_pooled_operation_before_returning(status: TaskStatus) -> None:
+    """A workflow-run task returns from cleanup without closing its browser; the workflow closes it later, so a
+    background operation still running then hits a closed page. Cleanup must stop and await it before returning."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-pooled", workflow_run_id="wr-pooled")
+    task.status = status
+    own = ParkedOperation(task.task_id)
+    other = ParkedOperation("task-pooled-other")
+    pool = agent.async_operation_pool
+    settled_at_return: list[bool] = []
+
+    async def cleanup() -> MagicMock:
+        returned = await agent.clean_up_task(task, last_step=MagicMock(), need_final_screenshot=False)
+        settled_at_return.append(own.settled.is_set())
+        return returned
+
+    try:
+        own_handle = await start_pooled_operation(pool, own)
+        other_handle = await start_pooled_operation(pool, other)
+        app_patch, capture_patch, context_patch = _workflow_cleanup_patches(task)
+        with app_patch, capture_patch, context_patch:
+            finished, _ = await settle_or_fail(cleanup())
+        returned = finished.result()
+
+        assert returned is task
+        assert settled_at_return == [True], "the task's pooled operation outlived its cleanup"
+        assert own.handled_cancellation
+        assert own_handle.done()
+        assert pool.get_aio_task(task.task_id, own.type) is None
+        assert not other_handle.done()
+        assert pool.get_aio_task(other.task_id, other.type) is other_handle
+    finally:
+        await stop_pooled_operations(pool, own.task_id, other.task_id)
+
+
+@pytest.mark.asyncio
+async def test_workflow_task_cleanup_cancelled_while_stopping_its_pooled_operation_still_propagates() -> None:
+    """A second cancellation landing while cleanup waits for the operation it just cancelled must still reach the
+    caller, and only after that operation has ended."""
+    agent = ForgeAgent()
+    task = _make_task(task_id="task-pooled-race", workflow_run_id="wr-pooled-race")
+    own = ParkedOperation(task.task_id, unwind_steps=3)
+    pool = agent.async_operation_pool
+    settled_when_cancellation_propagated: list[bool] = []
+
+    async def cleanup() -> MagicMock:
+        current = asyncio.current_task()
+        assert current is not None
+        own.on_cancel = current.cancel
+        try:
+            return await agent.clean_up_task(task, last_step=MagicMock(), need_final_screenshot=False)
+        except asyncio.CancelledError:
+            settled_when_cancellation_propagated.append(own.settled.is_set())
+            raise
+
+    try:
+        own_handle = await start_pooled_operation(pool, own)
+        app_patch, capture_patch, context_patch = _workflow_cleanup_patches(task)
+        with app_patch, capture_patch, context_patch:
+            finished, _ = await settle_or_fail(cleanup())
+
+        assert finished.cancelled(), "cleanup swallowed the cancellation it received while stopping the operation"
+        assert settled_when_cancellation_propagated == [True]
+        assert own_handle.done()
+        assert pool.get_aio_task(task.task_id, own.type) is None
+    finally:
+        await stop_pooled_operations(pool, own.task_id)
 
 
 @pytest.mark.asyncio

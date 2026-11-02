@@ -84,6 +84,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
@@ -710,7 +711,12 @@ async def get_totp_codes(
     ),
 ) -> list[TOTPCode]:
     principal = get_request_principal()
-    workflow_restricted = await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id)
+    scoped_folder_ceiling = (
+        principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+    )
+    workflow_restricted = scoped_folder_ceiling or await app.AGENT_FUNCTION.workflow_folders_restricted(
+        curr_org.organization_id
+    )
     credential_restricted = await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id)
     if (workflow_restricted or credential_restricted) and principal is None:
         return []
@@ -753,7 +759,12 @@ async def get_totp_codes(
             accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
                 principal, "workflow_run.read", set().union(*references_by_code.values())
             )
-            page = [code for code in page if references_by_code[code.totp_code_id] <= accessible_references]
+            page = [
+                code
+                for code in page
+                if references_by_code[code.totp_code_id] <= accessible_references
+                and (not scoped_folder_ceiling or references_by_code[code.totp_code_id])
+            ]
 
         if credential_restricted and page and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
             credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
@@ -2632,6 +2643,7 @@ async def get_credentials(
     page: int = Query(
         1,
         ge=1,
+        le=MAX_PAGE,
         description="Page number for pagination",
         examples=[1],
         openapi_extra={"x-fern-sdk-parameter-name": "page"},
@@ -2639,6 +2651,7 @@ async def get_credentials(
     page_size: int = Query(
         10,
         ge=1,
+        le=MAX_PAGE_SIZE,
         description="Number of items per page",
         examples=[10],
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
@@ -2775,7 +2788,7 @@ async def get_credential_folder(
 )
 @base_router.get("/credential_folders/", response_model=list[CredentialFolder], include_in_schema=False)
 async def get_credential_folders(
-    page: int = Query(1, ge=1, description="Page number"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),

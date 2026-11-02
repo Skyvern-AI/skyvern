@@ -170,21 +170,9 @@ def _build_client(
     return TestClient(fastapi_app, raise_server_exceptions=raise_server_exceptions), mocks
 
 
-def test_request_model_accepts_no_source() -> None:
-    request = CreateBrowserProfileRequest(name="fresh profile")
-
-    assert request.browser_session_id is None
-    assert request.workflow_run_id is None
-
-
 def test_request_model_rejects_both_sources() -> None:
     with pytest.raises(ValidationError, match="Provide only one of browser_session_id or workflow_run_id"):
         CreateBrowserProfileRequest(name="my profile", browser_session_id="pbs_1", workflow_run_id="wr_1")
-
-
-def test_request_model_rejects_whitespace_source_id() -> None:
-    with pytest.raises(ValidationError):
-        CreateBrowserProfileRequest(name="my profile", browser_session_id=" ")
 
 
 def test_whitespace_source_id_returns_422(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -407,6 +395,7 @@ def test_create_from_run_promotes_even_when_persist_flag_off(monkeypatch: pytest
 
     assert response.status_code == 200
     mocks.store_profile.assert_awaited_once()
+    mocks.rate_limit_submit_run.assert_not_awaited()
 
 
 def test_create_from_run_400_when_no_persisted_archive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -514,41 +503,6 @@ def test_create_empty_profile_preserves_duplicate_name_handling(monkeypatch: pyt
 
     assert response.status_code == 409
     assert "already exists" in response.json()["detail"]
-    mocks.store_profile.assert_not_awaited()
-
-
-def test_create_profile_route_delegates_workflow_run_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, mocks = _build_client(monkeypatch)
-    calls: list[dict[str, str | None]] = []
-
-    async def _create_profile_from_workflow_run(**kwargs: str | None) -> BrowserProfile:
-        calls.append(kwargs)
-        return _profile()
-
-    monkeypatch.setattr(
-        browser_profiles_route,
-        "_create_profile_from_workflow_run",
-        _create_profile_from_workflow_run,
-    )
-
-    response = client.post(
-        "/v1/browser_profiles/",
-        json={"name": "my profile", "description": "from workflow", "workflow_run_id": "wr_1"},
-    )
-
-    assert response.status_code == 200
-    assert calls == [
-        {
-            "organization_id": "org_oss",
-            "name": "my profile",
-            "description": "from workflow",
-            "workflow_run_id": "wr_1",
-            "proxy_location": None,
-            "proxy_session_id": None,
-        }
-    ]
-    mocks.rate_limit_submit_run.assert_not_awaited()
-    mocks.get_workflow_run.assert_not_awaited()
     mocks.store_profile.assert_not_awaited()
 
 

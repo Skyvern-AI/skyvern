@@ -63,6 +63,7 @@ installNoVncGestureCrashGuard();
 const MESSAGE_RECONNECT_DELAY_MS = 1000;
 const MESSAGE_MAX_RECONNECT_ATTEMPTS = 20;
 const VNC_MAX_RECONNECT_ATTEMPTS = 8;
+export const VNC_CONNECT_HINT_DELAY_MS = 15_000;
 const STREAM_GAVE_UP_DIAGNOSTIC: StreamDiagnostic = {
   title: "Browser stream connection lost",
   detail:
@@ -276,6 +277,19 @@ function BrowserStream({
     entity !== "browserSession" || hasBrowserSession;
   const isBrowserSessionBackendReady =
     entity !== "browserSession" || isBrowserSessionStarted;
+  const awaitingVnc = isBrowserSessionBackendReady && !isVncConnected;
+  const [vncConnectStuck, setVncConnectStuck] = useState(false);
+  useEffect(() => {
+    if (!awaitingVnc) return;
+    const timer = setTimeout(
+      () => setVncConnectStuck(true),
+      VNC_CONNECT_HINT_DELAY_MS,
+    );
+    return () => {
+      clearTimeout(timer);
+      setVncConnectStuck(false);
+    };
+  }, [awaitingVnc]);
   const handleMessageConnectionChange = useCallback(
     (connected: boolean, event?: CloseEvent) => {
       if (connected) {
@@ -923,7 +937,9 @@ function BrowserStream({
               ? {
                   title: "Reaching out to your browser",
                   detail: "Opening up the live stream and message channels...",
-                  hint: "If this sticks around, check VNC support for the session or switch to local browser streaming.",
+                  hint: vncConnectStuck
+                    ? "If this sticks around, check VNC support for the session or switch to local browser streaming."
+                    : undefined,
                   pending: true,
                 }
               : !isCanvasReady
