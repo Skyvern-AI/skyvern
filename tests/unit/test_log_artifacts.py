@@ -10,7 +10,6 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine
 from structlog.types import EventDict
 
 from skyvern.forge import app
@@ -21,7 +20,7 @@ from skyvern.forge.sdk.artifact.storage.local import LocalStorage
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.db.models import Base, WorkflowRunAttemptModel
+from skyvern.forge.sdk.db.models import WorkflowRunAttemptModel
 from skyvern.forge.sdk.forge_log import redact_registered_secrets, skyvern_logs_processor
 from skyvern.forge.sdk.log_artifacts import (
     save_step_logs,
@@ -33,6 +32,7 @@ from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import RetryDecision
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from tests.unit.conftest import SqliteEngineFactory
 
 
 @pytest.mark.parametrize("secret", ["failure", "attribution", "failure_attribution"])
@@ -69,12 +69,13 @@ def test_registered_secret_collision_cannot_leak_failure_attribution_into_contex
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_attribution", [False, True])
 async def test_workflow_log_artifacts_omit_only_internal_failure_attribution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, include_attribution: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine_factory: SqliteEngineFactory,
+    include_attribution: bool,
 ) -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    database = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=engine)
+    engine = sqlite_engine_factory()
+    database = AgentDB(str(engine.url), db_engine=engine)
     manager = ArtifactManager()
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "ARTIFACT_MANAGER", manager)
@@ -329,15 +330,14 @@ async def test_save_workflow_run_block_logs_with_context_filters_by_block_id(mon
 @pytest.mark.parametrize("attempt_raises", [False, True])
 async def test_retry_logs_keep_both_attempts_and_update_only_current_attempt(
     tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
     monkeypatch: pytest.MonkeyPatch,
     workflow_context_manager_factory,
     replace_context_during_lookup: bool,
     attempt_raises: bool,
 ) -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    database = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=engine)
+    engine = sqlite_engine_factory()
+    database = AgentDB(str(engine.url), db_engine=engine)
     manager = ArtifactManager()
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "ARTIFACT_MANAGER", manager)
