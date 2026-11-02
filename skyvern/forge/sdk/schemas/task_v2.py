@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_seriali
 
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_model_name
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.models.run_limits import MaxScreenshotScrolls
+from skyvern.forge.sdk.workflow.models.run_limits import MaxScrapeScreenshots, MaxScreenshotScrolls
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import WebhookUrl, validate_url
@@ -55,6 +55,7 @@ class TaskV2(BaseModel):
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: int | None = Field(default=None, alias="max_screenshot_scrolling_times")
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
@@ -228,6 +229,7 @@ class TaskV2Request(BaseModel):
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
     model: dict[str, Any] | None = None
+    max_scrape_screenshots: MaxScrapeScreenshots = None
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None

@@ -3792,6 +3792,7 @@ class WorkflowService:
                 proxy_location=workflow_request.proxy_location,
                 webhook_callback_url=workflow_request.webhook_callback_url,
                 max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+                max_scrape_screenshots=workflow_request.max_scrape_screenshots,
                 ai_fallback=workflow_request.ai_fallback,
                 run_with=workflow_request.run_with,
                 code_gen=code_gen,
@@ -3836,6 +3837,7 @@ class WorkflowService:
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     max_steps_override=max_steps_override,
                     max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
+                    max_scrape_screenshots=workflow_request.max_scrape_screenshots,
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
                     copilot_session_id=resolved_copilot_session_id,
                     trigger_type=resolved_trigger_type,
@@ -7159,6 +7161,8 @@ class WorkflowService:
             block_output_labels=list(block_outputs or ()),
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
+
+        skyvern_context.ensure_context().max_scrape_screenshots = workflow_run.max_scrape_screenshots
 
         # Guard: if the run was canceled while queued (before Temporal picked it up), don't
         # overwrite the canceled status with running. Checked BEFORE workflow resolution so a run
@@ -12820,6 +12824,7 @@ class WorkflowService:
                     totp_identifier=workflow_request.totp_identifier,
                     parent_workflow_run_id=parent_workflow_run_id,
                     max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+                    max_scrape_screenshots=workflow_request.max_scrape_screenshots,
                     max_elapsed_time_minutes=max_elapsed_time_minutes,
                     extra_http_headers=workflow_request.extra_http_headers,
                     cdp_connect_headers=workflow_request.cdp_connect_headers,
@@ -12890,6 +12895,7 @@ class WorkflowService:
             totp_identifier=workflow_request.totp_identifier,
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+            max_scrape_screenshots=workflow_request.max_scrape_screenshots,
             max_elapsed_time_minutes=max_elapsed_time_minutes,
             extra_http_headers=workflow_request.extra_http_headers,
             cdp_connect_headers=workflow_request.cdp_connect_headers,
@@ -16099,6 +16105,7 @@ class WorkflowService:
             browser_profile_id=workflow_run.browser_profile_id,
             browser_seed_source=workflow_run.browser_seed_source,
             max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+            max_scrape_screenshots=workflow_run.max_scrape_screenshots,
             task_v2=capped_task_v2(task_v2) if cap_output_values else task_v2,
             browser_address=workflow_run.browser_address,
             run_with=workflow_run.run_with,

@@ -79,6 +79,7 @@ async def ensure_workflow_run(
         start_fresh_browser=block_run_request.start_fresh_browser,
         reuse_browser_session=block_run_request.reuse_browser_session,
         max_screenshot_scrolls=block_run_request.max_screenshot_scrolls,
+        max_scrape_screenshots=block_run_request.max_scrape_screenshots,
         extra_http_headers=block_run_request.extra_http_headers,
     )
 
