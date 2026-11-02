@@ -6,6 +6,7 @@ import contextlib
 import functools
 import hashlib
 import itertools
+import json
 import logging
 import os
 import shutil
@@ -25,6 +26,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 import structlog
+from agents import FunctionTool
+from agents.tool_context import ToolContext
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from opentelemetry import trace as otel_trace
@@ -394,15 +397,25 @@ def make_block_output_parameter(key: str = "block_output", workflow_id: str = "w
     )
 
 
-def make_copilot_context(workflow_yaml: str = "") -> CopilotContext:
+def make_copilot_context(
+    workflow_yaml: str = "", *, organization_id: str = "o", workflow_permanent_id: str = "wp"
+) -> CopilotContext:
     return CopilotContext(
-        organization_id="o",
+        organization_id=organization_id,
         workflow_id="w",
-        workflow_permanent_id="wp",
+        workflow_permanent_id=workflow_permanent_id,
         workflow_yaml=workflow_yaml,
         browser_session_id=None,
         stream=SimpleNamespace(),  # type: ignore[arg-type]
     )
+
+
+async def invoke_copilot_tool(tool: FunctionTool, ctx: CopilotContext, arguments: dict[str, Any]) -> dict[str, Any]:
+    raw_arguments = json.dumps(arguments)
+    tool_context = ToolContext(
+        context=ctx, tool_name=tool.name, tool_call_id=f"call_{tool.name}", tool_arguments=raw_arguments
+    )
+    return json.loads(await tool.on_invoke_tool(tool_context, raw_arguments))
 
 
 # -- shared helpers for repository unit tests --

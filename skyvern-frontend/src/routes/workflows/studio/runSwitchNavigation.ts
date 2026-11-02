@@ -5,6 +5,8 @@ import { useRunViewStore } from "@/store/RunViewStore";
 
 import { liveSearch } from "./liveSearch";
 import {
+  copilotBrowserFocusSessionId,
+  COPILOT_RUN_FOCUS,
   fitPanesToWidth,
   panesFitWidth,
   searchWithRunReference,
@@ -45,7 +47,7 @@ export function searchWithRunSwitched(
   params.set("wr", runId);
   if (!options?.systemFocus) params.delete("panes");
   if (options?.systemFocus && copilotOwnsFocus) {
-    params.set(SYSTEM_RUN_FOCUS_PARAM, "copilot");
+    params.set(SYSTEM_RUN_FOCUS_PARAM, COPILOT_RUN_FOCUS);
   } else {
     // A user switching runs takes over the focus; the layout reclassifies.
     params.delete(SYSTEM_RUN_FOCUS_PARAM);
@@ -56,6 +58,31 @@ export function searchWithRunSwitched(
   // today, but clearing it keeps this the single, complete home for run-switch
   // navigation.
   params.delete("iteration");
+  return toReadableSearch(params);
+}
+
+// The latest call that names a browser wins the pin; useBrowserPaneView shows it only while it is one the
+// studio can stream. A run the user opened (no marker) is never pinned.
+export function searchWithCopilotBrowserFocus(
+  search: string,
+  callBrowserSessionId: string | null | undefined,
+): string {
+  const params = new URLSearchParams(search);
+  if (
+    !callBrowserSessionId ||
+    !params.has(SYSTEM_RUN_FOCUS_PARAM) ||
+    params.get(SYSTEM_RUN_FOCUS_PARAM) === callBrowserSessionId
+  ) {
+    return search;
+  }
+  params.set(SYSTEM_RUN_FOCUS_PARAM, callBrowserSessionId);
+  return toReadableSearch(params);
+}
+
+export function searchWithCopilotBrowserReleased(search: string): string {
+  const params = new URLSearchParams(search);
+  if (!copilotBrowserFocusSessionId(params)) return search;
+  params.set(SYSTEM_RUN_FOCUS_PARAM, COPILOT_RUN_FOCUS);
   return toReadableSearch(params);
 }
 

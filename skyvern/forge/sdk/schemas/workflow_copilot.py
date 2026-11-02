@@ -867,6 +867,13 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
         None,
         description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
     )
+    browser_session_id: str | None = Field(
+        None,
+        description=(
+            "Browser session a page-acting call resolves to when it is emitted; null for other tools and for "
+            "an unavailable target. Not persisted on the activity entry."
+        ),
+    )
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):

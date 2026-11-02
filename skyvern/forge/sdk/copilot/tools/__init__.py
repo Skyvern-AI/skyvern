@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM_NAME,
     BrowserTarget,
     resolve_browser_session_binding,
+    tool_accepts_target,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_missing as composition_page_evidence_missing,
@@ -105,6 +106,11 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import (
 from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     credential_delete_enabled,
     delete_saved_credentials,
+)
+from skyvern.forge.sdk.copilot.tools.event_triggers import (
+    create_webhook_trigger_tool,
+    list_workflow_triggers_tool,
+    test_trigger_mapping_tool,
 )
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
@@ -2498,6 +2504,9 @@ NATIVE_TOOLS = [
     offer_demonstration_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
+    list_workflow_triggers_tool,
+    test_trigger_mapping_tool,
+    create_webhook_trigger_tool,
     run_blocks_tool,
     test_workflow_from_blank_browser_tool,
     get_run_results_tool,
@@ -2555,8 +2564,7 @@ _PAGE_STATE_TOOL_NAMES = (
 def _with_page_state(tool: FunctionTool) -> FunctionTool:
     """Stamp the page the call's browser shows once the tool returns onto its JSON object result."""
     invoke = tool.on_invoke_tool
-    properties = tool.params_json_schema.get("properties")
-    accepts_target = isinstance(properties, dict) and BROWSER_TARGET_PARAM_NAME in properties
+    accepts_target = tool_accepts_target(tool)
 
     # Annotated ToolContext for the same reason as current_page_inspection_tool: the runner forks a bare
     # context for a RunContextWrapper annotation, and the delegate reads tool_name off it.

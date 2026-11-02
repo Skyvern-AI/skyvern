@@ -17,6 +17,7 @@ import structlog
 from cachetools import TTLCache
 from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
+from pydantic import JsonValue
 
 from skyvern import analytics
 from skyvern.config import CodeBlockMode, settings
@@ -265,6 +266,32 @@ class CopilotOrganizationUsage:
     overage_enabled: bool | None = None
     credits_note: str | None = None
     billing_page_path: str | None = None
+
+
+COPILOT_TRIGGERS_UNAVAILABLE = "Triggers are not available in this deployment."
+
+
+@dataclass(frozen=True)
+class CopilotTriggerSummary:
+    event_trigger_id: str
+    workflow_permanent_id: str
+    source_kind: str
+    mapping: dict[str, str]
+    enabled: bool
+    created_at: str
+
+
+TriggerMappingReasonCode = Literal[
+    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed"
+]
+
+
+@dataclass(frozen=True)
+class CopilotTriggerResult:
+    error: str | None = None
+    triggers: list[CopilotTriggerSummary] = field(default_factory=list)
+    resolved_parameters: dict[str, JsonValue] | None = None
+    reason_code: TriggerMappingReasonCode | None = None
 
 
 @dataclass(frozen=True)
@@ -1665,6 +1692,26 @@ class AgentFunction:
         """OSS keeps no billing records; cloud overrides this with the authenticated read."""
         del organization_id
         return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
+
+    async def create_copilot_webhook_trigger(
+        self, *, organization_id: str, workflow_permanent_id: str, mapping: dict[str, str]
+    ) -> CopilotTriggerResult:
+        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
+
+    async def dry_run_copilot_trigger_mapping(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        mapping: dict[str, str],
+        payload: dict[str, JsonValue],
+    ) -> CopilotTriggerResult:
+        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
+
+    async def list_copilot_workflow_triggers(
+        self, *, organization_id: str, workflow_permanent_id: str
+    ) -> CopilotTriggerResult:
+        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
