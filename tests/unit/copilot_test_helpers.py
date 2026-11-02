@@ -1965,7 +1965,11 @@ workflow_definition:
 
 
 def receipt_message(narrative_payload: dict[str, Any]) -> MagicMock:
-    return MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload=narrative_payload)
+    return MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload=narrative_payload,
+        _narrative_payload_unreadable=False,
+    )
 
 
 def all_blocks_tested_message() -> MagicMock:
