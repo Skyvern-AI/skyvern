@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -591,7 +591,7 @@ async def _resolve_live_browser_session_id(
 
 
 def _historical_turn_facts_projection(
-    narrative_payload: TurnNarrativePayload | None,
+    narrative_payload: Mapping[str, Any] | None,
 ) -> HistoricalTurnFactsProjection | None:
     if not isinstance(narrative_payload, dict):
         return None
