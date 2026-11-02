@@ -600,6 +600,9 @@ class Settings(BaseSettings):
     # Return an in-loop navigate's 404/410 to the model as the navigate result instead of ending the run (SKY-16206).
     # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
     TASK_V3_DEAD_END_RETURN: bool = False
+    # The acting model declares whether a run is a job application, and only a yes delivers the application defaults.
+    # Force-on term only: runs are randomized per run by the flag of the same name (APPLICATION_CONTEXT_FLAG).
+    TASK_V3_APPLICATION_CONTEXT: bool = False
     # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
     # as before. Force-on term only: where it is off, organizations are gated by the flag of the same name.
     # Retry policies match on stored codes, so turning this on can change which runs retry.

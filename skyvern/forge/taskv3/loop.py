@@ -4199,6 +4199,8 @@ async def run_agent_tool_loop(
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: ActionRoundSink | None = None,
     on_turn_start: TurnStart | None = None,
+    # Reads the turn number at each turn start; a returned string is appended as a user message.
+    turn_notice: Callable[[int], str | None] | None = None,
     on_turn_end: TurnEnd | None = None,
     # Awaited after each successful model call, before the turn touches the page.
     on_model_returned: Callable[[], Awaitable[None]] | None = None,
@@ -4934,6 +4936,14 @@ async def run_agent_tool_loop(
                 # Read by the finish tool's hold gates: a hold's retry turn no longer exists.
                 activity.final_turn_active = True
         st.turns += 1
+        if turn_notice is not None:
+            try:
+                notice = turn_notice(st.turns)
+            except Exception:
+                LOG.warning("taskv3 turn_notice callback failed", turn=st.turns, exc_info=True)
+            else:
+                if notice:
+                    st.messages.append({"role": "user", "content": notice})
         if activity is not None:
             activity.deliver_batch_reads()
             activity.refresh_cycles_remaining = max_refresh_cycles - st.refresh_cycles

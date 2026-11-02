@@ -244,6 +244,7 @@ from skyvern.forge.taskv3.provider_downloads import (
 )
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
+    APPLICATION_CONTEXT_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
     LLM_ROUTE_FLAG,
@@ -3043,6 +3044,13 @@ class ForgeAgent:
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
                 forced=settings.TASK_V3_DEAD_END_RETURN,
+            )
+            await resolve_run_arm(
+                context,
+                APPLICATION_CONTEXT_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=settings.TASK_V3_APPLICATION_CONTEXT,
             )
             await resolve_run_arm(
                 context,
