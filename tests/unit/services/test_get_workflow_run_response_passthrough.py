@@ -49,6 +49,8 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
         parameters={},
         errors=None,
         total_steps=4,
+        total_cost=1.5,
+        credits_used=30,
     )
 
     with (
@@ -74,6 +76,8 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
     assert resp.run_with == "code"
     assert resp.status == RunStatus.completed
     assert resp.step_count == 4
+    assert resp.total_cost == 1.5
+    assert resp.credits_used == 30
     assert resp.run_request is not None
     assert resp.run_request.browser_session_id == "pbs_123"
 
