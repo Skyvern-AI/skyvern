@@ -98,6 +98,16 @@ async def test_timeout_rescues_once_without_animation_retry_and_preserves_file(
 
 
 @pytest.mark.asyncio
+async def test_health_recording_rescue_keeps_the_default_png_encode() -> None:
+    page = _page()
+    await _current_viewpoint_screenshot_helper(page)
+    session = page.context.new_cdp_session.return_value
+    assert [call.args[1] for call in session.send.await_args_list if call.args[0] == "Page.captureScreenshot"] == [
+        {"format": "png", "captureBeyondViewport": False}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_persistent_context_timeout_is_rescued_over_raw_cdp() -> None:
     # launch_persistent_context exposes no owning Browser, yet CDP still attaches through the context.
     page = _page()

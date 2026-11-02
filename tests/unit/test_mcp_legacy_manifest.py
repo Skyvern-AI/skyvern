@@ -10,8 +10,7 @@ from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.instructions import DEFAULT_INSTRUCTIONS
 from skyvern.cli.mcp_tools.scopes import MCPScope, apply_scope
 
-# Re-frozen for SKY-17536: append guidance for skyvern_feedback.
-DEFAULT_INSTRUCTIONS_SHA256 = "2a5fae7eb9ab108d51666c0ce5896b76701c47bda32e5634bc69a41706854dac"
+DEFAULT_INSTRUCTIONS_SHA256 = "b69db0a4189d864b4cb669fdc0cf97438a2da6f03b162130ee94687af09e0194"
 
 # Digests snapshot each legacy tool's wire manifest: name, schema, description, annotations, _meta.
 # New tool names are ignored; any change to a legacy tool fails.
@@ -25,7 +24,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_bitwarden_config_set": "b454d21e59f7421d14983aa02b64e0fa897ee03af3888114df19ddd6a91bf2cc",
     "skyvern_bitwarden_items": "abf727ff755578e4dc4a475643ca1477a7c923c4009edca27b782afbfb63cd30",
     "skyvern_block_schema": "e7527dcb32d072814b3660ad5b1b837e957bd1605c872f8340cbc670fe59d2f5",
-    "skyvern_block_validate": "f93cbef9b0098f3469af49b6762fef337576895d48e442b7933f4b7d378c1f4d",
+    "skyvern_block_validate": "ba988cb4d78e5f4c08e002f91b446dfbb2cdb4672a78060d15c76f91e7be3da1",
     "skyvern_browser_profile_create": "8d118cf839a408e2d135eb3a48cc09baa253a7eb42342a86f203a086829445c2",
     "skyvern_browser_profile_delete": "ade127a22df9c841510a4435589b4cdbbab8527402774357d7c0d688168bdeb6",
     "skyvern_browser_profile_get": "4e78265e134bb6d587c7db30b873a56173cad9d7409c8c724aeae9e55d7c58b7",
@@ -127,9 +126,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     "skyvern_wait": "7f9b8d8d39762eaa2c2962ab3b1e4b997454d9a1039ee2fee1b5aaa07019786a",
     "skyvern_wait_for_either_state": "b4b127498f91a7d9e1536d11a8993cb9d1cbf7b1557f9bec832afaa127ea1613",
     "skyvern_workflow_cancel": "0ee1a599421c3a116bf09906613574807b7f0a4e7f72b6a79adf6cfb84edb3d1",
-    # Re-frozen for SKY-16333: the description said a code block's `steps` outline is "derived from the code
-    # when omitted"; steps are now always rebuilt on save. Description text only; the schema is unchanged.
-    "skyvern_workflow_create": "f9062f485a05cc359f0a818ebe09b047a5b03aebc29024999188ba413e4bf692",
+    "skyvern_workflow_create": "81ae134f87b166f5d3cc2f6233744c14ffbc10a09efd5a097ac207b690919a02",
     "skyvern_workflow_delete": "4b8b6574f78122c5d6bf8ee12f5b3cedeb83832d08462445889259cfd0c8b861",
     "skyvern_workflow_get": "b9340c5d1cfa0db49431d4e914c0879f15e458d4c6d4879de0d0de653de842da",
     "skyvern_workflow_list": "3b651992b2f20e020305fe308e0b1cde38d330e4dc3ee243887efaa212a2516a",
@@ -140,7 +137,7 @@ LEGACY_TOOL_MANIFEST_DIGESTS = {
     # exact-match browser profile, browser session and credential IDs. Description text only.
     "skyvern_workflow_run_list": "4e86472ab42dfd49f42bb882a6b966dde69ae34f9fa0cb603b25d84529e46333",
     "skyvern_workflow_status": "730fd46aae7cb9e974b631abdca8fdbc5c5c8a77917c22c3bd76735388103487",
-    "skyvern_workflow_update": "3931c7a6b3faee202ebb57291fc2a437b838411ff0082be93d3763dbf727d060",
+    "skyvern_workflow_update": "5a121e079995156b2759f87a1babe14374db2b9cee206f883c4fe28f7d881287",
     "skyvern_workflow_update_folder": "52efdfa02cf84cb9995bfbeb6d00562fdd1364e832e297e853d233ff6f68392d",
     "skyvern_write_grid": "84fb23a7e4a2436c9956d3dd756041b2e786368f4b680877fea49a4fc6058a06",
 }
