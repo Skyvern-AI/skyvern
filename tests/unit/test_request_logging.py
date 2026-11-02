@@ -860,6 +860,7 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
 
 @pytest.fixture(scope="module")
 def real_api_app() -> FastAPI:
+    # Tests register routes on this one app, so each route path must be unique within the module.
     # The first create_api_app() in a process runs setup_logger(), which replaces the interpreter hooks.
     hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
     app = api_app.create_api_app()
