@@ -23085,6 +23085,12 @@
             "type": "string",
             "title": "Connection Id"
           },
+          "credential_source": {
+            "type": "string",
+            "const": "nango",
+            "title": "Credential Source",
+            "default": "nango"
+          },
           "dataset_id": {
             "type": "string",
             "title": "Dataset Id"
@@ -23225,8 +23231,14 @@
             "type": "string",
             "minLength": 1,
             "title": "Connection Id",
-            "description": "Microsoft OAuth credential ID for this user.",
+            "description": "Power BI connection ID for this user.",
             "x-skyvern-connected-account": true
+          },
+          "credential_source": {
+            "type": "string",
+            "const": "nango",
+            "title": "Credential Source",
+            "default": "nango"
           },
           "dataset_id": {
             "type": "string",
