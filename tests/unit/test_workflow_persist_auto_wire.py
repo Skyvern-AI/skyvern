@@ -6,11 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 import yaml
-from fastmcp.tools import FunctionTool
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
-from skyvern.cli.mcp_tools import mcp
-from skyvern.cli.mcp_tools._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT
 from tests.unit._mcp_test_helpers import patch_get_workflow_by_id as _patch_get_workflow_by_id
 from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_client
 
@@ -46,30 +43,6 @@ def _patch_skyvern_http(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     return request_mock
 
 
-def _patch_existing_workflow(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    existing_workflow = {
-        "proxy_location": "RESIDENTIAL",
-        "workflow_definition": {
-            "parameters": [],
-            "blocks": [],
-        },
-    }
-    get_workflow_by_id = AsyncMock(return_value=existing_workflow)
-    _patch_get_workflow_by_id(monkeypatch, get_workflow_by_id)
-    return get_workflow_by_id
-
-
-def _navigation_block(**overrides: object) -> dict[str, object]:
-    block: dict[str, object] = {
-        "block_type": "navigation",
-        "label": "visit_page",
-        "url": "https://example.com",
-        "navigation_goal": "Open the page",
-    }
-    block.update(overrides)
-    return block
-
-
 def _code_block(**overrides: object) -> dict[str, object]:
     block: dict[str, object] = {
         "block_type": "code",
@@ -82,7 +55,7 @@ def _code_block(**overrides: object) -> dict[str, object]:
 
 def _workflow_definition(blocks: list[object], **overrides: object) -> dict[str, object]:
     definition: dict[str, object] = {
-        "title": "Code only workflow",
+        "title": "Auto-wire workflow",
         "workflow_definition": {
             "parameters": [],
             "blocks": blocks,
@@ -105,167 +78,6 @@ def _sent_definition(request_mock: AsyncMock) -> dict[str, object]:
         raw = yaml.safe_load(body["yaml_definition"])
     assert isinstance(raw, dict)
     return raw
-
-
-def _assert_code_only_rejection(result: dict[str, object], *, label: str) -> None:
-    assert result["ok"] is False
-    error = result["error"]
-    assert isinstance(error, dict)
-    assert error["code"] == workflow_tools.ErrorCode.INVALID_INPUT
-    assert "not allowed in code-only mode" in str(error["message"])
-    assert label in str(error["message"])
-    assert "use a `code` block" in str(error["hint"])
-    # Exact-string on purpose: the guidance text is the behavior surface under test — a
-    # keyword check would pass on inverted advice ("pass code_only=false to continue").
-    assert CODE_ONLY_POLICY_HINT in str(error["hint"])
-
-
-@pytest.mark.asyncio
-async def test_registered_code_only_tool_schemas_are_nullable_without_false_default() -> None:
-    tools = {tool.name: tool for tool in await mcp.list_tools()}
-
-    for tool_name in ("skyvern_block_validate", "skyvern_workflow_create", "skyvern_workflow_update"):
-        tool = tools[tool_name]
-        assert isinstance(tool, FunctionTool)
-        code_only_schema = tool.parameters["properties"]["code_only"]
-        assert {choice["type"] for choice in code_only_schema["anyOf"]} == {"boolean", "null"}
-        assert code_only_schema.get("default") is None
-        assert code_only_schema["description"] == CODE_ONLY_FIELD_DESCRIPTION
-
-
-@pytest.mark.asyncio
-async def test_workflow_create_rejects_navigation_block_in_code_only_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch)
-    definition = _workflow_definition([_navigation_block()])
-
-    result = await workflow_tools.skyvern_workflow_create(
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    _assert_code_only_rejection(result, label="visit_page")
-    request_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_workflow_create_defaults_code_only_off_and_persists_navigation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch)
-    definition = _workflow_definition([_navigation_block()])
-
-    result = await workflow_tools.skyvern_workflow_create(definition=json.dumps(definition), format="json")
-
-    assert result["ok"] is True, result
-    request_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_workflow_create_accepts_code_block_in_code_only_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch)
-    definition = _workflow_definition([_code_block()])
-
-    result = await workflow_tools.skyvern_workflow_create(
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    assert result["ok"] is True, result
-    request_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_workflow_create_rejects_task_block_nested_in_loop_in_code_only_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch)
-    definition = _workflow_definition(
-        [
-            {
-                "block_type": "for_loop",
-                "label": "for_each_item",
-                "loop_over_parameter_key": "items",
-                "loop_blocks": [
-                    {
-                        "block_type": "task",
-                        "label": "legacy_task",
-                        "url": "https://example.com",
-                        "navigation_goal": "Open the page",
-                    }
-                ],
-            }
-        ]
-    )
-
-    result = await workflow_tools.skyvern_workflow_create(
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    _assert_code_only_rejection(result, label="legacy_task")
-    request_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_workflow_create_rejects_label_less_navigation_block_in_code_only_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch)
-    navigation_block = _navigation_block()
-    navigation_block.pop("label")
-    definition = _workflow_definition([navigation_block])
-
-    result = await workflow_tools.skyvern_workflow_create(
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    _assert_code_only_rejection(result, label="(unlabeled)")
-    request_mock.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_workflow_update_rejects_navigation_block_in_code_only_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch)
-    get_workflow_by_id = _patch_existing_workflow(monkeypatch)
-    definition = _workflow_definition([_navigation_block()])
-
-    result = await workflow_tools.skyvern_workflow_update(
-        workflow_id="wpid_test",
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    _assert_code_only_rejection(result, label="visit_page")
-    request_mock.assert_not_awaited()
-    get_workflow_by_id.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_workflow_update_accepts_code_block_in_code_only_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch)
-    _patch_existing_workflow(monkeypatch)
-    definition = _workflow_definition(
-        [_code_block()],
-        proxy_location="RESIDENTIAL",
-        run_sequentially=True,
-        sequential_key="code-only",
-    )
-
-    result = await workflow_tools.skyvern_workflow_update(
-        workflow_id="wpid_test",
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    assert result["ok"] is True, result
-    request_mock.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
@@ -306,7 +118,6 @@ async def test_workflow_create_auto_wires_code_blocks_in_every_format(
     result = await workflow_tools.skyvern_workflow_create(
         definition=_serialized_definition(definition, serialized_as),
         format=format_name,
-        code_only=True,
     )
 
     assert result["ok"] is True, result
@@ -348,7 +159,6 @@ async def test_workflow_create_auto_wire_respects_parameter_key_field_states_and
     result = await workflow_tools.skyvern_workflow_create(
         definition=json.dumps(definition),
         format="json",
-        code_only=True,
     )
 
     assert result["ok"] is True, result
@@ -394,7 +204,6 @@ async def test_workflow_create_auto_wire_excludes_unsafe_and_malformed_parameter
     result = await workflow_tools.skyvern_workflow_create(
         definition=json.dumps(definition),
         format="json",
-        code_only=True,
     )
 
     assert result["ok"] is True, result
@@ -458,11 +267,24 @@ async def test_workflow_update_derives_steps_only_for_new_code_blocks(
     assert [step["action_type"] for step in by_label["new_block"]["steps"]] == ["goto_url"]
 
 
+_VALUE_PARAMETER = {"parameter_type": "workflow", "key": "value", "workflow_parameter_type": "string"}
+
+
+@pytest.mark.parametrize(
+    ("parameter_keys_field", "parameters"),
+    [
+        ({"parameter_keys": ["value"]}, [_VALUE_PARAMETER]),
+        ({}, []),
+    ],
+    ids=["explicit_keys", "no_eligible_parameters"],
+)
 @pytest.mark.parametrize("format_name", ["yaml", "auto"])
 @pytest.mark.asyncio
-async def test_workflow_create_code_only_false_preserves_yaml_bytes(
+async def test_workflow_create_preserves_yaml_bytes_when_nothing_to_wire(
     monkeypatch: pytest.MonkeyPatch,
     format_name: str,
+    parameter_keys_field: dict[str, list[str]],
+    parameters: list[dict[str, str]],
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch)
     # prompt and steps supplied as the code already derives them: omitted or stale values are
@@ -470,6 +292,7 @@ async def test_workflow_create_code_only_false_preserves_yaml_bytes(
     definition = _workflow_definition(
         [
             _code_block(
+                **parameter_keys_field,
                 prompt="",
                 steps=[
                     {
@@ -485,16 +308,122 @@ async def test_workflow_create_code_only_false_preserves_yaml_bytes(
         code_version=2,
         run_with="agent",
     )
-    definition["workflow_definition"]["parameters"] = [
-        {"parameter_type": "workflow", "key": "value", "workflow_parameter_type": "string"}
-    ]
+    definition["workflow_definition"]["parameters"] = parameters
     serialized = yaml.safe_dump(definition, sort_keys=False)
 
-    result = await workflow_tools.skyvern_workflow_create(
-        definition=serialized,
-        format=format_name,
-        code_only=False,
-    )
+    result = await workflow_tools.skyvern_workflow_create(definition=serialized, format=format_name)
 
     assert result["ok"] is True, result
     assert request_mock.await_args.kwargs["json"]["yaml_definition"] == serialized
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_leaves_code_block_unwired_when_no_parameter_is_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch)
+    existing_workflow = {
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {"parameters": [], "blocks": []},
+    }
+    _patch_get_workflow_by_id(monkeypatch, AsyncMock(return_value=existing_workflow))
+
+    definition = _workflow_definition([_code_block()])
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True, result
+    block = _sent_definition(request_mock)["workflow_definition"]["blocks"][0]
+    assert block.get("parameter_keys") is None
+
+
+def _runtime_code_block(label: str) -> dict[str, object]:
+    return _code_block(
+        label=label,
+        parameters=[],
+        output_parameter={"parameter_type": "output", "key": f"{label}_output"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool", "nested", "serialized_as"),
+    [
+        ("update", False, "json"),
+        ("update", True, "json"),
+        ("update", False, "yaml"),
+        ("create", False, "json"),
+        ("create", False, "yaml"),
+    ],
+    ids=["update_top_level", "update_loop_blocks", "update_yaml", "create_top_level", "create_yaml"],
+)
+@pytest.mark.asyncio
+async def test_runtime_shaped_code_block_without_parameters_keeps_auto_wire_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    nested: bool,
+    serialized_as: str,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch)
+    code_block = _runtime_code_block("visit_in_code")
+    block: dict[str, object] = (
+        {"block_type": "for_loop", "label": "for_each_item", "loop_blocks": [code_block]} if nested else code_block
+    )
+    definition = _workflow_definition([])
+    definition["workflow_definition"] = {"parameters": [dict(_VALUE_PARAMETER)], "blocks": [block]}
+
+    serialized = _serialized_definition(definition, serialized_as)
+
+    if tool == "update":
+        _patch_get_workflow_by_id(monkeypatch, AsyncMock(return_value=definition))
+        result = await workflow_tools.skyvern_workflow_update(
+            workflow_id="wpid_test", definition=serialized, format=serialized_as
+        )
+    else:
+        result = await workflow_tools.skyvern_workflow_create(definition=serialized, format=serialized_as)
+
+    assert result["ok"] is True, result
+    sent_blocks = _sent_definition(request_mock)["workflow_definition"]["blocks"]
+    sent_block = sent_blocks[0]["loop_blocks"][0] if nested else sent_blocks[0]
+    assert sent_block["parameter_keys"] == []
+
+
+@pytest.mark.asyncio
+async def test_workflow_update_keeps_prior_links_on_existing_code_block_and_wires_only_new_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_mock = _patch_skyvern_http(monkeypatch)
+    parameters = [
+        {"parameter_type": "workflow", "key": key, "workflow_parameter_type": "string"}
+        for key in ("report_url", "start", "end", "note")
+    ]
+    existing_workflow = {
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": {
+            "parameters": parameters[:1],
+            "blocks": [
+                _code_block(label="old_block", parameter_keys=["report_url"]),
+                {"block_type": "navigation", "label": "converted", "url": "https://example.com"},
+            ],
+        },
+    }
+    _patch_get_workflow_by_id(monkeypatch, AsyncMock(return_value=existing_workflow))
+
+    definition = _workflow_definition(
+        [_code_block(label="old_block"), _code_block(label="new_block"), _code_block(label="converted")]
+    )
+    definition["workflow_definition"]["parameters"] = parameters
+    result = await workflow_tools.skyvern_workflow_update(
+        workflow_id="wpid_test",
+        definition=json.dumps(definition),
+        format="json",
+    )
+
+    assert result["ok"] is True, result
+    by_label = {block["label"]: block for block in _sent_definition(request_mock)["workflow_definition"]["blocks"]}
+    assert by_label["old_block"]["parameter_keys"] == ["report_url"]
+    assert by_label["new_block"]["parameter_keys"] == ["report_url", "start", "end", "note"]
+    assert by_label["converted"]["parameter_keys"] == ["report_url", "start", "end", "note"]
+    assert "Re-attached parameter 'report_url' to block 'old_block'" in json.dumps(result)
