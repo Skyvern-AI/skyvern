@@ -61,6 +61,7 @@ from skyvern.forge.sdk.workflow.models.agent_step_tools import (
 )
 from skyvern.forge.sdk.workflow.models.block import Block, _validate_response_against_json_schema
 from skyvern.forge.sdk.workflow.models.parameter import (
+    PARAMETER_TYPE,
     AWSSecretParameter,
     OutputParameter,
     ParameterType,
@@ -614,10 +615,10 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
     return {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
 
 
-def _credential_keys(run_context: WorkflowRunContext) -> list[str]:
+def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
     return [
-        key
-        for key, parameter in run_context.parameters.items()
+        parameter.key
+        for parameter in parameters
         if parameter.parameter_type.is_login_credential()
         or (isinstance(parameter, WorkflowParameter) and parameter.workflow_parameter_type.is_credential_type())
     ]
@@ -642,7 +643,7 @@ async def run_agent_step(
         organization_id=organization_id,
         browser_session_id=browser_session_id,
         run_context=run_context,
-        credential_keys=_credential_keys(run_context),
+        credential_keys=_credential_keys(block.parameters),
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
         tools=block.tools,
     )

@@ -53,6 +53,7 @@ from skyvern.forge.sdk.services.credentials import (
     normalize_totp_config,
 )
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
+from skyvern.forge.sdk.services.request_principal import scoped_api_key_id_from_actor
 from skyvern.forge.sdk.workflow.block_notes import (
     block_opts_out_of_workflow_prompt,
     definition_step_notes,
@@ -60,7 +61,12 @@ from skyvern.forge.sdk.workflow.block_notes import (
 )
 from skyvern.forge.sdk.workflow.credential_fetch_outcome import CredentialFetch, record_credential_fetch
 from skyvern.forge.sdk.workflow.credential_selection import select_credential_for_run
-from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables, OutputParameterKeyCollisionError
+from skyvern.forge.sdk.workflow.exceptions import (
+    MissingJinjaVariables,
+    OutputParameterKeyCollisionError,
+    RenderFailureKind,
+    TemplateRenderCause,
+)
 from skyvern.forge.sdk.workflow.models._jinja import _JSON_TYPE_MARKER
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -466,6 +472,7 @@ class WorkflowRunContext:
         mask_secrets: bool = False,
         attempt_number: int = 1,
         parent_workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -479,7 +486,11 @@ class WorkflowRunContext:
             mask_secrets=mask_secrets,
             attempt_number=attempt_number,
             parent_workflow_run_id=parent_workflow_run_id,
+            requested_by=requested_by,
         )
+
+        if context := skyvern_context.current():
+            context.requested_by = requested_by
 
         workflow_run_context.organization_id = organization.organization_id
 
@@ -583,12 +594,14 @@ class WorkflowRunContext:
         mask_secrets: bool = False,
         attempt_number: int = 1,
         parent_workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
         self.workflow_permanent_id = workflow_permanent_id
         self.workflow_run_id = workflow_run_id
         self.parent_workflow_run_id = parent_workflow_run_id
+        self.requested_by = requested_by
         self.attempt_number = attempt_number
         self.workflow = workflow
         self.mask_secrets: bool = mask_secrets
@@ -977,7 +990,21 @@ class WorkflowRunContext:
 
         if missing_variables := get_missing_variables(raw_template, template_data):
             if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
-                raise MissingJinjaVariables(template=raw_template, variables=missing_variables)
+                # A dotted name or a present root is a nested miss, which names no reference.
+                absent_roots = sorted(
+                    name for name in missing_variables if name.isidentifier() and name not in template_data
+                )
+                raise MissingJinjaVariables(
+                    template=raw_template,
+                    variables=missing_variables,
+                    missing_references=absent_roots,
+                    render_cause=TemplateRenderCause(
+                        RenderFailureKind.MISSING_REFERENCE
+                        if absent_roots
+                        else RenderFailureKind.MISSING_KEY_OR_ATTRIBUTE,
+                        field_name="workflow_system_prompt",
+                    ),
+                )
             # Non-strict mode silently renders undefined variables as empty strings,
             # which makes typos like {{ persona }} invisible to the user. Emit a
             # warning so the operator has a breadcrumb when a workflow_system_prompt
@@ -1368,6 +1395,15 @@ class WorkflowRunContext:
         async with record_credential_fetch(parameter) as fetch:
             await self._load_credential_parameter_value(credential_id, parameter, organization, fetch)
 
+    async def _enforce_scoped_credential_use(self, organization_id: str | None) -> None:
+        if not scoped_api_key_id_from_actor(self.requested_by):
+            return
+        if organization_id is None:
+            raise PermissionError("credential not accessible")
+        await app.AGENT_FUNCTION.enforce_scoped_credential_use(
+            organization_id, self.workflow_run_id, requested_by=self.requested_by
+        )
+
     async def _load_credential_parameter_value(
         self,
         credential_id: str,
@@ -1379,6 +1415,7 @@ class WorkflowRunContext:
             organization.organization_id,
             credential_id,
             workflow_run_id=self.workflow_run_id,
+            requested_by=self.requested_by,
         )
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=organization.organization_id
@@ -1548,6 +1585,7 @@ class WorkflowRunContext:
         self,
         parameter: AWSSecretParameter,
     ) -> None:
+        await self._enforce_scoped_credential_use(self.organization_id)
         # If the parameter is an AWS secret, fetch the secret value and store it in the secrets dict
         # The value of the parameter will be the random secret id with format `secret_<uuid>`.
         # We'll replace the random secret id with the actual secret value when we need to use it.
@@ -1562,6 +1600,7 @@ class WorkflowRunContext:
         self,
         parameter: AzureSecretParameter,
     ) -> None:
+        await self._enforce_scoped_credential_use(self.organization_id)
         vault_name = settings.AZURE_STORAGE_ACCOUNT_NAME
         if vault_name is None:
             LOG.error("AZURE_STORAGE_ACCOUNT_NAME is not configured, cannot register Azure secret parameter value")
@@ -1582,6 +1621,7 @@ class WorkflowRunContext:
     async def register_onepassword_credential_parameter_value(
         self, parameter: OnePasswordCredentialParameter, organization: Organization
     ) -> None:
+        await self._enforce_scoped_credential_use(organization.organization_id)
         resolution = await resolve_onepassword_token(organization.organization_id)
         LOG.info(
             "1Password token resolved for workflow run",
@@ -1610,6 +1650,7 @@ class WorkflowRunContext:
                 organization.organization_id,
                 imported_credentials[0].credential_id,
                 workflow_run_id=self.workflow_run_id,
+                requested_by=self.requested_by,
             )
         lookup_context = self._format_resolved_lookup_context("1Password", vault_id=vault_id, item_id=item_id)
         item = await fetch_onepassword_item(token, vault_id, item_id, lookup_context)
@@ -1816,6 +1857,7 @@ class WorkflowRunContext:
         parameter: BitwardenLoginCredentialParameter,
         organization: Organization,
     ) -> None:
+        await self._enforce_scoped_credential_use(organization.organization_id)
         url = self._resolve_parameter_value(parameter.url_parameter_key)
         if not url and not parameter.bitwarden_item_id:
             LOG.error(f"URL parameter {parameter.url_parameter_key} not found or has no value")
@@ -1907,6 +1949,7 @@ class WorkflowRunContext:
         parameter: AzureVaultCredentialParameter,
         organization: Organization,
     ) -> None:
+        await self._enforce_scoped_credential_use(organization.organization_id)
         vault_name = self._resolve_required_parameter_value(parameter.vault_name, "Azure Vault Name")
         username_key = self._resolve_required_parameter_value(parameter.username_key, "Azure Username Key")
         password_key = self._resolve_required_parameter_value(parameter.password_key, "Azure Password Key")
@@ -1960,6 +2003,7 @@ class WorkflowRunContext:
         parameter: BitwardenSensitiveInformationParameter,
         organization: Organization,
     ) -> None:
+        await self._enforce_scoped_credential_use(organization.organization_id)
         bitwarden_identity_key = self._resolve_required_parameter_value(
             parameter.bitwarden_identity_key,
             "Bitwarden Identity Key",
@@ -2027,6 +2071,7 @@ class WorkflowRunContext:
         parameter: BitwardenCreditCardDataParameter,
         organization: Organization,
     ) -> None:
+        await self._enforce_scoped_credential_use(organization.organization_id)
         item_id = self._resolve_required_parameter_value(
             parameter.bitwarden_item_id,
             "Bitwarden Item ID",
@@ -2509,6 +2554,7 @@ class WorkflowContextManager:
         mask_secrets: bool = False,
         attempt_number: int = 1,
         parent_workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> WorkflowRunContext:
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
@@ -2527,6 +2573,7 @@ class WorkflowContextManager:
             mask_secrets=mask_secrets,
             attempt_number=attempt_number,
             parent_workflow_run_id=parent_workflow_run_id,
+            requested_by=requested_by,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context

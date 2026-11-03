@@ -26,6 +26,8 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.services.browser_session_redaction import redact_browser_session_addresses
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunResponseBase,
@@ -221,9 +223,11 @@ class _WebhookPayload:
     default_webhook_url: str | None
 
 
-async def build_run_preview(organization_id: str, run_id: str) -> RunWebhookPreviewResponse:
+async def build_run_preview(
+    organization_id: str, run_id: str, principal: RequestPrincipal | None = None
+) -> RunWebhookPreviewResponse:
     """Return the payload and headers that would be used for a replay."""
-    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
+    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id, principal=principal)
     api_key = await _get_api_key(organization_id=organization_id)
     signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=api_key)
     return RunWebhookPreviewResponse(
@@ -240,6 +244,7 @@ async def replay_run_webhook(
     run_id: str,
     target_url: str | None,
     api_key: str | None = None,
+    principal: RequestPrincipal | None = None,
 ) -> RunWebhookReplayResponse:
     """
     Send the webhook payload for a run to either the stored URL or a caller-provided override.
@@ -267,7 +272,7 @@ async def replay_run_webhook(
                 status_code=status.HTTP_409_CONFLICT,
             )
 
-    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id)
+    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id, principal=principal)
     signing_key = api_key if api_key else await _get_api_key(organization_id=organization_id)
     signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=signing_key)
 
@@ -333,13 +338,15 @@ async def replay_run_webhook(
     )
 
 
-async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookPayload:
+async def _build_webhook_payload(
+    organization_id: str, run_id: str, principal: RequestPrincipal | None = None
+) -> _WebhookPayload:
     run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
     if not run:
         # Attempt to resolve task v2 runs that may not yet be in the runs table.
         task_v2 = await app.DATABASE.observer.get_task_v2(run_id, organization_id=organization_id)
         if task_v2:
-            return await _build_task_v2_payload(task_v2)
+            return await _build_task_v2_payload(task_v2, organization_id, principal)
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
             workflow_run_id=run_id,
             organization_id=organization_id,
@@ -348,6 +355,7 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
             return await _build_workflow_payload(
                 organization_id=organization_id,
                 workflow_run_id=run_id,
+                principal=principal,
             )
         raise SkyvernHTTPException(
             f"Run {run_id} not found",
@@ -366,6 +374,7 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
             organization_id=organization_id,
             run_id=run.run_id,
             run_type_str=run_type,
+            principal=principal,
         )
     if run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.observer.get_task_v2(run.run_id, organization_id=organization_id)
@@ -374,14 +383,18 @@ async def _build_webhook_payload(organization_id: str, run_id: str) -> _WebhookP
                 f"Task v2 run {run_id} missing task record",
                 status_code=status.HTTP_404_NOT_FOUND,
             )
-        return await _build_task_v2_payload(task_v2)
+        return await _build_task_v2_payload(task_v2, organization_id, principal)
     if run.task_run_type == RunType.workflow_run:
-        return await _build_workflow_payload(organization_id=organization_id, workflow_run_id=run.run_id)
+        return await _build_workflow_payload(
+            organization_id=organization_id, workflow_run_id=run.run_id, principal=principal
+        )
 
     raise WebhookReplayError(f"Run type {run_type} is not supported for webhook replay.")
 
 
-async def _build_task_payload(organization_id: str, run_id: str, run_type_str: str) -> _WebhookPayload:
+async def _build_task_payload(
+    organization_id: str, run_id: str, run_type_str: str, principal: RequestPrincipal | None
+) -> _WebhookPayload:
     task: Task | None = await app.DATABASE.tasks.get_task(run_id, organization_id=organization_id)
     if not task:
         raise TaskNotFound(task_id=run_id)
@@ -394,10 +407,8 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
         raise WebhookReplayError(f"Run {run_id} has not reached a terminal state (status={task.status}).")
     latest_step = await app.DATABASE.tasks.get_latest_step(run_id, organization_id=organization_id)
     task_response = await app.agent.build_task_response(task=task, last_step=latest_step)
-
-    payload_dict = json.loads(task_response.model_dump_json(exclude={"request"}))
-
     run_response = await run_service.get_run_response(run_id=run_id, organization_id=organization_id)
+    responses = [task_response]
     if isinstance(run_response, TaskRunResponse):
         if not run_response.status.is_final():
             LOG.warning(
@@ -406,6 +417,11 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
                 status=run_response.status,
             )
             raise WebhookReplayError(f"Run {run_id} has not reached a terminal state (status={run_response.status}).")
+        responses.append(run_response)
+
+    await redact_browser_session_addresses(responses, organization_id, app.AGENT_FUNCTION, principal)
+    payload_dict = json.loads(task_response.model_dump_json(exclude={"request"}))
+    if isinstance(run_response, TaskRunResponse):
         run_response_json = run_response.model_dump_json(exclude={"run_request"})
         payload_dict.update(json.loads(run_response_json))
 
@@ -417,7 +433,9 @@ async def _build_task_payload(organization_id: str, run_id: str, run_type_str: s
     )
 
 
-async def _build_task_v2_payload(task_v2: TaskV2) -> _WebhookPayload:
+async def _build_task_v2_payload(
+    task_v2: TaskV2, organization_id: str, principal: RequestPrincipal | None
+) -> _WebhookPayload:
     if not task_v2.status.is_final():
         LOG.warning(
             "Webhook replay requested for non-terminal task v2 run",
@@ -437,6 +455,7 @@ async def _build_task_v2_payload(task_v2: TaskV2) -> _WebhookPayload:
         raise WebhookReplayError(
             f"Run {task_v2.observer_cruise_id} has not reached a terminal state (status={task_run_response.status})."
         )
+    await redact_browser_session_addresses([task_run_response], organization_id, app.AGENT_FUNCTION, principal)
     task_run_response_json = task_run_response.model_dump_json(exclude={"run_request"})
     return _WebhookPayload(
         run_id=task_v2.observer_cruise_id,
@@ -449,6 +468,7 @@ async def _build_task_v2_payload(task_v2: TaskV2) -> _WebhookPayload:
 async def _build_workflow_payload(
     organization_id: str,
     workflow_run_id: str,
+    principal: RequestPrincipal | None,
 ) -> _WebhookPayload:
     workflow_run: WorkflowRun | None = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
@@ -507,6 +527,10 @@ async def _build_workflow_payload(
         errors=status_response.errors,
         browser_seed_source=status_response.browser_seed_source,
         browser_settings_receipt=workflow_run.browser_settings_receipt,
+    )
+
+    await redact_browser_session_addresses(
+        [status_response, run_response], organization_id, app.AGENT_FUNCTION, principal
     )
 
     payload_dict = json.loads(

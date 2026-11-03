@@ -18,6 +18,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BrowserAblationMetadata,
     CopilotToolSurfaceIdentity,
@@ -36,7 +37,6 @@ from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts
@@ -80,6 +80,7 @@ UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
 UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
 RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
 BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
 BLOCK_RUNNING_TOOLS = frozenset(
     {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )
@@ -161,6 +162,7 @@ class SkippedPrefixBlock(TypedDict):
 class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
+    workflowRunId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -310,6 +312,13 @@ class NarrativeScreenshot(TypedDict):
     toolCallId: str | None
 
 
+class CanonicalWorkflowUnavailableFacts(TypedDict):
+    workflow_permanent_id: str
+    candidate_published: NotRequired[Literal[False]]
+    test_started: Literal[False]
+    detail: NotRequired[str]
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -335,6 +344,7 @@ class TurnNarrativePayload(TypedDict):
     outputFiles: NotRequired[list[NarrativeOutputFile]]
     googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
     demonstrationOffer: NotRequired[bool]
+    canonicalWorkflowUnavailable: NotRequired[CanonicalWorkflowUnavailableFacts]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -367,6 +377,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -1364,6 +1375,7 @@ class CopilotContext(AgentContext):
     google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
     # Kept apart from google_connection_notices, which each workflow save recomputes wholesale.
     google_setup_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    canonical_workflow_unavailable: CanonicalWorkflowUnavailableFacts | None = None
 
     # Tool tracking
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -1396,8 +1408,10 @@ class CopilotContext(AgentContext):
     # Workflow state
     authored_private_workflow_settings: dict[str, Any] | None = field(default=None, repr=False)
     persisted_workflow_yaml: str | None = None
+    # The saved row; persisted_workflow_yaml is None when it has no blocks, so its canvas comes from here.
+    saved_workflow: Workflow | None = field(default=None, repr=False)
     private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
-    last_workflow: Workflow | None = None
+    last_workflow: Workflow | None = field(default=None, repr=False)
     last_workflow_yaml: str | None = None
     # Copies of the saved workflow a full test loaded this turn; matched by identity, never offered as a proposal.
     saved_workflows_under_test: list[Workflow] = field(default_factory=list)
@@ -1510,8 +1524,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_failure_reason: str | None = None
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
-    # The discovery tool reaches the connected FastMCP client through this.
-    discovery_mcp_server: Any | None = None
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
 
     # default_factory is the safety net — Python dataclass inheritance
     # disallows non-default fields after default ones, and the parent

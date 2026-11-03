@@ -156,7 +156,7 @@ async def _sink_payloads(monkeypatch: pytest.MonkeyPatch, captured: dict[str, An
         raising=False,
     )
     monkeypatch.setattr(webhook_service.app, "WORKFLOW_SERVICE", service)
-    webhook = await webhook_service._build_workflow_payload("o_test", "wr_test")
+    webhook = await webhook_service._build_workflow_payload("o_test", "wr_test", principal=None)
 
     run_data = response.model_dump(mode="json")
     run_data["overall_status"] = run_data.pop("status")

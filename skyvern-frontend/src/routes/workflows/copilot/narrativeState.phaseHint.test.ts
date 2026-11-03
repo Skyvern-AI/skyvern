@@ -105,6 +105,7 @@ describe("applyNarrativeEvent — lastRunOutcome", () => {
       verdict: "not_demonstrated",
       role: "recorded",
       displayReason: "outcome not confirmed",
+      workflowRunId: "wr_1",
     });
   });
 

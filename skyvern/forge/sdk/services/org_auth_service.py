@@ -8,7 +8,7 @@ from typing import Annotated
 import jwt
 import structlog
 from cachetools import TTLCache
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from jwt.exceptions import PyJWTError
 from opentelemetry import trace
 from pydantic import ValidationError
@@ -22,6 +22,7 @@ from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
 from skyvern.forge.sdk.services.request_principal import (
+    APIKeyAuthProfile,
     AuthKind,
     get_request_principal,
     human_user_id,
@@ -59,8 +60,7 @@ class ApiKeyValidationResult:
 class _CachedOrganizationAuth:
     organization: Organization
     token_id: str
-    access_mode: str = "full_org"
-    bound_user_id: str | None = None
+    api_key_profile: APIKeyAuthProfile
 
 
 def _normalize_api_key_with_flags(raw_api_key: str) -> tuple[str, dict[str, bool]]:
@@ -279,10 +279,56 @@ async def _get_current_org_for_token_types(
 ) -> Organization:
     if authorization:
         try:
-            return await authenticate_helper(authorization)
+            organization = await _authenticate_bearer_organization(authorization)
         except HTTPException:
             if not x_api_key:
                 raise
+        else:
+            bearer_token = _extract_bearer_token(authorization)
+            scoped_api_key: _CachedOrganizationAuth | None = None
+            if x_api_key:
+                try:
+                    token_payload = _decode_token_before_cache(x_api_key)
+                except HTTPException:
+                    # Credential routes have always preferred a valid bearer to an invalid extra key.
+                    pass
+                else:
+                    if not _claims_ui_session(token_payload):
+                        try:
+                            validation = await resolve_org_from_api_key(
+                                x_api_key,
+                                app.DATABASE,
+                                token_types=(OrganizationAuthTokenType.api,),
+                                user_agent=user_agent,
+                                fern_language=fern_language,
+                                allow_scoped_key=True,
+                            )
+                        except HTTPException:
+                            # An invalid extra key does not displace an otherwise valid bearer.
+                            pass
+                        else:
+                            profile = await resolve_api_key_profile_identity(
+                                validation.organization.organization_id, validation.token.id
+                            )
+                            if profile.access_mode == "scoped":
+                                scoped_api_key = _CachedOrganizationAuth(
+                                    validation.organization, validation.token.id, profile
+                                )
+
+            if scoped_api_key:
+                if scoped_api_key.organization.organization_id != organization.organization_id:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid credentials")
+                await resolve_request_principal(
+                    organization.organization_id,
+                    api_key_type=OrganizationAuthTokenType.api,
+                    api_key_token_id=scoped_api_key.token_id,
+                    api_key_profile=scoped_api_key.api_key_profile,
+                    api_key_profile_resolved=True,
+                    bearer_token=bearer_token,
+                )
+            else:
+                await resolve_request_principal(organization.organization_id, bearer_token=bearer_token)
+            return organization
     if not x_api_key:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -294,6 +340,7 @@ async def _get_current_org_for_token_types(
         token_types=token_types,
         user_agent=user_agent,
         fern_language=fern_language,
+        allow_scoped_key=True,
     )
     apply_request_org_context(validation.organization)
     api_key_profile = (
@@ -339,6 +386,12 @@ async def get_current_org_for_credential_routes(
         user_agent=user_agent,
         fern_language=x_fern_language,
     )
+
+
+async def get_current_org_for_email_forwarding(
+    current_org: Organization = Depends(get_current_org_for_credential_routes),
+) -> Organization:
+    return current_org
 
 
 async def get_current_org_with_api_token(
@@ -631,6 +684,8 @@ async def resolve_org_from_api_key(
     token_types: Sequence[OrganizationAuthTokenType] = (OrganizationAuthTokenType.api,),
     user_agent: str | None = None,
     fern_language: str | None = None,
+    *,
+    allow_scoped_key: bool = False,
 ) -> ApiKeyValidationResult:
     """Decode and validate the API key against the database."""
     try:
@@ -710,6 +765,12 @@ async def resolve_org_from_api_key(
         )
 
     if api_key_db_obj.token_type == OrganizationAuthTokenType.api:
+        if not allow_scoped_key:
+            profile = await resolve_api_key_profile_identity(organization.organization_id, api_key_db_obj.id)
+            if profile.access_mode == "scoped":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Scoped API keys are not supported here"
+                )
         _schedule_api_key_validated_hook(
             organization.organization_id,
             api_key_db_obj,
@@ -764,6 +825,7 @@ async def _get_current_org_cached(
             db,
             user_agent=user_agent,
             fern_language=fern_language,
+            allow_scoped_key=True,
         )
         api_key_profile = await resolve_api_key_profile_identity(
             validation.organization.organization_id, validation.token.id
@@ -771,8 +833,7 @@ async def _get_current_org_cached(
         cached_auth = _CachedOrganizationAuth(
             validation.organization,
             validation.token.id,
-            api_key_profile[0],
-            api_key_profile[1],
+            api_key_profile,
         )
 
         if invalidation_generation == _current_org_cache_invalidation_generation:
@@ -816,12 +877,12 @@ async def get_current_org_cached(
             user_agent=user_agent,
             fern_language=fern_language,
         )
-        api_key_profile = (cached_auth.access_mode, cached_auth.bound_user_id, True)
-        if cached_auth.access_mode == "member":
+        api_key_profile = cached_auth.api_key_profile
+        if cached_auth.api_key_profile.access_mode == "member":
             current_profile = await resolve_api_key_profile_identity(
                 cached_auth.organization.organization_id, cached_auth.token_id
             )
-            if current_profile != api_key_profile:
+            if current_profile != cached_auth.api_key_profile:
                 raise HTTPException(status_code=401, detail="Invalid credentials")
         organization = cached_auth.organization
         token_id = cached_auth.token_id

@@ -14,11 +14,13 @@ from structlog.testing import capture_logs
 from websockets.exceptions import ConnectionClosedError
 
 from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.routes.streaming import run_stream_outcome, screenshot, verify
 from skyvern.forge.sdk.routes.streaming import vnc as vnc_route
 from skyvern.forge.sdk.routes.streaming.channels import vnc as vnc_channels
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -56,6 +58,10 @@ class _DisconnectedWebSocket:
         raise AssertionError("unreachable")
 
 
+async def _yield_instead_of_sleeping(_delay: float) -> None:
+    await asyncio.sleep(0)
+
+
 @pytest.mark.asyncio
 async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
     monkeypatch: pytest.MonkeyPatch,
@@ -73,6 +79,7 @@ async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
     )
 
     monkeypatch.setattr(screenshot.settings, "BROWSER_STREAMING_MODE", "vnc")
+    monkeypatch.setattr(screenshot, "asyncio", ScopedAsyncio(sleep=_yield_instead_of_sleeping))
     monkeypatch.setattr(screenshot, "get_current_org", AsyncMock(return_value=SimpleNamespace(organization_id="o_1")))
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_streaming_file=AsyncMock(return_value=b"jpeg")))
@@ -490,9 +497,20 @@ async def test_session_screencast_counts_a_run_only_while_it_holds_the_session(
 class _DisplayServer:
     """A session's VNC upstream: it sends the RFB handshake, then closes if the scenario says so."""
 
-    def __init__(self, before_close: Callable[[], Awaitable[None]] | None) -> None:
+    def __init__(
+        self,
+        before_close: Callable[[], Awaitable[None]] | None,
+        *,
+        frame_after_before_close: bool = False,
+        frame_count_after_before_close: int = 0,
+    ) -> None:
         self._before_close = before_close
         self._handshake_sent = False
+        self._before_close_complete = False
+        self._frame_after_before_close = frame_after_before_close
+        self._followup_frame_sent = False
+        self._frames_remaining = frame_count_after_before_close
+        self.sent_data: list[bytes] = []
 
     async def __aenter__(self) -> _DisplayServer:
         return self
@@ -501,7 +519,7 @@ class _DisplayServer:
         return None
 
     async def send(self, data: bytes) -> None:
-        return None
+        self.sent_data.append(data)
 
     async def recv(self) -> bytes:
         if not self._handshake_sent:
@@ -509,33 +527,59 @@ class _DisplayServer:
             return b"RFB 003.008\n"
         if self._before_close is None:
             await asyncio.Event().wait()
-        else:
+        elif not self._before_close_complete:
+            self._before_close_complete = True
             await self._before_close()
+            if self._frame_after_before_close and not self._followup_frame_sent:
+                self._followup_frame_sent = True
+                return b"restricted-run-frame"
+        if self._frames_remaining:
+            self._frames_remaining -= 1
+            return b"ordinary-frame"
         raise ConnectionClosedError(None, None)
 
 
 class _VncViewer:
-    def __init__(self, *, leaves: bool) -> None:
+    def __init__(
+        self,
+        *,
+        leaves: bool,
+        client_message: bytes | None = None,
+        client_message_ready: asyncio.Event | None = None,
+    ) -> None:
         self.client_state = WebSocketState.CONNECTED
         self._leaves = leaves
+        self._client_message = client_message
+        self._client_message_ready = client_message_ready
+        self._client_message_sent = False
         self._framed = asyncio.Event()
         self._closed = asyncio.Event()
+        self.close_codes: list[int] = []
+        self.sent_data: list[bytes] = []
 
     async def receive_bytes(self) -> bytes:
+        if self._client_message is not None and not self._client_message_sent:
+            await self._framed.wait()
+            if self._client_message_ready is not None:
+                await self._client_message_ready.wait()
+            self._client_message_sent = True
+            return self._client_message
         await (self._framed if self._leaves else self._closed).wait()
         self.client_state = WebSocketState.DISCONNECTED
         raise WebSocketDisconnect(1001)
 
     async def send_bytes(self, data: bytes) -> None:
+        self.sent_data.append(data)
         self._framed.set()
 
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
+        self.close_codes.append(code)
         self.client_state = WebSocketState.DISCONNECTED
         self._closed.set()
 
 
 @pytest.fixture
-def watch_over_vnc(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[None]]:
+def watch_over_vnc(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[_VncViewer]]:
     """Watch a session over the VNC route until the viewer leaves, or `before_close` runs and the display server
     closes (or fails, when it raises)."""
     monkeypatch.setattr(vnc_route, "auth", AsyncMock(return_value="o_1"))
@@ -550,26 +594,40 @@ def watch_over_vnc(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[N
         session_id: str,
         *,
         before_close: Callable[[], Awaitable[None]] | None = None,
+        frame_after_before_close: bool = False,
+        frame_count_after_before_close: int = 0,
         viewer_leaves: bool = False,
-    ) -> None:
-        display_server = _DisplayServer(before_close)
+        client_message: bytes | None = None,
+        client_message_ready: asyncio.Event | None = None,
+    ) -> _VncViewer:
+        display_server = _DisplayServer(
+            before_close,
+            frame_after_before_close=frame_after_before_close,
+            frame_count_after_before_close=frame_count_after_before_close,
+        )
         monkeypatch.setattr(vnc_channels.websockets, "connect", lambda url, **_: display_server)
+        viewer = _VncViewer(
+            leaves=viewer_leaves,
+            client_message=client_message,
+            client_message_ready=client_message_ready,
+        )
         await asyncio.wait_for(
             vnc_route.browser_session_stream(
-                websocket=cast(WebSocket, _VncViewer(leaves=viewer_leaves)),
+                websocket=cast(WebSocket, viewer),
                 browser_session_id=session_id,
                 apikey="key",
                 client_id=f"client_{session_id}",
             ),
             timeout=10,
         )
+        return viewer
 
     return _watch
 
 
 @pytest.mark.asyncio
 async def test_vnc_counts_a_run_whose_session_died_under_it_but_not_a_viewer_leaving_or_a_relay_hiccup(
-    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[None]]
+    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[_VncViewer]]
 ) -> None:
     sessions = _Sessions(
         pbs_left="wr_left", pbs_hiccup="wr_hiccup", pbs_broken="wr_broken", pbs_debug=None, pbs_idle=None
@@ -613,8 +671,76 @@ async def test_vnc_counts_a_run_whose_session_died_under_it_but_not_a_viewer_lea
 
 
 @pytest.mark.asyncio
+async def test_oss_agent_function_allows_browser_session_stream() -> None:
+    agent_functions = AgentFunction()
+    assert await agent_functions.authorize_browser_session_stream(None, "o_1", "pbs_1") is True
+    assert await agent_functions.reauthorize_browser_session_stream(None, "o_1", "pbs_1") is True
+    assert await agent_functions.browser_session_stream_reauthorization_required(None, "o_1") is False
+
+
+@pytest.mark.asyncio
+async def test_browser_session_vnc_stream_checks_cloud_authorization_before_opening_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    principal = RequestPrincipal(organization_id="o_1", auth_kind=AuthKind.bearer, user_id="user_1")
+    websocket = SimpleNamespace(close=AsyncMock())
+    auth = AsyncMock(return_value="o_1")
+    authorize = AsyncMock(return_value=False)
+    channel = AsyncMock(return_value=None)
+
+    async def deny_resolved_session(**kwargs: object) -> None:
+        authorize_stream = kwargs["authorize_stream"]
+        assert callable(authorize_stream)
+        assert await authorize_stream("pbs_1") is False  # type: ignore[operator]
+
+    channel.side_effect = deny_resolved_session
+    monkeypatch.setattr(vnc_route, "auth", auth)
+    monkeypatch.setattr(vnc_route, "get_request_principal", lambda: principal)
+    monkeypatch.setattr(vnc_route, "get_vnc_channel_for_browser_session", channel)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(authorize_browser_session_stream=authorize))
+
+    await vnc_route.browser_session_stream(
+        websocket=cast(WebSocket, websocket), browser_session_id="pbs_1", client_id="client_1"
+    )
+
+    auth_call = auth.await_args
+    assert auth_call is not None
+    assert auth_call.kwargs["folder_action"] == "workflow_run.execute"
+    authorize.assert_awaited_once_with(principal, "o_1", "pbs_1")
+    websocket.close.assert_awaited_once_with(code=4403)
+    channel.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("resource", "channel_name"),
+    [("task_id", "task"), ("workflow_run_id", "workflow_run")],
+)
+@pytest.mark.asyncio
+async def test_task_and_workflow_run_vnc_streams_keep_execute_auth_without_browser_connect_hook(
+    monkeypatch: pytest.MonkeyPatch, resource: str, channel_name: str
+) -> None:
+    websocket = SimpleNamespace(close=AsyncMock())
+    auth = AsyncMock(return_value="o_1")
+    authorize = AsyncMock(return_value=False)
+    channel = AsyncMock(return_value=None)
+    resource_id = f"{resource}_1"
+    monkeypatch.setattr(vnc_route, "auth", auth)
+    monkeypatch.setattr(vnc_route, f"get_vnc_channel_for_{channel_name}", channel)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(authorize_browser_session_stream=authorize))
+
+    await vnc_route.stream(websocket, client_id="client_1", **{resource: resource_id})
+
+    auth_call = auth.await_args
+    assert auth_call is not None
+    assert auth_call.kwargs["folder_action"] == "workflow_run.execute"
+    assert auth_call.kwargs["folder_resource"][resource] == resource_id
+    authorize.assert_not_awaited()
+    websocket.close.assert_awaited_once_with(code=1013)
+
+
+@pytest.mark.asyncio
 async def test_vnc_attributes_the_stream_ending_to_the_run_holding_the_session_since_the_last_poll(
-    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[None]]
+    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[_VncViewer]]
 ) -> None:
     sessions = _Sessions(pbs_handoff="wr_first", pbs_idle=None)
     running = WorkflowRunStatus.running
@@ -652,8 +778,379 @@ async def test_vnc_attributes_the_stream_ending_to_the_run_holding_the_session_s
 
 
 @pytest.mark.asyncio
+async def test_vnc_reauthorizes_and_closes_when_an_idle_session_is_assigned_to_a_restricted_run(
+    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[_VncViewer]]
+) -> None:
+    sessions = _Sessions(pbs_idle=None)
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", sessions)
+    monkeypatch.setattr(app, "DATABASE", _run_statuses(wr_restricted=WorkflowRunStatus.running))
+
+    denied = asyncio.Event()
+    authorization_calls = 0
+
+    async def authorize(*_args: object) -> bool:
+        nonlocal authorization_calls
+        authorization_calls += 1
+        if sessions.rows["pbs_idle"].runnable_id == "wr_restricted":
+            denied.set()
+            return False
+        return True
+
+    authorize_mock = AsyncMock(side_effect=authorize)
+    reauthorize_mock = AsyncMock(side_effect=authorize)
+
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            authorize_browser_session_stream=authorize_mock,
+            reauthorize_browser_session_stream=reauthorize_mock,
+            browser_session_stream_reauthorization_required=AsyncMock(return_value=True),
+        ),
+    )
+
+    async def run_takes_the_idle_session() -> None:
+        sessions.occupy("pbs_idle", "wr_restricted")
+        await denied.wait()
+
+    viewer = await watch_over_vnc("pbs_idle", before_close=run_takes_the_idle_session, frame_after_before_close=True)
+
+    assert authorization_calls >= 2
+    assert 4403 in viewer.close_codes
+    assert b"restricted-run-frame" not in viewer.sent_data
+
+
+@pytest.mark.asyncio
+async def test_vnc_holds_relay_during_state_change_authorization_then_closes_on_denial() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def authorize(_session_id: str) -> bool:
+        entered.set()
+        await release.wait()
+        return False
+
+    channel, close = _vnc_authorization_channel(authorize)
+    assert channel.browser_session is not None
+    channel.browser_session.runnable_id = "wr_restricted"
+    relays = [asyncio.create_task(channel.authorize_stream_relay()) for _ in range(2)]
+    await entered.wait()
+    assert not any(relay.done() for relay in relays)
+    release.set()
+    frames = [b"restricted-run-frame" for allowed in await asyncio.gather(*relays) if allowed]
+
+    assert frames == []
+    close.assert_awaited_once_with(code=4403, reason="browser-session-access-denied")
+
+
+@pytest.mark.asyncio
+async def test_vnc_close_cancels_in_flight_authorization() -> None:
+    channel, _ = _vnc_authorization_channel(None)
+    channel.client_id = "client_close_auth"
+    channel.websocket = SimpleNamespace(close=AsyncMock())
+    channel._stream_authorization_task = asyncio.create_task(asyncio.Event().wait())
+
+    await vnc_channels.VncChannel.close(channel, code=4403, reason="authorization-denied")
+
+    assert channel._stream_authorization_task.cancelled()
+    channel.websocket.close.assert_awaited_once_with(code=4403, reason="authorization-denied")
+
+
+@pytest.mark.asyncio
+async def test_vnc_frames_reuse_connect_authorization_without_repeated_database_checks(
+    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[_VncViewer]]
+) -> None:
+    sessions = _Sessions(pbs_idle=None)
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", sessions)
+    authorize = AsyncMock(return_value=True)
+    reauthorize = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            authorize_browser_session_stream=authorize,
+            reauthorize_browser_session_stream=reauthorize,
+            browser_session_stream_reauthorization_required=AsyncMock(return_value=True),
+        ),
+    )
+
+    async def keep_open() -> None:
+        return None
+
+    viewer = await watch_over_vnc("pbs_idle", before_close=keep_open, frame_count_after_before_close=20)
+
+    # The resolved session is authorized once at connect; streamed frames do no DB-backed checks.
+    assert authorize.await_count == 1
+    reauthorize.assert_not_awaited()
+    assert len(viewer.sent_data) == 21
+
+
+@pytest.mark.asyncio
+async def test_vnc_frames_keep_the_oss_no_reauthorization_behavior(
+    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[_VncViewer]]
+) -> None:
+    sessions = _Sessions(pbs_idle=None)
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", sessions)
+    authorize = AsyncMock(return_value=True)
+    reauthorize = AsyncMock(return_value=True)
+    should_reauthorize = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        app,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            authorize_browser_session_stream=authorize,
+            reauthorize_browser_session_stream=reauthorize,
+            browser_session_stream_reauthorization_required=should_reauthorize,
+        ),
+    )
+
+    async def keep_open() -> None:
+        return None
+
+    viewer = await watch_over_vnc("pbs_idle", before_close=keep_open, frame_count_after_before_close=20)
+
+    assert authorize.await_count == 1
+    reauthorize.assert_not_awaited()
+    assert should_reauthorize.await_count == 1
+    assert len(viewer.sent_data) == 21
+
+
+def _vnc_authorization_channel(
+    authorize: Callable[[str], Awaitable[bool]] | None, *, now: float = 0.0
+) -> tuple[vnc_channels.VncChannel, AsyncMock]:
+    channel = object.__new__(vnc_channels.VncChannel)
+    channel.stream_authorizer = authorize
+    channel.stream_authorization_probe = None
+    channel.stream_authorization_reauthorizer = None
+    channel.browser_session = SimpleNamespace(
+        persistent_browser_session_id="pbs_auth",
+        runnable_type=None,
+        runnable_id=None,
+        runnable_generation_id=None,
+    )
+    channel.organization_id = "org_auth"
+    channel._stream_authorized_state = channel._authorization_state(channel.browser_session)
+    channel._stream_authorized_at = now
+    channel._stream_authorization_failed_at = None
+    channel._stream_authorization_attempted_state = channel._stream_authorized_state
+    channel._stream_authorization_attempted_at = now
+    channel._stream_authorization_task = None
+    channel._stream_authorization_lock = asyncio.Lock()
+    close = AsyncMock()
+    object.__setattr__(channel, "close", close)
+    return channel, close
+
+
+@pytest.mark.asyncio
+async def test_vnc_rechecks_when_rbac_becomes_enforced_midstream() -> None:
+    channel, close = _vnc_authorization_channel(None)
+    channel.stream_authorization_probe = AsyncMock(side_effect=[False, True])
+    channel.stream_authorization_reauthorizer = AsyncMock(return_value=False)
+
+    assert await channel.check_stream_authorization() is True
+    close.assert_not_awaited()
+    assert await channel.check_stream_authorization() is False
+    channel.stream_authorization_reauthorizer.assert_awaited_once_with("pbs_auth")
+    close.assert_awaited_once_with(code=4403, reason="browser-session-access-denied")
+
+
+@pytest.mark.asyncio
+async def test_vnc_authorizes_a_relay_after_grace_was_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vnc_channels, "time", SimpleNamespace(monotonic=lambda: 16.0))
+    authorize = AsyncMock(return_value=True)
+    channel, close = _vnc_authorization_channel(authorize)
+
+    assert await channel.authorize_stream_relay() is True
+    task = channel._stream_authorization_task
+    assert task is not None and await task is True
+    authorize.assert_awaited_once_with("pbs_auth")
+    close.assert_not_awaited()
+
+
+@pytest.mark.parametrize("kind", ["task", "workflow_run"])
+@pytest.mark.asyncio
+async def test_idle_run_vnc_verification_reauthorizes_on_poll(monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    entity = SimpleNamespace(task_id="tsk_1", workflow_run_id="wr_1")
+    session = SimpleNamespace(persistent_browser_session_id="pbs_1")
+    observed: list[object] = []
+    channel = SimpleNamespace(
+        task=entity if kind == "task" else None,
+        workflow_run=entity if kind == "workflow_run" else None,
+        browser_session=None,
+        organization_id="org_1",
+        is_open=True,
+        live_stream=SimpleNamespace(observe_session=observed.append),
+        check_stream_authorization=AsyncMock(),
+    )
+
+    async def stop_after_poll(_seconds: float) -> None:
+        channel.is_open = False
+
+    monkeypatch.setattr(verify, "asyncio", SimpleNamespace(sleep=stop_after_poll))
+    monkeypatch.setattr(verify, f"verify_{kind}", AsyncMock(return_value=(entity, session)))
+
+    await getattr(verify, f"loop_verify_{kind}")(
+        channel,
+        on_session=lambda current: vnc_channels.VncChannel.on_session_verified(
+            cast(vnc_channels.VncChannel, channel), current
+        ),
+    )
+
+    channel.check_stream_authorization.assert_awaited_once()
+    assert observed == [session]
+
+
+@pytest.mark.asyncio
+async def test_vnc_relays_share_one_nonblocking_authorization_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def authorize(_session_id: str) -> bool:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return True
+
+    channel, channel_close = _vnc_authorization_channel(authorize)
+    monkeypatch.setattr(vnc_channels, "time", SimpleNamespace(monotonic=lambda: 6.0))
+
+    assert await channel.authorize_stream_relay() is True  # frontend-to-browser keeps the last good decision
+    assert await channel.authorize_stream_relay() is True  # browser-to-frontend shares the same pass
+    await entered.wait()
+    await asyncio.wait_for(channel._stream_authorization_lock.acquire(), timeout=0.1)
+    channel._stream_authorization_lock.release()
+    poll = asyncio.create_task(channel.authorize_stream_relay(wait_for_pass=True))
+    await asyncio.sleep(0)
+    assert not poll.done()
+    assert calls == 1
+    release.set()
+
+    assert await poll is True
+    assert calls == 1
+    channel_close.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("sustained", "permission_denied"),
+    [(False, False), (True, False), (False, True)],
+    ids=["transient", "sustained", "denied"],
+)
+@pytest.mark.asyncio
+async def test_vnc_denies_permission_errors_and_retries_transient_errors_within_grace(
+    monkeypatch: pytest.MonkeyPatch, sustained: bool, permission_denied: bool
+) -> None:
+    now = 100.0
+    calls = 0
+
+    async def authorize(_session_id: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if permission_denied:
+            raise PermissionError("credential not accessible")
+        if sustained or calls == 1:
+            raise RuntimeError("temporary lookup failure")
+        return True
+
+    channel, channel_close = _vnc_authorization_channel(authorize, now=100.0)
+    monkeypatch.setattr(vnc_channels, "time", SimpleNamespace(monotonic=lambda: now))
+
+    async def recheck(at: float) -> bool:
+        nonlocal now
+        now = at
+        assert await channel.authorize_stream_relay() is True
+        task = channel._stream_authorization_task
+        assert task is not None
+        return await task
+
+    assert await recheck(105.0) is not permission_denied
+    if permission_denied:
+        channel_close.assert_awaited_once_with(code=4403, reason="browser-session-access-denied")
+        assert calls == 1
+        return
+    channel_close.assert_not_awaited()
+    if sustained:
+        assert await recheck(110.0) is True
+        assert await recheck(115.0) is True
+        assert await recheck(120.0) is False
+        channel_close.assert_awaited_once_with(code=4403, reason="browser-session-access-denied")
+        assert calls == 4
+    else:
+        assert await recheck(110.0) is True
+        channel_close.assert_not_awaited()
+        assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("resource", "channel_name"),
+    [("task_id", "task"), ("workflow_run_id", "workflow_run")],
+)
+@pytest.mark.asyncio
+async def test_run_based_vnc_stream_authorizes_only_resolved_persistent_sessions(
+    monkeypatch: pytest.MonkeyPatch, resource: str, channel_name: str
+) -> None:
+    principal = RequestPrincipal(organization_id="o_1", auth_kind=AuthKind.bearer, user_id="user_1")
+    websocket = SimpleNamespace(close=AsyncMock())
+    auth = AsyncMock(return_value="o_1")
+    authorize = AsyncMock(return_value=True)
+    session_id = "pbs_1"
+    client_id = f"{resource}_client"
+    resource_id = f"{resource}_1"
+    channel = SimpleNamespace(
+        browser_session=SimpleNamespace(persistent_browser_session_id=session_id),
+        close=AsyncMock(),
+        live_stream=SimpleNamespace(finish=AsyncMock()),
+    )
+
+    async def resolve_persistent_channel(**kwargs: object) -> tuple[SimpleNamespace, list[object]]:
+        authorize_stream = kwargs["authorize_stream"]
+        assert callable(authorize_stream)
+        assert await authorize_stream(session_id) is True  # type: ignore[operator]
+        return channel, []
+
+    monkeypatch.setattr(vnc_route, "auth", auth)
+    monkeypatch.setattr(vnc_route, "get_request_principal", lambda: principal)
+    monkeypatch.setattr(vnc_route, f"get_vnc_channel_for_{channel_name}", resolve_persistent_channel)
+    monkeypatch.setattr(vnc_route, "collect", AsyncMock())
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(authorize_browser_session_stream=authorize))
+
+    await vnc_route.stream(cast(WebSocket, websocket), client_id=client_id, **{resource: resource_id})
+
+    auth_call = auth.await_args
+    assert auth_call is not None
+    assert auth_call.kwargs["folder_action"] == "workflow_run.execute"
+    assert auth_call.kwargs["folder_resource"][resource] == resource_id
+    authorize.assert_awaited_once_with(principal, "o_1", session_id)
+    channel.close.assert_awaited_once_with(reason="vnc-closed")
+
+
+@pytest.mark.asyncio
+async def test_vnc_connect_authorization_lookup_error_closes_retryably(monkeypatch: pytest.MonkeyPatch) -> None:
+    principal = RequestPrincipal(organization_id="o_1", auth_kind=AuthKind.bearer, user_id="user_1")
+    websocket = SimpleNamespace(close=AsyncMock())
+    authorize = AsyncMock(side_effect=RuntimeError("authorization lookup failed"))
+
+    async def resolve_channel(**kwargs: object) -> None:
+        authorize_stream = kwargs["authorize_stream"]
+        assert callable(authorize_stream)
+        assert await authorize_stream("pbs_1") is False  # type: ignore[operator]
+        return None
+
+    monkeypatch.setattr(vnc_route, "auth", AsyncMock(return_value="o_1"))
+    monkeypatch.setattr(vnc_route, "get_request_principal", lambda: principal)
+    monkeypatch.setattr(vnc_route, "get_vnc_channel_for_browser_session", resolve_channel)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(authorize_browser_session_stream=authorize))
+
+    await vnc_route.stream(cast(WebSocket, websocket), browser_session_id="pbs_1", client_id="client_lookup_failure")
+
+    authorize.assert_awaited_once_with(principal, "o_1", "pbs_1")
+    websocket.close.assert_awaited_once_with(code=1013, reason="authorization-temporarily-unavailable")
+
+
+@pytest.mark.asyncio
 async def test_vnc_keeps_a_session_death_it_saw_when_the_closing_session_read_fails(
-    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[None]]
+    monkeypatch: pytest.MonkeyPatch, watch_over_vnc: Callable[..., Awaitable[_VncViewer]]
 ) -> None:
     sessions = _Sessions(pbs_died="wr_died")
     monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", sessions)

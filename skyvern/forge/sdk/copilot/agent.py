@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -165,6 +165,7 @@ from skyvern.forge.sdk.copilot.model_telemetry import (
     CopilotModelStopMetadata,
     model_attempt_telemetry_scope,
 )
+from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     record_criteria_lifecycle,
@@ -234,6 +235,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     BrowserProbeOutcome,
     _browser_context_attachability,
+    cancel_ledgered_build_test_prestarts,
     close_browser_session_quietly,
     end_minted_browser_renewals,
     record_attached_browser_driver,
@@ -259,6 +261,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_workflow_draft,
     flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
+    maybe_emit_design_start,
 )
 from skyvern.forge.sdk.copilot.tools import reply_ends_turn
 from skyvern.forge.sdk.copilot.tools._shared import _copilot_seconds_remaining
@@ -286,12 +289,16 @@ from skyvern.forge.sdk.copilot.tools.scouting import (
     read_page_state_on_page,
 )
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+    CopilotCanonicalWorkflowUnavailableError,
     _candidate_proposal_data,
     display_block_label,
     display_labels_changed_between,
     publish_workflow_candidate,
+    record_canonical_workflow_unavailable,
     record_edited_block_labels,
     restore_pending_workflow_proposal,
+    saved_workflow_canvas,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import (
@@ -334,6 +341,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     runner_code_block_associations,
     stored_block_code,
     stored_workflow_yaml,
+    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
@@ -584,7 +592,7 @@ async def _resolve_live_browser_session_id(
 
 
 def _historical_turn_facts_projection(
-    narrative_payload: TurnNarrativePayload | None,
+    narrative_payload: Mapping[str, Any] | None,
 ) -> HistoricalTurnFactsProjection | None:
     if not isinstance(narrative_payload, dict):
         return None
@@ -1910,13 +1918,16 @@ def _draft_ran_on_current_source(facts: NarrativeTurnFacts) -> bool:
     return facts["runCompleted"] is not False and facts["evaluationState"] != "not_demonstrated"
 
 
-def _review_projection_for(ctx: CopilotContext, proposal_yaml: str | None) -> NarrativeReviewProjection | None:
+def _review_projection_for(
+    ctx: CopilotContext, proposal_yaml: str | None, candidate: Workflow | None = None
+) -> NarrativeReviewProjection | None:
     if not isinstance(proposal_yaml, str):
         return None
     review = build_review_projection(
-        ctx.persisted_workflow_yaml or _EMPTY_REVIEW_BASELINE_YAML,
+        saved_workflow_canvas(ctx) or _EMPTY_REVIEW_BASELINE_YAML,
         proposal_yaml,
         ctx.executed_block_fingerprints,
+        workflow_to_copilot_yaml(candidate) if isinstance(candidate, Workflow) else None,
     )
     if review is None:
         return None
@@ -2103,6 +2114,18 @@ def _make_agent_result(
             proposal_disposition=kwargs.get("proposal_disposition"),
         )
         kwargs.update(updated_workflow=None, workflow_yaml=None, proposal_disposition="no_proposal")
+    if ctx is not None and ctx.canonical_workflow_unavailable is not None:
+        # No active agent remains to receive a proposal, so Accept and auto-accept would both act on a missing row,
+        # and a stored one is retired even when the client asked to keep its pending proposal.
+        kwargs.update(
+            updated_workflow=None,
+            workflow_yaml=None,
+            staged_workflow=None,
+            staged_workflow_yaml=None,
+            has_staged_proposal=False,
+            proposal_disposition="no_proposal",
+            clear_proposed_workflow=True,
+        )
     proposal_yaml = kwargs.get("workflow_yaml")
     if isinstance(proposal_yaml, str):
         proposal_yaml = derive_code_block_steps_in_yaml(proposal_yaml)
@@ -2114,7 +2137,7 @@ def _make_agent_result(
     if ctx is not None and narrative_payload is None:
         raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     if ctx is not None and isinstance(narrative_payload, dict) and isinstance(proposal_yaml, str):
-        review = _review_projection_for(ctx, proposal_yaml)
+        review = _review_projection_for(ctx, proposal_yaml, kwargs.get("updated_workflow"))
         narrative_payload = {key: value for key, value in narrative_payload.items() if key != "review"}
         if review is not None:
             narrative_payload["review"] = review
@@ -2228,6 +2251,12 @@ def _make_agent_result(
                 payload_updates["googleConnectionNotices"] = notice_payloads
         if ctx is not None and ctx.demonstration_offered and "demonstrationOffer" not in narrative_payload:
             payload_updates["demonstrationOffer"] = True
+        if (
+            ctx is not None
+            and "canonicalWorkflowUnavailable" not in narrative_payload
+            and ctx.canonical_workflow_unavailable is not None
+        ):
+            payload_updates["canonicalWorkflowUnavailable"] = ctx.canonical_workflow_unavailable
         if payload_updates or len(payload_base) != len(narrative_payload):
             kwargs["narrative_payload"] = {**payload_base, **payload_updates}
     if turn_facts is not None:
@@ -2341,6 +2370,8 @@ def _build_narrative_payload(
             "startedAt": attempt["startedAt"],
             "endedAt": attempt["endedAt"],
         }
+        if workflow_run_id := attempt["workflowRunId"]:
+            block_entry["workflowRunId"] = workflow_run_id
         if "outcome" in attempt:
             block_entry["outcome"] = attempt["outcome"]
         if "outcomeRole" in attempt:
@@ -2394,10 +2425,12 @@ def _build_narrative_payload(
         payload["googleConnectionNotices"] = notice_payloads
     if ctx.demonstration_offered:
         payload["demonstrationOffer"] = True
+    if ctx.canonical_workflow_unavailable is not None:
+        payload["canonicalWorkflowUnavailable"] = ctx.canonical_workflow_unavailable
     if ctx.demonstration_items:
         payload["demonstrationItems"] = list(ctx.demonstration_items)
     if ctx.staged_workflow_yaml is not None:
-        review = _review_projection_for(ctx, ctx.staged_workflow_yaml)
+        review = _review_projection_for(ctx, ctx.staged_workflow_yaml, ctx.staged_workflow)
         if review is not None:
             payload["review"] = review
     payload["testedBlockFingerprints"] = serialize_execution_receipts(ctx.executed_block_fingerprints)
@@ -2516,6 +2549,13 @@ async def _run_end_to_end_test_turn(
     workflow_yaml: str,
 ) -> list[dict[str, str]]:
     started_at = datetime.now(UTC)
+    # The run streams block progress only when the turn has a narrator; the model's stream has not created one yet.
+    ctx.narrator_state = ctx.narrator_state or NarratorState()
+    try:
+        if not await ctx.stream.is_disconnected():
+            await maybe_emit_design_start(ctx.stream, ctx)
+    except Exception as emit_err:  # noqa: BLE001 - narrative emission is best-effort; the run still starts.
+        LOG.warning("copilot_test_end_to_end_design_start_emit_failed", error=str(emit_err))
     try:
         result = await run_workflow_end_to_end(ctx, workflow_yaml, seed_like_normal_run=True)
     except Exception as exc:
@@ -2600,6 +2640,9 @@ async def _run_end_to_end_test_turn(
         "data": handoff_data,
         "turn_seconds_remaining": TOTAL_TIMEOUT_SECONDS if seconds_remaining is None else seconds_remaining,
     }
+    unavailable = sanitized.get("canonical_workflow_unavailable")
+    if isinstance(unavailable, dict):
+        handoff_result["canonical_workflow_unavailable"] = unavailable
     if (control_kind in watchdog_control_kinds or refused_before_run) and isinstance(sanitized.get("error"), str):
         handoff_result["error"] = sanitized["error"]
     arguments = json.dumps(
@@ -4052,6 +4095,7 @@ async def _translate_to_agent_result(
         async with ctx.proposal_mutation_lock:
             publication_conflict: CopilotProposalConflictError | None = None
             prior_draft_yaml = ctx.last_workflow_yaml or ctx.workflow_yaml
+            canonical_unavailable: CopilotCanonicalWorkflowUnavailableError | None = None
             if last_workflow is not None and last_workflow_yaml is not None:
                 try:
                     last_workflow_yaml = await publish_workflow_candidate(
@@ -4059,6 +4103,8 @@ async def _translate_to_agent_result(
                     )
                 except CopilotProposalConflictError as conflict:
                     publication_conflict = conflict
+                except CopilotCanonicalWorkflowUnavailableError as unavailable:
+                    canonical_unavailable = unavailable
             if publication_conflict is not None:
                 # Nothing was stored, so the prior candidate stays on ctx and the reply says so
                 # rather than presenting a draft the next turn cannot find.
@@ -4073,6 +4119,12 @@ async def _translate_to_agent_result(
                     "The pending proposal changed while this draft was being saved, so it was not stored. "
                     "Ask me to make the change again.",
                 )
+                resp_type = "REPLY"
+                last_workflow = ctx.last_workflow
+                last_workflow_yaml = ctx.last_workflow_yaml
+            elif canonical_unavailable is not None:
+                record_canonical_workflow_unavailable(ctx, canonical_unavailable, refused="publication")
+                user_response = _with_inline_reject_note(user_response, CANONICAL_WORKFLOW_UNAVAILABLE_ERROR)
                 resp_type = "REPLY"
                 last_workflow = ctx.last_workflow
                 last_workflow_yaml = ctx.last_workflow_yaml
@@ -4134,6 +4186,7 @@ async def _translate_to_agent_result(
         and resp_type != "ASK_QUESTION"
         and not salvaged_reply
         and not direct_test_handoff
+        and ctx.canonical_workflow_unavailable is None
     ):
         user_response = _rewrite_failed_test_response(str(user_response), ctx)
     user_response = str(user_response).lstrip() or "Done."
@@ -4157,6 +4210,8 @@ async def _translate_to_agent_result(
         last_workflow = ctx.last_workflow
         last_workflow_yaml = ctx.last_workflow_yaml
         unvalidated = True
+    if ctx.canonical_workflow_unavailable is not None:
+        last_workflow, last_workflow_yaml, unvalidated = None, None, False
 
     structured = adopt_model_authored_context(global_llm_context, action_data.get("global_llm_context"))
     structured.merge_turn_summary(ctx.tool_activity)
@@ -5192,6 +5247,7 @@ async def run_copilot_agent(
         Callable[[dict[str, CopilotVideoEvidenceArtifact]], Awaitable[None]] | None
     ) = None,
     persisted_workflow_yaml: str | None = None,
+    saved_workflow: Workflow | None = None,
     opening_workflow_title: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
@@ -5247,6 +5303,7 @@ async def run_copilot_agent(
                     persist_too_long_video_file_ids=persist_too_long_video_file_ids,
                     persist_video_evidence_artifacts=persist_video_evidence_artifacts,
                     persisted_workflow_yaml=persisted_workflow_yaml,
+                    saved_workflow=saved_workflow,
                     opening_workflow_title=opening_workflow_title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=eval_capture_case_id,
@@ -5279,6 +5336,7 @@ async def run_copilot_agent(
                         browser_session_id=None,
                         stream=stream,
                         persisted_workflow_yaml=persisted_workflow_yaml,
+                        saved_workflow=saved_workflow,
                         private_workflow_settings=private_workflow_settings or {},
                         opening_workflow_title=opening_workflow_title,
                         executed_block_fingerprints=prior_executed_block_fingerprints or {},
@@ -5295,8 +5353,10 @@ async def run_copilot_agent(
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
                 if turn_end_ctx is not None:
-                    # Synchronous and first, so no later cleanup step that raises or is cancelled can leave a
-                    # minted browser stamped for the life of this process.
+                    # These three run synchronously before any awaited cleanup, so a later step that raises or is
+                    # cancelled cannot leave a pre-start running or a minted browser stamped for this process's life.
+                    turn_end_ctx.prestart_teardown_started = True
+                    cancel_ledgered_build_test_prestarts(turn_end_ctx)
                     end_minted_browser_renewals(turn_end_ctx)
                 _log_authoring_turn_summary(turn_end_ctx)
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)
@@ -5347,6 +5407,7 @@ async def run_copilot_agent(
                 browser_session_id=None,
                 stream=stream,
                 persisted_workflow_yaml=persisted_workflow_yaml,
+                saved_workflow=saved_workflow,
                 private_workflow_settings=private_workflow_settings or {},
                 opening_workflow_title=opening_workflow_title,
                 executed_block_fingerprints=prior_executed_block_fingerprints or {},
@@ -5390,6 +5451,7 @@ async def _run_copilot_turn_impl(
         Callable[[dict[str, CopilotVideoEvidenceArtifact]], Awaitable[None]] | None
     ) = None,
     persisted_workflow_yaml: str | None = None,
+    saved_workflow: Workflow | None = None,
     opening_workflow_title: str | None = None,
     prior_executed_block_fingerprints: dict[str, set[str]] | None = None,
     eval_capture_case_id: str | None = None,
@@ -5459,6 +5521,7 @@ async def _run_copilot_turn_impl(
         browser_session_id=None,
         stream=stream,
         persisted_workflow_yaml=persisted_workflow_yaml,
+        saved_workflow=saved_workflow,
         private_workflow_settings=private_workflow_settings or {},
         opening_workflow_title=opening_workflow_title,
         api_key=api_key,
@@ -5871,6 +5934,7 @@ async def _run_copilot_turn_impl(
             supports_credential_delete_card=chat_request.supports_credential_delete_card,
             browser_code_available=browser_code_mode != CopilotBrowserCodeMode.OFF
             and copilot_config.authoring_capability.code_blocks,
+            browser_pattern_accepting_calls=app.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls(),
             authoring_capability=copilot_config.authoring_capability,
             run_tools_available=surface_runs_blocks(
                 mode=eval_mode, browser_tools_available=copilot_config.browser_tools_available

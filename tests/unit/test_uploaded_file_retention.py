@@ -17,17 +17,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api import files as files_api
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
-from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.files import UploadedFile
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.schemas.runs import RunEngine
 from skyvern.services import uploaded_file_service
+from tests.unit.shared_route_app import shared_route_app
 
 VICTIM_ORG_ID = "o_victim"
 ATTACKER_ORG_ID = "o_attacker"
@@ -207,10 +206,8 @@ def _make_org(organization_id: str) -> Organization:
     )
 
 
-def _client() -> TestClient:
-    test_app = FastAPI()
-    test_app.include_router(base_router, prefix="/v1")
-    return TestClient(test_app)
+def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return TestClient(shared_route_app(monkeypatch))
 
 
 @pytest.mark.asyncio
@@ -231,7 +228,7 @@ async def test_a_file_past_its_expiry_no_longer_dereferences(
 
 
 class TestDeleteEndpoint:
-    def _request(self, file_id: str, caller_org_id: str, storage: FakeStorage) -> object:
+    def _request(self, client: TestClient, file_id: str, caller_org_id: str, storage: FakeStorage) -> object:
         with (
             patch("skyvern.forge.sdk.routes.agent_protocol.app", MagicMock()),
             patch(
@@ -239,51 +236,71 @@ class TestDeleteEndpoint:
                 new=AsyncMock(return_value=_make_org(caller_org_id)),
             ),
         ):
-            return _client().delete(f"/v1/files/{file_id}", headers={"x-api-key": "key"})
+            return client.delete(f"/v1/files/{file_id}", headers={"x-api-key": "key"})
 
     def test_deletes_the_bytes_at_the_uri_recorded_by_the_server(
-        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        client = _client(monkeypatch)
         file_id = repo.seed(VICTIM_ORG_ID)
 
-        resp = self._request(file_id, VICTIM_ORG_ID, storage)
+        resp = self._request(client, file_id, VICTIM_ORG_ID, storage)
 
         assert resp.status_code == 204  # type: ignore[attr-defined]
         assert storage.deleted == [_uri(VICTIM_ORG_ID)]
         assert repo.live_ids() == set()
 
     def test_another_orgs_file_id_is_a_404_that_deletes_nothing(
-        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The whole authorization boundary: a guessed id from another tenant must be inert."""
+        client = _client(monkeypatch)
         victim_file_id = repo.seed(VICTIM_ORG_ID)
 
-        resp = self._request(victim_file_id, ATTACKER_ORG_ID, storage)
+        resp = self._request(client, victim_file_id, ATTACKER_ORG_ID, storage)
 
         assert resp.status_code == 404  # type: ignore[attr-defined]
         assert storage.deleted == []
         assert repo.live_ids() == {victim_file_id}
 
     def test_a_cross_org_id_is_indistinguishable_from_one_that_never_existed(
-        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Otherwise the endpoint is an oracle for which file ids exist in other orgs."""
+        client = _client(monkeypatch)
         victim_file_id = repo.seed(VICTIM_ORG_ID)
 
-        cross_org = self._request(victim_file_id, ATTACKER_ORG_ID, storage)
+        cross_org = self._request(client, victim_file_id, ATTACKER_ORG_ID, storage)
         repo.rows.clear()
-        never_existed = self._request(victim_file_id, ATTACKER_ORG_ID, storage)
+        never_existed = self._request(client, victim_file_id, ATTACKER_ORG_ID, storage)
 
         assert cross_org.status_code == never_existed.status_code == 404  # type: ignore[attr-defined]
         assert cross_org.json() == never_existed.json()  # type: ignore[attr-defined]
 
     def test_deleting_the_same_file_twice_is_a_404_not_a_second_delete(
-        self, service_app: object, repo: FakeUploadedFilesRepository, storage: FakeStorage
+        self,
+        service_app: object,
+        repo: FakeUploadedFilesRepository,
+        storage: FakeStorage,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        client = _client(monkeypatch)
         file_id = repo.seed(VICTIM_ORG_ID)
 
-        assert self._request(file_id, VICTIM_ORG_ID, storage).status_code == 204  # type: ignore[attr-defined]
-        assert self._request(file_id, VICTIM_ORG_ID, storage).status_code == 404  # type: ignore[attr-defined]
+        assert self._request(client, file_id, VICTIM_ORG_ID, storage).status_code == 204  # type: ignore[attr-defined]
+        assert self._request(client, file_id, VICTIM_ORG_ID, storage).status_code == 404  # type: ignore[attr-defined]
         assert storage.deleted == [_uri(VICTIM_ORG_ID)]
 
 
@@ -315,7 +332,7 @@ class TestRetentionPeriod:
         now = datetime(2026, 8, 15, tzinfo=timezone.utc)
         assert uploaded_file_service.resolve_expires_at(7, now=now) == now + timedelta(days=7)
 
-    def test_upload_rejects_a_bad_retention_before_writing_any_bytes(self) -> None:
+    def test_upload_rejects_a_bad_retention_before_writing_any_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with (
             patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
             patch(
@@ -325,7 +342,7 @@ class TestRetentionPeriod:
         ):
             app_module.SETTINGS_MANAGER.MAX_UPLOAD_FILE_SIZE = settings.MAX_UPLOAD_FILE_SIZE
             app_module.STORAGE.save_legacy_file = AsyncMock()
-            resp = _client().post(
+            resp = _client(monkeypatch).post(
                 "/v1/upload_file",
                 headers={"x-api-key": "key"},
                 files={"file": ("a.csv", io.BytesIO(b"data"), "text/csv")},
@@ -347,7 +364,9 @@ class TestStorageUriUniqueness:
     delete the *second* upload's bytes while its row stayed listed as live.
     """
 
-    def test_two_uploads_of_a_pathlike_filename_get_distinct_storage_keys(self) -> None:
+    def test_two_uploads_of_a_pathlike_filename_get_distinct_storage_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         with (
             patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
             # record_upload lives in uploaded_file_service, which holds its own `app` name
@@ -376,8 +395,10 @@ class TestStorageUriUniqueness:
             app_module.STORAGE.save_legacy_file = AsyncMock(side_effect=fake_save_legacy_file)
             app_module.DATABASE.uploaded_files.create_uploaded_file = AsyncMock(side_effect=fake_create_uploaded_file)
 
+            client = _client(monkeypatch)
+
             def upload() -> object:
-                return _client().post(
+                return client.post(
                     "/v1/upload_file",
                     headers={"x-api-key": "key"},
                     files={"file": ("dir/report.pdf", io.BytesIO(b"%PDF-1.7 data"), "application/pdf")},
@@ -470,7 +491,7 @@ class TestUploadTypeRestrictions:
         ids=lambda value: value if isinstance(value, str) else None,
     )
     def test_upload_type_is_enforced_at_the_upload_route(
-        self, filename: str, content: bytes, expected_status: int
+        self, filename: str, content: bytes, expected_status: int, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         with (
             patch("skyvern.forge.sdk.routes.agent_protocol.app") as app_module,
@@ -491,7 +512,7 @@ class TestUploadTypeRestrictions:
             )
             app_module.DATABASE.uploaded_files.create_uploaded_file = AsyncMock(side_effect=fake_create_uploaded_file)
 
-            resp = _client().post(
+            resp = _client(monkeypatch).post(
                 "/v1/upload_file",
                 headers={"x-api-key": "key"},
                 files={"file": (filename, io.BytesIO(content), "application/octet-stream")},

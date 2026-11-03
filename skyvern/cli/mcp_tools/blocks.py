@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Annotated, Any
 
 import structlog
+from playwright.async_api import Page
 from pydantic import Field, TypeAdapter, ValidationError
 
 from skyvern.schemas.workflows import (
@@ -56,7 +57,7 @@ from skyvern.schemas.workflows import (
     WorkflowTriggerBlockYAML,
 )
 
-from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, make_error, make_result
+from ._common import ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
 
@@ -433,7 +434,18 @@ def _code_block_runtime_topic() -> dict[str, str]:
     """Render the names a CodeBlock may use from the executor's own namespace declaration."""
     # Keep workflow model imports deferred for the lightweight-install import contract.
     from skyvern.forge.sdk.workflow.models.block import CodeBlock  # noqa: PLC0415
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import (  # noqa: PLC0415
+        _LOCATOR_ACTION_MAP,
+        _LOCATOR_FACTORY_METHODS,
+        _PAGE_ACTION_MAP,
+    )
 
+    def on_page(name: str) -> bool:
+        # The secure runner refuses page.set_input_files; only the locator form is supported.
+        return hasattr(Page, name) and name != "set_input_files"
+
+    factories = sorted({"locator", *_LOCATOR_FACTORY_METHODS})
+    locator_actions = sorted(_LOCATOR_ACTION_MAP)
     safe_vars = CodeBlock.build_safe_vars()
     builtin_names = sorted(name for name in safe_vars["__builtins__"] if not name.startswith("__"))
     shims = {name: sorted(vars(value)) for name, value in safe_vars.items() if isinstance(value, SimpleNamespace)}
@@ -448,6 +460,21 @@ def _code_block_runtime_topic() -> dict[str, str]:
         *(f"- {name}: {', '.join(attrs)}" for name, attrs in sorted(shims.items())),
         "",
         "Helpers: page, " + ", ".join(helpers),
+        "",
+        "Page: `page` is a Playwright async Page.",
+        "Locator factories build a selector and make no browser call. On page or a locator: "
+        + ", ".join(name for name in factories if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in factories if not on_page(name)),
+        "`await page.evaluate(js, arg=None)` runs JavaScript in the page and returns a JSON-serializable result; "
+        "one call can read many elements.",
+        "Recorded as timeline actions, each with a screenshot: "
+        + ", ".join([*(f"page.{name}" for name in sorted(_PAGE_ACTION_MAP)), "page.keyboard.press"])
+        + "; on page or a locator: "
+        + ", ".join(name for name in locator_actions if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in locator_actions if not on_page(name)),
+        "Read methods such as inner_text, get_attribute, count, is_visible and wait_for run without a recorded action.",
         "",
         "For a date in a template field use {{current_date}}; inside code use datetime.date.today() "
         "or datetime.datetime.now(datetime.UTC).",
@@ -594,7 +621,8 @@ async def skyvern_workflow_knowledge(
                 "Knowledge topic IDs to retrieve. Omit to list every topic. Common IDs include "
                 "workflow_parameters, parameter_templating, workflow_execution_flow, choosing_a_block, "
                 "common_patterns, best_practices, captcha_solver, proxy_location, and code_block_runtime "
-                "(the builtins, module shims, and helpers a code block's Python may use)."
+                "(the builtins, module shims, helpers, and page object a code block's Python may use, "
+                "including which page calls are recorded as actions)."
             )
         ),
     ] = None,
@@ -788,10 +816,6 @@ async def skyvern_block_validate(
         str,
         Field(description="JSON string of a single block definition to validate"),
     ],
-    code_only: Annotated[
-        bool | None,
-        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
-    ] = None,
 ) -> dict[str, Any]:
     """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
     it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
@@ -832,27 +856,6 @@ async def skyvern_block_validate(
                 "Use a currently available block type from skyvern_block_schema.",
             ),
         )
-
-    if code_only:
-        # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
-        from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
-            collect_code_only_banned_items,
-        )
-
-        banned_items = collect_code_only_banned_items([raw])
-        if banned_items:
-            labels = ", ".join(sorted({label for label, _ in banned_items}))
-            types = ", ".join(sorted({block_type for _, block_type in banned_items}))
-            return make_result(
-                action,
-                ok=False,
-                error=make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
-                    "In code-only mode, use a `code` block for durable browser/page work instead of "
-                    "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
-                ),
-            )
 
     adapter = _get_block_adapter()
     try:

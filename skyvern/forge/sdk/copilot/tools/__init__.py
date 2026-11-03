@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import json
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
@@ -33,6 +34,7 @@ from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM_NAME,
     BrowserTarget,
     resolve_browser_session_binding,
+    tool_accepts_target,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_missing as composition_page_evidence_missing,
@@ -105,6 +107,11 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     credential_delete_enabled,
     delete_saved_credentials,
 )
+from skyvern.forge.sdk.copilot.tools.event_triggers import (
+    create_webhook_trigger_tool,
+    list_workflow_triggers_tool,
+    test_trigger_mapping_tool,
+)
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_SCHEMA as LOCATOR_INSPECTION_TOOL_SCHEMA
@@ -127,7 +134,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     stored_workflow_yaml,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.web_search import MAX_RESULTS_LIMIT
 from skyvern.utils.strings import join_phrases
 from skyvern.utils.yaml_loader import dump_workflow_yaml
@@ -159,6 +166,7 @@ from .blockers import _run_blocks_structured_blocker_message as _run_blocks_stru
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status
 from .browser_code import TOOL_NAME as BROWSER_CODE_TOOL_NAME
 from .browser_code import (
+    render_browser_code_description,
     resolve_executed_browser_code_source,
     run_browser_code_tool,
 )
@@ -239,6 +247,7 @@ from .frontier import _workflow_with_runtime_frontier_anchor as _workflow_with_r
 from .frontier import (
     _workflow_with_runtime_frontier_starter_url_seed as _workflow_with_runtime_frontier_starter_url_seed,
 )
+from .frontier import inputs_only_read_by_deleted_block as inputs_only_read_by_deleted_block
 from .guardrails import (
     _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
     _authority_tool_error,
@@ -477,6 +486,7 @@ async def _persist_block_scoped_edit(
     block_observation_refs: list[BlockObservationRef] | None = None,
     rebuilt_block_labels: list[str] | None = None,
     edited_label: str | None = None,
+    data_extra: Callable[[Workflow], dict[str, list[str]]] | None = None,
 ) -> str:
     """Send a server-composed workflow through the normal persistence path.
 
@@ -507,6 +517,8 @@ async def _persist_block_scoped_edit(
             originating_call_id=originating_call_id,
             block_scoped_authoring_prior_yaml=authoring_prior_yaml,
         )
+        if data_extra is not None and result.get("ok") is True:
+            result["data"] = {**(result.get("data") or {}), **data_extra(result["_workflow"])}
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, result)
         finalize_build_test_result(
@@ -878,14 +890,13 @@ async def add_block_tool(
 
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override="delete_block")
-async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
-    """Remove one block from the workflow by label.
-
-    Deleting is an explicit action: leaving a block out of a workflow you send elsewhere does not
-    remove it. Any block that pointed at this one as its next step is unlinked.
-    """
+async def delete_block_tool(ctx: RunContextWrapper, label: str, remove_parameters: list[str] | None = None) -> str:
+    """Remove one block by label (leaving it out of a workflow sent elsewhere does not delete it), unlinking any
+    block that pointed at it, plus the declared input keys in `remove_parameters` in the same write (an undeclared
+    key is an error). The result's `data.inputs_only_read_by_deleted_block` lists still-declared inputs that only
+    the deleted block read."""
     copilot_ctx = ctx.context
-    arguments = {"label": label}
+    arguments = {"label": label, "remove_parameters": remove_parameters}
     authority_error = _authority_tool_error(copilot_ctx, "delete_block")
     if authority_error:
         result = {"ok": False, "error": authority_error}
@@ -897,8 +908,9 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
         )
         return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
     async with copilot_ctx.block_edit_lock:
+        stored_yaml = _stored_workflow_yaml(copilot_ctx)
         try:
-            workflow_yaml = delete_block_from_workflow(_stored_workflow_yaml(copilot_ctx), label)
+            workflow_yaml = delete_block_from_workflow(stored_yaml, label, remove_parameters=remove_parameters)
         except BlockEditError as exc:
             result = {"ok": False, "error": str(exc)}
             record_tool_step_result_for_ctx(copilot_ctx, "delete_block", arguments, result)
@@ -910,7 +922,14 @@ async def delete_block_tool(ctx: RunContextWrapper, label: str) -> str:
             )
             return json.dumps(sanitize_tool_result_for_llm("delete_block", result))
         return await _persist_block_scoped_edit(
-            copilot_ctx, "delete_block", workflow_yaml, arguments, originating_call_id=_originating_call_id(ctx)
+            copilot_ctx,
+            "delete_block",
+            workflow_yaml,
+            arguments,
+            originating_call_id=_originating_call_id(ctx),
+            data_extra=lambda saved: {
+                "inputs_only_read_by_deleted_block": inputs_only_read_by_deleted_block(label, stored_yaml, saved)
+            },
         )
 
 
@@ -1467,10 +1486,6 @@ async def run_blocks_tool(
     and return compact debug output (status, failure reason, visible elements).
     The workflow must be saved before running blocks.
     Block labels must match labels in the saved workflow.
-    A run that starts at the first block opens a fresh browser loaded with the saved browser
-    profile, if any, that a normal run of the saved workflow would load. A profile that is only
-    staged in a proposal is not loaded until the workflow is saved with it, except the profile the
-    user saved by signing in from the credential card this turn: a draft that selects it loads it now.
 
     If an existing saved block can establish the state you need, run that
     block unchanged before scouting the resulting page.
@@ -2485,6 +2500,9 @@ NATIVE_TOOLS = [
     offer_demonstration_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
+    list_workflow_triggers_tool,
+    test_trigger_mapping_tool,
+    create_webhook_trigger_tool,
     run_blocks_tool,
     test_workflow_from_blank_browser_tool,
     get_run_results_tool,
@@ -2542,8 +2560,7 @@ _PAGE_STATE_TOOL_NAMES = (
 def _with_page_state(tool: FunctionTool) -> FunctionTool:
     """Stamp the page the call's browser shows once the tool returns onto its JSON object result."""
     invoke = tool.on_invoke_tool
-    properties = tool.params_json_schema.get("properties")
-    accepts_target = isinstance(properties, dict) and BROWSER_TARGET_PARAM_NAME in properties
+    accepts_target = tool_accepts_target(tool)
 
     # Annotated ToolContext for the same reason as current_page_inspection_tool: the runner forks a bare
     # context for a RunContextWrapper annotation, and the delegate reads tool_name off it.
@@ -2635,6 +2652,24 @@ def _with_executed_source_param(tool: FunctionTool, *, browser_code_available: b
     return dataclasses.replace(tool, params_json_schema=schema)
 
 
+BUILD_TEST_BROWSER_START = (
+    "A test that starts at the workflow's first block runs in a new browser with no cookies or storage, unless a "
+    "normal run of the saved workflow would load a saved browser profile; then it loads that profile. A profile "
+    "that is only staged in a proposal is not loaded until the workflow is saved with it, except the profile the "
+    "user saved by signing in from the credential card this turn: a draft that selects it loads it now. A test "
+    "whose first blocks are already verified and unchanged may start at the first block that is not. A test that "
+    "starts at a later block with the earlier blocks verified continues in the browser that ran them when that "
+    "browser is where the test starts. A later-block test instead runs every block it asked for in a new browser "
+    "when that browser is not where it starts. It does the same when the tested blocks sign in or fill a "
+    "credential. It does the same when a block before its start branches or jumps, or a later block jumps back "
+    "before it. That new browser starts as described above when the blocks it asked for begin at the first "
+    "block, and with no cookies or storage otherwise. In every other case a later-block test runs in this chat's "
+    "browser."
+)
+_BUILD_TEST_TOOL_NAMES = frozenset(
+    {EDIT_BLOCK_AND_RUN_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, run_blocks_tool.name}
+)
+
 _LIST_INTEGRATIONS_RUN_GUIDANCE = (
     "For a build-and-test request, pass the completed workflow and the bound block label to "
     f"`{UPDATE_AND_RUN_BLOCKS_TOOL_NAME}` in the same turn; do not stop at `{UPDATE_WORKFLOW_TOOL_NAME}`."
@@ -2651,6 +2686,7 @@ def copilot_native_tools(
     supports_credential_delete_card: bool = False,
     supports_google_setup_card: bool = False,
     supports_demonstration_offer: bool = False,
+    browser_pattern_accepting_calls: tuple[str, ...] = (),
 ) -> list[FunctionTool]:
     capability = _normalized_authoring_capability(authoring_capability)
     both_families = capability.code_blocks and capability.agent_blocks
@@ -2673,8 +2709,14 @@ def copilot_native_tools(
         if tool.name == REPLY_TOOL_NAME:
             tools.append(tool)
             continue
+        if tool.name == BROWSER_CODE_TOOL_NAME:
+            tool = dataclasses.replace(
+                tool, description=render_browser_code_description(browser_pattern_accepting_calls)
+            )
         if tool.name in _EXECUTED_SOURCE_PARAMS:
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
+        if tool.name in _BUILD_TEST_TOOL_NAMES:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{BUILD_TEST_BROWSER_START}")
         if tool.name == list_integrations_tool.name and run_tools_available:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}")
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:

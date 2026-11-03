@@ -1,3 +1,4 @@
+import { Status } from "@/api/types";
 import type { BrowserPaneViewIntent } from "@/store/useStudioBrowserStore";
 
 import type { RunVisuals } from "./useRunVisuals";
@@ -18,6 +19,8 @@ type ResolveBrowserPaneViewArgs = {
   blockRunInDebugSession: boolean;
   // The Copilot introduced the run focus and still owns its automatic view.
   systemFocused: boolean;
+  // The browser Copilot's latest call named is one the studio can stream now.
+  copilotBrowserFocused: boolean;
   // The inspected run executed in the live debug session, so that browser is
   // still the run's evidence once it finishes.
   runInDebugSession: boolean;
@@ -35,10 +38,39 @@ type ResolveLiveSurfaceArgs = {
   // A browser recording pins the live surface to the debug browser (the
   // recorder drives it), even if an inspected run streams elsewhere.
   recording: boolean;
+  // Which live browser Copilot's latest call named, when the studio can stream it.
+  copilotBrowserSurface: "debug" | "run" | null;
   running: boolean;
   runInDebugSession: boolean;
   hasRunId: boolean;
 };
+
+// A queued run is waiting for its turn, not starting a browser, and a run that
+// already names a browser is past that step.
+export function runStartupPlaceholder(run: {
+  status: Status;
+  browser_session_id?: string | null;
+}): { title: string; detail: string; pending: boolean } {
+  if (run.status === Status.Queued) {
+    return {
+      title: "Run queued",
+      detail: "Waiting for its turn to start…",
+      pending: true,
+    };
+  }
+  if (run.browser_session_id) {
+    return {
+      title: "Browser ready",
+      detail: "The run starts in a moment…",
+      pending: false,
+    };
+  }
+  return {
+    title: "Starting the browser",
+    detail: "Getting your run's browser ready…",
+    pending: true,
+  };
+}
 
 // A pill is offered only once there is something behind it, running or not:
 // recordings land at finalize, screenshots as the run takes each action.
@@ -61,13 +93,14 @@ export function resolveReplayAvailability(
  */
 export function resolveLiveSurface({
   recording,
+  copilotBrowserSurface,
   running,
   runInDebugSession,
   hasRunId,
 }: ResolveLiveSurfaceArgs): "debug" | "run" {
-  return !recording && running && !runInDebugSession && hasRunId
-    ? "run"
-    : "debug";
+  if (recording) return "debug";
+  if (copilotBrowserSurface) return copilotBrowserSurface;
+  return running && !runInDebugSession && hasRunId ? "run" : "debug";
 }
 
 /**
@@ -85,6 +118,7 @@ export function resolveBrowserPaneView({
   inspectingRun,
   blockRunInDebugSession,
   systemFocused,
+  copilotBrowserFocused,
   runInDebugSession,
   running,
   hasRecording,
@@ -114,6 +148,9 @@ export function resolveBrowserPaneView({
   }
   if (scrubbing && screenshotsAvailable) {
     return "screenshots";
+  }
+  if (copilotBrowserFocused) {
+    return "live";
   }
   // System focus keeps Live only while the run is still on that browser; a
   // finished run that minted its own browser replays like any inspected run.

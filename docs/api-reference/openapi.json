@@ -542,6 +542,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -553,6 +554,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "default": 10,
               "title": "Page Size"
@@ -954,6 +956,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number",
               "default": 1,
@@ -2977,6 +2980,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -2988,6 +2992,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "default": 10,
               "title": "Page Size"
@@ -4026,6 +4031,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination",
               "examples": [
@@ -4045,6 +4051,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of items per page",
               "examples": [
@@ -4832,6 +4839,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination",
               "examples": [
@@ -4848,6 +4856,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of items per page",
               "examples": [
@@ -5130,6 +5139,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -6031,6 +6041,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination.",
               "default": 1,
@@ -6044,6 +6055,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of runs to return per page.",
               "default": 10,
@@ -6224,6 +6236,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination.",
               "default": 1,
@@ -6237,6 +6250,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of runs to return per page.",
               "default": 10,
@@ -6452,7 +6466,9 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "integer"
+                  "type": "integer",
+                  "maximum": 2147483647,
+                  "minimum": 1
                 },
                 {
                   "type": "null"
@@ -7526,6 +7542,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number.",
               "default": 1,
@@ -9613,7 +9630,7 @@
               }
             ],
             "title": "Tools",
-            "description": "The tools the step may call. A block it runs through run_block is named by its block type, such as http_request. finish and read_run_data are always offered, and login only when the run has a credential parameter. Without a list the step has no other tools."
+            "description": "The tools the step may call. A block it runs through run_block is named by its block type, such as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a credential parameter. Without a list the step has no other tools."
           }
         },
         "type": "object",
@@ -11418,6 +11435,12 @@
               "http://localhost:9222",
               "https://3.12.10.11/browser/123456"
             ]
+          },
+          "browser_address_redacted": {
+            "type": "boolean",
+            "title": "Browser Address Redacted",
+            "description": "Whether the browser address was withheld because this caller cannot connect",
+            "default": false
           },
           "app_url": {
             "anyOf": [
@@ -14907,7 +14930,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "folder": {
             "anyOf": [
@@ -16409,7 +16433,8 @@
                 "type": "null"
               }
             ],
-            "title": "Google Credential Id"
+            "title": "Google Credential Id",
+            "x-skyvern-connected-account": true
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -17543,7 +17568,8 @@
                 "type": "null"
               }
             ],
-            "title": "Google Credential Id"
+            "title": "Google Credential Id",
+            "x-skyvern-connected-account": true
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -18679,7 +18705,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "has_header_row": {
             "type": "boolean",
@@ -18992,7 +19019,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "write_mode": {
             "type": "string",
@@ -23197,7 +23225,8 @@
             "type": "string",
             "minLength": 1,
             "title": "Connection Id",
-            "description": "Microsoft OAuth credential ID for this user."
+            "description": "Microsoft OAuth credential ID for this user.",
+            "x-skyvern-connected-account": true
           },
           "dataset_id": {
             "type": "string",
@@ -24848,7 +24877,8 @@
               }
             ],
             "title": "Credential Id",
-            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
+            "x-skyvern-connected-account": true
           },
           "cc": {
             "items": {

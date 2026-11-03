@@ -51,7 +51,7 @@ import {
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { CredentialsModal } from "@/routes/credentials/CredentialsModal";
 import { CredentialModalTypes } from "@/routes/credentials/useCredentialModalState";
-import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import {
   ReloadIcon,
@@ -71,6 +71,7 @@ import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import {
   type CopilotAttention,
   useCopilotHeaderStore,
@@ -260,6 +261,8 @@ import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { cn, formatElapsedSeconds, parseServerStamp } from "@/util/utils";
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import {
+  searchWithCopilotBrowserFocus,
+  searchWithCopilotBrowserReleased,
   searchWithoutRun,
   useSwitchStudioRun,
 } from "@/routes/workflows/studio/runSwitchNavigation";
@@ -1833,6 +1836,13 @@ export function WorkflowCopilotChat({
   const [isStopping, setIsStopping] = useState(false);
   const [stopArmed, setStopArmed] = useState(false);
   useTurnActivityChange(isLoading, onTurnActivityChange);
+  const setCopilotTurnActive = useStudioBrowserStore(
+    (s) => s.setCopilotTurnActive,
+  );
+  useTurnActivityChange(
+    docked && isLoading,
+    docked ? setCopilotTurnActive : undefined,
+  );
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
   const [narrative, setNarrative] =
     useState<TurnNarrativeState>(EMPTY_NARRATIVE);
@@ -2601,6 +2611,41 @@ export function WorkflowCopilotChat({
       resolveLivePanes,
     ],
   );
+  const replaceStudioSearch = useCallback(
+    (nextSearch: (search: string) => string) => {
+      const search = liveSearch(location.search);
+      const next = nextSearch(search);
+      if (next === search) return;
+      navigate(
+        { pathname: location.pathname, search: next, hash: location.hash },
+        {
+          replace: true,
+          state: liveLocationState(location.search, location.state),
+        },
+      );
+    },
+    [
+      navigate,
+      location.pathname,
+      location.search,
+      location.hash,
+      location.state,
+    ],
+  );
+  const focusCopilotBrowser = useCallback(
+    (browserSessionId: string | null | undefined) => {
+      if (!docked) return;
+      replaceStudioSearch((search) =>
+        searchWithCopilotBrowserFocus(search, browserSessionId),
+      );
+    },
+    [docked, replaceStudioSearch],
+  );
+  // The pane ignores a pin outside an active turn, so a pin left in the URL by
+  // an earlier turn is dropped before a new one can make it count again.
+  const releaseCopilotBrowser = useCallback(() => {
+    if (docked) replaceStudioSearch(searchWithCopilotBrowserReleased);
+  }, [docked, replaceStudioSearch]);
   const recoverCredentialTurn = useRef<
     (chatId: string, turnId: string) => boolean
   >(() => false);
@@ -3520,7 +3565,7 @@ export function WorkflowCopilotChat({
       let timer: ReturnType<typeof setTimeout> | null = null;
       let step = 0;
       let appliedContent: string | null = null;
-      let schedulesRefreshed = false;
+      let toolSideEffectsRefreshed = false;
       // Latching an id below makes later reads consistent, but an id resolved
       // from "the workflow's latest chat" is not proof the chat is this turn's,
       // so what gates the untagged fallback is how the poll started.
@@ -4043,10 +4088,13 @@ export function WorkflowCopilotChat({
             }
             // A replaceable interrupted row can be superseded by the still-running finalizer.
             if (!isReplaceableInterruptedRow(row.turn_outcome)) {
-              if (!schedulesRefreshed) {
-                schedulesRefreshed = true;
+              if (!toolSideEffectsRefreshed) {
+                toolSideEffectsRefreshed = true;
                 void queryClient.invalidateQueries({
                   queryKey: ["workflowSchedules", workflowPermanentId],
+                });
+                void queryClient.invalidateQueries({
+                  queryKey: ["eventTriggers"],
                 });
               }
               if (holdingReservation) {
@@ -7919,6 +7967,7 @@ export function WorkflowCopilotChat({
         setInputValue("");
       }
       if (composerSend) consumedComposerTextRef.current = candidate;
+      releaseCopilotBrowser();
       setIsLoading(true);
       inFlightRef.current = true;
       sendEpoch.current += 1;
@@ -8609,6 +8658,9 @@ export function WorkflowCopilotChat({
               case "condensing":
                 return false;
               case "tool_call":
+                applyStoredNarrativeEvent(payload);
+                focusCopilotBrowser(payload.browser_session_id);
+                return false;
               case "tool_result":
               case "narration":
                 applyStoredNarrativeEvent(payload);
@@ -8878,10 +8930,11 @@ export function WorkflowCopilotChat({
           }
         }
         unpostedSendsRef.current.delete(registeredAttachments);
-        // A turn can change schedules through Copilot's tools and still end in an error or abort.
+        // A turn can change schedules or triggers through Copilot's tools and still end in an error or abort.
         void queryClient.invalidateQueries({
           queryKey: ["workflowSchedules", workflowPermanentId],
         });
+        void queryClient.invalidateQueries({ queryKey: ["eventTriggers"] });
         const current = isCopilotOwnerCurrent(reservation);
         const undelivered = takePendingSteers(
           (steer) => steer.cancelToken === cancelToken,
@@ -8967,6 +9020,8 @@ export function WorkflowCopilotChat({
       attachments,
       pendingAttachments,
       focusTurnRun,
+      focusCopilotBrowser,
+      releaseCopilotBrowser,
       releaseTurnRun,
       followBuildLabel,
       inputValue,
@@ -10689,6 +10744,25 @@ export function WorkflowCopilotChat({
                             handleConnectedAccountChoice(turnId, connectionId)
                           }
                         />
+                      ) : null}
+                      {message.narrative.canonicalWorkflowUnavailable ? (
+                        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+                          <div className="font-medium">
+                            This agent is no longer available
+                          </div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            Copilot can&apos;t save or test changes to it. Open
+                            another agent or create a new one to continue.
+                          </div>
+                          <Button
+                            asChild
+                            size="sm"
+                            variant="secondary"
+                            className="mt-3"
+                          >
+                            <Link to="/agents">Open Agents</Link>
+                          </Button>
+                        </div>
                       ) : null}
                       {message.narrative.googleConnectionNotices.map(
                         (notice) => (

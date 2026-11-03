@@ -20,6 +20,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.schemas.webhooks import (
     RunWebhookPreviewResponse,
     RunWebhookReplayRequest,
@@ -223,6 +224,7 @@ async def preview_webhook_replay(
         return await build_run_preview(
             organization_id=current_org.organization_id,
             run_id=run_id,
+            principal=get_request_principal(),
         )
     except MissingApiKey as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -279,6 +281,7 @@ async def trigger_webhook_replay(
             organization_id=current_org.organization_id,
             run_id=run_id,
             target_url=request.override_webhook_url,
+            principal=get_request_principal(),
         )
     except MissingWebhookTarget as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

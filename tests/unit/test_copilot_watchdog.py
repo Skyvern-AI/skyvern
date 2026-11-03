@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app as forge_app
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
     contains_internal_machinery_leak,
@@ -21,12 +22,9 @@ from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginBlockOutput,
     OriginExecutionSettings,
-    OriginOutputRefusal,
-    OriginOutputRefusalDetail,
     OriginOutputSnapshot,
     SelectedOutputSource,
 )
-from skyvern.forge.sdk.copilot.runtime import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     WatchdogExitReason,
@@ -46,9 +44,18 @@ from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import ActionStatus
 from tests.unit._mcp_browser_fakes import crash_free_browser_state
-from tests.unit.copilot_test_helpers import SEARCH_THEN_SELECT_WORKFLOW_YAML, adopted_detached_tasks
+from tests.unit.copilot_test_helpers import (
+    SEARCH_THEN_SELECT_WORKFLOW_YAML,
+    adopted_detached_tasks,
+    install_fresh_run_browser,
+)
 from tests.unit.copilot_test_helpers import install_run_blocks_harness as _install_run_harness
-from tests.unit.copilot_test_helpers import make_copilot_ctx, run_result_action_row, terminal_extraction_block
+from tests.unit.copilot_test_helpers import (
+    make_copilot_ctx,
+    refuse_seeded_origin_output_once,
+    run_result_action_row,
+    terminal_extraction_block,
+)
 
 
 def _fake_run(status: str = "running", modified_at: datetime | None = None) -> Any:
@@ -673,36 +680,10 @@ async def test_a_retry_after_a_refused_earlier_output_keeps_the_chat_browser_it_
         monkeypatch, workflow_yaml=SEARCH_THEN_SELECT_WORKFLOW_YAML, polled_status="running"
     )
     _install_advancing_clock(monkeypatch)
-
-    async def _acquire(ctx: CopilotContext, **_kwargs: object) -> None:
-        ctx.browser_session_id = ctx.browser_session_id or "pbs_chat"
-
-    refusals = [
-        OriginOutputRefusalDetail(
-            reason=OriginOutputRefusal.CHANGED_PRODUCER, block_label="run_search", origin_workflow_run_id="wr_origin"
-        )
-    ]
-
-    def _refuse_once_after_persistence(*_args: object, check_settings: bool = True, **_kwargs: object) -> object:
-        return refusals.pop() if check_settings and refusals else None
-
-    monkeypatch.setattr(run_execution, "acquire_build_test_browser_session", _acquire)
-    monkeypatch.setattr(run_execution, "selected_output_run_refusal", _refuse_once_after_persistence)
+    install_fresh_run_browser(monkeypatch, "pbs_chat")
     ctx = make_copilot_ctx(browser_session_id=None)
     ctx.staged_workflow = harness["workflow"]
-    origin = OriginOutputSnapshot(
-        definition=harness["workflow"].workflow_definition,
-        outputs={
-            "run_search": OriginBlockOutput(
-                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"results": []}
-            )
-        },
-        settings=OriginExecutionSettings.of(harness["workflow"]),
-    )
-    ctx.repair_origin_outputs = origin
-    ctx.frontier_selected_output_sources = {
-        "run_search": SelectedOutputSource("run_search", "wr_origin", "origin", origin)
-    }
+    refusals = refuse_seeded_origin_output_once(monkeypatch, ctx)
 
     result = await _run_blocks_and_collect_debug({"block_labels": ["select_first_result"], "parameters": {}}, ctx)
 

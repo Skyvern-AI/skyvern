@@ -36,7 +36,9 @@ import {
 } from "./cardChrome";
 import { ACCEPT_BUTTON_CLASS, REJECT_BUTTON_CLASS } from "./cardLayout";
 import {
+  CHANGE_MARKERS,
   DuplicateWriteRows,
+  InputChangeRows,
   ReviewCoverageBadge,
   humanizedList,
   reviewCoverageTag,
@@ -211,32 +213,9 @@ type ChangeRow = {
   neverTested: boolean;
 };
 
-const CHANGE_ORDER = [
-  {
-    change: "added",
-    marker: "+",
-    srLabel: "Added",
-    markerClass: "text-success",
-  },
-  {
-    change: "changed",
-    marker: "~",
-    srLabel: "Changed",
-    markerClass: "text-amber-700 dark:text-amber-300",
-  },
-  {
-    change: "removed",
-    marker: "−",
-    srLabel: "Removed",
-    markerClass: "text-destructive",
-  },
-  {
-    change: "unchanged",
-    marker: "",
-    srLabel: "Unchanged",
-    markerClass: "text-muted-foreground",
-  },
-] as const;
+const CHANGE_ORDER = (
+  ["added", "changed", "removed", "unchanged"] as const
+).map((change) => ({ change, ...CHANGE_MARKERS[change] }));
 
 function changeRows(
   turn: TurnNarrativeState | undefined,
@@ -275,11 +254,15 @@ function changeRows(
   }));
 }
 
-function blockCountLabel(rows: ChangeRow[]): string | null {
-  const changed = rows.filter((row) => !row.muted).length;
-  const count = changed > 0 ? changed : rows.length;
-  if (count === 0) return null;
-  return `${count} ${count === 1 ? "block" : "blocks"}`;
+function blockCountLabel(rows: ChangeRow[], inputCount: number): string | null {
+  const count = rows.filter((row) => !row.muted).length;
+  const parts = [
+    count > 0 ? `${count} ${count === 1 ? "block" : "blocks"}` : null,
+    inputCount > 0
+      ? `${inputCount} ${inputCount === 1 ? "input" : "inputs"}`
+      : null,
+  ].filter((part) => part !== null);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function ChangeList({
@@ -310,6 +293,7 @@ function ChangeList({
     }
   }
   const hiddenNeverTested = hidden.filter((row) => row.neverTested).length;
+  const inputs = turn?.review?.inputs ?? [];
   const duplicateWrites = turn?.review?.duplicateWrites ?? [];
   const kept = docEditorEnabled
     ? [
@@ -317,7 +301,12 @@ function ChangeList({
         { kind: "descriptions", labels: turn?.review?.keptDescriptions ?? [] },
       ].filter((group) => group.labels.length > 0)
     : [];
-  if (rows.length === 0 && duplicateWrites.length === 0 && kept.length === 0)
+  if (
+    rows.length === 0 &&
+    inputs.length === 0 &&
+    duplicateWrites.length === 0 &&
+    kept.length === 0
+  )
     return null;
   return (
     <div>
@@ -343,6 +332,7 @@ function ChangeList({
           <ReviewCoverageBadge label={row.coverageTag} />
         </GutterRow>
       ))}
+      <InputChangeRows inputs={inputs} discarded={discarded} />
       {hidden.length > 0 || showAll ? (
         <div className="pl-7 pt-0.5">
           <button
@@ -439,12 +429,19 @@ function ResolvedReviewCard({
   const [expanded, setExpanded] = useState(false);
   const applied =
     accepted || (turn !== undefined && draftLanded(turn, { rejected }));
+  const inputCount = turn?.review?.inputs?.length ?? 0;
+  const changedRows = rows.filter((row) => !row.muted);
   const names =
-    rows.length > 0 && rows.length <= 2
-      ? rows.map((row) => humanizeBlockLabel(row.label)).join(", ")
-      : blockCountLabel(rows);
+    changedRows.length > 0 && changedRows.length <= 2
+      ? changedRows.map((row) => humanizeBlockLabel(row.label)).join(", ") +
+        (inputCount > 0
+          ? ` · ${inputCount} ${inputCount === 1 ? "input" : "inputs"}`
+          : "")
+      : blockCountLabel(rows, inputCount);
   const hasDetail =
-    rows.length > 0 || (turn?.review?.duplicateWrites.length ?? 0) > 0;
+    rows.length > 0 ||
+    inputCount > 0 ||
+    (turn?.review?.duplicateWrites.length ?? 0) > 0;
   return (
     <CopilotCard
       id={gateId}
@@ -489,6 +486,7 @@ function ResolvedReviewCard({
           )
         }
         meta={names}
+        wrapTitle
         right={
           rejected ? (
             <span className="text-[11px] text-muted-foreground">
@@ -644,6 +642,7 @@ export function ReviewGateCard({
   const showTestInBody = showActions && offerTestInBody && !confirmingTest;
   const hasBody =
     rows.length > 0 ||
+    (turn?.review?.inputs?.length ?? 0) > 0 ||
     (turn?.review?.duplicateWrites.length ?? 0) > 0 ||
     showTestInBody;
 
@@ -748,7 +747,7 @@ export function ReviewGateCard({
       <CardHeader
         icon={<MagicWandIcon className="h-3.5 w-3.5 text-muted-foreground" />}
         title={title}
-        meta={blockCountLabel(rows)}
+        meta={blockCountLabel(rows, turn?.review?.inputs?.length ?? 0)}
         wrapTitle
         right={
           !verdict ? null : testFailed ? (

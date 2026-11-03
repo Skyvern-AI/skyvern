@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import gc
 import io
 import json
 import logging
@@ -108,7 +107,6 @@ def test_unraisable_traceback_becomes_one_structured_event(json_stream: io.Strin
 
     doomed = _FinalizerRaises()
     del doomed
-    gc.collect()
 
     record = _sole_record(
         json_stream,

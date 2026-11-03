@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.cli.core import session_manager
+from skyvern.cli.core import copilot_sessions, session_manager
 from skyvern.cli.core.browser_ops import NavigateResult
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_manager import SessionState
@@ -1138,7 +1138,7 @@ class TestTabStatePersistenceGuards:
         page_b = _make_mock_page("https://b.com", "B")
         owned = SessionState(browser=_make_mock_browser(page_a, page_b), organization_id="org_tabs")
         session_manager.set_stateless_http_mode(True)
-        session_manager.register_copilot_session("pbs_tabs", owned, organization_id="org_tabs")
+        copilot_sessions.register_copilot_session("pbs_tabs", owned, organization_id="org_tabs")
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_tabs")
 
         async def _resolve_browser_installing_registered(
@@ -1151,7 +1151,7 @@ class TestTabStatePersistenceGuards:
         try:
             result = await mcp_tabs.skyvern_tab_switch(tab_id=str(id(page_b)))
         finally:
-            session_manager.unregister_copilot_session("pbs_tabs", organization_id="org_tabs")
+            copilot_sessions.unregister_copilot_session("pbs_tabs", organization_id="org_tabs")
 
         assert result["ok"] is True
         assert owned.tab_state_persists is True

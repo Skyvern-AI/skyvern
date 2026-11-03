@@ -11,6 +11,7 @@ from pydantic import (
     Field,
     JsonValue,
     PlainSerializer,
+    PrivateAttr,
     SecretStr,
     StringConstraints,
     field_serializer,
@@ -387,6 +388,8 @@ class WorkflowCopilotMessageFeedbackResponse(BaseModel):
 class WorkflowCopilotChatMessage(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    _narrative_payload_unreadable: bool = PrivateAttr(default=False)
+
     workflow_copilot_chat_message_id: str = Field(..., description="ID for the workflow copilot chat message")
     workflow_copilot_chat_id: str = Field(..., description="ID of the parent workflow copilot chat")
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
@@ -692,7 +695,7 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
         default_factory=list, description="Uploaded files the user attached to this message"
     )
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
-    narrative_payload: TurnNarrativePayload | None = Field(
+    narrative_payload: dict[str, Any] | None = Field(
         None,
         description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
     )
@@ -866,6 +869,13 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
     timestamp: datetime | None = Field(
         None,
         description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
+    )
+    browser_session_id: str | None = Field(
+        None,
+        description=(
+            "Browser session a page-acting call resolves to when it is emitted; null for other tools and for "
+            "an unavailable target. Not persisted on the activity entry."
+        ),
     )
 
 

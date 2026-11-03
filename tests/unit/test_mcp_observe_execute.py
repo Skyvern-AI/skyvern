@@ -596,6 +596,44 @@ class TestDoObserve:
         assert len(a11y_norths) == 2
 
     @pytest.mark.asyncio
+    async def test_input_role_combobox_merges_with_its_a11y_entry(self) -> None:
+        # SKY-19544: an input[role=combobox] is one field. Keying the merge on the role's
+        # single canonical tag listed it twice — once as a selectorless `select` — so agents
+        # saw a duplicate, mis-tagged field flagged as needing disambiguation.
+        page = _make_page(_make_a11y_tree(children=[{"role": "combobox", "name": "City", "value": ""}]))
+        page.evaluate = _mock_dom_evaluate(
+            [{"role": "combobox", "name": "City", "tag": "input", "selector": "#city", "value": "lake"}]
+        )
+
+        result = await do_observe(page, include_values=True)
+        serialized = serialize_elements(result.elements)
+
+        cities = [element for element in serialized if element["name"] == "City"]
+        assert len(cities) == 1, serialized
+        assert cities[0]["tag"] == "input"
+        assert cities[0]["selector"] == "#city"
+        assert cities[0]["value"] == "lake"
+        assert "needs_disambiguation" not in cities[0]
+
+    @pytest.mark.asyncio
+    async def test_heuristically_roled_wrapper_does_not_claim_the_a11y_entry(self) -> None:
+        # The DOM scan calls any leftover interactable a button, so a wrapper sharing its
+        # child's label must keep the tag in the merge key: the a11y entry belongs to the
+        # real <button>, and attaching the wrapper's selector would click the wrong element.
+        page = _make_page(_make_a11y_tree(children=[{"role": "button", "name": "Save"}]))
+        page.evaluate = _mock_dom_evaluate(
+            [
+                {"role": "button", "name": "Save", "tag": "div", "selector": "#save-wrap"},
+                {"role": "button", "name": "Save", "tag": "button", "selector": "#save"},
+            ]
+        )
+
+        result = await do_observe(page)
+        saves = [element for element in result.elements if element.name == "Save"]
+
+        assert [element.selector for element in saves] == ["#save", "#save-wrap"]
+
+    @pytest.mark.asyncio
     async def test_match_index_stable_when_cap_reorders(self) -> None:
         # A selector-bearing duplicate reordered ahead of the cap must NOT shift the nth ordinal
         # of a selectorless duplicate sharing its (role, name). The a11y duplicate must keep its

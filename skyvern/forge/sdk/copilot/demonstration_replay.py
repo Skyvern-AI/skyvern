@@ -14,6 +14,7 @@ from mcp.types import CallToolResult, TextContent
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.cache.base import BaseCache
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, safe_admitted_url
@@ -37,7 +38,7 @@ from skyvern.forge.sdk.copilot.llm_config import resolve_raw_secret_safety_handl
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm, summarize_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, screen_raw_secret_safety
-from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, ScoutedInteraction, staged_demonstrated_action
+from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, staged_demonstrated_action
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output

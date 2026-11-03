@@ -2,7 +2,10 @@ import { type BrowserSession } from "@/routes/workflows/types/browserSessionType
 import { normalizeUtcTimestamp } from "@/util/timeFormat";
 
 type BrowserSessionReadiness = Partial<
-  Pick<BrowserSession, "status" | "browser_address" | "completed_at">
+  Pick<
+    BrowserSession,
+    "status" | "browser_address" | "browser_address_redacted" | "completed_at"
+  >
 > & { recordings?: BrowserSession["recordings"] | null };
 
 const POST_TERMINAL_REFETCH_INTERVAL_MS = 10_000;
@@ -41,7 +44,10 @@ function getBrowserSessionRefetchIntervalMs(
     return 1000;
   }
   if (browserSession.status === "running") {
-    if (!browserSession.browser_address) {
+    if (
+      !browserSession.browser_address &&
+      !browserSession.browser_address_redacted
+    ) {
       return 1000;
     }
     return 5000;

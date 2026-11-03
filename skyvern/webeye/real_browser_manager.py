@@ -1655,6 +1655,7 @@ class RealBrowserManager(BrowserManager):
             organization_id=workflow_run.organization_id,
             browser_profile_id=browser_profile_id,
             browser_session_id=browser_session_id,
+            requested_by=workflow_run.requested_by,
         )
 
         context = skyvern_context.current()

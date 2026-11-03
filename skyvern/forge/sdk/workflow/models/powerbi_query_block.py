@@ -7,7 +7,8 @@ from pydantic import Field, field_validator
 from skyvern.forge import app
 from skyvern.forge.sdk.services.powerbi_query_service import PowerBIQueryError
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import Block
+from skyvern.forge.sdk.workflow.exceptions import RENDER_FAILURE_OUTPUT_KEY
+from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason, render_failure_record
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.utils.templating import (
@@ -51,8 +52,11 @@ class PowerBIQueryBlock(Block):
         organization_id: str | None,
         error_code: str,
         failure_reason: str,
+        render_failure: dict[str, Any] | None = None,
     ) -> BlockResult:
-        output = {"error": error_code}
+        output: dict[str, Any] = {"error": error_code}
+        if render_failure is not None:
+            output[RENDER_FAILURE_OUTPUT_KEY] = render_failure
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
         return await self.build_block_result(
             success=False,
@@ -113,14 +117,16 @@ class PowerBIQueryBlock(Block):
 
         try:
             self._render_templates(workflow_run_context)
-        except Exception:
+        except Exception as exc:
+            redact = self.secret_redactor(workflow_run_context)
             return await self._failure(
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=effective_org_id,
                 error_code="template_format_failed",
-                failure_reason="Could not render Power BI query fields.",
+                failure_reason=render_failure_reason("Could not render Power BI query fields.", exc, redact),
+                render_failure=render_failure_record(exc, redact),
             )
 
         if not effective_org_id:

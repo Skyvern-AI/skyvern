@@ -29,6 +29,7 @@ from skyvern.exceptions import (
     BrowserSessionClosed,
     BrowserSessionStartupTimeout,
     CopilotInlineSequentialCredentialUnsupported,
+    WorkflowNotFound,
 )
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import without_output_only_categories, without_output_only_labels
@@ -38,6 +39,13 @@ from skyvern.forge.sdk.copilot.active_run_session import (
     ActiveRunSessionAssociation,
     clear_active_run_session,
     publish_active_run_session,
+)
+from skyvern.forge.sdk.copilot.agent_context import (
+    FrontierStartProvenance,
+    OriginRunRedactionRegistry,
+    PreRunPageReference,
+    RegisteredArtifactEntry,
+    RegisteredArtifactEvidence,
 )
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import _literal_locator_selector
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -196,19 +204,19 @@ from skyvern.forge.sdk.copilot.run_outcome import (
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     BuildTestBrowserSeed,
-    FrontierStartProvenance,
-    OriginRunRedactionRegistry,
-    PreRunPageReference,
-    RegisteredArtifactEntry,
-    RegisteredArtifactEvidence,
     _build_test_connect_failure_result,
     acquire_fresh_exit_browser_session,
     browser_session_lock,
     browser_session_recovery,
+    claim_build_test_prestart,
     close_browser_session_quietly,
+    discard_build_test_prestart,
+    end_minted_browser_renewal,
     ensure_build_test_browser_session,
     record_attached_browser_driver,
     resolve_persistent_browser_state,
+    start_browser_driver_release,
+    start_build_test_prestart,
     verify_build_test_browser_session_by_attaching,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -366,10 +374,13 @@ from .guardrails import (
 )
 from .scouting import _mark_post_run_page_observed, _redact_codeblock_value
 from .workflow_update import (
+    CopilotCanonicalWorkflowUnavailableError,
     ProposalAdoptionOutcome,
     adopt_stored_workflow_candidate,
+    canonical_workflow_unavailable_result,
     prior_draft_settings_match_stored_candidate,
     proposal_conflict_result,
+    require_active_canonical_workflow,
     strip_copilot_yaml_headers,
     unseen_adoption,
 )
@@ -3573,6 +3584,37 @@ async def _renew_kept_browser_activity(session_id: str) -> None:
         app.BROWSER_MANAGER.end_session_activity_renewal(session_id)
 
 
+async def _close_minted_browser(
+    ctx: CopilotContext, session_id: str, run_id: str | None, *, reason: BrowserSessionCloseReason
+) -> None:
+    if run_id is not None and await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
+        LOG.info(
+            "copilot_minted_browser_kept_for_live_run", browser_session_id=session_id, run_id=run_id, reason=reason
+        )
+
+        async def _close_when_idle() -> None:
+            renewal = asyncio.create_task(_renew_kept_browser_activity(session_id))
+            try:
+                while await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
+                    await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
+            finally:
+                renewal.cancel()
+            if reason is BrowserSessionCloseReason.test_superseded:
+                await _close_superseded_minted_browser(ctx, session_id, None)
+            else:
+                await _close_minted_browser(ctx, session_id, None, reason=reason)
+
+        task = asyncio.create_task(_close_when_idle())
+        _DETACHED_CLEANUP_TASKS.add(task)
+        task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+        task.add_done_callback(_log_detached_cleanup_failure)
+        return
+    closed = await close_browser_session_quietly(ctx.organization_id, session_id, reason=reason)
+    LOG.info(
+        "copilot_minted_browser_closed", browser_session_id=session_id, run_id=run_id, closed=closed, reason=reason
+    )
+
+
 async def close_minted_browser_sessions(ctx: CopilotContext) -> None:
     """Close the browsers this turn minted, at the end of the turn that is their only reader.
 
@@ -3584,32 +3626,59 @@ async def close_minted_browser_sessions(ctx: CopilotContext) -> None:
     """
     minted = list(ctx.minted_browser_sessions.items())
     ctx.minted_browser_sessions.clear()
-
-    async def _close(session_id: str, run_id: str | None) -> None:
-        if run_id is not None and await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
-            LOG.info("copilot_minted_browser_kept_for_live_run", browser_session_id=session_id, run_id=run_id)
-
-            async def _close_when_idle() -> None:
-                renewal = asyncio.create_task(_renew_kept_browser_activity(session_id))
-                try:
-                    while await _run_in_a_minted_browser_is_still_live(session_id, run_id, ctx.organization_id):
-                        await asyncio.sleep(RUN_BLOCKS_POLL_INTERVAL_SECONDS)
-                finally:
-                    renewal.cancel()
-                await _close(session_id, None)
-
-            task = asyncio.create_task(_close_when_idle())
-            _DETACHED_CLEANUP_TASKS.add(task)
-            task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
-            task.add_done_callback(_log_detached_cleanup_failure)
-            return
-        closed = await close_browser_session_quietly(
-            ctx.organization_id, session_id, reason=BrowserSessionCloseReason.turn_ended
-        )
-        LOG.info("copilot_minted_browser_closed", browser_session_id=session_id, run_id=run_id, closed=closed)
-
     if minted:
-        await asyncio.gather(*(_close(session_id, run_id) for session_id, run_id in minted))
+        await asyncio.gather(
+            *(
+                _close_minted_browser(ctx, session_id, run_id, reason=BrowserSessionCloseReason.turn_ended)
+                for session_id, run_id in minted
+            )
+        )
+
+
+_SUPERSEDED_LAST_RUN_REASON = (
+    "The browser of the last test run was released because a newer test started; that test's own browser "
+    "becomes `last_run` when it returns."
+)
+
+
+async def _close_superseded_minted_browser(ctx: CopilotContext, session_id: str, run_id: str | None) -> None:
+    async with browser_session_lock(ctx, session_id=session_id):
+        attached = ctx.attached_browser_drivers.pop(session_id, None)
+        if attached is not None:
+            # Off the turn, so no time bound: closing before an admitted browser call unwinds would cut it off.
+            await asyncio.shield(
+                start_browser_driver_release(
+                    ctx.organization_id,
+                    attached,
+                    unwinding_operations=ctx.admitted_browser_operations.get(session_id),
+                )
+            )
+        await _close_minted_browser(ctx, session_id, run_id, reason=BrowserSessionCloseReason.test_superseded)
+
+
+def start_superseded_minted_browser_close(
+    ctx: CopilotContext, run_session_id: str | None, debug_session_id: str | None
+) -> None:
+    """Close earlier tests' browsers once a newer test's run is submitted, after any browser call on them ends.
+    An entry still None, or one a call still claims to resume, belongs to a call in flight, so neither qualifies."""
+    kept = {run_session_id, ctx.browser_session_id, debug_session_id}
+    superseded = [
+        (session_id, run_id)
+        for session_id, run_id in ctx.minted_browser_sessions.items()
+        if run_id is not None and session_id not in kept and session_id not in ctx.minted_browser_claims
+    ]
+    for session_id, run_id in superseded:
+        ctx.minted_browser_sessions.pop(session_id)
+        ctx.superseded_minted_browser_sessions.add(session_id)
+        end_minted_browser_renewal(ctx, session_id)
+        if ctx.last_run_blocks_browser_session_id == session_id:
+            ctx.last_run_blocks_browser_session_id = None
+            ctx.last_run_binding_unavailable_reason = _SUPERSEDED_LAST_RUN_REASON
+
+        task = asyncio.create_task(_close_superseded_minted_browser(ctx, session_id, run_id))
+        _DETACHED_CLEANUP_TASKS.add(task)
+        task.add_done_callback(_DETACHED_CLEANUP_TASKS.discard)
+        task.add_done_callback(_log_detached_cleanup_failure)
 
 
 def start_minted_browser_session_close(ctx: CopilotContext) -> asyncio.Task[None]:
@@ -3770,6 +3839,24 @@ def _with_build_test_acquisition_context(
     return result
 
 
+def _test_start_unavailable_result(ctx: CopilotContext) -> dict[str, Any]:
+    unavailable = CopilotCanonicalWorkflowUnavailableError(ctx.workflow_permanent_id)
+    return {
+        **canonical_workflow_unavailable_result(ctx, unavailable, refused="test_start"),
+        "data": {"run_dispatched": False, _PROPOSAL_BIND_REFUSED_KEY: True},
+    }
+
+
+async def _canonical_workflow_unavailable_refusal(ctx: CopilotContext) -> dict[str, Any] | None:
+    if not ctx.workflow_copilot_chat_id:
+        return None
+    try:
+        await require_active_canonical_workflow(ctx)
+    except CopilotCanonicalWorkflowUnavailableError:
+        return _test_start_unavailable_result(ctx)
+    return None
+
+
 async def run_workflow_end_to_end(
     ctx: CopilotContext,
     workflow_yaml: str | None = None,
@@ -3783,6 +3870,9 @@ async def run_workflow_end_to_end(
     authority_error = _authority_tool_error(ctx, "run_blocks_and_collect_debug")
     if authority_error:
         return {"ok": False, "error": authority_error}
+    unavailable = await _canonical_workflow_unavailable_refusal(ctx)
+    if unavailable is not None:
+        return unavailable
 
     if workflow_yaml is not None:
         # The UI still submits its candidate; the model tool selects it without resubmitting code.
@@ -4034,6 +4124,34 @@ def _attach_reused_origin_outputs(data: dict[str, Any], execution: _RunExecution
         data["named_output_not_reused"] = execution.named_output_not_reused.as_payload()
 
 
+def _claim_minted_browser(ctx: CopilotContext, session_id: str | None, claim: set[str]) -> None:
+    if session_id is None or session_id in claim:
+        return
+    run_id = ctx.minted_browser_sessions.get(session_id)
+    held = ctx.minted_browser_claims.get(session_id)
+    if held is not None:
+        # A claimant that submitted may have put a newer run id in the ledger while others still hold the browser.
+        ctx.minted_browser_claims[session_id] = (run_id or held[0], held[1] + 1)
+    elif run_id is not None:
+        ctx.minted_browser_claims[session_id] = (run_id, 1)
+    else:
+        return
+    if run_id is not None:
+        ctx.minted_browser_sessions[session_id] = None
+    claim.add(session_id)
+
+
+def _release_minted_browser_claim(ctx: CopilotContext, claim: set[str], *, restore: bool = True) -> None:
+    # Parallel calls can resume one browser; the earlier run id comes back only when the last of them lets go.
+    for session_id in claim:
+        earlier_run_id, claimants = ctx.minted_browser_claims.pop(session_id)
+        if claimants > 1:
+            ctx.minted_browser_claims[session_id] = (earlier_run_id, claimants - 1)
+        elif restore and session_id in ctx.minted_browser_sessions and ctx.minted_browser_sessions[session_id] is None:
+            ctx.minted_browser_sessions[session_id] = earlier_run_id
+    claim.clear()
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -4053,6 +4171,49 @@ async def _run_blocks_and_collect_debug(
 ) -> dict[str, Any]:
     """With ``new_exit``, run in a browser whose network exit is verified to differ from the most recent build
     test's; the model cannot choose or verify an exit, so the platform supplies it or says why it cannot."""
+    # The browser this call resumes holds a None ledger entry until its run takes the entry over, so a sibling
+    # call's superseded close skips it; every exit before that hands the earlier run id back.
+    minted_browser_claim: set[str] = set()
+    try:
+        return await _run_blocks_with_minted_browser_claim(
+            params,
+            ctx,
+            minted_browser_claim,
+            labels_to_execute=labels_to_execute,
+            block_outputs_to_seed=block_outputs_to_seed,
+            frontier_start_label=frontier_start_label,
+            force_fresh_session=force_fresh_session,
+            execution_snapshot=execution_snapshot,
+            explicit_blank=explicit_blank,
+            seed_like_normal_run=seed_like_normal_run,
+            use_ephemeral_inputs=use_ephemeral_inputs,
+            new_exit=new_exit,
+            verified_new_exit=verified_new_exit,
+            chat_browser_opened_before_retry=chat_browser_opened_before_retry,
+            frontier_request=frontier_request,
+        )
+    finally:
+        _release_minted_browser_claim(ctx, minted_browser_claim)
+
+
+async def _run_blocks_with_minted_browser_claim(
+    params: dict[str, Any],
+    ctx: CopilotContext,
+    minted_browser_claim: set[str],
+    *,
+    labels_to_execute: list[str] | None,
+    block_outputs_to_seed: dict[str, Any] | None,
+    frontier_start_label: str | None,
+    force_fresh_session: bool,
+    execution_snapshot: CopilotExecutionSnapshot | None,
+    explicit_blank: bool,
+    seed_like_normal_run: bool,
+    use_ephemeral_inputs: bool,
+    new_exit: bool,
+    verified_new_exit: FreshExitReceipt | None,
+    chat_browser_opened_before_retry: bool,
+    frontier_request: FrontierRequest | None,
+) -> dict[str, Any]:
     new_exit_prior_session_id = ctx.last_run_blocks_browser_session_id
     if new_exit and new_exit_prior_session_id is None:
         return {
@@ -4072,6 +4233,7 @@ async def _run_blocks_and_collect_debug(
     # Read the planner's session choice before any exit path, so a run that bails cannot leave it
     # set for a later run whose frontier was never proven against that browser.
     resume_session_id = None if explicit_blank else ctx.frontier_resume_session_id
+    _claim_minted_browser(ctx, resume_session_id, minted_browser_claim)
     planner_requires_own_browser = not explicit_blank and ctx.frontier_requires_own_browser
     start_provenance: FrontierStartProvenance = (
         "initial" if explicit_blank else ctx.frontier_start_provenance or "unanchored"
@@ -4088,6 +4250,13 @@ async def _run_blocks_and_collect_debug(
         ctx.frontier_named_output_refusal = None
         ctx.frontier_origin_reused_labels = []
         ctx.frontier_selected_output_sources = {}
+
+    unavailable = await _canonical_workflow_unavailable_refusal(ctx)
+    if unavailable is not None:
+        if verified_new_exit is not None and verified_new_exit.new_browser_session_id:
+            # A re-entry inherits the verified new-exit browser; nothing else will close it.
+            await close_browser_session_quietly(ctx.organization_id, verified_new_exit.new_browser_session_id)
+        return unavailable
 
     block_labels = params["block_labels"]
     if not block_labels:
@@ -4198,6 +4367,7 @@ async def _run_blocks_and_collect_debug(
             )
             is not None
         ):
+            _release_minted_browser_claim(ctx, minted_browser_claim)
             return await _run_blocks_and_collect_debug(
                 params,
                 ctx,
@@ -4223,6 +4393,8 @@ async def _run_blocks_and_collect_debug(
             ctx, (list(block_labels), {}, block_labels[0]), workflow.workflow_definition, None, list(block_labels)
         )
         resume_session_id = ctx.frontier_resume_session_id
+        _release_minted_browser_claim(ctx, minted_browser_claim)
+        _claim_minted_browser(ctx, resume_session_id, minted_browser_claim)
         planner_requires_own_browser = ctx.frontier_requires_own_browser
         ctx.frontier_resume_session_id = None
         ctx.frontier_requires_own_browser = False
@@ -4527,6 +4699,12 @@ async def _run_blocks_and_collect_debug(
     debug_session_id: str | None = None
     run_session_id: str | None
     new_exit_receipt: FreshExitReceipt | None = None
+    if not use_fresh_session:
+        discard_build_test_prestart(ctx, "resume" if resumes_a_build_test_browser else "chat_browser")
+    elif new_exit:
+        discard_build_test_prestart(ctx, "new_exit")
+    elif browser_seed is not None:
+        discard_build_test_prestart(ctx, "seeded")
 
     # Without a session, the workflow service launches the browser in-process,
     # which only works in worker pods (cloakbrowser isn't in the API image).
@@ -4559,17 +4737,20 @@ async def _run_blocks_and_collect_debug(
                 }
             run_session_id = new_exit_receipt.new_browser_session_id
         else:
-            acquisition_ctx = replace(ctx)
-            acquisition_ctx.browser_session_id = None
-            session_err = await acquire_build_test_browser_session(
-                acquisition_ctx,
-                fresh=True,
-                seed=browser_seed,
-                proxy_location=runtime_proxy_location(snapshot.workflow.proxy_location),
-            )
-            if session_err is not None:
-                return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
-            run_session_id = acquisition_ctx.browser_session_id
+            run_proxy_location = runtime_proxy_location(snapshot.workflow.proxy_location)
+            run_session_id = await claim_build_test_prestart(ctx, run_proxy_location)
+            if run_session_id is None:
+                acquisition_ctx = replace(ctx)
+                acquisition_ctx.browser_session_id = None
+                session_err = await acquire_build_test_browser_session(
+                    acquisition_ctx,
+                    fresh=True,
+                    seed=browser_seed,
+                    proxy_location=run_proxy_location,
+                )
+                if session_err is not None:
+                    return _with_build_test_acquisition_context(session_err, requested_block_labels=block_labels)
+                run_session_id = acquisition_ctx.browser_session_id
         if browser_seed is not None:
             if not run_session_id or not await _seed_profile_applied(
                 ctx.organization_id, run_session_id, browser_seed.browser_profile_id
@@ -4681,6 +4862,10 @@ async def _run_blocks_and_collect_debug(
                     organization_id=ctx.organization_id,
                 )
                 dispatch_draft_workflow_id = dispatch_workflow.workflow_id
+            except WorkflowNotFound:
+                # The version write re-reads the active row under the lock deletion takes, so this is the
+                # agent becoming unavailable after the earlier check, not a persistence failure.
+                return _test_start_unavailable_result(ctx)
             except Exception:
                 LOG.warning(
                     "Failed to persist copilot run snapshot; blocking execution",
@@ -4789,6 +4974,7 @@ async def _run_blocks_and_collect_debug(
                 ctx.frontier_origin_output_refusal = refusal
                 ctx.frontier_named_output_refusal = execution.named_output_not_reused
             requested_labels, requested_seed, requested_start, _ = replanned
+            _release_minted_browser_claim(ctx, minted_browser_claim)
             return await _run_blocks_and_collect_debug(
                 params,
                 ctx,
@@ -5125,6 +5311,15 @@ async def _run_blocks_and_collect_debug(
             secret_run_session_lock = None
         if interim_run_id is not None and not run_submission_attempted:
             _forget_interim_run_start(ctx, interim_run_id)
+        # The poll's finally never runs on this path, and a None entry is neither superseded nor checked for a run
+        # still using the browser at turn end.
+        if (
+            run_submission_attempted
+            and run_session_id
+            and run_session_id in ctx.minted_browser_sessions
+            and ctx.minted_browser_sessions[run_session_id] is None
+        ):
+            ctx.minted_browser_sessions[run_session_id] = workflow_run.workflow_run_id
         # The submission had not returned, so no worker owns the run yet, even at the backstop; cancel before
         # retiring the draft so a start that did land sees a canceled row.
         if run_submission_attempted:
@@ -5141,6 +5336,10 @@ async def _run_blocks_and_collect_debug(
         # attempted the run may already hold it.
         if used_fresh_run_session and run_session_id and not run_submission_attempted and not keep_run_session:
             await close_browser_session_quietly(ctx.organization_id, run_session_id)
+        if run_submission_attempted:
+            _release_minted_browser_claim(ctx, minted_browser_claim, restore=False)
+
+    start_superseded_minted_browser_close(ctx, run_session_id, debug_session_id)
 
     active_run_association: ActiveRunSessionAssociation | None = None
     run_paused = False
@@ -5508,6 +5707,14 @@ async def _run_blocks_and_collect_debug(
         # above, and the success path always populates final_status.
         assert final_status is not None
         run_ok = WorkflowRunStatus(final_status) == WorkflowRunStatus.completed
+        if (
+            not run_ok
+            and used_fresh_run_session
+            and starts_at_workflow_head
+            and browser_seed is None
+            and new_exit_receipt is None
+        ):
+            start_build_test_prestart(ctx, runtime_proxy_location(snapshot.workflow.proxy_location))
 
         action_observations = _retained_action_observations(results)
         per_block_action_observations = _retained_action_observations_by_label(results)
@@ -6712,11 +6919,15 @@ def _record_run_blocks_result(
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
     copilot_ctx.last_test_run_started = bool(run_id) or (isinstance(data, dict) and bool(data.get("blocks")))
     run_browser_session_id = data.get("browser_session_id") if isinstance(data, dict) else None
-    copilot_ctx.last_run_blocks_browser_session_id = (
-        run_browser_session_id if isinstance(run_browser_session_id, str) and run_browser_session_id else None
-    )
-    # The refusal sentence described the run these pointers used to name.
-    copilot_ctx.last_run_binding_unavailable_reason = None
+    if run_browser_session_id in copilot_ctx.superseded_minted_browser_sessions:
+        copilot_ctx.last_run_blocks_browser_session_id = None
+        copilot_ctx.last_run_binding_unavailable_reason = _SUPERSEDED_LAST_RUN_REASON
+    else:
+        copilot_ctx.last_run_blocks_browser_session_id = (
+            run_browser_session_id if isinstance(run_browser_session_id, str) and run_browser_session_id else None
+        )
+        # The refusal sentence described the run these pointers used to name.
+        copilot_ctx.last_run_binding_unavailable_reason = None
     copilot_ctx.last_successful_run_blocks_workflow_run_id = run_id if run_ok and isinstance(run_id, str) else None
     # Watchdog cancels normally count as ok=False; only a coincident total
     # timeout softens to ``None`` to keep the unvalidated WIP rescue open.

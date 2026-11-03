@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -12,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from starlette.requests import Request
 
@@ -21,8 +20,8 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent
 from skyvern.forge.api_app import create_api_app, handle_skyvern_http_exception
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
-from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.db.models import Base, OutputParameterModel, WorkflowModel
+from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
+from skyvern.forge.sdk.db.models import OutputParameterModel, WorkflowModel
 from skyvern.forge.sdk.db.repositories import workflows as workflows_repository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.routes.workflow_copilot import (
@@ -44,7 +43,9 @@ from skyvern.forge.sdk.workflow.validation import (
     WorkflowValidationTooComplex,
 )
 from skyvern.schemas.workflows import WorkflowRequest, WorkflowStatus
+from tests.unit.conftest import SqliteEngineFactory
 from tests.unit.force_stub_app import start_forge_stub_app
+from tests.unit.shared_route_app import shared_route_app
 
 start_forge_stub_app()
 
@@ -58,6 +59,12 @@ WORKFLOW_CREATE_PAYLOAD = {
     }
 }
 
+
+def _agent_db(sqlite_engine_factory: SqliteEngineFactory) -> AgentDB:
+    engine = sqlite_engine_factory(build_engine=_build_engine)
+    return AgentDB(str(engine.url), db_engine=engine)
+
+
 IDEMPOTENCY_KEY_ERROR_DETAIL = "Idempotency-Key must contain 1 to 255 visible ASCII bytes."
 
 REJECTED_IDEMPOTENCY_KEYS = {
@@ -69,16 +76,15 @@ REJECTED_IDEMPOTENCY_KEYS = {
     "control_byte": "replay\x07key",
     "delete_byte": "replay\x7fkey",
     "non_ascii": "replay-kéy",
+    # The first length over the limit: longer keys sit on the same side of the one length bound.
     "256_bytes": "a" * 256,
-    "1024_bytes": "a" * 1024,
-    "20000_bytes": "a" * 20_000,
 }
 
 
 @pytest.mark.asyncio
 async def test_validate_entrypoint_reports_credential_reference_in_note(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     definition = {
         "title": "Validation test agent",
@@ -101,7 +107,7 @@ async def test_validate_entrypoint_reports_credential_reference_in_note(
         },
     }
 
-    async with idempotency_lab(monkeypatch, tmp_path / "validate.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
         response = await lab.validate(definition)
 
     assert response.status_code == 200
@@ -152,11 +158,9 @@ class IdempotencyLab:
 @asynccontextmanager
 async def idempotency_lab(
     monkeypatch: pytest.MonkeyPatch,
-    database_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> AsyncIterator[IdempotencyLab]:
-    database = AgentDB(f"sqlite+aiosqlite:///{database_path}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -199,11 +203,9 @@ async def idempotency_lab(
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
-    fastapi_app.include_router(agent_protocol.legacy_base_router, prefix="/v1")
     fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
     transport = httpx.ASGITransport(app=fastapi_app)
@@ -224,10 +226,10 @@ async def idempotency_lab(
 async def test_create_workflow_rejects_malformed_idempotency_key_before_any_work(
     case: str,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     key = REJECTED_IDEMPOTENCY_KEYS[case]
-    async with idempotency_lab(monkeypatch, tmp_path / f"reject-{case}.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
         response = await lab.create(key)
 
         assert response.status_code == 422
@@ -247,9 +249,9 @@ async def test_create_workflow_rejects_malformed_idempotency_key_before_any_work
 async def test_create_workflow_without_definition_returns_422(
     payload: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    async with idempotency_lab(monkeypatch, tmp_path / "missing-definition.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
         response = await lab.client.post("/v1/agents", json=payload)
 
         assert response.status_code == 422
@@ -284,7 +286,7 @@ def test_validate_idempotency_key_rejects_multibyte_by_encoded_length() -> None:
 async def test_create_workflow_accepts_idempotency_key_within_bounds(
     key: str | None,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     audit_events: list[AuditEvent] = []
 
@@ -293,7 +295,7 @@ async def test_create_workflow_accepts_idempotency_key_within_bounds(
 
     monkeypatch.setattr(app.AGENT_FUNCTION, "record_audit_event", record_audit_event)
     monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: None)
-    async with idempotency_lab(monkeypatch, tmp_path / f"accept-{len(key or '')}.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
         created = await lab.create(key)
         replayed = await lab.create(key)
 
@@ -314,7 +316,7 @@ async def test_create_workflow_accepts_idempotency_key_within_bounds(
 @pytest.mark.asyncio
 async def test_idempotent_create_rejects_masked_inline_secrets(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     payload = {
         "json_definition": {
@@ -335,7 +337,7 @@ async def test_idempotent_create_rejects_masked_inline_secrets(
             },
         }
     }
-    async with idempotency_lab(monkeypatch, tmp_path / "masked-secret-create.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
         response = await lab.create("masked-secret-key", payload)
 
         assert response.status_code == 422
@@ -346,7 +348,7 @@ async def test_idempotent_create_rejects_masked_inline_secrets(
 @pytest.mark.asyncio
 async def test_create_workflow_honors_idempotency_key(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     audit_events: list[AuditEvent] = []
 
@@ -355,9 +357,7 @@ async def test_create_workflow_honors_idempotency_key(
 
     monkeypatch.setattr(app.AGENT_FUNCTION, "record_audit_event", record_audit_event)
     monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: None)
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -392,10 +392,9 @@ async def test_create_workflow_honors_idempotency_key(
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", workflow_service)
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
     try:
         transport = httpx.ASGITransport(app=fastapi_app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -473,11 +472,9 @@ async def test_create_workflow_honors_idempotency_key(
 @pytest.mark.asyncio
 async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-timeout.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -485,10 +482,9 @@ async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(app, "WORKFLOW_SERVICE", WorkflowService())
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: organization
     fastapi_app.dependency_overrides[org_auth_service.get_current_user_id_or_none] = lambda: "u_test"
-    fastapi_app.include_router(agent_protocol.base_router, prefix="/v1")
 
     try:
         transport = httpx.ASGITransport(app=fastapi_app)
@@ -523,10 +519,10 @@ async def test_create_workflow_idempotency_wait_deadline_returns_conflict(
 @pytest.mark.asyncio
 async def test_create_workflow_idempotency_database_timeout_is_not_conflict(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    async with idempotency_lab(monkeypatch, tmp_path / "idempotency-database-timeout.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
 
         @asynccontextmanager
         async def database_timeout(_lock_key: str | None = None) -> AsyncIterator[None]:
@@ -548,11 +544,9 @@ async def test_create_workflow_idempotency_database_timeout_is_not_conflict(
 @pytest.mark.asyncio
 async def test_create_workflow_idempotency_post_commit_failure_preserves_workflow(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-rollback.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -626,11 +620,9 @@ async def test_create_workflow_idempotency_post_commit_failure_preserves_workflo
 @pytest.mark.asyncio
 async def test_create_workflow_idempotency_generates_title_before_lock(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-title.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -675,11 +667,9 @@ async def test_create_workflow_idempotency_generates_title_before_lock(
 @pytest.mark.asyncio
 async def test_create_workflow_idempotency_releases_lock_before_post_commit_work(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-lock-order.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -749,11 +739,9 @@ async def test_create_workflow_idempotency_releases_lock_before_post_commit_work
 @pytest.mark.asyncio
 async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_writes(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'idempotency-write-rollback.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -810,7 +798,7 @@ async def test_create_workflow_idempotency_definition_failure_rolls_back_atomic_
 @pytest.mark.asyncio
 async def test_workflow_save_publishes_no_version_before_its_definition(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     """An ordinary save must not publish its new version row before the definition fills it.
 
@@ -819,9 +807,7 @@ async def test_workflow_save_publishes_no_version_before_its_definition(
     concurrent save inherits its settings, and the save precondition rejects valid drafts against
     a version that validation is about to discard.
     """
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'save-version-visibility.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -885,11 +871,9 @@ async def test_workflow_save_publishes_no_version_before_its_definition(
 @pytest.mark.asyncio
 async def test_nonterminal_finally_validation_rolls_back_before_version_commit(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'save-finally-validation.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -979,11 +963,9 @@ async def test_nonterminal_finally_validation_rolls_back_before_version_commit(
 @pytest.mark.asyncio
 async def test_failed_workflow_save_does_not_schedule_saved_hook_before_commit(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    database = AgentDB(f"sqlite+aiosqlite:///{tmp_path / 'save-hook-rollback.db'}")
-    async with database.engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    database = _agent_db(sqlite_engine_factory)
     organization = await database.organizations.create_organization(
         organization_name="Test",
         organization_id="o_test",
@@ -1052,13 +1034,13 @@ _MASKED_HEADERS = {"X-Test": "***", "X-New": "***"}
 )
 async def test_workflow_setting_presence_preserves_persisted_values(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
     entrypoint: str,
     field_name: str,
     supplied: dict[str, Any],
     expected: Any,
 ) -> None:
-    async with idempotency_lab(monkeypatch, tmp_path / "headers.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
         stored = await lab.database.workflows.create_workflow(
             title="Header test",
             workflow_definition={"parameters": [], "blocks": []},
@@ -1079,7 +1061,7 @@ async def test_workflow_setting_presence_preserves_persisted_values(
         if entrypoint in {"put", "json"}:
             if entrypoint == "put":
                 response = await lab.client.put(
-                    f"/v1/workflows/{stored.workflow_permanent_id}",
+                    f"/api/v1/workflows/{stored.workflow_permanent_id}",
                     content=document,
                     headers={"Content-Type": "application/x-yaml"},
                 )
@@ -1147,9 +1129,9 @@ async def test_workflow_setting_presence_preserves_persisted_values(
 @pytest.mark.asyncio
 async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
-    async with idempotency_lab(monkeypatch, tmp_path / "build-source.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
 
         async def build_source_of(workflow_id: str) -> str | None:
             persisted = await lab.database.workflows.get_workflow(
@@ -1167,7 +1149,7 @@ async def test_each_surface_stamps_the_build_source_of_the_version_it_writes(
 
         definition = WORKFLOW_CREATE_PAYLOAD["json_definition"]
         ui_save = await lab.client.put(
-            f"/v1/workflows/{workflow_permanent_id}",
+            f"/api/v1/workflows/{workflow_permanent_id}",
             content=yaml.safe_dump(definition),
             headers={"Content-Type": "application/x-yaml", "x-user-agent": "skyvern-ui"},
         )
@@ -1235,10 +1217,10 @@ def _stored_workflow_with_forward_reference() -> Workflow:
 @pytest.mark.asyncio
 async def test_saved_workflow_validate_is_served_on_the_api_v1_prefix_the_ui_calls(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     stored = _stored_workflow_with_forward_reference()
-    async with idempotency_lab(monkeypatch, tmp_path / "validate-saved.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
 
         async def get_stored(**_: object) -> Workflow:
             return stored
@@ -1253,6 +1235,22 @@ async def test_saved_workflow_validate_is_served_on_the_api_v1_prefix_the_ui_cal
 
     assert response.status_code == 200
     assert [problem["code"] for problem in response.json()["problems"]] == ["forward_reference"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["webapps/v1/workflows", "${772055+272300}", "42", "- a\n- b", "null"])
+async def test_workflow_create_rejects_yaml_that_is_not_a_mapping_with_422(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine_factory: SqliteEngineFactory,
+    body: str,
+) -> None:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
+        legacy = await lab.client.post("/api/v1/workflows", content=body, headers={"Content-Type": "text/plain"})
+        shared = await lab.client.post("/v1/workflows", json={"yaml_definition": body})
+        update = await lab.client.post("/v1/workflows/wpid_missing", json={"yaml_definition": body})
+
+    assert [legacy.status_code, shared.status_code, update.status_code] == [422, 422, 422]
+    assert "mapping" in legacy.json()["detail"]
 
 
 def _validation_request(body: bytes) -> Request:
@@ -1283,7 +1281,7 @@ async def test_workflow_validation_rejects_oversized_body_before_validation(monk
 async def test_workflow_validation_returns_complexity_limit_as_workflow_problem(
     limit: str,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    sqlite_engine_factory: SqliteEngineFactory,
 ) -> None:
     if limit == "depth":
         blocks: list[dict[str, object]] = [{"block_type": "navigation", "label": "step"}]
@@ -1295,7 +1293,7 @@ async def test_workflow_validation_returns_complexity_limit_as_workflow_problem(
             for index in range(MAX_WORKFLOW_VALIDATION_BLOCK_COUNT + 1)
         ]
 
-    async with idempotency_lab(monkeypatch, tmp_path / f"validate-{limit}.db") as lab:
+    async with idempotency_lab(monkeypatch, sqlite_engine_factory) as lab:
         response = await lab.validate({"workflow_definition": {"blocks": blocks}})
 
     assert response.status_code == 200

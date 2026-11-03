@@ -45,8 +45,13 @@ def _output_parameter(key: str) -> OutputParameter:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("browser_address", "browser_session_id"),
+    [("wss://sessions.skyvern.com/abc123", None), (None, "pbs_parent")],
+    ids=["browser-address", "null-address-inherited-session"],
+)
 async def test_taskv2_block_forwards_browser_connection_fields_to_child(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, browser_address: str | None, browser_session_id: str | None
 ) -> None:
     skyvern_context.set(SkyvernContext(organization_id="org_1", workflow_run_id="wr_parent", run_id="wr_parent"))
 
@@ -55,7 +60,7 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
     outer_workflow_run = SimpleNamespace(
         proxy_location=None,
         max_screenshot_scrolls=None,
-        browser_address="wss://sessions.skyvern.com/abc123",
+        browser_address=browser_address,
         extra_http_headers={"x-api-key": "sk-test"},
         cdp_connect_headers={"x-cdp-auth": "tok"},
     )
@@ -106,7 +111,10 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
         failure_category=None,
     )
 
-    async def fake_run_task_v2(**_: object) -> SimpleNamespace:
+    run_kwargs: dict[str, object] = {}
+
+    async def fake_run_task_v2(**kwargs: object) -> SimpleNamespace:
+        run_kwargs.update(kwargs)
         return completed_task_v2
 
     monkeypatch.setattr(task_v2_service, "run_task_v2", fake_run_task_v2)
@@ -139,13 +147,16 @@ async def test_taskv2_block_forwards_browser_connection_fields_to_child(
         workflow_run_id="wr_parent",
         workflow_run_block_id="wrb_1",
         organization_id="org_1",
+        browser_session_id=browser_session_id,
     )
 
     assert init_mock.await_count == 1
     kwargs = init_mock.await_args.kwargs
-    assert kwargs["browser_address"] == "wss://sessions.skyvern.com/abc123"
+    assert kwargs["browser_address"] == browser_address
+    assert "browser_session_id" not in kwargs
     assert kwargs["extra_http_headers"] == {"x-api-key": "sk-test"}
     assert kwargs["cdp_connect_headers"] == {"x-cdp-auth": "tok"}
+    assert run_kwargs["browser_session_id"] == browser_session_id
 
 
 @pytest.mark.asyncio

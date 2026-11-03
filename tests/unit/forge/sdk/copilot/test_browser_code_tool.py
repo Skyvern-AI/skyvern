@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -28,6 +29,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     resolve_copilot_tool_surface,
 )
 from skyvern.forge.sdk.copilot.browser_code_contract import (
+    DENIED_WHILE_TAINTED,
     BrowserCodeCellResult,
     BrowserCodeOperation,
     BrowserCodeSession,
@@ -130,6 +132,36 @@ def test_executed_source_parameters_are_advertised_only_with_the_tool_that_produ
     assert with_code_tool["update_and_run_blocks"]["executed_source_references"]["description"]
     assert "executed_source_reference" not in without_code_tool["edit_block_and_run"]
     assert "executed_source_references" not in without_code_tool["update_and_run_blocks"]
+
+
+def test_oss_browser_code_description_keeps_the_url_wait_line_without_a_pattern_list() -> None:
+    tools = copilot_native_tools(
+        supports_question_tool=True,
+        browser_code_available=True,
+        run_tools_available=True,
+        browser_pattern_accepting_calls=AgentFunction().copilot_browser_pattern_accepting_calls(),
+    )
+    description = next(tool for tool in tools if tool.name == browser_code_module.TOOL_NAME).description
+    assert "wait_for_url" in description and re.search(r"\bglob\b", description)
+    assert "Compiled" not in description
+
+
+@pytest.mark.parametrize("pattern_calls", [(), ("page.wait_for_url",)])
+def test_every_operation_refused_after_a_secret_run_is_named_in_the_browser_code_description(
+    pattern_calls: tuple[str, ...],
+) -> None:
+    tools = {
+        tool.name: tool.description
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=True,
+            run_tools_available=True,
+            browser_pattern_accepting_calls=pattern_calls,
+        )
+    }
+
+    for description in (tools[browser_code_module.TOOL_NAME], browser_code_module.TOOL_DESCRIPTION):
+        assert all(f"`{name}`" in description for name in DENIED_WHILE_TAINTED)
 
 
 class _LeaseProbeSession:

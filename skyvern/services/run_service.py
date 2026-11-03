@@ -444,6 +444,7 @@ async def retry_run_webhook(
     organization_id: str | None = None,
     api_key: str | None = None,
     webhook_url: str | None = None,
+    principal: RequestPrincipal | None = None,
 ) -> RunWebhookReplayResponse:
     """Retry sending the webhook for a run, optionally to a custom URL."""
     if not organization_id:
@@ -453,4 +454,5 @@ async def retry_run_webhook(
         run_id=run_id,
         target_url=webhook_url,
         api_key=api_key,
+        principal=principal,
     )

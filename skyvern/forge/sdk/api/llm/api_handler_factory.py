@@ -3836,6 +3836,8 @@ class LLMCaller:
         self.llm_config = LLMConfigRegistry.get_config(llm_key)
         self.base_parameters = base_parameters
         self.message_history: list[dict[str, Any]] = []
+        # The router group that answered the last successful call; None for a direct config or an unknown deployment.
+        self.last_served_model_group: str | None = None
         self.current_tool_results: list[dict[str, Any]] = []
         self.screenshot_scaling_enabled = screenshot_scaling_enabled
         self.browser_window_dimension = Resolution(width=settings.BROWSER_WIDTH, height=settings.BROWSER_HEIGHT)
@@ -4288,6 +4290,7 @@ class LLMCaller:
             if self._router is not None:
                 served_model_group = LLMAPIHandlerFactory._served_model_group(self._router, response)
                 LLMAPIHandlerFactory._record_served_service_tier(self._router, response)
+            self.last_served_model_group = served_model_group
 
             call_stats = LLMCallStats()
             try:

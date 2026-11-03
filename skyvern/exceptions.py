@@ -375,7 +375,7 @@ class CardNumberInputMismatch(SkyvernException):
 class SecretInputMismatch(SkyvernException):
     def __init__(self) -> None:
         # No secret material in the message: not the value, its length, or its character classes.
-        super().__init__("Secret input read-back mismatch after atomic re-entry.")
+        super().__init__("Secret input read-back mismatch after re-entry.")
 
 
 class FreeTextInputMismatch(SkyvernException):
@@ -1099,6 +1099,12 @@ class ScreenshotTargetClosed(FailedToTakeScreenshot):
     pass
 
 
+class ScreenshotPageHasNoDrawnArea(FailedToTakeScreenshot):
+    """The viewport collapsed to zero in one axis, so there was nothing to capture. Distinct from its
+    parent because the parent also wraps renderer crashes and protocol errors, which are ours, not the
+    page's."""
+
+
 class EmptyScrapePage(SkyvernException):
     def __init__(self) -> None:
         super().__init__("Failed to scrape the page, returned an NONE result")
@@ -1674,6 +1680,8 @@ class InvalidUrl(SkyvernHTTPException):
     def __init__(
         self, url: str, *, field_name: str = "url", reason: Literal["malformed", "unsupported scheme"] = "malformed"
     ) -> None:
+        self.field_name = field_name
+        self.reason = reason
         super().__init__(f"Invalid {field_name}: {reason}. Use an HTTP or HTTPS URL with at most 2083 characters.")
 
 

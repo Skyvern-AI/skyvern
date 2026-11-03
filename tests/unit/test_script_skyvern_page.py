@@ -3432,8 +3432,10 @@ class TestScriptSkyvernPageMagicLink:
         monkeypatch.setattr(module, "render_template", fake_render)
         monkeypatch.setattr(module, "default_navigation_settle", AsyncMock())
         monkeypatch.setattr(module.settings, "ALLOWED_HOSTS", ["portal.example.com"])
+        get_task = AsyncMock(return_value=SimpleNamespace(url="https://portal.example.com/login"))
+        monkeypatch.setattr(module.app, "DATABASE", SimpleNamespace(tasks=SimpleNamespace(get_task=get_task)))
 
-        page = SimpleNamespace(goto=fake_goto, fill=fake_fill)
+        page = SimpleNamespace(url="https://customer.auth0.com/callback", goto=fake_goto, fill=fake_fill)
         script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
         script_page.page = page
         module._set_scraped_page(script_page, SimpleNamespace(_browser_state=None))
@@ -3443,7 +3445,13 @@ class TestScriptSkyvernPageMagicLink:
     def _with_context():
         from skyvern.forge.sdk.core import skyvern_context
 
-        skyvern_context.set(skyvern_context.SkyvernContext(organization_id="org_1", workflow_run_id="wr_1"))
+        skyvern_context.set(
+            skyvern_context.SkyvernContext(
+                organization_id="org_1",
+                workflow_run_id="wr_1",
+                task_id="task_1",
+            )
+        )
         return skyvern_context
 
     @pytest.mark.asyncio
@@ -3461,6 +3469,8 @@ class TestScriptSkyvernPageMagicLink:
             ctx.reset()
 
         assert state["polled_with"]["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert state["polled_with"]["task_url"] == "https://portal.example.com/login"
+        assert script_page.page.url == "https://customer.auth0.com/callback"
         assert state["navigations"] == [link]
         assert state["fills"] == []
         # The anchor sits one grace interval behind now (naive UTC), so an email that landed

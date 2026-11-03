@@ -831,6 +831,66 @@ describe("WorkflowRunTimelineBlockItem", () => {
     expectNoPillChrome(errorType);
     expect(screen.queryByText("Screenshot")).toBeNull();
     expect(screen.getByText(/ValueError: boom · line 7/)).toBeDefined();
+
+    const failureReason =
+      "line 2: Locator.click: Timeout 3000ms exceeded." +
+      "x".repeat(1100) +
+      "TAIL_AFTER_CUT\nFinal URL: https://example.com/";
+    const blockWithReason = buildBlock({
+      workflow_run_block_id: "wrb_code_failed_reason",
+      block_type: "code",
+      label: "run_script",
+      status: Status.Failed,
+      failure_reason: failureReason,
+      actions: [
+        {
+          action_id: "wrb_code_failed_reason_action_0",
+          action_type: ActionTypes.NullAction,
+          status: Status.Failed,
+          reasoning: null,
+          description: "code error at line 2",
+          response: failureReason.slice(0, 1000),
+          output: { code_line: 2 },
+          created_by: null,
+          confidence_float: null,
+        },
+        {
+          action_id: "wrb_code_failed_reason_action_1",
+          action_type: ActionTypes.NullAction,
+          status: Status.Completed,
+          reasoning: null,
+          description: "recorded code step",
+          output: { code_line: 1, duration_ms: 250 },
+          created_by: null,
+          confidence_float: null,
+        },
+      ] as unknown as WorkflowRunBlock["actions"],
+    });
+
+    const { container: reasonContainer } = render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={blockWithReason}
+        block={blockWithReason}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    const rowText = reasonContainer.textContent ?? "";
+    expect(rowText).toContain(
+      "TAIL_AFTER_CUT\nFinal URL: https://example.com/",
+    );
+    expect(rowText.split("line 2: Locator.click").length - 1).toBe(1);
+    const errorSummary = within(reasonContainer).getByText(/TAIL_AFTER_CUT/);
+    expect(errorSummary.textContent).not.toContain("· line 2");
+    expect(errorSummary.className).toContain("whitespace-pre-wrap");
+    expect(errorSummary.className).not.toContain("truncate");
+    const stepSummary = within(reasonContainer).getByText(
+      /recorded code step · line 1 · 0.3s/,
+    );
+    expect(stepSummary.textContent).not.toContain("TAIL_AFTER_CUT");
+    expect(stepSummary.className).toContain("truncate");
   });
 
   it("labels non-failed synthetic code rows as steps instead of screenshots", () => {

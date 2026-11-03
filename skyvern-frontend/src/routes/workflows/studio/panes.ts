@@ -1,6 +1,16 @@
 export type StudioPaneId = "copilot" | "editor" | "browser" | "overview";
 
 export const SYSTEM_RUN_FOCUS_PARAM = "wrs";
+export const COPILOT_RUN_FOCUS = "copilot";
+
+// While Copilot acts in a page between runs, SYSTEM_RUN_FOCUS_PARAM holds that
+// browser's session id in place of COPILOT_RUN_FOCUS.
+export function copilotBrowserFocusSessionId(
+  params: URLSearchParams,
+): string | null {
+  const value = params.get(SYSTEM_RUN_FOCUS_PARAM);
+  return value && value !== COPILOT_RUN_FOCUS ? value : null;
+}
 
 export const STUDIO_PANE_IDS: readonly StudioPaneId[] = [
   "copilot",
