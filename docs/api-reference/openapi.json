@@ -11436,6 +11436,12 @@
               "https://3.12.10.11/browser/123456"
             ]
           },
+          "browser_address_redacted": {
+            "type": "boolean",
+            "title": "Browser Address Redacted",
+            "description": "Whether the browser address was withheld because this caller cannot connect",
+            "default": false
+          },
           "app_url": {
             "anyOf": [
               {
