@@ -148,6 +148,7 @@ from tests.unit.helpers import (
     make_task,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import SkewedTime
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage
 
@@ -8059,7 +8060,7 @@ async def test_native_quiescence_never_overrides_an_unknown_download_owner(monke
         tmp_path,
         drop_file=False,
         provider_source=source,
-        download_timeout=1.2,
+        download_timeout=0.3,
         loop_fn=run_loop,
     )
     assert waits == [(False, {str(tmp_path / "retained.crdownload")})]
@@ -8869,27 +8870,20 @@ async def test_v3_download_block_keeps_a_replacement_context_held_through_cleanu
 
 # A replay its hold admitted, in flight at finish (the original one past the 2.5 s request settle), is offered before
 # the task is written completed; one a download timeout or cancel leaves in flight blocks completion and stays running.
-class _SkewedClock:
-    skew = 0.0
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(time, name)
-
-    def monotonic(self) -> float:
-        return time.monotonic() + self.skew
-
-
 @pytest.mark.parametrize("mode", ["original-selected", "replacement-empty", "timed-out", "canceled", "fresh-window"])
 @pytest.mark.asyncio
 async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_written(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
-    release_after = {"original-selected": 2.6, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
+    # The original replay is released after the request settle gave up, half a second apart so a slow runner cannot
+    # reorder them.
+    monkeypatch.setattr(taskv3_tools, "_DOWNLOAD_FAILURE_SETTLE_SECONDS", 0.25)
+    release_after = {"original-selected": 0.75, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
     selection = {"original-selected": ["c1"], "fresh-window": ["c2"]}.get(mode, [])
-    harness = {"timed-out": {"download_timeout": 0.5}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
+    harness = {"timed-out": {"download_timeout": 0.2}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
     if mode == "fresh-window":
         harness = {"download_timeout": 2.0}
-    monkeypatch.setattr(agent_module, "time", clock := _SkewedClock())
+    monkeypatch.setattr(agent_module, "time", clock := SkewedTime())
     steps = [{}, *([{}] if mode == "fresh-window" else []), {"accept_download_candidates": selection}]
     entry = _replay_interceptor(tmp_path, monkeypatch)
     released = asyncio.Event()

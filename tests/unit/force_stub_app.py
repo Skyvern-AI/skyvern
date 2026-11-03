@@ -100,6 +100,12 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = (
+        base_agent_function.browser_session_ids_authorized_for_connect
+    )
+    fake_app_module.AGENT_FUNCTION.should_redact_unresolved_browser_session_address = (
+        base_agent_function.should_redact_unresolved_browser_session_address
+    )
     fake_app_module.AGENT_FUNCTION.accessible_workflow_folder_ids = base_agent_function.accessible_workflow_folder_ids
     fake_app_module.AGENT_FUNCTION.hidden_workflow_permanent_ids = base_agent_function.hidden_workflow_permanent_ids
     fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access

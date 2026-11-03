@@ -146,8 +146,10 @@ async def test_scaled_viewports_decline_cdp_and_keep_animation_retry(geometry: d
 @pytest.mark.asyncio
 @pytest.mark.parametrize("animations", ["disabled", "allow"])
 async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
-    animations: Literal["allow", "disabled"],
+    monkeypatch: pytest.MonkeyPatch, animations: Literal["allow", "disabled"]
 ) -> None:
+    spent: list[float] = []
+    _on_a_virtual_clock(monkeypatch, spent)
     page = _page()
     session = page.context.new_cdp_session.return_value
     session.send.side_effect = None
@@ -157,12 +159,11 @@ async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
     async def finishes_loading_after_the_first_attempt(*, timeout: float, animations: str, **_kwargs: object) -> bytes:
         calls.append((animations, timeout))
         if len(calls) == 1:
-            return await screenshot_stalls_until_its_own_timeout(timeout=timeout)
+            spent.append(timeout / 1000)
+            raise PlaywrightTimeoutError("waiting for fonts to load")
         return b"retry-bytes"
 
     page.screenshot.side_effect = finishes_loading_after_the_first_attempt
-    loop = asyncio.get_running_loop()
-    started = loop.time()
 
     result = await SkyvernFrame.take_scrolling_screenshot(
         page, timeout=1600, mode=ScreenshotMode.LITE, scrolling_number=0, animations=animations
@@ -171,8 +172,9 @@ async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
     assert result == b"retry-bytes"
     assert [call_animations for call_animations, _ in calls] == [animations, "allow"]
     (_, primary), (_, retry) = calls
-    assert primary <= 1200 and retry <= 1600 - primary
-    assert loop.time() - started < 1.6
+    assert primary <= 1200
+    assert retry <= 1600 - primary
+    assert retry >= 1600 - primary - 1
 
 
 @pytest.mark.asyncio
@@ -304,21 +306,7 @@ async def test_single_viewport_timeout_reaches_the_terminal_mapper_with_one_stri
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
     spent: list[float] = []
-    bounds = _recorded_bounds(spent)
-    # The page module's loop clock advances only by each Playwright attempt's timeout, each page-module sleep and each
-    # bound that expires, and its timeout_at deadlines expire on that clock, so no check here depends on runner speed.
-    bounds.get_running_loop = lambda: SimpleNamespace(time=lambda: sum(spent))
-
-    @contextlib.asynccontextmanager
-    async def expires_on_the_virtual_clock(when: float | None) -> AsyncIterator[None]:
-        try:
-            yield
-        finally:
-            if when is not None and sum(spent) >= when:
-                raise TimeoutError
-
-    bounds.timeout_at = expires_on_the_virtual_clock
-    monkeypatch.setattr(page_module, "asyncio", bounds)
+    _on_a_virtual_clock(monkeypatch, spent)
     page, selection = _page_for(kind)
 
     async def spends_its_timeout_then_raises(*, timeout: float, **_kwargs: object) -> bytes:
@@ -669,6 +657,26 @@ def _recorded_bounds(spent: list[float]) -> ScopedAsyncio:
     return ScopedAsyncio(wait_for=wait_for, timeout=RecordedTimeout, timeout_at=timeout_at, wait=wait, sleep=sleep)
 
 
+def _on_a_virtual_clock(monkeypatch: pytest.MonkeyPatch, spent: list[float]) -> ScopedAsyncio:
+    # The page module's loop clock advances only by what is appended to spent (each Playwright attempt's timeout, each
+    # page-module sleep and each bound that expires), and its timeout_at deadlines expire on that clock, so no check
+    # depends on runner speed.
+    bounds = _recorded_bounds(spent)
+    bounds.get_running_loop = lambda: SimpleNamespace(time=lambda: sum(spent))
+
+    @contextlib.asynccontextmanager
+    async def expires_on_the_virtual_clock(when: float | None) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if when is not None and sum(spent) >= when:
+                raise TimeoutError
+
+    bounds.timeout_at = expires_on_the_virtual_clock
+    monkeypatch.setattr(page_module, "asyncio", bounds)
+    return bounds
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["screenshot", "attach", "geometry", "capture", "detach"])
 async def test_cancellation_propagates_and_leaves_no_pending_stage_task(
@@ -869,6 +877,8 @@ async def test_health_silent_capture_starts_on_raw_cdp_and_ends_inside_the_deadl
     monkeypatch: pytest.MonkeyPatch, capture_seconds: int
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
+    spent: list[float] = []
+    _on_a_virtual_clock(monkeypatch, spent)
     page = _page()
     page.screenshot.side_effect = None
     page.screenshot.return_value = b"playwright"
@@ -881,8 +891,6 @@ async def test_health_silent_capture_starts_on_raw_cdp_and_ends_inside_the_deadl
         return await answers(method, params)
 
     session.send.side_effect = slow_capture
-    loop = asyncio.get_running_loop()
-    started = loop.time()
     capture = SkyvernFrame.take_scrolling_screenshot(
         page, timeout=3000, mode=ScreenshotMode.LITE, scrolling_number=0, animations="allow", record_health=False
     )
@@ -892,7 +900,8 @@ async def test_health_silent_capture_starts_on_raw_cdp_and_ends_inside_the_deadl
     else:
         with pytest.raises(FailedToTakeScreenshot):
             await capture
-    assert loop.time() - started < 3
+    # Only the stage bounds the page module derives from the deadline expire, so this is the time they end it at.
+    assert sum(spent) < 3
     page.screenshot.assert_not_awaited()
     session.detach.assert_awaited_once()
 
