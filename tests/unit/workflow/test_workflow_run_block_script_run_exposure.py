@@ -10,8 +10,6 @@ from unittest.mock import MagicMock
 
 from skyvern.forge.sdk.db.models import WorkflowRunBlockModel
 from skyvern.forge.sdk.db.utils import convert_to_workflow_run_block
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.schemas.runs import ScriptRunResponse
 
 
 def _fake_block_model(script_run_value: dict | None, prompt_value: str | None = None) -> MagicMock:
@@ -57,38 +55,6 @@ def _fake_block_model(script_run_value: dict | None, prompt_value: str | None = 
     model.prompt = prompt_value
     model.downloaded_file_count = None
     return model
-
-
-def test_schema_accepts_script_run_field() -> None:
-    """WorkflowRunBlock pydantic model accepts a ScriptRunResponse for
-    its new `script_run` field."""
-    now = datetime.utcnow()
-    block = WorkflowRunBlock(
-        workflow_run_block_id="wrb_test",
-        workflow_run_id="wr_test",
-        organization_id="o_test",
-        block_type="navigation",
-        created_at=now,
-        modified_at=now,
-        script_run=ScriptRunResponse(ai_fallback_triggered=True),
-    )
-    assert block.script_run is not None
-    assert block.script_run.ai_fallback_triggered is True
-
-
-def test_schema_defaults_script_run_to_none() -> None:
-    """Omitting the new field yields None — backward-compat for existing
-    callers / serialized rows that predate this change."""
-    now = datetime.utcnow()
-    block = WorkflowRunBlock(
-        workflow_run_block_id="wrb_test",
-        workflow_run_id="wr_test",
-        organization_id="o_test",
-        block_type="navigation",
-        created_at=now,
-        modified_at=now,
-    )
-    assert block.script_run is None
 
 
 def test_converter_passes_script_run_when_fallback_recorded() -> None:

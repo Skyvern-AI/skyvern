@@ -7,7 +7,11 @@ import {
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
-import { Status, WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
+import {
+  ActionTypes,
+  Status,
+  WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
 
 import {
   isAction,
@@ -159,6 +163,13 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
         artifactId: activeItem.screenshot_artifact_id ?? null,
         stepId: activeItem.step_id ?? null,
         actionOrder: activeItem.action_order ?? null,
+        // The full timeline, not the current attempt's: a pinned action may belong to an earlier attempt.
+        workflowRunBlockId:
+          activeItem.action_type === ActionTypes.NullAction
+            ? (buildFilmstrip(timeline).find(
+                (frame) => frame.id === activeItem.action_id,
+              )?.blockId ?? null)
+            : null,
       };
     }
     if (isWorkflowRunBlock(activeItem)) {

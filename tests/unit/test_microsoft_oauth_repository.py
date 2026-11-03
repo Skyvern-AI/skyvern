@@ -1,24 +1,20 @@
 import datetime
-from collections.abc import AsyncGenerator
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
-from skyvern.forge.sdk.db.models import Base, MicrosoftOAuthCredentialModel
+from skyvern.forge.sdk.db.models import MicrosoftOAuthCredentialModel
 from skyvern.forge.sdk.db.repositories.microsoft_oauth import STATE_ACTIVE, STATE_REVOKED, MicrosoftOAuthRepository
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
+from tests.unit.conftest import SqliteEngineFactory
 
 
 @pytest_asyncio.fixture
-async def engine() -> AsyncGenerator[AsyncEngine, None]:
-    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield eng
-    await eng.dispose()
+async def engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory()
 
 
 @pytest_asyncio.fixture

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import os
@@ -16,6 +17,7 @@ import structlog
 from cachetools import TTLCache
 from google.oauth2.credentials import Credentials
 from playwright.async_api import Frame, Page
+from pydantic import JsonValue
 
 from skyvern import analytics
 from skyvern.config import CodeBlockMode, settings
@@ -77,11 +79,13 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.audit_events import AuditEvent
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.services.request_principal import (
+    APIKeyAuthProfile,
     BearerIdentityResolution,
     BearerIdentityStatus,
     RequestPrincipal,
     get_request_principal,
     human_user_id,
+    scoped_api_key_id_from_actor,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
@@ -140,10 +144,19 @@ async def record_request_audit_event(
     *,
     changed_fields: tuple[str, ...] = (),
     related_resource_ids: tuple[str, ...] = (),
+    metadata: Mapping[str, str | list[str]] | None = None,
 ) -> None:
     await app.AGENT_FUNCTION.record_audit_event(
         get_request_principal(),
-        AuditEvent(organization_id, action, resource_type, resource_id, changed_fields, related_resource_ids),
+        AuditEvent(
+            organization_id,
+            action,
+            resource_type,
+            resource_id,
+            changed_fields,
+            related_resource_ids,
+            metadata=metadata or {},
+        ),
     )
 
 
@@ -264,6 +277,32 @@ class CopilotOrganizationUsage:
     overage_enabled: bool | None = None
     credits_note: str | None = None
     billing_page_path: str | None = None
+
+
+COPILOT_TRIGGERS_UNAVAILABLE = "Triggers are not available in this deployment."
+
+
+@dataclass(frozen=True)
+class CopilotTriggerSummary:
+    event_trigger_id: str
+    workflow_permanent_id: str
+    source_kind: str
+    mapping: dict[str, str]
+    enabled: bool
+    created_at: str
+
+
+TriggerMappingReasonCode = Literal[
+    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed"
+]
+
+
+@dataclass(frozen=True)
+class CopilotTriggerResult:
+    error: str | None = None
+    triggers: list[CopilotTriggerSummary] = field(default_factory=list)
+    resolved_parameters: dict[str, JsonValue] | None = None
+    reason_code: TriggerMappingReasonCode | None = None
 
 
 @dataclass(frozen=True)
@@ -809,6 +848,7 @@ async def _convert_css_shape_to_string(
     step: Step | None = None,
     *,
     llm_api_handler: LLMAPIHandler | None = None,
+    screenshot_admission: asyncio.Semaphore | None = None,
 ) -> None:
     element_id: str = element.get("id", "")
 
@@ -874,13 +914,15 @@ async def _convert_css_shape_to_string(
                 return None
 
             LOG.debug("call LLM to convert css shape to string shape", element_id=element_id)
-            # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below,
-            # which drops the element from future scrape passes and aborts the conversion.
-            screenshot = await take_element_screenshot(
-                locater,
-                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-                engine_selection=skyvern_frame.engine_selection,
-            )
+            # A capture failure (FailedToTakeScreenshot) falls through to the outer handler below, which stops
+            # converting this shape for the rest of the run; the element itself stays in the tree.
+            # A page takes one screenshot at a time and the timeout counts the wait, so a batch admits one capture.
+            async with screenshot_admission or contextlib.nullcontext():
+                screenshot = await take_element_screenshot(
+                    locater,
+                    timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                    engine_selection=skyvern_frame.engine_selection,
+                )
             prompt = prompt_engine.load_prompt("css-shape-convert")
             if llm_api_handler is None:
                 llm_api_handler = _get_org_aware_svg_css_converter_llm_api_handler()
@@ -1093,11 +1135,28 @@ class AgentFunction:
         *,
         principal: RequestPrincipal | None = None,
         workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks folder use before releasing a credential secret; OSS has no credential-folder ACLs."""
 
+    async def enforce_scoped_credential_use(
+        self,
+        organization_id: str,
+        workflow_run_id: str | None,
+        *,
+        requested_by: str | None = None,
+    ) -> RequestPrincipal | None:
+        if scoped_api_key_id_from_actor(requested_by):
+            raise PermissionError("credential not accessible")
+        return None
+
     async def enforce_totp_identifier_credential_use(
-        self, organization_id: str, totp_identifier: str, *, workflow_run_id: str | None = None
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        *,
+        workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks credentials bound to a TOTP identifier; OSS has no credential-folder ACLs."""
 
@@ -1114,6 +1173,7 @@ class AgentFunction:
         organization_id: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks credentials attached to run browser state; OSS has no credential-folder ACLs."""
 
@@ -1199,14 +1259,28 @@ class AgentFunction:
     def task_v3_application_defaults(self, parameters: dict[str, Any] | None) -> tuple[str | None, str] | None:
         return None
 
+    # A run that declares its own application context: the text its task message carries whatever it declares, then the
+    # age and application texts a declared yes delivers (the age text None when withheld). OSS has none, so no such run.
+    def task_v3_application_context_texts(
+        self, parameters: dict[str, Any] | None
+    ) -> tuple[str | None, str | None, str] | None:
+        return None
+
     # The submissions a page-level interceptor in this process held for the browser context, oldest first. Must stay a
     # local read with no page or CDP call: the finish tool reads it on every non-completed verdict. OSS has none.
     def task_v3_intercepted_submissions(self, browser_context: Any) -> tuple[InterceptedSubmission, ...]:
         return ()
 
-    # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none).
+    # An audit of the answers a run entered, consulted before the form moves on, or None (OSS: none). `declaring`: the
+    # run may arm it later by declaring an application, so it is supplied even when the payload does not qualify.
     async def task_v3_answer_basis_audit(
-        self, parameters: dict[str, Any] | None, *, goal: str, organization_id: str | None, step: Step | None
+        self,
+        parameters: dict[str, Any] | None,
+        *,
+        goal: str,
+        organization_id: str | None,
+        step: Step | None,
+        declaring: bool = False,
     ) -> AnswerBasisAudit | None:
         return None
 
@@ -1481,13 +1555,6 @@ class AgentFunction:
     ) -> bool:
         return False
 
-    async def resolve_mcp_code_only_mode(
-        self,
-        organization_id: str | None,
-        request_override: bool | None,
-    ) -> bool:
-        return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
-
     async def should_use_codeblock_runner(
         self,
         *,
@@ -1661,6 +1728,26 @@ class AgentFunction:
         """OSS keeps no billing records; cloud overrides this with the authenticated read."""
         del organization_id
         return CopilotOrganizationUsage(credits_note="This deployment does not track billing.")
+
+    async def create_copilot_webhook_trigger(
+        self, *, organization_id: str, workflow_permanent_id: str, mapping: dict[str, str]
+    ) -> CopilotTriggerResult:
+        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
+
+    async def dry_run_copilot_trigger_mapping(
+        self,
+        *,
+        organization_id: str,
+        workflow_permanent_id: str,
+        mapping: dict[str, str],
+        payload: dict[str, JsonValue],
+    ) -> CopilotTriggerResult:
+        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
+
+    async def list_copilot_workflow_triggers(
+        self, *, organization_id: str, workflow_permanent_id: str
+    ) -> CopilotTriggerResult:
+        return CopilotTriggerResult(error=COPILOT_TRIGGERS_UNAVAILABLE)
 
     def resolve_copilot_dispatch_trigger_type(self) -> WorkflowRunTriggerType | None:
         """Base no-op (no dispatch routing hint); overridden per deployment."""
@@ -1881,8 +1968,8 @@ class AgentFunction:
     async def resolve_member_api_key_user_id(self, organization_id: str, token_id: str) -> str | None:
         return None
 
-    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> tuple[str, str | None, bool] | None:
-        return "full_org", None, True
+    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> APIKeyAuthProfile | None:
+        return APIKeyAuthProfile("full_org", None, True)
 
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""
@@ -2848,6 +2935,8 @@ class AgentFunction:
         MAX_ELEMENT_CNT = settings.SVG_MAX_PARSING_ELEMENT_CNT
         if engine_selection is UNSET_SELECTION:
             engine_selection = _resolve_engine_selection(task)
+        # Shared by every batch this callback converts, so overlapping calls on one page still queue one capture.
+        css_shape_screenshot_admission = asyncio.Semaphore(1)
 
         @traced(name="skyvern.agent.cleanup_element_tree")
         async def cleanup_element_tree_func(frame: Page | Frame, url: str, element_tree: list[dict]) -> list[dict]:
@@ -2919,6 +3008,7 @@ class AgentFunction:
                             task=task,
                             step=step,
                             llm_api_handler=svg_css_converter_llm_api_handler,
+                            screenshot_admission=css_shape_screenshot_admission,
                         )
                         for elem, sf in eligible_css_shapes
                     ]
@@ -3377,7 +3467,9 @@ class AgentFunction:
         """Return whether the user belongs to the organization, or None when membership cannot be determined."""
         return None
 
-    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def resolve_bearer_identity(
+        self, bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         """Return a verified bearer identity or why it could not be resolved."""
         return BearerIdentityResolution(None, BearerIdentityStatus.identity_provider_unconfigured)
 

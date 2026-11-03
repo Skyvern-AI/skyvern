@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -97,6 +98,16 @@ async def test_timeout_rescues_once_without_animation_retry_and_preserves_file(
 
 
 @pytest.mark.asyncio
+async def test_health_recording_rescue_keeps_the_default_png_encode() -> None:
+    page = _page()
+    await _current_viewpoint_screenshot_helper(page)
+    session = page.context.new_cdp_session.return_value
+    assert [call.args[1] for call in session.send.await_args_list if call.args[0] == "Page.captureScreenshot"] == [
+        {"format": "png", "captureBeyondViewport": False}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_persistent_context_timeout_is_rescued_over_raw_cdp() -> None:
     # launch_persistent_context exposes no owning Browser, yet CDP still attaches through the context.
     page = _page()
@@ -136,7 +147,32 @@ async def test_scaled_viewports_decline_cdp_and_keep_animation_retry(geometry: d
 @pytest.mark.parametrize("animations", ["disabled", "allow"])
 async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
     animations: Literal["allow", "disabled"],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class RecordingCaptureDeadline(page_module._CaptureDeadline):
+        remaining_budgets: list[int]
+
+        def __init__(
+            self, *, at: float, animations: Literal["allow", "disabled"] = "disabled", record_health: bool = True
+        ) -> None:
+            super().__init__(at=at, animations=animations, record_health=record_health)
+            self.remaining_budgets = []
+
+        def remaining_ms(self) -> int:
+            budget = super().remaining_ms()
+            self.remaining_budgets.append(budget)
+            return budget
+
+    captures: list[RecordingCaptureDeadline] = []
+
+    def capture_deadline(
+        *, at: float, animations: Literal["allow", "disabled"] = "disabled", record_health: bool = True
+    ) -> RecordingCaptureDeadline:
+        capture = RecordingCaptureDeadline(at=at, animations=animations, record_health=record_health)
+        captures.append(capture)
+        return capture
+
+    monkeypatch.setattr(page_module, "_CaptureDeadline", capture_deadline)
     page = _page()
     session = page.context.new_cdp_session.return_value
     session.send.side_effect = None
@@ -150,9 +186,6 @@ async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
         return b"retry-bytes"
 
     page.screenshot.side_effect = finishes_loading_after_the_first_attempt
-    loop = asyncio.get_running_loop()
-    started = loop.time()
-
     result = await SkyvernFrame.take_scrolling_screenshot(
         page, timeout=1600, mode=ScreenshotMode.LITE, scrolling_number=0, animations=animations
     )
@@ -161,7 +194,10 @@ async def test_scaled_viewport_decline_retries_inside_the_remaining_deadline(
     assert [call_animations for call_animations, _ in calls] == [animations, "allow"]
     (_, primary), (_, retry) = calls
     assert primary <= 1200 and retry <= 1600 - primary
-    assert loop.time() - started < 1.6
+    # The retry must use the shared deadline's actual remaining budget. A wall-clock assertion here
+    # also measures unrelated CI scheduler delays after the successful screenshot has returned.
+    assert len(captures) == 1
+    assert retry == captures[0].remaining_budgets[-1]
 
 
 @pytest.mark.asyncio
@@ -292,33 +328,63 @@ async def test_single_viewport_timeout_reaches_the_terminal_mapper_with_one_stri
     monkeypatch: pytest.MonkeyPatch, kind: str, animations: Literal["allow", "disabled"]
 ) -> None:
     _production_rescue_timeouts(monkeypatch)
+    spent: list[float] = []
+    bounds = _recorded_bounds(spent)
+    # The page module's loop clock advances only by each Playwright attempt's timeout, each page-module sleep and each
+    # bound that expires, and its timeout_at deadlines expire on that clock, so no check here depends on runner speed.
+    bounds.get_running_loop = lambda: SimpleNamespace(time=lambda: sum(spent))
+
+    @contextlib.asynccontextmanager
+    async def expires_on_the_virtual_clock(when: float | None) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if when is not None and sum(spent) >= when:
+                raise TimeoutError
+
+    bounds.timeout_at = expires_on_the_virtual_clock
+    monkeypatch.setattr(page_module, "asyncio", bounds)
     page, selection = _page_for(kind)
-    page.screenshot.side_effect = screenshot_stalls_until_its_own_timeout
+
+    async def spends_its_timeout_then_raises(*, timeout: float, **_kwargs: object) -> bytes:
+        spent.append(timeout / 1000)
+        raise PlaywrightTimeoutError("waiting for fonts to load")
+
+    page.screenshot.side_effect = spends_its_timeout_then_raises
 
     async def never_attaches(*_args: object) -> None:
         await asyncio.Event().wait()
 
     page.context.new_cdp_session.side_effect = never_attaches
-    loop = asyncio.get_running_loop()
-    started = loop.time()
 
-    with skyvern_context.scoped(SkyvernContext()) as context, pytest.raises(FailedToTakeScreenshot):
-        await SkyvernFrame.take_scrolling_screenshot(
-            page,
-            timeout=500,
-            mode=ScreenshotMode.LITE,
-            scrolling_number=0,
-            engine_selection=selection,
-            animations=animations,
+    with skyvern_context.scoped(SkyvernContext()) as context:
+        capture = asyncio.create_task(
+            SkyvernFrame.take_scrolling_screenshot(
+                page,
+                timeout=500,
+                mode=ScreenshotMode.LITE,
+                scrolling_number=0,
+                engine_selection=selection,
+                animations=animations,
+            )
         )
+        try:
+            # A hang guard only: bounds above the rescue's stage bounds never expire and the attach never answers.
+            await asyncio.wait({capture}, timeout=30)
+            assert capture.done(), "no bound ended the single-viewport capture"
+        finally:
+            capture.cancel()
+            await asyncio.gather(capture, return_exceptions=True)
 
+    with pytest.raises(FailedToTakeScreenshot):
+        capture.result()
     assert context.browser_health.stuck_operations == {BrowserOperation.SCREENSHOT}
     assert context.browser_health.consecutive_timeouts == 1
     if kind == "chromium":
-        assert loop.time() - started < 0.5
+        assert sum(spent) < 0.5
         page.screenshot.assert_awaited_once()
     elif animations == "allow":
-        assert loop.time() - started < 0.75
+        assert spent == [0.5]
         assert page.screenshot.await_args.kwargs["timeout"] == 500
         page.screenshot.assert_awaited_once()
         page.context.new_cdp_session.assert_not_awaited()

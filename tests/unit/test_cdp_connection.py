@@ -16,6 +16,7 @@ from skyvern.config import settings
 from skyvern.exceptions import BlockedHost
 from skyvern.schemas.runs import TaskRunRequest
 from skyvern.webeye import browser_acquisition_sample as sample_mod
+from skyvern.webeye.browser_artifacts import CdpContextReceipt
 from skyvern.webeye.cdp_connection import (
     REDACTED,
     build_cdp_connect_headers,
@@ -391,6 +392,38 @@ async def test_cdp_connect_never_logs_a_credential_bearing_remote_url(monkeypatc
     # Redacted, not dropped: the session it dialed still has to be identifiable.
     assert "pbs_routed" in rendered
     assert REDACTED in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing", "headers", "expected"),
+    [
+        (1, None, CdpContextReceipt("existing")),
+        (0, None, CdpContextReceipt("new", (1366, 768))),
+        (1, {"X-Skyvern-Fresh-Context": "true"}, CdpContextReceipt("new", (1366, 768))),
+    ],
+    ids=["reused", "no_context", "fresh_context_header"],
+)
+async def test_cdp_connect_reports_the_context_it_returned(
+    monkeypatch: pytest.MonkeyPatch,
+    existing: int,
+    headers: dict[str, str] | None,
+    expected: CdpContextReceipt,
+) -> None:
+    monkeypatch.setattr(browser_factory.settings, "BROWSER_WIDTH", 1366)
+    monkeypatch.setattr(browser_factory.settings, "BROWSER_HEIGHT", 768)
+    reused = SimpleNamespace(pages=[])
+    created = SimpleNamespace(pages=[])
+    browser = SimpleNamespace(contexts=[reused] * existing, new_context=AsyncMock(return_value=created))
+    monkeypatch.setattr(browser_factory, "_connect_over_cdp_with_diagnostics", AsyncMock(return_value=browser))
+
+    context, artifacts, _ = await browser_factory._connect_to_cdp_browser(
+        MagicMock(), "http://127.0.0.1:9222", extra_http_headers=headers
+    )
+
+    assert context is (reused if expected.source == "existing" else created)
+    assert artifacts.cdp_context_for(context) == expected
+    assert artifacts.cdp_context_for(SimpleNamespace(pages=[])) is None, "a receipt never describes another context"
 
 
 class TestCdpConnectAcquireMode:

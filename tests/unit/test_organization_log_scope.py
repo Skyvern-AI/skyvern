@@ -12,12 +12,13 @@ from skyvern.config import settings
 from skyvern.forge.sdk import log_artifacts
 from skyvern.forge.sdk.core.organization_age_cache import cached_org_age
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
-from skyvern.forge.sdk.db.models import Base, OrganizationModel
+from skyvern.forge.sdk.db.models import OrganizationModel
 from skyvern.forge.sdk.forge_log import has_log_organization_fields
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.services import organization_log_scope
 from skyvern.services.organization_log_scope import organization_log_scope as scope_organization_logs
 from skyvern.services.organization_log_scope import warm_organization_age
+from tests.unit.conftest import SqliteEngineFactory
 from tests.unit.forge_log_capture import capture_runtime_logs
 
 _ORGANIZATION_ID = "o_100000000000000002"
@@ -88,11 +89,11 @@ async def test_both_reads_pass_the_production_bound(monkeypatch: pytest.MonkeyPa
 
 
 @pytest_asyncio.fixture
-async def database(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AgentDB]:
-    engine = _build_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    database = AgentDB("sqlite+aiosqlite:///:memory:", db_engine=engine)
+async def database(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine_factory: SqliteEngineFactory
+) -> AsyncIterator[AgentDB]:
+    engine = sqlite_engine_factory(build_engine=_build_engine)
+    database = AgentDB(str(engine.url), db_engine=engine)
     async with database.Session() as session:
         session.add(
             OrganizationModel(

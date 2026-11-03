@@ -69,7 +69,12 @@ from skyvern.forge.sdk.copilot.config import (
     TOTAL_TIMEOUT_SECONDS,
     CopilotConfig,
 )
-from skyvern.forge.sdk.copilot.context import BLOCK_RUNNING_TOOLS, REPLY_TOOL_NAME, WORKFLOW_MUTATION_TOOLS
+from skyvern.forge.sdk.copilot.context import (
+    BLOCK_RUNNING_TOOLS,
+    CREATE_WEBHOOK_TRIGGER_TOOL_NAME,
+    REPLY_TOOL_NAME,
+    WORKFLOW_MUTATION_TOOLS,
+)
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
@@ -154,7 +159,9 @@ LOG = structlog.get_logger()
 
 BUDGET_DRAIN_HEADROOM = 4
 ToolT = TypeVar("ToolT", bound=Tool)
-BUDGET_DRAIN_EXCLUDED_TOOLS = WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME}
+BUDGET_DRAIN_EXCLUDED_TOOLS = (
+    WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME, CREATE_WEBHOOK_TRIGGER_TOOL_NAME}
+)
 HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
 # A turn whose budget is already spent may have no backstop time left for its one final reply, so
 # that reply gets at least this long. Budget-drain reports that finished took a median 14s, p90 35s.

@@ -176,7 +176,7 @@ async def cdp_https_site():
     ssl_ctx.load_cert_chain(cert_path, key_path)
     server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(

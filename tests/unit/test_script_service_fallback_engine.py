@@ -534,25 +534,6 @@ async def test_otp_inheritance_finds_loop_nested_block() -> None:
 
 
 @pytest.mark.asyncio
-async def test_block_screenshot_without_browser_state_is_not_a_warning(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A block that runs before a browser exists, or never needs one, has no screenshot to take;
-    # skipping it is routine and must not compete with real warnings.
-    from skyvern.services import script_service as script_service_module
-
-    log = MagicMock()
-    monkeypatch.setattr(script_service_module, "LOG", log)
-    monkeypatch.setattr(
-        "skyvern.services.script_service.app.BROWSER_MANAGER.get_for_workflow_run", lambda *_a, **_k: None
-    )
-
-    await script_service_module._take_workflow_run_block_screenshot("wr_test", "o_test", MagicMock())
-
-    log.warning.assert_not_called()
-    log.info.assert_called_once()
-    assert log.info.call_args.args[0] == "No browser state found when creating workflow_run_block"
-
-
-@pytest.mark.asyncio
 async def test_block_screenshot_timeout_is_logged_and_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
     # The pre-block capture is best effort: a capture that runs out of budget must not abort the block setup
     # that already persisted its rows, mirroring Block.execute_safe.

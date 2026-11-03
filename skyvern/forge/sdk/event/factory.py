@@ -27,8 +27,8 @@ _default_scroll = DefaultScrollStrategy()
 class _EventMetrics:
     """Records per-event-type timing as an OTEL histogram (no-op when metrics are unconfigured)."""
 
-    def __init__(self, histogram: metrics.Histogram = _event_duration_histogram) -> None:
-        self._histogram = histogram
+    def __init__(self) -> None:
+        self._histogram = _event_duration_histogram
 
     def record(self, event_type: str, duration: float) -> None:
         self._histogram.record(duration, {"event_type": event_type})

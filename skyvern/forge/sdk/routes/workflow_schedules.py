@@ -13,6 +13,7 @@ from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.core.permissions.schedule_limit_checker import ScheduleLimitCheckerFactory
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.agent_db import ScheduleLimitExceededError
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_schedules import (
@@ -284,7 +285,7 @@ async def _set_schedule_enabled(
     ),
 )
 async def list_organization_schedules(
-    page: int = Query(default=1, ge=1),
+    page: int = Query(default=1, ge=1, le=MAX_PAGE),
     page_size: int = Query(default=10, ge=1, le=100),
     status: Literal["active", "paused"] | None = Query(
         default=None, description="Filter by status: 'active' or 'paused'"

@@ -12,8 +12,10 @@ import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
  */
 function useArtifactImageSrc(artifact: ArtifactApiResponse | undefined) {
   const credentialGetter = useCredentialGetter();
-  const [mintedUrl, setMintedUrl] = useState<string | null>(null);
-  const [imageFailed, setImageFailed] = useState(false);
+  const [minted, setMinted] = useState<{ key: string; url: string } | null>(
+    null,
+  );
+  const [failedKey, setFailedKey] = useState<string | null>(null);
 
   const artifactId = artifact?.artifact_id;
   const baseSrc = artifact ? getImageURL(artifact) : undefined;
@@ -24,31 +26,41 @@ function useArtifactImageSrc(artifact: ArtifactApiResponse | undefined) {
     "file://",
   );
   const currentArtifactIdRef = useRef(artifactId);
+  // Keyed so a failure or minted URL from the previous artifact is not used on the first render after a switch.
+  const imageKey = `${artifactId}|${baseSrc}`;
+  const imageFailed = failedKey === imageKey;
+  const mintedUrl = minted?.key === imageKey ? minted.url : null;
 
   useEffect(() => {
     currentArtifactIdRef.current = artifactId;
-    setMintedUrl(null);
-    setImageFailed(false);
+    setMinted(null);
+    setFailedKey(null);
   }, [artifactId, baseSrc]);
 
   const onImageError = useCallback(() => {
     if (!artifactId || !mintable || mintedUrl) {
-      setImageFailed(true);
+      setFailedKey(imageKey);
       return;
     }
     mintSignedArtifactUrl(credentialGetter, artifactId)
-      .then((minted) => {
+      .then((response) => {
         // Ignore mints that resolve after the rendered artifact changed.
-        if (currentArtifactIdRef.current === artifactId) {
-          setMintedUrl(minted.signed_url);
+        if (currentArtifactIdRef.current !== artifactId) {
+          return;
+        }
+        // Re-rendering the URL that just failed would not fire onError again, so it would never fail over.
+        if (response.signed_url === baseSrc) {
+          setFailedKey(imageKey);
+        } else {
+          setMinted({ key: imageKey, url: response.signed_url });
         }
       })
       .catch(() => {
         if (currentArtifactIdRef.current === artifactId) {
-          setImageFailed(true);
+          setFailedKey(imageKey);
         }
       });
-  }, [artifactId, mintable, mintedUrl, credentialGetter]);
+  }, [artifactId, mintable, mintedUrl, credentialGetter, imageKey, baseSrc]);
 
   return { src: mintedUrl ?? baseSrc, onImageError, imageFailed };
 }

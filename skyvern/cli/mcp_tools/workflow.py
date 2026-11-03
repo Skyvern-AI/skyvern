@@ -33,7 +33,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, Timer, make_error, make_result
+from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_folder_id, validate_run_id, validate_workflow_id, validate_workflow_run_id
 from ._workflow_http import (
@@ -559,56 +559,6 @@ def _validate_definition_structure(json_def: dict[str, Any] | None, action: str)
     return None
 
 
-def _extract_workflow_blocks(definition: dict[str, Any]) -> list[Any]:
-    block_lists: list[list[Any]] = []
-    top_level_blocks = definition.get("blocks")
-    if isinstance(top_level_blocks, list):
-        block_lists.append(top_level_blocks)
-
-    workflow_definition = definition.get("workflow_definition")
-    if isinstance(workflow_definition, dict):
-        workflow_blocks = workflow_definition.get("blocks")
-        if isinstance(workflow_blocks, list) and workflow_blocks is not top_level_blocks:
-            block_lists.append(workflow_blocks)
-
-    return [block for blocks in block_lists for block in blocks]
-
-
-def _validate_code_only_workflow_blocks(definition: dict[str, Any], action: str) -> dict[str, Any] | None:
-    blocks = _extract_workflow_blocks(definition)
-    if not blocks:
-        return None
-
-    # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
-    from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
-        collect_code_only_banned_items,
-    )
-
-    banned_items = collect_code_only_banned_items(blocks)
-    if not banned_items:
-        return None
-
-    labels = ", ".join(sorted({label for label, _ in banned_items}))
-    types = ", ".join(sorted({block_type for _, block_type in banned_items}))
-    return make_result(
-        action,
-        ok=False,
-        error=make_error(
-            ErrorCode.INVALID_INPUT,
-            f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
-            "In code-only mode, use a `code` block for durable browser/page work instead of "
-            "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
-        ),
-    )
-
-
-def _validate_code_only_definition(definition: str, fmt: str, action: str) -> dict[str, Any] | None:
-    raw, _ = _load_definition_dict(definition, fmt)
-    if raw is None:
-        return None
-    return _validate_code_only_workflow_blocks(raw, action)
-
-
 _CODE_V2_DEFAULTS: dict[str, Any] = {
     "code_version": 2,
     "run_with": "agent",
@@ -987,7 +937,7 @@ def _block_to_authoring_shape(block: Any) -> Any:
             for param in resolved
             if isinstance(param, dict) and param.get("key") and param.get("key") != output_key
         ]
-        if derived:
+        if derived or authoring.get("block_type") == "code":
             existing = [k for k in (authoring.get("parameter_keys") or []) if isinstance(k, str)]
             authoring["parameter_keys"] = existing + [k for k in derived if k not in existing]
 
@@ -1118,7 +1068,11 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def _auto_wire_code_only_parameter_keys(raw_definition: dict[str, Any], excluded_keys: set[str]) -> bool:
+def _auto_wire_code_block_parameter_keys(
+    raw_definition: dict[str, Any],
+    excluded_keys: set[str],
+    skip_labels: frozenset[str] = frozenset(),
+) -> bool:
     wf_def = raw_definition.get("workflow_definition")
     if not isinstance(wf_def, dict):
         return False
@@ -1145,10 +1099,12 @@ def _auto_wire_code_only_parameter_keys(raw_definition: dict[str, Any], excluded
             eligible_by_key[key] = eligible_by_key[key] and eligible
 
     eligible_keys = [key for key in ordered_keys if eligible_by_key[key]]
+    if not eligible_keys:
+        return False
     blocks = wf_def.get("blocks")
     changed = False
     for block in _iter_blocks_flat(blocks if isinstance(blocks, list) else []):
-        if block.get("block_type") != BlockType.CODE:
+        if block.get("block_type") != BlockType.CODE or block.get("label") in skip_labels:
             continue
         # Explicit [] is a caller opt-out ("this block uses no workflow parameters");
         # only a missing/null parameter_keys triggers auto-wiring.
@@ -1158,11 +1114,21 @@ def _auto_wire_code_only_parameter_keys(raw_definition: dict[str, Any], excluded
     return changed
 
 
+def _convert_runtime_definition_shape(raw_definition: dict[str, Any]) -> bool:
+    wf_def = raw_definition.get("workflow_definition")
+    if not _has_runtime_definition_shape(wf_def):
+        return False
+    raw_definition["workflow_definition"] = _workflow_definition_to_authoring_shape(wf_def)
+    return True
+
+
 def _auto_wire_definition_string(definition: str, fmt: str, excluded_keys: set[str]) -> str:
     raw, parsed_format = _load_definition_dict(definition, fmt)
     if raw is None or parsed_format is None:
         return definition
-    if not _auto_wire_code_only_parameter_keys(raw, excluded_keys):
+    # Convert first: a runtime code block's empty ``parameters`` becomes the ``parameter_keys: []`` opt-out.
+    converted = _convert_runtime_definition_shape(raw)
+    if not (_auto_wire_code_block_parameter_keys(raw, excluded_keys) or converted):
         return definition
     return _dump_definition_dict(raw, parsed_format)
 
@@ -1280,6 +1246,7 @@ async def _inject_workflow_update_parameters(
     if raw is None or parsed_format is None:
         return definition, warnings
 
+    converted = _convert_runtime_definition_shape(raw)
     wf_def = raw.get("workflow_definition")
     if not isinstance(wf_def, dict):
         return definition, warnings
@@ -1293,8 +1260,6 @@ async def _inject_workflow_update_parameters(
 
     existing_params: list[dict[str, Any]] = existing_wf_def.get("parameters", [])
 
-    modified = False
-
     # --- Step 1: Always replace protected parameters with existing values ---
     # Credential/secret parameters — including workflow inputs of type credential_id —
     # should NEVER be modifiable via MCP. The existing workflow's values always win,
@@ -1305,6 +1270,14 @@ async def _inject_workflow_update_parameters(
     for param in existing_params:
         if _is_protected_update_parameter(param):
             protected_keys.add(param["key"])
+
+    # Only code blocks new to the workflow are auto-wired; an existing code block keeps its prior links via Step 3.
+    existing_labels = frozenset(
+        block["label"]
+        for block in _iter_blocks_flat(existing_wf_def.get("blocks", []))
+        if isinstance(block.get("label"), str) and block.get("block_type") == BlockType.CODE
+    )
+    modified = _auto_wire_code_block_parameter_keys(raw, protected_keys, existing_labels) or converted
 
     if protected_keys:
         # Remove any protected params the caller may have included (may have stale data)
@@ -1819,24 +1792,19 @@ async def skyvern_workflow_create(
         str, Field(description="Definition format: 'json', 'yaml', or 'auto' (tries JSON first, falls back to YAML)")
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
-    code_only: Annotated[
-        bool | None,
-        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
-    ] = None,
 ) -> dict[str, Any]:
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
 
     The ENTIRE workflow — its title, blocks, and parameters — must be serialized INTO the `definition`
     string (YAML or JSON). Do NOT pass title, blocks, parameters, or other workflow fields as separate
-    top-level arguments; only definition/format/folder_id/code_only are accepted and any other top-level
+    top-level arguments; only definition/format/folder_id are accepted and any other top-level
     field is rejected. Minimal JSON definition:
     {"title": "My workflow", "workflow_definition": {"blocks": [...], "parameters": [...]}}.
     This creates from a definition — it does not list or search; to browse existing workflows use
     skyvern_workflow_list.
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
-    Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
     When omitted, run_with defaults to "agent" and code_version defaults to 2 for both JSON and YAML
     definitions.
@@ -1883,17 +1851,10 @@ async def skyvern_workflow_create(
     if err := _validate_definition_structure(json_def, "skyvern_workflow_create"):
         return err
 
-    if code_only:
-        if json_def is not None:
-            if err := _validate_code_only_workflow_blocks(json_def, "skyvern_workflow_create"):
-                return err
-            # No exclusions on create: _auto_wire_code_only_parameter_keys already skips
-            # sensitive params, and there is no existing workflow to protect.
-            _auto_wire_code_only_parameter_keys(json_def, set())
-        elif err := _validate_code_only_definition(definition, format, "skyvern_workflow_create"):
-            return err
-        elif yaml_def is not None:
-            yaml_def = _auto_wire_definition_string(yaml_def, format, set())
+    if json_def is not None:
+        _auto_wire_code_block_parameter_keys(json_def, set())
+    elif yaml_def is not None:
+        yaml_def = _auto_wire_definition_string(yaml_def, format, set())
 
     with Timer() as timer:
         try:
@@ -1930,17 +1891,13 @@ async def skyvern_workflow_update(
     format: Annotated[  # noqa: A002
         str, Field(description="Definition format: 'json', 'yaml', or 'auto'")
     ] = "auto",
-    code_only: Annotated[
-        bool | None,
-        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
-    ] = None,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow.
 
     The ENTIRE updated workflow — its title, blocks, and parameters — must be serialized INTO the
     `definition` string; do NOT pass title/blocks/parameters as separate top-level arguments (only
-    workflow_id/definition/format/code_only are accepted, any other top-level field is rejected).
+    workflow_id/definition/format are accepted, any other top-level field is rejected).
 
     For very large workflows, run
     `skyvern workflow get --id <wpid> --definition-file wf.json`, edit wf.json, then run
@@ -1967,10 +1924,6 @@ async def skyvern_workflow_update(
             ),
         )
 
-    if code_only:
-        if err := _validate_code_only_definition(definition, format, "skyvern_workflow_update"):
-            return err
-
     existing_workflow: dict[str, Any] | None = None
 
     async def fetch_existing() -> dict[str, Any]:
@@ -1985,18 +1938,6 @@ async def skyvern_workflow_update(
         definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
         definition = await _inject_workflow_update_code_block_prompt_defaults(definition, format, fetch_existing)
         definition = _inject_code_block_derived_steps(definition, format)
-        if code_only:
-            existing = await fetch_existing()
-            existing_wf_def = existing.get("workflow_definition")
-            existing_params = existing_wf_def.get("parameters", []) if isinstance(existing_wf_def, dict) else []
-            # Only the existing workflow's protected keys need excluding here; sensitive
-            # keys in the submitted definition are already skipped inside the auto-wire.
-            protected_existing = {
-                parameter["key"]
-                for parameter in (existing_params if isinstance(existing_params, list) else [])
-                if _is_protected_update_parameter(parameter)
-            }
-            definition = _auto_wire_definition_string(definition, format, protected_existing)
         definition, param_warnings = await _inject_workflow_update_parameters(definition, format, fetch_existing)
     except NotFoundError:
         return make_result(

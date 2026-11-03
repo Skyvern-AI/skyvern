@@ -12,8 +12,6 @@ from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_REFUSAL_SENTINEL
 from skyvern.forge.sdk.copilot.tools import (
     _build_skyvern_mcp_overlays,
     edit_block_and_run_tool,
-    fill_credential_field_tool,
-    list_credentials_tool,
     run_blocks_tool,
     update_and_run_blocks_tool,
 )
@@ -35,11 +33,6 @@ class TestAgentPromptRefusalClause:
         rendered = _render_agent_prompt()
         assert "a password, API key, token, or one-time code" not in rendered
         assert RAW_SECRET_REFUSAL_SENTINEL not in rendered
-
-    def test_saved_credentials_are_resolved_by_name_or_id(self) -> None:
-        rendered = _render_agent_prompt()
-        assert "resolve one the user names, by exact name or credential ID" in rendered
-        assert "When a credential has already been resolved for the page you are on, use it" in rendered
 
     def test_old_permissive_clause_is_gone(self) -> None:
         """The v2 template used to authorize inline secrets via `parameters` — must be removed."""
@@ -69,21 +62,6 @@ class TestToolDocstringsRefusalClause:
             assert "one_time_code, private_key" not in desc
             assert "do not build or run with the raw value" in desc
             assert "CREDENTIAL HANDLING refusal rule" not in desc
-
-    def test_list_credentials_tool_describes_pagination(self) -> None:
-        """list_credentials docstring must warn about paging before concluding no match."""
-        desc = list_credentials_tool.description  # type: ignore[attr-defined]
-        assert "has_more" in desc
-        assert "already stored on a later page" in desc
-
-    def test_saved_login_state_is_reused_instead_of_rescouted(self) -> None:
-        run_desc = " ".join(run_blocks_tool.description.split())  # type: ignore[attr-defined]
-        fill_desc = " ".join(fill_credential_field_tool.description.split()).lower()  # type: ignore[attr-defined]
-
-        assert "existing saved block" in run_desc
-        assert "run that block unchanged" in run_desc
-        assert "existing saved login block" in fill_desc
-        assert "run that block unchanged" in fill_desc
 
 
 class TestBrowserToolOverlayRefusalCaveat:

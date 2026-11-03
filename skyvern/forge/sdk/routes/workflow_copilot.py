@@ -452,6 +452,9 @@ def _assistant_execution_receipts(
 ) -> dict[str, set[str]]:
     # Each turn writes a cumulative snapshot that already retracts failed runs, so the newest one wins.
     for message in reversed(chat_messages):
+        if message.sender == WorkflowCopilotChatSender.AI and message._narrative_payload_unreadable is True:
+            # Its receipts may have retracted older ones, so an unreadable snapshot is the boundary.
+            return {}
         payload = message.narrative_payload
         if (
             message.sender == WorkflowCopilotChatSender.AI

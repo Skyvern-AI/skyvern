@@ -9,7 +9,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import structlog
@@ -65,6 +65,8 @@ from skyvern.forge.sdk.copilot.workflow_yaml import strip_private_workflow_setti
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
+
+    from skyvern.forge.agent_functions import TriggerMappingReasonCode
 
 LOG = structlog.get_logger()
 
@@ -2178,6 +2180,14 @@ _PAGE_CHALLENGE_OUTCOME_SUMMARIES = {
     "unavailable": "Challenge solving is not available for this page",
 }
 
+# The first three match the Studio Triggers panel's delivery reasons (triggerErrors.ts).
+_TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
+    "mapping_path_missing": "A mapped path isn't in the body",
+    "invalid_mapping": "Mapping is invalid",
+    "invalid_parameters": "Inputs failed validation",
+    "owner_lookup_failed": "Couldn't look up your role; try again",
+}
+
 
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
@@ -2347,6 +2357,25 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if steps:
             summary = " → ".join(steps)
         return f"{summary} at {url[:80]}" if isinstance(url, str) and url else summary
+    if tool_name == "create_webhook_trigger":
+        return (
+            "Created a webhook trigger. It rejects every event until you click Rotate secret on it in the "
+            "Triggers panel and give your sender the new secret."
+        )
+    if tool_name == "test_trigger_mapping":
+        resolved = data.get("resolved_parameters")
+        if not data.get("accepted") or not isinstance(resolved, dict):
+            reason_code = cast("TriggerMappingReasonCode", data.get("reason_code"))
+            reason = _TRIGGER_MAPPING_REASON_LABELS.get(reason_code, "Mapping was rejected")
+            return f"The mapping did not resolve on the sample: {reason}"
+        pairs = ", ".join(
+            f"{sanitize_block_label_for_display(str(key))} = {sanitize_block_label_for_display(str(value), 80)}"
+            for key, value in resolved.items()
+        )
+        return f"Mapping resolved on the sample: {pairs}" if pairs else "Mapping resolved on the sample"
+    if tool_name == "list_workflow_triggers":
+        triggers = data.get("triggers")
+        return f"Found {len(triggers) if isinstance(triggers, list) else 0} trigger(s) on this workflow"
     return "OK"
 
 

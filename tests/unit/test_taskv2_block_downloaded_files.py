@@ -10,7 +10,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
-from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import TaskV2Block
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
@@ -30,51 +29,6 @@ def _output_parameter(key: str) -> OutputParameter:
         created_at=now,
         modified_at=now,
     )
-
-
-def test_taskv2_context_loop_state_available_after_nested_task_execution() -> None:
-    """Verify loop_internal_state survives nested task execution and remains available for filtering."""
-    loop_state = {
-        "downloaded_file_signatures_before_iteration": [
-            ["a.pdf", "abc", "https://files/a.pdf"],
-        ],
-    }
-
-    parent_context = SkyvernContext(
-        organization_id="org_1",
-        workflow_run_id="wr_1",
-        run_id="wr_1",
-        loop_internal_state=loop_state,
-    )
-    skyvern_context.set(parent_context)
-
-    with skyvern_context.scoped(
-        SkyvernContext(
-            organization_id="org_1",
-            workflow_run_id="wr_child",
-            workflow_permanent_id="wfp_child",
-            task_v2_id="tsk_v2_child",
-            run_id="wr_1",
-        )
-    ):
-        pass
-
-    current_context = skyvern_context.current()
-    assert current_context is not None
-    assert current_context is parent_context
-    assert current_context.loop_internal_state == loop_state
-
-    all_files = [
-        _file("https://files/a.pdf?sig=old", "a.pdf", "abc"),
-        _file("https://files/b.pdf?sig=new", "b.pdf", "def"),
-    ]
-    filtered = filter_downloaded_files_for_current_iteration(
-        all_files,
-        current_context.loop_internal_state,
-    )
-    assert [f.filename for f in filtered] == ["b.pdf"]
-
-    skyvern_context.reset()
 
 
 @pytest.fixture(autouse=True)

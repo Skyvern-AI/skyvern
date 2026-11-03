@@ -148,6 +148,9 @@ class _FakeBrowser:
     async def get_working_page(self) -> SkyvernBrowserPage:
         return SkyvernBrowserPage(MagicMock(), self._context.pages[-1])
 
+    async def get_page_for(self, page: Page) -> SkyvernBrowserPage:
+        return SkyvernBrowserPage(MagicMock(), page)
+
 
 class _LocalToolResult:
     def __init__(self, payload: dict[str, Any]) -> None:
@@ -496,8 +499,8 @@ async def test_iframe_navigation_invalidates_observed_ref(mcp_session: SessionSt
     assert "Unknown ref" in execute_result["data"]["results"][0]["error"]
 
 
-async def _select_frame_then_steal_focus(state: SessionState) -> tuple[Frame, Page]:
-    """Select the payment iframe, then let the page open a popup that takes focus on its own."""
+async def _select_frame_then_open_popup(state: SessionState) -> tuple[Frame, Page]:
+    """Select the payment iframe, then let the page open a popup that becomes the newest page on its own."""
     switched = await skyvern_frame_switch(selector="#pay-frame")
     assert switched["ok"] is True
     leftover_frame = state._working_frame
@@ -525,6 +528,28 @@ async def _select_frame_then_steal_focus(state: SessionState) -> tuple[Frame, Pa
         leftover_is_detached=leftover_frame.is_detached(),
     )
     return leftover_frame, popup
+
+
+async def _select_frame_then_steal_focus(state: SessionState) -> tuple[Frame, Page]:
+    leftover_frame, popup = await _select_frame_then_open_popup(state)
+    # get_page keeps the page it first resolved, so a popup alone no longer moves the selection; moving it here
+    # without clearing the frame leaves the selected frame owned by another page, which no tool path produces.
+    state._active_page = popup
+    return leftover_frame, popup
+
+
+@pytest.mark.asyncio
+async def test_popup_opened_by_the_page_leaves_the_selection_on_the_framed_page(mcp_session: SessionState) -> None:
+    leftover_frame, popup = await _select_frame_then_open_popup(mcp_session)
+
+    read = await skyvern_evaluate(expression="document.querySelector('#frame-only-sentinel')?.textContent ?? null")
+    typed = await skyvern_type(selector="#card", text="4242", selector_mode="direct")
+
+    assert read["ok"] is True, read
+    assert read["data"]["result"] == "payment-frame"
+    assert typed["ok"] is True, typed
+    assert await leftover_frame.locator("#card").input_value() == "4242"
+    assert await popup.locator("#card").input_value() == ""
 
 
 @pytest.mark.asyncio

@@ -422,6 +422,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         copilot_total_timeout_exceeded=False,
         workflow_verification_evidence=WorkflowVerificationEvidence(),
         last_run_blocks_workflow_run_id=None,
+        superseded_minted_browser_sessions=set(),
         last_run_blocks_block_ids=[],
         last_run_outcome_block_ids=[],
         last_run_blocks_block_labels=[],

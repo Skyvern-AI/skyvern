@@ -28,6 +28,7 @@ from skyvern.exceptions import (
     ActionDeadlineExceeded,
     ElementTreeBuildFailed,
     FailedToTakeScreenshot,
+    ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
     SkyvernPageAnalysisTimeout,
 )
@@ -856,6 +857,14 @@ def _is_screenshot_target_closed(
     return _is_engine_error(error, engine_selection) and _SCREENSHOT_TARGET_CLOSED_MESSAGE in str(error)
 
 
+def _is_screenshot_no_drawn_area(error: BaseException) -> bool:
+    """Chromium refuses to capture a viewport that has collapsed to zero in either axis. A reused
+    remote CDP context left at 0x0 is the usual source; see _apply_viewport_on_reused_context."""
+    with contextlib.suppress(Exception):
+        return "cannot take screenshot with 0 " in str(error).lower()
+    return False
+
+
 def screenshot_failure_outcome(
     exc: BaseException, engine_selection: BrowserEngineSelection | None
 ) -> ScreenshotFailureOutcome:
@@ -1285,6 +1294,8 @@ async def _current_viewpoint_screenshot_helper(
                 timeout_budget_ms=timeout,
             ),
         )
+        if _is_screenshot_no_drawn_area(e):
+            raise ScreenshotPageHasNoDrawnArea(error_message=str(e)) from e
         raise FailedToTakeScreenshot(error_message=str(e)) from e
 
 
@@ -1381,7 +1392,14 @@ async def _cdp_rescue_screenshot(
                 )
                 return _RESCUE_DECLINED
             stage = ScreenshotStage.CAPTURE
-            result = await session.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})
+            # Health-silent captures trade a larger PNG for a several-times-faster encode so a large viewport fits the
+            # raw work window; agent-path captures keep the default encode.
+            params: dict[str, str | bool] = {
+                "format": "png",
+                "captureBeyondViewport": False,
+                **({} if record_health else {"optimizeForSpeed": True}),
+            }
+            result = await session.send("Page.captureScreenshot", params)
         stage = ScreenshotStage.VALIDATION
         data = base64.b64decode(result.get("data", ""), validate=False)
         if data[: len(_PNG_SIGNATURE)] != _PNG_SIGNATURE:
@@ -2180,6 +2198,7 @@ class SkyvernFrame:
         async def bootstrap_expression() -> Any:
             return await _dispatch_dom_utils_bootstrap(frame, arg, force_cdp=force_cdp)
 
+        deadline_kwargs: dict[str, Any] = {"deadline": deadline} if deadline is not None else {}
         return await SkyvernFrame._evaluate_expression(
             frame=frame,
             expression=expression,
@@ -2187,7 +2206,27 @@ class SkyvernFrame:
             timeout_ms=timeout_ms,
             engine_selection=engine_selection,
             bootstrap_expression=bootstrap_expression,
-            **({"deadline": deadline} if deadline is not None else {}),
+            **deadline_kwargs,
+        )
+
+    @staticmethod
+    async def evaluate_on_element(
+        frame: Page | Frame,
+        element: ElementHandle,
+        expression: str,
+        arg: Any | None = None,
+        timeout_ms: float = SettingsManager.get_settings().BROWSER_ACTION_TIMEOUT_MS,
+        engine_selection: BrowserEngineSelection | None = None,
+    ) -> Any:
+        # Runs in the context that produced ``element``; ``frame`` only labels browser-health accounting. A destroyed
+        # context invalidates the handle itself, so navigation recovery could only retry a handle that cannot answer.
+        return await SkyvernFrame._evaluate_expression(
+            frame=frame,
+            expression=expression,
+            evaluate_expression=lambda: element.evaluate(expression, arg),
+            timeout_ms=timeout_ms,
+            engine_selection=engine_selection,
+            recover_navigation=False,
         )
 
     @staticmethod
@@ -2199,6 +2238,7 @@ class SkyvernFrame:
         engine_selection: BrowserEngineSelection | None = None,
         deadline: float | None = None,
         bootstrap_expression: Callable[[], Awaitable[Any]] | None = None,
+        recover_navigation: bool = True,
     ) -> Any:
         if isinstance(expression, _DomUtilsExpression):
             if bootstrap_expression is None:
@@ -2230,7 +2270,7 @@ class SkyvernFrame:
             # `evaluate_in_main_world` raises RuntimeError on Runtime.evaluate
             # exception payloads; only navigation-context-lost text recovers here.
             error_msg = str(e)
-            if not _is_navigation_context_lost(error_msg):
+            if not recover_navigation or not _is_navigation_context_lost(error_msg):
                 raise
             return await SkyvernFrame._evaluate_with_navigation_recovery(
                 frame=frame,
@@ -2248,7 +2288,7 @@ class SkyvernFrame:
             if not _is_engine_error(e, engine_selection):
                 raise
             error_msg = str(e)
-            if not _is_navigation_context_lost(error_msg):
+            if not recover_navigation or not _is_navigation_context_lost(error_msg):
                 raise
             return await SkyvernFrame._evaluate_with_navigation_recovery(
                 frame=frame,

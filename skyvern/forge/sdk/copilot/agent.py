@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -235,6 +235,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     BrowserProbeOutcome,
     _browser_context_attachability,
+    cancel_ledgered_build_test_prestarts,
     close_browser_session_quietly,
     end_minted_browser_renewals,
     record_attached_browser_driver,
@@ -340,6 +341,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     runner_code_block_associations,
     stored_block_code,
     stored_workflow_yaml,
+    workflow_to_copilot_yaml,
 )
 from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
@@ -590,7 +592,7 @@ async def _resolve_live_browser_session_id(
 
 
 def _historical_turn_facts_projection(
-    narrative_payload: TurnNarrativePayload | None,
+    narrative_payload: Mapping[str, Any] | None,
 ) -> HistoricalTurnFactsProjection | None:
     if not isinstance(narrative_payload, dict):
         return None
@@ -1916,13 +1918,16 @@ def _draft_ran_on_current_source(facts: NarrativeTurnFacts) -> bool:
     return facts["runCompleted"] is not False and facts["evaluationState"] != "not_demonstrated"
 
 
-def _review_projection_for(ctx: CopilotContext, proposal_yaml: str | None) -> NarrativeReviewProjection | None:
+def _review_projection_for(
+    ctx: CopilotContext, proposal_yaml: str | None, candidate: Workflow | None = None
+) -> NarrativeReviewProjection | None:
     if not isinstance(proposal_yaml, str):
         return None
     review = build_review_projection(
         saved_workflow_canvas(ctx) or _EMPTY_REVIEW_BASELINE_YAML,
         proposal_yaml,
         ctx.executed_block_fingerprints,
+        workflow_to_copilot_yaml(candidate) if isinstance(candidate, Workflow) else None,
     )
     if review is None:
         return None
@@ -2132,7 +2137,7 @@ def _make_agent_result(
     if ctx is not None and narrative_payload is None:
         raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     if ctx is not None and isinstance(narrative_payload, dict) and isinstance(proposal_yaml, str):
-        review = _review_projection_for(ctx, proposal_yaml)
+        review = _review_projection_for(ctx, proposal_yaml, kwargs.get("updated_workflow"))
         narrative_payload = {key: value for key, value in narrative_payload.items() if key != "review"}
         if review is not None:
             narrative_payload["review"] = review
@@ -2425,7 +2430,7 @@ def _build_narrative_payload(
     if ctx.demonstration_items:
         payload["demonstrationItems"] = list(ctx.demonstration_items)
     if ctx.staged_workflow_yaml is not None:
-        review = _review_projection_for(ctx, ctx.staged_workflow_yaml)
+        review = _review_projection_for(ctx, ctx.staged_workflow_yaml, ctx.staged_workflow)
         if review is not None:
             payload["review"] = review
     payload["testedBlockFingerprints"] = serialize_execution_receipts(ctx.executed_block_fingerprints)
@@ -5348,8 +5353,10 @@ async def run_copilot_agent(
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
                 if turn_end_ctx is not None:
-                    # Synchronous and first, so no later cleanup step that raises or is cancelled can leave a
-                    # minted browser stamped for the life of this process.
+                    # These three run synchronously before any awaited cleanup, so a later step that raises or is
+                    # cancelled cannot leave a pre-start running or a minted browser stamped for this process's life.
+                    turn_end_ctx.prestart_teardown_started = True
+                    cancel_ledgered_build_test_prestarts(turn_end_ctx)
                     end_minted_browser_renewals(turn_end_ctx)
                 _log_authoring_turn_summary(turn_end_ctx)
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)

@@ -3943,55 +3943,7 @@ async def test_workflow_update_does_not_duplicate_keys_on_positional_reinjection
 
 
 @pytest.mark.asyncio
-async def test_code_only_update_auto_wires_new_parameter_and_preserves_existing_link(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
-    existing = {
-        "proxy_location": "RESIDENTIAL",
-        "workflow_definition": {
-            "parameters": [
-                {"parameter_type": "workflow", "key": "old", "workflow_parameter_type": "string"},
-            ],
-            "blocks": [
-                {
-                    "block_type": "code",
-                    "label": "use_values",
-                    "parameter_keys": ["old"],
-                    "code": "return old",
-                }
-            ],
-        },
-    }
-    get_workflow_by_id = AsyncMock(return_value=existing)
-    _patch_get_workflow_by_id(monkeypatch, get_workflow_by_id)
-    definition = {
-        "title": "Updated workflow",
-        "proxy_location": "RESIDENTIAL",
-        "workflow_definition": {
-            "parameters": [
-                {"parameter_type": "workflow", "key": "old", "workflow_parameter_type": "string"},
-                {"parameter_type": "workflow", "key": "new", "workflow_parameter_type": "string"},
-            ],
-            "blocks": [{"block_type": "code", "label": "use_values", "code": "return old, new"}],
-        },
-    }
-
-    result = await workflow_tools.skyvern_workflow_update(
-        workflow_id="wpid_test",
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    assert result["ok"] is True, result
-    sent = request_mock.await_args.kwargs["json"]["json_definition"]
-    assert sent["workflow_definition"]["blocks"][0]["parameter_keys"] == ["old", "new"]
-    get_workflow_by_id.assert_awaited_once_with("wpid_test")
-
-
-@pytest.mark.asyncio
-async def test_code_only_update_auto_wires_nested_loop_blocks_and_respects_empty_opt_out(
+async def test_update_auto_wires_nested_loop_blocks_and_respects_empty_opt_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
@@ -4024,7 +3976,6 @@ async def test_code_only_update_auto_wires_nested_loop_blocks_and_respects_empty
         workflow_id="wpid_test",
         definition=json.dumps(definition),
         format="json",
-        code_only=True,
     )
 
     assert result["ok"] is True, result
@@ -4035,7 +3986,7 @@ async def test_code_only_update_auto_wires_nested_loop_blocks_and_respects_empty
 
 
 @pytest.mark.asyncio
-async def test_code_only_update_never_auto_wires_misdeclared_existing_credential(
+async def test_update_never_auto_wires_misdeclared_existing_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
@@ -4056,7 +4007,7 @@ async def test_code_only_update_never_auto_wires_misdeclared_existing_credential
                 {"parameter_type": "workflow", "key": "secret", "workflow_parameter_type": "string"},
                 {"parameter_type": "workflow", "key": "public", "workflow_parameter_type": "string"},
             ],
-            "blocks": [{"block_type": "code", "label": "use_values", "code": "return public"}],
+            "blocks": [{"block_type": "code", "label": "new_block", "code": "return public"}],
         },
     }
 
@@ -4064,7 +4015,6 @@ async def test_code_only_update_never_auto_wires_misdeclared_existing_credential
         workflow_id="wpid_test",
         definition=json.dumps(definition),
         format="json",
-        code_only=True,
     )
 
     assert result["ok"] is True, result

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 from collections.abc import Callable
@@ -16,6 +17,7 @@ from pytest import MonkeyPatch  # type: ignore[import-not-found]
 from skyvern.exceptions import MissingBrowserStatePage, get_user_facing_exception_message
 from skyvern.forge import app
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.async_operations import AgentPhase, AsyncOperation, AsyncOperationPool
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.api.llm import api_handler_factory
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
@@ -282,6 +284,53 @@ def make_step(
     }
     base.update(overrides)
     return Step(**base)
+
+
+class ParkedOperation(AsyncOperation):
+    """A pooled operation that runs until cancelled and, like the cloud mouse movement, swallows that cancellation."""
+
+    def __init__(self, task_id: str, *, unwind_steps: int = 0) -> None:
+        super().__init__(task_id, "PARKED", AgentPhase.scrape, page=MagicMock())
+        self.started = asyncio.Event()
+        self.settled = asyncio.Event()
+        self.handled_cancellation = False
+        self.on_cancel: Callable[[], object] | None = None
+        # Event-loop passes the operation takes to finish after its cancellation, so ending is observably later.
+        self.unwind_steps = unwind_steps
+
+    async def execute(self) -> None:
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.handled_cancellation = True
+            if self.on_cancel is not None:
+                self.on_cancel()
+            for _ in range(self.unwind_steps):
+                await asyncio.sleep(0)
+        finally:
+            self.settled.set()
+
+
+async def start_pooled_operation(pool: AsyncOperationPool, operation: ParkedOperation) -> asyncio.Task:
+    pool.add_operations(operation.task_id, [operation])
+    pool.run_operation(operation.task_id, operation.agent_phase)
+    aio_task = pool.get_aio_task(operation.task_id, operation.type)
+    assert aio_task is not None
+    await asyncio.wait_for(operation.started.wait(), timeout=2)
+    return aio_task
+
+
+async def stop_pooled_operations(pool: AsyncOperationPool, *task_ids: str) -> None:
+    """Test teardown: reap whatever these tasks left in the process-wide pool, so no test leaks a running operation."""
+    running = [aio_task for task_id in task_ids for aio_task in pool.get_aio_tasks(task_id)]
+    for aio_task in running:
+        aio_task.cancel()
+    if running:
+        await asyncio.wait(running, timeout=2)
+    for task_id in task_ids:
+        pool._remove_aio_tasks(task_id)
+        pool._remove_operations(task_id)
 
 
 @dataclass
