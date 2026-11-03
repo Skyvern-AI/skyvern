@@ -24,7 +24,7 @@ from ._common import ErrorCode, make_error, make_result
 from .trajectory import skyvern_trajectory_get
 
 PARAMETER_WIRING_HINT = (
-    "Non-credential workflow parameters are auto-wired into code blocks on code-only create/update "
+    "Non-credential workflow parameters are auto-wired into code blocks on create/update "
     "when a block omits parameter_keys; pass explicit parameter_keys to wire anything else, or [] to opt out."
 )
 

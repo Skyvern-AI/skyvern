@@ -663,6 +663,10 @@ class AgentContext:
     cancelled_build_test_prestarts: dict[asyncio.Task[PrestartedBrowser | None], str] = field(default_factory=dict)
     # Set first thing at turn end: a pre-start that finishes later finds the sweeps already run and cleans up itself.
     prestart_teardown_started: bool = False
+    # Closed when a newer test started; an older call's result that lands later must not rebind last_run to one.
+    superseded_minted_browser_sessions: set[str] = field(default_factory=set)
+    # A resumed browser's earlier run id and how many calls hold it while their runs are not yet submitted.
+    minted_browser_claims: dict[str, tuple[str, int]] = field(default_factory=dict)
     browser_allocation_recorder: Callable[[str, str | None], Awaitable[None]] | None = None
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
