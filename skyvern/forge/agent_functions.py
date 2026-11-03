@@ -1024,6 +1024,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    async def nango_powerbi_available(self, organization_id: str) -> bool:
+        return False
+
     async def ensure_email_forwarding_available(
         self, organization_id: str | None = None, *, fresh: bool = True
     ) -> bool:

@@ -801,6 +801,314 @@ async def test_click_refuses_a_natively_disabled_target_before_the_actionability
     assert downs == {"submit-on": 1, "soon-on": 1, "blink-on": 1, "aria-soon-on": 1, **clicked_aria}, (downs, aria)
 
 
+_MULTI_ACCOUNT_ROW_HTML = """<!doctype html><html><body>
+  <!-- Each row ships a display:none submit whose `value` carries the row's text, so Playwright's text
+       engine matches it FIRST in document order. -->
+  <div style="display:none">
+    <input type="submit" id="acct-hidden" value="ACCT-10041">
+  </div>
+  <button id="acct-card" data-row>ACCT-10041</button>
+
+  <!-- The same shape with a space in the text, which `_is_host_anchored_selector` reads as a combinator. -->
+  <div style="display:none"><input type="submit" id="spaced-hidden" value="PAY MY BILL"></div>
+  <button id="spaced-card" data-row>PAY MY BILL</button>
+
+  <!-- The rendered match already comes first. -->
+  <button id="solo-first" data-row>SOLOROW</button>
+  <div style="display:none"><input type="submit" id="solo-hidden" value="SOLOROW"></div>
+
+  <!-- Two rendered matches: a real choice, so position keeps deciding it as it does on main. -->
+  <button id="dup-first" data-row>DUPEROW</button>
+  <button id="dup-second" data-row>DUPEROW</button>
+<script>
+  window.clicks = [];
+  for (const el of document.querySelectorAll("[data-row], input[type=submit]")) {
+    el.addEventListener("click", () => window.clicks.push(el.id));
+  }
+</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_click_on_a_multi_match_selector_lands_on_the_one_row_the_page_renders() -> None:
+    # A selector the model wrote is not counted by the single-target guard, so the non-strict driver action
+    # took the first match, a submit inside a display:none subtree, and spent the whole actionability wait.
+    async with _content_page(_MULTI_ACCOUNT_ROW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        click = _tool(tools, "click").handler
+        hidden_first = await click({"selector": "text=ACCT-10041"})
+        spaced = await click({"selector": "text=PAY MY BILL"})
+        rendered_first = await click({"selector": "text=SOLOROW"})
+        two_rendered = await click({"selector": "text=DUPEROW"})
+        clicks = await page.evaluate("() => window.clicks")
+    assert hidden_first.status == "ok", hidden_first.content
+    # A space in the text is not ambiguity: one element could ever have received this, and the count that
+    # the host-anchored predicate enables used to refuse it outright.
+    assert spaced.status == "ok", spaced.content
+    assert rendered_first.status == "ok", rendered_first.content
+    assert two_rendered.status == "ok", two_rendered.content
+    # The rendered row received every click and the boxless duplicates received none -- the behavior the
+    # 15s timeout stood in for. Order matters: it also pins which of two rendered matches wins.
+    assert clicks == ["acct-card", "spaced-card", "solo-first", "dup-first"], clicks
+
+
+_SPACED_DUPLICATE_FIELD_HTML = """<!doctype html><html><body>
+  <div class="rows"><div style="display:none"><input class="acct" id="acct-hidden"></div></div>
+  <div class="rows"><input class="acct" id="acct-visible"></div>
+  <button>Go Now</button><button>Go Now</button>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_every_rendered_target_tool_treats_a_spaced_selector_by_one_rule() -> None:
+    # One rendered match among hidden ones narrows on all four tools, a spaced engine selector included; a
+    # plain spaced CSS selector reads as an observe composite and is counted and refused on all four.
+    calls = (("click", {}), ("hover", {}), ("type", {"text": "ACCT 10041"}), ("select_combobox", {"value": "x"}))
+    async with _content_page(_SPACED_DUPLICATE_FIELD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for tool_name, extra in calls:
+            result, _ = await _dispatch(tools, tool_name, {"selector": "css=.rows input.acct", **extra})
+            assert "matches 2 elements" not in result.content, (tool_name, result.content)
+            assert "acct-hidden" not in result.content, (tool_name, result.content)
+        assert await page.evaluate("document.querySelector('#acct-hidden').value") == ""
+        assert await page.evaluate("document.querySelector('#acct-visible').value")
+        for tool_name, extra in calls:
+            result, _ = await _dispatch(tools, tool_name, {"selector": ".rows input.acct", **extra})
+            assert "matches 2 elements" in result.content, (tool_name, result.content)
+            # Two rendered matches is a real choice, and no match is nothing to narrow: both stay refused.
+            result, _ = await _dispatch(tools, tool_name, {"selector": "text=Go Now", **extra})
+            assert "matches 2 elements" in result.content, (tool_name, result.content)
+            result, _ = await _dispatch(tools, tool_name, {"selector": "text=No Such Row", **extra})
+            assert "matches nothing" in result.content, (tool_name, result.content)
+
+
+_LABELLED_ROW_HTML = """<!doctype html><html><head><style>.accts td.num input { display: none; }</style></head><body>
+<table class="accts"><tr>
+  <td class="num"><input type="submit" id="acct1" value="10041" onclick="window.opened.push('10041'); return false;"></td>
+  <td><label for="acct1">&#9679;</label></td><td><label for="acct1">Account 10041, 12 Elm Street</label></td>
+  <td><label for="acct1">$54.20</label></td>
+</tr></table>
+<input type="checkbox" id="agree" name="opt" style="display:none"><label for="agree" id="agree-label">I agree</label>
+<button name="opt" id="danger" onclick="window.opened.push('danger')">Delete account</button>
+<script>window.opened = [];</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_narrowing_follows_the_label_that_reaches_a_hidden_match() -> None:
+    async with _content_page(_LABELLED_ROW_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        # The rendered match is a label of the hidden submit, so it is the target.
+        row, _ = await _dispatch(tools, "click", {"selector": "text=10041"})
+        assert row.status == "ok", row.content
+        # The hidden checkbox is still reached through its own label, so the unrelated rendered button is
+        # not a forced choice and the label path acts as before.
+        box, _ = await _dispatch(tools, "click", {"selector": '[name="opt"]'})
+        assert box.status == "ok", box.content
+        assert await page.evaluate("document.querySelector('#agree').checked")
+        assert await page.evaluate("window.opened") == ["10041"]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_rendered_first_match_keeps_the_selector_the_page_can_re_resolve() -> None:
+    # The row swaps its button on mouseenter. The model's selector re-resolves to the new node; a token
+    # written on the old one would be stale by the time the driver clicks.
+    async with _content_page(
+        """<div id="row"><button class="go" style="width:80px;height:20px">Open</button></div>
+        <div style="display:none"><button class="go">Open</button></div>
+        <script>
+        window.clicked = 0;
+        const row = document.querySelector('#row');
+        row.addEventListener('mouseenter', () => {
+          const fresh = document.createElement('button');
+          fresh.className = 'go'; fresh.textContent = 'Open'; fresh.style.cssText = 'width:80px;height:20px';
+          fresh.addEventListener('click', () => { window.clicked += 1; });
+          row.replaceChildren(fresh);
+        }, { once: true });
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result, _ = await _dispatch(tools, "click", {"selector": "button.go"})
+        assert result.status == "ok", result.content
+        assert await page.evaluate("window.clicked") == 1
+
+
+_TWIN_TYPEAHEAD_HTML = """<!doctype html><html><body style="margin:0">
+  <div style="display:none"><input class="cty"></div>
+  <input class="cty" id="country" role="combobox" aria-autocomplete="list" aria-controls="country-list" type="text"
+         autocomplete="off" style="position:absolute;top:20px;left:20px;width:300px;height:24px">
+  <div id="country-list" role="listbox" style="position:absolute;top:52px;left:20px;width:300px;background:#fff"></div>
+  <script>
+    var OPTIONS = ['United States (+1)', 'United States Minor Outlying Islands (+1)', 'United Kingdom (+44)'];
+    var input = document.getElementById('country');
+    var list = document.getElementById('country-list');
+    window.inputs = 0;
+    input.addEventListener('input', function () {
+      window.inputs += 1;
+      list.innerHTML = '';
+      var q = input.value.trim().toLowerCase();
+      if (!q) return;
+      OPTIONS.filter(function (o) { return o.toLowerCase().indexOf(q) === 0; }).forEach(function (text) {
+        var row = document.createElement('div');
+        row.setAttribute('role', 'option');
+        row.style.height = '24px';
+        row.textContent = text;
+        row.addEventListener('click', function () {
+          input.value = text;
+          input.setAttribute('data-committed', text);
+          list.innerHTML = '';
+        });
+        list.appendChild(row);
+      });
+    });
+  </script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_narrowed_typeahead_keeps_its_offered_rows_for_the_follow_up_pick() -> None:
+    async with _live_page(_TWIN_TYPEAHEAD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        typed, _ = await _dispatch(tools, "type", {"selector": ".cty", "text": "United"})
+        assert "United Kingdom (+44)" in typed.content, typed.content
+        inputs_after_type = await page.evaluate("window.inputs")
+        picked, _ = await _dispatch(tools, "select_combobox", {"selector": ".cty", "value": "United Kingdom (+44)"})
+        assert picked.status == "ok", picked.content
+        assert await page.eval_on_selector("#country", "el => el.getAttribute('data-committed')") == (
+            "United Kingdom (+44)"
+        )
+        # The pick came from the rows the type call offered, not from typing the label again.
+        assert await page.evaluate("window.inputs") == inputs_after_type
+
+
+_RENDERED_FIRST_SPACED_HTML = """<!doctype html><html><body>
+  <button class="pay" onclick="window.paid = (window.paid || 0) + 1">Pay my bill</button>
+  <div style="display:none"><input type="submit" class="pay" value="Pay my bill"></div>
+  <div class="first"><input class="f2" id="f2-visible"></div>
+  <div class="first"><div style="display:none"><input class="f2" id="f2-hidden"></div></div>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_spaced_engine_selector_rendered_first_narrows_instead_of_being_refused() -> None:
+    # The guard counts a spaced selector, so leaving it untouched would refuse it as ambiguous.
+    async with _content_page(_RENDERED_FIRST_SPACED_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        for tool_name, extra in (("click", {}), ("hover", {})):
+            result, _ = await _dispatch(tools, tool_name, {"selector": "text=Pay my bill", **extra})
+            assert result.status == "ok", (tool_name, result.content)
+        assert await page.evaluate("window.paid") == 1
+        for tool_name, extra in (("type", {"text": "ACCT 1"}), ("select_combobox", {"value": "x"})):
+            result, _ = await _dispatch(tools, tool_name, {"selector": "css=.first input.f2", **extra})
+            assert "matches 2 elements" not in result.content, (tool_name, result.content)
+        assert await page.evaluate("document.querySelector('#f2-visible').value")
+        assert await page.evaluate("document.querySelector('#f2-hidden').value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_typed_selector_in_a_child_frame_narrows_in_that_frame() -> None:
+    frame = (
+        "<div style='display:none'><input class='fr' id='fh'><button class='go'>Go</button></div>"
+        "<input class='fr' id='fv'><button class='go' onclick='window.c = (window.c || 0) + 1'>Go</button>"
+    )
+    async with _live_page(
+        f'<!doctype html><html><body><iframe srcdoc="{frame}" width="400" height="200"></iframe></body></html>'
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        clicked, _ = await _dispatch(tools, "click", {"selector": "button.go"})
+        assert clicked.status == "ok", clicked.content
+        typed, _ = await _dispatch(tools, "type", {"selector": "input.fr", "text": "hello"})
+        assert typed.status == "ok", typed.content
+        child = page.frames[1]
+        assert await child.evaluate("window.c") == 1
+        assert await child.evaluate("[document.querySelector('#fh').value, document.querySelector('#fv').value]") == [
+            "",
+            "hello",
+        ]
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_selector_past_the_match_cap_is_left_to_the_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(taskv3_tools, "_ACTION_TIMEOUT_MS", 1500)
+    hidden = '<div style="display:none"><button class="many">Row</button></div>' * 12
+    async with _content_page(
+        f'<!doctype html><html><body>{hidden}<button class="many" id="shown">Row</button></body></html>'
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        result, _ = await _dispatch(tools, "click", {"selector": "button.many"})
+        assert result.status == "error", result.content
+        assert await page.evaluate("document.querySelector('#shown').getAttribute('data-tv3-act')") is None
+
+
+_UNLABELLED_TEMPLATE_HTML = """<!doctype html><html><body>
+  <div style="display:none"><input class="field" id="template"></div>
+  <label for="email">Email address</label><input class="field" id="email">
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_answer_audit_names_the_field_the_narrowed_type_fills() -> None:
+    async with _content_page(_UNLABELLED_TEMPLATE_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        type_tool = _tool(tools, "type")
+        _, name, _, _ = await type_tool.answer_probe({"selector": ".field", "text": "a@b.c", "press_enter": True})
+        assert name == "Email address"
+        typed, _ = await _dispatch(tools, "type", {"selector": ".field", "text": "a@b.c", "press_enter": True})
+        assert typed.status == "ok", typed.content
+        assert await page.evaluate("document.querySelector('#email').value") == "a@b.c"
+        assert await page.evaluate("document.querySelector('#template').value") == ""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_stale_host_anchored_selector_with_one_rendered_clone_is_still_refused() -> None:
+    # The page hid the observed control and rendered a different one in its place. The observe-minted
+    # selector now names both, and the rendered one is NOT the control the model observed.
+    async with _live_page(
+        """<x-card id="card"></x-card>
+        <script>
+        window.__clicked = [];
+        const root = document.querySelector('x-card').attachShadow({mode: 'open'});
+        root.innerHTML = '<button style="width:80px;height:20px">Save</button>';
+        root.querySelector('button').addEventListener('click', () => window.__clicked.push('save'));
+        window.__clone = () => {
+          const d = document.createElement('button'); d.textContent = 'Delete';
+          d.style.cssText = 'width:80px;height:20px';
+          d.addEventListener('click', () => window.__clicked.push('delete'));
+          root.querySelector('button').style.display = 'none';
+          root.prepend(d);
+        };
+        </script>"""
+    ) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        await _tool(tools, "observe").handler({})
+        selectors = [e["selector"] for e in (await _observe_data(page))["elements"]]
+        anchored = [sel for sel in selectors if sel.startswith("#card ")]
+        assert anchored, selectors
+        await page.evaluate("window.__clone()")
+        for sel in anchored:
+            for tool_name, extra in (("click", {}), ("hover", {}), ("type", {"text": "x"})):
+                result, _ = await _dispatch(tools, tool_name, {"selector": sel, **extra})
+                assert result.status == "error", (tool_name, result.content)
+                assert "matches 2 elements" in result.content, (tool_name, result.content)
+        assert await page.evaluate("window.__clicked") == []
+
+
 @_skip_no_browser
 @pytest.mark.asyncio
 async def test_observe_renders_group_context() -> None:
