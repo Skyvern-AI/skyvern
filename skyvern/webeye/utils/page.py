@@ -1392,7 +1392,14 @@ async def _cdp_rescue_screenshot(
                 )
                 return _RESCUE_DECLINED
             stage = ScreenshotStage.CAPTURE
-            result = await session.send("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})
+            # Health-silent captures trade a larger PNG for a several-times-faster encode so a large viewport fits the
+            # raw work window; agent-path captures keep the default encode.
+            params: dict[str, str | bool] = {
+                "format": "png",
+                "captureBeyondViewport": False,
+                **({} if record_health else {"optimizeForSpeed": True}),
+            }
+            result = await session.send("Page.captureScreenshot", params)
         stage = ScreenshotStage.VALIDATION
         data = base64.b64decode(result.get("data", ""), validate=False)
         if data[: len(_PNG_SIGNATURE)] != _PNG_SIGNATURE:

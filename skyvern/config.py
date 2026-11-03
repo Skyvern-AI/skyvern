@@ -320,8 +320,6 @@ class Settings(BaseSettings):
     # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
-    # Default code_only for MCP block/workflow tools. Off = permissive.
-    MCP_CODE_ONLY_MODE: bool = False
     RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight

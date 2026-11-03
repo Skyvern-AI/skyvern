@@ -6,7 +6,7 @@ overrides:
   vitest: ^4.1.12
   vite: ^7.3.7
   rollup: ^4.59.0
-  serialize-javascript: ^7.0.3
+  serialize-javascript: ^7.1.3
   fast-uri: ^3.1.9
   source-map-js: ^1.2.2
   ajv: ^8.18.0
@@ -694,8 +694,8 @@ packages:
     resolution: {integrity: sha512-SdsKMrI9TdgjdweUSR9MweHA4EJ8YxHn8DFaDisvhVlUOe4BF1tLD7GAj0lIqWVl+dPb/rExr0Btby5loQm20Q==}
     engines: {node: '>=10'}
     hasBin: true
-  serialize-javascript@7.0.7:
-    resolution: {integrity: sha512-YAy8Od6KV+uuwUuU50np8fGB/Aues6Y0nAhA9y/hId74PlKUcme4pXcBD46NWKr1Q4osN/iseZ17YqO1XfmI8g==}
+  serialize-javascript@7.1.4:
+    resolution: {integrity: sha512-FqlEuoTq/zRmA4Lg6aOqyH3lCHbUtCB0bmHCeFniX2GBdDqMJM3FwdvEhlE5Pim1dlt2FfBdVPmUNNiGhhKqpw==}
     engines: {node: '>=20.0.0'}
   siginfo@2.0.0:
     resolution: {integrity: sha512-ybx0WO1/8bSBLEWXZvEd7gMW3Sn3JFlW3TvX1nREbDLRNQNaeNN8WK0meBwPdAaOI7TtRRRJn/Es1zhrrCHu7g==}
@@ -1452,7 +1452,7 @@ snapshots:
       ajv-formats: 2.1.1(ajv@8.20.0)
       ajv-keywords: 5.1.0(ajv@8.20.0)
   semver@7.7.3: {}
-  serialize-javascript@7.0.7: {}
+  serialize-javascript@7.1.4: {}
   siginfo@2.0.0: {}
   signal-exit@4.1.0: {}
   source-map-js@1.2.2: {}
@@ -1486,7 +1486,7 @@ snapshots:
       '@jridgewell/trace-mapping': 0.3.31
       jest-worker: 27.5.1
       schema-utils: 4.3.3
-      serialize-javascript: 7.0.7
+      serialize-javascript: 7.1.4
       terser: 5.44.0
       webpack: 5.104.1
   terser@5.44.0:
