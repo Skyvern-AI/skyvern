@@ -76,6 +76,7 @@ async def _execute(
 ) -> BlockResult:
     context = context or FakeWorkflowRunContext(values={})
     context.organization_id = "org_test"
+    context._powerbi_hop_tokens[block.label] = "test-hop-token"
 
     async def build_result(self: PowerBIQueryBlock, **kwargs: object) -> BlockResult:
         return _block_result(self, **kwargs)
@@ -101,6 +102,7 @@ def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -
                     "block_type": "powerbi_query",
                     "label": "query_sales",
                     "connection_id": "conn_test",
+                    "credential_source": "nango",
                     "dataset_id": _DATASET,
                     "query": "EVALUATE VALUES('Sales')",
                 }
@@ -115,6 +117,7 @@ def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -
     block_yaml = definition.blocks[0]
     assert isinstance(block_yaml, PowerBIQueryBlockYAML)
     assert block_yaml.block_type == BlockType.POWERBI_QUERY
+    assert block_yaml.credential_source == "nango"
     assert block_yaml.max_rows == 1_000
     assert block_yaml.model_dump(mode="json")["connection_id"] == "conn_test"
 
@@ -122,9 +125,32 @@ def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -
     runtime_block = block_yaml_to_block(block_yaml, {output.key: output})
     assert isinstance(runtime_block, PowerBIQueryBlock)
     assert runtime_block.connection_id == "conn_test"
+    assert runtime_block.credential_source == "nango"
     assert runtime_block.dataset_id == _DATASET
     assert runtime_block.query == "EVALUATE VALUES('Sales')"
     assert runtime_block.max_rows == 1_000
+
+
+def test_powerbi_query_credential_source_defaults_to_nango_and_rejects_native() -> None:
+    block_yaml = PowerBIQueryBlockYAML(
+        label="query_sales",
+        connection_id="conn_test",
+        dataset_id=_DATASET,
+        query="EVALUATE VALUES('Sales')",
+    )
+
+    assert block_yaml.credential_source == "nango"
+    assert _block().credential_source == "nango"
+    with pytest.raises(ValidationError):
+        PowerBIQueryBlockYAML(
+            label="query_sales",
+            connection_id="conn_test",
+            credential_source="native",  # type: ignore[arg-type]
+            dataset_id=_DATASET,
+            query="EVALUATE VALUES('Sales')",
+        )
+    with pytest.raises(ValidationError):
+        _block(credential_source="native")
 
 
 @pytest.mark.parametrize("max_rows", [0, 100_001, True, 1.0, "1000", "{{ row_cap }}"])
@@ -268,15 +294,30 @@ async def test_powerbi_query_renders_fields_and_returns_direct_rows(monkeypatch:
 
     assert result.success is True
     assert result.output_parameter_value == _ROWS
+    assert context.get_powerbi_hop_token("query_sales") == "test-hop-token"
     run_query.assert_awaited_once_with(
         organization_id="org_test",
         workflow_run_id="wr_test",
         workflow_run_block_id="wfrb_test",
         connection_id="conn_test",
+        hop_token="test-hop-token",
+        credential_source="nango",
         dataset_id=_DATASET,
         query="EVALUATE VALUES('Sales')",
         max_rows=20,
     )
+
+
+@pytest.mark.asyncio
+async def test_powerbi_query_keeps_capability_for_loop_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = FakeWorkflowRunContext(values={}, block_metadata={"query_sales": {"current_index": 0}})
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(_block(), context=context)
+
+    assert result.success is True
+    assert context.get_powerbi_hop_token("query_sales") == "test-hop-token"
 
 
 @pytest.mark.asyncio
@@ -436,6 +477,7 @@ async def test_powerbi_query_failures_are_safe_and_oss_hook_fails_closed(monkeyp
             "trigger_chain_owner_required",
             "Power BI queries require every triggering workflow to be saved by the connection owner.",
         ),
+        ("row_limit_exceeded", "row_limit_exceeded", "Power BI query exceeded the row limit."),
         ("integration_unavailable", "integration_unavailable", "Power BI queries are not currently available."),
         (
             "workflow_owner_resave_required",
