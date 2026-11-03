@@ -65,7 +65,6 @@ def _default_host() -> str:
 async def _cleanup_mcp_resources() -> None:
     from skyvern.cli.core.action_log import shutdown_action_log_worker  # noqa: PLC0415
     from skyvern.cli.core.client import close_skyvern  # noqa: PLC0415
-    from skyvern.cli.core.mcp_http_auth import close_auth_db  # noqa: PLC0415
     from skyvern.cli.core.session_manager import close_all_sessions  # noqa: PLC0415
 
     try:
@@ -77,7 +76,9 @@ async def _cleanup_mcp_resources() -> None:
             try:
                 await close_skyvern()
             finally:
-                await close_auth_db()
+                http_auth = sys.modules.get("skyvern.cli.core.mcp_http_auth")
+                if http_auth is not None:
+                    await http_auth.close_auth_db()
 
 
 def _cleanup_mcp_resources_blocking() -> None:
@@ -729,7 +730,6 @@ def run_mcp(
     except Exception:
         LOG.warning("local_browser_profile_startup_sweep_failed", exc_info=True)
     imports_started_at = time.monotonic()
-    from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
     from skyvern.cli.core.session_manager import (  # noqa: PLC0415
         set_stateless_http_mode,
         set_stdio_local_file_access_enabled,
@@ -796,6 +796,8 @@ def run_mcp(
         # Origin validation must precede MCPAPIKeyMiddleware: a hostile page riding a
         # valid API key is already past the gate if auth resolves first. The server card
         # stays outermost so discovery remains public.
+        from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
+
         middleware = [
             Middleware(_ServerCardMiddleware, transport_type=transport, host=host, port=port, mcp_path=path),
             Middleware(OriginValidationMiddleware),

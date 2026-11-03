@@ -3780,8 +3780,34 @@ class WorkflowRunsRepository(BaseRepository):
                 PersistentBrowserSessionModel.created_for_workflow_run_id.is_not(None),
             ),
         )
+        association_roots = associations.subquery()
+        session_runs = (
+            select(
+                association_roots.c.browser_session_id,
+                association_roots.c.workflow_run_id,
+                WorkflowRunModel.browser_address,
+            )
+            .outerjoin(WorkflowRunModel, WorkflowRunModel.workflow_run_id == association_roots.c.workflow_run_id)
+            .cte("session_workflow_runs", recursive=True)
+        )
+        session_runs = session_runs.union(
+            select(
+                session_runs.c.browser_session_id,
+                WorkflowRunModel.workflow_run_id,
+                WorkflowRunModel.browser_address,
+            )
+            .join(WorkflowRunModel, WorkflowRunModel.parent_workflow_run_id == session_runs.c.workflow_run_id)
+            .where(
+                WorkflowRunModel.organization_id == organization_id,
+                WorkflowRunModel.browser_session_id.is_(None),
+                session_runs.c.browser_address.is_not(None),
+                WorkflowRunModel.browser_address == session_runs.c.browser_address,
+            )
+        )
         async with self.Session() as session:
-            rows = (await session.execute(associations)).all()
+            rows = (
+                await session.execute(select(session_runs.c.browser_session_id, session_runs.c.workflow_run_id))
+            ).all()
 
         runs_by_session: dict[str, set[str]] = {}
         for browser_session_id, workflow_run_id in rows:
