@@ -75,6 +75,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseResolution,
     _decode_active_pause,
     _encode_active_pause,
+    _encode_record,
     await_pending_credential_pause,
     claim_credential_generation,
     credential_pause_active_key,
@@ -4502,16 +4503,27 @@ async def test_registration_card_reopened_after_its_deadline_passed_mid_save_is_
 ) -> None:
     cache = _FakeCache()
     monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
-    _seed_registration_pause(cache, expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=50))
+    _seed_registration_pause(cache)
     _registration_database(monkeypatch, _make_credential())
-    vault = _RegistrationVault(
-        _make_credential(), reject=failure == "rejected", fail=failure == "vault_error", delay=0.1
-    )
+    vault = _RegistrationVault(_make_credential(), reject=failure == "rejected", fail=failure == "vault_error")
     vault.install(monkeypatch)
+    active_key = credential_pause_active_key("org-1", "chat-1", "turn-1")
+    prepare = vault.prepare
+
+    async def prepare_once_the_deadline_has_passed(
+        organization_id: str, data: CreateCredentialRequest
+    ) -> _RegistrationVault:
+        record = _decode_active_pause(cache.store[active_key])
+        assert record is not None and record.status == "resolving"
+        lapsed = replace(record, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        cache.store[active_key] = _encode_record(lapsed)
+        return await prepare(organization_id, data)
+
+    monkeypatch.setattr(copilot_routes, "prepare_credential_create", prepare_once_the_deadline_has_passed)
 
     result = await _generate()
 
-    record = _decode_active_pause(cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")])
+    record = _decode_active_pause(cache.store[active_key])
     assert record is not None and record.status == "pending"
     assert result.expires_at == record.expires_at
     assert record.expires_at > datetime.now(timezone.utc) + timedelta(
