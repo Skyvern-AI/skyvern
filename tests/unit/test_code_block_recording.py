@@ -748,11 +748,11 @@ async def test_ineligible_stalled_sink_capture_gives_up_after_one_timeout(
     selection = skycdp_engine_selection() if kind == "skycdp" else None
 
     with capture_logs() as logs:
-        data, elapsed_ms, health_calls, _ = await _sink_upload(page, selection)
+        data, _, health_calls, _ = await _sink_upload(page, selection)
 
     assert data is None
-    assert elapsed_ms < 300 * 1.5
     screenshot.assert_awaited_once()
+    assert screenshot.await_args.kwargs["timeout"] == 300
     page.context.new_cdp_session.assert_not_awaited()
     assert health_calls == []
     loud = [log["event"] for log in logs if log["log_level"] not in {"debug", "info"} or log.get("exc_info")]

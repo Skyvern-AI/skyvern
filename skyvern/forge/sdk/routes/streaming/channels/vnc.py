@@ -79,6 +79,7 @@ class MessageType(IntEnum):
 
 
 REMOTE_CLIPBOARD_SYNC_PASTE_GRACE_SECONDS = 2.0
+STREAM_AUTHORIZATION_RECHECK_SECONDS = 5.0
 
 
 class Keys:
@@ -172,6 +173,22 @@ class VncChannel:
     # --
 
     browser_session: AddressablePersistentBrowserSession | None = None
+    stream_authorizer: t.Callable[[str], t.Awaitable[bool]] | None = dataclasses.field(default=None, repr=False)
+    stream_authorization_probe: t.Callable[[], t.Awaitable[bool]] | None = dataclasses.field(default=None, repr=False)
+    stream_authorization_reauthorizer: t.Callable[[str], t.Awaitable[bool]] | None = dataclasses.field(
+        default=None, repr=False
+    )
+    _stream_authorized_state: tuple[str | None, str | None, str | None] | None = dataclasses.field(
+        init=False, default=None, repr=False
+    )
+    _stream_authorized_at: float = dataclasses.field(init=False, default=0.0, repr=False)
+    _stream_authorization_failed_at: float | None = dataclasses.field(init=False, default=None, repr=False)
+    _stream_authorization_attempted_state: tuple[str | None, str | None, str | None] | None = dataclasses.field(
+        init=False, default=None, repr=False
+    )
+    _stream_authorization_attempted_at: float = dataclasses.field(init=False, default=0.0, repr=False)
+    _stream_authorization_task: asyncio.Task[bool] | None = dataclasses.field(init=False, default=None, repr=False)
+    _stream_authorization_lock: asyncio.Lock = dataclasses.field(init=False, default_factory=asyncio.Lock, repr=False)
     key_state: KeyState = dataclasses.field(default_factory=KeyState)
     remote_clipboard_synced_at: float | None = None
     task: Task | None = None
@@ -189,7 +206,157 @@ class VncChannel:
         )
         if self.browser_session:
             self.live_stream.observe_session(self.browser_session)
+            self._stream_authorized_state = self._authorization_state(self.browser_session)
+            self._stream_authorized_at = time.monotonic()
+            self._stream_authorization_attempted_state = self._stream_authorized_state
+            self._stream_authorization_attempted_at = self._stream_authorized_at
         add_vnc_channel(self)
+
+    @staticmethod
+    def _authorization_state(
+        session: AddressablePersistentBrowserSession,
+    ) -> tuple[str | None, str | None, str | None]:
+        return (session.runnable_type, session.runnable_id, session.runnable_generation_id)
+
+    async def authorize_stream_relay(self, *, wait_for_pass: bool = False) -> bool:
+        if self.stream_authorizer is None:
+            return True
+
+        wait_for_state_change = False
+        async with self._stream_authorization_lock:
+            session = self.browser_session
+            if session is None:
+                session_id = None
+                task = None
+            else:
+                state = self._authorization_state(session)
+                wait_for_state_change = state != self._stream_authorized_state
+                session_id = session.persistent_browser_session_id
+                task = self._stream_authorization_task
+                due = (
+                    state != self._stream_authorization_attempted_state
+                    or time.monotonic() - self._stream_authorization_attempted_at
+                    >= STREAM_AUTHORIZATION_RECHECK_SECONDS
+                )
+                if (task is None or task.done()) and due:
+                    now = time.monotonic()
+                    if (
+                        self._stream_authorization_failed_at is not None
+                        and now - self._stream_authorization_attempted_at >= STREAM_AUTHORIZATION_RECHECK_SECONDS * 3
+                    ):
+                        self._stream_authorization_failed_at = None
+                    self._stream_authorization_attempted_state = state
+                    self._stream_authorization_attempted_at = now
+                    task = asyncio.create_task(self._reauthorize_stream(session_id, state))
+                    self._stream_authorization_task = task
+
+        if session_id is None:
+            await self.close(code=4403, reason="browser-session-access-denied")
+            return False
+        if (wait_for_pass or wait_for_state_change) and task is not None:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    return False
+                raise
+        return True
+
+    async def check_stream_authorization(self) -> bool:
+        if self.stream_authorizer is not None:
+            return await self.authorize_stream_relay()
+        if self.stream_authorization_probe is None or self.stream_authorization_reauthorizer is None:
+            return True
+        try:
+            required = await self.stream_authorization_probe()
+        except PermissionError:
+            await self.close(code=4403, reason="browser-session-access-denied")
+            return False
+        except Exception:
+            LOG.warning("Browser-session enforcement-state check failed; retrying", exc_info=True)
+            return True
+        if not required:
+            return True
+        self.stream_authorizer = self.stream_authorization_reauthorizer
+        self.stream_authorization_probe = None
+        self._stream_authorization_attempted_state = None
+        return await self.authorize_stream_relay(wait_for_pass=True)
+
+    async def on_session_verified(self, session: AddressablePersistentBrowserSession | None) -> None:
+        self.live_stream.observe_session(session)
+        await self.check_stream_authorization()
+
+    async def _reauthorize_stream(self, session_id: str, state: tuple[str | None, str | None, str | None]) -> bool:
+        authorizer = self.stream_authorizer
+        if authorizer is None:
+            return True
+        while True:
+            attempt_started_at = time.monotonic()
+            failed_at = self._stream_authorization_failed_at
+            remaining = (
+                STREAM_AUTHORIZATION_RECHECK_SECONDS * 3
+                if failed_at is None
+                else max(0.001, STREAM_AUTHORIZATION_RECHECK_SECONDS * 3 - (attempt_started_at - failed_at))
+            )
+            try:
+                authorized = await asyncio.wait_for(authorizer(session_id), timeout=remaining)
+            except PermissionError:
+                authorized = False
+            except Exception:
+                LOG.warning(
+                    "Browser-session stream reauthorization failed.",
+                    browser_session_id=session_id,
+                    organization_id=self.organization_id,
+                    exc_info=True,
+                )
+                authorized = None
+
+            retry_state_change = False
+            async with self._stream_authorization_lock:
+                session = self.browser_session
+                now = time.monotonic()
+                if session is None:
+                    authorized = False
+                elif self._authorization_state(session) != state:
+                    state = self._authorization_state(session)
+                    session_id = session.persistent_browser_session_id
+                    self._stream_authorization_failed_at = None
+                    self._stream_authorization_attempted_state = state
+                    self._stream_authorization_attempted_at = now
+                    continue
+                elif authorized is True:
+                    self._stream_authorized_state = state
+                    self._stream_authorized_at = now
+                    self._stream_authorization_failed_at = None
+                    self._stream_authorization_attempted_state = state
+                    self._stream_authorization_attempted_at = now
+                    return True
+                elif authorized is None:
+                    if self._stream_authorization_failed_at is None:
+                        self._stream_authorization_failed_at = attempt_started_at
+                    within_grace = now - self._stream_authorization_failed_at < 3 * STREAM_AUTHORIZATION_RECHECK_SECONDS
+                    self._stream_authorization_attempted_at = now
+                    if within_grace:
+                        if state != self._stream_authorized_state:
+                            retry_state_change = True
+                        else:
+                            return True
+                    else:
+                        retry_state_change = False
+                else:
+                    retry_state_change = False
+
+            if authorized is None and retry_state_change:
+                await asyncio.sleep(STREAM_AUTHORIZATION_RECHECK_SECONDS)
+                continue
+
+            LOG.info(
+                "Rejecting VNC relay after browser-session authorization failed.",
+                browser_session_id=session_id,
+                organization_id=self.organization_id,
+            )
+            await self.close(code=4403, reason="browser-session-access-denied")
+            return False
 
     @property
     def class_name(self) -> str:
@@ -233,6 +400,11 @@ class VncChannel:
 
     async def close(self, code: int = 1000, reason: str | None = None) -> t.Self:
         LOG.debug(f"{self.class_name} closing.", reason=reason, code=code, **self.identity)
+
+        task = self._stream_authorization_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
         self.browser_session = None
         self.task = None
@@ -385,6 +557,11 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     if vnc_url.startswith("wss://") and vnc_channel.x_api_key:
         extra_headers["x-api-key"] = vnc_channel.x_api_key
 
+    async def authorize_relay() -> bool:
+        if vnc_channel.stream_authorizer is None:
+            return True
+        return await vnc_channel.authorize_stream_relay()
+
     async with websockets.connect(vnc_url, additional_headers=extra_headers) as novnc_ws:
 
         async def frontend_to_browser() -> None:
@@ -396,6 +573,9 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
             while vnc_channel.is_open:
                 try:
                     data = await vnc_channel.websocket.receive_bytes()
+
+                    if data and not await authorize_relay():
+                        return
 
                     if data:
                         message_type = data[0]
@@ -485,6 +665,8 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
             while vnc_channel.is_open:
                 try:
                     data = await novnc_ws.recv()
+                    if data and not await authorize_relay():
+                        return
 
                 except WebSocketDisconnect:
                     vnc_channel.live_stream.end_first("stream_error")
@@ -560,11 +742,35 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
             await vnc_channel.close(reason="loop-stream-vnc-closed")
 
 
+async def _stream_authorization_callbacks(
+    authorize: t.Callable[[str], t.Awaitable[bool]] | None,
+    should_reauthorize: t.Callable[[], t.Awaitable[bool]] | None,
+    reauthorize: t.Callable[[str], t.Awaitable[bool]] | None,
+    monitor_enforcement: t.Callable[[], t.Awaitable[bool]] | None,
+) -> tuple[
+    t.Callable[[str], t.Awaitable[bool]] | None,
+    t.Callable[[], t.Awaitable[bool]] | None,
+    t.Callable[[str], t.Awaitable[bool]] | None,
+]:
+    if authorize is None:
+        return None, None, None
+    callback = reauthorize or authorize
+    if should_reauthorize is None or await should_reauthorize():
+        return callback, None, callback
+    if monitor_enforcement is not None and await monitor_enforcement():
+        return None, should_reauthorize, callback
+    return None, None, None
+
+
 async def get_vnc_channel_for_browser_session(
     client_id: str,
     browser_session_id: str,
     organization_id: str,
     websocket: WebSocket,
+    authorize_stream: t.Callable[[str], t.Awaitable[bool]] | None = None,
+    should_reauthorize_stream: t.Callable[[], t.Awaitable[bool]] | None = None,
+    reauthorize_stream: t.Callable[[str], t.Awaitable[bool]] | None = None,
+    monitor_enforcement: t.Callable[[], t.Awaitable[bool]] | None = None,
 ) -> tuple[VncChannel, Loops] | None:
     """
     Return a vnc channel for a browser session, with a list of loops to run concurrently.
@@ -578,6 +784,17 @@ async def get_vnc_channel_for_browser_session(
     if not browser_session:
         return None
 
+    if authorize_stream is not None and not await authorize_stream(browser_session_id):
+        return None
+
+    (
+        stream_authorizer,
+        stream_authorization_probe,
+        stream_authorization_reauthorizer,
+    ) = await _stream_authorization_callbacks(
+        authorize_stream, should_reauthorize_stream, reauthorize_stream, monitor_enforcement
+    )
+
     x_api_key = await get_x_api_key(organization_id)
 
     try:
@@ -587,6 +804,9 @@ async def get_vnc_channel_for_browser_session(
             organization_id=organization_id,
             vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
             browser_session=browser_session,
+            stream_authorizer=stream_authorizer,
+            stream_authorization_probe=stream_authorization_probe,
+            stream_authorization_reauthorizer=stream_authorization_reauthorizer,
             x_api_key=x_api_key,
             websocket=websocket,
         )
@@ -597,9 +817,7 @@ async def get_vnc_channel_for_browser_session(
     LOG.debug("Got vnc context for browser session.", vnc_channel=vnc_channel)
 
     loops = [
-        asyncio.create_task(
-            loop_verify_browser_session(vnc_channel, on_session=vnc_channel.live_stream.observe_session)
-        ),
+        asyncio.create_task(loop_verify_browser_session(vnc_channel, on_session=vnc_channel.on_session_verified)),
         asyncio.create_task(loop_stream_vnc(vnc_channel)),
     ]
 
@@ -611,6 +829,10 @@ async def get_vnc_channel_for_task(
     task_id: str,
     organization_id: str,
     websocket: WebSocket,
+    authorize_stream: t.Callable[[str], t.Awaitable[bool]] | None = None,
+    should_reauthorize_stream: t.Callable[[], t.Awaitable[bool]] | None = None,
+    reauthorize_stream: t.Callable[[str], t.Awaitable[bool]] | None = None,
+    monitor_enforcement: t.Callable[[], t.Awaitable[bool]] | None = None,
 ) -> tuple[VncChannel, Loops] | None:
     """
     Return a vnc channel for a task, with a list of loops to run concurrently.
@@ -625,6 +847,17 @@ async def get_vnc_channel_for_task(
     if not browser_session:
         return None
 
+    if authorize_stream is not None and not await authorize_stream(browser_session.persistent_browser_session_id):
+        return None
+
+    (
+        stream_authorizer,
+        stream_authorization_probe,
+        stream_authorization_reauthorizer,
+    ) = await _stream_authorization_callbacks(
+        authorize_stream, should_reauthorize_stream, reauthorize_stream, monitor_enforcement
+    )
+
     x_api_key = await get_x_api_key(organization_id)
 
     vnc_channel = VncChannel(
@@ -635,11 +868,14 @@ async def get_vnc_channel_for_task(
         x_api_key=x_api_key,
         websocket=websocket,
         browser_session=browser_session,
+        stream_authorizer=stream_authorizer,
+        stream_authorization_probe=stream_authorization_probe,
+        stream_authorization_reauthorizer=stream_authorization_reauthorizer,
         task=task,
     )
 
     loops = [
-        asyncio.create_task(loop_verify_task(vnc_channel)),
+        asyncio.create_task(loop_verify_task(vnc_channel, on_session=vnc_channel.on_session_verified)),
         asyncio.create_task(loop_stream_vnc(vnc_channel)),
     ]
 
@@ -651,6 +887,10 @@ async def get_vnc_channel_for_workflow_run(
     workflow_run_id: str,
     organization_id: str,
     websocket: WebSocket,
+    authorize_stream: t.Callable[[str], t.Awaitable[bool]] | None = None,
+    should_reauthorize_stream: t.Callable[[], t.Awaitable[bool]] | None = None,
+    reauthorize_stream: t.Callable[[str], t.Awaitable[bool]] | None = None,
+    monitor_enforcement: t.Callable[[], t.Awaitable[bool]] | None = None,
 ) -> tuple[VncChannel, Loops] | None:
     """
     Return a vnc channel for a workflow run, with a list of loops to run concurrently.
@@ -670,6 +910,17 @@ async def get_vnc_channel_for_workflow_run(
     if not browser_session:
         return None
 
+    if authorize_stream is not None and not await authorize_stream(browser_session.persistent_browser_session_id):
+        return None
+
+    (
+        stream_authorizer,
+        stream_authorization_probe,
+        stream_authorization_reauthorizer,
+    ) = await _stream_authorization_callbacks(
+        authorize_stream, should_reauthorize_stream, reauthorize_stream, monitor_enforcement
+    )
+
     x_api_key = await get_x_api_key(organization_id)
 
     vnc_channel = VncChannel(
@@ -678,6 +929,9 @@ async def get_vnc_channel_for_workflow_run(
         organization_id=organization_id,
         vnc_port=settings.SKYVERN_BROWSER_VNC_PORT,
         browser_session=browser_session,
+        stream_authorizer=stream_authorizer,
+        stream_authorization_probe=stream_authorization_probe,
+        stream_authorization_reauthorizer=stream_authorization_reauthorizer,
         workflow_run=workflow_run,
         x_api_key=x_api_key,
         websocket=websocket,
@@ -686,7 +940,7 @@ async def get_vnc_channel_for_workflow_run(
     LOG.debug("Got vnc channel context for workflow run.", vnc_channel=vnc_channel)
 
     loops = [
-        asyncio.create_task(loop_verify_workflow_run(vnc_channel)),
+        asyncio.create_task(loop_verify_workflow_run(vnc_channel, on_session=vnc_channel.on_session_verified)),
         asyncio.create_task(loop_stream_vnc(vnc_channel)),
     ]
 

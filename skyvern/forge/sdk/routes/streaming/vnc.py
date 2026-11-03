@@ -13,6 +13,7 @@ import structlog
 from fastapi import WebSocket
 from websockets.exceptions import ConnectionClosedOK
 
+from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
 from skyvern.forge.sdk.routes.streaming.channels.vnc import (
@@ -22,6 +23,7 @@ from skyvern.forge.sdk.routes.streaming.channels.vnc import (
     get_vnc_channel_for_task,
     get_vnc_channel_for_workflow_run,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.utils.aio import collect
 
 LOG = structlog.get_logger()
@@ -104,6 +106,45 @@ async def stream(
         LOG.info("Authentication failed.", task_id=task_id, workflow_run_id=workflow_run_id)
         return
 
+    principal = get_request_principal()
+    authorization_failed = False
+    authorization_lookup_failed = False
+
+    async def authorize_browser_session_stream(browser_session_id: str) -> bool:
+        nonlocal authorization_failed, authorization_lookup_failed
+        try:
+            authorized = await app.AGENT_FUNCTION.authorize_browser_session_stream(
+                principal, organization_id, browser_session_id
+            )
+        except PermissionError:
+            authorization_failed = True
+            return False
+        except Exception:
+            LOG.warning(
+                "VNC: connect-time browser-session authorization lookup failed; retrying",
+                browser_session_id=browser_session_id,
+                exc_info=True,
+            )
+            authorization_lookup_failed = True
+            return False
+        authorization_failed = not authorized
+        return authorized
+
+    async def reauthorize_browser_session_stream(browser_session_id: str) -> bool:
+        nonlocal authorization_failed
+        authorized = await app.AGENT_FUNCTION.reauthorize_browser_session_stream(
+            principal, organization_id, browser_session_id
+        )
+        authorization_failed = not authorized
+        return authorized
+
+    async def browser_session_stream_reauthorization_required() -> bool:
+        return await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(principal, organization_id)
+
+    async def browser_session_stream_enforcement_monitor_required() -> bool:
+        monitor_hook = getattr(app.AGENT_FUNCTION, "browser_session_stream_enforcement_monitor_required", None)
+        return await monitor_hook(principal, organization_id) if monitor_hook is not None else False
+
     vnc_channel: VncChannel
     loops: Loops
 
@@ -113,9 +154,19 @@ async def stream(
             browser_session_id=browser_session_id,
             organization_id=organization_id,
             websocket=websocket,
+            authorize_stream=authorize_browser_session_stream,
+            reauthorize_stream=reauthorize_browser_session_stream,
+            should_reauthorize_stream=browser_session_stream_reauthorization_required,
+            monitor_enforcement=browser_session_stream_enforcement_monitor_required,
         )
 
         if not result:
+            if authorization_failed:
+                await websocket.close(code=4403)
+                return
+            if authorization_lookup_failed:
+                await websocket.close(code=1013, reason="authorization-temporarily-unavailable")
+                return
             LOG.debug(
                 "No vnc context found for the browser session.",
                 browser_session_id=browser_session_id,
@@ -131,9 +182,19 @@ async def stream(
             task_id=task_id,
             organization_id=organization_id,
             websocket=websocket,
+            authorize_stream=authorize_browser_session_stream,
+            reauthorize_stream=reauthorize_browser_session_stream,
+            should_reauthorize_stream=browser_session_stream_reauthorization_required,
+            monitor_enforcement=browser_session_stream_enforcement_monitor_required,
         )
 
         if not result:
+            if authorization_failed:
+                await websocket.close(code=4403)
+                return
+            if authorization_lookup_failed:
+                await websocket.close(code=1013, reason="authorization-temporarily-unavailable")
+                return
             LOG.debug("No vnc context found for the task.", task_id=task_id, organization_id=organization_id)
             await websocket.close(code=1013)
             return
@@ -149,9 +210,19 @@ async def stream(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             websocket=websocket,
+            authorize_stream=authorize_browser_session_stream,
+            reauthorize_stream=reauthorize_browser_session_stream,
+            should_reauthorize_stream=browser_session_stream_reauthorization_required,
+            monitor_enforcement=browser_session_stream_enforcement_monitor_required,
         )
 
         if not result:
+            if authorization_failed:
+                await websocket.close(code=4403)
+                return
+            if authorization_lookup_failed:
+                await websocket.close(code=1013, reason="authorization-temporarily-unavailable")
+                return
             LOG.debug(
                 "No vnc context found for the workflow run.",
                 workflow_run_id=workflow_run_id,

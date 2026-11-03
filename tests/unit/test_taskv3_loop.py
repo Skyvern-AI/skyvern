@@ -99,7 +99,6 @@ from skyvern.forge.taskv3.loop import (
     PROGRESS_LEDGER_WINDOW,
     STALE_READ_MAX_HOLDS,
     SUBMISSION_HELD_WAIT_MAX_SECONDS,
-    SUBMISSION_RENDER_MARGIN_SECONDS,
     TARGET_ACTION_ROUND_EVENT,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
@@ -150,6 +149,7 @@ from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from skyvern.utils.url_validators import validate_fetch_url
 from tests.unit.helpers import held_finish_restated
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import ScopedTime, SkewedTime
 
 
 class _ScriptedCaller:
@@ -1227,6 +1227,83 @@ async def test_non_retryable_call_error_is_not_retried() -> None:
     assert caller.attempts == 1  # raised once, no retry
 
 
+class _OpenDeadline:
+    def __init__(self, scope: Any, at: float, delay: float) -> None:
+        self.scope = scope
+        self.at = at
+        self.delay = delay
+        self.fired = False
+
+
+class _ClockedTimeout:
+    """An ``asyncio.timeout`` scope that the deadline clock, not the wall clock, expires."""
+
+    def __init__(self, clock: _DeadlineClock, entry: _OpenDeadline) -> None:
+        self._clock = clock
+        self._entry = entry
+
+    async def __aenter__(self) -> Any:
+        return await self._entry.scope.__aenter__()
+
+    async def __aexit__(self, *exc_info: Any) -> bool | None:
+        try:
+            return await self._entry.scope.__aexit__(*exc_info)
+        finally:
+            if self._entry in self._clock.open_deadlines:
+                self._clock.open_deadlines.remove(self._entry)
+
+
+class _DeadlineClock(ScopedTime):
+    """The loop's deadline clock, frozen until a test moves it, so a stalled runner cannot spend a run's deadline.
+
+    ``action_deadline.under_action_deadline`` bounds a dispatch, a reload or a pre-action capture with an
+    ``asyncio.timeout``. Here those scopes expire when this clock passes them: ``advance`` moves time as a
+    handler would by running long, and ``expire_innermost`` is the hung handler's wait running out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.now = 1000.0
+        self.open_deadlines: list[_OpenDeadline] = []
+
+    def timeout(self, delay: float | None) -> Any:
+        scope = asyncio.timeout(None)
+        if delay is None:
+            return scope
+        entry = _OpenDeadline(scope, self.now + delay, delay)
+        self.open_deadlines.append(entry)
+        return _ClockedTimeout(self, entry)
+
+    def _fire(self, entry: _OpenDeadline) -> None:
+        entry.fired = True
+        entry.scope.reschedule(asyncio.get_running_loop().time())
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        for entry in list(self.open_deadlines):
+            if not entry.fired and entry.at <= self.now:
+                self._fire(entry)
+
+    def expire_innermost(self, budget_seconds: float) -> None:
+        """The hung call's bound runs out. ``budget_seconds`` is how long that bound should be (the run's remaining
+        deadline plus the dispatch margin), so a bound that grew or shrank fails here instead of passing."""
+        pending = [entry for entry in self.open_deadlines if not entry.fired]
+        assert pending, "no deadline scope is open to expire: the hung call is not bounded"
+        entry = pending[-1]
+        assert entry.delay == pytest.approx(budget_seconds), (entry.delay, budget_seconds)
+        self.now = max(self.now, entry.at) + 0.001
+        self._fire(entry)
+
+
+@pytest.fixture
+def deadline_clock(monkeypatch: pytest.MonkeyPatch) -> _DeadlineClock:
+    clock = _DeadlineClock()
+    monkeypatch.setattr(loop_module, "time", clock)
+    monkeypatch.setattr(action_deadline_module, "asyncio", ScopedAsyncio(timeout=clock.timeout))
+    # The scope also arms a real re-arm timer; keep it far past any test so a stalled runner cannot fire it.
+    monkeypatch.setattr(action_deadline_module, "DEADLINE_REARM_INTERVAL_SECONDS", 3600.0)
+    return clock
+
+
 class _Clock:
     """Deterministic monotonic clock: returns each queued value once, then repeats the last."""
 
@@ -1287,7 +1364,7 @@ async def test_deadline_seconds_exhausts_budget(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.asyncio
 async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_deadline(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     # The wait_for makes a regression fail instead of hanging; the margin puts the timeout past the run deadline.
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.2)
@@ -1303,6 +1380,7 @@ async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_dead
     monkeypatch.setattr(loop_module, "_tool_call_timed_out", _capture_timeout)
 
     async def _never_returns(args: dict[str, Any]) -> ToolResult:
+        deadline_clock.expire_innermost(1.0 + 0.2)
         await asyncio.Event().wait()
         raise AssertionError("the handler was awaited to completion")
 
@@ -1342,7 +1420,7 @@ async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_dead
 
 @pytest.mark.asyncio
 async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_turn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -1352,6 +1430,7 @@ async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_tu
 
     async def never_returns(_args: dict[str, Any]) -> ToolResult:
         link_calls.append(None)
+        deadline_clock.expire_innermost(0.2 + 0.05)
         await asyncio.Event().wait()
         raise AssertionError("the handler was awaited to completion")
 
@@ -1390,7 +1469,9 @@ async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_tu
 
 
 @pytest.mark.asyncio
-async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_expired_deadline_skips_the_rest_of_a_tool_batch(
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
+) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
     monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
@@ -1399,6 +1480,7 @@ async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pyte
     async def _observe(args: dict[str, Any]) -> ToolResult:
         calls.append(args["id"])
         if args["id"] == 1:
+            deadline_clock.expire_innermost(0.25 + 0.05)
             await asyncio.Event().wait()
         return ToolResult.ok("observed")
 
@@ -1434,7 +1516,11 @@ async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pyte
     [("page_refresh", "budget_exhausted", False), ("on_pre_action", "failed", True)],
 )
 async def test_hung_pre_dispatch_work_is_bounded_and_logged(
-    call_site: str, expected_status: str, finish_is_dispatched: bool, monkeypatch: pytest.MonkeyPatch
+    call_site: str,
+    expected_status: str,
+    finish_is_dispatched: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_clock: _DeadlineClock,
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -1451,6 +1537,7 @@ async def test_hung_pre_dispatch_work_is_bounded_and_logged(
     monkeypatch.setattr(loop_module, "_tool_call_timed_out", capture_timeout_result)
 
     async def _hang(*_args: Any, **_kwargs: Any) -> None:
+        deadline_clock.expire_innermost(0.25 + 0.05)
         await asyncio.Event().wait()
 
     kwargs: dict[str, Any] = {}
@@ -7715,6 +7802,23 @@ async def test_finish_terminated_after_submit_click_stands_without_a_relook() ->
     assert fp_calls["n"] == 0
 
 
+_RENDER_CLOCK = SkewedTime()
+
+
+@pytest.fixture(autouse=True)
+def _render_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Reads and submission records are stamped on this clock; at zero skew it is the real monotonic clock.
+    _RENDER_CLOCK.skew = 0.0
+    monkeypatch.setattr(loop_module, "time", _RENDER_CLOCK)
+
+
+async def _let_the_render_margin_pass() -> None:
+    """A read that starts after this counts a response already delivered as rendered. The loop's clock jumps past the
+    production margin rather than the test sleeping through it."""
+    _RENDER_CLOCK.skew += loop_module.SUBMISSION_RENDER_MARGIN_SECONDS + 0.1
+    await asyncio.sleep(0)
+
+
 class _FakeSubmissions:
     """What a page-level interceptor's ledger reports, driven by the test's own tools."""
 
@@ -7725,7 +7829,7 @@ class _FakeSubmissions:
         return tuple(self.records)
 
     def deliver(self, *, ago: float = 0.0, outcome: SubmissionOutcome = SubmissionOutcome.DELIVERED) -> None:
-        at = time.monotonic() - ago
+        at = _RENDER_CLOCK.monotonic() - ago
         self.records.append(
             InterceptedSubmission(
                 record_id=len(self.records) + 1,
@@ -7743,12 +7847,14 @@ class _FakeSubmissions:
     def hold(self) -> int:
         record_id = len(self.records) + 1
         self.records.append(
-            InterceptedSubmission(record_id=record_id, outcome=SubmissionOutcome.HELD, started_at=time.monotonic())
+            InterceptedSubmission(
+                record_id=record_id, outcome=SubmissionOutcome.HELD, started_at=_RENDER_CLOCK.monotonic()
+            )
         )
         return record_id
 
     def release(self, record_id: int) -> None:
-        now = time.monotonic()
+        now = _RENDER_CLOCK.monotonic()
         self.records[record_id - 1] = dataclasses.replace(
             self.records[record_id - 1], outcome=SubmissionOutcome.DELIVERED, released_at=now, delivered_at=now
         )
@@ -7767,14 +7873,14 @@ def _submission_tools(
         if click_delivers:
             submissions.deliver()
         if click_settles:
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("click done")
 
     async def observe(args: dict[str, Any]) -> ToolResult:
         if observe_delivers_mid_read:
             # The reference run: the read started before the response reached the page and returned after it.
             submissions.deliver()
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("url=x text: 'Submit application'")
 
     return [
@@ -8089,7 +8195,7 @@ async def test_a_submission_released_after_the_wait_cap_is_still_shown_before_th
         reads[0] += 1
         if reads[0] == 2:
             submissions.release(record_id)
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("url=x text: 'Submit application'")
 
     tools = [
@@ -8168,8 +8274,8 @@ def test_submissions_since_keeps_a_response_landing_within_the_render_margin_bef
     # not the block boundary, decides whether this block saw it.
     submissions = _FakeSubmissions()
     started_at = time.monotonic()
-    inside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS / 2
-    outside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS * 2
+    inside = started_at - loop_module.SUBMISSION_RENDER_MARGIN_SECONDS / 2
+    outside = started_at - loop_module.SUBMISSION_RENDER_MARGIN_SECONDS * 2
     for at in (outside, inside):
         submissions.records.append(
             InterceptedSubmission(
@@ -8204,9 +8310,11 @@ async def _typed_rejection_run(
     *,
     click_outcomes: list[SubmissionOutcome] | None = None,
     finish_kwargs: dict[str, Any] | None = None,
+    release_held: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """Each click is a submit the interceptor records with the next outcome; once they run out it records nothing."""
+    """Each click is a submit the interceptor records with the next outcome; once they run out it records nothing.
+    With ``release_held`` an in-flight record is answered while its click is still settling."""
     activity = ActivityRecency()
     tools = _submission_tools(submissions, activity, **(finish_kwargs or {}))
     pending = list(click_outcomes or [])
@@ -8215,10 +8323,12 @@ async def _typed_rejection_run(
         if pending:
             next_outcome = pending.pop(0)
             if next_outcome is SubmissionOutcome.HELD:
-                submissions.hold()
+                record_id = submissions.hold()
+                if release_held:
+                    submissions.release(record_id)
             else:
                 submissions.deliver(outcome=next_outcome)
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("click done")
 
     tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True)
@@ -8331,15 +8441,9 @@ async def test_a_submit_queued_behind_the_retry_hold_spends_the_offer_for_the_re
         [("finish", {"status": "terminated", "reason": "r3"})],
     ]
 
-    async def settle_held() -> None:
-        while not any(r.outcome is SubmissionOutcome.HELD for r in submissions.records):
-            await asyncio.sleep(0.01)
-        submissions.release(next(r.record_id for r in submissions.records if r.outcome is SubmissionOutcome.HELD))
-
-    releaser = asyncio.create_task(settle_held()) if second is SubmissionOutcome.HELD else None
-    outcome, logs = await _typed_rejection_run(submissions, script, click_outcomes=outcomes)
-    if releaser is not None:
-        await releaser
+    outcome, logs = await _typed_rejection_run(
+        submissions, script, click_outcomes=outcomes, release_held=second is SubmissionOutcome.HELD
+    )
     finishes = [
         str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
     ]
@@ -8359,7 +8463,7 @@ async def test_a_submission_the_loop_did_not_send_also_spends_the_retry_offer_fo
 
     async def click(args: dict[str, Any]) -> ToolResult:
         submissions.deliver(outcome=_REJECTED)
-        await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        await _let_the_render_margin_pass()
         return ToolResult.ok("click done")
 
     async def observe(args: dict[str, Any]) -> ToolResult:
@@ -9192,7 +9296,9 @@ async def test_hung_pending_marker_probe_is_bounded_and_reads_as_nothing_pending
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", ["click_poisoning_probe", "finish_settled_probe"])
-async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scenario: str) -> None:
+async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(
+    scenario: str, deadline_clock: _DeadlineClock
+) -> None:
     # SKY-15056 exhaustive audit: two probes in the per-turn batch flow were bounded only by the flat
     # default cap (_PAGE_PROBE_TIMEOUT_SECONDS), never by what's left of the run's OWN deadline -- the
     # click-poisoning probe_before/probe_after pair (a failed batched call's page-moved check), and
@@ -9209,7 +9315,7 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
     class _SlowFirstCallCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 0:
-                await asyncio.sleep(0.1)  # eats the whole deadline before this turn's batch dispatches
+                deadline_clock.advance(0.1)  # eats the whole deadline before this turn's batch dispatches
             return await super().call(**kwargs)
 
     if scenario == "click_poisoning_probe":
@@ -9223,7 +9329,7 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
                 page_fingerprint=hanging_probe,
                 settle_wait_seconds=0.0,
                 max_settle_deferrals=1,
-                deadline_at=time.monotonic() - 1.0,  # already elapsed before the run even starts
+                deadline_at=deadline_clock.monotonic() - 1.0,  # already elapsed before the run even starts
             )
         ]
         caller = _ScriptedCaller(
@@ -9234,7 +9340,6 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
         )
         run_kwargs = {}
 
-    started = time.monotonic()
     outcome = await asyncio.wait_for(
         run_agent_tool_loop(
             llm_caller=caller,
@@ -9245,11 +9350,9 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
             max_tool_calls=20,
             **run_kwargs,
         ),
-        timeout=2,
+        timeout=10,
     )
-    elapsed = time.monotonic() - started
 
-    assert elapsed <= 1.0, elapsed
     assert hang_calls["n"] == 0  # the hanging sampler was never awaited, at either call site
     assert outcome.status in ("budget_exhausted", "completed")
 
@@ -9271,6 +9374,7 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     skipped_tool_before_finish: str | None,
     expected_status: str,
     expected_skips: list[bool],
+    deadline_clock: _DeadlineClock,
 ) -> None:
     # The stall detector's pre-batch fingerprint baseline passes deadline_at, so a slow LLM turn that
     # burns the whole deadline must skip the sample entirely -- a hanging sampler there would otherwise
@@ -9317,7 +9421,7 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     class _SlowFirstCallCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 0:
-                await asyncio.sleep(0.2)  # eats the whole deadline before this turn's batch dispatches
+                deadline_clock.advance(0.2)  # eats the whole deadline before this turn's batch dispatches
             return await super().call(**kwargs)
 
     final_batch: list[tuple[str, dict[str, Any]]] = []
@@ -9326,18 +9430,19 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
         final_batch.append((skipped_tool_before_finish, skipped_args))
     final_batch.append(("finish", {"status": "completed", "reason": "ok"}))
     caller = _SlowFirstCallCaller([[("click", {"selector": "#next"})], final_batch])
-    started = time.monotonic()
-    outcome = await run_agent_tool_loop(
-        llm_caller=caller,
-        system_prompt="sys",
-        user_prompt="goal",
-        tools=tools,
-        max_turns=20,
-        max_tool_calls=100,
-        page_fingerprint=hanging_fingerprint,
-        deadline_seconds=0.05,
+    outcome = await asyncio.wait_for(
+        run_agent_tool_loop(
+            llm_caller=caller,
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools,
+            max_turns=20,
+            max_tool_calls=100,
+            page_fingerprint=hanging_fingerprint,
+            deadline_seconds=0.05,
+        ),
+        timeout=10,
     )
-    elapsed = time.monotonic() - started
 
     # Skipped page-changing calls invalidate a queued finish; skipped reads do not.
     assert outcome.status == expected_status
@@ -9346,12 +9451,11 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     assert fp_calls["n"] == 0  # deadline already gone -- the hanging sampler was never awaited
     tool_results = [message for message in outcome.messages if message.get("role") == "tool"]
     assert [message["content"].startswith("skipped:") for message in tool_results] == expected_skips
-    assert elapsed < 2.0, elapsed  # loose wall-clock bound: an awaited sampler would add its full 5s sleep
 
 
 @pytest.mark.asyncio
 async def test_post_dispatch_refresh_expiry_does_not_duplicate_skipped_tail_result(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.01)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -9380,7 +9484,7 @@ async def test_post_dispatch_refresh_expiry_does_not_duplicate_skipped_tail_resu
     class _SlowFirstCallCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 0:
-                await asyncio.sleep(0.1)
+                deadline_clock.advance(0.1)
             return await super().call(**kwargs)
 
     caller = _SlowFirstCallCaller(
@@ -11690,13 +11794,17 @@ async def test_refused_finish_preserves_pending_refresh_before_next_observe() ->
 @pytest.mark.parametrize("batch_tail", [[], [("observe", {})]], ids=["no-pending-call", "pending-call"])
 @pytest.mark.parametrize("wrap_up_tool", ["finish", "observe"], ids=["final-finish", "final-nonfinish"])
 async def test_post_dispatch_refresh_timeout_skips_only_pending_calls(
-    batch_tail: list[tuple[str, dict[str, Any]]], wrap_up_tool: str, monkeypatch: pytest.MonkeyPatch
+    batch_tail: list[tuple[str, dict[str, Any]]],
+    wrap_up_tool: str,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_clock: _DeadlineClock,
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
     monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
 
     async def reload_page() -> None:
+        deadline_clock.expire_innermost(0.5 + 0.05)
         await asyncio.Event().wait()
 
     click_calls: list[tuple[str, dict[str, Any]]] = []
@@ -11745,7 +11853,7 @@ async def test_post_dispatch_refresh_timeout_skips_only_pending_calls(
 
 @pytest.mark.asyncio
 async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_turn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -11756,6 +11864,7 @@ async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_t
 
     async def reload_page() -> None:
         reload_calls.append(None)
+        deadline_clock.expire_innermost(0.2 + 0.05)
         await asyncio.Event().wait()
 
     ctx = SkyvernContext(task_id="tsk_refresh_timeout_on_cap_final_turn")
@@ -11798,7 +11907,7 @@ async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_t
 
 @pytest.mark.asyncio
 async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates_finish(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.5)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -11811,14 +11920,14 @@ async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates
 
     async def observe_handler(args: dict[str, Any]) -> ToolResult:
         observe_calls.append(("observe", args))
-        await asyncio.sleep(0.35)
+        deadline_clock.advance(0.35)
         return ToolResult.ok("observed")
 
     async def click_handler(args: dict[str, Any]) -> ToolResult:
         click_calls.append(("click", args))
-        click_times.append(time.monotonic())
-        await asyncio.sleep(0.25)
-        click_times.append(time.monotonic())
+        click_times.append(deadline_clock.monotonic())
+        deadline_clock.advance(0.25)
+        click_times.append(deadline_clock.monotonic())
         ctx.refresh_working_page = True
         return ToolResult.ok("click done")
 
@@ -11836,7 +11945,7 @@ async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates
             [("click", {"selector": "#submit"}), ("finish", {"status": "completed", "reason": "done"})],
         ]
     )
-    run_started_at = time.monotonic()
+    run_started_at = deadline_clock.monotonic()
     skyvern_context.set(ctx)
     try:
         outcome = await asyncio.wait_for(
@@ -11869,7 +11978,7 @@ async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates
 
 @pytest.mark.asyncio
 async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -11880,6 +11989,7 @@ async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending
 
     async def reload_page() -> None:
         reload_calls.append(None)
+        deadline_clock.expire_innermost(0.5 + 0.05)
         await asyncio.Event().wait()
 
     class _RefreshBeforeFinalCall(_ScriptedCaller):
@@ -11925,7 +12035,7 @@ async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending
 @pytest.mark.parametrize("finish_status", ["completed", "failed", "terminated"])
 @pytest.mark.parametrize("read_before_finish", [False, True], ids=["finish-only", "skipped-read-first"])
 async def test_expired_deadline_preserves_refresh_before_granted_finish(
-    finish_status: str, read_before_finish: bool
+    finish_status: str, read_before_finish: bool, deadline_clock: _DeadlineClock
 ) -> None:
     reload_calls: list[None] = []
     observe_calls: list[tuple[str, dict[str, Any]]] = []
@@ -11938,16 +12048,16 @@ async def test_expired_deadline_preserves_refresh_before_granted_finish(
     class _RefreshDuringFinalCall(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 1:
-                await asyncio.sleep(0.55)
+                deadline_clock.advance(0.55)
                 ctx.refresh_working_page = True
-                final_call_times.append(time.monotonic())
+                final_call_times.append(deadline_clock.monotonic())
             return await super().call(**kwargs)
 
     final_batch = ([("observe", {})] if read_before_finish else []) + [
         ("finish", {"status": finish_status, "reason": "done"})
     ]
     caller = _RefreshDuringFinalCall([[("observe", {})], final_batch])
-    run_started_at = time.monotonic()
+    run_started_at = deadline_clock.monotonic()
     skyvern_context.set(ctx)
     try:
         outcome = await asyncio.wait_for(

@@ -2421,6 +2421,65 @@ _WITH_POINTER_ROOTS_JS = (
       }
     }
   } catch (e) {}
+  // The visibility gates a pointer root must pass, shared by the scan and by a dropped control's label election.
+  const rootable = (el, r) => r.width > 0 && r.height > 0 && getComputedStyle(el).visibility === 'visible'
+    && !offCanvas(el, r) && painted(el, r) && !offRight(el, r);
+  const nameOf = (el) => {
+    let name = '';
+    if (hasTextDescendant.has(el)) {
+      try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
+    }
+    if (!name) name = String(getAttr.call(el, 'aria-label') || getAttr.call(el, 'title') || '').trim();
+    // innerText stops at a <slot>, so a component's wrapper is named by the rendered text slotted in.
+    if (!name) {
+      for (const slot of qsa.call(el, 'slot')) {
+        for (const n of slot.assignedNodes({ flatten: true })) {
+          if (n.nodeType === 3) name += ' ' + String(n.textContent || '');
+          // innerText of an unrendered element falls back to its textContent, so it is skipped.
+          else if (n.nodeType === 1 && (!n.checkVisibility || n.checkVisibility())) {
+            try { name += ' ' + String(innerTextOf.call(n) || ''); } catch (e) { /* unnamed */ }
+          }
+        }
+      }
+      name = name.trim();
+    }
+    if (!name) {
+      for (const img of qsa.call(el, 'img[alt]')) {
+        name = String(getAttr.call(img, 'alt') || '').trim();
+        if (name) break;
+      }
+    }
+    return name;
+  };
+  // A pointer can land on the label: its centre hit-tests to it. A point outside the viewport cannot be tested here,
+  // and the click scrolls it in first, so it is not held against the label.
+  const hitsItself = (l, r) => {
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return true;
+    const hit = l.getRootNode().elementFromPoint(x, y);
+    return !!hit && (hit === l || l.contains(hit));
+  };
+  // Every label of a dropped control performs the same click, so only its most-named label a pointer can land on is
+  // a root; the rest would spend the pointer-root cap on duplicates of one action. A box under 2px a side is unseen,
+  // as _unseen holds, so a screen-reader-only label never wins. No eligible label leaves every label to the gates.
+  const spokesmen = new WeakMap();
+  const otherLabelSpeaks = (el) => {
+    const ctl = el.control;
+    if (!spokesmen.has(ctl)) {
+      let best = null, bestLen = 0;
+      for (const l of Array.from(ctl.labels || [])) {
+        try {
+          const r = bcr.call(l);
+          if (!isPointer(l) || r.width < 2 || r.height < 2 || !rootable(l, r) || !hitsItself(l, r)) continue;
+          const len = nameOf(l).length;
+          if (len > bestLen) { best = l; bestLen = len; }
+        } catch (e) { /* not eligible */ }
+      }
+      spokesmen.set(ctl, best);
+    }
+    const best = spokesmen.get(ctl);
+    return best !== null && best !== el;
+  };
   // A failure here costs the pointer roots only, never the semantic list merged below.
   try {
     for (const el of all) {
@@ -2440,8 +2499,13 @@ _WITH_POINTER_ROOTS_JS = (
         const holds = hasListableDescendant.has(el);
         if (inListable(parentOf.call(el)) || (sr && sr.nodeType === 11 && (holds || anyListable(fragQsa.call(sr, q))))
           || heldBySlot(el)
-          // A label bound to a control names that control, which is listed (or skinned) on its own.
-          || (tag === 'label' && el.control)) { state.covered.add(el); continue; }
+          // A label bound to a control the reading keeps names that control; one whose control was dropped
+          // (a display:none submit drawn by its labels) is the only thing a person can click, so it stays a root.
+          // A disabled control's label does nothing on click, as v1 holds (domUtils.js isInteractable).
+          || (tag === 'label' && el.control && (listable(el.control) || el.control.disabled || otherLabelSpeaks(el)))) {
+          state.covered.add(el);
+          continue;
+        }
         // A row or card that also carries a button is not listed (its centre may land on the button);
         // its first named control-free pointer child stands for it instead, for as many holders as the
         // cap could ever list. Past that a holder is covered, so a long list costs no more work than before.
@@ -2453,9 +2517,7 @@ _WITH_POINTER_ROOTS_JS = (
         // An icon in a pointer card is its own control (the card's trash), not a stand-in for the card, so a card
         // already represented still lists it.
         const r = bcr.call(el);
-        if (!(r.width > 0 && r.height > 0)) continue;
-        if (getComputedStyle(el).visibility !== 'visible' || offCanvas(el, r)) continue;
-        if (!painted(el, r) || offRight(el, r)) continue;
+        if (!rootable(el, r)) continue;
         const kind = iconKind(el, r);
         const directPointer = kind === 'graphic' || ownPointerCursor(el);
         const iconInCard = holder !== null && (kind === 'graphic' || (kind === 'css' && directPointer)) && !textOf(el);
@@ -2465,30 +2527,7 @@ _WITH_POINTER_ROOTS_JS = (
         }
         // A decorative child (an icon font's ligature) does not name the row.
         if (holder && closest.call(el, '[aria-hidden="true"]')) continue;
-        let name = '';
-        if (hasTextDescendant.has(el)) {
-          try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
-        }
-        if (!name) name = String(getAttr.call(el, 'aria-label') || getAttr.call(el, 'title') || '').trim();
-        // innerText stops at a <slot>, so a component's wrapper is named by the rendered text slotted in.
-        if (!name) {
-          for (const slot of qsa.call(el, 'slot')) {
-            for (const n of slot.assignedNodes({ flatten: true })) {
-              if (n.nodeType === 3) name += ' ' + String(n.textContent || '');
-              // innerText of an unrendered element falls back to its textContent, so it is skipped.
-              else if (n.nodeType === 1 && (!n.checkVisibility || n.checkVisibility())) {
-                try { name += ' ' + String(innerTextOf.call(n) || ''); } catch (e) { /* unnamed */ }
-              }
-            }
-          }
-          name = name.trim();
-        }
-        if (!name) {
-          for (const img of qsa.call(el, 'img[alt]')) {
-            name = String(getAttr.call(img, 'alt') || '').trim();
-            if (name) break;
-          }
-        }
+        const name = nameOf(el);
         const iconCandidate = !name && (kind === 'graphic' || (kind === 'css' && (holder === null || directPointer)))
           && !hasNamedDescendant.has(el);
         const icon = iconCandidate && state.iconCount < state.ceiling;

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import inspect
 import json
-import os
-import subprocess
-import sys
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
@@ -626,7 +626,7 @@ async def test_candidate_guard_uses_both_units_and_enforces_byte_cap() -> None:
     assert capped["_max_bytes"] == response_module.MCP_MAX_RESPONSE_BYTES
 
 
-def test_extraction_default_verbosity_supports_full_and_summary() -> None:
+def test_extraction_default_verbosity_supports_full_and_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     env_name = "SKYVERN_MCP_EXTRACTION_DEFAULT_VERBOSITY"
 
     assert response_module.extraction_default_verbosity({env_name: "full"}) == "full"
@@ -634,19 +634,44 @@ def test_extraction_default_verbosity_supports_full_and_summary() -> None:
     with pytest.raises(ValueError, match="must be 'full' or 'summary'"):
         response_module.extraction_default_verbosity({env_name: "compact"})
 
-    script = (
-        "import inspect; "
-        "from skyvern.cli.mcp_tools.browser import skyvern_extract; "
-        "print(inspect.signature(skyvern_extract).parameters['verbosity'].default)"
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**os.environ, env_name: "summary"},
-    )
-    assert completed.stdout.strip().splitlines()[-1] == "summary"
+    # The default is read from the environment once, at import; run the module's source again under the env
+    # instead of paying a fresh interpreter's import of the whole browser tool module.
+    monkeypatch.setenv(env_name, "summary")
+    spec = importlib.util.spec_from_file_location("_extraction_verbosity_probe", response_module.__file__)
+    assert spec is not None and spec.loader is not None
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    assert probe.EXTRACTION_DEFAULT_VERBOSITY == "summary"
+
+    # Each extraction-class tool's default must be that constant itself; a literal in a signature would ignore the env.
+    browser_spec = importlib.util.find_spec("skyvern.cli.mcp_tools.browser")
+    assert browser_spec is not None and browser_spec.origin is not None
+    browser_tree = ast.parse(Path(browser_spec.origin).read_text(encoding="utf-8"))
+    imported = {
+        alias.name
+        for node in browser_tree.body
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module == "response"
+        for alias in node.names
+    }
+    tools = {
+        node.name: node
+        for node in browser_tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in response_module.EXTRACTION_TOOL_NAMES
+    }
+    assert set(tools) == set(response_module.EXTRACTION_TOOL_NAMES)
+    for name, tool in tools.items():
+        positional = [*tool.args.posonlyargs, *tool.args.args]
+        defaults = {
+            arg.arg: value
+            for arg, value in [
+                *zip(positional[len(positional) - len(tool.args.defaults) :], tool.args.defaults),
+                *zip(tool.args.kwonlyargs, tool.args.kw_defaults),
+            ]
+            if value is not None
+        }
+        default = defaults.get("verbosity")
+        assert isinstance(default, ast.Name) and default.id == "EXTRACTION_DEFAULT_VERBOSITY", name
+    assert "EXTRACTION_DEFAULT_VERBOSITY" in imported
 
 
 def test_url_query_spans_do_not_synthesize_anchor_pairs() -> None:

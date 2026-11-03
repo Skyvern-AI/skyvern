@@ -98,12 +98,16 @@ function cardStepViewed(organizationId: string): void {
 
 function cardStepReturned(
   outcome: "success" | "cancel",
-  organizationId: string,
+  organizationId?: string,
 ): void {
   capture("billing.card_step.returned", {
     outcome,
-    organization_id: organizationId,
-    $groups: { organization: organizationId },
+    ...(organizationId
+      ? {
+          organization_id: organizationId,
+          $groups: { organization: organizationId },
+        }
+      : {}),
   });
 }
 

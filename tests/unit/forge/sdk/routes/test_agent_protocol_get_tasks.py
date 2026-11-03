@@ -4,7 +4,9 @@ import json
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -15,12 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import WorkflowRunStatus
 from skyvern.forge.sdk.db.models import TaskModel
 from skyvern.forge.sdk.db.repositories import tasks as tasks_repository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunResponseBase
 from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_task_listing"
@@ -90,6 +94,82 @@ async def test_task_listing_builds_and_serializes_the_page_off_the_event_loop(
     assert response.json() == json.loads(expected_body)
     assert len(response.json()) == 3
     assert agent_protocol.TASK_NEXT_CURSOR_HEADER not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connect_authorized", [False, True])
+async def test_workflow_run_listing_respects_connect_authorization(
+    monkeypatch: pytest.MonkeyPatch, connect_authorized: bool
+) -> None:
+    session_id = "pbs_test_workflow_run_listing"
+    address = f"wss://router.test/{session_id}?token=secret"
+    run = WorkflowRun.model_construct(
+        workflow_run_id="wr_test_workflow_run_listing",
+        workflow_id="wpid_test_workflow_run_listing",
+        workflow_permanent_id="wpid_test_workflow_run_listing",
+        organization_id=ORG_ID,
+        status=WorkflowRunStatus.running,
+        browser_session_id=session_id,
+        browser_address=address,
+    )
+    authorization = AsyncMock(return_value={session_id} if connect_authorized else set())
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    monkeypatch.setattr(
+        app_instance,
+        "WORKFLOW_SERVICE",
+        SimpleNamespace(get_workflow_runs=AsyncMock(return_value=[run])),
+    )
+    monkeypatch.setattr(
+        app_instance,
+        "AGENT_FUNCTION",
+        SimpleNamespace(browser_session_ids_authorized_for_connect=authorization),
+    )
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    principal = SimpleNamespace(organization_id=ORG_ID, api_key_access_mode="member")
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: principal)
+
+    async with _client(shared_route_app(monkeypatch)) as client:
+        response = await client.get("/api/v1/workflows/runs")
+
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["browser_session_id"] == session_id
+    assert response.json()[0]["browser_address"] == (address if connect_authorized else None)
+    authorization.assert_awaited_once_with(principal, ORG_ID, {session_id})
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_detail_respects_connect_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    session_id = "pbs_test_workflow_run_detail"
+    address = f"wss://router.test/{session_id}?token=secret"
+    response = WorkflowRunResponseBase.model_construct(
+        workflow_run_id="wr_test_workflow_run_detail",
+        workflow_id="wpid_test_workflow_run_detail",
+        status=WorkflowRunStatus.running,
+        browser_session_id=session_id,
+        browser_address=address,
+    )
+    authorization = AsyncMock(return_value=set())
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    monkeypatch.setattr(
+        agent_protocol.run_service,
+        "coalesce_in_flight",
+        AsyncMock(return_value=response),
+    )
+    monkeypatch.setattr(
+        app_instance,
+        "AGENT_FUNCTION",
+        SimpleNamespace(browser_session_ids_authorized_for_connect=authorization),
+    )
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    principal = SimpleNamespace(organization_id=ORG_ID, api_key_access_mode="member")
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: principal)
+
+    result = await agent_protocol.get_workflow_run(
+        response.workflow_run_id, current_org=SimpleNamespace(organization_id=ORG_ID)
+    )
+
+    assert result.browser_address is None
+    authorization.assert_awaited_once_with(principal, ORG_ID, {session_id})
 
 
 def _client(fastapi_app: FastAPI, organization_id: str = ORG_ID) -> httpx.AsyncClient:

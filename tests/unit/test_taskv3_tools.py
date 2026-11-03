@@ -47764,3 +47764,164 @@ async def test_select_combobox_releases_the_handle_of_a_replaced_field_it_follow
         await (await page.context.new_cdp_session(page)).send("HeapProfiler.collectGarbage")
         released = await page.evaluate("window.gone.deref() === undefined")
     assert released
+
+
+_DROPPED_CONTROL_CARD_HTML = """<!doctype html><html><head><style>
+  .accts td.num input { display: none; }
+  .accts label { cursor: pointer; display: inline-block; padding: 4px; }
+</style></head><body>
+<table class="accts">
+  <tr><td class="num"><input type="submit" id="acct1" value="10041" onclick="window.__opened.push('10041'); return false;"></td>
+    <td><label for="acct1">&#9679;</label></td><td><label for="acct1">12 Elm Street 10041</label></td>
+    <td><label for="acct1">$54.20</label></td></tr>
+  <tr><td class="num"><input type="submit" id="acct2" value="10042" onclick="window.__opened.push('10042'); return false;"></td>
+    <td><label for="acct2">&#9679;</label></td><td><label for="acct2">40 Oak Avenue 10042</label></td>
+    <td><label for="acct2">$12.00</label></td></tr>
+  <tr><td class="num"><input type="submit" id="acct3" value="10043" onclick="window.__opened.push('10043'); return false;"></td>
+    <td><label for="acct3">&#9679;</label></td><td><label for="acct3">7 Pine Road 10043</label></td>
+    <td><label for="acct3">$0.00</label></td></tr>
+</table>
+<script>window.__opened = [];</script>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_a_label_whose_bound_control_it_dropped() -> None:
+    # A display:none submit is dropped as a zero-size control; the visible labels bound to it are the only
+    # thing a person can click, so the reading must offer one of them rather than nothing.
+    async with _content_page(_DROPPED_CONTROL_CARD_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        ref = re.search(r"^ref=(\d+) .*40 Oak Avenue 10042", observed.content, re.M)
+        assert ref is not None, observed.content
+        # One root per row: the three labels of a row perform one click, so only the most-named one is listed.
+        assert re.findall(r"^ref=\d+ label '(.*)'$", observed.content, re.M) == [
+            "12 Elm Street 10041",
+            "40 Oak Avenue 10042",
+            "7 Pine Road 10043",
+        ], observed.content
+        clicked, _ = await _dispatch(tools, "click", {"selector": f"ref={ref.group(1)}"})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("window.__opened") == ["10042"]
+
+
+def _many_dropped_control_rows_html(rows: int) -> str:
+    body = "".join(
+        f'<tr><td class="num"><input type="submit" id="a{n}" value="{20000 + n}"></td>'
+        f'<td><label for="a{n}">&#9679;</label></td><td><label for="a{n}">Account {20000 + n}, {n} Main Street</label></td>'
+        f'<td><label for="a{n}">${n}.00</label></td></tr>'
+        for n in range(rows)
+    )
+    return f"""<!doctype html><html><head><style>
+  .accts td.num input {{ display: none; }}
+  .accts label, #after {{ cursor: pointer; display: inline-block; padding: 2px; }}
+</style></head><body><table class="accts">{body}</table><span id="after">Contact support</span></body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_one_label_per_dropped_control_past_the_pointer_root_cap() -> None:
+    async with _content_page(_many_dropped_control_rows_html(20)) as page:
+        observed = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        names = re.findall(r"^ref=\d+ label '(.*)'$", observed.content, re.M)
+        assert names == [f"Account {20000 + n}, {n} Main Street" for n in range(20)], observed.content
+        assert "Contact support" in observed.content, observed.content
+
+
+_SKINNED_TOGGLES_HTML = """<!doctype html><html><head><style>
+  .clip { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  label { cursor: pointer; }
+</style></head><body>
+  <input type="checkbox" id="news" class="clip"><label for="news">Send me news</label>
+  <input type="radio" id="plan-a" name="plan" class="clip"><label for="plan-a">Plan A</label>
+  <input type="checkbox" id="dark" role="switch" style="opacity:0"><label for="dark">Dark mode</label>
+</body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_keeps_a_skinned_toggle_listed_once_and_its_label_covered() -> None:
+    async with _content_page(_SKINNED_TOGGLES_HTML) as page:
+        observed = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        lines = [line for line in observed.content.splitlines() if line.startswith("ref=")]
+        assert not [line for line in lines if " label " in line], observed.content
+        for name in ("Send me news", "Plan A", "Dark mode"):
+            assert sum(name in line for line in lines) == 1, observed.content
+
+
+_INELIGIBLE_LONGEST_LABEL_HTML = """<!doctype html><html><head><style>
+  .num input { display: none; }
+  label.go { cursor: pointer; }
+</style></head><body><table>
+  <tr><td class="num"><input type="submit" id="r1" value="30001"></td>
+    <td><label for="r1" class="go" style="visibility:hidden">Account 30001, a much longer hidden name</label></td>
+    <td><label for="r1">Account 30001, default cursor and a long name</label></td>
+    <td><label for="r1" class="go">Open 30001</label></td></tr>
+</table></body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_dropped_controls_label_is_chosen_among_those_that_can_be_a_root() -> None:
+    # The longest label is invisible and the next has no pointer cursor, so only the short one can be listed.
+    async with _content_page(_INELIGIBLE_LONGEST_LABEL_HTML) as page:
+        observed = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert re.findall(r"^ref=\d+ label '(.*)'$", observed.content, re.M) == ["Open 30001"], observed.content
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_labels_of_disabled_dropped_controls_do_not_spend_the_pointer_root_cap() -> None:
+    rows = "".join(
+        f'<tr><td class="num"><input type="submit" id="d{n}" value="{n}" disabled></td>'
+        f'<td><label for="d{n}">Closed account {n}</label></td></tr>'
+        for n in range(45)
+    )
+    async with _content_page(
+        f"""<!doctype html><html><head><style>.num input {{ display: none; }} label, #real {{ cursor: pointer; }}</style>
+        </head><body><table>{rows}</table><span id="real">Open statements</span></body></html>"""
+    ) as page:
+        observed = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        assert "Closed account" not in observed.content, observed.content
+        assert "Open statements" in observed.content, observed.content
+
+
+_ELECTION_SHAPES_HTML = """<!doctype html><html><head><style>
+  .num input { display: none; }
+  label { cursor: pointer; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .icon { display: inline-block; width: 24px; height: 24px; }
+  .wrap { position: relative; display: inline-block; }
+  .lid { position: absolute; inset: 0; background: #fff; }
+</style></head><body><table>
+  <tr><td class="num"><input type="submit" id="s1" value="40001" onclick="window.opened.push('40001'); return false;"></td>
+    <td><label for="s1">&#9679;</label></td>
+    <td><label for="s1" class="sr">Account number 40001 for screen readers only</label></td>
+    <td><label for="s1">$12.00</label></td></tr>
+  <tr><td class="num"><input type="submit" id="s2" value="40002"></td>
+    <td><label for="s2" class="icon" aria-label="Pin account 40002"></label></td>
+    <td><label for="s2" class="icon" aria-label="Open account 40002 summary"></label></td></tr>
+  <tr><td class="num"><input type="submit" id="s3" value="40003"></td>
+    <td><span class="wrap"><label for="s3">Account 40003, the long covered name</label><span class="lid"></span></span></td>
+    <td><label for="s3">Open 40003</label></td></tr>
+</table><script>window.opened = [];</script></body></html>
+"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_dropped_controls_label_is_one_a_pointer_can_land_on() -> None:
+    # A screen-reader-only label and a covered one are the longest names on their rows, but a click cannot land on
+    # either; a row named only by aria-label still lists its most-named label.
+    async with _content_page(_ELECTION_SHAPES_HTML) as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        observed = await _tool(tools, "observe").handler({})
+        names = re.findall(r"^ref=(\d+) label '(.*)'$", observed.content, re.M)
+        assert [name for _, name in names] == ["$12.00", "Open account 40002 summary", "Open 40003"], observed.content
+        clicked, _ = await _dispatch(tools, "click", {"selector": f"ref={names[0][0]}"})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("window.opened") == ["40001"]

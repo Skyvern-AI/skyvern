@@ -47,6 +47,7 @@ from skyvern.cli.core.browser_ops import (
     do_select_option,
     do_type_at,
     get_observe_document_id,
+    is_skyvern_page,
     observe_v2_enabled,
     parse_extract_schema,
     ref_map_from_elements,
@@ -84,7 +85,6 @@ from skyvern.cli.core.perception_telemetry import PerceptionSnapshotCategory, tr
 from skyvern.cli.core.session_manager import ObserveV2State, get_observe_v2_state, is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.config import settings
-from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import (
     ActionDeadlineExceeded,
     BlockedHost,
@@ -730,7 +730,7 @@ async def skyvern_click(
                     resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
                 else:
                     assert selector is not None
-                    if isinstance(page, SkyvernPage):
+                    if is_skyvern_page(page):
                         kwargs["_skip_element_prep"] = skip_element_prep
                     # Doubled: this leg dismisses an overlay and clicks a second time, each with
                     # the whole budget, and threading one deadline would change every SDK caller.
@@ -1524,7 +1524,7 @@ async def skyvern_type(
                     else:
                         assert selector is not None
                         fill_kwargs: dict[str, Any] = {"timeout": action_timeout}
-                        if isinstance(page, SkyvernPage):
+                        if is_skyvern_page(page):
                             fill_kwargs["_skip_element_prep"] = skip_element_prep
                         await page.fill(selector, text, **fill_kwargs)
                 else:
@@ -1546,7 +1546,7 @@ async def skyvern_type(
                         await loc.type(text, **kwargs)
                     else:
                         assert selector is not None
-                        if isinstance(page, SkyvernPage):
+                        if is_skyvern_page(page):
                             kwargs["_skip_element_prep"] = skip_element_prep
                         await page.type(selector, text, **kwargs)
                 if coordinate_target is None and press_enter:
@@ -1564,8 +1564,9 @@ async def skyvern_type(
         except ActionDeadlineExceeded as e:
             return _action_deadline_result(action_result, "skyvern_type", e, ctx, timer.timing_ms)
         except (TimeoutError, PlaywrightTimeoutError) as e:
-            if isinstance(e, TimeoutError):
-                e = PlaywrightTimeoutError(f"Timeout {action_timeout}ms exceeded.")
+            timeout_exc = (
+                PlaywrightTimeoutError(f"Timeout {action_timeout}ms exceeded.") if isinstance(e, TimeoutError) else e
+            )
             if coordinate_target is not None:
                 return action_result(
                     "skyvern_type",
@@ -1574,14 +1575,14 @@ async def skyvern_type(
                     timing_ms=timer.timing_ms,
                     error=make_error(
                         ErrorCode.ACTION_FAILED,
-                        str(e),
+                        str(timeout_exc),
                         "Check that the coordinates are within the current viewport",
-                        exc=e,
+                        exc=timeout_exc,
                     ),
                 )
             if direct_action and selector is not None:
                 return await _direct_failure_result(
-                    "skyvern_type", ctx, timer, page, selector, e, action_timeout, typed_text=text
+                    "skyvern_type", ctx, timer, page, selector, timeout_exc, action_timeout, typed_text=text
                 )
             return action_result(
                 "skyvern_type",
@@ -1590,9 +1591,9 @@ async def skyvern_type(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SELECTOR_NOT_FOUND,
-                    str(e),
+                    str(timeout_exc),
                     "Verify the selector matches an editable element, or use intent for AI-powered finding",
-                    exc=e,
+                    exc=timeout_exc,
                 ),
             )
         except Exception as e:

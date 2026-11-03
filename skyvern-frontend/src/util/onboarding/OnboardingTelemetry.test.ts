@@ -92,6 +92,24 @@ describe("OnboardingTelemetry", () => {
     );
   });
 
+  it("captures a Stripe return without organization attribution when unavailable", () => {
+    vi.mocked(posthog.getGroups).mockReturnValueOnce({});
+    OnboardingTelemetry.cardStepReturned("success");
+
+    expect(posthog.capture).toHaveBeenCalledWith(
+      "billing.card_step.returned",
+      expect.objectContaining({
+        outcome: "success",
+        organization_id: undefined,
+        step_id: "billing.card_step.returned:v1",
+      }),
+    );
+    expect(posthog.capture).not.toHaveBeenCalledWith(
+      "billing.card_step.returned",
+      expect.objectContaining({ $groups: expect.anything() }),
+    );
+  });
+
   it("reports whether PostHog accepted a questionnaire capture", () => {
     const input = {
       primaryIntent: "fill_forms",

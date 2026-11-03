@@ -534,7 +534,7 @@ async def test_workflow_create_preserves_explicit_internal_text_prompt_llm_key(m
     }
 
     with patch(
-        "skyvern.schemas.workflows.LLMConfigRegistry.get_model_names",
+        "skyvern.forge.sdk.api.llm.config_registry.LLMConfigRegistry.get_model_names",
         return_value=["SPECIAL_INTERNAL_KEY"],
     ):
         result = await workflow_tools.skyvern_workflow_create(definition=json.dumps(definition), format="json")
@@ -586,7 +586,7 @@ async def test_mcp_strips_all_common_hallucinated_llm_keys(
     }
 
     with patch(
-        "skyvern.schemas.workflows.LLMConfigRegistry.get_model_names",
+        "skyvern.forge.sdk.api.llm.config_registry.LLMConfigRegistry.get_model_names",
         return_value=[],  # simulate: none of these are registered
     ):
         result = await workflow_tools.skyvern_workflow_create(definition=json.dumps(definition), format="auto")

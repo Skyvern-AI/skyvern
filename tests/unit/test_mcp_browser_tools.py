@@ -1132,39 +1132,46 @@ def _assert_sdk_equivalent_parses(result: dict[str, object]) -> ast.Module:
     return ast.parse(f"async def _f():\n    {sdk_equivalent}\n")
 
 
+_SDK_EQUIVALENT_FIELDS = [
+    pytest.param("skyvern_navigate", "url", {}, id="navigate-url"),
+    pytest.param("skyvern_click", "intent", {"selector": "#target"}, id="click-intent"),
+    pytest.param("skyvern_hover", "intent", {"selector": "#target"}, id="hover-intent"),
+    pytest.param("skyvern_type", "text", {"selector": "#target", "intent": "field"}, id="type-text"),
+    pytest.param("skyvern_type", "intent", {"selector": "#target", "text": "value"}, id="type-intent"),
+    pytest.param("skyvern_scroll", "intent", {"direction": "down", "selector": "#target"}, id="scroll-intent"),
+    pytest.param("skyvern_select_option", "value", {"intent": "dropdown"}, id="select-value"),
+    pytest.param("skyvern_select_option", "intent", {"value": "choice"}, id="select-intent"),
+    pytest.param("skyvern_press_key", "key", {"selector": "#target", "intent": "field"}, id="press-key"),
+    pytest.param("skyvern_press_key", "intent", {"selector": "#target", "key": "Enter"}, id="press-intent"),
+    pytest.param("skyvern_press_key", "key", {}, id="press-key-bare"),
+    pytest.param("skyvern_wait", "intent", {}, id="wait-intent"),
+    pytest.param("skyvern_evaluate", "expression", {}, id="evaluate-expression"),
+    pytest.param("skyvern_extract", "prompt", {}, id="extract-prompt"),
+    pytest.param("skyvern_validate", "prompt", {}, id="validate-prompt"),
+    pytest.param("skyvern_act", "prompt", {}, id="act-prompt"),
+    pytest.param("skyvern_run_task", "prompt", {}, id="run-task-prompt"),
+    pytest.param("skyvern_frame_switch", "name", {}, id="frame-name"),
+    pytest.param("skyvern_click", "selector", {}, id="click-selector"),
+    pytest.param("skyvern_hover", "selector", {}, id="hover-selector"),
+    pytest.param("skyvern_type", "selector", {"text": "value"}, id="type-selector"),
+    pytest.param("skyvern_scroll", "selector", {"direction": "down", "intent": "target"}, id="scroll-selector"),
+    pytest.param("skyvern_select_option", "selector", {"value": "choice"}, id="select-option-selector"),
+    pytest.param("skyvern_press_key", "selector", {"key": "Enter"}, id="press-key-selector"),
+    pytest.param("skyvern_wait", "selector", {}, id="wait-selector"),
+    pytest.param("skyvern_frame_switch", "selector", {}, id="frame-switch-selector"),
+]
+# Both-quotes and newline break any quoting shortcut for every field; xpath is only tried where the field is a selector.
+_SDK_EQUIVALENT_QUOTING_CASES = [
+    pytest.param(tool_name, field, base_kwargs, value.values[0], id=f"{value.id}-{case.id}")
+    for case in _SDK_EQUIVALENT_FIELDS
+    for tool_name, field, base_kwargs in [case.values]
+    for value in _SDK_LITERAL_VALUES
+    if value.id in {"both-quotes", "newline"} or (value.id == "xpath" and field == "selector")
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("tool_name", "field", "base_kwargs"),
-    [
-        pytest.param("skyvern_navigate", "url", {}, id="navigate-url"),
-        pytest.param("skyvern_click", "intent", {"selector": "#target"}, id="click-intent"),
-        pytest.param("skyvern_hover", "intent", {"selector": "#target"}, id="hover-intent"),
-        pytest.param("skyvern_type", "text", {"selector": "#target", "intent": "field"}, id="type-text"),
-        pytest.param("skyvern_type", "intent", {"selector": "#target", "text": "value"}, id="type-intent"),
-        pytest.param("skyvern_scroll", "intent", {"direction": "down", "selector": "#target"}, id="scroll-intent"),
-        pytest.param("skyvern_select_option", "value", {"intent": "dropdown"}, id="select-value"),
-        pytest.param("skyvern_select_option", "intent", {"value": "choice"}, id="select-intent"),
-        pytest.param("skyvern_press_key", "key", {"selector": "#target", "intent": "field"}, id="press-key"),
-        pytest.param("skyvern_press_key", "intent", {"selector": "#target", "key": "Enter"}, id="press-intent"),
-        pytest.param("skyvern_press_key", "key", {}, id="press-key-bare"),
-        pytest.param("skyvern_wait", "intent", {}, id="wait-intent"),
-        pytest.param("skyvern_evaluate", "expression", {}, id="evaluate-expression"),
-        pytest.param("skyvern_extract", "prompt", {}, id="extract-prompt"),
-        pytest.param("skyvern_validate", "prompt", {}, id="validate-prompt"),
-        pytest.param("skyvern_act", "prompt", {}, id="act-prompt"),
-        pytest.param("skyvern_run_task", "prompt", {}, id="run-task-prompt"),
-        pytest.param("skyvern_frame_switch", "name", {}, id="frame-name"),
-        pytest.param("skyvern_click", "selector", {}, id="click-selector"),
-        pytest.param("skyvern_hover", "selector", {}, id="hover-selector"),
-        pytest.param("skyvern_type", "selector", {"text": "value"}, id="type-selector"),
-        pytest.param("skyvern_scroll", "selector", {"direction": "down", "intent": "target"}, id="scroll-selector"),
-        pytest.param("skyvern_select_option", "selector", {"value": "choice"}, id="select-option-selector"),
-        pytest.param("skyvern_press_key", "selector", {"key": "Enter"}, id="press-key-selector"),
-        pytest.param("skyvern_wait", "selector", {}, id="wait-selector"),
-        pytest.param("skyvern_frame_switch", "selector", {}, id="frame-switch-selector"),
-    ],
-)
-@pytest.mark.parametrize("value", _SDK_LITERAL_VALUES)
+@pytest.mark.parametrize(("tool_name", "field", "base_kwargs", "value"), _SDK_EQUIVALENT_QUOTING_CASES)
 async def test_sdk_equivalent_quotes_caller_strings(
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
