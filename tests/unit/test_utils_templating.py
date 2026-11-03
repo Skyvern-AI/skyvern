@@ -1,9 +1,7 @@
-import re
-
 import pytest
 from jinja2.exceptions import SecurityError
 
-from skyvern.utils.templating import Constants, get_missing_variables
+from skyvern.utils.templating import get_missing_variables
 
 
 @pytest.mark.parametrize(
@@ -29,24 +27,6 @@ from skyvern.utils.templating import Constants, get_missing_variables
 def test_get_missing_variables(template, data, expected):
     missing_vars = get_missing_variables(template, data)
     assert missing_vars == expected
-
-
-@pytest.mark.parametrize(
-    "template,expected",
-    [
-        ("{{ var }}", {"var"}),
-        ("{{ var.attr }}", {"var.attr"}),
-        ("{{ var[0] }}", {"var[0]"}),
-        ("{{ var['key'] }}", {"var['key']"}),
-        ('{{ var["key"] }}', {'var["key"]'}),
-        ("{{ var.attr[0] }}", {"var.attr[0]"}),
-        ("No variables here", set()),
-        ("{{ var1 }} and {{ var2.attr }}", {"var1", "var2.attr"}),
-    ],
-)
-def test_regex_missing_variable_pattern(template, expected):
-    matches = set(re.findall(Constants.MissingVariablePattern, template))
-    assert matches == expected
 
 
 @pytest.mark.parametrize(

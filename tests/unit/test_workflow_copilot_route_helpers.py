@@ -102,12 +102,18 @@ def test_assistant_history_retains_execution_receipts_after_proposal_clear() -> 
     first = MagicMock(
         sender=WorkflowCopilotChatSender.AI,
         narrative_payload={"testedBlockFingerprints": {"step": ["version_a"]}},
+        _narrative_payload_unreadable=False,
     )
     second = MagicMock(
         sender=WorkflowCopilotChatSender.AI,
         narrative_payload={"testedBlockFingerprints": {"step": ["version_b"], "other": ["version_c"]}},
+        _narrative_payload_unreadable=False,
     )
-    crashed = MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload={"terminal": "error"})
+    crashed = MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload={"terminal": "error"},
+        _narrative_payload_unreadable=False,
+    )
 
     assert _assistant_execution_receipts([first, second, crashed], None) == {
         "step": {"version_b"},

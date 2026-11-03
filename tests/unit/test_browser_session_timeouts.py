@@ -242,6 +242,7 @@ def test_session_is_active_matches_positive_remaining_time() -> None:
 async def _create_session(timeout: int | None) -> tuple[MagicMock, BrowserSessionResponse]:
     app_mock = MagicMock()
     app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
+    app_mock.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = AsyncMock(return_value={"pbs_1"})
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(
         return_value=SimpleNamespace(persistent_browser_session_id="pbs_1")
     )

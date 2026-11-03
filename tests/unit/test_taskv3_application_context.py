@@ -21,8 +21,8 @@ DEFAULTS = "the defaults text"
         ({1: True}, "yes_declared", True),
         ({1: False}, "no_declared", False),
         ({}, "no_implicit", False),
-        ({3: True}, "late_yes", False),
-        ({1: False, 2: True}, "late_yes", False),
+        ({3: True}, "late_yes", True),
+        ({1: False, 2: True}, "late_yes", True),
         ({1: True, 2: False}, "yes_declared", True),
         ({3: False}, "no_implicit", False),
         ({1: "yes"}, "no_implicit", False),
@@ -107,7 +107,7 @@ async def test_loop_appends_the_notice_and_the_defaults_as_user_messages_once() 
 
 
 @pytest.mark.asyncio
-async def test_loop_delivers_nothing_for_a_yes_after_the_first_reply() -> None:
+async def test_loop_delivers_once_the_turn_after_a_late_yes() -> None:
     context = ApplicationContext(DEFAULTS)
     tools = [_recording_tool("observe", []), context.tool, make_finish_tool()]
     script = [
@@ -117,9 +117,27 @@ async def test_loop_delivers_nothing_for_a_yes_after_the_first_reply() -> None:
         [("finish", {"status": "completed", "reason": "done"})],
     ]
     outcome, _ = await _run(script, tools, turn_notice=context.turn_notice)
-    users = [m["content"] for m in outcome.messages if m["role"] == "user"]
-    assert users.count(DEFAULTS) == 0
-    assert (context.final_state, context.delivered, context.audit_armed()) == ("late_yes", False, True)
+    messages = outcome.messages
+    assert [m["content"] for m in messages if m["role"] == "user"].count(DEFAULTS) == 1
+    replies = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+    assert replies[1] < messages.index({"role": "user", "content": DEFAULTS}) < replies[2]
+    assert (context.final_state, context.delivered, context.audit_armed()) == ("late_yes", True, True)
+
+
+@pytest.mark.asyncio
+async def test_a_yes_sent_with_finish_delivers_nothing() -> None:
+    context = ApplicationContext(DEFAULTS)
+    tools = [_recording_tool("observe", []), context.tool, make_finish_tool()]
+    script = [
+        [("observe", {})],
+        [
+            ("declare_application_context", {"is_job_application": True}),
+            ("finish", {"status": "completed", "reason": "done"}),
+        ],
+    ]
+    outcome, _ = await _run(script, tools, turn_notice=context.turn_notice)
+    assert DEFAULTS not in [m["content"] for m in outcome.messages if m["role"] == "user"]
+    assert (context.final_state, context.delivered) == ("late_yes", False)
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,8 @@
  *
  * Verifies that the isElementVisible guard correctly distinguishes:
  *  - filter inputs inside closed dropdowns (NOT force-visible)
- *  - regular shadow DOM text inputs (force-visible)
+ *  - regular shadow DOM text inputs, textareas and selects (force-visible)
+ *  - shadow DOM input[type=hidden] (NOT force-visible)
  *  - unrelated aria-expanded elements in the same shadow root (no effect)
  *  - open dropdown filter inputs (force-visible)
  *
@@ -154,6 +155,40 @@ test("regular shadow DOM text input: IS force-visible", () => {
   const sr = new MockShadowRoot(host, []);
   const input = makeEl({ tagName: "INPUT", type: "text", shadowRoot: sr });
   assert(isElementVisible(input), "should be visible");
+});
+
+test("shadow DOM textarea hidden by CSS: IS force-visible", () => {
+  const host = makeEl({ tagName: "custom-input", attributes: {} });
+  const sr = new MockShadowRoot(host, []);
+  const textarea = makeEl({
+    tagName: "TEXTAREA",
+    shadowRoot: sr,
+    rect: { width: 0, height: 0, left: 0, top: 0 },
+  });
+  assert(isElementVisible(textarea), "textarea should be force-visible");
+});
+
+test("shadow DOM select hidden by CSS: IS force-visible", () => {
+  const host = makeEl({ tagName: "custom-select", attributes: {} });
+  const sr = new MockShadowRoot(host, []);
+  const select = makeEl({
+    tagName: "SELECT",
+    shadowRoot: sr,
+    rect: { width: 0, height: 0, left: 0, top: 0 },
+  });
+  assert(isElementVisible(select), "select should be force-visible");
+});
+
+test("shadow DOM input[type=hidden]: NOT force-visible", () => {
+  const host = makeEl({ tagName: "custom-input", attributes: {} });
+  const sr = new MockShadowRoot(host, []);
+  const input = makeEl({
+    tagName: "INPUT",
+    type: "hidden",
+    shadowRoot: sr,
+    rect: { width: 0, height: 0, left: 0, top: 0 },
+  });
+  assert(!isElementVisible(input), "hidden input must not be force-visible");
 });
 
 test("closed sibling trigger: combobox filter input NOT force-visible", () => {

@@ -628,7 +628,11 @@ class SchedulesRepository(BaseRepository):
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
-        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal())
+        principal = get_request_principal()
+        accessible_folder_ids = await app.AGENT_FUNCTION.accessible_workflow_folder_ids(principal)
+        scoped_folder_ceiling = (
+            principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+        )
         db_page = page - 1
         async with self.Session() as session:
             # Subquery to get the latest version title per workflow_permanent_id
@@ -679,9 +683,12 @@ class SchedulesRepository(BaseRepository):
                 .where(WorkflowScheduleModel.deleted_at.is_(None))
             )
             if accessible_folder_ids is not None:
+                folder_filter = current_folder_id.in_(accessible_folder_ids)
+                if not scoped_folder_ceiling:
+                    folder_filter = or_(current_folder_id.is_(None), folder_filter)
                 base_filter = base_filter.where(
                     workflow_title_sq.c.workflow_permanent_id.is_not(None),
-                    or_(current_folder_id.is_(None), current_folder_id.in_(accessible_folder_ids)),
+                    folder_filter,
                 )
 
             if enabled_filter is not None:

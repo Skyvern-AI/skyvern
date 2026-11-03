@@ -59,9 +59,10 @@ def test_create_request_rejects_invalid_start_url() -> None:
 @pytest.mark.asyncio
 async def test_create_browser_session_passes_start_url_to_session_manager() -> None:
     created_session = SimpleNamespace(persistent_browser_session_id="pbs_1")
-    response = SimpleNamespace(browser_session_id="pbs_1")
+    response = SimpleNamespace(browser_session_id="pbs_1", browser_address=None)
     app_mock = MagicMock()
     app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
+    app_mock.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = AsyncMock(return_value={"pbs_1"})
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=created_session)
     from_browser_session = AsyncMock(return_value=response)
 

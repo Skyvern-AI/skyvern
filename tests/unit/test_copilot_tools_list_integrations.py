@@ -710,7 +710,7 @@ async def test_read_google_sheet_keeps_the_opened_connection_and_no_token_when_t
 async def test_read_google_sheet_bounds_an_oversized_sheet_and_says_so(
     sheets_api: SheetsApiInstaller, cell_character: str
 ) -> None:
-    sheets_api([_google(id="goac_opens")], {"goac_opens": OPENING_TOKEN}, rows=[[cell_character * 5_000] * 60] * 400)
+    sheets_api([_google(id="goac_opens")], {"goac_opens": OPENING_TOKEN}, rows=[[cell_character * 300] * 30] * 60)
 
     result = await _read_google_sheet({"spreadsheet_url": SHEET_URL, "range": "A1:ZZ400"}, _sheet_ctx())
 

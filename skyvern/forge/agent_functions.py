@@ -79,11 +79,13 @@ from skyvern.forge.sdk.services import (
 from skyvern.forge.sdk.services.audit_events import AuditEvent
 from skyvern.forge.sdk.services.credentials import AuthenticatorTotpParseResult
 from skyvern.forge.sdk.services.request_principal import (
+    APIKeyAuthProfile,
     BearerIdentityResolution,
     BearerIdentityStatus,
     RequestPrincipal,
     get_request_principal,
     human_user_id,
+    scoped_api_key_id_from_actor,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
@@ -142,10 +144,19 @@ async def record_request_audit_event(
     *,
     changed_fields: tuple[str, ...] = (),
     related_resource_ids: tuple[str, ...] = (),
+    metadata: Mapping[str, str | list[str]] | None = None,
 ) -> None:
     await app.AGENT_FUNCTION.record_audit_event(
         get_request_principal(),
-        AuditEvent(organization_id, action, resource_type, resource_id, changed_fields, related_resource_ids),
+        AuditEvent(
+            organization_id,
+            action,
+            resource_type,
+            resource_id,
+            changed_fields,
+            related_resource_ids,
+            metadata=metadata or {},
+        ),
     )
 
 
@@ -1013,6 +1024,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    async def nango_powerbi_available(self, organization_id: str) -> bool:
+        return False
+
     async def ensure_email_forwarding_available(
         self, organization_id: str | None = None, *, fresh: bool = True
     ) -> bool:
@@ -1065,6 +1079,18 @@ class AgentFunction:
     ) -> set[str]:
         """Return sessions whose associated workflow credentials are usable; OSS has no credential-folder ACLs."""
         return browser_session_ids
+
+    async def browser_session_ids_authorized_for_connect(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_ids: set[str]
+    ) -> set[str]:
+        """Return sessions whose client address may include a connect token; OSS has no RBAC enforcement."""
+        return browser_session_ids
+
+    async def should_redact_unresolved_browser_session_address(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        """Return whether an unresolvable address must be withheld; OSS has no RBAC enforcement."""
+        return False
 
     async def enforce_folder_access(
         self, principal: RequestPrincipal | None, action: str, resource: Mapping[str, object]
@@ -1124,11 +1150,28 @@ class AgentFunction:
         *,
         principal: RequestPrincipal | None = None,
         workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks folder use before releasing a credential secret; OSS has no credential-folder ACLs."""
 
+    async def enforce_scoped_credential_use(
+        self,
+        organization_id: str,
+        workflow_run_id: str | None,
+        *,
+        requested_by: str | None = None,
+    ) -> RequestPrincipal | None:
+        if scoped_api_key_id_from_actor(requested_by):
+            raise PermissionError("credential not accessible")
+        return None
+
     async def enforce_totp_identifier_credential_use(
-        self, organization_id: str, totp_identifier: str, *, workflow_run_id: str | None = None
+        self,
+        organization_id: str,
+        totp_identifier: str,
+        *,
+        workflow_run_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks credentials bound to a TOTP identifier; OSS has no credential-folder ACLs."""
 
@@ -1145,6 +1188,7 @@ class AgentFunction:
         organization_id: str | None = None,
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
+        requested_by: str | None = None,
     ) -> None:
         """Cloud checks credentials attached to run browser state; OSS has no credential-folder ACLs."""
 
@@ -1193,6 +1237,29 @@ class AgentFunction:
     ) -> bool:
         # OSS has no cloud role policy; preserve its existing response behavior.
         return False
+
+    async def authorize_browser_session_stream(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+    ) -> bool:
+        """Cloud enforces connect permission and origin-folder access; OSS preserves existing stream behavior."""
+        return True
+
+    async def browser_session_stream_reauthorization_required(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        """OSS has no dynamic browser-session stream authorization to recheck."""
+        return False
+
+    async def browser_session_stream_enforcement_monitor_required(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        return False
+
+    async def reauthorize_browser_session_stream(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+    ) -> bool:
+        """Recheck a stream when its session state changes; OSS retains its allow-by-default behavior."""
+        return await self.authorize_browser_session_stream(principal, organization_id, browser_session_id)
 
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.
@@ -1525,13 +1592,6 @@ class AgentFunction:
         script: Any,
     ) -> bool:
         return False
-
-    async def resolve_mcp_code_only_mode(
-        self,
-        organization_id: str | None,
-        request_override: bool | None,
-    ) -> bool:
-        return request_override if request_override is not None else settings.MCP_CODE_ONLY_MODE
 
     async def should_use_codeblock_runner(
         self,
@@ -1946,8 +2006,8 @@ class AgentFunction:
     async def resolve_member_api_key_user_id(self, organization_id: str, token_id: str) -> str | None:
         return None
 
-    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> tuple[str, str | None, bool] | None:
-        return "full_org", None, True
+    async def resolve_api_key_profile(self, organization_id: str, token_id: str) -> APIKeyAuthProfile | None:
+        return APIKeyAuthProfile("full_org", None, True)
 
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""
@@ -3445,7 +3505,9 @@ class AgentFunction:
         """Return whether the user belongs to the organization, or None when membership cannot be determined."""
         return None
 
-    async def resolve_bearer_identity(self, bearer_token: str, organization_id: str) -> BearerIdentityResolution:
+    async def resolve_bearer_identity(
+        self, bearer_token: str, organization_id: str, *, bearer_authenticated: bool = False
+    ) -> BearerIdentityResolution:
         """Return a verified bearer identity or why it could not be resolved."""
         return BearerIdentityResolution(None, BearerIdentityStatus.identity_provider_unconfigured)
 

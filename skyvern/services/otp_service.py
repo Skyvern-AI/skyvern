@@ -1032,8 +1032,14 @@ async def poll_otp_value(
     ``observed_otp_types`` off them to report which kind of OTP did arrive.
     """
     if totp_identifier:
+        run_context = (
+            app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(workflow_run_id) if workflow_run_id else None
+        )
         await app.AGENT_FUNCTION.enforce_totp_identifier_credential_use(
-            organization_id, totp_identifier, workflow_run_id=workflow_run_id
+            organization_id,
+            totp_identifier,
+            workflow_run_id=workflow_run_id,
+            requested_by=run_context.requested_by if run_context else None,
         )
 
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)

@@ -27,7 +27,6 @@ from pydantic import (
 
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
-from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
@@ -154,6 +153,9 @@ def _normalize_llm_selection(
         )
         block.llm_key = None
         return block
+
+    # Local on purpose: config_registry imports litellm, and the stdio MCP server must not load it at boot.
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # noqa: PLC0415
 
     if raw_llm_key in LLMConfigRegistry.get_model_names():
         block.llm_key = raw_llm_key
@@ -1551,8 +1553,8 @@ class AgentStepBlockYAML(BlockYAML):
     tools: list[str] | None = Field(
         default=None,
         description="The tools the step may call. A block it runs through run_block is named by its block type, such "
-        "as http_request. finish and read_run_data are always offered, and login only when the run has a credential "
-        "parameter. Without a list the step has no other tools.",
+        "as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a "
+        "credential parameter. Without a list the step has no other tools.",
     )
 
     @field_validator("tools")

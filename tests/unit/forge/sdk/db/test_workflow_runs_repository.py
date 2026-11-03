@@ -35,7 +35,6 @@ from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.id import generate_task_id, generate_workflow_run_id
 from skyvern.forge.sdk.db.models import (
     ArtifactModel,
-    Base,
     CredentialModel,
     CredentialParameterModel,
     OrganizationModel,
@@ -67,6 +66,7 @@ from skyvern.forge.taskv3.loop import LoopOutcome
 from skyvern.schemas.run_enums import RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT
 from skyvern.schemas.workflows import WorkflowRetryPolicy
+from tests.unit.conftest import SqliteEngineFactory
 from tests.unit.statement_timeout_fakes import FakeQueryCanceled
 
 
@@ -111,19 +111,13 @@ def _assert_not_filtering_copilot_authored_workflows(where_clause: str) -> None:
 
 
 @pytest_asyncio.fixture
-async def sqlite_engine() -> AsyncEngine:
-    engine = _build_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    try:
-        yield engine
-    finally:
-        await engine.dispose()
+async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory(build_engine=_build_engine)
 
 
 @pytest_asyncio.fixture
 async def sqlite_db(sqlite_engine: AsyncEngine) -> AgentDB:
-    return AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    return AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
 
 
 def _workflow_run_model(

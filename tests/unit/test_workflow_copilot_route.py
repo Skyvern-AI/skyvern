@@ -1232,6 +1232,97 @@ async def test_video_evidence_artifact_is_persisted_on_the_attachment(sqlite_eng
 
 
 @pytest.mark.asyncio
+async def test_chat_read_survives_a_review_card_saved_before_a_payload_key_existed(
+    sqlite_engine: AsyncEngine,
+) -> None:
+    """A chat read validates every row it serves, so one row saved under an older payload shape used to
+    fail the whole read and take the chat's history with it. Keys added after the first release stay
+    optional, and a row that still cannot be read drops its snapshot rather than the chat."""
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wpid-1")
+    pre_key_review = {
+        "blocks": [{"label": "Seed_Rows", "blockType": "code", "change": "added"}],
+        "duplicateWrites": [],
+    }
+    current_payload = {
+        **terminal_narrative_payload(),
+        "review": {
+            **pre_key_review,
+            "inputs": [{"key": "seed_rows", "change": "added"}],
+            "futureCardKey": "newer-card-data",
+        },
+        "futureNarrativeKey": {"producer": "newer-worker"},
+    }
+    for content, payload in (
+        ("before the key shipped", {**terminal_narrative_payload(), "review": pre_key_review}),
+        ("unreadable snapshot", {"review": "not a projection"}),
+        ("after the key shipped", current_payload),
+    ):
+        await repo.create_workflow_copilot_chat_message(
+            organization_id="org-1",
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            sender=WorkflowCopilotChatSender.AI,
+            content=content,
+            narrative_payload=payload,
+        )
+
+    messages = await repo.get_workflow_copilot_chat_messages(chat.workflow_copilot_chat_id)
+
+    assert [message.content for message in messages] == [
+        "before the key shipped",
+        "unreadable snapshot",
+        "after the key shipped",
+    ]
+    pre_key, unreadable, current = messages
+    assert pre_key.narrative_payload is not None
+    # Absent reads as no input changes, which is what every consumer of the key already defaults to.
+    assert pre_key.narrative_payload["review"].get("inputs", []) == []
+    assert pre_key.narrative_payload["review"]["blocks"] == pre_key_review["blocks"]
+    assert unreadable.narrative_payload is None
+    assert current.narrative_payload is not None
+    assert current.narrative_payload["review"]["inputs"] == [{"key": "seed_rows", "change": "added"}]
+    assert current.narrative_payload == current_payload
+    history = workflow_copilot_route.convert_to_history_messages([current])
+    assert history[0].model_dump()["narrative_payload"] == current_payload
+
+
+@pytest.mark.asyncio
+async def test_unreadable_newest_assistant_snapshot_stops_receipt_lookup(sqlite_engine: AsyncEngine) -> None:
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
+    chat = await repo.create_workflow_copilot_chat(organization_id="org-1", workflow_permanent_id="wpid-1")
+    older = await repo.create_workflow_copilot_chat_message(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.AI,
+        content="older receipt snapshot",
+        narrative_payload={
+            **terminal_narrative_payload(),
+            "testedBlockFingerprints": {"Seed_Rows": ["older-fingerprint"]},
+        },
+    )
+    intentional_null = await repo.create_workflow_copilot_chat_message(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.AI,
+        content="interrupted assistant row",
+        narrative_payload=None,
+    )
+    unreadable_newest = await repo.create_workflow_copilot_chat_message(
+        organization_id="org-1",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        sender=WorkflowCopilotChatSender.AI,
+        content="unreadable newest snapshot",
+        narrative_payload={"review": "not a projection"},
+    )
+
+    assert workflow_copilot_route._assistant_execution_receipts([older], None) == {"Seed_Rows": {"older-fingerprint"}}
+    assert workflow_copilot_route._assistant_execution_receipts([older, intentional_null], None) == {
+        "Seed_Rows": {"older-fingerprint"}
+    }
+    assert workflow_copilot_route._assistant_execution_receipts([older, unreadable_newest], None) == {}
+
+
+@pytest.mark.asyncio
 async def test_turning_off_auto_accept_mid_turn_keeps_the_pending_review_and_gates_the_turns_proposal(
     sqlite_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9846,6 +9937,8 @@ async def test_terminal_frame_is_still_sent_when_the_run_read_fails(monkeypatch:
 async def test_terminal_frame_is_still_sent_when_the_run_read_outlasts_its_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(workflow_copilot_route, "TERMINAL_RUN_FACTS_TIMEOUT_SECONDS", 0.05)
+
     async def never_answers(workflow_run_id: str, organization_id: str) -> None:
         await asyncio.Event().wait()
 

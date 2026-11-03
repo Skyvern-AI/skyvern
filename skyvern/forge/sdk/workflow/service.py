@@ -3709,6 +3709,9 @@ class WorkflowService:
                 if copilot_session_id is not None
                 else (ambient_context.copilot_session_id if ambient_context else None)
             )
+            resolved_requested_by = requested_by or (
+                ambient_context.requested_by if parent_workflow_run_id is not None and ambient_context else None
+            )
             resolved_trigger_type = trigger_type
             if resolved_trigger_type is None and ambient_context:
                 resolved_trigger_type = ambient_context.trigger_type
@@ -3758,7 +3761,7 @@ class WorkflowService:
                 fallback_attempt=fallback_attempt,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
-                requested_by=requested_by,
+                requested_by=resolved_requested_by,
                 workflow=workflow,
                 block_scoped=block_scoped,
                 created_by=created_by,
@@ -3828,6 +3831,7 @@ class WorkflowService:
                     workflow_id=workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                     root_workflow_run_id=root_workflow_run_id,
+                    requested_by=resolved_requested_by,
                     run_id=current_run_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     max_steps_override=max_steps_override,
@@ -7513,6 +7517,7 @@ class WorkflowService:
                 mask_secrets=getattr(workflow, "mask_secrets", False),
                 attempt_number=attempt_number,
                 parent_workflow_run_id=workflow_run.parent_workflow_run_id,
+                requested_by=getattr(workflow_run, "requested_by", None),
             )
         except WorkflowAttemptDispatchSuperseded:
             raise

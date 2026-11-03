@@ -245,6 +245,7 @@ from skyvern.forge.taskv3.provider_downloads import (
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
     APPLICATION_CONTEXT_FLAG,
+    CARRY_REASONING_FLAG,
     DATE_SEGMENT_AIM_FLAG,
     DEAD_END_RETURN_FLAG,
     LLM_ROUTE_FLAG,
@@ -3059,6 +3060,13 @@ class ForgeAgent:
                 organization_id=task.organization_id,
                 forced=False,
             )
+            await resolve_run_arm(
+                context,
+                CARRY_REASONING_FLAG,
+                distinct_id=task.workflow_run_id or task.task_id,
+                organization_id=task.organization_id,
+                forced=False,
+            )
             turn_dom_arm = await resolve_run_arm(
                 context,
                 TURN_DOM_FLAG,
@@ -4732,6 +4740,8 @@ class ForgeAgent:
                     "Workflow run is canceled, stopping execution inside task",
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+                # The parent run tears the browser down without this task's cleanup, so stop its pooled operations here.
+                await self.async_operation_pool.cancel_task(task.task_id)
                 step = await self.update_step(
                     step,
                     status=StepStatus.canceled,
@@ -4750,6 +4760,7 @@ class ForgeAgent:
                     "Workflow run is timed out, stopping execution inside task",
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+                await self.async_operation_pool.cancel_task(task.task_id)
                 step = await self.update_step(
                     step,
                     status=StepStatus.canceled,
@@ -5073,6 +5084,7 @@ class ForgeAgent:
                 # The poll already settled this stop; a failed read or write (or a row already final) must not
                 # reach the catch-all, which would fail the task and run cleanup the parent run owns.
                 if canceled_by_workflow_run:
+                    await self.async_operation_pool.cancel_task(task.task_id)
                     try:
                         task = await self.update_task(task, status=terminal_status)
                     except Exception:
@@ -5331,6 +5343,9 @@ class ForgeAgent:
         # TODO (kerem): Let's add other exceptions that we know about here as custom exceptions as well
         except CancelledError:
             context.clear_multi_field_totp_state(task.task_id)
+            # A cancelled step never reaches clean_up_task, where its pooled operations are otherwise stopped.
+            with contained_effect("pooled async operation cancellation", task_id=task.task_id):
+                await self.async_operation_pool.cancel_task(task.task_id)
             raise
         except StepUnableToExecuteError:
             LOG.exception("Step cannot be executed. Task execution stopped")
@@ -10456,6 +10471,9 @@ class ForgeAgent:
         # Last point common to every terminal path, and late enough that the screenshot and
         # download work above has already given the billed speculative call time to land.
         await drain_speculative_persist_tasks(skyvern_context.current())
+        # Before the workflow-run return below: the workflow closes that browser later, and a pooled operation still
+        # running then would hit the closed page.
+        await self.async_operation_pool.cancel_task(task.task_id)
         # if it's a task block from workflow run,
         # we don't need to close the browser, save browser artifacts, or call webhook
         if task.workflow_run_id:
@@ -10466,8 +10484,6 @@ class ForgeAgent:
                 workflow_run_id=task.workflow_run_id,
             )
             return task
-
-        await self.async_operation_pool.remove_task(task.task_id)
 
         _tracer = otel_trace.get_tracer("skyvern")
         with traced_span(_tracer, "skyvern.agent.cleanup.browser_and_artifacts") as _cl_br_span:

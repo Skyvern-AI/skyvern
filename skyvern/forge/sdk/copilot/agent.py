@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -235,6 +235,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     BrowserProbeOutcome,
     _browser_context_attachability,
+    cancel_ledgered_build_test_prestarts,
     close_browser_session_quietly,
     end_minted_browser_renewals,
     record_attached_browser_driver,
@@ -591,7 +592,7 @@ async def _resolve_live_browser_session_id(
 
 
 def _historical_turn_facts_projection(
-    narrative_payload: TurnNarrativePayload | None,
+    narrative_payload: Mapping[str, Any] | None,
 ) -> HistoricalTurnFactsProjection | None:
     if not isinstance(narrative_payload, dict):
         return None
@@ -5352,8 +5353,10 @@ async def run_copilot_agent(
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
                 if turn_end_ctx is not None:
-                    # Synchronous and first, so no later cleanup step that raises or is cancelled can leave a
-                    # minted browser stamped for the life of this process.
+                    # These three run synchronously before any awaited cleanup, so a later step that raises or is
+                    # cancelled cannot leave a pre-start running or a minted browser stamped for this process's life.
+                    turn_end_ctx.prestart_teardown_started = True
+                    cancel_ledgered_build_test_prestarts(turn_end_ctx)
                     end_minted_browser_renewals(turn_end_ctx)
                 _log_authoring_turn_summary(turn_end_ctx)
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)

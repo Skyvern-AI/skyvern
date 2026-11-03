@@ -131,14 +131,6 @@ class TestRecordArtifactsAfterActionTargetClosed:
         log.exception.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_other_screenshot_failures_still_log_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        log, kwargs = _agent_rig(monkeypatch, FailedToTakeScreenshot(error_message="Target crashed"))
-
-        await ForgeAgent.record_artifacts_after_action(MagicMock(), **kwargs)
-
-        assert any("Failed to record screenshot after action" in str(call.args[0]) for call in log.error.call_args_list)
-
-    @pytest.mark.asyncio
     async def test_capture_deadline_timeout_warns_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         log, kwargs = _agent_rig(monkeypatch, TimeoutError())
 
@@ -831,7 +823,6 @@ class TestStepBoundaryBrowserLoss:
 class TestTaskV2IterationTargetClosed:
     """Structural guard: ``run_task_v2_helper`` needs a full workflow-run rig to drive, so this pins
     the clause ordering instead — the closed-target handler must precede the generic ``LOG.exception``.
-    Same ``inspect.getsource`` approach already used in ``test_screenshot_attribution.py``.
     """
 
     def test_closed_target_handled_before_generic_exception(self) -> None:

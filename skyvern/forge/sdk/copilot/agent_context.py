@@ -256,6 +256,18 @@ class ScoutedInteraction(TypedDict):
 
 
 @dataclass(frozen=True)
+class PrestartedBrowser:
+    session_id: str
+    ready_monotonic: float
+
+
+@dataclass(frozen=True)
+class BuildTestPrestart:
+    task: asyncio.Task[PrestartedBrowser | None]
+    proxy_location: ProxyLocationInput
+
+
+@dataclass(frozen=True)
 class AttachedBrowserDriver:
     session_id: str
     browser_state: BrowserState
@@ -641,6 +653,20 @@ class AgentContext:
     # budgets. A run left to its owner takes its browser out of the ledger.
     minted_browser_sessions: dict[str, str | None] = field(default_factory=dict)
     minted_browser_renewal_checks: dict[str, asyncio.TimerHandle] = field(default_factory=dict)
+    # The next build test's blank browser, started while the model fixes a failed first-block test.
+    build_test_prestart: BuildTestPrestart | None = None
+    # Every unfinished pre-start mapped to the ctx copy it provisions on; claim and discard leave this alone.
+    pending_build_test_prestarts: dict[asyncio.Task[PrestartedBrowser | None], AgentContext] = field(
+        default_factory=dict
+    )
+    # The browser each turn-end cancel interrupted, since the cancelled provision retires the copy's id.
+    cancelled_build_test_prestarts: dict[asyncio.Task[PrestartedBrowser | None], str] = field(default_factory=dict)
+    # Set first thing at turn end: a pre-start that finishes later finds the sweeps already run and cleans up itself.
+    prestart_teardown_started: bool = False
+    # Closed when a newer test started; an older call's result that lands later must not rebind last_run to one.
+    superseded_minted_browser_sessions: set[str] = field(default_factory=set)
+    # A resumed browser's earlier run id and how many calls hold it while their runs are not yet submitted.
+    minted_browser_claims: dict[str, tuple[str, int]] = field(default_factory=dict)
     browser_allocation_recorder: Callable[[str, str | None], Awaitable[None]] | None = None
 
     # Set by tool gates / loop guards / tool-side error branches when a tool

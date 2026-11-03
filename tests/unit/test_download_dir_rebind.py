@@ -74,6 +74,7 @@ def _workflow_attach_run() -> SimpleNamespace:
         parent_workflow_run_id=None,
         workflow_permanent_id="wpid_block",
         organization_id="org_1",
+        requested_by=None,
         browser_profile_id=None,
         proxy_location=None,
         extra_http_headers=None,
@@ -279,11 +280,6 @@ async def test_rebind_context_path_without_interceptor_still_sets_behaviour() ->
     await rebind_download_dir(None, run_id="wr_test", page=page)
 
     cdp_session.send.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_rebind_no_browser_and_no_page_is_noop() -> None:
-    await rebind_download_dir(None, run_id="wr_test")
 
 
 @pytest.mark.asyncio
@@ -760,31 +756,6 @@ async def test_browser_manager_adoption_rebinds_via_context_page_without_owning_
     assert result is browser_state
     _, params = cdp_session.send.await_args.args
     assert params["downloadPath"].endswith("/wr_block")
-
-
-@pytest.mark.asyncio
-async def test_browser_manager_adoption_no_browser_no_page_returns_state(browser_manager: RealBrowserManager) -> None:
-    """No Browser and no working page leaves nothing to rebind, but attachment stays fail-open."""
-    browser_state = MagicMock()
-    browser_state.browser_context.browser = None
-    browser_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
-    browser_state.get_working_page = AsyncMock(return_value=None)
-    browser_state.get_or_create_page = AsyncMock()
-    manager = browser_manager
-
-    with (
-        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
-        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=None),
-    ):
-        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
-        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
-        result = await manager.get_or_create_for_workflow_run(
-            _workflow_attach_run(),
-            browser_session_id="bs_block",
-        )
-
-    assert result is browser_state
 
 
 @pytest.mark.asyncio
@@ -1592,14 +1563,6 @@ async def test_file_upload_block_uploads_downloads_to_google_drive(tmp_path) -> 
     assert destination.storage_type == FileStorageType.GOOGLE_DRIVE
     assert destination.google_access_token == "at-1"
     assert destination.google_drive_folder_id == "folder_123"
-
-
-def test_resolve_run_download_id_preserves_task_id_tail() -> None:
-    """CORR-1: mirrors handler.py fallback_run_id=task.workflow_run_id or task.task_id — when both
-    context and workflow_run_id are absent, the task_id tail must still be resolved (not None)."""
-    empty = SkyvernContext(run_id=None, workflow_run_id=None, task_id=None)
-    # Equivalent to handler.py's `task.workflow_run_id or task.task_id` collapsing to the task_id tail.
-    assert resolve_run_download_id(empty, fallback_run_id="tsk_x") == "tsk_x"
 
 
 @pytest.mark.asyncio

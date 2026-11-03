@@ -33,7 +33,6 @@ export const agentStepNodeDefaultData: AgentStepNodeData = {
     "browser_task",
     "download_to_s3",
     "file_download",
-    "login",
     "page_click",
     "page_fill",
     "page_goto",

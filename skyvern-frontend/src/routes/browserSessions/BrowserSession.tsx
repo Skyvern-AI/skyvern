@@ -59,7 +59,9 @@ import { BrowserSessionStream } from "./BrowserSessionStream";
 import { BrowserSessionTimeline } from "./BrowserSessionTimeline";
 import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
 import {
+  canViewBrowserSessionLive,
   getBrowserSessionTabFromPathname,
+  getBrowserSessionTabOptions,
   getSessionControlsState,
 } from "./BrowserSession.utils";
 
@@ -75,14 +77,6 @@ const BROWSER_SESSION_STATUS_BADGE_VARIANT: Record<
   retry: "warning",
   created: "secondary",
 };
-
-const TAB_OPTIONS = [
-  { label: "Stream", to: "stream" },
-  { label: "Recordings", to: "recordings" },
-  { label: "Downloads", to: "downloads" },
-  { label: "Timeline", to: "timeline" },
-  { label: "Runs", to: "runs" },
-];
 
 function BrowserTabStrip({
   options,
@@ -128,10 +122,6 @@ function BrowserSession() {
   const [previewWidth, setPreviewWidth] = useState<number | null>(null);
   const { browserStreamingMode } = useBrowserStreamingMode();
 
-  // Only the Stream tab has a preview to size the window against; the other tabs
-  // hold tables and want the whole pane.
-  const windowWidth = activeTab === "stream" ? previewWidth : null;
-
   useEffect(() => {
     setVncFailed(false);
   }, [browserSessionId]);
@@ -156,8 +146,15 @@ function BrowserSession() {
   });
 
   const browserSession = query.data;
-  // A registered external browser has no stream; without this the global mode would mount one the server refuses.
+  const canConnect = Boolean(browserSession?.browser_address);
   const isExternal = browserSession?.source === "external";
+  const canViewLive = canViewBrowserSessionLive(browserSession);
+  const tabOptions = getBrowserSessionTabOptions(canViewLive);
+  // Only the Stream tab has a preview to size the window against; the other tabs
+  // hold tables and want the whole pane.
+  const windowWidth =
+    activeTab === "stream" && canViewLive ? previewWidth : null;
+  // A registered external browser has no stream; without this the global mode would mount one the server refuses.
   const { showControls, isSavingProfile, showCloseSession } =
     getSessionControlsState({
       browserSessionId,
@@ -165,6 +162,7 @@ function BrowserSession() {
       savingProfileSessionId: activeProfileCreate?.browserSessionId,
     });
   const isCdpMode =
+    canConnect &&
     !isExternal &&
     resolveStreamTransport(
       browserStreamingMode,
@@ -224,7 +222,9 @@ function BrowserSession() {
         <div className="flex w-full flex-shrink-0 flex-row items-center justify-between p-4">
           <div className="flex w-full flex-row items-center justify-start gap-2">
             <div className="text-xl">Browser Session</div>
-            {activeTab === "stream" && <StreamModeBadge mode={streamMode} />}
+            {activeTab === "stream" && canViewLive && (
+              <StreamModeBadge mode={streamMode} />
+            )}
             {browserSession && (
               <div className="ml-auto flex flex-col items-end justify-end overflow-hidden">
                 <div className="flex items-center justify-end gap-2">
@@ -269,7 +269,7 @@ function BrowserSession() {
         {/* Title bar: section tabs left, session controls docked right. Controls come
             after every tab in the DOM so keyboard order stays tabs-then-actions. */}
         <div className="flex w-full flex-shrink-0 items-center gap-2 rounded-t-lg border border-b-0 bg-slate-900 px-2 pt-1">
-          <BrowserTabStrip options={TAB_OPTIONS} />
+          <BrowserTabStrip options={tabOptions} />
 
           {showControls && (
             <div className="ml-auto flex flex-shrink-0 items-center gap-1 pb-1">
@@ -374,10 +374,16 @@ function BrowserSession() {
               pointerEvents: activeTab === "stream" ? "auto" : "none",
             }}
           >
-            {isExternal && (
+            {browserSession.browser_address_redacted &&
+              activeTab === "stream" && (
+                <div className="p-4 text-sm text-muted-foreground">
+                  Live view is unavailable with your current permissions.
+                </div>
+              )}
+            {canViewLive && isExternal && (
               <StreamStatusPanel diagnostic={EXTERNAL_BROWSER_DIAGNOSTIC} />
             )}
-            {(isCdpMode || vncFailed) && browserSessionId && (
+            {canConnect && (isCdpMode || vncFailed) && browserSessionId && (
               <BrowserSessionStream
                 browserSessionId={browserSessionId}
                 interactive={true}
@@ -387,7 +393,7 @@ function BrowserSession() {
                 onFrameWidthChange={setPreviewWidth}
               />
             )}
-            {streamMode === "vnc" && (
+            {canViewLive && streamMode === "vnc" && (
               <BrowserStream
                 browserSessionId={browserSessionId}
                 browserSession={browserSession}

@@ -23,6 +23,7 @@ TURN_DOM_FLAG = "TASK_V3_TURN_DOM"
 LLM_ROUTE_FLAG = "TASK_V3_LLM_ROUTE"
 ANSWER_AUDIT_LOG_ONLY_FLAG = "TASK_V3_ANSWER_AUDIT_LOG_ONLY"
 APPLICATION_CONTEXT_FLAG = "TASK_V3_APPLICATION_CONTEXT"
+CARRY_REASONING_FLAG = "TASK_V3_CARRY_REASONING"
 
 # Person properties a flag is evaluated with beyond organization_id; resolve_run_arm drops any other key. The
 # PostHog preflight (scripts/check_run_arm_flags.py) reads this mapping to accept release conditions on them.

@@ -24,7 +24,11 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunGroupItemModel,
     WorkflowRunGroupModel,
 )
-from skyvern.forge.sdk.services.request_principal import get_request_principal, trigger_owner_id
+from skyvern.forge.sdk.services.request_principal import (
+    get_request_principal,
+    scoped_api_key_actor_id,
+    trigger_owner_id,
+)
 from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
 from skyvern.schemas.workflow_run_groups import (
     IN_FLIGHT_ITEM_STATES,
@@ -151,6 +155,7 @@ class WorkflowRunGroupsRepository(BaseRepository):
                 )
                 if changed := sorted(key for key, group_id in latest.items() if expected.get(key) != group_id):
                     raise GroupAccountsRanSinceReview(changed)
+            principal = get_request_principal()
             group = WorkflowRunGroupModel(
                 organization_id=organization_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -159,7 +164,14 @@ class WorkflowRunGroupsRepository(BaseRepository):
                 submission_key=submission_key,
                 input_fingerprint=input_fingerprint,
                 status=WorkflowRunGroupStatus.active.value,
-                created_by=trigger_owner_id(get_request_principal(), organization_id),
+                created_by=trigger_owner_id(principal, organization_id),
+                requested_by=(
+                    scoped_api_key_actor_id(principal.api_key_token_id)
+                    if principal is not None
+                    and principal.api_key_access_mode == "scoped"
+                    and principal.api_key_token_id is not None
+                    else None
+                ),
             )
             session.add(group)
             await session.flush()
