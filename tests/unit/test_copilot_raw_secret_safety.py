@@ -1,25 +1,56 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
+from skyvern.forge.sdk.copilot import request_policy as request_policy_module
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _request_policy_agent_inputs,
+    _rewrite_failed_test_response,
     _store_request_policy_on_context,
 )
-from skyvern.forge.sdk.copilot.context import ApprovedCredential, StructuredContext
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.context import (
+    ApprovedCredential,
+    StructuredContext,
+    record_approved_credentials_in_global_llm_context,
+)
+from skyvern.forge.sdk.copilot.eval_llm_overrides import EvalLLMOverrides, eval_llm_override_scope
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_REFUSAL_SENTINEL,
     SAFETY_SCREEN_UNAVAILABLE_QUESTION,
+    RequestPolicy,
+    _seed_prior_approved_credentials,
     build_request_policy_trust_floor,
+    credential_prompt_reason,
+    screen_raw_secret_safety,
+)
+from skyvern.forge.sdk.copilot.tools.credential_fill import (
+    _credential_fill_origin_grant,
+    _credential_fill_prerequisite_error,
+    _request_credential,
+    _within_grant,
 )
 from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error, _update_and_run_requires_skipped_run
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.test_copilot_credential_pause import (
+    _answered_cache,
+    _make_credential,
+    _stub_credential_lookup,
+    _tool_ctx,
+)
 
 _SCREEN_UNAVAILABLE_TURN = "[INPUT_UNAVAILABLE_SAFETY_SCREEN_INCOMPLETE]"
 _ACCESS_LINK_VALUE = "A1B2C3D4E5F6"
@@ -312,6 +343,49 @@ async def test_multiple_semantic_secret_citations_are_each_redacted() -> None:
     assert policy.canonical_user_message == "Draft this config with [REDACTED_SECRET] and [REDACTED_SECRET]"
     assert policy.raw_secret_handling == "redacted_draft"
     assert policy.raw_secret_safety_citation_count == 2
+
+
+@pytest.mark.asyncio
+async def test_every_copy_of_a_cited_secret_is_redacted_including_curly_quoted_and_colon_prefixed() -> None:
+    secret = "Zq8!vL3#pR2w"
+    policy, _ = await _build(
+        f"Use backup code {secret} first.\nIf asked again, type “{secret}” or enter PIN:{secret} and press Enter.",
+        {"version": "1", "state": "detected", "citations": [secret]},
+    )
+
+    assert secret not in policy.canonical_user_message
+    assert policy.canonical_user_message.count("[REDACTED_SECRET]") == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("secret", "citation"),
+    [("Hunter2:Portal!", "Portal!"), ("Hunter2‘Portal!", "Portal!"), ("Hunter2’Portal!", "Hunter2")],
+    ids=["after-colon", "after-curly-quote", "before-curly-quote"],
+)
+async def test_citing_part_of_a_secret_split_by_a_colon_or_curly_quote_fails_closed(secret: str, citation: str) -> None:
+    policy, _ = await _build(
+        f"My portal login is {secret}",
+        {"version": "1", "state": "detected", "citations": [citation]},
+    )
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert "Hunter2" not in policy.canonical_user_message
+    assert "Portal" not in policy.canonical_user_message
+
+
+@pytest.mark.asyncio
+async def test_a_cited_value_that_also_ends_a_longer_secret_leaves_no_part_of_it() -> None:
+    policy, _ = await _build(
+        "Use Portal! at the kiosk. The admin login is Hunter2:Portal! and the backup is “Portal!”.",
+        {"version": "1", "state": "detected", "citations": ["Portal!"]},
+    )
+
+    assert policy.raw_secret_safety_status == "detected"
+    assert "Portal!" not in policy.canonical_user_message
+    assert "Hunter2" not in policy.canonical_user_message
+    assert "Use [REDACTED_SECRET] at the kiosk." in policy.canonical_user_message
 
 
 @pytest.mark.asyncio
@@ -755,7 +829,7 @@ async def _uncited_redaction_ctx(message: str = _RAW_SECRET_MESSAGE):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tool_name",
-    ["run_blocks_and_collect_debug", "discover_workflow_entrypoint", "inspect_page_for_composition"],
+    ["run_blocks_and_collect_debug", "discover_workflow_entrypoint", "inspect_page_for_composition", "search_web"],
 )
 async def test_uncited_deterministic_redaction_does_not_block_browser_tools(tool_name: str) -> None:
     ctx, policy = await _uncited_redaction_ctx()
@@ -779,7 +853,18 @@ async def test_uncited_deterministic_redaction_preserves_run_authority() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", ["run_blocks_and_collect_debug", "discover_workflow_entrypoint"])
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "run_blocks_and_collect_debug",
+        "edit_block_and_run",
+        "discover_workflow_entrypoint",
+        "search_web",
+        "run_browser_code",
+        "inspect_page_for_composition",
+        "inspect_locator_matches",
+    ],
+)
 async def test_verified_cited_raw_secret_blocks_browser_acting_tools(tool_name: str) -> None:
     literal = "Hunter2Portal!"
     policy, _ = await _build(
@@ -797,16 +882,16 @@ async def test_verified_cited_raw_secret_blocks_browser_acting_tools(tool_name: 
 
 
 @pytest.mark.asyncio
-async def test_verified_cited_raw_secret_does_not_block_read_only_page_inspection() -> None:
+async def test_verified_cited_raw_secret_blocks_saved_credential_fill() -> None:
     literal = "Hunter2Portal!"
     policy, _ = await _build(
         f"The password is {literal}",
         {"version": "1", "state": "detected", "citations": [literal]},
     )
     ctx = make_copilot_ctx(request_policy=policy)
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
 
-    assert _authority_tool_error(ctx, "inspect_page_for_composition") is None
-    assert ctx.blocker_signal is None
+    assert _credential_fill_prerequisite_error(ctx, "cred_1") is not None
 
 
 @pytest.mark.asyncio
@@ -848,3 +933,382 @@ async def test_clean_turn_reaches_the_browser_and_runs() -> None:
     assert policy.raw_secret_detected is False
     assert _authority_tool_error(ctx, "run_blocks_and_collect_debug") is None
     assert _update_and_run_requires_skipped_run(ctx, "update_and_run_blocks") is False
+
+
+_CARD_SECRET = "Sentinel-Pass-7Q2"
+_CARD_LOGIN = "sentinel-login"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_url",
+    [
+        f"https://portal.example.com/login?user={_CARD_LOGIN}&password={_CARD_SECRET}",
+        f"https://portal.example.com/{_CARD_LOGIN}/{_CARD_SECRET}/login",
+    ],
+    ids=["query", "path"],
+)
+async def test_redacted_secret_turn_opens_the_card_for_the_users_site_and_keeps_the_run_gate_closed(
+    monkeypatch: pytest.MonkeyPatch, user_url: str
+) -> None:
+    message = (
+        f"Sign in at {user_url} with username {_CARD_LOGIN} and password {_CARD_SECRET}, then download the invoice"
+    )
+    policy, _ = await _build(message, {"version": "1", "state": "detected", "citations": [_CARD_SECRET]})
+    assert policy.raw_secret_redacted_draft
+    ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
+    monkeypatch.setattr(credential_pause_module, "_new_resume_token", lambda: "tok-1")
+    ctx.request_policy = policy
+    ctx.test_after_update_done = True
+    _stub_credential_lookup(monkeypatch, _make_credential())
+
+    with capture_logs() as logs:
+        result = await _request_credential("https://portal.example.com/sign-in", "The portal needs a sign-in.", ctx)
+        carried = record_approved_credentials_in_global_llm_context(ctx, None)
+
+    assert result["status"] == "connected"
+    ctx.last_workflow = object()
+    ctx.last_update_block_count = 1
+    final = _rewrite_failed_test_response(f"Done. Bound your saved login for {user_url}.", ctx)
+    assert "untested" in final
+    frame = ctx.stream.send.await_args_list[0].args[0]
+    assert frame.type is WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED
+    assert frame.login_page_urls == ["https://portal.example.com"]
+    surfaces = {
+        "frame": frame.model_dump_json(),
+        "result": json.dumps(result),
+        "ask_urls": json.dumps(policy.credential_ask_login_page_urls),
+        "admitted": json.dumps(policy.live_page_admitted_urls),
+        "carried": carried or "",
+        "final": final,
+        "logs": json.dumps(logs, default=str),
+    }
+    for surface, text in surfaces.items():
+        assert _CARD_SECRET not in text, surface
+        assert _CARD_LOGIN not in text, surface
+
+    assert policy.allow_run_blocks is False
+    assert policy.allow_missing_credentials_in_draft is True
+    assert ctx.test_after_update_done is True
+    assert credential_prompt_reason(policy) is None
+    assert _update_and_run_requires_skipped_run(ctx, "update_and_run_blocks") is True
+    for tool_name in (
+        "run_blocks_and_collect_debug",
+        "search_web",
+        "run_browser_code",
+        "inspect_page_for_composition",
+        "inspect_locator_matches",
+    ):
+        assert _authority_tool_error(ctx, tool_name) is not None
+    grant, error = await _credential_fill_origin_grant(ctx, "cred_1")
+    assert grant is None
+    assert error is not None
+
+    next_policy = RequestPolicy()
+    await _seed_prior_approved_credentials(next_policy, organization_id="org-1", global_llm_context=carried)
+    next_ctx = make_copilot_ctx(request_policy=next_policy)
+    next_ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    next_grant, next_error = await _credential_fill_origin_grant(next_ctx, "cred_1")
+    assert next_error is None
+    assert next_grant is not None
+    assert _within_grant("https://portal.example.com/password", next_grant)
+    assert _authority_tool_error(next_ctx, "run_blocks_and_collect_debug") is None
+
+
+@pytest.mark.asyncio
+async def test_a_user_url_carrying_userinfo_authorizes_no_card_on_a_redacted_secret_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = f"Sign in at https://{_CARD_LOGIN}:{_CARD_SECRET}@portal.example.com/login and download the invoice"
+    policy, _ = await _build(message, {"version": "1", "state": "detected", "citations": [_CARD_SECRET]})
+    assert policy.raw_secret_redacted_draft
+    ctx = _tool_ctx(monkeypatch, _answered_cache("connected", "cred_1"))
+    ctx.request_policy = policy
+
+    result = await _request_credential("https://portal.example.com/login", "The portal needs a sign-in.", ctx)
+
+    assert result["ok"] is False
+    ctx.stream.send.assert_not_awaited()
+    assert policy.credential_ask_login_page_urls == []
+    assert _CARD_SECRET not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("user_url", "card_can_open", "expected"),
+    [
+        ("https://portal.example.com/login?pw=" + _CARD_SECRET, True, "request_credential"),
+        ("", True, "ask the user for it"),
+        ("https://portal.example.com/login", False, "Credentials UI"),
+    ],
+    ids=["user_site", "no_site", "card_unavailable"],
+)
+def test_a_redacted_secret_draft_result_points_at_the_card_while_it_can_open(
+    monkeypatch: pytest.MonkeyPatch, user_url: str, card_can_open: bool, expected: str
+) -> None:
+    ctx = _tool_ctx(monkeypatch)
+    ctx.client_supports_credential_pause = card_can_open
+    ctx.request_policy = RequestPolicy(user_provided_site_urls=[user_url] if user_url else [])
+    ctx.request_policy.apply_raw_secret_redacted_draft()
+    result: dict[str, Any] = {"ok": True}
+
+    tools_module._mark_credential_deferred_draft(ctx, result)
+
+    message = result["data"]["message"]
+    assert expected in message
+    assert _CARD_SECRET not in message
+    assert ("Credentials UI" in message) is not card_can_open
+
+
+_CLEAN_VERDICT = {"version": "1", "state": "clean", "citations": []}
+_SCREEN_PROMPT_TYPE = "workflow-copilot-raw-secret-safety"
+_CLEAN_MESSAGE = "Build a workflow that downloads the invoice"
+
+
+class _SafetyLeg:
+    def __init__(
+        self,
+        llm_key: str,
+        response: object = None,
+        *,
+        delay: float = 0.0,
+        error: type[Exception] | None = None,
+        hang: bool = False,
+    ) -> None:
+        self.llm_key = llm_key
+        self.response = response
+        self.delay = delay
+        self.error = error
+        self.hang = hang
+        self.started_at: list[float] = []
+        self.cancelled = False
+
+    async def __call__(self, **_: object) -> object:
+        self.started_at.append(time.monotonic())
+        try:
+            if self.hang:
+                await asyncio.Event().wait()
+            if self.delay:
+                await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        if self.error is not None:
+            raise self.error("provider unavailable")
+        return self.response
+
+
+def _route_with_fallback(monkeypatch: pytest.MonkeyPatch, fallback: _SafetyLeg) -> list[str]:
+    builds: list[str] = []
+
+    def build(llm_key: str) -> _SafetyLeg:
+        builds.append(llm_key)
+        return fallback
+
+    monkeypatch.setattr(request_policy_module, "router_fallback_llm_key", {"PRIMARY": "FALLBACK", "SELF": "SELF"}.get)
+    monkeypatch.setattr(request_policy_module.LLMAPIHandlerFactory, "get_llm_api_handler", build)
+    return builds
+
+
+async def _trust_floor(message: str, handler: _SafetyLeg) -> RequestPolicy:
+    return await build_request_policy_trust_floor(
+        user_message=message,
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=handler,
+    )
+
+
+@pytest.mark.asyncio
+async def test_hung_primary_is_answered_by_the_fallback_inside_the_screen_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT, delay=0.5)
+    builds = _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert screen.status == "clean"
+    assert screen.canonical_user_message == _CLEAN_MESSAGE
+    assert (screen.answered_by, screen.hedged) == ("fallback", True)
+    assert builds == ["FALLBACK"]
+    assert fallback.started_at[0] - primary.started_at[0] >= settings.COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS
+    assert screen.latency_ms < 4000
+    assert primary.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_prompt_primary_never_builds_or_calls_the_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT, delay=0.2)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    builds = _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "primary", False)
+    assert builds == []
+    assert fallback.started_at == []
+
+
+@pytest.mark.asyncio
+async def test_failed_primary_starts_the_fallback_without_waiting_for_the_hedge_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = _SafetyLeg("PRIMARY", delay=0.1, error=RuntimeError)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "fallback", True)
+    assert fallback.started_at[0] - primary.started_at[0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_fallback_citation_redacts_the_cited_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", {"version": "1", "state": "detected", "citations": ["Hunter2Portal!"]})
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety("The password is Hunter2Portal!", primary, organization_id="org-1")
+
+    assert (screen.status, screen.handling, screen.answered_by) == ("detected", "redacted_draft", "fallback")
+    assert screen.canonical_user_message == "The password is [REDACTED_SECRET]"
+
+
+@pytest.mark.asyncio
+async def test_invalid_fallback_verdict_is_final_and_withholds_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT, delay=0.5)
+    fallback = _SafetyLeg("FALLBACK", {"version": "1", "state": "detected", "citations": ["not-in-turn-8391!"]})
+    _route_with_fallback(monkeypatch, fallback)
+
+    policy = await _trust_floor(_CLEAN_MESSAGE, primary)
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "invalid_citation"
+    assert (policy.raw_secret_safety_answered_by, policy.raw_secret_safety_hedged) == ("fallback", True)
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+    assert primary.cancelled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallback_response",
+    [RuntimeError, {"version": "1", "state": "detected", "citations": ["Hunter2Portal!"]}],
+)
+async def test_primary_verdict_wins_a_same_tick_finish(
+    monkeypatch: pytest.MonkeyPatch, fallback_response: object
+) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.0)
+    primary = _SafetyLeg("PRIMARY", _CLEAN_VERDICT)
+    fallback = (
+        _SafetyLeg("FALLBACK", error=RuntimeError)
+        if fallback_response is RuntimeError
+        else _SafetyLeg("FALLBACK", fallback_response)
+    )
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen = await screen_raw_secret_safety("The password is Hunter2Portal!", primary, organization_id="org-1")
+
+    assert len(fallback.started_at) == 1
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "primary", True)
+
+
+@pytest.mark.asyncio
+async def test_both_hung_legs_withhold_the_turn_at_the_screen_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 1.0)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", hang=True)
+    _route_with_fallback(monkeypatch, fallback)
+
+    policy = await _trust_floor("The password is Hunter2Portal!", primary)
+
+    assert policy.raw_secret_safety_status == "blocked"
+    assert policy.raw_secret_safety_failure_kind == "timeout"
+    assert (policy.raw_secret_safety_answered_by, policy.raw_secret_safety_hedged) == ("none", True)
+    assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
+    assert policy.allow_update_workflow is False
+    assert policy.allow_run_blocks is False
+    assert 1000 <= policy.raw_secret_safety_latency_ms < 1500
+    assert (primary.cancelled, fallback.cancelled) == (True, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_hangs", [False, True])
+@pytest.mark.parametrize(
+    "route", ["hedge_disabled", "no_fallback_key", "self_fallback", "screen_eval_override", "fallback_build_error"]
+)
+async def test_screen_without_a_usable_fallback_makes_one_call(
+    monkeypatch: pytest.MonkeyPatch, route: str, primary_hangs: bool
+) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED", route != "hedge_disabled")
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.5)
+    llm_key = {"no_fallback_key": "SOLO", "self_fallback": "SELF"}.get(route, "PRIMARY")
+    primary = _SafetyLeg(llm_key, hang=primary_hangs, error=RuntimeError)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    builds = _route_with_fallback(monkeypatch, fallback)
+    if route == "fallback_build_error":
+
+        def build_fails(fallback_key: str) -> _SafetyLeg:
+            builds.append(fallback_key)
+            raise RuntimeError("deployment not configured")
+
+        monkeypatch.setattr(request_policy_module.LLMAPIHandlerFactory, "get_llm_api_handler", build_fails)
+    overrides = (
+        EvalLLMOverrides("org-1", {_SCREEN_PROMPT_TYPE: llm_key}, {_SCREEN_PROMPT_TYPE: primary}, "eval-sha")
+        if route == "screen_eval_override"
+        else None
+    )
+
+    with eval_llm_override_scope(overrides, "wpid-1"):
+        screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
+
+    assert (screen.status, screen.failure_kind) == ("blocked", "timeout" if primary_hangs else "provider_error")
+    assert (screen.answered_by, screen.hedged) == ("none", False)
+    assert builds == (["FALLBACK"] if route == "fallback_build_error" else [])
+    assert fallback.started_at == []
+    assert len(primary.started_at) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["bound_method_handler", "acting_model_eval_override"])
+async def test_hung_primary_still_hedges(monkeypatch: pytest.MonkeyPatch, variant: str) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)
+    _route_with_fallback(monkeypatch, fallback)
+    # A bound method carries llm_key on __self__, not on the callable.
+    handler = primary.__call__ if variant == "bound_method_handler" else primary
+    overrides = (
+        EvalLLMOverrides("org-1", {"workflow-copilot": "OTHER"}, {"workflow-copilot": _SafetyLeg("OTHER")}, "eval-sha")
+        if variant == "acting_model_eval_override"
+        else None
+    )
+
+    with eval_llm_override_scope(overrides, "wpid-1"):
+        screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, handler, organization_id="org-1")
+
+    assert (screen.status, screen.answered_by, screen.hedged) == ("clean", "fallback", True)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_screen_cancels_both_legs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
+    primary = _SafetyLeg("PRIMARY", hang=True)
+    fallback = _SafetyLeg("FALLBACK", hang=True)
+    _route_with_fallback(monkeypatch, fallback)
+
+    screen_task = asyncio.create_task(screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1"))
+    await asyncio.sleep(0.3)
+    assert fallback.started_at
+    screen_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await screen_task
+    assert (primary.cancelled, fallback.cancelled) == (True, True)

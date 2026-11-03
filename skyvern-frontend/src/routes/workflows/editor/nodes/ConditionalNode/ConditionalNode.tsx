@@ -10,6 +10,10 @@ import {
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { cn } from "@/util/utils";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { NodeHeader } from "../components/NodeHeader";
 import { AppNode } from "..";
 import { applyDescendantCollapseVisibility } from "../../collapse/applyDescendantCollapseVisibility";
@@ -30,6 +34,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   const node = nodes.find((n) => n.id === id);
   const isCollapsed = useIsBlockCollapsed(data.label);
   const prevIsCollapsed = useRef<boolean | null>(null);
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
   const { open } = useCollapseContext();
   const workflowPermanentId = useWorkflowPermanentId();
 
@@ -84,6 +89,9 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
       lastHeaderHeight.current = undefined;
       const observer = new ResizeObserver(() => {
         const height = Math.round(el.offsetHeight);
+        // A header hidden with display:none measures 0, which is not a height:
+        // layout would fall back to its default margin.
+        if (height === 0) return;
         if (lastHeaderHeight.current !== height) {
           lastHeaderHeight.current = height;
           updateNodeData(id, { _headerHeight: height });
@@ -101,6 +109,8 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
   // recursively, and so the expand path respects inner blocks' own
   // collapse state in the zustand store.
   useEffect(() => {
+    // Keep the last applied state until graph writes are allowed again.
+    if (mutationLocked || prevIsCollapsed.current === isCollapsed) return;
     if (prevIsCollapsed.current === null && !isCollapsed) {
       prevIsCollapsed.current = false;
       return;
@@ -119,7 +129,7 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
       previousIsCollapsed,
       isCollapsed,
     );
-  }, [id, isCollapsed, setNodes, workflowPermanentId]);
+  }, [id, isCollapsed, mutationLocked, setNodes, workflowPermanentId]);
 
   if (!node) {
     // If the node has been removed or is not yet available, bail out gracefully.
@@ -138,7 +148,6 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
         <div
           className={cn(
             "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
-            data.comparisonColor,
           )}
         >
           <NodeHeader
@@ -181,7 +190,6 @@ function ConditionalNodeComponent({ id, data }: NodeProps<ConditionalNode>) {
             className={cn(
               "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
               open ? "shadow-md" : "shadow-sm",
-              data.comparisonColor,
             )}
           >
             <NodeHeader

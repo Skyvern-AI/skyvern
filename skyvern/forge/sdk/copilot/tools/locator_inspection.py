@@ -12,10 +12,15 @@ visible. It reports; it does not rank, score, generate a selector, or name a can
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 from typing import Any
 
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
+
+from skyvern.forge.sdk.copilot.browser_target import BrowserTarget
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
 TOOL_NAME = "inspect_locator_matches"
 MAX_SELECTORS = 8
@@ -27,9 +32,10 @@ OUTER_HTML_CHARS = 1200
 
 TOOL_DESCRIPTION = (
     "Inspect Playwright locators being considered for a repair. Pass the failed authored locator "
-    "and concrete alternatives before editing. Returns match counts and bounded DOM facts for each "
-    "match, including descendants, so container elements can be distinguished from controls or "
-    "value-bearing nodes. It reports facts only and does not rank or choose a locator."
+    "and concrete alternatives before editing. Returns match counts and, for each match, whether "
+    "Playwright considers it visible and bounded DOM facts including descendants, so container "
+    "elements can be distinguished from controls or value-bearing nodes. It reports facts only and "
+    "does not rank or choose a locator."
 )
 
 TOOL_SCHEMA: dict[str, Any] = {
@@ -37,7 +43,7 @@ TOOL_SCHEMA: dict[str, Any] = {
     "properties": {
         "target": {
             "type": "string",
-            "enum": ["debug", "last_run"],
+            "enum": [target.value for target in BrowserTarget],
             "description": "Which browser to inspect in.",
         },
         "selectors": {
@@ -52,8 +58,11 @@ TOOL_SCHEMA: dict[str, Any] = {
 
 # One expression per match: the element's own identity plus its descendants, so a wrapper and the
 # node holding the number are distinguishable without the caller guessing at structure.
-_MATCH_FACTS = """
-(el) => {
+_MATCH_FACTS = (
+    """
+(el) => {"""
+    + OTP_INPUT_PRIVACY_JS
+    + """
   const clip = (s, n) => (typeof s === 'string' ? s.trim().slice(0, n) : null);
   const identity = (node, textChars) => ({
     tag: node.tagName ? node.tagName.toLowerCase() : null,
@@ -65,7 +74,7 @@ _MATCH_FACTS = """
   });
   const self = identity(el, %(text_chars)d);
   self.title = el.getAttribute ? el.getAttribute('title') : null;
-  self.outer_html = clip(el.outerHTML, %(html_chars)d);
+  self.outer_html = clip(otpSafeHtml(el), %(html_chars)d);
   const kids = Array.from(el.querySelectorAll('*')).slice(0, %(max_desc)d);
   self.descendants = kids.map((node, index) => {
     const d = identity(node, %(desc_chars)d);
@@ -75,9 +84,25 @@ _MATCH_FACTS = """
   return self;
 }
 """
+)
 
 
 SELECTOR_BUDGET_SECONDS = 8.0
+
+
+async def _match_facts(match: Locator, expression: str, index: int) -> dict[str, Any]:
+    # One handle for both reads: a Locator finds its element again on each call, so after a navigation its
+    # evaluate would read the new page beside an is_visible() that Playwright 1.46 answers False for the old one.
+    handle = await match.element_handle()
+    try:
+        visible = await handle.is_visible()
+        facts = await handle.evaluate(expression)
+    finally:
+        with contextlib.suppress(PlaywrightError):
+            await handle.dispose()
+    facts["index"] = index
+    facts["visible"] = visible
+    return facts
 
 
 async def inspect_locator_matches(page: Page, selectors: list[str]) -> dict[str, Any]:
@@ -105,12 +130,30 @@ async def inspect_locator_matches(page: Page, selectors: list[str]) -> dict[str,
         matches: list[dict[str, Any]] = []
         for index in range(min(count, MAX_MATCHES)):
             try:
-                facts = await asyncio.wait_for(locator.nth(index).evaluate(expression), timeout=SELECTOR_BUDGET_SECONDS)
+                facts = await asyncio.wait_for(
+                    _match_facts(locator.nth(index), expression, index), SELECTOR_BUDGET_SECONDS
+                )
             except (PlaywrightError, TimeoutError) as exc:
                 matches.append({"index": index, "error": f"{type(exc).__name__}: {exc}"})
                 continue
-            facts["index"] = index
             matches.append(facts)
         entry["matches"] = matches
         results.append(entry)
     return {"selectors": results, "selectors_truncated": len(selectors) > MAX_SELECTORS}
+
+
+def visibility_counts(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """What a result told the model about visibility, without selector or page text, for logging."""
+    counts: list[dict[str, Any]] = []
+    for entry in result["selectors"]:
+        matches = entry.get("matches") or []
+        counts.append(
+            {
+                "selector_sha256": hashlib.sha256(entry["selector"].encode()).hexdigest()[:12],
+                "error": "error" in entry,
+                "match_count": entry.get("match_count"),
+                "listed_visible": sum(1 for match in matches if match.get("visible") is True),
+                "first_match_visible": matches[0].get("visible") if matches else None,
+            }
+        )
+    return counts

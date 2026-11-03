@@ -36,6 +36,11 @@ export const TriggerType = {
   Mcp: "mcp",
   Api: "api",
   Scheduled: "scheduled",
+  Webhook: "webhook",
+  Event: "event",
+  JobRecipeExtract: "job_recipe_extract",
+  JobRecipeApply: "job_recipe_apply",
+  SeoRecipeSubmit: "seo_recipe_submit",
 } as const;
 
 export type TriggerType = (typeof TriggerType)[keyof typeof TriggerType];
@@ -134,6 +139,7 @@ export type StepApiResponse = {
   retry_index: number;
   status: Status;
   step_cost: number;
+  created_by?: string | null;
 };
 
 export type Task = {
@@ -168,6 +174,9 @@ export type FailureCategory = {
   category: string;
   confidence_float: number;
   reasoning: string;
+  reason_code?: string | null;
+  error_code?: string | null;
+  anti_bot?: { contribution?: string | null } | null;
 };
 
 export type TaskApiResponse = {
@@ -216,6 +225,7 @@ export type User = {
   id: string;
   email: string;
   name: string;
+  createdAt?: Date;
 };
 
 export type OrganizationApiResponse = {
@@ -245,10 +255,18 @@ export type ApiKeyApiResponse = {
   valid: boolean;
 };
 
+export type OnePasswordTokenSource = "organization" | "instance_default";
+
+export type OnePasswordTokenStatus = {
+  configured: boolean;
+  source: OnePasswordTokenSource | null;
+  instance_default_available: boolean;
+  modified_at: string | null;
+};
+
 export type OnePasswordTokenApiResponse = {
   id: string;
   organization_id: string;
-  token: string;
   created_at: string;
   modified_at: string;
   token_type: string;
@@ -261,12 +279,46 @@ export type OnePasswordItemApiResponse = {
   vault_id: string;
   vault_name: string;
   category: string;
+  importable?: boolean;
   url?: string | null;
 };
 
 export type OnePasswordItemsApiResponse = {
   configured: boolean;
+  source: OnePasswordTokenSource | null;
   items: Array<OnePasswordItemApiResponse>;
+};
+
+export const ONEPASSWORD_CREDENTIALS_REQUEST_LIMIT = 500;
+
+export type OnePasswordCredentialImportRequest = {
+  folder_id?: string;
+  items: Array<{ vault_id: string; item_id: string }>;
+};
+
+export type OnePasswordCredentialImportResult = {
+  vault_id: string;
+  item_id: string;
+  status: "imported" | "updated" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialImportResponse = {
+  results: Array<OnePasswordCredentialImportResult>;
+};
+
+export type OnePasswordCredentialRefreshResult = {
+  vault_id: string;
+  item_id: string;
+  status: "refreshed" | "stale" | "skipped";
+  reason?: string | null;
+};
+
+export type OnePasswordCredentialRefreshResponse = {
+  refreshed: number;
+  stale: number;
+  skipped: number;
+  results: Array<OnePasswordCredentialRefreshResult>;
 };
 
 export type BitwardenItemApiResponse = {
@@ -375,6 +427,8 @@ export interface GoogleOAuthCredential {
   scopes_granted?: string[] | string | null;
   scopes?: string[] | string | null;
   valid?: boolean | null;
+  // Decided by the server: active, send permission granted, and a verified account identity on record.
+  gmail_send_ready?: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -409,10 +463,17 @@ export interface UpdateGoogleOAuthClientConfigRequest {
   app_origins: string[];
 }
 
+export type GoogleOAuthScopeProfile =
+  | "google_sheets"
+  | "gmail"
+  | "google_drive"
+  | "gmail_send"
+  | "gmail_read_send";
+
 export interface CreateGoogleOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: string;
+  scope_profile?: GoogleOAuthScopeProfile;
   app_origin?: string;
   // Existing credential to re-authenticate in place, preserving its id so
   // workflows referencing it keep working without edits.
@@ -452,10 +513,14 @@ export interface MicrosoftOAuthCredentialListResponse {
   credentials: MicrosoftOAuthCredential[];
 }
 
+export type MicrosoftOAuthScopeProfile =
+  | "outlook_mail"
+  | "powerbi_dataset_read";
+
 export interface CreateMicrosoftOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: "outlook_mail";
+  scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
 }
 
@@ -521,6 +586,70 @@ export interface CreateGoogleSheetTabResponse {
 export interface GoogleSheetsReconnectRequiredError {
   code: "reconnect_required";
   missing_scope: string | null;
+}
+
+export interface TwilioCredentialSafe {
+  account_sid: string;
+  api_key_sid: string | null;
+  has_api_key_secret: boolean;
+  has_auth_token: boolean;
+}
+
+export interface TwilioCredentialResponse {
+  credential: TwilioCredentialSafe | null;
+}
+
+export interface TwilioCredentialRequest {
+  account_sid: string;
+  api_key_sid?: string | null;
+  api_key_secret?: string | null;
+  auth_token: string;
+}
+
+export interface TwilioPhoneNumberInfo {
+  sid: string;
+  phone_number: string;
+  friendly_name: string;
+  sms_capable: boolean;
+  current_sms_url: string | null;
+  enabled: boolean;
+  phone_number_id: string | null;
+}
+
+export interface OrganizationPhoneNumber {
+  phone_number_id: string;
+  organization_id: string;
+  sms_config_id: string;
+  phone_number: string;
+  provider: string;
+  credential_id: string | null;
+  price_cents: number | null;
+  billing_exempt: boolean;
+  status:
+    | "active"
+    | "disabled"
+    | "provisioning"
+    | "quarantining"
+    | "reversal_pending"
+    | "quarantined"
+    | "surrendering"
+    | "releasing"
+    | "released";
+  quarantined_until: string | null;
+  cancel_at?: string | null;
+  created_at: string;
+  modified_at: string;
+  deleted_at: string | null;
+}
+
+export interface EnablePhoneNumberRequest {
+  phone_number_sid: string;
+  confirm_takeover?: boolean;
+  credential_id?: string | null;
+}
+
+export interface DisablePhoneNumberRequest {
+  phone_number_id: string;
 }
 
 export interface BitwardenCredential {
@@ -675,8 +804,28 @@ export type ActionApiResponse = {
   screenshot_artifact_id?: string | null;
 };
 
+export type ActionSummaryBody = {
+  // Trimmed but not collapsed: paragraph breaks survive for a card that renders blocks. A caller
+  // rendering one line must collapse them itself (normalizeInlineText) — InlineMarkdown joins
+  // paragraphs with no separator at all.
+  text: string;
+  // Only the model's own prose is markdown. A typed value or a recorded outcome is literal text and
+  // must render verbatim — a password containing "*" is not emphasis.
+  isProse: boolean;
+};
+
+export type ActionSummary = {
+  // What the action set out to do.
+  body: ActionSummaryBody | null;
+  // What it actually did, when the run recorded it. Shown beside the body, never instead of it: a
+  // card that let the plan stand for the effect reads a dead end as a successful navigation.
+  outcome: string | null;
+};
+
 export type Action = {
-  reasoning: string;
+  // The text the card shows, already resolved through getActionSummary: a Task V3 action often
+  // carries no reasoning, and then its intention or its recorded outcome is all it has.
+  summary: ActionSummary | null;
   confidence?: number;
   type: ActionType;
   input: string;
@@ -795,6 +944,26 @@ export type DebugLoginBlockCompatibilityResponse = {
   reason: "pbs_no_profile" | "pbs_different_profile" | null;
 };
 
+export type WorkflowRunAttempt = {
+  attempt_number: number;
+  status: Status;
+  failure_reason: string | null;
+  error_codes: Array<string>;
+  started_at: string | null;
+  finished_at: string | null;
+  retry_decision: string | null;
+  decision_reason: string | null;
+  next_attempt_at: string | null;
+  webhook_sent_at: string | null;
+};
+
+export type WorkflowRunRetryFields = {
+  attempt?: number;
+  retry_pending?: boolean;
+  next_attempt_at?: string | null;
+  attempts?: Array<WorkflowRunAttempt>;
+};
+
 export type WorkflowRunApiResponse = {
   created_at: string;
   failure_reason: string | null;
@@ -816,7 +985,10 @@ export type WorkflowRunApiResponse = {
   workflow_run_id: string;
   workflow_title: string | null;
   retried_from_workflow_run_id?: string | null;
-};
+} & Pick<
+  WorkflowRunRetryFields,
+  "attempt" | "retry_pending" | "next_attempt_at"
+>;
 
 export const TaskRunType = {
   TaskV1: "task_v1",
@@ -843,8 +1015,12 @@ export type TaskRunListItem = {
   workflow_deleted: boolean;
   script_run: boolean;
   trigger_type?: TriggerType | null;
+  created_by?: string | null;
   searchable_text: string | null;
-};
+} & Pick<
+  WorkflowRunRetryFields,
+  "attempt" | "retry_pending" | "next_attempt_at"
+>;
 
 export type WorkflowRunStatusApiResponse = {
   workflow_id: string;
@@ -887,7 +1063,8 @@ export type WorkflowRunStatusApiResponse = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
-};
+  copilot_session_id?: string | null;
+} & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_id: string;
@@ -923,6 +1100,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   workflow_title: string | null;
   browser_session_id: string | null;
   browser_profile_id: string | null;
+  browser_type?: string | null;
   max_screenshot_scrolls: number | null;
   run_with: string | null;
   workflow: WorkflowApiResponse;
@@ -931,7 +1109,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
-};
+  copilot_session_id?: string | null;
+} & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {
   suggested_title: string | null;
@@ -1031,6 +1210,7 @@ export type BrowserProfileUsage = {
 
 export type PasswordCredentialApiResponse = {
   username: string;
+  has_totp?: boolean;
   totp_type: "authenticator" | "email" | "text" | "passkey" | "none";
   totp_identifier?: string | null;
 };
@@ -1057,6 +1237,18 @@ export type CredentialApiResponse = {
     | SecretCredentialResponse;
   credential_type: "password" | "credit_card" | "secret";
   name: string;
+  vault_type?:
+    | "skyvern"
+    | "bitwarden"
+    | "azure_vault"
+    | "gcp"
+    | "custom"
+    | "onepassword"
+    | "bitwarden_connected"
+    | null;
+  vault_id?: string | null;
+  item_id?: string | null;
+  upstream_missing_at?: string | null;
   browser_profile_id?: string | null;
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;
@@ -1067,6 +1259,7 @@ export type CredentialApiResponse = {
   folder_id?: string | null;
   proxy_location?: ProxyLocation | null;
   proxy_session_id?: string | null;
+  created_by?: string | null;
 };
 
 export function isPasswordCredential(
@@ -1193,6 +1386,26 @@ export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];
 
 export type PylonEmailHash = {
   hash: string;
+};
+
+export type RunFeedbackTargetType =
+  | "workflow_run"
+  | "task"
+  | "browser_recording";
+export type FeedbackRating = "up" | "down";
+
+export type RunFeedbackApiResponse = {
+  run_feedback_id: string;
+  organization_id: string;
+  target_type: RunFeedbackTargetType;
+  target_id: string;
+  context_id: string | null;
+  rating: FeedbackRating;
+  reason: string | null;
+  needs_support: boolean;
+  submitted_by: string | null;
+  created_at: string;
+  modified_at: string;
 };
 
 export const BROWSER_DOWNLOAD_TIMEOUT_SECONDS = 120 as const;

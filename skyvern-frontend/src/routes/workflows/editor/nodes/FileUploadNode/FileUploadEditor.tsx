@@ -15,6 +15,7 @@ import {
 import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
 
 import { helpTooltips } from "../../helpContent";
+import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileUploadNode, type FileUploadNodeData } from "./types";
 import { useUpdate } from "../../useUpdate";
 
@@ -97,6 +98,7 @@ function FileUploadEditorBody({
           <HelpTooltip content={helpTooltips["fileUpload"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea
+          name="prompt"
           nodeId={blockId}
           onChange={(value) => update({ prompt: value })}
           value={prompt ?? ""}
@@ -122,6 +124,7 @@ function FileUploadEditorBody({
               />
             </div>
             <WorkflowBlockInputTextarea
+              name="awsAccessKeyId"
               nodeId={blockId}
               onChange={(value) => update({ awsAccessKeyId: value })}
               value={awsAccessKeyId as string}
@@ -138,6 +141,7 @@ function FileUploadEditorBody({
               />
             </div>
             <WorkflowBlockInput
+              name="awsSecretAccessKey"
               nodeId={blockId}
               type="password"
               value={awsSecretAccessKey as string}
@@ -151,6 +155,7 @@ function FileUploadEditorBody({
               <HelpTooltip content={helpTooltips["fileUpload"]["s3_bucket"]} />
             </div>
             <WorkflowBlockInputTextarea
+              name="s3Bucket"
               nodeId={blockId}
               onChange={(value) => update({ s3Bucket: value })}
               value={s3Bucket as string}
@@ -167,6 +172,7 @@ function FileUploadEditorBody({
               />
             </div>
             <WorkflowBlockInputTextarea
+              name="regionName"
               nodeId={blockId}
               onChange={(value) => update({ regionName: value })}
               value={regionName as string}
@@ -183,6 +189,7 @@ function FileUploadEditorBody({
               />
             </div>
             <WorkflowBlockInputTextarea
+              name="endpointUrl"
               nodeId={blockId}
               onChange={(value) => update({ endpointUrl: value })}
               value={endpointUrl as string}
@@ -198,6 +205,7 @@ function FileUploadEditorBody({
               <HelpTooltip content={helpTooltips["fileUpload"]["path"]} />
             </div>
             <WorkflowBlockInputTextarea
+              name="path:s3"
               nodeId={blockId}
               onChange={(value) => update({ path: value })}
               value={path as string}
@@ -221,6 +229,7 @@ function FileUploadEditorBody({
               />
             </div>
             <WorkflowBlockInputTextarea
+              name="azureStorageAccountName"
               nodeId={blockId}
               onChange={(value) => update({ azureStorageAccountName: value })}
               value={azureStorageAccountName as string}
@@ -239,6 +248,7 @@ function FileUploadEditorBody({
               />
             </div>
             <WorkflowBlockInput
+              name="azureStorageAccountKey"
               nodeId={blockId}
               type="password"
               value={azureStorageAccountKey as string}
@@ -258,6 +268,7 @@ function FileUploadEditorBody({
               />
             </div>
             <WorkflowBlockInputTextarea
+              name="azureBlobContainerName"
               nodeId={blockId}
               onChange={(value) => update({ azureBlobContainerName: value })}
               value={azureBlobContainerName as string}
@@ -272,6 +283,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="Optional folder path within the blob container. Defaults to {{ workflow_run_id }} if not specified." />
             </div>
             <WorkflowBlockInputTextarea
+              name="path:azure"
               nodeId={blockId}
               onChange={(value) => update({ path: value })}
               value={path as string}
@@ -305,6 +317,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root." />
             </div>
             <WorkflowBlockInputTextarea
+              name="googleDriveFolderId"
               nodeId={blockId}
               onChange={(value) => update({ googleDriveFolderId: value })}
               value={googleDriveFolderId ?? ""}
@@ -322,6 +335,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="The SFTP host to upload files to." />
             </div>
             <WorkflowBlockInputTextarea
+              name="sftpHost"
               nodeId={blockId}
               onChange={(value) => update({ sftpHost: value })}
               value={sftpHost ?? ""}
@@ -334,6 +348,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="Numeric only — template values are not supported. Defaults to 22 if left blank." />
             </div>
             <WorkflowBlockInputTextarea
+              name="sftpPort"
               nodeId={blockId}
               onChange={(value) =>
                 update({ sftpPort: value.replace(/[^0-9]/g, "") })
@@ -348,6 +363,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="The SFTP username." />
             </div>
             <WorkflowBlockInputTextarea
+              name="sftpUsername"
               nodeId={blockId}
               onChange={(value) => update({ sftpUsername: value })}
               value={sftpUsername ?? ""}
@@ -360,6 +376,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="Password auth. Leave blank if using a private key. Reference a secret parameter for security." />
             </div>
             <WorkflowBlockInput
+              name="sftpPassword"
               nodeId={blockId}
               type="password"
               onChange={(value) => update({ sftpPassword: value })}
@@ -374,10 +391,12 @@ function FileUploadEditorBody({
               </Label>
               <HelpTooltip content="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security." />
             </div>
-            <WorkflowBlockInputTextarea
+            <SftpPrivateKeyField
+              key={blockId}
               nodeId={blockId}
               onChange={(value) => update({ sftpPrivateKey: value })}
               value={sftpPrivateKey ?? ""}
+              disabled={!editable}
               className="nopan text-xs"
             />
           </div>
@@ -389,6 +408,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="Optional passphrase for the private key." />
             </div>
             <WorkflowBlockInput
+              name="sftpPrivateKeyPassphrase"
               nodeId={blockId}
               type="password"
               onChange={(value) => update({ sftpPrivateKeyPassphrase: value })}
@@ -404,6 +424,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="Remote directory to upload into. Created if it does not exist. Defaults to the login directory." />
             </div>
             <WorkflowBlockInputTextarea
+              name="sftpRemotePath"
               nodeId={blockId}
               onChange={(value) => update({ sftpRemotePath: value })}
               value={sftpRemotePath ?? ""}
@@ -418,6 +439,7 @@ function FileUploadEditorBody({
               <HelpTooltip content="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks." />
             </div>
             <WorkflowBlockInputTextarea
+              name="sftpHostKey"
               nodeId={blockId}
               onChange={(value) => update({ sftpHostKey: value })}
               value={sftpHostKey ?? ""}

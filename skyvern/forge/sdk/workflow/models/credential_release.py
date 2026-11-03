@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from os import PathLike, fspath
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import structlog
 
 from skyvern.config import settings
-from skyvern.forge.sdk.credential_site_policy import describe_release_scope, origin_of, same_release_scope
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope, origin_of, same_release_scope
 
 LOG = structlog.get_logger()
 
@@ -45,7 +46,7 @@ def _arg(args: tuple[Any, ...], index: int) -> Any:
     return args[index] if len(args) > index else None
 
 
-async def _release_target_url(target: Any, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+async def release_target_url(target: Any, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
     """The URL of the document that would receive the value: the target element's owner frame."""
     locator = target
     if name.startswith("page."):
@@ -112,6 +113,16 @@ async def _focused_frame_url(page: Any) -> str | None:
     return page.url
 
 
+def login_release_sites(tested_url: str | None, vault_sites: Sequence[LoginSite] | None) -> list[LoginSite] | None:
+    """Where a login's secrets may go: its vault item's readable sites, else its tested URL's whole site.
+    The item's sites come first because a tested URL saved later covers its whole site; None means unconfined."""
+    if vault_sites is not None:
+        return [site for site in vault_sites if describe_release_scope(site.url.strip()) is not None]
+    if tested_url and describe_release_scope(tested_url.strip()) is not None:
+        return [LoginSite(tested_url.strip(), whole_site=True)]
+    return None
+
+
 class CodeBlockCredentialReleaseError(Exception):
     # Duck-typed marker consumed by the secure runner's transport map (same convention as
     # RecordingLocator._skyvern_brokerable_handle): a refusal must cross the protocol as a
@@ -124,6 +135,16 @@ class ArmedSecret:
     secret_value: str
     allowed_url: str
     parameter_key: str
+    # An unenforced secret is only logged when it would have been refused.
+    enforced: bool = True
+    whole_site: bool = True
+
+    def admits(self, target_url: str | None) -> bool:
+        return LoginSite(self.allowed_url, self.whole_site).admits(target_url)
+
+    @property
+    def allowed_scope(self) -> str | None:
+        return describe_release_scope(self.allowed_url, whole_site=self.whole_site)
 
 
 class CredentialReleaseGuard:
@@ -132,27 +153,69 @@ class CredentialReleaseGuard:
         self._workflow_run_id = workflow_run_id
         self._block_label = block_label
 
-    def arm(self, secret_value: object, allowed_url: object, parameter_key: str) -> bool:
+    def arm(
+        self,
+        secret_value: object,
+        allowed_url: object,
+        parameter_key: str,
+        *,
+        enforced: bool = True,
+        whole_site: bool = True,
+    ) -> bool:
         """Arm one secret, or report that its saved login site yields no scope to compare against."""
         if not (isinstance(secret_value, str) and secret_value and isinstance(allowed_url, str)):
             return False
         scoped = allowed_url.strip()
         if not scoped or describe_release_scope(scoped) is None:
             return False
-        self._armed.append(ArmedSecret(secret_value, scoped, parameter_key))
+        self._armed.append(ArmedSecret(secret_value, scoped, parameter_key, enforced, whole_site))
         return True
+
+    def arm_siteless(self, secret_value: object, parameter_key: str, *, enforced: bool = True) -> bool:
+        """Arm a secret whose login is saved for no website a scope can be read from, refusing it everywhere."""
+        if not (isinstance(secret_value, str) and secret_value):
+            return False
+        self._armed.append(ArmedSecret(secret_value, "", parameter_key, enforced))
+        return True
+
+    def arm_login(
+        self,
+        secret_values: Iterable[object],
+        parameter_key: str,
+        *,
+        tested_url: str | None,
+        vault_sites: Sequence[LoginSite] | None,
+        enforce_vault_sites: bool,
+    ) -> list[ArmedSecret]:
+        """Arm a login's secrets against its vault item's saved sites, else its tested URL; returns what was armed.
+        Unenforced vault sites yield to an enforced tested URL, so only an untested login is armed log-only."""
+        start = len(self._armed)
+        use_vault_sites = vault_sites is not None and (enforce_vault_sites or not tested_url)
+        sites = login_release_sites(tested_url, vault_sites if use_vault_sites else None)
+        if sites is None:
+            return []
+        enforced = enforce_vault_sites if use_vault_sites else True
+        for secret in secret_values:
+            armed = False
+            for site in sites:
+                armed |= self.arm(secret, site.url, parameter_key, enforced=enforced, whole_site=site.whole_site)
+            if not armed:
+                self.arm_siteless(secret, parameter_key, enforced=enforced)
+        return self._armed[start:]
 
     @property
     def is_armed(self) -> bool:
         return bool(self._armed)
 
     def log_armed(self) -> None:
-        scopes = sorted({describe_release_scope(entry.allowed_url) or "unreadable" for entry in self._armed})
+        enforced = [entry for entry in self._armed if entry.enforced]
+        scopes = sorted({entry.allowed_scope or "unreadable" for entry in enforced})
         LOG.info(
             "codeblock_credential_release_armed",
-            parameter_keys=sorted({entry.parameter_key for entry in self._armed}),
+            parameter_keys=sorted({entry.parameter_key for entry in enforced}),
+            observed_parameter_keys=sorted({entry.parameter_key for entry in self._armed if not entry.enforced}),
             allowed_scopes=scopes,
-            secret_count=len(self._armed),
+            secret_count=len(enforced),
             workflow_run_id=self._workflow_run_id,
             block_label=self._block_label,
         )
@@ -160,6 +223,15 @@ class CredentialReleaseGuard:
     def match(self, value: object) -> ArmedSecret | None:
         matches = self.matches(value)
         return matches[0] if matches else None
+
+    def matches_anywhere(self, value: object) -> list[ArmedSecret]:
+        """Every armed secret appearing anywhere in ``value``, ignoring the short-secret length
+        floor ``matches`` applies. For a channel with no release target, where refusal is the only
+        outcome, a false refusal is a visible authoring error but a missed short secret -- a CVV or
+        a 2-digit expiry embedded in a longer answer -- is a silent release."""
+        if not isinstance(value, str) or not value:
+            return []
+        return [entry for entry in self._armed if entry.secret_value in value]
 
     def matches(self, value: object) -> list[ArmedSecret]:
         if not isinstance(value, str) or not value:
@@ -187,8 +259,44 @@ class CredentialReleaseGuard:
         if name.startswith("keyboard."):
             url = await _focused_frame_url(target)
         else:
-            url = await _release_target_url(target, name, args, kwargs)
+            url = await release_target_url(target, name, args, kwargs)
         self.check_release(entry, url, operation=name, alternatives=candidates[1:])
+
+    def refused_release(self, value: object, target_url: str | None) -> ArmedSecret | None:
+        """The armed secret inside *value* that *target_url* may not receive, if any.
+
+        Matching keeps the short-secret length floor: this channel has a release target, so a
+        two-digit expiry appearing inside an unrelated number would refuse an ordinary request.
+        """
+        return self._refused_owner(self.matches(value), target_url)
+
+    def _refused_owner(self, candidates: list[ArmedSecret], target_url: str | None) -> ArmedSecret | None:
+        # Two credentials can legitimately hold the SAME value (one username saved against two
+        # sites), and either owner may authorize it. A shorter secret merely appearing inside the
+        # value being filled is a different secret, though, and cannot authorize releasing the
+        # longer one: site A's "hunter2!" must not ride out on site B's "hunter2".
+        for secret_value in dict.fromkeys(candidate.secret_value for candidate in candidates):
+            owners = [candidate for candidate in candidates if candidate.secret_value == secret_value]
+            # An unenforced owner decides only when no enforced one holds the value.
+            deciding = [owner for owner in owners if owner.enforced] or owners
+            if any(owner.admits(target_url) for owner in deciding):
+                continue
+            if deciding[0].enforced:
+                return deciding[0]
+            self._log_would_refuse(deciding[0], target_url)
+        return None
+
+    def _log_would_refuse(self, entry: ArmedSecret, target_url: str | None) -> None:
+        actual_origin = origin_of(target_url)
+        LOG.info(
+            "codeblock_credential_release_would_refuse",
+            parameter_key=entry.parameter_key,
+            allowed_scope=entry.allowed_scope,
+            actual_scope=describe_release_scope(target_url),
+            actual_host=actual_origin.host if actual_origin is not None else None,
+            workflow_run_id=self._workflow_run_id,
+            block_label=self._block_label,
+        )
 
     def check_release(
         self,
@@ -198,24 +306,13 @@ class CredentialReleaseGuard:
         operation: str,
         alternatives: list[ArmedSecret] | None = None,
     ) -> None:
-        # Two credentials can legitimately hold the SAME value (one username saved against two
-        # sites), and either owner may authorize it. A shorter secret merely appearing inside the
-        # value being filled is a different secret, though, and cannot authorize releasing the
-        # longer one: site A's "hunter2!" must not ride out on site B's "hunter2".
-        candidates = [entry, *(alternatives or [])]
-        refused = entry
-        for secret_value in dict.fromkeys(candidate.secret_value for candidate in candidates):
-            owners = [candidate for candidate in candidates if candidate.secret_value == secret_value]
-            if any(target_url and same_release_scope(target_url, owner.allowed_url) for owner in owners):
-                continue
-            refused = owners[0]
-            break
-        else:
+        refused = self._refused_owner([entry, *(alternatives or [])], target_url)
+        if refused is None:
             return
         entry = refused
         # Never fall back to the stored URL itself: it can carry basic-auth credentials or a
         # token in its query, and this string reaches both the logs and the run record.
-        allowed_scope = describe_release_scope(entry.allowed_url) or "an unreadable saved login site"
+        allowed_scope = entry.allowed_scope or "no website Skyvern can check"
         actual_scope = describe_release_scope(target_url) or "a page whose site could not be identified"
         actual_origin = origin_of(target_url)
         LOG.warning(
@@ -229,8 +326,12 @@ class CredentialReleaseGuard:
             workflow_run_id=self._workflow_run_id,
             block_label=self._block_label,
         )
+        next_step = (
+            "Continue the sign-in on the credential's own site instead."
+            if entry.allowed_scope
+            else "Give the login a website with a Base domain, Host or Default URI match."
+        )
         raise CodeBlockCredentialReleaseError(
             f"Refused to type the saved credential `{entry.parameter_key}` here: the credential "
-            f"belongs to {allowed_scope}, but this field is on {actual_scope}. "
-            "Continue the sign-in on the credential's own site instead."
+            f"belongs to {allowed_scope}, but this field is on {actual_scope}. {next_step}"
         )

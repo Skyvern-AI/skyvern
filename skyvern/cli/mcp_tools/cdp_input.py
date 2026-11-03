@@ -9,7 +9,8 @@ import structlog
 from pydantic import Field
 
 from skyvern.cli.core.browser_ops import do_screenshot
-from skyvern.cli.core.guards import CREDENTIAL_HINT, PASSWORD_PATTERN, GuardError
+from skyvern.cli.core.guards import CREDENTIAL_HINT, PASSWORD_PATTERN, STALE_FRAME_HINT, GuardError
+from skyvern.exceptions import StaleFrameSelectionError
 
 from ._common import ErrorCode, make_error, make_result, save_artifact
 from ._session import BrowserNotAvailableError, get_page, no_browser_error
@@ -85,6 +86,17 @@ async def skyvern_write_grid(
     except BrowserNotAvailableError as exc:
         return make_result("skyvern_write_grid", ok=False, error=no_browser_error(exc))
 
+    try:
+        # Page-space input ignores the frame selection; read the scope so an unowned one refuses
+        # instead of writing into whichever document currently has focus.
+        _ = page.locator_scope
+    except StaleFrameSelectionError as exc:
+        return make_result(
+            "skyvern_write_grid",
+            ok=False,
+            error=make_error(ErrorCode.STALE_FRAME_SELECTION, str(exc), STALE_FRAME_HINT, exc=exc),
+        )
+
     total = 0
     try:
         if focus_selector:
@@ -136,7 +148,7 @@ async def skyvern_write_grid(
             "skyvern_write_grid",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
     except Exception as e:
         LOG.warning("skyvern_write_grid_failed", error=str(e), exc_info=True)
@@ -144,7 +156,9 @@ async def skyvern_write_grid(
             "skyvern_write_grid",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the target grid is focused and editable"),
+            error=make_error(
+                ErrorCode.ACTION_FAILED, str(e), "Check that the target grid is focused and editable", exc=e
+            ),
         )
 
     shot_path = None

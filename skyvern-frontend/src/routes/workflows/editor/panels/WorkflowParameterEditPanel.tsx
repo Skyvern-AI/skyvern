@@ -229,9 +229,8 @@ function WorkflowParameterEditPanel({
   ];
   const skyvernCredentialSourceAvailable =
     useSkyvernCredentialSourceAvailable();
-  const { parsedConfig: customCredentialServiceConfig } =
+  const { isConfigured: hasCustomCredentialService } =
     useCustomCredentialServiceConfig();
-  const hasCustomCredentialService = customCredentialServiceConfig !== null;
   const isEditMode = !!initialValues;
   const [key, setKey] = useState(initialValues?.key ?? "");
   const keyValidationError = validateParameterKey(key);

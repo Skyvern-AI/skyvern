@@ -1,12 +1,6 @@
 // @vitest-environment jsdom
 
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-} from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { NarrativeView } from "./NarrativeView";
@@ -29,6 +23,8 @@ const action = (
   summary: null,
   durationMs: 200,
   failed: false,
+  codeLine: null,
+  response: null,
   ...overrides,
 });
 
@@ -183,7 +179,7 @@ const narrationTurn = (
   startedAt: "2026-06-10T00:00:00Z",
 });
 
-const clamped = () => document.querySelector('[data-testid="copilot-reason"]');
+const reason = () => document.querySelector('[data-testid="copilot-reason"]');
 const caret = () =>
   document.querySelector(
     '[data-testid="copilot-reason"] > span[aria-hidden="true"]',
@@ -209,7 +205,7 @@ describe("NarrativeView — narration reveal", () => {
 
     expect(hidden()!.textContent).toBe("");
     expect(caret()!.className).toContain("opacity-0");
-    expect(clamped()!.textContent).toContain(REASON);
+    expect(reason()!.textContent).toContain(REASON);
   });
 
   it("renders a narration with no arrival stamp complete on first render", () => {
@@ -221,37 +217,10 @@ describe("NarrativeView — narration reveal", () => {
 
     expect(hidden()!.textContent).toBe("");
     expect(caret()!.className).toContain("opacity-0");
-    expect(clamped()!.textContent).toContain(REASON);
+    expect(reason()!.textContent).toContain(REASON);
   });
 
-  it("clamps the narration to four lines rather than growing the row", () => {
-    render(
-      <NarrativeView
-        turn={narrationTurn([toolCall("1", 1), narration(1, undefined)])}
-      />,
-    );
-
-    expect(clamped()).toBeTruthy();
-    expect(clamped()!.textContent).toContain(REASON);
-  });
-
-  it("holds the truncation ellipsis until the reveal finishes", () => {
-    render(
-      <NarrativeView
-        turn={narrationTurn([toolCall("1", 1), narration(1, NOW - 500)])}
-      />,
-    );
-
-    expect(clamped()!.className).not.toContain("line-clamp-4");
-
-    act(() => {
-      vi.advanceTimersByTime(60_000);
-    });
-
-    expect(clamped()!.className).toContain("line-clamp-4");
-  });
-
-  it("loses nothing when its owner row is closed and opened after the reveal window", () => {
+  it("keeps a step's sentence above it once a later step starts", () => {
     render(
       <NarrativeView
         turn={narrationTurn([
@@ -263,15 +232,14 @@ describe("NarrativeView — narration reveal", () => {
       />,
     );
 
-    expect(clamped()).toBeNull();
-
     act(() => {
       vi.advanceTimersByTime(60_000);
     });
-    fireEvent.click(screen.getByRole("button", { name: /Tool 1 finished/ }));
 
     expect(hidden()!.textContent).toBe("");
     expect(caret()!.className).toContain("opacity-0");
-    expect(clamped()!.textContent).toContain(REASON);
+    expect(reason()!.textContent).toContain(REASON);
+    // The whole sentence wraps; nothing cuts it to an ellipsis.
+    expect(reason()!.className).not.toContain("line-clamp");
   });
 });

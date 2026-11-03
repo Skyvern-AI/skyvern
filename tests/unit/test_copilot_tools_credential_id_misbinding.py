@@ -12,6 +12,12 @@ from skyvern.forge.sdk.copilot.tools import (
     _list_credentials,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools.credentials import (
+    _google_connection_reference_ids,
+    bitwarden_binding_change_error,
+)
+from skyvern.forge.sdk.copilot.workflow_credential_utils import bitwarden_secret_bindings
+from tests.unit.conftest import ORG_VAULT_ITEM_ID
 
 
 def _yaml(body: str) -> str:
@@ -31,6 +37,7 @@ def test_credential_id_in_navigation_goal_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
@@ -165,6 +172,7 @@ def test_credential_parameter_unrelated_field_with_credential_id_is_still_flagge
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
         """
@@ -190,6 +198,7 @@ def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [cred_527971855302737592]
         """
@@ -202,6 +211,41 @@ def test_credential_id_in_parameter_keys_list_is_flagged() -> None:
             "location": "login_to_portal",
             "field": "parameter_keys",
             "credential_id": "cred_527971855302737592",
+        }
+    ]
+
+
+def test_declared_credential_named_key_is_not_flagged_but_misbound_id_is() -> None:
+    yaml = _yaml(
+        """
+        title: Sign in
+        workflow_definition:
+          parameters:
+          - key: cred_x
+            parameter_type: workflow
+            workflow_parameter_type: credential_id
+            default_value: cred_527971855302737592
+          blocks:
+          - block_type: http_request
+            label: sign_in
+            method: POST
+            url: https://api.example.test/session
+            body:
+              username: "{{cred_x.username}}"
+            parameter_keys: [cred_x]
+          - block_type: code
+            label: report_done
+            code: print("signed in as cred_927971855302737594")
+        """
+    )
+
+    findings = _credential_id_misbinding_findings(yaml)
+
+    assert findings == [
+        {
+            "location": "report_done",
+            "field": "code",
+            "credential_id": "cred_927971855302737594",
         }
     ]
 
@@ -266,6 +310,7 @@ def test_credential_id_in_block_url_prose_is_flagged() -> None:
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/?cred_527971855302737592
             navigation_goal: Sign in.
         """
@@ -375,11 +420,12 @@ def _ctx() -> MagicMock:
     ctx.turn_halt = None
     ctx.build_test_outcomes = []
     ctx.latest_recorded_build_test_outcome = None
+    ctx.credential_origin_recovery = None
     return ctx
 
 
 @pytest.mark.asyncio
-async def test_update_workflow_persists_credential_id_misbinding_without_authoring_a_finding() -> None:
+async def test_update_workflow_stages_credential_id_misbinding_without_authoring_a_finding() -> None:
     submitted = _yaml(
         """
         title: Sign in
@@ -392,6 +438,7 @@ async def test_update_workflow_persists_credential_id_misbinding_without_authori
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in with credential cred_527971855302737592 by entering its username and password.
@@ -443,7 +490,8 @@ async def test_update_workflow_persists_credential_id_misbinding_without_authori
 
     assert result["ok"] is True, result
     assert "findings" not in result["data"]
-    mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_awaited_once()
+    mock_app.WORKFLOW_SERVICE.update_workflow_definition.assert_not_awaited()
+    assert ctx.staged_workflow is result["_workflow"]
 
 
 @pytest.mark.asyncio
@@ -460,6 +508,7 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
           blocks:
           - block_type: login
             label: login_to_portal
+            engine: skyvern-3.0
             url: https://authenticationtest.com/loginUserAndPassword/
             parameter_keys: [login_credentials]
             navigation_goal: Sign in to the portal.
@@ -559,3 +608,101 @@ async def test_list_credentials_without_request_policy_is_inert() -> None:
         result = await _list_credentials({}, ctx)
 
     assert result["ok"] is True
+
+
+_BITWARDEN_SECRET_KEYS = """
+            bitwarden_client_id_aws_secret_key: SKYVERN_BITWARDEN_CLIENT_ID
+            bitwarden_client_secret_aws_secret_key: SKYVERN_BITWARDEN_CLIENT_SECRET
+            bitwarden_master_password_aws_secret_key: SKYVERN_BITWARDEN_MASTER_PASSWORD"""
+
+
+def _bitwarden_workflow(
+    parameter_fields: str, extra_parameters: str = "", secret_keys: str = _BITWARDEN_SECRET_KEYS
+) -> str:
+    return _yaml(
+        f"""
+        title: Sign in
+        workflow_definition:
+          parameters:
+          - key: portal_login
+            parameter_type: bitwarden_login_credential{secret_keys}{parameter_fields}{extra_parameters}
+          blocks:
+          - block_type: login
+            label: login_to_portal
+            url: https://portal.example.com/login
+            parameter_keys: [portal_login]
+        """
+    )
+
+
+_LITERAL_BINDING = _bitwarden_workflow(
+    f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1"
+)
+_CREDIT_CARD_BINDING = _bitwarden_workflow(
+    f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1",
+    f"""
+          - key: card
+            parameter_type: bitwarden_credit_card_data{_BITWARDEN_SECRET_KEYS}
+            bitwarden_collection_id: col_1
+            bitwarden_item_id: {ORG_VAULT_ITEM_ID}""",
+)
+
+
+@pytest.mark.parametrize(
+    "yaml",
+    [
+        pytest.param(_LITERAL_BINDING, id="literal"),
+        pytest.param(_bitwarden_workflow('\n            bitwarden_item_id: "{{ item_id }}"'), id="templated"),
+        pytest.param(_bitwarden_workflow("\n            url_parameter_key: portal_url"), id="url-only"),
+    ],
+)
+def test_a_new_bitwarden_login_parameter_is_refused_but_one_the_workflow_had_is_kept(yaml: str) -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(yaml)
+
+    assert bitwarden_binding_change_error(yaml, _ctx_with_policy().request_policy) is not None
+    assert bitwarden_binding_change_error(yaml, kept.request_policy) is None
+
+
+def test_a_kept_bitwarden_login_parameter_cannot_be_repointed() -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(_LITERAL_BINDING)
+    repointed = _bitwarden_workflow(
+        '\n            bitwarden_item_id: "{{ item_id }}"\n            bitwarden_collection_id: col_1'
+    )
+
+    assert bitwarden_binding_change_error(repointed, kept.request_policy) is not None
+
+
+def test_a_new_bitwarden_credit_card_binding_is_refused_but_one_the_workflow_had_is_kept() -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(_CREDIT_CARD_BINDING)
+
+    assert bitwarden_binding_change_error(_CREDIT_CARD_BINDING, _ctx_with_policy().request_policy) is not None
+    assert bitwarden_binding_change_error(_CREDIT_CARD_BINDING, kept.request_policy) is None
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_refuses_a_new_bitwarden_parameter_even_when_an_untested_draft_is_allowed() -> None:
+    ctx = _ctx_with_policy()
+    ctx.allow_untested_workflow_draft = True
+
+    result = await _update_workflow({"workflow_yaml": _LITERAL_BINDING}, ctx)
+
+    assert result["ok"] is False
+    assert result["error"] == bitwarden_binding_change_error(_LITERAL_BINDING, ctx.request_policy)
+
+
+def test_a_bitwarden_login_parameter_does_not_back_a_google_sheets_connection_slot() -> None:
+    definition = {
+        "parameters": [
+            {
+                "key": "portal_login",
+                "parameter_type": "bitwarden_login_credential",
+                "bitwarden_item_id": ORG_VAULT_ITEM_ID,
+            }
+        ],
+        "blocks": [{"block_type": "google_sheets_read", "label": "read_sheet", "credential_id": "{{ portal_login }}"}],
+    }
+
+    assert _google_connection_reference_ids(definition, None) == ["{{ portal_login }}"]

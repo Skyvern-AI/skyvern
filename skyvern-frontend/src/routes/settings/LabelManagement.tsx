@@ -35,8 +35,7 @@ import { Search } from "@/components/ui/search";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/util/utils";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { useWorkflowTaggingState } from "@/hooks/useWorkflowTaggingEnabled";
 import { TagChip } from "@/routes/workflows/components/tagging/TagChip";
 import { TagColorSwatchPicker } from "@/routes/workflows/components/tagging/TagColorSwatchPicker";
 import { useTagValuesListQuery } from "@/routes/workflows/hooks/useTagValuesQuery";
@@ -461,10 +460,9 @@ function CreateLabelDialog({
 }
 
 function LabelManagement() {
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
-  const { data: tagValues = [], isPending } = useTagValuesListQuery({
-    enabled: taggingEnabled,
-  });
+  const taggingState = useWorkflowTaggingState();
+  // Pending until the flag resolves on and the list loads; the query stays disabled while the flag is pending.
+  const { data: tagValues = [], isPending } = useTagValuesListQuery();
   const [query, setQuery] = React.useState("");
   const [createOpen, setCreateOpen] = React.useState(false);
   const [labelToDelete, setLabelToDelete] = React.useState<TagValue | null>(
@@ -501,8 +499,16 @@ function LabelManagement() {
           </CardDescription>
         </CardHeader>
         <CardContent className="p-8">
-          {taggingEnabled && isPending ? (
-            <div className="flex flex-col gap-3">
+          {taggingState === "off" ? (
+            <p className="text-sm text-muted-foreground">
+              Labels aren't available for this organization.
+            </p>
+          ) : isPending ? (
+            <div
+              className="flex flex-col gap-3"
+              role="status"
+              aria-label="Loading labels"
+            >
               <Skeleton className="h-6 w-40" />
               <Skeleton className="h-6 w-full" />
               <Skeleton className="h-6 w-full" />

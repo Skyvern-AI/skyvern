@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from PIL import Image
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 from skyvern.cli.core import browser_ops
 from skyvern.cli.core.browser_ops import do_act, do_extract, do_navigate, do_screenshot, parse_extract_schema
@@ -20,6 +24,7 @@ from skyvern.cli.core.guards import (
 )
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.client.types.extensions import Extensions
+from tests.unit.copilot_test_helpers import skip_no_browser
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 LOCALHOST_RECOVERY_HINT = (
@@ -274,6 +279,42 @@ async def test_do_screenshot_full_page() -> None:
     result = await do_screenshot(page, full_page=True)
     assert result.data == b"png-data"
     assert result.full_page is True
+
+
+@pytest.mark.asyncio
+async def test_do_screenshot_returns_the_capture_when_the_viewport_probe_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def wedged_renderer(*_: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(browser_ops, "_VIEWPORT_PROBE_TIMEOUT_SECONDS", 0.05)
+    page = MagicMock()
+    page.screenshot = AsyncMock(return_value=b"png-data")
+    page.evaluate = wedged_renderer
+
+    result = await do_screenshot(page)
+
+    assert result.data == b"png-data"
+    assert result.viewport_css_px is None
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_do_screenshot_reports_the_css_viewport_only_for_a_viewport_capture() -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page(viewport={"width": 800, "height": 600}, device_scale_factor=2)
+            await page.set_content("<body style='height: 3000px'>tall</body>")
+            viewport = await do_screenshot(page)
+            full_page = await do_screenshot(page, full_page=True)
+        finally:
+            await browser.close()
+
+    assert Image.open(io.BytesIO(viewport.data)).size == (1600, 1200)
+    assert viewport.viewport_css_px == (800, 600)
+    assert full_page.viewport_css_px is None
 
 
 @pytest.mark.asyncio

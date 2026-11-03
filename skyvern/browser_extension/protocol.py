@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
@@ -11,6 +12,69 @@ LEGACY_PROTOCOL_VERSION = 1
 PROTOCOL_VERSION = 2
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION})
 EXTENSION_ID = "dhommdmblflboaledbbfkdaapkadphlp"
+PAGE_CHANGED_WHILE_RUNNING_MESSAGE = "The page changed while the extension operation was running."
+PAGE_CHANGED_BEFORE_START_MESSAGE = "The page changed before the extension operation started."
+
+PAGE_CHANGE_TIER_R_METHODS: frozenset[str] = frozenset(
+    {
+        "Page.getFrameTree",
+        "Page.getLayoutMetrics",
+        "Page.captureScreenshot",
+        "Network.getResponseBody",
+        "Page.enable",
+        "Runtime.enable",
+        "Log.enable",
+        "Network.enable",
+        "Page.setLifecycleEventsEnabled",
+        "Page.createIsolatedWorld",
+        "Target.setAutoAttach",
+        "Page.addScriptToEvaluateOnNewDocument",
+    }
+)
+PAGE_CHANGE_TIER_Q_METHODS: frozenset[str] = frozenset(
+    {"Runtime.runIfWaitingForDebugger", "Emulation.setFocusEmulationEnabled", "Emulation.setEmulatedMedia"}
+)
+
+
+def is_page_change_bootstrap(method: str, params: object) -> bool:
+    if method != "Runtime.evaluate" or type(params) is not dict or set(params) != {"expression", "contextId"}:
+        return False
+    context_id = params["contextId"]
+    expression = params["expression"]
+    if type(context_id) not in (int, float) or context_id < 0 or context_id % 1 != 0 or not isinstance(expression, str):
+        return False
+    expression = expression.strip()
+    if not re.match(r"^\(\(\) => \{\s+const module = \{\};", expression):
+        return False
+    if re.search(
+        r"return new \(module\.exports\.UtilityScript\(\)\)\(globalThis, (?:true|false)\);\s+\}\)\(\);$", expression
+    ):
+        return True
+    injected = re.search(
+        r"return new \(module\.exports\.InjectedScript\(\)\)\(globalThis, (\{[^\r\n]*\})\);\s+\}\)\(\);$",
+        expression,
+    )
+    if injected is None:
+        return False
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"Invalid JSON constant: {value}")
+
+    try:
+        return isinstance(json.loads(injected[1], parse_constant=reject_constant), dict)
+    except (ValueError, RecursionError):
+        return False
+
+
+def is_page_change_exempt(method: str, params: object) -> bool:
+    if method == "Page.addScriptToEvaluateOnNewDocument":
+        return isinstance(params, dict) and params.get("source") == "" and params.get("runImmediately") is not True
+    return (
+        method in PAGE_CHANGE_TIER_R_METHODS
+        or method in PAGE_CHANGE_TIER_Q_METHODS
+        or is_page_change_bootstrap(method, params)
+    )
+
 
 ALLOWED_OPS = frozenset(
     {
@@ -18,6 +82,7 @@ ALLOWED_OPS = frozenset(
         "debugger.detach",
         "debugger.send",
         "dom.evaluate",
+        "dom.fill",
         "tabs.create",
         "tabs.remove",
         "tabs.activate",

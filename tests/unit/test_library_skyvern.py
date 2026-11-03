@@ -1,17 +1,8 @@
-from skyvern.schemas import runs
 from skyvern.schemas.proxy_location import (
-    SUPPORTED_GEO_COUNTRIES,
     GeoTarget,
     ProxyLocation,
     proxy_location_to_request,
 )
-
-
-def test_runs_reexports_proxy_location_types() -> None:
-    assert runs.GeoTarget is GeoTarget
-    assert runs.ProxyLocation is ProxyLocation
-    assert runs.SUPPORTED_GEO_COUNTRIES is SUPPORTED_GEO_COUNTRIES
-    assert runs.proxy_location_to_request is proxy_location_to_request
 
 
 def test_proxy_location_to_request_dumps_geotarget_values() -> None:
@@ -19,6 +10,7 @@ def test_proxy_location_to_request_dumps_geotarget_values() -> None:
         "country": "US",
         "subdivision": None,
         "city": None,
+        "isISP": False,
     }
 
 

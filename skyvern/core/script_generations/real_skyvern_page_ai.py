@@ -23,11 +23,13 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     get_org_aware_secondary_llm_api_handler,
 )
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_prompt_type_handler
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.credentials import is_unresolved_totp_value
+from skyvern.forge.sdk.workflow.context_manager import register_secret_derived_output
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
@@ -58,6 +60,7 @@ from skyvern.webeye.actions.handler import (
 )
 from skyvern.webeye.actions.parse_actions import parse_actions
 from skyvern.webeye.actions.responses import ActionAbort, ActionResult
+from skyvern.webeye.browser_state import raise_if_browser_connection_lost
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 jinja_sandbox_env = SandboxedEnvironment()
@@ -157,12 +160,14 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     template_data = data.copy() if data else {}
     jinja_template = jinja_sandbox_env.from_string(template)
     context = skyvern_context.current()
+    run_secrets: dict[str, Any] | None = None
     if context and context.workflow_run_id:
         workflow_run_id = context.workflow_run_id
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
         template_data.update(workflow_run_context.values)
         if template in template_data:
             return template_data[template]
+        run_secrets = workflow_run_context.secrets
 
     # Inject loop metadata from script `skyvern.loop()` / `skyvern.while_loop()`
     # (current_value, current_index, current_item) so cached function bodies inside
@@ -172,7 +177,10 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             if key in context.loop_metadata:
                 template_data[key] = context.loop_metadata[key]
 
-    return jinja_template.render(template_data)
+    rendered = jinja_template.render(template_data)
+    if run_secrets is not None:
+        register_secret_derived_output(run_secrets, jinja_template, template, template_data, rendered)
+    return rendered
 
 
 class RealSkyvernPageAi(SkyvernPageAi):
@@ -185,12 +193,39 @@ class RealSkyvernPageAi(SkyvernPageAi):
         self.page = page
         self.current_label: str | None = None
 
+    def _raise_if_browser_connection_lost(self) -> None:
+        context = skyvern_context.current()
+        raise_if_browser_connection_lost(
+            self.scraped_page._browser_state, workflow_run_id=context.workflow_run_id if context else None
+        )
+
     async def _refresh_scraped_page(
         self, take_screenshots: bool = True, max_retries: int = SKYVERN_PAGE_MAX_SCRAPING_RETRIES
     ) -> None:
+        self._raise_if_browser_connection_lost()
         self.scraped_page = await self.scraped_page.generate_scraped_page(
             take_screenshots=take_screenshots, max_retries=max_retries
         )
+
+    def _step_notes_section(self) -> str | None:
+        """Notes for the cached block now running, keyed by its workflow block label."""
+        context = skyvern_context.current()
+        if not context or not context.workflow_run_id or not context.cached_block_label:
+            return None
+        try:
+            workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
+        except WorkflowRunContextNotInitialized:
+            return None
+        # Resolved per call: loop children never pass through _apply_workflow_system_prompt on the
+        # script path, and each iteration renders its own loop values.
+        return workflow_run_context.resolve_block_notes_section(context.cached_block_label)
+
+    def _with_step_notes(self, goal: str | None) -> str | None:
+        """Cached-script fallbacks see only the block goal, so append the notes this block reads."""
+        notes_section = self._step_notes_section()
+        if not notes_section:
+            return goal
+        return f"{goal}\n\n{notes_section}" if goal else notes_section
 
     async def ai_click(
         self,
@@ -236,10 +271,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
             if ep_id is not None:
                 v3_parent_episode_id = ep_id
 
-        # Set when a setup already performed the interaction before raising SkyvernActionFailed,
-        # so the except block below can tell a genuine AI miss (safe to retry on selector) apart
-        # from a setup failure that already mutated the page (retrying would repeat side effects).
-        setup_performed_before_failure = False
+        # Set when the failure must not be retried as a raw selector click: a setup already
+        # performed the interaction (retrying would repeat side effects), or the handler refused
+        # the click and asked to stop (skip_remaining_actions), e.g. to wait for explicit intent.
+        raw_retry_unsafe = False
         try:
             # Build the element tree of the current page for the prompt
             context = skyvern_context.ensure_context()
@@ -257,7 +292,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 current_url=self.page.url,
                 elements=element_tree,
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
-                user_context=context.prompt,
+                user_context=self._with_step_notes(context.prompt),
             )
             llm_handler = await _resolve_assist_llm_handler(
                 "single-click-action", app.SINGLE_CLICK_AGENT_LLM_API_HANDLER
@@ -296,7 +331,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     setup_results = await setup(action, self.page, self.scraped_page, task, step)
                     if setup_results:
                         if setup_results[-1].success is False:
-                            setup_performed_before_failure = setup_results[-1].setup_performed
+                            raw_retry_unsafe = setup_results[-1].setup_performed
                             raise SkyvernActionFailed(
                                 setup_results[-1].exception_message or "Click action setup returned success=False"
                             )
@@ -305,7 +340,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 if setup_result is None:
                     result = await handle_click_action(action, self.page, self.scraped_page, task, step)
                     if result and result[-1].success is False:
-                        setup_performed_before_failure = result[-1].setup_performed
+                        raw_retry_unsafe = result[-1].setup_performed or result[-1].skip_remaining_actions
                         raise SkyvernActionFailed(result[-1].exception_message or "Click action returned success=False")
                     if result and isinstance(result[-1], ActionAbort):
                         # handle_click_action's own ClickContext.desired_state guard can suppress
@@ -343,12 +378,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
         except SkyvernActionFailed:
             if selector is None:
                 raise
-            if setup_performed_before_failure:
-                # The setup already mutated the page (e.g. clicked, toggled, or navigated) before
-                # this failure — a raw click on `selector` would repeat that side effect rather
-                # than recover from it, so surface the failure instead of retrying.
+            if raw_retry_unsafe:
+                # A raw click on `selector` would repeat a side effect the setup already caused, or
+                # override the handler's refusal, so surface the failure instead of retrying.
                 LOG.warning(
-                    "AI click setup already performed the interaction before failing; not retrying with a raw click",
+                    "AI click failure must not be retried with a raw click; surfacing it",
                     selector=selector,
                     intention=intention,
                 )
@@ -367,6 +401,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 exc_info=True,
             )
 
+        self._raise_if_browser_connection_lost()
         if selector:
             locator = self.page.locator(selector)
             await locator.click(timeout=timeout)
@@ -390,6 +425,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
+        self._raise_if_browser_connection_lost()
         sensitive_value = value if value_is_sensitive else None
 
         # v3 mid-run hook — see ai_click for the contract.
@@ -426,7 +462,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         if intention:
             try:
-                prompt = context.prompt
+                prompt = self._with_step_notes(context.prompt)
                 # Merge script_run_parameters into LLM payload (consistency with ai_click/ai_upload_file).
                 # No-op when script_run_parameters is unset (i.e. non-adaptive-caching runs).
                 data = _get_context_data(data)
@@ -529,6 +565,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception("Failed to adapt value for input text action", selector=selector)
 
+        self._raise_if_browser_connection_lost()
         if action and organization_id and task and step:
             result = await handle_input_text_action_direct(action, self.page, self.scraped_page, task, step)
             if result and result[-1].success is False:
@@ -579,7 +616,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
         if intention:
             try:
-                prompt = context.prompt
+                prompt = self._with_step_notes(context.prompt)
                 data = data or {}
                 if files and isinstance(data, dict) and "files" not in data:
                     data["files"] = files
@@ -653,6 +690,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             except Exception:
                 LOG.exception(f"Failed to adapt value for upload file action on selector={selector}, file={files}")
 
+        self._raise_if_browser_connection_lost()
         if action and original_files and action.file_url and action.file_url != original_files:
             LOG.warning(
                 "LLM returned a different file url than the user provided, using the original",
@@ -689,7 +727,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             step = await app.DATABASE.tasks.get_step(context.step_id, organization_id=context.organization_id)
             if intention and task and step:
                 try:
-                    prompt = context.prompt if context else None
+                    prompt = self._with_step_notes(context.prompt if context else None)
                     # Merge script_run_parameters into LLM payload (consistency with ai_click/ai_upload_file).
                     # No-op when script_run_parameters is unset (i.e. non-adaptive-caching runs).
                     data = _get_context_data(data)
@@ -752,6 +790,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                         exc_info=True,
                     )
 
+        self._raise_if_browser_connection_lost()
         if not selector:
             raise SkyvernActionFailed(
                 f"Select option failed and no fallback selector available for intention: {intention}"
@@ -840,14 +879,15 @@ class RealSkyvernPageAi(SkyvernPageAi):
             await self._refresh_scraped_page(take_screenshots=False)
         extracted_text_for_meta = (self.scraped_page.extracted_text or "")[:2000]
 
+        context = skyvern_context.current()
         classify_prompt = prompt_engine.load_prompt(
             template="page-classify",
             current_url=current_url,
             extracted_text=extracted_text_for_meta,
             options=options,
+            step_notes=self._step_notes_section(),
         )
 
-        context = skyvern_context.current()
         step = None
         organization_id = context.organization_id if context else None
         if context and context.organization_id and context.step_id:
@@ -869,9 +909,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
 
             LOG.info(
                 "page.classify: LLM classification result",
-                classification=classification,
-                confidence=confidence,
-                reasoning=reasoning,
+                **llm_response_log_metadata(json_response),
             )
 
             if classification in options or classification == "UNKNOWN":
@@ -1485,6 +1523,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 recorded, value = workflow_run_context_for_prompt.get_block_workflow_system_prompt(self.current_label)
                 if recorded:
                     workflow_system_prompt = value
+                elif context and (
+                    noted := workflow_run_context_for_prompt.resolve_noted_block_system_prompt(
+                        context.cached_block_label
+                    )
+                ):
+                    workflow_system_prompt = noted
                 else:
                     workflow_system_prompt = workflow_run_context_for_prompt.resolve_effective_workflow_system_prompt()
 
@@ -1642,7 +1686,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.warning("ai_extract cache store failed; ignoring", exc_info=True)
 
         if context and context.script_mode:
-            LOG.debug("Extracted information", result=result)
+            LOG.debug("Extracted information", **llm_response_log_metadata(result))
         return result
 
     async def ai_validate(
@@ -1650,11 +1694,13 @@ class RealSkyvernPageAi(SkyvernPageAi):
         prompt: str,
         model: dict[str, Any] | None = None,
     ) -> bool:
+        context = skyvern_context.current()
         result = await script_service.execute_validation(
             complete_criterion=prompt,
             terminate_criterion=None,
             error_code_mapping=None,
             model=model,
+            notes_label=context.cached_block_label if context else None,
         )
         return result.status == BlockStatus.completed
 
@@ -1673,7 +1719,9 @@ class RealSkyvernPageAi(SkyvernPageAi):
         scraped_page_refreshed = await self.scraped_page.refresh()
         context = skyvern_context.ensure_context()
 
-        prompt_rendered = _render_template_with_label(prompt, label=self.current_label)
+        # Notes join after rendering: a note's literal {{ }} (credential references included) must stay literal.
+        rendered_goal = _render_template_with_label(prompt, label=self.current_label)
+        prompt_rendered = self._with_step_notes(rendered_goal) or rendered_goal
 
         locate_element_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
@@ -1702,14 +1750,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if not result or not isinstance(result, dict):
             LOG.error(
                 "AI locate element failed - invalid result",
-                result=result,
-                result_type=type(result).__name__,
+                **llm_response_log_metadata(result),
                 prompt=prompt_rendered,
             )
             return None
 
         element_id = result.get("element_id", None)
-        confidence = result.get("confidence_float", 0.0)
 
         xpath: str | None = None
         if element_id:
@@ -1723,17 +1769,14 @@ class RealSkyvernPageAi(SkyvernPageAi):
         if not xpath:
             LOG.error(
                 "AI locate element failed - no xpath in element data",
-                element_id=element_id,
-                result=result,
+                **llm_response_log_metadata(result),
                 prompt=prompt_rendered,
             )
             return None
 
         LOG.info(
             "AI locate element result",
-            element_id=element_id,
-            xpath=xpath,
-            confidence=confidence,
+            **llm_response_log_metadata(result),
             prompt=prompt_rendered,
         )
 
@@ -1746,10 +1789,12 @@ class RealSkyvernPageAi(SkyvernPageAi):
         model: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list | str | None:
         """Send a prompt to the LLM and get a response based on the provided schema."""
+        context = skyvern_context.current()
         result = await script_service.prompt(
             prompt=prompt,
             schema=schema,
             model=model,
+            notes_label=context.cached_block_label if context else None,
         )
         return result
 
@@ -1761,6 +1806,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
     ) -> None:
         """Perform an action on the page using AI based on a natural language prompt."""
         context = skyvern_context.ensure_context()
+        prompt = self._with_step_notes(prompt) or prompt
         organization_id = context.organization_id
         task_id = context.task_id
         step_id = context.step_id
@@ -1789,25 +1835,29 @@ class RealSkyvernPageAi(SkyvernPageAi):
         )
 
         if not json_response or "inferred_actions" not in json_response:
-            LOG.warning("ai_act: failed to infer action type", prompt=prompt, response=json_response)
+            LOG.warning(
+                "ai_act: failed to infer action type",
+                prompt=prompt,
+                **llm_response_log_metadata(json_response),
+            )
             return
 
         inferred_actions = json_response.get("inferred_actions", [])
         if not inferred_actions:
-            error = json_response.get("error")
-            LOG.warning("ai_act: no action type inferred", prompt=prompt, error=error)
+            LOG.warning(
+                "ai_act: no action type inferred",
+                prompt=prompt,
+                **llm_response_log_metadata(json_response),
+            )
             return
 
         action_info = inferred_actions[0]
         action_type = action_info.get("action_type")
-        confidence = action_info.get("confidence_float", 0.0)
 
         LOG.info(
             "ai_act: inferred action type",
             prompt=prompt,
-            action_type=action_type,
-            confidence=confidence,
-            reasoning=action_info.get("reasoning"),
+            **llm_response_log_metadata(json_response),
         )
 
         if not skip_refresh:

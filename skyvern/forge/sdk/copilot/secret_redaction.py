@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import json
 import re
+from typing import TypeVar, cast
 
 from email_validator import EmailNotValidError, validate_email
+
+from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 
 # The `token` keyword is guarded by negative lookbehinds so pagination cursors
 # (next_token, page_token, continuation_token, ...), which are not credentials,
 # aren't matched as secrets by either detection or redaction.
-SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
+_SECRET_KEYWORD = (
     r"(?:^|(?<=[^A-Za-z0-9]))(?:[A-Za-z0-9]+_){0,8}"
     r"(?:password|passcode|api[_ -]?key|secret|bearer|authorization"
     r"|(?<!next_)(?<!prev_)(?<!previous_)(?<!page_)(?<!continuation_)(?<!cursor_)token)"
+)
+SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
     # Consume an optional auth scheme word so `Authorization: Bearer <token>`
     # redacts the token, not just the scheme.
-    r"\s*[:=]\s*(?:(?:bearer|basic|token|digest)\s+)?\S+",
+    _SECRET_KEYWORD + r"\s*[:=]\s*(?:(?:bearer|basic|token|digest)\s+)?\S+",
     re.I,
 )
+# A structured label carrying the keyword anywhere ("Password (required)"), for callers that already
+# hold the label apart from its value and so cannot rely on the assignment shape above.
+SECRET_KEYWORD_LABEL_PATTERN = re.compile(_SECRET_KEYWORD + r"(?![A-Za-z0-9])", re.I)
 RAW_SECRET_PATTERNS = (
     SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     re.compile(
@@ -31,6 +39,70 @@ _COLON_DELIMITED_SECRET_SEGMENT_SEPARATORS = (",", ";", "|")
 _COLON_DELIMITED_SECRET_EDGE_CHARS = "\"'`()[]{}<>"
 
 
+_TOTP_DIAGNOSTIC = re.compile(r"\b(totp_identifier|totp_verification_url)(?:\s*=|[\"']?\s*:\s*(?=[\"']))")
+_TOTP_FIELDS = frozenset({"totp_identifier", "totp_verification_url"})
+_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "reason",
+        "reasoning",
+        "intention",
+        "error",
+        "errors",
+        "error_message",
+        "failure_reason",
+        "terminate_reason",
+        "terminated_reason",
+        "display_reason",
+        "workflow_error_message",
+        "traceback",
+        "exception",
+        "action_trace",
+        "action_trace_summary",
+        "reviewer_output",
+        "logs",
+    }
+)
+_T = TypeVar("_T")
+
+
+def redact_totp_runtime_values(node: _T, *, diagnostic: bool | None = None) -> _T:
+    if isinstance(node, str):
+        fields = sorted({match[1] for match in _TOTP_DIAGNOSTIC.finditer(node)}) if diagnostic is not False else []
+        if fields:
+            # Legacy diagnostics do not delimit values; retaining any free text can retain a value fragment.
+            failure = "TOTP verification failed"
+            if "No TOTP verification code found" in node or "produced no code" in node:
+                failure = "TOTP verification code unavailable"
+            return cast(_T, f"{failure} ({', '.join(fields)}): [WITHHELD]")
+        return node
+    if isinstance(node, dict):
+        return cast(
+            _T,
+            {
+                key: (
+                    "[WITHHELD]"
+                    if key in _TOTP_FIELDS and isinstance(value, (str, int, float)) and value != SECRET_HEADER_MASK
+                    else redact_totp_runtime_values(
+                        value,
+                        diagnostic=key in _DIAGNOSTIC_FIELDS or (diagnostic is True and key in {"message", "detail"}),
+                    )
+                )
+                for key, value in node.items()
+            },
+        )
+    if isinstance(node, list):
+        return cast(
+            _T,
+            [redact_totp_runtime_values(value, diagnostic=diagnostic) for value in node],
+        )
+    if isinstance(node, tuple):
+        return cast(
+            _T,
+            tuple(redact_totp_runtime_values(value, diagnostic=diagnostic) for value in node),
+        )
+    return node
+
+
 def _candidate_secret_segments(text: str) -> list[str]:
     segments: list[str] = []
     for raw_token in (text or "").split():
@@ -41,7 +113,7 @@ def _candidate_secret_segments(text: str) -> list[str]:
     return [segment for segment in segments if segment]
 
 
-def _is_valid_account_row_email(value: str) -> bool:
+def is_account_row_email(value: str) -> bool:
     if any(char.isspace() for char in value) or "/" in value or ":" in value:
         return False
     try:
@@ -69,7 +141,7 @@ def _email_password_pair_segments(text: str) -> list[str]:
         email, separator, secret_value = segment.partition(":")
         if not separator:
             continue
-        if _is_valid_account_row_email(email) and _looks_like_colon_delimited_secret_value(secret_value):
+        if is_account_row_email(email) and _looks_like_colon_delimited_secret_value(secret_value):
             pairs.append(segment)
     return pairs
 
@@ -99,6 +171,46 @@ def redact_raw_secrets_for_prompt(text: str) -> str:
         redacted = pattern.sub("[REDACTED_SECRET]", redacted)
     for segment in _email_password_pair_segments(redacted):
         redacted = redacted.replace(segment, "[REDACTED_SECRET]")
+    return redacted
+
+
+# A 32+ hex run carrying a letter is signature-shaped, and a long separator-free run mixing case and
+# digits is token-shaped. Both mirror the same shape test taskv3 uses for opaque signing values.
+_HEX_BLOB_RE = re.compile(r"[0-9A-Fa-f]{32,}")
+# Includes the separators a token alphabet uses (``ghp_...``, base64url), since the word-run
+# check below is what keeps ordinary names like "Q3_Report_2026_Final" readable.
+_OPAQUE_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{24,}")
+_LOWERCASE_RUN_RE = re.compile(r"[a-z]+")
+# A CamelCase export name ("CustomerOrdersExport20260911") carries several whole words; a random
+# token can hit one long lowercase run by chance, so one is not evidence and two are.
+_WORDLIKE_RUN_CHARS = 4
+_WORDLIKE_RUNS_REQUIRED = 2
+
+
+def is_secret_shaped(token: str) -> bool:
+    if any(not run.isdigit() for run in _HEX_BLOB_RE.findall(token)):
+        return True
+    wordlike_runs = sum(1 for run in _LOWERCASE_RUN_RE.findall(token) if len(run) >= _WORDLIKE_RUN_CHARS)
+    return (
+        _OPAQUE_TOKEN_RE.fullmatch(token) is not None
+        and wordlike_runs < _WORDLIKE_RUNS_REQUIRED
+        and any(char.isupper() for char in token)
+        and any(char.islower() for char in token)
+        and any(char.isdigit() for char in token)
+    )
+
+
+def redact_secretlike_filename(name: str) -> str:
+    """Keep an ordinary display name, but never hand the model a filename whose stem is shaped like a
+    credential. The patterns above only catch secrets they can name, and a filename is user-chosen
+    text that no semantic screen sees.
+    """
+    redacted = redact_raw_secrets_for_prompt(name or "")
+    stem, dot, extension = redacted.rpartition(".")
+    if not dot:
+        stem, extension = redacted, ""
+    if is_secret_shaped(stem.strip()):
+        return f"[REDACTED_SECRET]{dot}{extension}"
     return redacted
 
 

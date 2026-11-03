@@ -11,6 +11,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { RunEngine } from "@/api/types";
+import { placeholders } from "../../helpContent";
 import type { FileDownloadNode } from "../../nodes/FileDownloadNode/types";
 import type * as WorkflowEditorUtilsModule from "../../workflowEditorUtils";
 import type {
@@ -20,8 +21,15 @@ import type {
 
 const mockNodes = new Map<
   string,
-  { id: string; type: string; data?: Record<string, unknown> } | undefined
+  | {
+      id: string;
+      type: string;
+      parentId?: string;
+      data?: Record<string, unknown>;
+    }
+  | undefined
 >();
+const mockEdges: Array<{ id: string; source: string; target: string }> = [];
 const updateNodeData = vi.fn();
 
 vi.mock("@xyflow/react", async () => {
@@ -38,15 +46,20 @@ vi.mock("@xyflow/react", async () => {
       return node ? { id: node.id, type: node.type, data: node.data } : null;
     },
     useNodes: () => Array.from(mockNodes.values()),
-    useEdges: () => [],
+    useEdges: () => mockEdges,
   };
 });
 
-vi.mock("../../workflowEditorUtils", () => ({
-  getAvailableOutputParameterKeys: () => [],
-  isNodeInsideForLoop: () => false,
-  getParentLoopSkipsOnFail: () => false,
-}));
+vi.mock("../../workflowEditorUtils", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../workflowEditorUtils")
+  >("../../workflowEditorUtils");
+  return {
+    ...actual,
+    isNodeInsideForLoop: () => false,
+    getParentLoopSkipsOnFail: () => false,
+  };
+});
 
 // Stub heavy components: WorkflowBlockInputTextarea, ParametersMultiSelect,
 // ErrorCodeMappingEditor, ModelSelector, RunEngineSelector,
@@ -59,15 +72,26 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
     onChange: (value: string) => void;
     placeholder?: string;
     aiImprove?: { useCase?: string };
+    name?: string;
+    "aria-required"?: boolean;
+    disabled?: boolean;
   }) => {
     // The useCase string is `workflow_editor.<block>.<field>` so we can
     // route assertions for AI-improved fields by field. For non-AI fields
     // we fall back to placeholder as a stable disambiguator.
     const aiField = props.aiImprove?.useCase?.split(".").pop();
-    const testId = aiField ? `wbi-${aiField}` : `wbi-ph-${props.placeholder}`;
+    const testId =
+      props.name === "sftpPrivateKey"
+        ? "wbi-private-key"
+        : aiField
+          ? `wbi-${aiField}`
+          : `wbi-ph-${props.placeholder}`;
     return (
       <textarea
         data-testid={testId}
+        name={props.name}
+        aria-required={props["aria-required"]}
+        disabled={props.disabled}
         value={props.value}
         onChange={(event) => props.onChange(event.target.value)}
       />
@@ -237,18 +261,21 @@ vi.mock("@/components/ui/accordion", () => {
 
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { errorMappingExampleValue } from "../../nodes/types";
 import { FileDownloadBlockForm } from "./FileDownloadBlockForm";
 
 beforeEach(() => {
   vi.useFakeTimers();
   mockNodes.clear();
+  mockEdges.length = 0;
   updateNodeData.mockReset();
   usePendingCommitsStore.setState({ commits: {} });
   useSidebarSaveStateStore.getState().reset();
 });
 
 afterEach(() => {
+  useWorkflowYamlEditorStore.getState().setCommitInProgress(false);
   vi.useRealTimers();
   cleanup();
 });
@@ -330,6 +357,416 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(screen.queryByText("Storage Account Name")).toBeNull();
     expect(screen.queryByText("Google Account")).toBeNull();
     expect(screen.queryByText("SFTP Host")).toBeNull();
+  });
+
+  test("hides a saved SFTP private key and preserves it when saving untouched", async () => {
+    const privateKey = "saved-synthetic-key-marker";
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: privateKey,
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(document.body.textContent).not.toContain(privateKey);
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(updateNodeData).not.toHaveBeenCalled();
+
+    const { getWorkflowBlocks } = await vi.importActual<
+      typeof WorkflowEditorUtilsModule
+    >("../../workflowEditorUtils");
+    const [savedBlock] = getWorkflowBlocks(
+      [mockNodes.get("d1") as unknown as FileDownloadNode],
+      [],
+    );
+    expect(savedBlock).toHaveProperty("sftp_private_key", privateKey);
+  });
+
+  test("keeps SFTP private-key parameter references editable", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "{{ sftp_key }}",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      (screen.getByTestId("wbi-private-key") as HTMLTextAreaElement).value,
+    ).toBe("{{ sftp_key }}");
+    expect(screen.queryByText("A private key is saved and hidden.")).toBeNull();
+  });
+
+  test("allows replacing a saved SFTP private key explicitly", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    const { rerender } = render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    const keyField = screen.getByTestId(
+      "wbi-private-key",
+    ) as HTMLTextAreaElement;
+    expect(keyField.value).toBe("");
+    expect(updateNodeData).not.toHaveBeenCalled();
+
+    updateNodeData.mockImplementationOnce(
+      (id: string, updates: Record<string, unknown>) => {
+        const node = mockNodes.get(id);
+        if (node) node.data = { ...node.data, ...updates };
+      },
+    );
+    fireEvent.change(keyField, { target: { value: "replacement-key" } });
+    expect(updateNodeData).toHaveBeenCalledWith("d1", {
+      sftpPrivateKey: "replacement-key",
+    });
+
+    rerender(<FileDownloadBlockForm blockId="d1" />);
+    expect(
+      (screen.getByTestId("wbi-private-key") as HTMLTextAreaElement).value,
+    ).toBe("replacement-key");
+  });
+
+  test("resets the private-key draft when switching between download blocks", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "block-a-saved-key",
+    });
+    setFileDownloadNode("d2", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "block-b-saved-key",
+    });
+    const { rerender } = render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    fireEvent.change(screen.getByTestId("wbi-private-key"), {
+      target: { value: "block-a-replacement-draft" },
+    });
+
+    rerender(<FileDownloadBlockForm blockId="d2" />);
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "block-a-replacement-draft",
+    );
+
+    rerender(<FileDownloadBlockForm blockId="d1" />);
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain(
+      "block-a-replacement-draft",
+    );
+  });
+
+  test("resets the private-key draft after an external value change", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    const { rerender } = render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Replace key" }));
+    fireEvent.change(screen.getByTestId("wbi-private-key"), {
+      target: { value: "local-replacement-draft" },
+    });
+
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "restored-key",
+    });
+    rerender(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(document.body.textContent).not.toContain("local-replacement-draft");
+  });
+
+  test("allows removing a saved SFTP private key explicitly", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove key" }));
+    expect(updateNodeData).toHaveBeenCalledWith("d1", { sftpPrivateKey: "" });
+  });
+
+  test("keeps a saved key hidden when removal is rejected during a YAML commit", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpPrivateKey: "saved-key",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+    useWorkflowYamlEditorStore.getState().setCommitInProgress(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove key" }));
+
+    expect(
+      screen.getByText("A private key is saved and hidden."),
+    ).toBeDefined();
+    expect(screen.queryByTestId("wbi-private-key")).toBeNull();
+    expect(updateNodeData).not.toHaveBeenCalled();
+  });
+
+  test("warns that a first block with no URL has nowhere to download from", () => {
+    setFileDownloadNode("d1", { downloadTarget: "sftp", url: "" });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeDefined();
+
+    cleanup();
+    setFileDownloadNode("d2", {
+      downloadTarget: "sftp",
+      url: "https://example.com/invoices",
+    });
+    render(<FileDownloadBlockForm blockId="d2" />);
+
+    expect(
+      screen.queryByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeNull();
+
+    cleanup();
+    mockNodes.set("http", {
+      id: "http",
+      type: "http_request",
+      data: { label: "http_request_1" },
+    });
+    mockEdges.push({ id: "http-d3", source: "http", target: "d3" });
+    setFileDownloadNode("d3", { downloadTarget: "sftp", url: "" });
+    render(<FileDownloadBlockForm blockId="d3" />);
+
+    expect(
+      screen.getByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeDefined();
+
+    cleanup();
+    setFileDownloadNode("d4", {
+      downloadTarget: "sftp",
+      url: "",
+      sftpSourcePath: "/reports/report.csv",
+    });
+    render(<FileDownloadBlockForm blockId="d4" />);
+
+    expect(
+      screen.queryByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeNull();
+  });
+
+  test("classifies predecessors by whether they reach BaseTaskBlock.execute", () => {
+    // None of these reach BaseTaskBlock.execute as the first block, whatever they
+    // subclass: HumanInteractionBlock overrides execute and never calls up,
+    // ValidationBlock terminates at task order 0, DownloadToS3Block fetches over HTTP.
+    const warning =
+      "Nothing runs before this block, so it needs a URL to start from.";
+    const cases: Array<[string, Record<string, unknown>, boolean]> = [
+      ["validation", {}, true],
+      ["human_interaction", {}, true],
+      ["download", { url: "https://example.com/a.pdf" }, true],
+      ["task", {}, false],
+    ];
+
+    for (const [type, extra, warns] of cases) {
+      cleanup();
+      mockEdges.length = 0;
+      mockNodes.clear();
+      mockNodes.set("p", {
+        id: "p",
+        type,
+        data: { label: `${type}_1`, ...extra },
+      });
+      mockEdges.push({ id: "p-d1", source: "p", target: "d1" });
+      setFileDownloadNode("d1", { downloadTarget: "sftp", url: "" });
+      render(<FileDownloadBlockForm blockId="d1" />);
+
+      expect(screen.queryByText(warning) !== null).toBe(warns);
+    }
+  });
+
+  test("sees a browser task nested inside a preceding loop", () => {
+    mockNodes.set("loop", { id: "loop", type: "loop", data: { label: "l1" } });
+    mockNodes.set("inner", {
+      id: "inner",
+      type: "navigation",
+      parentId: "loop",
+      data: { label: "n1", engine: RunEngine.SkyvernV1 },
+    });
+    mockEdges.push({ id: "loop-d1", source: "loop", target: "d1" });
+    setFileDownloadNode("d1", { downloadTarget: "sftp", url: "" });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.queryByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeNull();
+  });
+
+  test("keeps the warning when the only predecessor downloads its source from Drive", () => {
+    // That predecessor is served by the Drive API and never opens the browser, so the
+    // block after it is still the first browser task and needs its own URL.
+    setFileDownloadNode("drive", {
+      downloadTarget: "sftp",
+      url: "https://drive.google.com/file/d/abc123/view",
+      googleCredentialId: "goac-existing",
+    });
+    mockEdges.push({ id: "drive-d1", source: "drive", target: "d1" });
+    setFileDownloadNode("d1", { downloadTarget: "sftp", url: "" });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeDefined();
+
+    cleanup();
+    setFileDownloadNode("drive", {
+      downloadTarget: "sftp",
+      url: "https://example.com/invoices",
+      googleCredentialId: "goac-existing",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.queryByText(
+        "Nothing runs before this block, so it needs a URL to start from.",
+      ),
+    ).toBeNull();
+  });
+
+  test("hides the Google Drive source account for an SFTP block downloading from a website", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      url: "https://example.com/invoices",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(screen.getByText("SFTP Host")).toBeDefined();
+    expect(screen.getByText("(Optional) Host Key")).toBeDefined();
+    expect(screen.getByText("(Optional) Remote Directory")).toBeDefined();
+    expect(
+      document
+        .querySelector('[name="sftpHostKey"]')
+        ?.getAttribute("aria-required"),
+    ).toBe("false");
+    expect(
+      screen.queryByText("Google Drive Source Account (Optional)"),
+    ).toBeNull();
+  });
+
+  test("offers SFTP source fields and requires its host key", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "website",
+      sftpSourcePath: "/reports/report.csv",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(screen.getByText("SFTP Host (Source)")).toBeDefined();
+    expect(screen.getByText("SFTP Source Path")).toBeDefined();
+    expect(
+      screen.getByText("Host Key (Required for SFTP source)"),
+    ).toBeDefined();
+    expect(screen.queryByText("Download Goal")).toBeNull();
+    expect(screen.queryByText("Download Timeout (sec)")).toBeNull();
+    expect(
+      document
+        .querySelector('[name="sftpHostKey"]')
+        ?.getAttribute("aria-required"),
+    ).toBe("true");
+    expect(screen.queryByText("(Optional) Remote Directory")).toBeNull();
+  });
+
+  test("hides the Drive source account when an SFTP path is set", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      url: "https://drive.google.com/file/d/example/view",
+      googleCredentialId: "goac-existing",
+      sftpSourcePath: "/reports/report.csv",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.queryByText("Google Drive Source Account (Optional)"),
+    ).toBeNull();
+    expect(
+      document
+        .querySelector('[name="sftpHostKey"]')
+        ?.getAttribute("aria-required"),
+    ).toBe("true");
+  });
+
+  test("edits the SFTP source path", () => {
+    setFileDownloadNode("d1");
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    fireEvent.change(screen.getByTestId("wbi-ph-/path/to/file"), {
+      target: { value: "/reports/report.csv" },
+    });
+
+    expect(updateNodeData).toHaveBeenCalledWith("d1", {
+      sftpSourcePath: "/reports/report.csv",
+    });
+  });
+
+  test("offers the Google Drive source account for an SFTP block whose URL is a Drive link", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      url: "https://drive.google.com/file/d/abc123/view",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.getByText("Google Drive Source Account (Optional)"),
+    ).toBeDefined();
+
+    cleanup();
+    setFileDownloadNode("d2", { downloadTarget: "sftp", url: "abc123_-XYZ" });
+    render(<FileDownloadBlockForm blockId="d2" />);
+
+    expect(
+      screen.getByText("Google Drive Source Account (Optional)"),
+    ).toBeDefined();
+
+    cleanup();
+    setFileDownloadNode("d3", {
+      downloadTarget: "sftp",
+      url: "https://DRIVE.GOOGLE.COM/file/d/abc123/view",
+    });
+    render(<FileDownloadBlockForm blockId="d3" />);
+
+    expect(
+      screen.getByText("Google Drive Source Account (Optional)"),
+    ).toBeDefined();
+  });
+
+  test("does not treat a URL containing the Drive hostname as a Drive link", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      url: "https://example.com/drive.google.com/file/d/abc123/view",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    expect(
+      screen.queryByText("Google Drive Source Account (Optional)"),
+    ).toBeNull();
   });
 
   test("selects a Google Drive source account for SFTP delivery", () => {
@@ -470,7 +907,7 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     render(<FileDownloadBlockForm blockId="d1" />);
 
     const suffixInput = screen.getByTestId(
-      "wbi-ph-Enter the complete filename (without extension)",
+      `wbi-ph-${placeholders["download"]["downloadSuffix"]}`,
     );
     fireEvent.change(suffixInput, { target: { value: "invoice-2024" } });
 

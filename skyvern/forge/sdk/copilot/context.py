@@ -7,30 +7,42 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import structlog
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import NotRequired, TypedDict
 
-from skyvern.forge.sdk.copilot.authoring_parameter_binding import AuthoringParameterBindingDirective
-from skyvern.forge.sdk.copilot.browser_ablation import BrowserAblationMetadata, CopilotEvalMode
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import AgentContext
+from skyvern.forge.sdk.copilot.browser_ablation import (
+    BrowserAblationMetadata,
+    CopilotToolSurfaceIdentity,
+)
+from skyvern.forge.sdk.copilot.budget_expiry import BudgetExpiryState
+from skyvern.forge.sdk.copilot.code_block_synthesis import CREDENTIAL_FILL_TOOL_NAME
 from skyvern.forge.sdk.copilot.code_write_diff import TURN_PATCH_CHAR_BUDGET, CodeWriteDiff
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.credential_resolution import loggable_origin, safe_admitted_url
 from skyvern.forge.sdk.copilot.google_connection_notice import (
     GoogleConnectionNotice,
     GoogleConnectionNoticePayload,
     GoogleSheetConnectionBinding,
 )
+from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
+from skyvern.forge.sdk.workflow.block_notes import block_field_texts
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.schemas.proxy_location import ProxyLocationInput
+from skyvern.utils.strings import join_phrases
 
 LOG = structlog.get_logger()
 
@@ -61,6 +73,62 @@ class NarrativeDraft(TypedDict):
     summary: str | None
 
 
+REPLY_TOOL_NAME = "reply"
+EDIT_BLOCK_TOOL_NAME = "edit_block"
+EDIT_BLOCK_AND_RUN_TOOL_NAME = "edit_block_and_run"
+UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
+UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
+RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
+BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
+BLOCK_RUNNING_TOOLS = frozenset(
+    {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
+)
+WORKFLOW_MUTATION_TOOLS = frozenset(
+    {
+        UPDATE_WORKFLOW_TOOL_NAME,
+        UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
+        EDIT_BLOCK_TOOL_NAME,
+        EDIT_BLOCK_AND_RUN_TOOL_NAME,
+        "add_block",
+        "delete_block",
+    }
+)
+USER_FACING_REASON_PARAM = "user_facing_reason"
+USER_FACING_REASON_SCHEMA = {
+    "type": ["string", "null"],
+    "description": (
+        "One short sentence displayed above this action while it runs, saying what it is for. Null is accepted."
+    ),
+}
+
+
+def normalize_action_reason(value: Any) -> str | None:
+    """Untrusted JSON metadata never changes ordinary action validation."""
+    return value.strip() or None if isinstance(value, str) else None
+
+
+class DesignActivityBucket(TypedDict):
+    kind: Literal["design"]
+
+
+class BlockActivityBucket(TypedDict):
+    kind: Literal["block"]
+    workflow_run_block_id: str
+
+
+ActivityBucket = DesignActivityBucket | BlockActivityBucket
+
+
+CopilotTestInputSource = Literal["copilot", "page", "earlier_run", "default", "placeholder"]
+
+
+class CopilotTestInput(TypedDict):
+    key: str
+    source: CopilotTestInputSource
+    sourceRunId: NotRequired[str]
+
+
 # Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
 # present only for tool_call/tool_result and success only for tool_result.
 class NarrativeActivityEntry(TypedDict):
@@ -70,20 +138,31 @@ class NarrativeActivityEntry(TypedDict):
     toolName: NotRequired[str]
     displayLabel: NotRequired[str]
     success: NotRequired[bool]
-    # activeLabel reads while the step runs; outcomeLabel replaces it once
-    # finished. Absent when the narrator did not speak, leaving displayLabel.
+    reason: NotRequired[str]
+    activityStartedAt: NotRequired[str]
+    activityBucket: NotRequired[ActivityBucket]
     activeLabel: NotRequired[str]
     outcomeLabel: NotRequired[str]
     codeDiffs: NotRequired[list[CodeWriteDiff]]
+    browserSteps: NotRequired[list[str]]
+    workflowRunId: NotRequired[str]
+    testInputs: NotRequired[list[CopilotTestInput]]
     id: str
     # Server clock read for the event this entry describes, shared with the SSE
     # update so a rehydrated row renders the same elapsed the live row did.
     timestamp: NotRequired[str]
 
 
+class SkippedPrefixBlock(TypedDict):
+    label: str
+    kind: Literal["reused", "not_run"]
+    sourceWorkflowRunId: NotRequired[str]
+
+
 class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
+    workflowRunId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -93,11 +172,74 @@ class NarrativeBlock(TypedDict):
     outcome: NotRequired[str]
     outcomeReason: NotRequired[str]
     outcomeRole: NotRequired[RunOutcomeRole]
+    skippedBefore: NotRequired[list[SkippedPrefixBlock]]
 
 
-class BlockRunIdentity(NamedTuple):
-    workflow_run_block_id: str
-    iteration: int
+# A loop body mints fresh run-block ids every iteration, so the identity-keyed archive
+# is unbounded without this. Mirror MAX_BLOCK_ATTEMPTS in narrativeState.ts.
+MAX_NARRATIVE_BLOCK_ATTEMPTS = 200
+
+
+class NarrativeBlockAttempt(TypedDict):
+    workflowRunBlockId: str
+    workflowRunId: str | None
+    label: str
+    blockType: str
+    rawStatus: str
+    lastSeenIteration: int
+    startedAt: str | None
+    endedAt: str | None
+    outcome: NotRequired[str]
+    outcomeReason: NotRequired[str]
+    outcomeRole: NotRequired[RunOutcomeRole]
+
+
+def skipped_prefix_anchor(archive: dict[str, NarrativeBlockAttempt], workflow_run_id: str) -> str | None:
+    """The run's earliest surviving attempt, which the run's skipped-prefix rows render before."""
+    return next(
+        (attempt_id for attempt_id, attempt in archive.items() if attempt["workflowRunId"] == workflow_run_id),
+        None,
+    )
+
+
+def upsert_narrative_block_attempt(
+    archive: dict[str, NarrativeBlockAttempt],
+    *,
+    workflow_run_block_id: str,
+    workflow_run_id: str | None,
+    label: str,
+    block_type: str,
+    status: str,
+    iteration: int,
+    started_at: str | None,
+    ended_at: str | None,
+) -> NarrativeBlockAttempt:
+    attempt = archive.get(workflow_run_block_id)
+    if attempt is None:
+        attempt = {
+            "workflowRunBlockId": workflow_run_block_id,
+            "workflowRunId": workflow_run_id,
+            "label": label,
+            "blockType": block_type,
+            "rawStatus": status,
+            "lastSeenIteration": iteration,
+            "startedAt": started_at,
+            "endedAt": ended_at,
+        }
+        archive[workflow_run_block_id] = attempt
+        while len(archive) > MAX_NARRATIVE_BLOCK_ATTEMPTS:
+            del archive[next(iter(archive))]
+        return attempt
+
+    attempt["workflowRunId"] = workflow_run_id or attempt["workflowRunId"]
+    attempt["label"] = label or attempt["label"]
+    attempt["blockType"] = block_type or attempt["blockType"]
+    attempt["rawStatus"] = status
+    attempt["lastSeenIteration"] = iteration
+    if attempt["startedAt"] is None and started_at is not None:
+        attempt["startedAt"] = started_at
+    attempt["endedAt"] = None if status == "running" else ended_at or attempt["endedAt"]
+    return attempt
 
 
 class NarrativeConnectedAccountChoice(TypedDict):
@@ -107,6 +249,11 @@ class NarrativeConnectedAccountChoice(TypedDict):
     email_address: str | None
 
 
+class NarrativeOutputFile(TypedDict):
+    artifact_id: str
+    filename: str
+
+
 class NarrativeTurnFacts(TypedDict):
     factsAvailable: bool
     evaluationState: str | None
@@ -114,13 +261,64 @@ class NarrativeTurnFacts(TypedDict):
     runCompleted: bool | None
     terminalCause: str | None
     blocksRunThisTurn: int | None
+    # The failed run's own recorded reason, secret-scrubbed at source. Carried as evidence so a
+    # terminal that ships no model reply still shows why the run failed, in the run's words.
+    # NotRequired: rows persisted before it was published carry no such key.
+    recordedFailure: NotRequired[str | None]
     authoredBlockCount: NotRequired[int]
     matchingSourceBlockCount: NotRequired[int]
     # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
     ranCleanOnCurrentSource: bool
+    editedBlockLabels: NotRequired[list[str]]
+
+
+class HistoricalNarrativeTurnFacts(TypedDict, total=False):
+    factsAvailable: bool
+    evaluationState: str | None
+    runId: str | None
+    runCompleted: bool | None
+    terminalCause: str | None
+    blocksRunThisTurn: int | None
+    authoredBlockCount: int
+    matchingSourceBlockCount: int
+    ranCleanOnCurrentSource: bool
+
+
+class HistoricalTurnFactsProjection(TypedDict):
+    scope: Literal["originating_turn"]
+    turnId: NotRequired[str]
+    turnIndex: NotRequired[int]
+    facts: HistoricalNarrativeTurnFacts
+
+
+class NarrativeBudgetExpiry(TypedDict):
+    budgetExpired: Literal[True]
+    source: Literal["deadline", "max_turns"]
+    reportProduced: bool | None
+    stagedDraftId: str | None
+    drainFingerprint: str | None
+    leftRunIds: NotRequired[list[str]]
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
+class NarrativeWorkPlan(TypedDict):
+    toolCallId: str
+    items: list[str]
+
+
+class NarrativeScreenshot(TypedDict):
+    artifactId: str
+    capturedAt: str
+    toolCallId: str | None
+
+
+class CanonicalWorkflowUnavailableFacts(TypedDict):
+    workflow_permanent_id: str
+    candidate_published: NotRequired[Literal[False]]
+    test_started: Literal[False]
+    detail: NotRequired[str]
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -129,17 +327,24 @@ class TurnNarrativePayload(TypedDict):
     proposalDisposition: NotRequired[ProposalDisposition]
     # TurnOutcome.response_kind value: "answer" | "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
-    terminalEnvelope: NotRequired[dict[str, Any]]
-    # {"reason": <credential_prompt_reason() token>}, set when this turn surfaces a credential need.
+    questionInteractions: NotRequired[list[dict[str, Any]]]
+    steerMessages: NotRequired[list[dict[str, Any]]]
+    # {"reason": <token>}, set when this turn surfaces a typed credential need.
     credentialPrompt: NotRequired[dict[str, str]]
-    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ...}, set when a mid-build
-    # credential pause (credential_pause.py) resolved during this turn.
+    # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
+    # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
+    # the tool call whose row was newest when the card was raised.
     credentialPause: NotRequired[dict[str, str]]
+    # Every pick card's credentialPause, oldest first; set only when more than one card settled this turn.
+    credentialPauses: NotRequired[list[dict[str, str]]]
     # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
     # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
     credentialAutoBound: NotRequired[dict[str, str]]
     connectedAccountChoices: NotRequired[list[NarrativeConnectedAccountChoice]]
+    outputFiles: NotRequired[list[NarrativeOutputFile]]
     googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
+    demonstrationOffer: NotRequired[bool]
+    canonicalWorkflowUnavailable: NotRequired[CanonicalWorkflowUnavailableFacts]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -149,26 +354,40 @@ class TurnNarrativePayload(TypedDict):
     narrativeSummary: str | None
     priorBlockCount: int | None
     designActivity: list[NarrativeActivityEntry]
+    # The last plan a successful set_work_plan stored this turn. Kept off designActivity, whose cap
+    # can trim the call's row in a long turn.
+    workPlan: NotRequired[NarrativeWorkPlan]
+    screenshots: NotRequired[list[NarrativeScreenshot]]
     startedAt: str | None
     endedAt: str | None
     review: NotRequired[NarrativeReviewProjection]
     testedBlockFingerprints: NotRequired[dict[str, list[str]]]
+    budgetExpiry: NotRequired[NarrativeBudgetExpiry]
     turnFacts: NotRequired[NarrativeTurnFacts]
+    demonstrationItems: NotRequired[list[str]]
 
 
 if TYPE_CHECKING:
+    from agents.items import ModelResponse
+
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.build_test_outcome import (
         RecordedBuildTestOutcome,
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
+    from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, TurnOutcome
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+        ConnectedAccountChoice,
+        DeliveredOutputFile,
+        TurnOutcome,
+    )
 
 
 class UrlVisit(BaseModel):
@@ -190,6 +409,21 @@ class CredentialCheck(BaseModel):
 
 class ApprovedCredential(BaseModel):
     credential_id: str
+    # Set for a credential-card selection or an answered carried proposal. The approval stays
+    # bound to that origin. Empty for a credential the user named without an origin.
+    admitted_url: str = ""
+
+
+ProposedCredentialOrigin = Literal["live_page_admitted", "executed_credential_fill"]
+
+
+class ProposedCredential(BaseModel):
+    credential_id: str
+    admitted_url: str = ""
+    origin_arm: ProposedCredentialOrigin | None = None
+    # How many later asks this proposal has already survived. The renewal cannot tell an ask about
+    # this credential from an ask about anything else, so the count is what bounds it.
+    carries: int = 0
 
 
 class ObservedPage(BaseModel):
@@ -216,9 +450,6 @@ class ObservedPage(BaseModel):
 _TURN_EPHEMERAL_INTERACTION_FIELDS = frozenset({"input_value", "read_result_value", "selector_match_count"})
 # Held by chats persisted before the record exposed secret-safe input identities.
 _RETIRED_INTERACTION_FIELDS = frozenset({"typed_value"})
-
-
-OUTPUT_OWNER_AMBIGUITY_REASON_CODE = "output_owner_ambiguous"
 
 
 class PageObstructionSelectorCandidate(BaseModel):
@@ -263,7 +494,22 @@ class PageObstruction(BaseModel):
     text: str | None = None
     visual_location: str | None = None
     underlying_page_blocked: bool | None = None
+    intercepts_outside_control: bool | None = None
     visible_controls: list[PageObstructionControl] = Field(default_factory=list)
+    visible_controls_omitted: int | None = None
+
+
+SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP = 2500
+
+
+class SignedOutPageObservation(BaseModel):
+    """One URL as a browser carrying no cookies or storage renders it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    requested_url: str
+    reached_url: str
+    page_summary: dict[str, Any]
 
 
 class CodeAuthoringRepairContext(BaseModel):
@@ -274,9 +520,7 @@ class CodeAuthoringRepairContext(BaseModel):
     available_parameter_keys: list[str] = Field(default_factory=list)
     binding_candidates: list[str] = Field(default_factory=list)
     selector: str | None = None
-    source_url: str | None = None
     refiner_selector: str | None = None
-    selector_alternatives: list[dict[str, str]] = Field(default_factory=list)
     runtime_failure_reason: str | None = None
     runtime_failure_class: str | None = None
     output_dependency_failure_class: str | None = None
@@ -297,18 +541,14 @@ class CodeAuthoringRepairContext(BaseModel):
     observed_after_workflow_run: bool = False
     rendered_value_excerpt: str | None = None
     page_form_summaries: list[str] = Field(default_factory=list)
+    page_value_bindings: list[str] = Field(default_factory=list)
     page_result_summaries: list[str] = Field(default_factory=list)
     page_action_summaries: list[str] = Field(default_factory=list)
     page_challenge_summaries: list[str] = Field(default_factory=list)
     page_obstruction_summaries: list[str] = Field(default_factory=list)
     page_obstructions: list[PageObstruction] = Field(default_factory=list)
     page_obstruction_omission_notices: list[str] = Field(default_factory=list)
-    required_block_structure: str = ""
-    spine_stage_count: int | None = None
-    spine_split_blockers: list[str] = Field(default_factory=list)
-    output_owner_candidate_labels: list[str] = Field(default_factory=list)
-    parameter_binding_directive: AuthoringParameterBindingDirective | None = None
-    repair_instruction: str = "add workflow-input-like names to parameter_keys, or stop referencing them."
+    repair_instruction: str = ""
 
 
 class StructuredContext(BaseModel):
@@ -324,6 +564,9 @@ class StructuredContext(BaseModel):
     # Google connections the user picked from the account card. Separate from approved_credentials
     # because connections never enter resolved_credentials, which is ADR 0002's password-fill plane.
     approved_connections: list[ApprovedCredential] = Field(default_factory=list)
+    # The credential the server itself resolved on a turn that ended by asking the user about it,
+    # rewritten unconditionally at every turn end so it never outlives the turn after the ask.
+    proposed_credential: ProposedCredential | None = None
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
     page_inspection_calls_made: int = 0
@@ -425,12 +668,20 @@ class StructuredContext(BaseModel):
             elif tool == "update_workflow":
                 self.workflow_state = summary
 
+            elif tool == "run_browser_code":
+                self.decisions_made.append(f"{tool}: {summary}")
+                if summary.startswith("Ran browser code") and " at " in summary:
+                    url = summary.rsplit(" at ", 1)[1].strip()
+                    if url and not any(v.url == url for v in self.urls_visited):
+                        self.urls_visited.append(UrlVisit(url=url, summary="browser code"))
+
             elif tool in (
                 "click",
                 "evaluate",
                 "run_blocks_and_collect_debug",
                 "update_and_run_blocks",
                 "edit_block_and_run",
+                "test_workflow_from_blank_browser",
                 "get_run_results",
             ):
                 self.decisions_made.append(f"{tool}: {summary}")
@@ -446,6 +697,7 @@ class StructuredContext(BaseModel):
                 "run_blocks_and_collect_debug",
                 "update_and_run_blocks",
                 "edit_block_and_run",
+                "test_workflow_from_blank_browser",
                 "get_run_results",
             ):
                 preview = output[:300] if len(output) > 300 else output
@@ -635,6 +887,10 @@ def finalize_observation_context(ctx: Any, raw_context: str | None) -> str | Non
 
 
 _MAX_APPROVED_CREDENTIALS = 20
+# Copilot re-asks about the same credential a handful of times before the user answers — the
+# production chat this carry was built for asked four. Past that the conversation has moved on,
+# whatever the turns are shaped like.
+_MAX_PROPOSAL_CARRIES = 5
 
 
 def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_context: str | None) -> str | None:
@@ -657,21 +913,243 @@ def record_approved_credentials_in_global_llm_context(ctx: CopilotContext, raw_c
         sc.approved_connections.append(ApprovedCredential(credential_id=policy.selected_connected_account_id))
         if len(sc.approved_connections) > _MAX_APPROVED_CREDENTIALS:
             sc.approved_connections = sc.approved_connections[-_MAX_APPROVED_CREDENTIALS:]
-    existing_ids = {record.credential_id for record in sc.approved_credentials}
+    existing_records = {record.credential_id: record for record in sc.approved_credentials}
     for credential in policy.resolved_credentials:
         # A credential the user picked from the card is durable approval even though the resume
         # stamped an origin for it; only page-vouched ids have to be re-earned.
+        # A stamp the carry restored is not page evidence the user has to re-earn: without this a
+        # user who answers by naming the credential gets no durable approval, which is the re-ask
+        # loop this amendment exists to end. A stamp a live page wrote this turn still counts.
+        settled_ids = policy.current_turn_named_credential_ids | policy.origin_recovery_kept_named_credential_ids
+        # Read at turn end, when what the user settled is final: a card pick or a typed name landing
+        # after the citation is still them answering this ask by choosing a different credential.
+        carry_stamp_the_user_answered = (
+            credential.credential_id in policy.seeded_proposal_credential_ids
+            and credential.credential_id in policy.carry_cited_credential_ids
+            and not (settled_ids and credential.credential_id not in settled_ids)
+        )
+        card_selected = credential.credential_id in policy.credential_pause_connected_credential_ids
         stamped_by_page = (
             credential.credential_id in policy.live_page_admitted_urls
-            and credential.credential_id != ctx.credential_pause_connected_credential_id
+            and not card_selected
+            and not carry_stamp_the_user_answered
         )
-        if credential.credential_id in existing_ids or stamped_by_page:
+        if (
+            credential.credential_id in policy.persisted_workflow_credential_ids
+            and credential.credential_id not in settled_ids
+            and not card_selected
+            and not carry_stamp_the_user_answered
+        ):
+            # A saved binding grants authority through that workflow, not an independent chat
+            # approval that would outlive removal of the binding.
             continue
-        sc.approved_credentials.append(ApprovedCredential(credential_id=credential.credential_id))
-        existing_ids.add(credential.credential_id)
+        source_url = policy.live_page_admitted_urls.get(credential.credential_id, "")
+        if source_url and (card_selected or carry_stamp_the_user_answered) and canonicalize_origin(source_url) is None:
+            continue
+        admitted_url = safe_admitted_url(source_url) if card_selected or carry_stamp_the_user_answered else ""
+        existing_record = existing_records.get(credential.credential_id)
+        if existing_record is not None:
+            # A new explicit card answer can bind a prior name-only approval, or select a new
+            # login origin. Page observations alone never rewrite durable user approval.
+            if card_selected and admitted_url:
+                existing_record.admitted_url = admitted_url
+            continue
+        if stamped_by_page:
+            continue
+        # An approval minted from a carry keeps the origin that vouched for the credential. Without
+        # it the id is resolved on every later turn with nothing pinning it, and the fill seam's
+        # user-provided-site route then reaches any site named anywhere in the conversation.
+        sc.approved_credentials.append(
+            ApprovedCredential(
+                credential_id=credential.credential_id,
+                admitted_url=admitted_url,
+            )
+        )
+        existing_records[credential.credential_id] = sc.approved_credentials[-1]
     if len(sc.approved_credentials) > _MAX_APPROVED_CREDENTIALS:
         sc.approved_credentials = sc.approved_credentials[-_MAX_APPROVED_CREDENTIALS:]
     return sc.to_json_str()
+
+
+def _live_page_admitted_proposal(policy: RequestPolicy) -> ProposedCredential | None:
+    """The credential a login page admitted on this turn, when it admitted exactly one.
+
+    An id the carry itself seeded is not evidence: hydration restores the same two fields a fresh
+    admission writes, so counting it here would re-mint the carry from its own state every turn.
+    """
+    # Count only what a page admitted this turn. Hydration appends the carry to the same list, so
+    # counting it would bail whenever a page freshly admits a second credential — dropping the new
+    # one and renewing the stale carry, on the turn copilot found a different login.
+    admitted_this_turn = [
+        credential
+        for credential in policy.auto_bound_credentials
+        if credential.credential_id not in policy.seeded_proposal_credential_ids
+    ]
+    if len(admitted_this_turn) != 1:
+        return None
+    credential_id = admitted_this_turn[0].credential_id
+    admitted_url = policy.live_page_admitted_urls.get(credential_id) or ""
+    if not admitted_url:
+        return None
+    return ProposedCredential(
+        credential_id=credential_id,
+        admitted_url=safe_admitted_url(admitted_url),
+        origin_arm="live_page_admitted",
+    )
+
+
+def _carried_proposal_still_unanswered(policy: RequestPolicy, sc: StructuredContext) -> ProposedCredential | None:
+    """The carry from an earlier turn, kept while the ask it was recorded for is still outstanding.
+
+    Copilot asks about the same credential across several turns before the user answers, so a carry
+    that died on the first re-ask would restore the loop this exists to end. The carry retires the
+    moment the answer lands: an answered proposal is durable approval, and a turn that settles a
+    different credential is the user declining this one. A turn that does not end by asking clears
+    it, since the recorder only reaches here on an ask.
+    """
+    seed = sc.proposed_credential
+    if seed is None or seed.credential_id not in policy.seeded_proposal_credential_ids:
+        return None
+    return seed
+
+
+def _executed_credential_fill_proposal(ctx: CopilotContext) -> ProposedCredential | None:
+    """The credential the server itself filled this turn, when the turn ran exactly one such fill.
+
+    Read from this turn's own trajectory, never the persisted record: ``_merge_carried_trajectory``
+    keeps earlier turns' entries verbatim and unmarked, so a filter over the merged list would match
+    every historical fill and re-derive the carry forever. ``credentials_checked`` is not a source
+    either — a vault lookup by name has no page behind it, so it leaves no origin to restore.
+    """
+    raw_trajectory = getattr(ctx, "scout_trajectory", None)
+    trajectory = raw_trajectory if isinstance(raw_trajectory, Sequence) else ()
+    fills = [
+        entry
+        for entry in trajectory
+        if isinstance(entry, Mapping)
+        and entry.get("carried") is not True
+        and entry.get("tool_name") == CREDENTIAL_FILL_TOOL_NAME
+        and isinstance(entry.get("credential_id"), str)
+        and entry.get("credential_id")
+        and isinstance(entry.get("executed_selector"), str)
+        and entry.get("executed_selector")
+        and isinstance(entry.get("source_url"), str)
+        and entry.get("source_url")
+    ]
+    if len({str(entry["credential_id"]) for entry in fills}) != 1:
+        return None
+    return ProposedCredential(
+        credential_id=str(fills[-1]["credential_id"]),
+        admitted_url=safe_admitted_url(str(fills[-1]["source_url"])),
+        origin_arm="executed_credential_fill",
+    )
+
+
+def _proposal_that_survives_this_turn(
+    proposed: ProposedCredential, policy: RequestPolicy, sc: StructuredContext
+) -> ProposedCredential | None:
+    """Apply the retirement rules to whichever arm produced the proposal.
+
+    Held here rather than in the arms because each arm otherwise enforces its own subset: a turn that
+    ran a fill would mint a fresh record every time, resetting the count and outliving both the
+    answer and a different credential the user settled — the login-retry loop the fill arm exists for
+    is exactly where that ran forever.
+    """
+    if proposed.credential_id in policy.carry_cited_credential_ids:
+        return None
+    settled_ids = policy.current_turn_named_credential_ids
+    if settled_ids and proposed.credential_id not in settled_ids:
+        return None
+    prior = sc.proposed_credential
+    # Fresh evidence for a credential the user still has not answered for is the same unanswered ask,
+    # so the count follows the credential rather than the arm that produced this turn's record.
+    carries = prior.carries + 1 if prior is not None and prior.credential_id == proposed.credential_id else 0
+    if carries >= _MAX_PROPOSAL_CARRIES:
+        return None
+    return proposed.model_copy(update={"carries": carries})
+
+
+def record_proposed_credential_in_global_llm_context(
+    ctx: CopilotContext, raw_context: str | None, response_type: str
+) -> str | None:
+    """Carry the credential the server itself bound or filled, when the turn ends by asking the user,
+    so the next turn can verify a model citation against it. The write is unconditional in both
+    directions, so any turn reaching here expires an older record.
+    """
+    policy = ctx.request_policy
+    sc = StructuredContext.from_json_str(raw_context)
+    proposed: ProposedCredential | None = None
+    if policy is not None and response_type == "ASK_QUESTION":
+        proposed = (
+            _live_page_admitted_proposal(policy)
+            or _executed_credential_fill_proposal(ctx)
+            or _carried_proposal_still_unanswered(policy, sc)
+        )
+        if proposed is not None:
+            proposed = _proposal_that_survives_this_turn(proposed, policy, sc)
+        # The card settles its own id within the turn, so a card answer never needs the carry — and
+        # a card answer naming a different credential retires the proposal it replaced.
+        if proposed is not None and ctx.credential_pause_connected_credential_id is not None:
+            proposed = None
+    if proposed is None:
+        return clear_proposed_credential(raw_context)
+    LOG.info(
+        "copilot_credential_proposal_recorded",
+        credential_id=proposed.credential_id,
+        origin_arm=proposed.origin_arm,
+        admitted_url=loggable_origin(proposed.admitted_url),
+    )
+    if sc.proposed_credential == proposed:
+        return raw_context
+    sc.proposed_credential = proposed
+    return sc.to_json_str()
+
+
+def clear_proposed_credential(raw_context: str | None) -> str | None:
+    """Drop the one-turn credential proposal from a context a turn is about to persist. Every path
+    that persists without running the recorder above must call this, or the proposal outlives its
+    turn and re-grants fill authority later.
+    """
+    if raw_context is None:
+        return raw_context
+    sc = StructuredContext.from_json_str(raw_context)
+    if sc.proposed_credential is None:
+        return raw_context
+    sc.proposed_credential = None
+    return sc.to_json_str()
+
+
+# Turn-end writers: adopt_model_authored_context restores the first group, merge_turn_summary adds to the third.
+# finalize_observation_context recomputes only page_inspection_calls_made and builds the rest on what it was given.
+TRUSTED_CONTEXT_FIELDS = ("approved_credentials", "approved_connections", "proposed_credential", "carried_trajectory")
+OBSERVED_CONTEXT_FIELDS = ("entrypoint_url", "page_inspection_calls_made", "observed_acted_pages", "carried_trajectory")
+TOOL_ACTIVITY_CONTEXT_FIELDS = (
+    "urls_visited",
+    "fields_filled",
+    "credentials_checked",
+    "decisions_made",
+    "workflow_state",
+)
+_CONTEXT_FIELD_NOTES = {
+    "urls_visited": "append, don't repeat",
+    "decisions_made": "concise",
+    "workflow_state": "what blocks exist now",
+}
+
+
+def _context_field_phrases(names: Iterable[str]) -> list[str]:
+    return [f"{name} ({_CONTEXT_FIELD_NOTES[name]})" if name in _CONTEXT_FIELD_NOTES else name for name in names]
+
+
+def model_written_context_fields() -> str:
+    server_written = {*TRUSTED_CONTEXT_FIELDS, *OBSERVED_CONTEXT_FIELDS, *TOOL_ACTIVITY_CONTEXT_FIELDS}
+    return join_phrases(
+        _context_field_phrases(name for name in StructuredContext.model_fields if name not in server_written), "and"
+    )
+
+
+def tool_recorded_context_fields() -> str:
+    return join_phrases(_context_field_phrases(TOOL_ACTIVITY_CONTEXT_FIELDS), "and", serial_comma=False)
 
 
 def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> StructuredContext:
@@ -694,13 +1172,20 @@ def adopt_model_authored_context(trusted_raw: str | None, model_raw: object) -> 
     if isinstance(model_raw, dict):
         try:
             structured = StructuredContext.model_validate(model_raw)
-        except Exception:
+        except Exception as exc:
+            # The whole update is dropped, user_goal included, so a silent hit here hides lost model context.
+            LOG.warning(
+                "structured_context_model_update_rejected",
+                error_type=type(exc).__name__,
+                rejected_fields=sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+                if isinstance(exc, ValidationError)
+                else [],
+            )
             structured = trusted
     elif isinstance(model_raw, str):
         structured = StructuredContext.from_json_str(model_raw)
-    structured.approved_credentials = list(trusted.approved_credentials)
-    structured.approved_connections = list(trusted.approved_connections)
-    structured.carried_trajectory = [dict(entry) for entry in trusted.carried_trajectory]
+    for field_name in TRUSTED_CONTEXT_FIELDS:
+        setattr(structured, field_name, deepcopy(getattr(trusted, field_name)))
     return structured
 
 
@@ -711,9 +1196,13 @@ class AgentResult:
     global_llm_context: str | None
     response_type: ResponseType = "REPLY"
     workflow_yaml: str | None = None
+    private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
     workflow_was_persisted: bool = False
     # Route nulls any persisted proposed_workflow when this is set.
     clear_proposed_workflow: bool = False
+    # Set when request policy barred this turn from authoring; the route's own
+    # proposal-clearing branches must not retire a draft such a turn never saw.
+    authoring_barred: bool = False
     # Actual API token usage accumulated across the agent run. None when no
     # provider reported usage on the stream — distinguishes "no data" from
     # "0 tokens" so eval cost grading can flag missing telemetry instead of
@@ -731,6 +1220,8 @@ class AgentResult:
     # AgentResult, never the context that recorded them. None when unknown.
     cancellation_iteration: int | None = None
     cancellation_last_recorded_phase: str | None = None
+    cancellation_workflow_run_id: str | None = None
+    cancellation_stopped_facts: StoppedTurnFacts | None = None
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
@@ -739,15 +1230,18 @@ class AgentResult:
     narrative_summary: str | None = None
     # Persisted on the assistant chat message so the bubble survives a reload.
     narrative_payload: TurnNarrativePayload | None = None
-    # Shadow-only typed terminal-state envelope persisted and streamed on terminal frames.
-    terminal_envelope: dict[str, Any] | None = None
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    proposal_owner_turn_id: str | None = None
+    proposal_revision: int | None = None
+    # The turn took over another turn's stored candidate and authored nothing since, so it has no turn-end write.
+    proposal_adopted: bool = False
+    proposal_workflow_run_id: str | None = None
     code_artifact_metadata: dict[str, dict[str, Any]] | None = None
     executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
-    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
-    # settings changes); terminal handlers roll back on non-auto-accept.
+    # Legacy marker for turns that wrote canonical before snapshot isolation.
+    # Terminal handlers retain rollback support for those persisted turns.
     canonical_was_persisted_due_to_param_change: bool = False
     # Exact model-owned contract deletion must survive to the auto-accept write; ordinary saves
     # still preserve a stored contract when their rebuilt definition omits this Copilot field.
@@ -757,6 +1251,9 @@ class AgentResult:
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     # Internal eval-only metadata. The normal response schema never serializes this field.
     browser_ablation_metadata: BrowserAblationMetadata | None = None
+    # None when the turn never reached the agent loop, so a terminal frame built without a
+    # context leaves the client's rendered plan untouched instead of clearing it.
+    work_plan: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -765,6 +1262,9 @@ class InFlightStreamToolCall:
     tool_name: str
     iteration: int
     display_label: str | None = None
+    reason: str | None = None
+    started_at: datetime | None = None
+    activity_bucket: ActivityBucket | None = None
 
 
 @dataclass
@@ -786,9 +1286,13 @@ class CopilotContext(AgentContext):
     """
 
     workflow_copilot_chat_id: str | None = None
+    copilot_cancel_token: str | None = None
+    handled_steer_ids: set[str] = field(default_factory=set)
+    copilot_question_pause_seconds: float = 0.0
+    human_input_wait: HumanInputWait = field(default_factory=HumanInputWait)
     eval_capture_case_id: str | None = None
-    eval_mode: CopilotEvalMode | None = None
     eval_prompt_sha256: str | None = None
+    tool_surface_identity: CopilotToolSurfaceIdentity | None = None
     eval_tool_surface_sha256: str | None = None
     eval_native_tool_names: tuple[str, ...] = ()
     eval_mcp_tool_names: tuple[str, ...] = ()
@@ -803,7 +1307,13 @@ class CopilotContext(AgentContext):
     copilot_total_timeout_exceeded: bool = False
     copilot_turn_cancelled_iteration: int | None = None
     copilot_max_turns_exceeded: bool = False
+    empty_completion: bool = False
+    budget_expiry_state: BudgetExpiryState = field(default_factory=BudgetExpiryState)
+    check_model_work_deadline: Callable[[], None] | None = field(default=None, repr=False)
     model_calls_this_turn: int = 0
+    # The latest model response this turn, or None while a model call is in flight.
+    last_model_response: ModelResponse | None = field(default=None, repr=False)
+    tool_calls_this_turn: int = 0
     enforcement_pass_count: int = 0
     pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
     user_message: str = ""
@@ -811,9 +1321,10 @@ class CopilotContext(AgentContext):
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     copilot_config: CopilotConfig | None = None
-    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.TASK_V3_PURE
     target_block_label: str | None = None
     selected_block_label: str | None = None
+    doc_editor_enabled: bool = False
     turn_context_packet: TurnContextPacket | None = None
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged Google
@@ -827,25 +1338,44 @@ class CopilotContext(AgentContext):
     # is set from the chat request at construction; the rest are owned by maybe_credential_pause.
     last_run_skipped_unbound_credentials: bool = False
     client_supports_credential_pause: bool = False
-    credential_pause_used: bool = False
-    # True only while a card is on screen. credential_pause_used stays true for the rest of the
-    # turn once one has been raised, which cannot tell a concurrent sibling ask from a later one.
-    credential_ask_in_flight: bool = False
-    # A tool ask the user did not answer with a credential spends the one-card budget on a guess.
-    # A run that then hits a real login wall has evidence the guess did not, so it gets the budget
-    # back once.
-    credential_pause_reaskable_by_run: bool = False
+    client_supports_credential_pause_recovery: bool = False
+    client_supports_credential_generation: bool = False
+    credential_recovery_token_digest: str | None = field(default=None, repr=False)
+    credential_recovery_armed: bool = False
+    # One update card (add an authenticator, or replace values a site refused) may follow an answered
+    # card per turn: it asks to fix the credential the user already chose, not to choose again.
+    credential_totp_update_asked: bool = False
     copilot_credential_pause_seconds: float = 0.0
     credential_pause_outcome: str | None = None
+    credential_registration_outcome: Literal["rejected", "unknown"] | None = None
+    # Generate and save created, or may have created, a credential; a second generate card could mint a duplicate.
+    credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
+    credential_pause_anchor_tool_call_id: str | None = None
+    credential_pause_receipts: list[dict[str, str]] = field(default_factory=list)
+    demonstration_requested: bool = False
+    demonstration_ran: bool = False
+    demonstration_id: str | None = None
+    demonstration_insertion: dict[str, str | None] | None = None
+    demonstration_items: list[str] = field(default_factory=list)
+    demonstration_offered: bool = False
     # Set while a ``request_credential`` ask is open, so tool calls issued alongside it in the same
     # model response wait for the user's answer instead of racing it.
     credential_pause_settled: asyncio.Event | None = None
     # Preserve the immutable turn-open document because ``workflow_yaml`` is
     # reassigned after every accepted update in the same agent turn.
-    google_connection_turn_start_workflow_yaml: str | None = field(init=False, default=None)
+    turn_start_workflow_yaml: str | None = field(init=False, default=None)
+    # Set once background naming renames the placeholder, so a title the model mints afterwards on
+    # this turn is recognised as a mint rather than a rename.
+    agent_named_title: str | None = field(init=False, default=None)
+    # The saved row's title as the turn opened. Independent of the saved YAML, which a workflow with
+    # no blocks does not have, and of the submitted canvas, which can carry an unsaved rename.
+    opening_workflow_title: str | None = None
     google_connection_turn_start_bindings: tuple[GoogleSheetConnectionBinding, ...] | None = None
     google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    # Kept apart from google_connection_notices, which each workflow save recomputes wholesale.
+    google_setup_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    canonical_workflow_unavailable: CanonicalWorkflowUnavailableFacts | None = None
 
     # Tool tracking
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -853,6 +1383,9 @@ class CopilotContext(AgentContext):
     # the satisfying tool's tool_output event flushes; these carry what the
     # exit path needs to emit the missing TOOL_RESULT frame.
     in_flight_stream_tool_call: InFlightStreamToolCall | None = None
+    stream_tool_calls: dict[str, InFlightStreamToolCall] = field(default_factory=dict)
+    pending_stream_tool_call_ids: set[str] = field(default_factory=set)
+    goal_satisfied_tool_call_id: str | None = None
     goal_satisfied_tool_name: str | None = None
     goal_satisfied_tool_output: dict[str, Any] | None = None
     # Stashed by the write seam under the id of the tool call that produced it, and drained by
@@ -873,9 +1406,15 @@ class CopilotContext(AgentContext):
     resolved_model: str | None = None
 
     # Workflow state
+    authored_private_workflow_settings: dict[str, Any] | None = field(default=None, repr=False)
     persisted_workflow_yaml: str | None = None
-    last_workflow: Workflow | None = None
+    # The saved row; persisted_workflow_yaml is None when it has no blocks, so its canvas comes from here.
+    saved_workflow: Workflow | None = field(default=None, repr=False)
+    private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
+    last_workflow: Workflow | None = field(default=None, repr=False)
     last_workflow_yaml: str | None = None
+    # Copies of the saved workflow a full test loaded this turn; matched by identity, never offered as a proposal.
+    saved_workflows_under_test: list[Workflow] = field(default_factory=list)
     # Always False under staging; ``has_staged_proposal`` carries the signal.
     workflow_persisted: bool = False
     last_update_block_count: int | None = None
@@ -884,7 +1423,6 @@ class CopilotContext(AgentContext):
     last_artifact_health_blocker_reason: str | None = None
     last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
     last_artifact_health_failure_classes: list[str] = field(default_factory=list)
-    code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
     last_failed_workflow_yaml: str | None = None
     code_native_pending_capability: str | None = None
@@ -903,17 +1441,34 @@ class CopilotContext(AgentContext):
     # after a watchdog reconciliation read has cleared the retry guard.
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
+    # Runs this turn actually dispatched. ``last_run_blocks_workflow_run_id`` cannot answer that:
+    # a repair turn is seeded with the run it was opened about, which this turn never dispatched.
+    dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
+    # Keyed by run id and drained by that run's own tool result, so a parallel sibling never shows these.
+    pending_test_inputs: dict[str, list[CopilotTestInput]] = field(default_factory=dict)
+    # Redacted, display-clamped labels of blocks this turn's writes changed, in first-write order.
+    edited_block_labels_this_turn: list[str] = field(default_factory=list)
+    # Counts every recorded block edit, repeats included, so a run can tell whether an edit followed it.
+    block_edits_recorded_this_turn: int = 0
+    block_edits_recorded_at_dispatch: dict[str, int] = field(default_factory=dict)
+    # Whether the latest recorded run-tool result created a run row; None until one is recorded.
+    last_test_run_started: bool | None = None
+    # The files the last recorded worker run published, keyed by that run's id.
+    delivered_output_files: tuple[str, list[DeliveredOutputFile]] | None = None
+    # Producers a dispatched run was seeded with and never ran; their values belong to another run.
+    seeded_only_labels_by_run_id: dict[str, frozenset[str]] = field(default_factory=dict)
+    skipped_prefix_by_run_id: dict[str, list[SkippedPrefixBlock]] = field(default_factory=dict)
     # The browser session the last run actually executed in. On the fresh-session replay path this
     # is not ctx.browser_session_id, which stays pointed at the debug/scout browser.
     last_run_blocks_browser_session_id: str | None = None
+    # Why the chat's last recorded run could not be bound, when it could not. Distinct from having
+    # no run at all, which the target resolver states itself.
+    last_run_binding_unavailable_reason: str | None = None
     # In-turn run-outcome trace derived from assignments to ``last_run_outcome``
     # (the same source that powers run_outcome SSE frames). Append-only across
     # per-run pointer resets (``last_run_outcome = None``) and workflow edits.
-    terminal_envelope_run_outcomes: list[RecordedRunOutcome] = field(default_factory=list)
-    # Consecutive failed runs where navigation completed but the scraper
-    # could not read the page (generic "failed to load the website" template).
-    # Resets on any non-matching run outcome. Streak crosses workflow-shape
-    effective_workflow_proxy_location: Any | None = None
+    run_outcome_trace: list[RecordedRunOutcome] = field(default_factory=list)
+    effective_workflow_proxy_location: ProxyLocationInput = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -933,14 +1488,13 @@ class CopilotContext(AgentContext):
     last_frontier_start_label: str | None = None
     pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
     last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
+    signed_out_page_observations: list[SignedOutPageObservation] = field(default_factory=list)
+    signed_out_page_observation_attempts: list[str] = field(default_factory=list)
     latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
     recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
     recorded_persisted_block_run_workflow_run_id: str | None = None
-    # Set by _record_run_blocks_result when the most recent failed run matches
-    # SKIP_INNER_NAV_RETRY_ERRORS (DNS / cert / SSL / invalid URL). Drives the
-    # one-shot non-retriable-nav stop nudge and the deterministic exit-path
-    # exception in run_with_enforcement. Cleared at the top of every call to
-    # _record_run_blocks_result so stale state can't leak across runs.
+    # Set by _record_run_blocks_result when the last failed run blames the target (DNS / cert / SSL / invalid URL),
+    # never Skyvern's own proxy hop; cleared at the top of every call so stale state can't leak across runs.
     last_test_non_retriable_nav_error: str | None = None
     # Secure-runner codes from the latest run that were faults of the sandbox itself, joined.
     # Cleared per run in _record_run_blocks_result, so a later clean run releases the guard.
@@ -954,6 +1508,7 @@ class CopilotContext(AgentContext):
 
     last_good_workflow: Workflow | None = None
     last_good_workflow_yaml: str | None = None
+    last_good_private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
 
     # Populated lazily by ``stream_to_sse`` and reused across enforcement
     # iterations so cadence/last-emitted-at survive ``run_with_enforcement``
@@ -969,8 +1524,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_failure_reason: str | None = None
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
-    # The discovery tool reaches the connected FastMCP client through this.
-    discovery_mcp_server: Any | None = None
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
 
     # default_factory is the safety net — Python dataclass inheritance
     # disallows non-default fields after default ones, and the parent
@@ -984,23 +1538,43 @@ class CopilotContext(AgentContext):
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    # Fields by label that a write this turn kept from the saved workflow because the submitted YAML omitted them.
+    # Label -> field -> the text Copilot left out and the save kept, from the previous draft or the saved row.
+    kept_note_labels: dict[str, dict[str, str]] = field(default_factory=dict)
+    # The pending proposal when only a canvas edit kept it from being restored this turn.
+    canvas_rejected_proposal_yaml: str | None = None
+    # Blocks whose notes in that proposal differ from the saved notes this turn reads.
+    unrestored_proposal_note_labels: list[str] = field(default_factory=list)
+    # A single in-process writer at a time; the row-level CAS below this lock is the
+    # cross-process fence. The token is replaced only after a durable publication.
+    proposal_mutation_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # Held from reading the stored draft through publishing the edit, so tool calls sent in one model
+    # response compose in order. Separate from proposal_mutation_lock, which the publish takes inside it.
+    block_edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    proposal_owner_turn_id: str | None = None
+    proposal_revision: int | None = None
+    # A token this turn adopted but did not author never authorizes a turn-end write.
+    proposal_adopted: bool = False
+    proposal_adoptions: int = 0
+    # Adoptions the latest model response had seen; its tool calls were written before any later one.
+    proposal_adoptions_seen_by_model: int = 0
+    proposal_canonical_fingerprint: str | None = None
+    proposal_workflow_run_id: str | None = None
+    # A restored candidate whose request private settings differ from its own; its stored bytes cannot vouch
+    # for what a test under this token would run, so binding a run to it is refused.
+    settings_diverged_proposal_token: tuple[str, int] | None = None
     # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
     # staged draft at turn end. None on entrypoints that load no chat row.
     auto_accept: bool | None = None
     # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
     prior_copilot_workflow_yaml: str | None = None
-    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
-    # settings changes); terminal handlers roll back on non-auto-accept.
+    # Legacy marker for turns that wrote canonical before snapshot isolation.
+    # Terminal handlers retain rollback support for those persisted turns.
     canonical_was_persisted_due_to_param_change: bool = False
     clear_persisted_completion_contract: bool = False
     completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     prior_block_count: int | None = None
-    block_state_map: dict[str, str] = field(default_factory=dict)
-    block_started_at_map: dict[str, str] = field(default_factory=dict)
-    block_ended_at_map: dict[str, str] = field(default_factory=dict)
-    # Keyed by label, so a label that ran more than once in a turn keeps only its
-    # last run's identity.
-    block_run_identity_map: dict[str, BlockRunIdentity] = field(default_factory=dict)
+    narrative_block_attempts: dict[str, NarrativeBlockAttempt] = field(default_factory=dict)
     turn_started_at: str | None = None
     turn_ended_at: str | None = None
 
@@ -1010,10 +1584,10 @@ class CopilotContext(AgentContext):
             parent_post_init()
         from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 
-        self.google_connection_turn_start_workflow_yaml = self.workflow_yaml
+        self.turn_start_workflow_yaml = self.workflow_yaml
 
         if isinstance(self.last_run_outcome, RecordedRunOutcome):
-            super().__setattr__("terminal_envelope_run_outcomes", [self.last_run_outcome])
+            super().__setattr__("run_outcome_trace", [self.last_run_outcome])
 
     def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
@@ -1026,11 +1600,11 @@ class CopilotContext(AgentContext):
             # archive reset. The trace retains the full in-order run record;
             # terminal projection deliberately anchors to its latest run.
             return
-        outcomes = getattr(self, "terminal_envelope_run_outcomes", None)
+        outcomes = getattr(self, "run_outcome_trace", None)
         if isinstance(outcomes, list):
             outcomes.append(value)
         else:
-            super().__setattr__("terminal_envelope_run_outcomes", [value])
+            super().__setattr__("run_outcome_trace", [value])
 
     def has_genuine_workflow_attempt(self) -> bool:
         """This turn persisted a workflow proposal or executed a real build-test run; excludes
@@ -1042,13 +1616,27 @@ class CopilotContext(AgentContext):
             return True
         if self.last_test_ok is not None:
             return True
-        for run_id in (
-            self.last_run_blocks_workflow_run_id,
-            self.last_successful_run_blocks_workflow_run_id,
-        ):
-            if run_id is not None and run_id.strip():
-                return True
-        return False
+        # Runs this turn dispatched, not ``last_run_blocks_workflow_run_id``: that one can hold a
+        # run inherited from an earlier turn, which is not an attempt by this one.
+        return bool(self.dispatched_run_ids_this_turn)
+
+    def record_edited_block_label(self, label: str) -> None:
+        if not label:
+            return
+        self.block_edits_recorded_this_turn += 1
+        if label not in self.edited_block_labels_this_turn:
+            self.edited_block_labels_this_turn.append(label)
+
+    def record_dispatched_run(self, workflow_run_id: str) -> None:
+        self.dispatched_run_ids_this_turn.add(workflow_run_id)
+        self.block_edits_recorded_at_dispatch.setdefault(workflow_run_id, self.block_edits_recorded_this_turn)
+
+    def edited_after_dispatch(self, workflow_run_id: str) -> bool:
+        # A run whose dispatch was never recorded is treated as preceding every edit, so it never vouches for one.
+        return self.block_edits_recorded_this_turn > self.block_edits_recorded_at_dispatch.get(workflow_run_id, 0)
+
+    def google_connection_notice_payloads(self) -> list[GoogleConnectionNoticePayload]:
+        return [notice.to_payload() for notice in (*self.google_setup_notices, *self.google_connection_notices)]
 
     def genuine_attempt_parity_fields(self) -> dict[str, bool | int | str | None]:
         return {
@@ -1059,5 +1647,24 @@ class CopilotContext(AgentContext):
             "last_test_ok": self.last_test_ok,
             "last_run_blocks_workflow_run_id": self.last_run_blocks_workflow_run_id,
             "last_successful_run_blocks_workflow_run_id": self.last_successful_run_blocks_workflow_run_id,
+            "dispatched_run_count_this_turn": len(self.dispatched_run_ids_this_turn),
             "ctx_last_workflow_present": self.last_workflow is not None,
         }
+
+
+def advertises(ctx: CopilotContext | None, tool_name: str) -> bool:
+    # A context that never resolved a tool surface advertises nothing.
+    return ctx is not None and (tool_name in ctx.eval_native_tool_names or tool_name in ctx.eval_mcp_tool_names)
+
+
+def copilot_sees_notes(ctx: AgentContext | None) -> bool:
+    """Notes and step descriptions reach the Copilot model only with the Doc editor on; they stay saved either way."""
+    return isinstance(ctx, CopilotContext) and ctx.doc_editor_enabled
+
+
+def record_kept_note_texts(ctx: CopilotContext, kept_fields: Mapping[str, Sequence[str]], stored_yaml: str) -> None:
+    texts = block_field_texts(stored_yaml)
+    for label, fields in kept_fields.items():
+        for key in fields:
+            if text := texts.get(label, {}).get(key):
+                ctx.kept_note_labels.setdefault(label, {})[key] = text

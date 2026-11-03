@@ -8,6 +8,11 @@ from pydantic import BaseModel
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.action_types import ActionType
 
+# `steps.created_by` of a Task V3 turn step: one row per loop turn, beside the block's own order-0 step. Turn
+# steps are observability only -- the order-0 step stays the block's billing unit and workflow step-budget unit,
+# so the warehouse invoice model and the budget count both skip rows carrying this marker.
+TASK_V3_TURN_STEP_CREATED_BY = "task_v3"
+
 
 class StepStatus(StrEnum):
     created = "created"
@@ -45,14 +50,6 @@ class SpeculativeLLMMetadata(BaseModel):
     llm_response_json: str | None = None
     parsed_response_json: str | None = None
     rendered_response_json: str | None = None
-    llm_key: str | None = None
-    model: str | None = None
-    duration_seconds: float | None = None
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    reasoning_tokens: int | None = None
-    cached_tokens: int | None = None
-    llm_cost: float | None = None
 
 
 class Step(BaseModel):

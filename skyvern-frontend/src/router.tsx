@@ -4,6 +4,7 @@ import {
   DebugRoute,
   EditRoute,
   StudioRoute,
+  WorkflowRunRoute,
 } from "@/routes/workflows/StudioRouteGates";
 import { LegacyWorkflowsRedirect } from "@/routes/workflows/LegacyWorkflowsRedirect";
 import { BrowserSession } from "@/routes/browserSessions/BrowserSession";
@@ -25,15 +26,9 @@ import { TasksPage } from "./routes/tasks/list/TasksPage";
 import { WorkflowPage } from "./routes/workflows/WorkflowPage";
 import { WorkflowScriptDetailPage } from "./routes/workflows/WorkflowScriptDetailPage";
 import { WorkflowScriptsPage } from "./routes/workflows/WorkflowScriptsPage";
-import { WorkflowRun } from "./routes/workflows/WorkflowRun";
 import { WorkflowRunParameters } from "./routes/workflows/WorkflowRunParameters";
 import { Workflows } from "./routes/workflows/Workflows";
 import { WorkflowsPageLayout } from "./routes/workflows/WorkflowsPageLayout";
-import { WorkflowPostRunParameters } from "./routes/workflows/workflowRun/WorkflowPostRunParameters";
-import { WorkflowRunOutput } from "./routes/workflows/workflowRun/WorkflowRunOutput";
-import { WorkflowRunOverview } from "./routes/workflows/workflowRun/WorkflowRunOverview";
-import { WorkflowRunRecording } from "./routes/workflows/workflowRun/WorkflowRunRecording";
-import { WorkflowRunCode } from "@/routes/workflows/workflowRun/WorkflowRunCode";
 import { DebugStoreProvider } from "@/store/DebugStoreContext";
 import { BrowserProfileDetailPage } from "@/routes/browserProfiles/BrowserProfileDetailPage.tsx";
 import { BrowserProfilesPage } from "@/routes/browserProfiles/BrowserProfilesPage.tsx";
@@ -45,6 +40,8 @@ import { RecipesPage } from "@/routes/recipes/RecipesPage";
 import { RunRouter } from "@/routes/runs/RunRouter";
 import { SchedulesRoute } from "@/routes/schedules/SchedulesRoute";
 import { ScheduleDetailRoute } from "@/routes/schedules/ScheduleDetailRoute";
+import { OidcCallback } from "@/routes/auth/OidcCallback";
+import { OrganizationMembers } from "@/routes/settings/OrganizationMembers";
 
 const recipeComingSoonRoutes = [
   {
@@ -100,6 +97,11 @@ const recipeComingSoonRoutes = [
     description:
       "Skyvern's Job Apps Agent allows you to automate job applications with agents",
   },
+  {
+    path: "recipes/seo",
+    title: "SEO",
+    description: "Submit your product to web directories.",
+  },
 ].map(({ path, title, description }) => ({
   path,
   element: <PageLayout />,
@@ -112,6 +114,10 @@ const recipeComingSoonRoutes = [
 }));
 
 const router = createBrowserRouter([
+  {
+    path: "/oidc/callback",
+    element: <OidcCallback />,
+  },
   {
     path: "browser-session/:browserSessionId",
     element: <BrowserSession />,
@@ -285,41 +291,8 @@ const router = createBrowserRouter([
                 ],
               },
               {
-                path: ":workflowRunId",
-                element: <WorkflowRun />,
-                children: [
-                  {
-                    index: true,
-                    element: <Navigate to="overview" />,
-                  },
-                  {
-                    path: "blocks",
-                    element: <Navigate to="overview" />,
-                  },
-                  {
-                    path: "overview",
-                    element: <WorkflowRunOverview />,
-                  },
-                  {
-                    path: "output",
-                    element: <WorkflowRunOutput />,
-                  },
-                  {
-                    path: "parameters",
-                    element: <WorkflowPostRunParameters />,
-                  },
-
-                  {
-                    path: "recording",
-                    element: <WorkflowRunRecording />,
-                  },
-                  {
-                    path: "code",
-                    element: (
-                      <WorkflowRunCode showCacheKeyValueSelector={true} />
-                    ),
-                  },
-                ],
+                path: ":workflowRunId/*",
+                element: <WorkflowRunRoute />,
               },
             ],
           },
@@ -367,6 +340,10 @@ const router = createBrowserRouter([
           {
             path: "labels",
             element: <LabelManagement />,
+          },
+          {
+            path: "members",
+            element: <OrganizationMembers />,
           },
         ],
       },

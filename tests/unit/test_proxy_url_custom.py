@@ -59,12 +59,12 @@ def test_build_browser_args_uses_configured_recording_size(monkeypatch: pytest.M
 async def test_resolve_recording_video_size_is_noop_in_oss() -> None:
     agent_function = AgentFunction()
 
-    assert await agent_function.resolve_recording_video_size(None, distinct_id="wr_1", organization_id="o_1") is None
+    none_result = await agent_function.resolve_recording_video_size(None, distinct_id="wr_1", organization_id="o_1")
+    assert none_result.record_video_size is None and none_result.raw_output_bound is None
     existing = {"width": 1280, "height": 720}
-    assert (
-        await agent_function.resolve_recording_video_size(existing, distinct_id="wr_1", organization_id="o_1")
-        == existing
-    )
+    result = await agent_function.resolve_recording_video_size(existing, distinct_id="wr_1", organization_id="o_1")
+    # OSS no-op: the operator size passes through as both the Playwright size and the raw whole-display bound.
+    assert result.record_video_size == existing and result.raw_output_bound == existing
 
 
 def test_deserialize_proxy_location_custom_url_returns_dict() -> None:

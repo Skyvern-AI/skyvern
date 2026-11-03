@@ -11,12 +11,16 @@ covered by ``test_validation_evidence_router.py``.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from skyvern.constants import DEFAULT_MAX_TOKENS
+from skyvern.forge import agent as agent_module
 from skyvern.forge.agent import ForgeAgent
+from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
@@ -27,6 +31,8 @@ from skyvern.forge.validation_evidence_router import (
     ValidationRouterMode,
     ValidationRouterResult,
 )
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+from skyvern.utils.strings import UNTRUSTED_WEB_PAGE_DATA_BEGIN
 from tests.unit.helpers import make_organization, make_step, make_task
 
 
@@ -46,6 +52,34 @@ def _make_browser_state() -> MagicMock:
     page = AsyncMock()
     bs.get_working_page = AsyncMock(return_value=page)
     return bs
+
+
+def _test_llm_config(model_family: str) -> LLMConfig | LLMRouterConfig:
+    if model_family == "anthropic":
+        return LLMRouterConfig(
+            model_name="test-anthropic-router",
+            required_env_vars=[],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            model_list=[
+                LLMRouterModelConfig(
+                    model_name="anthropic",
+                    litellm_params={"model": "anthropic/claude-sonnet-test"},
+                ),
+                LLMRouterModelConfig(
+                    model_name="bedrock",
+                    litellm_params={"model": "bedrock/us.anthropic.claude-test"},
+                ),
+            ],
+            main_model_group="anthropic",
+            fallback_model_group="bedrock",
+        )
+    return LLMConfig(
+        model_name={"gpt": "openai/gpt-5.5", "gemini": "gemini/gemini-test"}[model_family],
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+    )
 
 
 @pytest.fixture
@@ -74,6 +108,11 @@ def patched_agent(monkeypatch: pytest.MonkeyPatch) -> ForgeAgent:
         "skyvern.forge.agent.get_slim_output_template_value",
         AsyncMock(return_value=False),
     )
+    monkeypatch.setattr(
+        agent_module.app.AGENT_FUNCTION,
+        "get_extra_extract_action_guidance",
+        AsyncMock(return_value=""),
+    )
     return agent
 
 
@@ -94,6 +133,79 @@ def _stub_router_result(
         rationale="stub",
         mode=mode,
     )
+
+
+@pytest.mark.parametrize(
+    ("model_family", "uses_anthropic_cache"),
+    [("anthropic", True), ("gpt", False), ("gemini", False)],
+)
+@pytest.mark.asyncio
+async def test_extract_action_prompt_uses_resolved_anthropic_handler(
+    patched_agent: ForgeAgent,
+    monkeypatch: pytest.MonkeyPatch,
+    model_family: str,
+    uses_anthropic_cache: bool,
+) -> None:
+    llm_key = f"TEST_PROMPT_CACHE_{model_family.upper()}"
+    monkeypatch.setitem(LLMConfigRegistry._configs, llm_key, _test_llm_config(model_family))
+    monkeypatch.setattr(
+        agent_module.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        MagicMock(return_value=SimpleNamespace(llm_key=llm_key)),
+    )
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now), task_type=TaskType.general)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+    context = SkyvernContext(tz_info=None)
+
+    with skyvern_context.scoped(context):
+        result = await patched_agent._build_extract_action_prompt(
+            task,
+            step,
+            _make_browser_state(),
+            _make_scraped_page(),
+        )
+
+    assert (context.cached_static_prompt is not None) is uses_anthropic_cache
+    assert result.use_caching is uses_anthropic_cache
+    if uses_anthropic_cache:
+        assert context.cached_static_prompt is not None and context.cached_task_prompt
+        assert result.prompt.startswith(
+            f"{context.cached_static_prompt.rstrip()}\n\n{context.cached_task_prompt}{UNTRUSTED_WEB_PAGE_DATA_BEGIN}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_split_prompt_above_economy_threshold_uses_full_render(
+    patched_agent: ForgeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    llm_key = "TEST_PROMPT_CACHE_ECONOMY_ANTHROPIC"
+    monkeypatch.setitem(LLMConfigRegistry._configs, llm_key, _test_llm_config("anthropic"))
+    monkeypatch.setattr(
+        agent_module.LLMAPIHandlerFactory,
+        "get_override_llm_api_handler",
+        MagicMock(return_value=SimpleNamespace(llm_key=llm_key)),
+    )
+    monkeypatch.setattr(agent_module, "count_tokens", lambda _: DEFAULT_MAX_TOKENS + 1)
+
+    class _FullPrompt(str):
+        pass
+
+    full_prompt = _FullPrompt()
+    monkeypatch.setattr(agent_module, "load_prompt_with_elements", lambda **_: full_prompt)
+    now = datetime.now(UTC)
+    task = make_task(now, make_organization(now), task_type=TaskType.general)
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    with skyvern_context.scoped(SkyvernContext(tz_info=None)):
+        result = await patched_agent._build_extract_action_prompt(
+            task,
+            step,
+            _make_browser_state(),
+            _make_scraped_page(),
+        )
+
+    assert result.prompt is full_prompt
 
 
 @pytest.mark.asyncio

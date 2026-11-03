@@ -5,6 +5,7 @@ import { parse as parseYAML, stringify as convertToYAML } from "yaml";
 import {
   expandFileToWorkflowYamls,
   extractTitleFromYaml,
+  stripLegacyEngineFromYaml,
   unzipArchive,
 } from "./importWorkflowYaml";
 
@@ -72,6 +73,24 @@ describe("expandFileToWorkflowYamls", () => {
     const bundle = `${convertToYAML(workflowA)}---\ntitle: Broken\nblocks: [1, 2\n`;
 
     expect(() => expandFileToWorkflowYamls(bundle)).toThrow();
+  });
+
+  it("converts JSON strings so the backend's YAML 1.1 parser keeps them strings", () => {
+    const [yaml] = expandFileToWorkflowYamls(
+      JSON.stringify({ title: "on", goal: "1_000" }),
+    );
+    expect(parseYAML(yaml!, { version: "1.1" })).toEqual({
+      title: "on",
+      goal: "1_000",
+    });
+  });
+
+  it("splits a bundle into each document's own text, so every value reaches the backend as written", () => {
+    const first =
+      "# first\ntitle: A\nflag: Y\nn: n\ncount: 1e3\nwhen: 2024-01-01 10:00:00-05:00\n";
+    const second = "---\ntitle: B # kept\nflag: 'on'\n";
+    const expanded = expandFileToWorkflowYamls(first + second);
+    expect(expanded).toEqual([first, second]);
   });
 
   it("returns a single JSON array element as one workflow", () => {
@@ -164,5 +183,157 @@ describe("extractTitleFromYaml", () => {
     expect(extractTitleFromYaml("foo: 1")).toBeNull();
     expect(extractTitleFromYaml("title: ''")).toBeNull();
     expect(extractTitleFromYaml(": : invalid : :")).toBeNull();
+  });
+});
+
+describe("stripLegacyEngineFromYaml", () => {
+  const lines = [
+    "# exported",
+    "title: t",
+    "workflow_definition:",
+    "  parameters:",
+    "    - key: flag",
+    "      default_value: Y",
+    "    - key: other",
+    "      default_value: n",
+    "  blocks:",
+    "    - block_type: navigation",
+    "      label: a",
+    "      engine: skyvern-1.0  # legacy",
+    "      navigation_goal: 1e3",
+    "      complete_criterion: 2001-12-14 21:59:43.10 -05:00",
+    "    - engine: skyvern-1.0",
+    "      block_type: extraction",
+    "      label: b",
+    "    - block_type: for_loop",
+    "      label: c",
+    "      loop_blocks:",
+    "        - block_type: navigation",
+    "          label: d",
+    "          engine: 'skyvern-1.0'",
+    "        - block_type: wait",
+    "          label: e",
+    "          wait_sec: 1",
+    "    - block_type: code",
+    "      label: f",
+    "      code: x",
+    "",
+  ];
+  const legacy = lines.join("\n");
+
+  const withoutLegacy = [...lines];
+  withoutLegacy.splice(22, 1);
+  withoutLegacy.splice(14, 2, "    - block_type: extraction");
+  withoutLegacy.splice(11, 1);
+
+  it("removes only the skyvern-1.0 lines of a legacy export, at any depth, and leaves every other byte", () => {
+    expect(stripLegacyEngineFromYaml(legacy)).toEqual({
+      yaml: withoutLegacy.join("\n"),
+      strippedLegacyEngines: true,
+    });
+  });
+
+  it("keeps a marked skyvern-1.0 pin while stripping the unmarked legacy lines around it", () => {
+    const pinned =
+      "    - block_type: login\n      label: p\n      engine: skyvern-1.0\n      engine_pinned: true\n";
+    expect(stripLegacyEngineFromYaml(legacy + pinned)).toEqual({
+      yaml: withoutLegacy.join("\n") + pinned,
+      strippedLegacyEngines: true,
+    });
+  });
+
+  it("strips a legacy export whose validation block predates its engine key", () => {
+    const bare = "    - block_type: validation\n      label: g\n";
+    expect(stripLegacyEngineFromYaml(legacy + bare)).toEqual({
+      yaml: withoutLegacy.join("\n") + bare,
+      strippedLegacyEngines: true,
+    });
+  });
+
+  it.each(
+    [
+      "task",
+      "navigation",
+      "action",
+      "extraction",
+      "login",
+      "file_download",
+      "validation",
+    ].flatMap((type) => [
+      [type, "null"],
+      [type, "skyvern-3.0"],
+    ]),
+  )(
+    "keeps skyvern-1.0 as a pin beside a %s block with engine %s",
+    (type, engine) => {
+      const yaml = `${legacy}    - block_type: ${type}\n      engine: ${engine}\n`;
+      expect(stripLegacyEngineFromYaml(yaml)).toEqual({
+        yaml,
+        strippedLegacyEngines: false,
+      });
+    },
+  );
+
+  it.each([
+    [
+      "a task block without an engine",
+      legacy.replace("      engine: skyvern-1.0  # legacy\n", ""),
+    ],
+    [
+      "a task block pinned to another engine",
+      legacy.replace("'skyvern-1.0'", "skyvern-3.0"),
+    ],
+    [
+      "a task block with a null engine",
+      legacy.replace("'skyvern-1.0'", "null"),
+    ],
+    ["no engine at all", withoutLegacy.join("\n")],
+    [
+      "only blocks that carry no engine",
+      "workflow_definition:\n  blocks:\n    - block_type: wait\n    - block_type: code\n",
+    ],
+  ])("keeps skyvern-1.0 as a pin in a file with %s", (_, yaml) => {
+    expect(stripLegacyEngineFromYaml(yaml)).toEqual({
+      yaml,
+      strippedLegacyEngines: false,
+    });
+  });
+
+  it("leaves a flow-style block holding skyvern-1.0 unchanged rather than rewrite it", () => {
+    const flow =
+      "workflow_definition:\n  blocks:\n    - {label: a, engine: skyvern-1.0, goal: Y}\n";
+    expect(stripLegacyEngineFromYaml(flow).yaml).toBe(flow);
+  });
+
+  it("leaves a file with merged or aliased blocks unchanged, since their inherited fields are unread", () => {
+    const merged = [
+      "title: t",
+      "defaults: &nav",
+      "  block_type: navigation",
+      "  engine: skyvern-3.0",
+      "workflow_definition:",
+      "  blocks:",
+      "    - <<: *nav",
+      "      label: a",
+      "    - block_type: navigation",
+      "      label: b",
+      "      engine: skyvern-1.0",
+      "",
+    ].join("\n");
+    const aliased = merged.replace(
+      "    - <<: *nav\n      label: a",
+      "    - *nav",
+    );
+    for (const file of [merged, aliased]) {
+      expect(stripLegacyEngineFromYaml(file)).toEqual({
+        yaml: file,
+        strippedLegacyEngines: false,
+      });
+    }
+  });
+
+  it("returns unparseable text unchanged", () => {
+    const bad = "title: [unclosed\n  engine: skyvern-1.0";
+    expect(stripLegacyEngineFromYaml(bad).yaml).toBe(bad);
   });
 });

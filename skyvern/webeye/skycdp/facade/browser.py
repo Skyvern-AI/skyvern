@@ -138,18 +138,24 @@ class BrowserContext:
         session = await self.browser.connection.attach_supplementary(page.session.target.target_id)
         return CdpSessionFacade(self.browser.connection, session=session)
 
+    def _storage_params(self) -> dict[str, Any]:
+        # Without browserContextId the Storage domain acts on the default context, not this one.
+        return {"browserContextId": self.browser_context_id} if self.browser_context_id else {}
+
     async def cookies(self, urls: str | list[str] | None = None) -> list[dict]:
-        params: dict[str, Any] = {}
+        params = self._storage_params()
         if urls:
             params["urls"] = [urls] if isinstance(urls, str) else list(urls)
         result = await self.browser.connection.transport.send("Storage.getCookies", params)
         return result.get("cookies", [])
 
     async def add_cookies(self, cookies: list[dict]) -> None:
-        await self.browser.connection.transport.send("Storage.setCookies", {"cookies": cookies})
+        await self.browser.connection.transport.send(
+            "Storage.setCookies", {**self._storage_params(), "cookies": cookies}
+        )
 
     async def clear_cookies(self) -> None:
-        await self.browser.connection.transport.send("Storage.clearCookies", {})
+        await self.browser.connection.transport.send("Storage.clearCookies", self._storage_params())
 
     async def add_init_script(self, script: str) -> None:
         for page in self.pages:

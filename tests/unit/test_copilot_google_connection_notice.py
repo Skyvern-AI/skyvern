@@ -91,18 +91,22 @@ def test_reports_missing_and_unusable_new_bindings_but_not_active_or_preexisting
         ],
     )
 
-    assert [notice.model_dump() for notice in notices] == [
+    assert [notice.to_payload() for notice in notices] == [
         {
             "provider": "google",
             "connectionId": "goac_missing",
             "displayName": None,
             "condition": "missing",
+            "scopeProfile": "google_sheets",
+            "origin": "workflow",
         },
         {
             "provider": "google",
             "connectionId": "goac_error",
             "displayName": "Needs reconnect",
             "condition": "unusable",
+            "scopeProfile": "google_sheets",
+            "origin": "workflow",
         },
     ]
 
@@ -128,6 +132,57 @@ def test_unresolved_connection_name_left_in_the_slot_is_not_a_connection_binding
     workflow = _workflow(_write("named", "Shared Sheets Account"), _write("bound", "goac_active"))
 
     assert google_sheet_connection_bindings(workflow) == (("bound", "goac_active"),)
+
+
+@pytest.mark.parametrize("with_usable_connection", [False, True])
+def test_unbound_nested_sheets_offer_only_usable_connections(with_usable_connection: bool) -> None:
+    nested = GoogleSheetsReadBlock(
+        label="read",
+        spreadsheet_url="https://docs.google.com/spreadsheets/d/test",
+        credential_id=None,
+        output_parameter=_output("read"),
+    )
+    loop = ForLoopBlock(
+        label="loop",
+        loop_over_parameter_key="items",
+        loop_blocks=[nested, _write("write", "")],
+        output_parameter=_output("loop"),
+    )
+    credentials = [_credential("goac_error", "error"), _credential("goac_mail", "active", scopes_granted=[])]
+    if with_usable_connection:
+        credentials.append(_credential("goac_active", "active"))
+
+    notices = collect_google_connection_notices(
+        turn_start_bindings=(),
+        current_bindings=google_sheet_connection_bindings(_workflow(loop)),
+        visible_credentials=credentials,
+    )
+
+    assert len(notices) == 1
+    assert notices[0].condition == "unbound"
+    assert notices[0].connectionId is None
+    assert [choice.connection_id for choice in notices[0].choices] == (
+        ["goac_active"] if with_usable_connection else []
+    )
+
+
+def test_unbound_notice_tracks_draft_binding_changes() -> None:
+    assert (
+        collect_google_connection_notices(
+            turn_start_bindings=(("write", None),),
+            current_bindings=(("write", None),),
+            visible_credentials=[],
+        )
+        == []
+    )
+    notices = collect_google_connection_notices(
+        turn_start_bindings=(("write", "goac_old"),),
+        current_bindings=(("write", None),),
+        visible_credentials=[],
+    )
+    assert len(notices) == 1
+    assert retain_notices_after_lookup_failure(current_connection_ids=(None,), notices=notices) == notices
+    assert retain_notices_after_lookup_failure(current_connection_ids=("goac_active",), notices=notices) == []
 
 
 def test_new_block_using_a_preexisting_connection_is_still_a_new_binding() -> None:
@@ -158,28 +213,32 @@ def test_repeated_update_can_clear_notice_and_lookup_failure_only_retains_still_
     assert removed == []
 
 
-def test_active_connection_without_sheets_scope_is_unusable() -> None:
+@pytest.mark.parametrize(
+    ("other_state", "other_scopes"),
+    [
+        ("active", ["https://www.googleapis.com/auth/gmail.readonly"]),
+        ("error", ["https://www.googleapis.com/auth/gmail.readonly"]),
+        ("error", ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]),
+    ],
+    ids=["active-gmail", "expired-gmail", "expired-sheets-and-drive"],
+)
+def test_sheets_block_bound_to_a_connection_holding_another_profile_offers_a_sheets_choice_instead_of_a_reconnect(
+    other_state: str, other_scopes: list[str]
+) -> None:
     notices = collect_google_connection_notices(
         turn_start_bindings=(),
-        current_bindings=(("write", "goac_gmail"),),
+        current_bindings=(("write", "goac_gmail"), ("other", "goac_sheets_error")),
         visible_credentials=[
-            _credential(
-                "goac_gmail",
-                "active",
-                "Mail only",
-                scopes_granted=["https://www.googleapis.com/auth/gmail.readonly"],
-            )
+            _credential("goac_gmail", other_state, "Other profile", scopes_granted=other_scopes),
+            _credential("goac_sheets_error", "error", "Sheets expired"),
+            _credential("goac_sheets", "active"),
         ],
     )
 
-    assert [notice.model_dump() for notice in notices] == [
-        {
-            "provider": "google",
-            "connectionId": "goac_gmail",
-            "displayName": "Mail only",
-            "condition": "unusable",
-        }
-    ]
+    assert [
+        (notice.connectionId, notice.condition, [choice.connection_id for choice in notice.choices])
+        for notice in notices
+    ] == [(None, "unbound", ["goac_sheets"]), ("goac_sheets_error", "unusable", [])]
 
 
 def _capture(tmp_path: Path, turn_id: str, *blocks: object, credentials: list[GoogleOAuthCredentialBase]) -> None:

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { driver, type DriveStep, type Config } from "driver.js";
-import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { usePostHogFeatureFlagVariantKey as useFeatureFlagVariantKey } from "@/hooks/usePostHogFeatureFlag";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { useProductTourStore } from "@/store/ProductTourStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
@@ -345,5 +345,5 @@ function useEditorOnboardingTour(): UseEditorOnboardingTourReturn {
   return { showExitDialog, onExitConfirm, onExitCancel };
 }
 
-export { useEditorOnboardingTour };
+export { BASE_DRIVER_CONFIG, useEditorOnboardingTour };
 export type { UseEditorOnboardingTourReturn };

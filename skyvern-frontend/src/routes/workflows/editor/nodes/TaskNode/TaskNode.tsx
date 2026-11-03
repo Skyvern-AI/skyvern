@@ -62,7 +62,6 @@ function TaskNode({ id, data, type }: NodeProps<TaskNode>) {
               "bg-background outline outline-2 outline-ring":
                 thisBlockIsTargetted,
             },
-            data.comparisonColor,
           )}
         >
           <NodeHeader

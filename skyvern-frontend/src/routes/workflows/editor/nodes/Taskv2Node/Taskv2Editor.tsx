@@ -54,6 +54,7 @@ function Taskv2EditorBody({
       <div className="space-y-2">
         <Label className="text-xs text-tertiary-foreground">URL</Label>
         <WorkflowBlockInputTextarea
+          name="url"
           nodeId={blockId}
           onChange={(value) => update({ url: value })}
           value={data.url}
@@ -64,6 +65,7 @@ function Taskv2EditorBody({
       <div className="space-y-2">
         <Label className="text-xs text-tertiary-foreground">Prompt</Label>
         <WorkflowBlockInputTextarea
+          name="prompt"
           aiImprove={AI_IMPROVE_CONFIGS.taskV2.prompt}
           nodeId={blockId}
           onChange={(value) => update({ prompt: value })}
@@ -132,6 +134,7 @@ function Taskv2EditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier"
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
@@ -149,6 +152,7 @@ function Taskv2EditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl"
                   nodeId={blockId}
                   onChange={(value) => update({ totpVerificationUrl: value })}
                   value={data.totpVerificationUrl ?? ""}

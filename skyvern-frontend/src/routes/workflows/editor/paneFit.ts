@@ -159,6 +159,51 @@ export function startAnchoredViewport({
   };
 }
 
+// Entry positioning uses one measured node's absolute canvas bounds. A large
+// block may extend past the pane edges; entry zoom remains exactly 100%.
+export function centeredNodeViewport({
+  pane,
+  bounds,
+}: {
+  pane: Size;
+  bounds: Rect;
+}): Viewport | null {
+  if (
+    pane.width <= 0 ||
+    pane.height <= 0 ||
+    bounds.width <= 0 ||
+    bounds.height <= 0
+  ) {
+    return null;
+  }
+  return {
+    x: pane.width / 2 - bounds.x - bounds.width / 2,
+    y: pane.height / 2 - bounds.y - bounds.height / 2,
+    zoom: 1,
+  };
+}
+
+const REVEAL_TOP_MARGIN_PX = 48;
+
+// Like centeredNodeViewport, but a node taller than the pane is pinned by its
+// top so its header, where the review status sits, stays in view.
+export function revealNodeViewport({
+  pane,
+  bounds,
+}: {
+  pane: Size;
+  bounds: Rect;
+}): Viewport | null {
+  const centered = centeredNodeViewport({ pane, bounds });
+  if (centered === null) {
+    return null;
+  }
+  if (bounds.height + REVEAL_TOP_MARGIN_PX * 2 <= pane.height) {
+    return centered;
+  }
+  return { ...centered, y: REVEAL_TOP_MARGIN_PX - bounds.y };
+}
+
 export const END_ANCHOR_BOTTOM_PX = 24;
 
 /**

@@ -1,23 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
+from urllib.parse import urlparse
 
 import structlog
 from pypdf import PdfReader, PdfWriter
 
 from skyvern.config import settings
 from skyvern.constants import MAX_FILE_PARSE_INPUT_TOKENS
-from skyvern.exceptions import PDFParsingError
+from skyvern.exceptions import PDFParsingError, SplitPdfTooManyPages
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     download_file,
     get_path_for_workflow_download_directory,
-    validate_local_file_path,
+    parse_uri_to_path,
+    resolve_local_or_download_file,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -36,15 +39,19 @@ from skyvern.forge.sdk.workflow.models.block import (
     Block,
     capture_block_download_baseline,
     extract_file_url_from_block_output,
+    render_failure_reason,
     sanitize_filename,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
-from skyvern.utils.token_counter import count_tokens
+from skyvern.utils.token_counter import decode_tokens, encode_tokens
 
 LOG = structlog.get_logger()
 
 MIN_PER_PAGE_TOKENS = 256
+# A longer PDF cannot give every page MIN_PER_PAGE_TOKENS of text, the least the planner needs to
+# assign a page to a document, so the block rejects it rather than split from unusable excerpts.
+MAX_PLANNABLE_PAGES = MAX_FILE_PARSE_INPUT_TOKENS // MIN_PER_PAGE_TOKENS
 
 
 class SplitPdfBlock(Block):
@@ -135,13 +142,15 @@ class SplitPdfBlock(Block):
     async def _resolve_source_pdf(self, workflow_run_id: str, organization_id: str | None) -> tuple[str, bool]:
         if settings.ENV == "local" and os.path.exists(self.file_url):
             return self.file_url, False
-        if self.file_url.startswith("/"):
+        parsed_url = urlparse(self.file_url)
+        if self.file_url.startswith("/") or parsed_url.scheme == "file":
             context = skyvern_context.current()
             run_id = context.run_id if context and context.run_id else workflow_run_id
-            resolved = validate_local_file_path(self.file_url, run_id)
-            if not os.path.isfile(resolved):
-                raise FileNotFoundError(f"Local file not found: {self.file_url}")
-            return resolved, False
+            resolved = await resolve_local_or_download_file(self.file_url, run_id, organization_id)
+            is_temp = parsed_url.scheme == "file" and os.path.realpath(resolved) != os.path.realpath(
+                parse_uri_to_path(self.file_url)
+            )
+            return resolved, is_temp
         return await download_file(self.file_url, organization_id=organization_id), True
 
     @staticmethod
@@ -166,23 +175,43 @@ class SplitPdfBlock(Block):
             LOG.warning(
                 "SplitPdfBlock LLM response missing expected key",
                 expected_key=expected_key,
-                response_keys=list(parsed.keys()),
+                response_keys_count=len(parsed),
             )
         return parsed
 
-    def _build_page_texts(self, reader: PdfReader) -> list[dict[str, int | str]]:
+    @staticmethod
+    def _build_page_texts(reader: PdfReader) -> list[dict[str, int | str]]:
         # Give every page a slice of the budget and truncate over-long pages, instead of blanking
         # all pages once a running total is hit: the planner needs some text from every page to
         # assign it to a document, and a single huge page must not blank everything after it.
+        # total_pages * (budget // total_pages) <= budget, so the excerpts always fit in aggregate.
         total_pages = len(reader.pages) or 1
-        per_page_token_budget = max(MIN_PER_PAGE_TOKENS, MAX_FILE_PARSE_INPUT_TOKENS // total_pages)
+        per_page_token_budget = MAX_FILE_PARSE_INPUT_TOKENS // total_pages
+        if per_page_token_budget < MIN_PER_PAGE_TOKENS:
+            raise SplitPdfTooManyPages(
+                total_pages=total_pages,
+                max_pages=MAX_PLANNABLE_PAGES,
+                min_per_page_tokens=MIN_PER_PAGE_TOKENS,
+            )
         page_texts: list[dict[str, int | str]] = []
+        truncated_pages = 0
         for page_index, page in enumerate(reader.pages):
             text = page.extract_text() or ""
-            if text and count_tokens(text) > per_page_token_budget:
-                # ~4 chars/token heuristic; document-type/boundary cues sit near the top of a page.
-                text = text[: per_page_token_budget * 4]
+            tokens = encode_tokens(text)
+            if len(tokens) > per_page_token_budget:
+                # Slice tokens, not characters: a chars-per-token estimate understates dense text
+                # such as identifier columns. Keep the head — document-type and boundary cues sit
+                # near the top of a page.
+                text = decode_tokens(tokens[:per_page_token_budget])
+                truncated_pages += 1
             page_texts.append({"page_number": page_index + 1, "text": text})
+        if truncated_pages:
+            LOG.info(
+                "Truncated SplitPdfBlock page excerpts to fit the planner input budget",
+                total_pages=total_pages,
+                truncated_pages=truncated_pages,
+                per_page_token_budget=per_page_token_budget,
+            )
         return page_texts
 
     async def _request_split_plan(
@@ -304,8 +333,11 @@ class SplitPdfBlock(Block):
         reader: PdfReader,
         documents: list[dict[str, Any]],
         base_dir: Path,
+        source_pdf_path: str,
     ) -> list[tuple[dict[str, Any], bytes]]:
         written: list[tuple[dict[str, Any], bytes]] = []
+        source_path = Path(source_pdf_path).resolve()
+        used_paths: set[tuple[str, str]] = set()
         for document in documents:
             start_page = cast(int, document["start_page"])
             end_page = cast(int, document["end_page"])
@@ -320,14 +352,25 @@ class SplitPdfBlock(Block):
             folder = cast(str, document.get("folder") or "")
             output_dir = base_dir.joinpath(*folder.split("/")) if folder else base_dir
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / cast(str, document["name"])
+            output_name = cast(str, document["name"])
+            output_path = output_dir / output_name
+            while (
+                (folder, output_name) in used_paths
+                or output_path.resolve() == source_path
+                or (output_path.exists() and output_path.samefile(source_path))
+            ):
+                used_paths.add((folder, output_name))
+                output_name = SplitPdfBlock._deduplicate_document_name(folder, output_name, used_paths)
+                output_path = output_dir / output_name
+            used_paths.add((folder, output_name))
             output_path.write_bytes(pdf_bytes)
 
             doc_meta = dict(document)
             doc_meta.update(
                 {
+                    "name": output_name,
                     "file_path": str(output_path),
-                    "file_name": document["name"],
+                    "file_name": output_name,
                     "file_size": len(pdf_bytes),
                     "page_range": [start_page, end_page],
                     "page_count": end_page - start_page + 1,
@@ -416,7 +459,9 @@ class SplitPdfBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -436,7 +481,7 @@ class SplitPdfBlock(Block):
 
         try:
             try:
-                validate_pdf_file(source_pdf_path, file_identifier=self.file_url)
+                await asyncio.to_thread(validate_pdf_file, source_pdf_path, file_identifier=self.file_url)
                 reader = PdfReader(source_pdf_path)
                 total_pages = len(reader.pages)
             except PDFParsingError as e:
@@ -479,7 +524,7 @@ class SplitPdfBlock(Block):
                     )
 
                 base_dir = get_path_for_workflow_download_directory(workflow_run_id)
-                written = self._write_split_documents(reader, documents, base_dir)
+                written = self._write_split_documents(reader, documents, base_dir, source_pdf_path)
 
                 artifact_org_id = organization_id or workflow_run_context.organization_id
                 artifact_block = await self._resolve_workflow_run_block(workflow_run_block_id, artifact_org_id)
@@ -522,6 +567,14 @@ class SplitPdfBlock(Block):
                     status=BlockStatus.completed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                )
+            except SplitPdfTooManyPages as e:
+                return await self._record_failure(
+                    workflow_run_context,
+                    workflow_run_id,
+                    workflow_run_block_id,
+                    organization_id,
+                    str(e),
                 )
             except Exception as e:
                 return await self._record_failure(

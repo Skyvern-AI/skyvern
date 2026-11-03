@@ -1,3 +1,4 @@
+import { WorkflowFindingsBoundary } from "@/components/WorkflowFindingsSlot";
 import { getClient } from "@/api/AxiosClient";
 import { Button } from "@/components/ui/button";
 import { SelectionHeaderCheckboxCell } from "@/components/SelectionCheckbox";
@@ -47,6 +48,7 @@ import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
 import { FolderTreeNode } from "./components/tree/FolderTreeNode";
 import { WorkflowRow } from "./components/tree/WorkflowRow";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import {
   WorkflowsListContext,
   type WorkflowsListContextValue,
@@ -76,8 +78,10 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
 import { getUniqueSlugForFolder } from "@/util/folderSlug";
 import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import {
+  useUrlTagFilter,
+  useWorkflowTaggingEnabled,
+} from "@/hooks/useWorkflowTaggingEnabled";
 
 const FOLDERS_PAGE_SIZE = 25;
 const AGENTS_PAGE_SIZE = 20;
@@ -88,7 +92,11 @@ function WorkflowsTree() {
   const navigate = useNavigate();
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [search, setSearch] = useState("");
+  const searchParam = searchParams.get("search") ?? "";
+  const [search, setSearch] = useState(searchParam);
+  useEffect(() => {
+    setSearch(searchParam);
+  }, [searchParam]);
   const [debouncedSearch] = useDebounce(search, 250);
   const [isBulkOperating, setIsBulkOperating] = useState(false);
   const [bulkDeleteDialog, setBulkDeleteDialog] = useState<{
@@ -110,12 +118,10 @@ function WorkflowsTree() {
     () => parseTagFilter(tagFilterParam),
     [tagFilterParam],
   );
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
-  // While tagging is hidden, ignore stale `?tags=` so the backend list isn't tag-filtered.
-  const serializedTagFilter = taggingEnabled
-    ? serializeTagFilter(tagFilters)
-    : "";
+  const taggingEnabled = useWorkflowTaggingEnabled();
+  // While tagging is off, ignore stale `?tags=` so the backend list isn't tag-filtered.
+  const { tags: serializedTagFilter, hold: holdForTaggingFlag } =
+    useUrlTagFilter(serializeTagFilter(tagFilters));
 
   const setTagFilters = useCallback(
     (terms: TagFilterTerm[]) => {
@@ -329,7 +335,10 @@ function WorkflowsTree() {
     getNextPageParam: (lastPage, allPages) =>
       lastPage.length === AGENTS_PAGE_SIZE ? allPages.length + 1 : undefined,
     initialPageParam: 1,
-    placeholderData: (previousData) => previousData,
+    enabled: !holdForTaggingFlag,
+    // A held tag-filtered list must not carry over the previous unfiltered rows.
+    placeholderData: (previousData) =>
+      holdForTaggingFlag ? undefined : previousData,
   });
 
   const workflows = useMemo(
@@ -503,7 +512,8 @@ function WorkflowsTree() {
   const showCheckbox = isFilterActive
     ? selectionItems.length > 0
     : allFolders.length > 0 || selectionItems.length > 0;
-  const columnCount = showCheckbox ? 6 : 5;
+  const showCreator = useCreatorColumnEnabled();
+  const columnCount = 5 + (showCheckbox ? 1 : 0) + (showCreator ? 1 : 0);
 
   const {
     selected,
@@ -693,7 +703,9 @@ function WorkflowsTree() {
   };
 
   const showFlatInitialSkeleton =
-    isFilterActive && isWorkflowsLoading && displayWorkflows.length === 0;
+    isFilterActive &&
+    (isWorkflowsLoading || holdForTaggingFlag) &&
+    displayWorkflows.length === 0;
   const showTreeInitialSkeleton =
     !isFilterActive &&
     (isFoldersLoading || isWorkflowsLoading) &&
@@ -722,6 +734,11 @@ function WorkflowsTree() {
         <TableCell>
           <Skeleton className="h-5 w-20" />
         </TableCell>
+        {showCreator && (
+          <TableCell>
+            <Skeleton className="h-5 w-20" />
+          </TableCell>
+        )}
         <TableCell>
           <Skeleton className="h-5 w-32" />
         </TableCell>
@@ -858,7 +875,7 @@ function WorkflowsTree() {
     );
   }
 
-  return (
+  const content = (
     <div className="space-y-10">
       <div className="flex h-32 justify-between gap-6">
         <div className="space-y-5">
@@ -905,6 +922,13 @@ function WorkflowsTree() {
               value={search}
               onChange={(value) => {
                 setSearch(value);
+                const params = new URLSearchParams(searchParams);
+                if (value === "") {
+                  params.delete("search");
+                } else {
+                  params.set("search", value);
+                }
+                setSearchParams(params, { replace: true });
               }}
               placeholder="Search by title or input..."
               className="w-48 lg:w-72"
@@ -988,14 +1012,27 @@ function WorkflowsTree() {
                       ariaLabel="Select all agents"
                     />
                   )}
-                  <TableHead className={showCheckbox ? "w-[22%]" : "w-[25%]"}>
+                  <TableHead className={showCheckbox ? "w-[19%]" : "w-[21%]"}>
                     ID
                   </TableHead>
-                  <TableHead className={showCheckbox ? "w-[27%]" : "w-[30%]"}>
+                  <TableHead
+                    className={
+                      showCreator
+                        ? showCheckbox
+                          ? "w-[25%]"
+                          : "w-[26%]"
+                        : showCheckbox
+                          ? "w-[37%]"
+                          : "w-[38%]"
+                    }
+                  >
                     Title
                   </TableHead>
-                  <TableHead className="w-[15%]">Folder</TableHead>
-                  <TableHead className="w-[15%]">Created At</TableHead>
+                  <TableHead className="w-[13%]">Folder</TableHead>
+                  {showCreator && (
+                    <TableHead className="w-[12%]">Created By</TableHead>
+                  )}
+                  <TableHead className="w-[13%]">Created At</TableHead>
                   <TableHead className="w-[15%] text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
@@ -1061,10 +1098,10 @@ function WorkflowsTree() {
           open={isTemplateDialogOpen}
           onOpenChange={setIsTemplateDialogOpen}
           onSelectTemplate={(template) => {
-            const clonedWorkflow = convert({
-              ...template,
-              title: `${template.title} (copy)`,
-            });
+            const clonedWorkflow = convert(
+              { ...template, title: `${template.title} (copy)` },
+              { asNewWorkflow: true },
+            );
             createWorkflowMutation.mutate({
               ...clonedWorkflow,
               folder_id: selectedFolderId,
@@ -1072,11 +1109,14 @@ function WorkflowsTree() {
           }}
         />
 
-        <div data-hint="start-template">
-          <WorkflowTemplates />
-        </div>
+        <WorkflowTemplates folderId={selectedFolderId} />
       </div>
     </div>
+  );
+  return (
+    <WorkflowFindingsBoundary workflowPermanentIds={workflowIds}>
+      {content}
+    </WorkflowFindingsBoundary>
   );
 }
 

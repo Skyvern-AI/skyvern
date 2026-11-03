@@ -6,14 +6,24 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.code_block_steps import (
+    code_block_labels_awaiting_goal_rebuild,
+    code_block_labels_with_user_owned_goal,
+)
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     build_transcript_context,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.secret_redaction import redact_secretlike_filename
 from skyvern.forge.sdk.copilot.workflow_change_summary import WorkflowChangeKind, summarize_user_workflow_change
 from skyvern.forge.sdk.schemas.credentials import Credential
-from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    MAX_ATTACHED_FILES_PER_MESSAGE,
+    CopilotAttachedFile,
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+)
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
@@ -23,6 +33,7 @@ TurnContextSection = Literal[
     "latest_assistant_proposal",
     "latest_run_result",
     "credential_metadata",
+    "attached_files",
 ]
 
 
@@ -55,12 +66,20 @@ class RunnableDraftContext(BaseModel):
     block_labels: list[str] = Field(default_factory=list)
 
 
+class UserGoalContext(BaseModel):
+    rendered_summary: str
+    block_labels: list[str] = Field(default_factory=list)
+
+
 class TranscriptContext(BaseModel):
     earliest_user_turn: str
     latest_prior_user_turn: str
     latest_assistant_turn: str
     retained_history: str
     omitted_any: bool
+
+
+COPILOT_TESTS_ENDED_AFTER_THEIR_TURN_KEY = "copilot_tests_ended_after_their_turn"
 
 
 class RunContext(BaseModel):
@@ -86,14 +105,34 @@ class CredentialContext(BaseModel):
     omitted_credential_count: int = 0
 
 
+class AttachedFileContext(BaseModel):
+    files: list[CopilotAttachedFile] = Field(default_factory=list)
+    omitted_file_count: int = 0
+
+    def render_prompt_block(self) -> str:
+        lines: list[str] = []
+        for attached in self.files:
+            name = redact_secretlike_filename(attached.filename) or "(name unavailable)"
+            if attached.available:
+                lines.append(f"- {name} (file_id: {attached.file_id})")
+            else:
+                lines.append(f"- {name} (file_id: {attached.file_id}) — NO LONGER AVAILABLE")
+        if self.omitted_file_count:
+            lines.append(f"- ...and {self.omitted_file_count} older attachment(s) not listed")
+        return "\n".join(lines)
+
+
 class TurnContextPacket(BaseModel):
     workflow_context: WorkflowContext | None = None
     proposal_context: ProposalContext | None = None
     workflow_change_context: WorkflowChangeContext | None = None
     runnable_draft_context: RunnableDraftContext | None = None
+    user_goal_context: UserGoalContext | None = None
     transcript_context: TranscriptContext
     run_context: RunContext | None = None
+    copilot_tests_ended_after_their_turn: list[RunContext] | None = None
     credential_context: CredentialContext | None = None
+    attached_file_context: AttachedFileContext | None = None
     omissions: list[TurnContextOmission] = Field(default_factory=list)
 
     def to_trace_data(self) -> dict[str, Any]:
@@ -102,8 +141,11 @@ class TurnContextPacket(BaseModel):
             "proposal_context",
             "workflow_change_context",
             "runnable_draft_context",
+            "user_goal_context",
             "run_context",
+            "copilot_tests_ended_after_their_turn",
             "credential_context",
+            "attached_file_context",
         )
         return {
             "sections": [field for field in section_fields if getattr(self, field) is not None],
@@ -124,6 +166,8 @@ class TurnContextInputs(BaseModel):
     prior_workflow_yaml: str = ""
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list)
     prior_run_packet: dict[str, Any] | None = None
+    copilot_test_packets: list[dict[str, Any]] = Field(default_factory=list)
+    attached_files: list[CopilotAttachedFile] = Field(default_factory=list)
 
 
 def _dedupe_nonempty(values: list[str]) -> list[str]:
@@ -188,10 +232,12 @@ class TurnContextAssembler:
         workflow_char_budget: int = 12_000,
         proposal_char_budget: int = 2_000,
         credential_count_budget: int = 20,
+        attached_file_count_budget: int = MAX_ATTACHED_FILES_PER_MESSAGE,
     ) -> None:
         self.workflow_char_budget = workflow_char_budget
         self.proposal_char_budget = proposal_char_budget
         self.credential_count_budget = credential_count_budget
+        self.attached_file_count_budget = attached_file_count_budget
 
     def assemble(self, inputs: TurnContextInputs) -> TurnContextPacket:
         omissions: list[TurnContextOmission] = []
@@ -259,6 +305,7 @@ class TurnContextAssembler:
                 )
 
         runnable_draft_context = self._runnable_draft_context(inputs)
+        user_goal_context = self._user_goal_context(inputs)
 
         if inputs.prior_run_packet:
             run_context = RunContext(packet=inputs.prior_run_packet)
@@ -268,14 +315,22 @@ class TurnContextAssembler:
         credential_context, credential_omissions = self._credential_context(inputs.request_policy)
         omissions.extend(credential_omissions)
 
+        attached_file_context, attached_file_omissions = self._attached_file_context(inputs.attached_files)
+        omissions.extend(attached_file_omissions)
+
         packet = TurnContextPacket(
             workflow_context=workflow_context,
             proposal_context=proposal_context,
             workflow_change_context=workflow_change_context,
             runnable_draft_context=runnable_draft_context,
+            user_goal_context=user_goal_context,
             transcript_context=transcript_context,
             run_context=run_context,
+            copilot_tests_ended_after_their_turn=(
+                [RunContext(packet=packet) for packet in inputs.copilot_test_packets] or None
+            ),
             credential_context=credential_context,
+            attached_file_context=attached_file_context,
             omissions=omissions,
         )
 
@@ -284,6 +339,20 @@ class TurnContextAssembler:
             **{f"turn_context_{key}": value for key, value in packet.to_trace_data().items()},
         )
         return packet
+
+    def _user_goal_context(self, inputs: TurnContextInputs) -> UserGoalContext | None:
+        labels = code_block_labels_awaiting_goal_rebuild(inputs.workflow_yaml)
+        if not labels:
+            return None
+        owned_labels = code_block_labels_with_user_owned_goal(inputs.workflow_yaml)
+        summary = (
+            "The user changed the Goal on these code blocks and has not applied it yet: "
+            f"{', '.join(labels)}. Their Goal text is what the block is for; the saved code still does what the "
+            "previous Goal said. The user applies a new Goal from the block, which sends its own request. "
+            f"A Goal you submit for any user-owned block ({', '.join(owned_labels)}) is discarded; the Goal "
+            "field on the block is where the user edits it."
+        )
+        return UserGoalContext(rendered_summary=summary, block_labels=labels)
 
     def _runnable_draft_context(self, inputs: TurnContextInputs) -> RunnableDraftContext | None:
         if not inputs.request_policy.allow_run_blocks:
@@ -295,10 +364,8 @@ class TurnContextAssembler:
             return None
         labels_csv = ", ".join(labels)
         summary = (
-            "A prior turn proposed a workflow draft that was never committed to the canvas, so the"
-            " CURRENT WORKFLOW YAML above is empty. The user is asking to run/re-test that draft. To"
-            " run it, call run_blocks_and_collect_debug with these block labels: "
-            f"{labels_csv}. Do not call update_and_run_blocks and do not ask the user to rebuild it."
+            "A prior turn produced an uncommitted workflow draft. It is not the current canvas workflow. "
+            f"The draft remains runnable by its top-level block labels: {labels_csv}."
         )
         return RunnableDraftContext(rendered_summary=summary, block_labels=labels)
 
@@ -322,3 +389,21 @@ class TurnContextAssembler:
             credentials=[_safe_credential_metadata(credential) for credential in credentials],
             omitted_credential_count=omitted_count,
         ), omissions
+
+    def _attached_file_context(
+        self, attached_files: list[CopilotAttachedFile]
+    ) -> tuple[AttachedFileContext | None, list[TurnContextOmission]]:
+        if not attached_files:
+            return None, []
+        kept = attached_files[: self.attached_file_count_budget]
+        omitted_count = len(attached_files) - len(kept)
+        omissions = []
+        if omitted_count:
+            omissions.append(
+                TurnContextOmission(
+                    context_key="attached_files",
+                    reason="truncated_to_budget",
+                    detail=f"{omitted_count} attached file entries omitted",
+                )
+            )
+        return AttachedFileContext(files=kept, omitted_file_count=omitted_count), omissions

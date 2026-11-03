@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from skyvern.config import settings
 from skyvern.errors.errors import UserDefinedError
 from skyvern.schemas.steps import AgentStepOutput, BrowserMetadata
+from skyvern.services.run_cancellation import RunCancellation
 from skyvern.utils.action_redaction import redact_action_for_log
 from skyvern.webeye.actions.actions import Action, DecisiveAction
 from skyvern.webeye.actions.responses import ActionResult
@@ -27,6 +28,8 @@ class DetailedAgentStepOutput(BaseModel):
     actions_and_results: list[tuple[Action, list[ActionResult]]] | None
     step_exception: str | None = None
     cua_response: OpenAIResponse | None = None
+    # Set when the step stopped because its run was canceled or timed out under it.
+    run_cancellation: RunCancellation | None = None
 
     model_config = ConfigDict(exclude=["scraped_page", "extract_action_prompt"])
 
@@ -71,6 +74,7 @@ class DetailedAgentStepOutput(BaseModel):
             else [(action, result) for action, result in self.actions_and_results if result],
             step_exception=self.step_exception,
             cua_response=self.cua_response,
+            run_cancellation=self.run_cancellation,
         )
 
     def to_agent_step_output(self) -> AgentStepOutput:

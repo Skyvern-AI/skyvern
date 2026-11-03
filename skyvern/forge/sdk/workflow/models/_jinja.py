@@ -5,14 +5,18 @@ from __future__ import annotations
 import io
 import json
 import tokenize
-from typing import Any, Callable, cast
+from typing import Any, Callable, NoReturn, cast
 
 import structlog
-from jinja2 import ChainableUndefined, StrictUndefined
+from jinja2 import ChainableUndefined, StrictUndefined, Undefined
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.exceptions import (
+    FailedToFormatJinjaStyleParameter,
+    RenderFailureKind,
+    TemplateRenderCause,
+)
 
 LOG = structlog.get_logger()
 
@@ -106,6 +110,7 @@ def render_templates_in_json_value(value: object, render_string: Callable[[str],
                 "The '| json' filter can only be used for complete value replacement. "
                 "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
                 "Remove the surrounding text or remove the '| json' filter.",
+                render_cause=TemplateRenderCause(RenderFailureKind.JSON_FILTER_WITH_OTHER_TEXT),
             )
         return rendered
     if isinstance(value, list):
@@ -151,6 +156,20 @@ jinja_json_finalize_required_binding_env = SandboxedEnvironment(
     undefined=RequiredBindingUndefined, finalize=_json_finalize_required_binding
 )
 jinja_json_finalize_required_binding_env.filters["json"] = _json_type_filter
+
+
+def _fail_on_undefined_json(value: object) -> NoReturn:
+    if isinstance(value, Undefined):
+        value._fail_with_undefined_error()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+# `| tojson` serializes with json.dumps, which never calls __str__, so an undefined would surface as a
+# generic TypeError instead of the UndefinedError that names the missing binding.
+jinja_json_finalize_required_binding_env.policies["json.dumps_kwargs"] = {
+    **jinja_json_finalize_required_binding_env.policies["json.dumps_kwargs"],
+    "default": _fail_on_undefined_json,
+}
 
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
     jinja_json_finalize_strict_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)

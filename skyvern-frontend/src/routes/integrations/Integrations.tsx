@@ -6,6 +6,7 @@ import {
   UpdateIcon,
 } from "@radix-ui/react-icons";
 import { GoogleOAuthCredential } from "@/api/types";
+import { MessageIcon } from "@/components/icons/MessageIcon";
 import { GoogleOAuthClientConfigForm } from "@/components/GoogleOAuthClientConfigForm";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,25 +21,36 @@ import {
   DialogClose,
   DialogContent,
   DialogDescription,
+  DialogHeader,
   DialogFooter,
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
 import {
+  googleCredentialGmailCapabilities,
+  googleCredentialHasGmailCapability,
   hasGoogleOAuthCredentialScopes,
   isGoogleOAuthCredentialActive,
   useGoogleOAuthCredentials,
+  type GmailCapability,
 } from "@/hooks/useGoogleOAuthCredentials";
+import { useTwilioCredentialQuery } from "@/hooks/useTwilioIntegration";
 import {
   GOOGLE_DRIVE_REQUIRED_SCOPES,
   GOOGLE_GMAIL_REQUIRED_SCOPES,
   GOOGLE_SHEETS_BLOCK_REQUIRED_SCOPES,
+  gmailScopeProfile,
 } from "@/util/googleScopes";
+import {
+  GmailCapabilityCheckboxes,
+  GmailCapabilityPills,
+} from "./GmailCapabilities";
 import {
   buildGoogleOAuthRedirectUri,
   getGoogleOAuthAppOrigin,
   storeGoogleOAuthIntegrationIdForState,
 } from "./googleOAuth";
+import { TwilioIntegrationPanel } from "./twilio/TwilioIntegrationPanel";
 
 const integrations = [
   {
@@ -51,7 +63,7 @@ const integrations = [
   {
     id: "gmail",
     title: "Gmail",
-    description: "Read verification emails for OTP polling.",
+    description: "Read verification codes and send email from your agents.",
     scopeProfile: "gmail",
     capabilityScopes: GOOGLE_GMAIL_REQUIRED_SCOPES,
   },
@@ -67,6 +79,15 @@ const integrations = [
 function Integrations() {
   const [connectingId, setConnectingId] = useState<string | null>(null);
   const [reconnectingId, setReconnectingId] = useState<string | null>(null);
+  const [enabling, setEnabling] = useState<{
+    credentialId: string;
+    capability: GmailCapability;
+  } | null>(null);
+  const [gmailCapabilities, setGmailCapabilities] = useState({
+    read: true,
+    send: false,
+  });
+  const newGmailScopeProfile = gmailScopeProfile(gmailCapabilities);
   const {
     credentials,
     isFetching,
@@ -74,7 +95,18 @@ function Integrations() {
     isStartingAuthorize,
     deleteCredential,
     isDeletingCredential,
-  } = useGoogleOAuthCredentials();
+  } = useGoogleOAuthCredentials({ includeEmail: true });
+  const {
+    data: twilioCapability,
+    isLoading: isLoadingTwilioCredential,
+    isFetching: isFetchingTwilioCredential,
+    isError: isTwilioCredentialError,
+    error: twilioCredentialError,
+    refetch: refetchTwilioCredential,
+  } = useTwilioCredentialQuery();
+  const twilioCredential = twilioCapability?.credential;
+  const hasTwilioCredentialError =
+    isTwilioCredentialError || Boolean(twilioCredentialError);
 
   const connect = async (integration: (typeof integrations)[number]) => {
     setConnectingId(integration.id);
@@ -83,7 +115,9 @@ function Integrations() {
         redirect_uri: buildGoogleOAuthRedirectUri(),
         app_origin: getGoogleOAuthAppOrigin(),
         credential_name: integration.title,
-        scope_profile: integration.scopeProfile,
+        scope_profile:
+          (integration.id === "gmail" ? newGmailScopeProfile : null) ??
+          integration.scopeProfile,
       });
       storeGoogleOAuthIntegrationIdForState(response.state, integration.id);
       window.location.assign(response.authorize_url);
@@ -109,6 +143,27 @@ function Integrations() {
     }
   };
 
+  // Adds a Gmail permission to an existing connection. It keeps its id and current
+  // access; if consent is cancelled or declined the connection is left as it was.
+  const enableCapability = async (
+    credential: GoogleOAuthCredential,
+    capability: GmailCapability,
+  ) => {
+    setEnabling({ credentialId: credential.id, capability });
+    try {
+      const response = await startAuthorize({
+        redirect_uri: buildGoogleOAuthRedirectUri(),
+        app_origin: getGoogleOAuthAppOrigin(),
+        credential_id: credential.id,
+        scope_profile: capability === "send" ? "gmail_send" : "gmail",
+      });
+      storeGoogleOAuthIntegrationIdForState(response.state, "gmail");
+      window.location.assign(response.authorize_url);
+    } finally {
+      setEnabling(null);
+    }
+  };
+
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6 p-6">
       <Card>
@@ -123,14 +178,20 @@ function Integrations() {
         </CardContent>
       </Card>
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2">
         {integrations.map((integration) => {
-          const matchingCredentials = credentials.filter((credential) =>
-            hasGoogleOAuthCredentialScopes(
+          const isGmail = integration.id === "gmail";
+          const matchingCredentials = credentials.filter((credential) => {
+            if (isGmail) {
+              const { read, send } =
+                googleCredentialGmailCapabilities(credential);
+              return read || send;
+            }
+            return hasGoogleOAuthCredentialScopes(
               credential,
               Array.from(integration.capabilityScopes),
-            ),
-          );
+            );
+          });
           const activeCount = matchingCredentials.filter(
             isGoogleOAuthCredentialActive,
           ).length;
@@ -144,10 +205,19 @@ function Integrations() {
                 <div className="text-sm text-muted-foreground">
                   {activeCount} active connection{activeCount === 1 ? "" : "s"}
                 </div>
+                {isGmail ? (
+                  <GmailCapabilityCheckboxes
+                    value={gmailCapabilities}
+                    onChange={setGmailCapabilities}
+                  />
+                ) : null}
                 <Button
                   type="button"
                   className="w-full gap-2"
-                  disabled={isStartingAuthorize}
+                  disabled={
+                    isStartingAuthorize ||
+                    (isGmail && newGmailScopeProfile === null)
+                  }
                   onClick={() => void connect(integration)}
                 >
                   {connectingId === integration.id ? (
@@ -162,6 +232,70 @@ function Integrations() {
           );
         })}
       </div>
+      {twilioCapability?.available !== false ? (
+        <section className="space-y-3">
+          <div>
+            <h2 className="text-lg font-semibold">Communication</h2>
+            <p className="text-sm text-muted-foreground">
+              Connect services that deliver verification messages to workflows.
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-3">
+            <Card>
+              <CardHeader>
+                <div className="mb-2 flex size-9 items-center justify-center rounded-md border bg-muted">
+                  <MessageIcon className="size-5" />
+                </div>
+                <CardTitle className="text-base">Twilio</CardTitle>
+                <CardDescription>
+                  Connected and enabled Twilio numbers deliver SMS 2FA codes
+                  automatically. For any other number, push codes through the
+                  2FA API or UI.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="text-sm text-muted-foreground">
+                  {isLoadingTwilioCredential
+                    ? "Checking connection..."
+                    : twilioCredential
+                      ? "Connected"
+                      : "Not connected"}
+                </div>
+                <Dialog>
+                  <DialogTrigger asChild>
+                    <Button
+                      type="button"
+                      className="w-full"
+                      onClick={(event) =>
+                        hasTwilioCredentialError &&
+                        (event.preventDefault(), void refetchTwilioCredential())
+                      }
+                      disabled={
+                        isLoadingTwilioCredential || isFetchingTwilioCredential
+                      }
+                    >
+                      {(hasTwilioCredentialError && "Retry") ||
+                        (twilioCredential ? "Manage" : "Configure")}
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-4xl">
+                    <DialogHeader>
+                      <DialogTitle>Twilio</DialogTitle>
+                      <DialogDescription>
+                        Connect Twilio and choose the phone numbers that deliver
+                        SMS verification codes to Skyvern automatically.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="pt-2">
+                      <TwilioIntegrationPanel />
+                    </div>
+                  </DialogContent>
+                </Dialog>
+              </CardContent>
+            </Card>
+          </div>
+        </section>
+      ) : null}
 
       <Card>
         <CardHeader className="border-b-2">
@@ -182,6 +316,8 @@ function Integrations() {
               {credentials.map((credential) => {
                 const isActive = isGoogleOAuthCredentialActive(credential);
                 const isReconnecting = reconnectingId === credential.id;
+                const showGmailPills =
+                  isActive && googleCredentialHasGmailCapability(credential);
                 return (
                   <div
                     key={credential.id}
@@ -202,6 +338,20 @@ function Integrations() {
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
+                      {showGmailPills ? (
+                        <GmailCapabilityPills
+                          credential={credential}
+                          pendingAction={
+                            enabling?.credentialId === credential.id
+                              ? enabling.capability
+                              : null
+                          }
+                          disabled={isStartingAuthorize}
+                          onEnable={(capability) =>
+                            void enableCapability(credential, capability)
+                          }
+                        />
+                      ) : null}
                       <Button
                         type="button"
                         variant={isActive ? "outline" : "default"}

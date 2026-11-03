@@ -1,0 +1,78 @@
+{
+  "provenance": {
+    "kind": "authored_control",
+    "source": "authored for this replay; not a capture and not derived from one",
+    "notes": "A native navigation block fails once, its goal is reworded, and the next run passes. Run ids are placeholders. The supplied reply carries the model's own caution, which has to come back word for word. Each failed run's outcome lists its failed block in failed_block_labels, as the recorder sets it."
+  },
+  "reported_workflow_yaml": null,
+  "supplied_reply": "I reworded the step and the retest passed. The first attempt failed on this step, so treat it as unproven until you have run it yourself.",
+  "steps": [
+    {
+      "workflow_yaml": "title: Open the deferred freight quote\nworkflow_definition:\n  parameters: []\n  blocks:\n    - block_type: navigation\n      label: open_quote\n      url: http://localhost:8900/deferred_total_quote/\n      navigation_goal: Open quote QF-4821.\n",
+      "staged_workflow_yaml": null,
+      "outcome": {
+        "phase": "persisted_block_run",
+        "attempted_tool": "update_and_run_blocks",
+        "workflow_run_id": "wr_authored_native_first",
+        "block_labels": [
+          "open_quote"
+        ],
+        "executed_block_labels": [
+          "open_quote"
+        ],
+        "attempted_block_label": "open_quote",
+        "verdict": "repairable_failure",
+        "reason_code": "runtime_block_failure",
+        "failed_block_labels": [
+          "open_quote"
+        ]
+      }
+    },
+    {
+      "workflow_yaml": "title: Open the deferred freight quote\nworkflow_definition:\n  parameters: []\n  blocks:\n    - block_type: navigation\n      label: open_quote\n      url: http://localhost:8900/deferred_total_quote/\n      navigation_goal: Open quote QF-4821 and wait for its totals panel.\n",
+      "staged_workflow_yaml": null,
+      "outcome": {
+        "phase": "persisted_block_run",
+        "attempted_tool": "update_and_run_blocks",
+        "workflow_run_id": "wr_authored_native_second",
+        "block_labels": [
+          "open_quote"
+        ],
+        "executed_block_labels": [
+          "open_quote"
+        ],
+        "verdict": "progress_observed",
+        "reason_code": "verified_success"
+      }
+    }
+  ],
+  "expect": {
+    "handback_ok": true,
+    "latest_verdict": "progress_observed",
+    "prior_attempt_change_identity": null,
+    "history": [
+      {
+        "workflow_run_id": "wr_authored_native_first",
+        "verdict": "repairable_failure",
+        "reason_code": "runtime_block_failure",
+        "attempted_block_label": "open_quote",
+        "attempted_block_signature": "",
+        "attempted_block_code_hash": "",
+        "executed_yaml_digests": {
+          "open_quote": "97fdd7b8c644cd60"
+        }
+      },
+      {
+        "workflow_run_id": "wr_authored_native_second",
+        "verdict": "progress_observed",
+        "reason_code": "verified_success",
+        "attempted_block_label": "",
+        "attempted_block_signature": "",
+        "attempted_block_code_hash": "",
+        "executed_yaml_digests": {
+          "open_quote": "f1d83196d3a245eb"
+        }
+      }
+    ]
+  }
+}

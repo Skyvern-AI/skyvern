@@ -65,6 +65,8 @@ interface MultiSelectProps
     value: string;
     /** Optional icon component to display alongside the option. */
     icon?: React.ComponentType<{ className?: string }>;
+    /** Optional text shown beside the label in the dropdown only. */
+    description?: string;
   }[];
 
   /**
@@ -193,7 +195,7 @@ export const MultiSelect = React.forwardRef<
                         {IconComponent && (
                           <IconComponent className="mr-2 h-4 w-4" />
                         )}
-                        {option?.label}
+                        {option?.label ?? value}
                         <CrossCircledIcon
                           className="ml-2 h-4 w-4 cursor-pointer"
                           onClick={(event) => {
@@ -299,6 +301,14 @@ export const MultiSelect = React.forwardRef<
                         <option.icon className="mr-2 h-4 w-4 text-muted-foreground" />
                       )}
                       <span>{option.label}</span>
+                      {option.description && (
+                        <span
+                          className="ml-2 max-w-72 truncate text-xs text-muted-foreground"
+                          title={option.description}
+                        >
+                          {option.description}
+                        </span>
+                      )}
                     </CommandItem>
                   );
                 })}

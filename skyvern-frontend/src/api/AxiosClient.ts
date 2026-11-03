@@ -10,6 +10,7 @@ import {
 } from "@/util/env";
 import { useAuthIssueStore } from "@/store/AuthIssueStore";
 import axios, { AxiosHeaders, type InternalAxiosRequestConfig } from "axios";
+import { isForwardingAccessDenied } from "./emailForwarding";
 
 type ApiVersion = "sans-api-v1" | "v1" | "v2";
 
@@ -57,6 +58,49 @@ const artifactApiClient = axios.create({
 
 const clients = [client, v2Client, clientSansApiV1] as const;
 
+type AttributionResolver = (
+  authorization: string | undefined,
+) => string | undefined;
+let attributionResolver: AttributionResolver | undefined;
+
+// Cloud supplies the ownership check; shared API code has no analytics dependency.
+export function setPostHogAttributionResolver(
+  resolver: AttributionResolver,
+): void {
+  attributionResolver = resolver;
+  removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
+}
+
+export function getPostHogAttributionHeaders(
+  authorization: string,
+): Record<string, string> {
+  try {
+    const value = attributionResolver?.(authorization);
+    return value ? { [POSTHOG_ATTRIBUTION_HEADER]: value } : {};
+  } catch {
+    return {};
+  }
+}
+
+clients.forEach((instance) => {
+  instance.interceptors.request.use((config) => {
+    if (attributionResolver) {
+      const authorization = config.headers.get("Authorization");
+      const attribution = getPostHogAttributionHeaders(
+        typeof authorization === "string" ? authorization : "",
+      );
+      config.headers.delete(POSTHOG_ATTRIBUTION_HEADER);
+      if (attribution[POSTHOG_ATTRIBUTION_HEADER]) {
+        config.headers.set(
+          POSTHOG_ATTRIBUTION_HEADER,
+          attribution[POSTHOG_ATTRIBUTION_HEADER],
+        );
+      }
+    }
+    return config;
+  });
+});
+
 type UISessionResponse = {
   token: string;
   expires_at: number;
@@ -64,7 +108,22 @@ type UISessionResponse = {
 
 type UISessionRetryConfig = InternalAxiosRequestConfig & {
   uiSessionRetry?: boolean;
+  signedOutRetry?: boolean;
 };
+
+// Must match SIGNED_OUT_DETAIL in cloud/core/authentication.py.
+const SIGNED_OUT_DETAIL = "Session has been signed out";
+let freshCredentialGetter: CredentialGetter | null = null;
+
+// A sign-out on one device refuses every token the user minted before it, including the one
+// another live session still has cached; that session retries once with a newly minted token.
+// Clerk stamps iat in whole seconds and the API refuses iat <= its cutoff, so a token minted in the
+// sign-out's own second is refused too. Waiting a second guarantees the new token's iat is past it.
+const SIGNED_OUT_REMINT_DELAY_MS = 1_000;
+
+export function setFreshCredentialGetter(getter: CredentialGetter | null) {
+  freshCredentialGetter = getter;
+}
 
 const UI_SESSION_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -237,6 +296,17 @@ function getResponseDetail(data: unknown): string | undefined {
   return undefined;
 }
 
+function getResponseErrorCode(data: unknown): string | undefined {
+  if (data && typeof data === "object" && "detail" in data) {
+    const detail = (data as { detail?: unknown }).detail;
+    if (detail && typeof detail === "object" && "error_code" in detail) {
+      const errorCode = (detail as { error_code?: unknown }).error_code;
+      return typeof errorCode === "string" ? errorCode : undefined;
+    }
+  }
+  return undefined;
+}
+
 clients.forEach((instance) => {
   instance.interceptors.response.use(
     (response) => {
@@ -246,12 +316,39 @@ clients.forEach((instance) => {
       return response;
     },
     async (error) => {
+      if (isForwardingAccessDenied(error)) return Promise.reject(error);
       if (axios.isAxiosError(error)) {
         const statusCode = error.response?.status;
         const detail = getResponseDetail(error.response?.data);
+        const isOrganizationAdminDenial =
+          getResponseErrorCode(error.response?.data) ===
+          "organization_admin_required";
         const retryConfig = error.config as UISessionRetryConfig | undefined;
         if (
-          (statusCode === 401 || statusCode === 403) &&
+          statusCode === 403 &&
+          detail === SIGNED_OUT_DETAIL &&
+          retryConfig &&
+          !retryConfig.signedOutRetry &&
+          freshCredentialGetter
+        ) {
+          retryConfig.signedOutRetry = true;
+          await new Promise((resolve) =>
+            setTimeout(resolve, SIGNED_OUT_REMINT_DELAY_MS),
+          );
+          // A sign-out clears the getter; one during the wait or the mint must not install a token past its cutoff.
+          const getFreshCredential = freshCredentialGetter;
+          const credential = getFreshCredential
+            ? await getFreshCredential().catch(() => null)
+            : null;
+          if (credential && freshCredentialGetter === getFreshCredential) {
+            setAuthorizationHeader(credential);
+            retryConfig.headers.set("Authorization", `Bearer ${credential}`);
+            return await instance.request(retryConfig);
+          }
+        }
+        if (
+          (statusCode === 401 ||
+            (statusCode === 403 && !isOrganizationAdminDenial)) &&
           retryConfig &&
           !retryConfig.uiSessionRetry
         ) {
@@ -266,7 +363,7 @@ clients.forEach((instance) => {
         }
         const isAuthFailure =
           statusCode === 401 ||
-          statusCode === 403 ||
+          (statusCode === 403 && !isOrganizationAdminDenial) ||
           (statusCode === 404 && detail === "Organization not found");
 
         if (statusCode && isAuthFailure) {
@@ -296,14 +393,6 @@ function removeHeaderForAllClients(header: string) {
     delete instance.defaults.headers.common[header];
     delete (instance.defaults.headers as Record<string, unknown>)[header];
   });
-}
-
-export function setPostHogAttributionHeader(value: string | undefined) {
-  if (value) {
-    setHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER, value);
-  } else {
-    removeHeaderForAllClients(POSTHOG_ATTRIBUTION_HEADER);
-  }
 }
 
 export function setAuthorizationHeader(token: string) {
@@ -390,5 +479,31 @@ async function getClientWithRequestHeaders(
 }
 
 export type CredentialGetter = () => Promise<string | null>;
+
+// A keepalive request is the one kind the browser finishes after the page is gone; an Axios call
+// started during page teardown is cancelled with it.
+export async function deleteUploadedFileOnPageExit(
+  fileId: string,
+): Promise<boolean> {
+  const headers: Record<string, string> = { "x-user-agent": "skyvern-ui" };
+  const authorization =
+    clientSansApiV1.defaults.headers.common["Authorization"];
+  if (typeof authorization === "string") {
+    headers.Authorization = authorization;
+  }
+  const apiKey = getRuntimeApiKey();
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey;
+  }
+  try {
+    const response = await fetch(
+      `${apiSansApiV1BaseUrl}/files/${encodeURIComponent(fileId)}`,
+      { method: "DELETE", headers, keepalive: true },
+    );
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
 
 export { artifactApiClient, getClient, getClientWithRequestHeaders };

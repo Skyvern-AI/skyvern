@@ -7,7 +7,9 @@ from typing import Any
 import httpx
 import pytest
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.services import google_sheets_service
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 TransportInstaller = Callable[[Callable[[httpx.Request], httpx.Response]], None]
 
@@ -316,6 +318,81 @@ class TestHeaders:
 
 class TestGridProperties:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "merges",
+        [
+            None,
+            [{"sheetId": 7, "startRowIndex": 900, "endRowIndex": 902, "startColumnIndex": 24, "endColumnIndex": 26}],
+        ],
+    )
+    async def test_complete_merges_include_blank_grid_regions(
+        self, mock_sheets_transport: TransportInstaller, merges: list[dict[str, int]] | None
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert "ranges" not in request.url.params
+            assert "merges" in request.url.params["fields"]
+            sheet: dict[str, Any] = {
+                "properties": {"sheetId": 7, "title": "Target", "gridProperties": {"columnCount": 26, "rowCount": 1000}}
+            }
+            if merges is not None:
+                sheet["merges"] = merges
+            return httpx.Response(200, json={"sheets": [sheet]})
+
+        mock_sheets_transport(handler)
+        grid = await google_sheets_service.get_sheet_grid_properties(
+            access_token="synthetic-token",
+            spreadsheet_id="1AbCdEfGhIjKlMnOpQrSt_12345",
+            sheet_title="Target",
+            include_merges=True,
+        )
+        assert grid is not None
+        assert grid.merges_complete is True
+        assert grid.merges == (merges or [])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            None,
+            {},
+            ["invalid"],
+            [{"sheetId": 8}],
+            [{"sheetId": 7, "startRowIndex": True}],
+            [{"sheetId": 7, "startRowIndex": -1}],
+            [{"sheetId": 7, "endRowIndex": 1001}],
+            [{"sheetId": 7, "startColumnIndex": 3, "endColumnIndex": 3}],
+        ],
+    )
+    async def test_requested_malformed_merges_fail_closed(
+        self, mock_sheets_transport: TransportInstaller, malformed: Any
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "sheets": [
+                        {
+                            "properties": {
+                                "sheetId": 7,
+                                "title": "Target",
+                                "gridProperties": {"columnCount": 26, "rowCount": 1000},
+                            },
+                            "merges": malformed,
+                        }
+                    ]
+                },
+            )
+
+        mock_sheets_transport(handler)
+        grid = await google_sheets_service.get_sheet_grid_properties(
+            access_token="synthetic-token",
+            spreadsheet_id="1AbCdEfGhIjKlMnOpQrSt_12345",
+            sheet_title="Target",
+            include_merges=True,
+        )
+        assert grid is None
+
+    @pytest.mark.asyncio
     async def test_get_sheet_grid_properties_returns_dimensions(
         self, mock_sheets_transport: TransportInstaller
     ) -> None:
@@ -418,7 +495,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -447,7 +524,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -476,7 +553,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         frozen_now = datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -518,7 +595,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             sleeps.append(delay)
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -546,7 +623,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             return None
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
@@ -570,7 +647,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             return None
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("connection refused", request=request)
@@ -594,7 +671,7 @@ class TestRetry:
         async def fake_sleep(delay: float) -> None:
             return None
 
-        monkeypatch.setattr(google_sheets_service.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(google_sheets_service, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(503, json={"error": {"message": "upstream down"}})
@@ -646,6 +723,46 @@ class TestRuntime:
         assert payload["updates"]["updatedRows"] == 1
         assert captured["path"].endswith(":append")
         assert captured["params"]["valueInputOption"] == "USER_ENTERED"
+        assert captured["params"]["insertDataOption"] == "INSERT_ROWS"
+
+    @pytest.mark.asyncio
+    async def test_values_append_wrapper_forwards_the_insert_data_option(
+        self, mock_sheets_transport: TransportInstaller
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"updates": {"updatedRows": 1}})
+
+        mock_sheets_transport(handler)
+        await AgentFunction().google_sheets_values_append(
+            access_token="tok",
+            spreadsheet_id="1abc_xyz_1234567890ABCDEF",
+            range_="Sheet1!C63",
+            values=[["a"]],
+            insert_data_option="OVERWRITE",
+        )
+        assert captured["params"]["insertDataOption"] == "OVERWRITE"
+
+    @pytest.mark.asyncio
+    async def test_values_append_wrapper_defaults_to_inserting_rows(
+        self, mock_sheets_transport: TransportInstaller
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"updates": {"updatedRows": 1}})
+
+        mock_sheets_transport(handler)
+        await AgentFunction().google_sheets_values_append(
+            access_token="tok",
+            spreadsheet_id="1abc_xyz_1234567890ABCDEF",
+            range_="Sheet1",
+            values=[["a"]],
+        )
+        assert captured["params"]["insertDataOption"] == "INSERT_ROWS"
 
     @pytest.mark.asyncio
     async def test_batch_update_sends_requests(self, mock_sheets_transport: TransportInstaller) -> None:

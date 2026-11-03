@@ -10,6 +10,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from skyvern._cli_bootstrap import mark_cli_command
+from skyvern.cli.core.guards import STALE_FRAME_HINT, stale_frame_selection_in
 from skyvern.cli.core.telemetry import capture_cli_tool_call
 
 console = Console()
@@ -59,7 +61,10 @@ def output_error(
     action: str = "",
     json_mode: bool = False,
     exit_code: int = 1,
+    exc: BaseException | None = None,
 ) -> NoReturn:
+    if stale_frame_selection_in(exc):
+        hint = STALE_FRAME_HINT
     if json_mode:
         envelope: dict[str, Any] = {
             "schema_version": ENVELOPE_SCHEMA_VERSION,
@@ -127,6 +132,7 @@ def run_tool(
     telemetry_tool_name: str | None = None,
 ) -> None:
     """Run an async MCP tool and emit the result."""
+    mark_cli_command()
     try:
         result: dict[str, Any] = asyncio.run(runner())
         emit_tool_result(result, json_output=json_output, telemetry_tool_name=telemetry_tool_name)
@@ -135,7 +141,7 @@ def run_tool(
     except Exception as e:
         if telemetry_tool_name is not None:
             capture_cli_tool_call(telemetry_tool_name, ok=False, error=e)
-        output_error(str(e), hint=hint_on_exception, action=action, json_mode=json_output)
+        output_error(str(e), hint=hint_on_exception, action=action, json_mode=json_output, exc=e)
 
 
 def resolve_inline_or_file(value: str | None, *, param_name: str) -> str | None:

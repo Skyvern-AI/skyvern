@@ -1,6 +1,9 @@
 import { describe, test, expect } from "vitest";
-import { areBlocksIdentical } from "./compareBlocks";
+import { diffBlockFields } from "./compareBlocks";
 import { WorkflowBlock } from "../types/workflowTypes";
+
+const areBlocksIdentical = (a: WorkflowBlock, b: WorkflowBlock) =>
+  diffBlockFields(a, b).length === 0;
 
 function makeOutputParameter(id: string) {
   return {
@@ -52,9 +55,40 @@ function makeTaskBlock(overrides: Record<string, unknown> = {}): WorkflowBlock {
   } as unknown as WorkflowBlock;
 }
 
-describe("areBlocksIdentical", () => {
+describe("diffBlockFields", () => {
   test("identical blocks compare equal", () => {
     expect(areBlocksIdentical(makeTaskBlock(), makeTaskBlock())).toBe(true);
+  });
+
+  test("a server dump and canvas data of the same block compare equal, per block type's defaults", () => {
+    const extraction = (overrides: Record<string, unknown>) =>
+      makeTaskBlock({ block_type: "extraction", ...overrides });
+    expect(
+      areBlocksIdentical(
+        extraction({ include_extracted_text: false }),
+        extraction({ include_extracted_text: undefined }),
+      ),
+    ).toBe(true);
+    expect(
+      areBlocksIdentical(
+        extraction({ complete_verification: false }),
+        extraction({ complete_verification: undefined }),
+      ),
+    ).toBe(true);
+    const download = (overrides: Record<string, unknown>) =>
+      makeTaskBlock({ block_type: "file_download", ...overrides });
+    expect(
+      areBlocksIdentical(
+        download({
+          complete_on_download: true,
+          include_action_history_in_verification: true,
+        }),
+        download({
+          complete_on_download: undefined,
+          include_action_history_in_verification: undefined,
+        }),
+      ),
+    ).toBe(true);
   });
 
   test("different output_parameter IDs do not flip blocks to modified", () => {

@@ -1,5 +1,6 @@
 """Tests for prompt-based conditional branch evaluation behavior."""
 
+import copy
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -13,6 +14,8 @@ from skyvern.exceptions import BranchEvaluationContextTooLargeError, Conditional
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
@@ -26,9 +29,11 @@ from skyvern.forge.sdk.workflow.models.block import (
     _make_empty_params_explicit,
     _neutralize_jinja_delimiters,
 )
-from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus
+from skyvern.utils.token_counter import count_tokens
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON = (
@@ -357,6 +362,232 @@ async def test_branch_goal_above_reserved_budget_trips_before_extraction() -> No
             )
 
     mock_extraction_cls.assert_not_called()
+
+
+def _prompt_conditional(label: str) -> ConditionalBlock:
+    return ConditionalBlock(
+        label=label,
+        output_parameter=_output_parameter(f"{label}_output"),
+        branch_conditions=[
+            BranchCondition(
+                criteria=PromptBranchCriteria(expression="the customer is on the premium plan"),
+                next_block_label=f"{label}_matched",
+            ),
+            BranchCondition(is_default=True, next_block_label=f"{label}_default"),
+        ],
+    )
+
+
+def _run_context(*blocks: ConditionalBlock) -> WorkflowRunContext:
+    now = datetime.now(UTC)
+    return WorkflowRunContext(
+        workflow_title="wf",
+        workflow_id="wf",
+        workflow_permanent_id="wpid",
+        workflow_run_id="wr",
+        aws_client=MagicMock(),
+        workflow=Workflow(
+            workflow_id="wf",
+            organization_id="org",
+            title="wf",
+            workflow_permanent_id="wpid",
+            version=1,
+            is_saved_task=False,
+            workflow_definition=WorkflowDefinition(parameters=[], blocks=list(blocks)),
+            created_at=now,
+            modified_at=now,
+        ),
+    )
+
+
+_EVALUATION_REASONING = "reasoning-marker: the stored plan is premium"
+
+
+async def _execute_prompt_conditional(block: ConditionalBlock, run_context: WorkflowRunContext) -> dict:
+    """Run the block against a real run context; only the model call and the database write are faked."""
+
+    async def _condition_is_true(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        return _extraction_result(
+            self.output_parameter,
+            [{"condition_index": 1, "reasoning": _EVALUATION_REASONING, "result": True}],
+        )
+
+    with (
+        patch.object(ExtractionBlock, "execute", _condition_is_true),
+        patch.object(
+            block_module.app.WORKFLOW_CONTEXT_MANAGER,
+            "get_workflow_run_context",
+            new=MagicMock(return_value=run_context),
+        ),
+        patch.object(
+            block_module.app.DATABASE.workflow_runs,
+            "create_or_update_workflow_run_output_parameter",
+            new=AsyncMock(),
+        ),
+        patch.object(ConditionalBlock, "build_block_result", new_callable=AsyncMock) as mock_build_result,
+    ):
+        await block.execute(workflow_run_id="wr", workflow_run_block_id="wrb", organization_id="org")
+    return mock_build_result.await_args.kwargs
+
+
+@pytest.mark.parametrize(
+    ("output_share_of_budget", "expected_branch", "expected_evaluation_error"),
+    [
+        pytest.param(0.6, "cond_2_matched", None, id="one-copy-fits"),
+        pytest.param(1.2, "cond_2_default", BRANCH_CONTEXT_TOO_LARGE_FAILURE_REASON, id="one-copy-too-large"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_prior_block_output_counts_once_against_the_branch_context_budget(
+    output_share_of_budget: float, expected_branch: str, expected_evaluation_error: str | None
+) -> None:
+    cond_1, cond_2 = _prompt_conditional("cond_1"), _prompt_conditional("cond_2")
+    run_context = _run_context(cond_1, cond_2)
+    await _execute_prompt_conditional(cond_1, run_context)
+    row = "invoice 1042 paid in full; "
+    tokens_per_row = count_tokens(row * 100) / 100
+    row_count = int(output_share_of_budget * block_module.BRANCH_EVALUATION_GOAL_MAX_TOKENS / tokens_per_row)
+    await run_context.register_output_parameter_value_post_execution(
+        _output_parameter("invoices_output"), {"extracted_information": {"rows": row * row_count}}
+    )
+
+    result = await _execute_prompt_conditional(cond_2, run_context)
+
+    assert result["status"] == BlockStatus.completed
+    assert result["executed_branch_next_block"] == expected_branch
+    assert result["output_parameter_value"].get("evaluation_error") == expected_evaluation_error
+
+
+@pytest.mark.asyncio
+async def test_branch_context_snapshot_holds_each_output_once_and_no_earlier_evaluation_payload() -> None:
+    cond_1 = _prompt_conditional("cond_1")
+    run_context = _run_context(cond_1, _prompt_conditional("cond_2"))
+    # Present while cond_1 evaluates, so the prompt cond_1 stores embeds it.
+    run_context.values["plan"] = "plan-marker-premium"
+    await _execute_prompt_conditional(cond_1, run_context)
+    # Not a conditional: a field that shares a name with a conditional's debug field is this block's data.
+    lookup_output = {"status": "paid", "evaluations": ["manual review passed"]}
+    for label in ("first_lookup", "second_lookup"):
+        await run_context.register_output_parameter_value_post_execution(
+            _output_parameter(f"{label}_output"), lookup_output
+        )
+    values_before = copy.deepcopy(run_context.values)
+
+    snapshot = BranchEvaluationContext(
+        workflow_run_context=run_context, block_label="cond_2"
+    ).build_llm_safe_context_snapshot()
+
+    # Two different blocks with equal outputs both stay; each is listed once, findable by its label.
+    assert {key: value for key, value in snapshot.items() if "lookup" in key} == {
+        "first_lookup_output": lookup_output,
+        "second_lookup_output": lookup_output,
+    }
+    assert [key for key in snapshot if key.startswith("cond_1")] == ["cond_1_output"]
+    # What a later condition can refer to survives: which branch the earlier conditional took.
+    assert snapshot["cond_1_output"]["branch_taken"] == "cond_1_matched"
+    assert snapshot["cond_1_output"]["branch_index"] == 0
+    assert snapshot["cond_1_output"]["criteria_expression"] == "the customer is on the premium plan"
+    # Its stored prompt, raw response and per-branch detail do not.
+    assert not {"llm_prompt", "llm_response", "evaluations"} & snapshot["cond_1_output"].keys()
+    serialized = json.dumps(snapshot, default=str)
+    assert serialized.count("plan-marker-premium") == 1
+    assert _EVALUATION_REASONING not in serialized
+    # Only the snapshot changes: templates still resolve both names against the untouched run context.
+    assert run_context.values == values_before
+    assert _EVALUATION_REASONING in json.dumps(run_context.values["cond_1"], default=str)
+
+
+@pytest.mark.asyncio
+async def test_branch_context_snapshot_deduplicates_carried_outputs_and_strips_carried_conditional_debug() -> None:
+    now = datetime.now(UTC)
+    conditional_output = {
+        "branch_taken": "prior_matched",
+        "llm_prompt": "stored prompt",
+        "llm_response": "stored response",
+        "evaluations": [{"reasoning": "stored detail"}],
+    }
+    plain_output = {"status": "paid", "evaluations": ["manual review passed"]}
+    workflow = _run_context(_prompt_conditional("prior")).workflow
+    assert workflow is not None
+    run_context = await WorkflowRunContext.init(
+        aws_client=MagicMock(),
+        organization=Organization(organization_id="org", organization_name="test", created_at=now, modified_at=now),
+        workflow_run_id="wr",
+        workflow_title="wf",
+        workflow_id="wf",
+        workflow_permanent_id="wpid",
+        workflow_parameter_tuples=[],
+        workflow_output_parameters=[],
+        context_parameters=[],
+        secret_parameters=[],
+        block_outputs={"prior": conditional_output, "lookup": plain_output},
+        workflow=workflow,
+    )
+
+    snapshot = BranchEvaluationContext(workflow_run_context=run_context).build_llm_safe_context_snapshot()
+
+    assert run_context.workflow_run_outputs == {}
+    assert run_context.carried_block_labels == {"prior", "lookup"}
+    assert snapshot["prior_output"] == {"branch_taken": "prior_matched"}
+    assert snapshot["lookup_output"] == plain_output
+    assert not {"prior", "lookup"} & snapshot.keys()
+    assert run_context.values["prior"] == conditional_output
+
+
+@pytest.mark.asyncio
+async def test_branch_context_snapshot_strips_only_recorded_conditional_outputs_and_keeps_declared_keys() -> None:
+    """A conditional's output is known by its recorded output key and alias, not by a label a parameter may
+    share; a declared parameter is the author's whatever its name."""
+    now = datetime.now(UTC)
+
+    def _declare(key: str, value: object) -> None:
+        run_context.parameters[key] = WorkflowParameter(
+            key=key,
+            workflow_parameter_id=f"wp_{key}",
+            workflow_parameter_type=WorkflowParameterType.STRING,
+            workflow_id="wf",
+            created_at=now,
+            modified_at=now,
+        )
+        run_context.values[key] = value
+
+    conditional = _prompt_conditional("cond")
+    conditional.output_parameter = _output_parameter("decision_output")
+    run_context = _run_context(conditional, _prompt_conditional("pending"))
+    _declare("prompt_branch_eval_flag", "yes")
+    # A parameter that shares the not-yet-run conditional's label: author data, kept whole.
+    _declare("pending", {"llm_prompt": "author text", "answer": 1})
+    await _execute_prompt_conditional(conditional, run_context)
+
+    snapshot = BranchEvaluationContext(
+        workflow_run_context=run_context, block_label="next"
+    ).build_llm_safe_context_snapshot()
+
+    assert snapshot["prompt_branch_eval_flag"] == "yes"
+    assert [key for key in snapshot if key.startswith("prompt_branch_eval_")] == ["prompt_branch_eval_flag"]
+    assert snapshot["pending"] == {"llm_prompt": "author text", "answer": 1}
+    assert "decision" not in snapshot
+    assert snapshot["decision_output"]["branch_taken"] == "cond_matched"
+    assert not {"llm_prompt", "llm_response", "evaluations"} & snapshot["decision_output"].keys()
+
+
+@pytest.mark.asyncio
+async def test_branch_context_snapshot_keeps_a_block_reference_that_differs_from_its_output() -> None:
+    """A block that ran in two loop iterations: `<label>` merges both passes, `<label>_output` is the last."""
+    run_context = _run_context()
+    await run_context.register_output_parameter_value_post_execution(
+        _output_parameter("step_output"), {"first_pass": "a"}
+    )
+    await run_context.register_output_parameter_value_post_execution(
+        _output_parameter("step_output"), {"second_pass": "b"}
+    )
+
+    snapshot = BranchEvaluationContext(
+        workflow_run_context=run_context, block_label="cond"
+    ).build_llm_safe_context_snapshot()
+
+    assert snapshot["step"] == {"first_pass": "a", "second_pass": "b"}
+    assert snapshot["step_output"] == {"second_pass": "b"}
 
 
 @pytest.mark.asyncio

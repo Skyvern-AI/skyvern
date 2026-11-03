@@ -57,6 +57,31 @@ async def test_read_blob_url_bytes_returns_bytes_within_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_blob_url_bytes_and_content_type_preserves_blob_mime_type() -> None:
+    page = MagicMock()
+    main_frame = MagicMock()
+    page.main_frame = main_frame
+    payload = b"<html><body>report</body></html>"
+    eval_mock = AsyncMock(
+        return_value={
+            "ok": True,
+            "base64": base64.b64encode(payload).decode(),
+            "contentType": "text/html",
+        }
+    )
+
+    with (
+        patch(f"{_MOD}._frames_for_blob_origin", return_value=[main_frame]),
+        patch(f"{_MOD}.evaluate_in_main_world", new=eval_mock),
+    ):
+        result = await SkyvernFrame.read_blob_url_bytes_and_content_type(
+            page=page, blob_url="blob:https://example.com/report", max_size_bytes=1024
+        )
+
+    assert result == (payload, "text/html")
+
+
+@pytest.mark.asyncio
 async def test_read_blob_url_bytes_returns_empty_bytes_for_zero_byte_blob() -> None:
     page = MagicMock()
     main_frame = MagicMock()

@@ -45,7 +45,9 @@ import {
   useBrowserStreamingMode,
 } from "@/hooks/useRuntimeConfig";
 import {
+  EXTERNAL_BROWSER_DIAGNOSTIC,
   StreamModeBadge,
+  StreamStatusPanel,
   type StreamMode,
 } from "@/routes/streaming/StreamDiagnostics";
 
@@ -154,6 +156,8 @@ function BrowserSession() {
   });
 
   const browserSession = query.data;
+  // A registered external browser has no stream; without this the global mode would mount one the server refuses.
+  const isExternal = browserSession?.source === "external";
   const { showControls, isSavingProfile, showCloseSession } =
     getSessionControlsState({
       browserSessionId,
@@ -161,13 +165,14 @@ function BrowserSession() {
       savingProfileSessionId: activeProfileCreate?.browserSessionId,
     });
   const isCdpMode =
+    !isExternal &&
     resolveStreamTransport(
       browserStreamingMode,
       browserSession?.stream_transport,
     ) === "cdp";
   const streamMode: StreamMode = isCdpMode
     ? "cdp"
-    : browserSession?.vnc_streaming_supported
+    : browserSession?.vnc_streaming_supported && !isExternal
       ? vncFailed
         ? "fallback"
         : "vnc"
@@ -175,6 +180,7 @@ function BrowserSession() {
 
   const closeBrowserSessionMutation = useCloseBrowserSessionMutation({
     browserSessionId,
+    external: isExternal,
     onSuccess: () => {
       setIsDialogOpen(false);
     },
@@ -267,37 +273,39 @@ function BrowserSession() {
 
           {showControls && (
             <div className="ml-auto flex flex-shrink-0 items-center gap-1 pb-1">
-              <Button
-                variant="ghost"
-                size="sm"
-                className={cn(
-                  "h-7 px-2 text-xs text-slate-300",
-                  isSavingProfile
-                    ? "cursor-not-allowed"
-                    : "hover:text-foreground",
-                )}
-                onClick={() => {
-                  if (isSavingProfile) {
-                    return;
+              {!isExternal && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={cn(
+                    "h-7 px-2 text-xs text-slate-300",
+                    isSavingProfile
+                      ? "cursor-not-allowed"
+                      : "hover:text-foreground",
+                  )}
+                  onClick={() => {
+                    if (isSavingProfile) {
+                      return;
+                    }
+                    setIsSaveProfileDialogOpen(true);
+                  }}
+                  // `disabled` would pull in the button base's
+                  // disabled:pointer-events-none (killing the title tooltip) and
+                  // disabled:opacity-50 (dimming the only in-progress feedback to
+                  // 3.9:1, under the 4.5:1 AA floor).
+                  aria-disabled={isSavingProfile}
+                  title={
+                    isSavingProfile ? "Saving profile — please wait" : undefined
                   }
-                  setIsSaveProfileDialogOpen(true);
-                }}
-                // `disabled` would pull in the button base's
-                // disabled:pointer-events-none (killing the title tooltip) and
-                // disabled:opacity-50 (dimming the only in-progress feedback to
-                // 3.9:1, under the 4.5:1 AA floor).
-                aria-disabled={isSavingProfile}
-                title={
-                  isSavingProfile ? "Saving profile — please wait" : undefined
-                }
-              >
-                {isSavingProfile ? (
-                  <ReloadIcon className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <BrowserIcon className="mr-1.5 h-3.5 w-3.5" />
-                )}
-                {isSavingProfile ? "Saving…" : "Save Profile"}
-              </Button>
+                >
+                  {isSavingProfile ? (
+                    <ReloadIcon className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <BrowserIcon className="mr-1.5 h-3.5 w-3.5" />
+                  )}
+                  {isSavingProfile ? "Saving…" : "Save Profile"}
+                </Button>
+              )}
               {showCloseSession && (
                 <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
                   <TooltipProvider>
@@ -307,22 +315,29 @@ function BrowserSession() {
                           <Button
                             variant="ghost"
                             size="icon"
-                            aria-label="Close browser session"
+                            aria-label={
+                              isExternal
+                                ? "Disconnect from browser"
+                                : "Close browser session"
+                            }
                             className="h-7 w-7 text-slate-300 hover:bg-red-500/15 hover:text-red-300"
                           >
                             <Cross2Icon className="h-3.5 w-3.5" />
                           </Button>
                         </DialogTrigger>
                       </TooltipTrigger>
-                      <TooltipContent>Close</TooltipContent>
+                      <TooltipContent>
+                        {isExternal ? "Disconnect" : "Close"}
+                      </TooltipContent>
                     </Tooltip>
                   </TooltipProvider>
                   <DialogContent>
                     <DialogHeader>
                       <DialogTitle>Are you sure?</DialogTitle>
                       <DialogDescription>
-                        Are you sure you want to stop (shut down) this browser
-                        session?
+                        {isExternal
+                          ? "Skyvern will disconnect from this browser. The browser itself keeps running."
+                          : "Are you sure you want to stop (shut down) this browser session?"}
                       </DialogDescription>
                     </DialogHeader>
                     <DialogFooter>
@@ -339,7 +354,7 @@ function BrowserSession() {
                         {closeBrowserSessionMutation.isPending && (
                           <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                         )}
-                        Stop Browser Session
+                        {isExternal ? "Disconnect" : "Stop Browser Session"}
                       </Button>
                     </DialogFooter>
                   </DialogContent>
@@ -359,6 +374,9 @@ function BrowserSession() {
               pointerEvents: activeTab === "stream" ? "auto" : "none",
             }}
           >
+            {isExternal && (
+              <StreamStatusPanel diagnostic={EXTERNAL_BROWSER_DIAGNOSTIC} />
+            )}
             {(isCdpMode || vncFailed) && browserSessionId && (
               <BrowserSessionStream
                 browserSessionId={browserSessionId}
@@ -369,17 +387,16 @@ function BrowserSession() {
                 onFrameWidthChange={setPreviewWidth}
               />
             )}
-            {!isCdpMode &&
-              browserSession.vnc_streaming_supported &&
-              !vncFailed && (
-                <BrowserStream
-                  browserSessionId={browserSessionId}
-                  interactive={false}
-                  showControlButtons={true}
-                  isVisible={activeTab === "stream"}
-                  onClose={() => setVncFailed(true)}
-                />
-              )}
+            {streamMode === "vnc" && (
+              <BrowserStream
+                browserSessionId={browserSessionId}
+                browserSession={browserSession}
+                interactive={false}
+                showControlButtons={true}
+                isVisible={activeTab === "stream"}
+                onClose={() => setVncFailed(true)}
+              />
+            )}
           </div>
           <div
             className="absolute left-0 top-0 h-full w-full"

@@ -8,12 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from agents.agent import Agent, AgentBase
+from agents.exceptions import AgentsException
 from agents.items import ModelResponse, TResponseInputItem
 from agents.lifecycle import RunHooksBase
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.tool import Tool
+from agents.tool_context import ToolContext
 
 from skyvern.forge.sdk.copilot.browser_ablation import prompt_sha256
+from skyvern.forge.sdk.copilot.context import REPLY_TOOL_NAME
 from skyvern.forge.sdk.copilot.credential_pause import arm_credential_pause_gate
 from skyvern.forge.sdk.copilot.enforcement import (
     gate_decision_trace_fields,
@@ -26,6 +29,7 @@ from skyvern.forge.sdk.copilot.turn_halt import (
     raise_if_turn_halt,
     stash_turn_halt_from_blocker_signal,
 )
+from skyvern.forge.sdk.integrations.catalog import listed_oauth_accounts
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -36,7 +40,18 @@ LOG = structlog.get_logger()
 # entry as a short preview. This is a hooks-side concern (what to record),
 # not a registry of the tools themselves.
 _BLOCK_OUTPUT_TOOLS: frozenset[str] = frozenset(
-    {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks", "edit_block_and_run"}
+    {
+        "run_blocks_and_collect_debug",
+        "get_run_results",
+        "update_and_run_blocks",
+        "edit_block_and_run",
+        "test_workflow_from_blank_browser",
+    }
+)
+# The tools that dispatch a build test. Counted per model response so the acquisition seam can tell
+# a stale run of an earlier turn from a sibling call the same response is running right now.
+_BUILD_TEST_DISPATCH_TOOLS: frozenset[str] = frozenset(
+    {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run", "test_workflow_from_blank_browser"}
 )
 _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
     {
@@ -59,7 +74,12 @@ def _copilot_log_fields(ctx: CopilotContext) -> dict[str, str | None]:
 
 
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
-    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks", "edit_block_and_run"}:
+    if tool_name not in {
+        "run_blocks_and_collect_debug",
+        "update_and_run_blocks",
+        "edit_block_and_run",
+        "test_workflow_from_blank_browser",
+    }:
         return False
     if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
         return False
@@ -85,10 +105,14 @@ class CopilotRunHooks(RunHooksBase):
         system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
+        self._ctx.model_call_in_flight = True
+        self._ctx.model_call_streamed_tool_call = False
+        self._ctx.last_model_response = None
         try:
             self._ctx.model_calls_this_turn += 1
             if self._ctx.eval_mode == "browser_ablation" and isinstance(system_prompt, str):
                 self._ctx.eval_prompt_sha256 = prompt_sha256(system_prompt)
+            self._ctx.open_step_run_ids.clear()
         except Exception:
             LOG.warning(
                 "CopilotRunHooks.on_llm_start counting failed",
@@ -96,12 +120,23 @@ class CopilotRunHooks(RunHooksBase):
             )
 
     async def on_llm_end(self, context: RunContextWrapper, agent: Agent, response: ModelResponse) -> None:
+        self._ctx.model_call_in_flight = False
+        self._ctx.last_model_response = response
+        self._ctx.proposal_adoptions_seen_by_model = self._ctx.proposal_adoptions
+        if self._ctx.check_model_work_deadline is not None:
+            self._ctx.check_model_work_deadline()
         try:
-            if any(getattr(item, "name", None) == "request_credential" for item in response.output):
+            called = [getattr(item, "name", None) for item in response.output]
+            # Counted before the credential gate: a gate that raises would otherwise leave the
+            # previous response's count standing, and the acquisition seam reads it as this one's.
+            self._ctx.build_test_tool_calls_in_model_response = sum(
+                1 for name in called if name in _BUILD_TEST_DISPATCH_TOOLS
+            )
+            if "request_credential" in called:
                 arm_credential_pause_gate(self._ctx)
         except Exception:
             LOG.warning(
-                "CopilotRunHooks.on_llm_end credential gate arming failed",
+                "CopilotRunHooks.on_llm_end response accounting failed",
                 **_copilot_log_fields(self._ctx),
             )
 
@@ -114,13 +149,30 @@ class CopilotRunHooks(RunHooksBase):
                 **_copilot_log_fields(self._ctx),
             )
 
-    async def on_tool_end(
+    async def on_tool_start(
         self,
         context: RunContextWrapper,
+        agent: AgentBase,
+        tool: Tool,
+    ) -> None:
+        # A reply is the turn's answer, not work the turn did: like a text reply it is not counted as a tool call.
+        if tool.name == REPLY_TOOL_NAME:
+            return
+        # Retry safety depends on this monotonic fact, so record it before the
+        # tool executes and outside the best-effort activity-summary path.
+        self._ctx.tool_calls_this_turn += 1
+
+    async def on_tool_end(
+        self,
+        context: ToolContext[CopilotContext],
         agent: Agent,
         tool: Tool,
         result: Any,
     ) -> None:
+        if tool.name == REPLY_TOOL_NAME:
+            return
+        if self._ctx.check_model_work_deadline is not None:
+            self._ctx.check_model_work_deadline()
         # Activity recording is observability -- a malformed tool result or an
         # unserializable block output must not propagate into the agent loop
         # and kill the whole run.
@@ -147,9 +199,10 @@ class CopilotRunHooks(RunHooksBase):
                 exact = data.get("credential") if isinstance(data, dict) else None
                 if not listed and isinstance(exact, dict):
                     listed = [exact]
+                vault_logins = data.get("vault_logins") if isinstance(data, dict) else None
                 resolved = [
                     {"credential_id": c.get("credential_id"), "name": c.get("name")}
-                    for c in listed
+                    for c in [*listed, *(vault_logins if isinstance(vault_logins, list) else [])]
                     if isinstance(c, dict) and isinstance(c.get("credential_id"), str)
                 ]
                 if resolved:
@@ -158,23 +211,28 @@ class CopilotRunHooks(RunHooksBase):
             if tool_name == "list_integrations" and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 listed = data.get("integrations", []) if isinstance(data, dict) else []
-                if not isinstance(listed, list):
-                    listed = []
                 integrations = [
                     {
-                        "connection_id": integration.get("connection_id"),
-                        "provider": integration.get("provider"),
-                        "state": integration.get("state"),
-                        "scopes_granted": integration.get("scopes_granted"),
+                        "connection_id": account["connection_id"],
+                        "provider": account["provider"],
+                        "state": account.get("state"),
+                        "scopes_granted": account.get("scopes_granted"),
                     }
-                    for integration in listed
-                    if isinstance(integration, dict)
-                    and isinstance(integration.get("connection_id"), str)
-                    and isinstance(integration.get("provider"), str)
-                    and isinstance(integration.get("state"), str)
-                    and isinstance(integration.get("scopes_granted"), list)
+                    for account in listed_oauth_accounts(listed if isinstance(listed, list) else [])
+                    if isinstance(account.get("state"), str) and isinstance(account.get("scopes_granted"), list)
                 ]
                 activity_entry["integrations"] = integrations
+
+            if tool_name == "read_google_sheet" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                rows = data.get("connections", []) if isinstance(data, dict) else []
+                activity_entry["opened_connection_ids"] = [
+                    row["connection_id"]
+                    for row in (rows if isinstance(rows, list) else [])
+                    if isinstance(row, dict)
+                    and row.get("status") == "opened"
+                    and isinstance(row.get("connection_id"), str)
+                ]
 
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}
@@ -183,8 +241,8 @@ class CopilotRunHooks(RunHooksBase):
                     blocks = []
                 output_parts = []
                 for b in blocks:
-                    if b.get("output") or b.get("extracted_data"):
-                        out = b.get("output") or b.get("extracted_data")
+                    if b.get("output") or b.get("extracted_data") or b.get("output_preview"):
+                        out = b.get("output") or b.get("extracted_data") or b.get("output_preview")
                         out_str = json.dumps(out, default=str) if not isinstance(out, str) else out
                         if len(out_str) > 500:
                             out_str = out_str[:500] + "..."
@@ -219,5 +277,24 @@ class CopilotRunHooks(RunHooksBase):
                 else None,
                 **_copilot_log_fields(self._ctx),
             )
+            self._ctx.goal_satisfied_tool_call_id = context.tool_call_id
             self._ctx.goal_satisfied_tool_name = tool_name
             self._ctx.goal_satisfied_tool_output = dict(parsed)
+
+
+class FinalReplyToolRefusedError(AgentsException):
+    pass
+
+
+class FinalReplyRunHooks(CopilotRunHooks):
+    async def on_tool_start(
+        self,
+        context: RunContextWrapper,
+        agent: AgentBase,
+        tool: Tool,
+    ) -> None:
+        if tool.name == REPLY_TOOL_NAME:
+            return
+        # The drain offers only `reply`. The SDK awaits this before it creates the invoke task, so any other
+        # tool that reaches here never runs or counts.
+        raise FinalReplyToolRefusedError(tool.name)

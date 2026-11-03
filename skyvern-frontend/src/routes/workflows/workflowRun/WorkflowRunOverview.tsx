@@ -1,9 +1,16 @@
+import {
+  getRunAttempt,
+  getRunAttemptKey,
+  runIsRetryWaiting,
+  runIsExecuting,
+  runIsLogicallyFinal,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { ActionsApiResponse, Status as WorkflowRunStatus } from "@/api/types";
 import { BrowserStream } from "@/components/BrowserStream";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { ActionScreenshot } from "@/routes/tasks/detail/ActionScreenshot";
-import { statusIsFinalized } from "@/routes/tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
@@ -18,6 +25,7 @@ import { WorkflowRunBlockScreenshot } from "./WorkflowRunBlockScreenshot";
 import { WorkflowRunStream } from "./WorkflowRunStream";
 import { useSearchParams } from "react-router-dom";
 import {
+  filterTimelineToAttempt,
   findActiveItem,
   findTimelineBlock,
   parseActiveIterationParam,
@@ -27,6 +35,11 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { useStreamTransport } from "@/hooks/useRuntimeConfig";
+import {
+  EXTERNAL_BROWSER_DIAGNOSTIC,
+  STREAM_STARTING_DIAGNOSTIC,
+  StreamStatusPanel,
+} from "@/routes/streaming/StreamDiagnostics";
 import { RunHealChip } from "./RunHealChip";
 import { RunReliabilityUplink } from "./RunReliabilityUplink";
 
@@ -43,29 +56,39 @@ export type WorkflowRunOverviewActiveElement =
   | null;
 
 function WorkflowRunOverview() {
+  const { data: workflowRun } = useWorkflowRunWithWorkflowQuery();
+  return (
+    <WorkflowRunOverviewAttempt
+      key={workflowRun ? getRunAttemptKey(workflowRun) : "loading"}
+    />
+  );
+}
+
+function WorkflowRunOverviewAttempt() {
   const [searchParams] = useSearchParams();
   const active = searchParams.get("active");
   const iterationParam = searchParams.get("iteration");
   const activeIteration = parseActiveIterationParam(iterationParam);
   const queryClient = useQueryClient();
   const [vncFailed, setVncFailed] = useState(false);
-  const { data: workflowRun, isLoading: workflowRunIsLoading } =
-    useWorkflowRunWithWorkflowQuery();
+  const {
+    data: workflowRun,
+    isLoading: workflowRunIsLoading,
+    isPlaceholderData: runIsWithheld,
+  } = useWorkflowRunWithWorkflowQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
 
   const workflowRunId = workflowRun?.workflow_run_id;
-  const workflow = workflowRun?.workflow;
-  const workflowPermanentId = workflow?.workflow_permanent_id;
 
   const browserSessionId = workflowRun?.browser_session_id;
-  const { streamTransport } = useStreamTransport(browserSessionId);
+  const { streamTransport, isExternal } = useStreamTransport(browserSessionId);
 
   const invalidateQueries = useCallback(() => {
     if (workflowRunId) {
       queryClient.invalidateQueries({
-        queryKey: ["workflowRun", workflowPermanentId, workflowRunId],
+        queryKey: ["workflowRun", workflowRunId],
       });
       queryClient.invalidateQueries({ queryKey: ["workflowRuns"] });
       queryClient.invalidateQueries({
@@ -73,7 +96,7 @@ function WorkflowRunOverview() {
       });
       queryClient.invalidateQueries({ queryKey: ["runs"] });
     }
-  }, [queryClient, workflowPermanentId, workflowRunId]);
+  }, [queryClient, workflowRunId]);
 
   const handleVncClose = useCallback(() => {
     setVncFailed(true);
@@ -84,7 +107,7 @@ function WorkflowRunOverview() {
     setVncFailed(false);
   }, [browserSessionId]);
 
-  if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
+  if (workflowRunIsLoading || workflowRunTimelineIsLoading || runIsWithheld) {
     return (
       <AspectRatio ratio={16 / 9}>
         <Skeleton className="h-full w-full" />
@@ -96,15 +119,32 @@ function WorkflowRunOverview() {
     return null;
   }
 
+  const retryWaiting = runIsRetryWaiting(workflowRun);
+  if (retryWaiting && (active === null || active === "stream")) {
+    return (
+      <AspectRatio ratio={16 / 9}>
+        <div className="flex h-full items-center justify-center">
+          Retry pending. The browser reconnects when the next attempt starts.
+        </div>
+      </AspectRatio>
+    );
+  }
+
   if (typeof workflowRunTimeline === "undefined") {
     return null;
   }
 
-  const workflowRunIsFinalized = statusIsFinalized(workflowRun);
+  const workflowRunIsFinalized = runIsLogicallyFinal(workflowRun);
   const finallyBlockLabel =
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
   const selection = findActiveItem(
-    workflowRunTimeline,
+    active === null
+      ? filterTimelineToAttempt(
+          workflowRunTimeline,
+          workflowRun?.attempts ?? [],
+          getRunAttempt(workflowRun),
+        )
+      : workflowRunTimeline,
     active,
     workflowRunIsFinalized,
     finallyBlockLabel,
@@ -115,21 +155,29 @@ function WorkflowRunOverview() {
 
   const wantsVncStream = !!(
     browserSessionId &&
-    !workflowRunIsFinalized &&
+    (runIsExecuting(workflowRun) || isPaused) &&
     (selection === "stream" ||
       (isWorkflowRunBlock(selection) &&
         selection.block_type === "human_interaction"))
   );
 
+  const shouldShowExternalPanel = isExternal && wantsVncStream;
+  // Mounting before the session answers would open a VNC socket an external session cannot serve.
+  const isSessionLookupPending =
+    wantsVncStream && streamTransport === undefined;
+  const canMountSessionStream =
+    wantsVncStream && !isSessionLookupPending && !isExternal;
   const shouldUseCdpStream = streamTransport === "cdp";
   const shouldShowBrowserStream =
-    wantsVncStream && !shouldUseCdpStream && !vncFailed;
+    canMountSessionStream && !shouldUseCdpStream && !vncFailed;
   const shouldShowScreencastFallback =
-    wantsVncStream && (shouldUseCdpStream || vncFailed);
+    canMountSessionStream && (shouldUseCdpStream || vncFailed);
 
   const isStreamActive =
     shouldShowBrowserStream ||
     shouldShowScreencastFallback ||
+    shouldShowExternalPanel ||
+    isSessionLookupPending ||
     selection === "stream";
 
   return (
@@ -160,14 +208,18 @@ function WorkflowRunOverview() {
             centered
           />
         )}
-        {!shouldShowBrowserStream &&
-          !shouldShowScreencastFallback &&
-          selection === "stream" && (
-            <WorkflowRunStream
-              interactive={isPaused}
-              showControlButtons={isPaused}
-            />
-          )}
+        {shouldShowExternalPanel && (
+          <StreamStatusPanel diagnostic={EXTERNAL_BROWSER_DIAGNOSTIC} />
+        )}
+        {isSessionLookupPending && (
+          <StreamStatusPanel diagnostic={STREAM_STARTING_DIAGNOSTIC} />
+        )}
+        {!wantsVncStream && selection === "stream" && (
+          <WorkflowRunStream
+            interactive={isPaused}
+            showControlButtons={isPaused}
+          />
+        )}
         {!isStreamActive && isAction(selection) && (
           <ActionScreenshot
             artifactId={selection.screenshot_artifact_id ?? undefined}
@@ -192,7 +244,7 @@ function WorkflowRunOverview() {
               <WorkflowRunBlockScreenshot
                 workflowRunBlockId={screenshotBlockId}
                 blockType={screenshotBlockType}
-                runStatus={workflowRun?.status}
+                running={statusIsNotFinalized(workflowRun)}
               />
             );
           })()}

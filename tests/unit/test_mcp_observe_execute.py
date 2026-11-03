@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import gc
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call
 
 import pytest
 
@@ -29,9 +29,10 @@ from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.client.errors import InternalServerError
+from skyvern.exceptions import StaleFrameSelectionError
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS
-from tests.unit._mcp_browser_fakes import make_real_wait_for_timeout, make_session_state
+from tests.unit._mcp_browser_fakes import make_real_wait_for_timeout, make_session_state, make_skyvern_page
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -325,6 +326,7 @@ class TestDoObserve:
         frame = SimpleNamespace(
             name="payment",
             url="https://example.com/payment-frame",
+            page=page.page,
             title=AsyncMock(return_value="Payment Frame"),
             evaluate=_mock_dom_evaluate(
                 [
@@ -592,6 +594,44 @@ class TestDoObserve:
         serialized = serialize_elements(result.elements)
         a11y_norths = [e for e in serialized if e["name"] == "North" and not e.get("selector")]
         assert len(a11y_norths) == 2
+
+    @pytest.mark.asyncio
+    async def test_input_role_combobox_merges_with_its_a11y_entry(self) -> None:
+        # SKY-19544: an input[role=combobox] is one field. Keying the merge on the role's
+        # single canonical tag listed it twice — once as a selectorless `select` — so agents
+        # saw a duplicate, mis-tagged field flagged as needing disambiguation.
+        page = _make_page(_make_a11y_tree(children=[{"role": "combobox", "name": "City", "value": ""}]))
+        page.evaluate = _mock_dom_evaluate(
+            [{"role": "combobox", "name": "City", "tag": "input", "selector": "#city", "value": "lake"}]
+        )
+
+        result = await do_observe(page, include_values=True)
+        serialized = serialize_elements(result.elements)
+
+        cities = [element for element in serialized if element["name"] == "City"]
+        assert len(cities) == 1, serialized
+        assert cities[0]["tag"] == "input"
+        assert cities[0]["selector"] == "#city"
+        assert cities[0]["value"] == "lake"
+        assert "needs_disambiguation" not in cities[0]
+
+    @pytest.mark.asyncio
+    async def test_heuristically_roled_wrapper_does_not_claim_the_a11y_entry(self) -> None:
+        # The DOM scan calls any leftover interactable a button, so a wrapper sharing its
+        # child's label must keep the tag in the merge key: the a11y entry belongs to the
+        # real <button>, and attaching the wrapper's selector would click the wrong element.
+        page = _make_page(_make_a11y_tree(children=[{"role": "button", "name": "Save"}]))
+        page.evaluate = _mock_dom_evaluate(
+            [
+                {"role": "button", "name": "Save", "tag": "div", "selector": "#save-wrap"},
+                {"role": "button", "name": "Save", "tag": "button", "selector": "#save"},
+            ]
+        )
+
+        result = await do_observe(page)
+        saves = [element for element in result.elements if element.name == "Save"]
+
+        assert [element.selector for element in saves] == ["#save", "#save-wrap"]
 
     @pytest.mark.asyncio
     async def test_match_index_stable_when_cap_reorders(self) -> None:
@@ -1033,6 +1073,7 @@ class TestSkyvernObserveMCP:
             interactive_only=False,
             max_elements=7,
             include_values=False,
+            propagate_page_change=True,
         )
 
     @pytest.mark.asyncio
@@ -1208,6 +1249,26 @@ class TestSkyvernExecuteMCP:
 
         result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"selector": "#btn"}}])
         assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_a_frame_owned_by_another_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pins the stale-frame arm on skyvern_execute's observe-v2 document reads.
+
+        Both reads sit in a try whose other handler is CancelledError, so without this arm the
+        refusal escapes the tool instead of becoming a structured error.
+        """
+        page = make_skyvern_page(_make_page())
+        type(page).locator_scope = PropertyMock(
+            side_effect=StaleFrameSelectionError("payment", "https://frame.example.com/")
+        )
+        ctx = BrowserContext(mode="local")
+        monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        monkeypatch.setattr(mcp_browser, "observe_v2_enabled", lambda: True)
+
+        result = await mcp_browser.skyvern_execute(steps=[{"tool": "click", "params": {"selector": "#btn"}}])
+
+        assert result["ok"] is False, result
+        assert result["error"]["code"] == mcp_browser.ErrorCode.STALE_FRAME_SELECTION, result
 
     @pytest.mark.asyncio
     async def test_execute_dispatch_calls_tool(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1397,6 +1458,7 @@ class TestSkyvernExecuteMCP:
         frame = SimpleNamespace(
             name="payment",
             url="https://example.com/payment-frame",
+            page=page.page,
             title=AsyncMock(return_value="Payment"),
             evaluate=_mock_dom_evaluate(
                 [
@@ -1514,6 +1576,7 @@ class TestSkyvernExecuteMCP:
         assert mcp_browser.skyvern_click.call_args.kwargs["selector"] == 'role=button[name="Current"]'
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_session_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_navigate_refs")
@@ -1537,6 +1600,7 @@ class TestSkyvernExecuteMCP:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_batch_refs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_batch_navigate_refs")
@@ -1563,7 +1627,6 @@ class TestSkyvernExecuteMCP:
         page = _make_page()
         ctx = BrowserContext(mode="cloud_session", session_id="pbs_tab_refs")
         monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
-        monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(page, ctx)))
 
         tab_a = MagicMock()
         tab_a.url = "https://example.com/a"
@@ -1576,6 +1639,7 @@ class TestSkyvernExecuteMCP:
         tab_b.bring_to_front = AsyncMock()
         browser = MagicMock()
         browser._browser_context.pages = [tab_a, tab_b]
+        monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, ctx)))
 
         async with scoped_session(make_session_state(context=ctx, browser=browser)):
             observe_result = await mcp_browser.skyvern_observe(session_id=ctx.session_id)
@@ -1757,6 +1821,7 @@ class TestSkyvernExecuteMCP:
         assert result.error_step is None
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_observe_started_during_navigation_is_discarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A generation captured while navigation is in flight must not commit after it completes."""
         page = _make_page()
@@ -1877,6 +1942,7 @@ class TestSkyvernExecuteMCP:
         click.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_failed_navigation_still_invalidates_midflight_observe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A navigation that raises can still have replaced the document — mid-flight commits must die."""
         page = _make_page()
@@ -1902,15 +1968,6 @@ class TestSkyvernExecuteMCP:
         assert nav_result["ok"] is False
         assert committed is False
         assert session_manager.get_session_ref("e0", session_id=ctx.session_id) is None
-
-    def test_page_identity_key_never_reused_after_gc(self) -> None:
-        """Identity tokens must not be reissued to a new page even if id() is reused."""
-        page = _make_page()
-        old_key = session_manager.page_ref_key(page)
-        del page
-        gc.collect()
-        new_page = _make_page()
-        assert session_manager.page_ref_key(new_page) != old_key
 
     @pytest.mark.asyncio
     async def test_stale_observe_commit_is_discarded_after_clear(self) -> None:
@@ -1969,9 +2026,13 @@ class TestSkyvernExecuteMCP:
             click=AsyncMock(return_value="#unexpected-click"),
         )
         page.page = page
+        page.locator_scope = page
         page._working_frame = None
         ctx = BrowserContext(mode="local")
         monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+        # select_option gets what is left of the click's budget; freeze the clock so a loaded runner
+        # cannot spend a millisecond of it before the exact timeout assert below.
+        monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=lambda: 0.0))
 
         result = await mcp_browser.skyvern_execute(
             steps=[
@@ -2149,3 +2210,56 @@ class TestSkyvernExecuteMCP:
         assert result["ok"] is True
         click_kwargs = mcp_browser.skyvern_click.call_args.kwargs
         assert click_kwargs["selector"] == "role=combobox >> nth=0"
+
+
+_ARIA_PAGE = (
+    "<h1>Quarterly Report</h1><p>Revenue grew.</p>"
+    '<label>Email <input value="secret@x.io"></label>'
+    '<input type="password" value="hunter2" aria-label="Pw"><button>Send</button>'
+    '<iframe srcdoc="<h2>Inner Frame Heading</h2>"></iframe>'
+    "<h2>Revenue: FY 2026</h2><h3>It's {ready}</h3><p>Price &#127; end</p>"
+    '<select aria-label="Pick"><option>A: B</option><option>It\'s {ready}</option></select>'
+    '<input aria-label="Note: x" value="top: secret">'
+    '<button aria-label="Back&#8;space">Go</button><p>Back&#8;space</p><h1>After</h1>'
+    "<code>npm install x</code><strong>Bold claim</strong><em>Stressed note</em>"
+)
+
+
+@pytest.mark.parametrize("engine", ["playwright", "patchright"])
+@pytest.mark.asyncio
+async def test_observe_keeps_static_semantics_without_page_accessibility(engine: str) -> None:
+    async_api = pytest.importorskip(f"{engine}.async_api")
+    async with async_api.async_playwright() as driver:
+        if not Path(driver.chromium.executable_path).exists():
+            pytest.skip("Requires an installed Chromium-based browser")
+        browser = await driver.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(_ARIA_PAGE)
+            await page.frames[1].wait_for_load_state()
+            assert getattr(page, "accessibility", None) is None
+
+            everything = await browser_ops.do_observe(page, interactive_only=False, max_elements=200)
+            scoped = await browser_ops.do_observe(page, selector="h1", interactive_only=False)
+            interactive = await browser_ops.do_observe(page, interactive_only=True)
+        finally:
+            await browser.close()
+
+    pairs = {(e.role, e.name) for e in everything.elements}
+    assert ("heading", "Quarterly Report") in pairs
+    assert ("text", "Revenue grew.") in pairs
+    assert ("heading", "Revenue: FY 2026") in pairs
+    assert ("heading", "It's {ready}") in pairs
+    assert ("text", "Price \x7f end") in pairs
+    assert ("button", "Back\x08space") in pairs
+    assert ("text", "Back\x08space") in pairs
+    assert ("heading", "After") in pairs
+    assert not any("Backbspace" in name for _, name in pairs)
+    assert {("text", "npm install x"), ("text", "Bold claim"), ("text", "Stressed note")} <= pairs
+    options = {option for e in everything.elements for option in (e.options or [])}
+    assert {"A: B", "It's {ready}"} <= options
+    names = " ".join(e.name for e in everything.elements)
+    assert "secret@x.io" not in names and "hunter2" not in names and "top: secret" not in names
+    assert "Inner Frame Heading" not in names
+    assert {(e.role, e.name) for e in scoped.elements} == {("heading", "Quarterly Report")}
+    assert all(e.role in browser_ops.INTERACTIVE_ROLES for e in interactive.elements)

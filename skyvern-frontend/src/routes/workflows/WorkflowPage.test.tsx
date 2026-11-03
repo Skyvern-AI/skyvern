@@ -32,6 +32,10 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: (flag: string) => mockFeatureFlagEnabled(flag),
   useFeatureFlagVariantKey: () => undefined,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagEnabled: (flag: string) => mockFeatureFlagEnabled(flag),
+  usePostHogFeatureFlagVariantKey: () => undefined,
+}));
 
 vi.mock("use-debounce", () => ({
   useDebounce: <T,>(value: T): [T] => [value],
@@ -104,6 +108,10 @@ vi.mock("./hooks/useWorkflowQuery", () => ({
     },
     isLoading: false,
   }),
+}));
+
+vi.mock("./hooks/useGlobalWorkflowsQuery", () => ({
+  useGlobalWorkflowsQuery: () => ({ data: [], isError: false }),
 }));
 
 vi.mock("./hooks/useWorkflowRunsQuery", () => ({
@@ -439,4 +447,11 @@ describe("Past Runs list state in the URL", () => {
 
     expect(locationSearch(container)).not.toContain("status=");
   });
+});
+
+it("refetches the history on mount without adding list polling", () => {
+  renderWorkflowPage();
+  const options = mockWorkflowRunsQuery.mock.lastCall?.[0];
+  expect(options.refetchOnMount).toBe("always");
+  expect(options.refetchInterval).toBeUndefined();
 });

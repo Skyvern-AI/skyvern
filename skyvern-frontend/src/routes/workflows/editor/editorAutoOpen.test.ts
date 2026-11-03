@@ -29,14 +29,15 @@ describe("shouldAutoOpenEditor", () => {
     expect(result.nextState).toEqual({ armed: false });
   });
 
-  it("does not fire for a draft (applied undefined)", () => {
+  it("fires on the first mid-turn draft that lands blocks in studio", () => {
     const result = shouldAutoOpenEditor(armed, {
       embedded: true,
       applied: undefined,
+      midTurnDraft: true,
       blockCount: 2,
     });
-    expect(result.fire).toBe(false);
-    expect(result.nextState).toEqual(armed);
+    expect(result.fire).toBe(true);
+    expect(result.nextState).toEqual(disarmed);
   });
 
   it("does not fire for a snap-back (applied false)", () => {

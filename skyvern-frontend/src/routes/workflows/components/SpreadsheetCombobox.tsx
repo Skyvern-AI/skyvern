@@ -136,6 +136,7 @@ function SpreadsheetCombobox({
       <PopoverAnchor asChild>
         <div ref={anchorRef} className="relative">
           <WorkflowBlockInputTextarea
+            name="spreadsheetUrl"
             nodeId={nodeId}
             value={renderedValue}
             onChange={handleChange}

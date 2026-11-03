@@ -27,12 +27,9 @@ export function DiffCard({
   if (!draft) {
     return null;
   }
-  const priorLabels = new Set(
-    turn.blocks.filter((b) => b.state === "drafted").map((b) => b.label),
-  );
-  const removed = [...priorLabels].filter(
-    (label) => !draft.blockLabels.includes(label),
-  );
+  const removed = (turn.review?.blocks ?? [])
+    .filter((b) => b.change === "removed")
+    .map((b) => b.label);
 
   return (
     <div className="rounded-lg border border-border bg-slate-elevation2 p-3">

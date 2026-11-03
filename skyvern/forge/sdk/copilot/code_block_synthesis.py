@@ -16,6 +16,7 @@ import keyword
 import re
 import textwrap
 import tokenize
+import unicodedata
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import structlog
 
+from skyvern.forge.sdk.copilot.agent_context import ScoutedDynamicRowEvidence, ScoutedDynamicRowPeriodMatch
 from skyvern.forge.sdk.copilot.authoring_parameter_binding import (
     AuthoringParameterBindingSnapshot,
     SameMonthFileMatchTransform,
@@ -37,10 +39,6 @@ from skyvern.forge.sdk.copilot.reached_download_target import (
     DOWNLOAD_CLAIM_HELPER_NAME,
     ReachedDownloadTarget,
     can_deliver_registered_download,
-)
-from skyvern.forge.sdk.copilot.runtime import (
-    ScoutedDynamicRowEvidence,
-    ScoutedDynamicRowPeriodMatch,
 )
 
 LOG = structlog.get_logger()
@@ -84,6 +82,18 @@ _DOWNLOAD_PATH_VAR_BASE = "_downloaded_file_path"
 _DOWNLOAD_OUTPUT_VAR_BASE = "downloaded_files"
 
 CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
+# Recorded actions a workflow silently loses if dropped; a recording emits a repair step for them instead.
+# Dropped hovers are tolerated: they are usually incidental to a located click.
+_RECORDING_REQUIRED_ACTION_TYPES = {
+    "click": "click",
+    "drag": "drag",
+    "set_dialog_policy": "input_text",
+    "type_text": "input_text",
+    CREDENTIAL_FILL_TOOL_NAME: "input_text",
+    "select_option": "select_option",
+    "upload_file": "upload_file",
+}
+
 _CREDENTIAL_FIELDS = CREDENTIAL_FILL_FIELDS
 
 # Shape of a synthesized credential fill, ``.fill(<param>.<field>)`` or the runtime OTP
@@ -283,8 +293,12 @@ def credential_scout_gap(
     return ScoutGap(missing_fields=missing_fields, missing_submit=missing_submit)
 
 
-_ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
-_DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
+_ENTRY_TARGET_TOOLS = frozenset(
+    {"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file", "press_key", "drag"}
+)
+_DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset(
+    {"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "upload_file"}
+)
 _OPTIONAL_DISMISSAL_NAME_PATTERN = re.compile(
     r"\b(?:accept|agree|allow|consent|cookies?|decline|reject|refuse|dismiss|got it|no thanks)\b|^(?:ok|okay)$",
     re.I,
@@ -318,8 +332,9 @@ _STRUCTURAL_DISMISSAL_SELECTOR_PATTERN = re.compile(
 _REQUIRED_STATE_TIMEOUT_MS = 120_000
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
-# plus the injected `page`). A parameter key colliding with one of these is silently dropped
-# at bind time, so the synthesized fill would stringify the builtin instead of the user value.
+# plus the injected `page`). A parameter key colliding with one of these is shadowed by the
+# builtin at bind time (block.py's late safe globals let a persisted parameter keep its value,
+# but a new block must not rely on that), so the synthesized fill would stringify the builtin.
 # "username"/"password"/"totp"/"totp_identifier" are reserved too: CodeBlock.execute also
 # injects a bound credential's fields under those bare names, so a plain parameter named
 # `password` would resolve to the credential's secret value instead of the user input.
@@ -332,6 +347,11 @@ _RESERVED_PARAM_NAMES = frozenset(
         "totp_identifier",
         "otp",
         "solve_captcha",
+        "search_web",
+        "open_page",
+        "clear_browser_data",
+        "attach_authorized_file",
+        "set_dialog_policy",
         DOWNLOAD_CLAIM_HELPER_NAME,
         "print",
         "len",
@@ -351,6 +371,8 @@ _RESERVED_PARAM_NAMES = frozenset(
         "max",
         "min",
         "sum",
+        "round",
+        "abs",
         "sorted",
         "sleep",
         "asyncio",
@@ -433,11 +455,13 @@ class SynthesizedCodeBlock:
 
 
 def grounded_parameter_key_is_safe(parameter_key: str) -> bool:
+    normalized_key = unicodedata.normalize("NFKC", parameter_key)
     return (
         parameter_key.isidentifier()
-        and not keyword.iskeyword(parameter_key)
-        and not parameter_key.startswith("__")
-        and parameter_key not in _RESERVED_PARAM_NAMES
+        and normalized_key.isidentifier()
+        and not keyword.iskeyword(normalized_key)
+        and not normalized_key.startswith("__")
+        and normalized_key not in _RESERVED_PARAM_NAMES
     )
 
 
@@ -1897,7 +1921,14 @@ def synthesize_goto_code_block(url: str) -> SynthesizedCodeBlock | None:
     )
     return SynthesizedCodeBlock(
         code=line + "\n",
-        steps=[{"description": f"Open {url}", "action_type": "goto_url", "line_start": 1, "line_end": 1}],
+        steps=[
+            {
+                "description": f"Open {_scrub_url_for_code_literal(url)}",
+                "action_type": "goto_url",
+                "line_start": 1,
+                "line_end": 1,
+            }
+        ],
     )
 
 
@@ -1909,6 +1940,11 @@ def synthesize_code_block(
     parameter_binding_snapshot: AuthoringParameterBindingSnapshot | None = None,
     file_match_transform: SameMonthFileMatchTransform | None = None,
     emit_read_return: bool = True,
+    # Recordings can bind a `secret` credential, whose single value field is not a login field;
+    # copilot's own gating sets stay untouched by passing the wider set only from that caller.
+    allowed_credential_fields: AbstractSet[str] = _CREDENTIAL_FIELDS,
+    _max_steps: int = _MAX_STEPS,
+    _allow_recording_fallbacks: bool = False,
     _segment_pass: bool = False,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
@@ -2180,6 +2216,14 @@ def synthesize_code_block(
             if post_auth_resume_relative_index > fallback_entry_relative_index
             else 0
         )
+        if _allow_recording_fallbacks:
+            # A recording is an ordered replay, so a later visible locator cannot prove that
+            # preceding clicks are optional. Start from the captured URL and emit from index 0.
+            fallback_entry_target = ""
+            fallback_entry_relative_index = -1
+            fallback_entry_index = entry_index
+            post_auth_resume_target = ""
+            entry_post_auth_resume_index = 0
         download_entry_target = (
             _DOWNLOAD_TARGET_VAR
             if file_match_locator
@@ -2317,7 +2361,7 @@ def synthesize_code_block(
         elif entry_post_auth_resume_index:
             lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
             lines.append(f"{_INDENT * 2}pass")
-        append_step(f"Open {entry_url}", "goto_url", line_start)
+        append_step(f"Open {_scrub_url_for_code_literal(entry_url)}", "goto_url", line_start)
 
     emitted = 0
     terminal_action_index = _last_action_interaction_index(trajectory)
@@ -2374,11 +2418,31 @@ def synthesize_code_block(
         diagnostics.grounded_submit_binding_fingerprints.append(parameter_binding_snapshot.fingerprint)
         snapshot_recovery_emitted = True
 
+    repaired_drop_count = len(diagnostics.dropped_interactions)
+
+    def emit_recording_repairs() -> None:
+        nonlocal emitted, repaired_drop_count
+        if not _allow_recording_fallbacks:
+            return
+        for dropped in diagnostics.dropped_interactions[repaired_drop_count:]:
+            dropped_index = dropped.get("trajectory_index")
+            dropped_tool = str(dropped.get("tool_name") or "")
+            action_type = _RECORDING_REQUIRED_ACTION_TYPES.get(dropped_tool)
+            if action_type is None or not isinstance(dropped_index, int) or dropped_index < 0:
+                continue
+            line_start = len(lines) + 1
+            message = f"Recorded {dropped_tool} needs repair: {dropped.get('reason_code') or 'not replayable'}"
+            lines.append(f"{action_indent_for(dropped_index)}raise Exception({_py_str(message)})")
+            append_step(f"Repair recorded {dropped_tool}", action_type, line_start)
+            emitted += 1
+        repaired_drop_count = len(diagnostics.dropped_interactions)
+
     truncated_at_index = len(trajectory)
     for trajectory_index, interaction in enumerate(trajectory):
-        if emitted >= _MAX_STEPS:
+        emit_recording_repairs()
+        if emitted >= _max_steps:
             diagnostics.truncated = True
-            notes.append(f"trajectory truncated at {_MAX_STEPS} steps")
+            notes.append(f"trajectory truncated at {_max_steps} steps")
             truncated_at_index = trajectory_index
             break
         if entry_replay_start_index and trajectory_index < entry_replay_start_index:
@@ -2393,6 +2457,22 @@ def synthesize_code_block(
             continue
         action_indent = action_indent_for(trajectory_index)
         tool_name = str(interaction.get("tool_name") or "")
+
+        incomplete_capture_reason = str(interaction.get("incomplete_capture_reason") or "").strip()
+        replay_unsupported_reason = str(interaction.get("replay_unsupported_reason") or "").strip()
+        if incomplete_capture_reason or replay_unsupported_reason:
+            diagnostics.dropped_interactions.append(
+                {
+                    "trajectory_index": trajectory_index,
+                    "tool_name": tool_name,
+                    "reason_code": (
+                        f"incomplete_capture_{incomplete_capture_reason}"
+                        if incomplete_capture_reason
+                        else replay_unsupported_reason
+                    ),
+                }
+            )
+            continue
 
         if tool_name == "press_key":
             emit_snapshot_recovery(trajectory_index, action_indent)
@@ -2497,6 +2577,35 @@ def synthesize_code_block(
             emitted += 1
             continue
 
+        if tool_name == "set_dialog_policy":
+            action = str(interaction.get("action") or "").strip()
+            if action not in {"accept", "dismiss"} or interaction.get("prompt_text_redacted"):
+                reason_code = "redacted_prompt_text" if interaction.get("prompt_text_redacted") else "invalid_action"
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": reason_code}
+                )
+                continue
+            line_start = len(lines) + 1
+            prompt_text = interaction.get("prompt_text")
+            if prompt_text is not None:
+                dialog_param_key = _unique_key("dialog_prompt", used_param_keys)
+                parameters.append({"key": dialog_param_key, "default_value": str(prompt_text)})
+                lines.append(
+                    f"{action_indent}await set_dialog_policy(page, {_py_str(action)}, str({dialog_param_key}))"
+                )
+            else:
+                lines.append(f"{action_indent}await set_dialog_policy(page, {_py_str(action)})")
+            record_emission(
+                trajectory_index,
+                tool_name,
+                "set_dialog_policy",
+                "page",
+                line_start=line_start,
+                lane="recording_dialog",
+            )
+            emitted += 1
+            continue
+
         locator = _locator_expr(
             interaction,
             notes,
@@ -2507,6 +2616,21 @@ def synthesize_code_block(
         )
         if not locator:
             continue
+        click_args = ""
+        if tool_name == "click" and _allow_recording_fallbacks and "canvas_click_position" in interaction:
+            canvas_position = interaction["canvas_click_position"]
+            if not canvas_position:
+                notes.append("dropped a canvas click with no recorded offset")
+                diagnostics.dropped_interactions.append(
+                    {
+                        "trajectory_index": trajectory_index,
+                        "tool_name": tool_name,
+                        "reason_code": "missing_canvas_offset",
+                    }
+                )
+                continue
+            # ponytail: absolute CSS px offset, breaks if the canvas is resized; upgrade = ratio x runtime size.
+            click_args = f'position={{"x": {float(canvas_position["x"])!r}, "y": {float(canvas_position["y"])!r}}}'
 
         line_start = len(lines) + 1
         if tool_name == "click":
@@ -2544,12 +2668,33 @@ def synthesize_code_block(
                         f"{action_indent}{_INDENT}raise Exception("
                         f"{_py_str('grounded statement row did not resolve uniquely')})"
                     )
-                lines.append(f"{action_indent}await {locator}.click()")
+                lines.append(f"{action_indent}await {locator}.click({click_args})")
                 lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
                 if trajectory_index in captcha_boundary_indices:
                     lines.append(f"{action_indent}await solve_captcha(page)")
                 record_emission(trajectory_index, tool_name, "click", locator, line_start=line_start)
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
+        elif tool_name == "drag" and not strict_selectors:
+            destination = interaction.get("destination")
+            destination_locator = (
+                _locator_expr(
+                    destination,
+                    notes,
+                    diagnostics=diagnostics,
+                    trajectory_index=trajectory_index,
+                    tool_name=tool_name,
+                    strict_selectors=strict_selectors,
+                )
+                if isinstance(destination, dict)
+                else ""
+            )
+            if not destination_locator:
+                continue
+            lines.append(f"{action_indent}await {locator}.drag_to({destination_locator})")
+            record_emission(
+                trajectory_index, tool_name, "drag_to", locator, line_start=line_start, lane="recording_drag"
+            )
+            append_step(f"Drag {_step_target(interaction)}", "drag", line_start)
         elif tool_name == "type_text":
             snapshot_binding = snapshot_bindings_by_index.get(trajectory_index)
             typed_identity = _typed_value_identity(interaction)
@@ -2609,7 +2754,7 @@ def synthesize_code_block(
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
             credential_field = str(interaction.get("credential_field") or "").strip()
-            if not credential_id or credential_field not in _CREDENTIAL_FIELDS:
+            if not credential_id or credential_field not in allowed_credential_fields:
                 notes.append("dropped a credential fill with no usable credential reference")
                 diagnostics.dropped_interactions.append(
                     {
@@ -2651,6 +2796,26 @@ def synthesize_code_block(
             lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             record_emission(trajectory_index, tool_name, "select_option", locator, line_start=line_start)
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
+        elif tool_name == "upload_file":
+            selector = str(interaction.get("selector") or "").strip()
+            if not selector:
+                notes.append("dropped a file upload with no durable selector")
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_selector"}
+                )
+                continue
+            parameter_name = str(interaction.get("parameter_name") or "upload_file")
+            param_key = _unique_key(_safe_param_base(parameter_name), used_param_keys)
+            parameters.append({"key": param_key, "workflow_parameter_type": "file_url"})
+            lines.append(f"{action_indent}await attach_authorized_file(page, {param_key}, {_py_str(selector)})")
+            record_emission(
+                trajectory_index,
+                tool_name,
+                "attach_authorized_file",
+                locator,
+                line_start=line_start,
+            )
+            append_step(f"Upload a file to {_step_target(interaction)}", "upload_file", line_start)
         elif tool_name == "hover" and not strict_selectors:
             # Non-strict only: recording trajectories carry deliberate hovers; the
             # strict-imposition envelope keeps treating hover as unsupported.
@@ -2666,6 +2831,7 @@ def synthesize_code_block(
             )
             continue
         emitted += 1
+    emit_recording_repairs()
 
     if (
         entry_replay_condition_active
@@ -2757,8 +2923,8 @@ def synthesize_code_block(
     if compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
-        # The worker-owned claim helper is the one terminal shape both engines execute: the sandboxed
-        # runner cannot broker page.expect_download. The helper clicks once and confirms the fired
+        # The worker-owned claim helper is the terminal shape both engines execute for one known
+        # affordance. The helper clicks once and confirms the fired
         # download; the bytes land wherever this run's download binding already sends them, and the
         # execution layer registers them from there.
         download_filename = _unique_key(_DOWNLOAD_FILENAME_VAR_BASE, used_download_vars)
@@ -2822,6 +2988,9 @@ def synthesize_code_block(
                 parameter_binding_snapshot=parameter_binding_snapshot,
                 file_match_transform=file_match_transform if segment_download_target is not None else None,
                 emit_read_return=emit_read_return,
+                allowed_credential_fields=allowed_credential_fields,
+                _max_steps=_max_steps,
+                _allow_recording_fallbacks=_allow_recording_fallbacks,
                 _segment_pass=True,
             )
             if segment is None or not segment.diagnostics.emitted_interaction_count:
@@ -2898,15 +3067,6 @@ def _download_summary_return_lines(download_filename: str, emit_read_return: boo
 
 def code_contains_credential_fill(code: str) -> bool:
     return CREDENTIAL_FILL_CODE_PATTERN.search(code) is not None
-
-
-def trajectory_has_credential_fill(trajectory: Sequence[Mapping[str, Any]]) -> bool:
-    for interaction in trajectory:
-        if str(interaction.get("tool_name") or "") != CREDENTIAL_FILL_TOOL_NAME:
-            continue
-        if str(interaction.get("credential_field") or "").strip() in _CREDENTIAL_FIELDS:
-            return True
-    return False
 
 
 def trajectory_has_browser_fill_interaction(trajectory: Sequence[Mapping[str, Any]]) -> bool:

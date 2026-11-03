@@ -11,8 +11,14 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import libcst as cst
+import pytest
 
-from skyvern.core.script_generations.generate_script import _action_to_stmt, _build_block_fn
+from skyvern.core.script_generations.generate_script import (
+    _action_to_stmt,
+    _actions_support_cached_scripts,
+    _build_block_fn,
+)
+from skyvern.webeye.actions.action_types import ActionType
 
 
 def _render(stmt: cst.BaseStatement) -> str:
@@ -194,3 +200,35 @@ class TestMagicLinkBlockGeneration:
         # nosemgrep: incomplete-url-substring-sanitization  # searching generated source, not a URL
         assert recorded_url in code, code
         assert "page.magic_link(" not in code, code
+
+
+def test_multi_field_totp_action_makes_block_ineligible_for_cached_scripts() -> None:
+    action = {
+        "action_type": "input_text",
+        "element_id": "box-0",
+        "text": "1",
+        "totp_timing_info": {
+            "is_totp_sequence": True,
+            "action_index": 0,
+            "box_element_ids": ["box-0", "box-1"],
+            "code_source": "external",
+        },
+    }
+
+    assert not _actions_support_cached_scripts([action])
+    with pytest.raises(ValueError, match="Multi-field TOTP"):
+        _build_block_fn({"label": "verification", "parameters": []}, [action])
+
+
+def test_user_close_page_makes_block_ineligible_for_cached_scripts() -> None:
+    close_action = {"action_type": ActionType.CLOSE_PAGE, "tab_index": 1}
+    recovery_action = {"action_type": ActionType.CLOSE_PAGE, "is_internal_recovery": True}
+    actions = [
+        close_action,
+        {"action_type": ActionType.CLICK, "xpath": "/html/body/a", "element_id": "e1"},
+    ]
+
+    assert not _actions_support_cached_scripts(actions)
+    assert _actions_support_cached_scripts([recovery_action])
+    with pytest.raises(ValueError, match="CLOSE_PAGE"):
+        _build_block_fn({"label": "popup", "parameters": []}, actions)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import hashlib
 import json
@@ -11,23 +10,26 @@ import re
 import textwrap
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any, Literal, NamedTuple, cast
+from typing import Annotated, Any, Literal, NamedTuple, cast, get_args
 
 import structlog
 import yaml
-from jinja2 import TemplateSyntaxError
-from pydantic import AliasChoices, BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, TypeAdapter, ValidationError
+from pydantic_core import to_jsonable_python
 
+from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.author_time_block import (
-    BANNED_BLOCKS_BLOCK_ID,
     CODE_SAFETY_BLOCK_ID,
     CREDENTIAL_SCOUT_BLOCK_ID,
     AuthorTimeBlock,
 )
+from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.blocker_signal import (
     clear_active_run_evidence_on_workflow_edit,
 )
@@ -35,27 +37,35 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     CodeSafetyRejectionFact,
     RecordedBuildTestOutcome,
-    authored_structure_signature_from_workflow,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
+    redacted_terminal_text,
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
+    WRAPPER_SCOPE_GLOBAL_REASON_CODE,
+    CodeBlockPreflightDiagnostic,
     advisory_code_block_diagnostics,
     scanner_advisory_diagnostics,
 )
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
-from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
+from skyvern.forge.sdk.copilot.code_block_steps import (
+    bind_referenced_parameters_in_yaml,
+    carry_user_owned_goals_in_yaml,
+    user_owned_goal_carry_disclosure,
+)
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
-from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import (
+    CanonicalWorkflowUnavailableFacts,
     CodeAuthoringRepairContext,
     CopilotContext,
+    ProposalDisposition,
+    copilot_sees_notes,
+    record_kept_note_texts,
 )
 from skyvern.forge.sdk.copilot.credential_fill_fields import CredentialFillField
 from skyvern.forge.sdk.copilot.google_connection_notice import (
@@ -66,7 +76,7 @@ from skyvern.forge.sdk.copilot.google_connection_notice import (
 )
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
-    declared_string_workflow_parameter_keys,
+    code_block_available_contracts_by_label,
     declared_workflow_parameter_keys,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -75,9 +85,14 @@ from skyvern.forge.sdk.copilot.output_policy import (
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
-from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
+from skyvern.forge.sdk.copilot.output_utils import (
+    _BUILD_TEST_WORKFLOW_MAX_CHARS,
+    INTERNAL_VALIDATION_FAILURE_PREFIX,
+    sanitize_block_label_for_display,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    code_captures_download,
     code_uses_download_claim,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -88,10 +103,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _coerce_requested_output_evidence_source,
     _is_judgment_boolean_criterion,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    ScoutedInteraction,
-)
+from skyvern.forge.sdk.copilot.review_gate import CODE_BLOCK_NON_IDENTITY_KEYS
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SCHEMA_INCOMPATIBILITY_REASON_CODE,
     SchemaIncompatibility,
@@ -99,6 +112,7 @@ from skyvern.forge.sdk.copilot.schema_incompatibility import (
     render_schema_incompatibility_agent_steer,
     render_schema_incompatibility_user_reason,
 )
+from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.secret_scrub import registered_scrub_values, scrub_secrets_from_text
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -107,20 +121,54 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_blocks,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _PRIVATE_WORKFLOW_SETTINGS_FIELDS,
+    _canonicalize_copilot_proxy_location,
+    _normalize_copilot_yaml,
     _process_workflow_yaml,
+    dump_workflow_yaml,
+    inherited_header_settings,
+    merge_private_workflow_settings,
+    private_workflow_settings_from_yaml,
     reconcile_workflow_completion_contract,
     redact_credentials_in_workflow_yaml,
+    resolve_cdp_connect_headers,
+    resolve_extra_http_headers,
+    resolve_proxy_location,
+    resolve_totp_identifier,
+    resolve_totp_verification_url,
+    resolve_webhook_callback_url,
     runner_code_block_associations,
+    strip_private_workflow_settings,
+    strip_runtime_block_fields,
+    submitted_private_workflow_settings,
+    with_workflow_yaml_title,
+    workflow_to_copilot_yaml,
 )
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, CopilotProposalConflictReason
+from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PRIVATE_SETTINGS_KEY, copilot_proposal_metadata
 from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.workflow.block_notes import (
+    carry_block_notes_from_versions,
+    drop_submitted_note_fields,
+    stored_notes_for_labels,
+)
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
-from skyvern.forge.sdk.workflow.models.workflow import Workflow
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
-from skyvern.schemas.proxy_location import runtime_proxy_location
-from skyvern.schemas.workflows import BlockType
-from skyvern.utils.templating import get_missing_variables
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
+from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
+from skyvern.schemas.workflows import (
+    BLOCK_YAML_SUBCLASSES,
+    BlockType,
+    CodeBlockYAML,
+    ForLoopBlockYAML,
+    WhileLoopBlockYAML,
+    WorkflowCreateYAMLRequest,
+)
+from skyvern.utils.secret_headers import SECRET_HEADER_MASK, merge_masked_headers
 from skyvern.utils.url_validators import validate_webhook_url
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import (
     _enum_or_string_name,
@@ -128,23 +176,20 @@ from ._shared import (
     _raw_yaml_proxy_location,
 )
 from .banned_blocks import (
-    _banned_block_reject_message,
-    _copilot_banned_block_types,
-    _copilot_block_authoring_policy,
-    _detect_new_banned_blocks,
-    _record_banned_block_reject_span,
-    _task_v3_pure_policy_violations,
-    _task_v3_pure_reject_message,
+    _copilot_authoring_capability,
+    reject_authoring_violations,
 )
 from .credentials import (
     _credential_id_misbinding_findings,
     _credential_reference_validation_error,
+    bitwarden_binding_change_error,
     canonicalize_named_google_sheet_bindings,
+    import_bound_vault_logins,
+    resolve_google_sheet_tabs_from_gid,
 )
 from .frontier import (
     _get_prior_workflow,
     _invalidate_verified_state_on_edit,
-    _workflow_requires_canonical_persist,
 )
 from .guardrails import _authority_tool_error
 
@@ -186,7 +231,7 @@ class CodeArtifactClaimedOutcome(BaseModel):
             "JSON Schema the user confirmed for this claim's extraction shape, serialized as a JSON "
             'string (an object, or `{"type":"array","items":{...}}` for repeated records). Named '
             "fields, types, and nesting the `goal_value_paths` index into; the block return is conformed "
-            "and validated against it. Same dialect as the legacy `data_schema` lever."
+            "and validated against it."
         ),
     )
     extraction_schema_provenance: ExtractionSchemaProvenance | None = None
@@ -216,11 +261,14 @@ class CodeArtifactCompletionCriterion(BaseModel):
     terminal: bool | None = None
     output_path: str | None = None
     requested_output_evidence_source: RequestedOutputEvidenceSource | None = None
-    deliverable_kind: Literal["registered_download"] | None = Field(
+    deliverable_kind: Literal["registered_download", "generated_file"] | None = Field(
         default=None,
         description=(
-            "Set to `registered_download` only when this criterion promises the user a downloaded file. "
-            "Run finalization then verifies execution-layer file registration; authored code output cannot satisfy it."
+            "Set only when this criterion promises the user a file. `registered_download`: a file the site serves and "
+            "the browser downloads. `generated_file`: a file the workflow builds itself and publishes with "
+            "`publish_file`, such as a screenshot or report. Run finalization verifies the matching "
+            "execution-layer registration: a published file never satisfies `registered_download`, a site download "
+            "never satisfies `generated_file`, and authored code output satisfies neither."
         ),
     )
     judgment_predicate: JudgmentPredicate | None = Field(
@@ -302,7 +350,16 @@ class CodeArtifactMetadata(BaseModel):
         default=None, description="Label of the authored `code` block this artifact describes."
     )
     block_id: str | None = None
-    declared_goal: str = Field(default="", description="The durable goal this block accomplishes; model-owned.")
+    declared_goal: str = Field(
+        default="",
+        description=(
+            "The durable goal this block accomplishes; model-owned. First name only the visible page state a person "
+            "sees once the block has succeeded, showing every value it returns, with no actions, 'after' or 'returns' "
+            "clauses, then the route that reaches it: page, controls by visible label or role, action order, inputs "
+            "by workflow parameter name (never a value), and what the block returns, naming only page content the "
+            "first sentence already shows, never a data structure."
+        ),
+    )
     claimed_outcomes: list[CodeArtifactClaimedOutcome] = Field(
         default_factory=list,
         description=(
@@ -712,7 +769,41 @@ def _workflow_yaml_code_blocks_by_label(workflow_yaml: str | None) -> dict[str, 
     return blocks
 
 
-# Headroom under enforcement._RECENT_TOOL_OUTPUT_CHAR_CAP: a result past that cap is head-truncated,
+def _workflow_yaml_block_types_by_label(workflow_yaml: str | None) -> dict[str, str]:
+    if workflow_yaml is None:
+        return {}
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        block["label"]: normalize_copilot_block_type_alias(_enum_or_string_name(block["block_type"]))
+        for block in workflow_blocks(parsed)
+        if isinstance(block.get("label"), str) and block["label"] and isinstance(block.get("block_type"), str)
+    }
+
+
+def _block_definition_changes(
+    prior_yaml: str | None, accepted_yaml: str
+) -> tuple[list[str], dict[str, dict[str, str]]]:
+    prior = _workflow_yaml_block_types_by_label(prior_yaml)
+    accepted = _workflow_yaml_block_types_by_label(accepted_yaml)
+    dropped = sorted(label for label in prior if label not in accepted)
+    type_changes = {
+        label: {"from": prior_type, "to": accepted[label]}
+        for label, prior_type in prior.items()
+        if label in accepted and accepted[label] != prior_type
+    }
+    return dropped, type_changes
+
+
+def _latest_draft_yaml(ctx: AgentContext) -> str | None:
+    # Prefer the most-recent in-turn emission so cross-path flows (inline REPLACE_WORKFLOW
+    # followed by update_workflow) compare against what the model saw, not the turn-start state.
+    last_yaml = ctx.last_workflow_yaml
+    return last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+
+
+# Headroom under output_utils._RECENT_TOOL_OUTPUT_CHAR_CAP: a result past that cap is head-truncated,
 # which would leave the model a sliced, unparseable JSON payload instead of code it can re-anchor on.
 _MAX_STORED_CODE_CHARS = 30_000
 
@@ -728,11 +819,16 @@ def _withheld_labels_within(labels: list[str], budget: int) -> list[str]:
     return exhausted if len(json.dumps(exhausted)) <= budget else []
 
 
-def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str) -> dict[str, str]:
+def _changed_code_blocks(
+    prior_yaml: str | None, submitted_yaml: str, accepted_yaml: str
+) -> tuple[dict[str, str], list[str]]:
+    """The accepted code per changed label, plus the labels whose stored code is not the bytes the
+    submission carried — a model anchoring its next edit on what it submitted would miss those."""
     prior = _workflow_yaml_code_blocks_by_label(prior_yaml)
     submitted = _workflow_yaml_code_blocks_by_label(submitted_yaml)
     accepted = _workflow_yaml_code_blocks_by_label(accepted_yaml)
     changed: dict[str, str] = {}
+    rewritten: list[str] = []
     for label, block in accepted.items():
         code = block.get("code")
         if not isinstance(code, str):
@@ -744,19 +840,91 @@ def _changed_code_blocks(prior_yaml: str | None, submitted_yaml: str, accepted_y
         if unchanged_since_prior and matches_submission:
             continue
         changed[label] = code
-    return changed
+        if submitted_block is not None and not matches_submission:
+            rewritten.append(label)
+    return changed, sorted(rewritten)
 
 
-def _advisory_labels_by_message(changed_code_blocks: Mapping[str, str]) -> dict[str, list[str]]:
-    """Labels per advisory message, computed from every changed block rather than the
+_NON_EDIT_BLOCK_KEYS = frozenset({"label", "next_block_label", "loop_blocks", *CODE_BLOCK_NON_IDENTITY_KEYS})
+_BLOCK_YAML_MODELS_BY_TYPE: dict[str, type[BaseModel]] = {
+    to_jsonable_python(model.model_fields["block_type"].default): model for model in get_args(BLOCK_YAML_SUBCLASSES)
+}
+_NO_DECLARED_DEFAULT = object()
+
+
+def _declared_block_default(block_type: str | None, key: str) -> object:
+    model = _BLOCK_YAML_MODELS_BY_TYPE.get(block_type) if isinstance(block_type, str) else None
+    field = model.model_fields.get(key) if model is not None else None
+    if field is None or field.is_required():
+        return _NO_DECLARED_DEFAULT
+    return to_jsonable_python(field.get_default(call_default_factory=True))
+
+
+def _comparable_blocks_by_label(workflow_yaml: str | None) -> dict[str, dict[str, Any]]:
+    parsed = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    if not isinstance(parsed, dict):
+        return {}
+    # Masked on both sides: a save restores stored secrets the model only ever saw masked.
+    mask_workflow_definition_secrets(parsed.get("workflow_definition"))
+    return {
+        block["label"]: {
+            key: value for key, value in strip_runtime_block_fields(block).items() if key not in _NON_EDIT_BLOCK_KEYS
+        }
+        for block in workflow_blocks(parsed)
+        if isinstance(block.get("label"), str) and block["label"]
+    }
+
+
+def _labels_changed_between(prior_yaml: str | None, stored_yaml: str) -> list[str]:
+    """Keys only the prior sets are ignored, so a write that only deletes a field is not named: the
+    prior may be the full stored definition while the write is request-shaped."""
+    prior = _comparable_blocks_by_label(prior_yaml)
+    stored = _comparable_blocks_by_label(stored_yaml)
+    changed = [
+        label
+        for label, block in stored.items()
+        if label not in prior
+        or any(
+            value != prior[label].get(key, _declared_block_default(block.get("block_type"), key))
+            for key, value in block.items()
+        )
+    ]
+    return changed + [label for label in prior if label not in stored]
+
+
+def display_block_label(ctx: AgentContext, label: str) -> str:
+    # The context's own values go first because a context without a session is not in the shared registry.
+    return sanitize_block_label_for_display(redacted_terminal_text(scrub_secrets_from_text(ctx, label)) or "")
+
+
+def display_labels_changed_between(ctx: AgentContext, prior_yaml: str | None, stored_yaml: str) -> list[str]:
+    return [display_block_label(ctx, label) for label in _labels_changed_between(prior_yaml, stored_yaml)]
+
+
+def record_edited_block_labels(ctx: CopilotContext, prior_yaml: str | None, stored_yaml: str) -> None:
+    labels = display_labels_changed_between(ctx, prior_yaml, stored_yaml)
+    for label in labels:
+        ctx.record_edited_block_label(label)
+    # A settings or parameter edit names no block but still postdates any run dispatched before it.
+    if not labels and parse_workflow_yaml(prior_yaml or "") != parse_workflow_yaml(stored_yaml):
+        ctx.block_edits_recorded_this_turn += 1
+
+
+def _advisory_labels_by_diagnostic(
+    changed_code_blocks: Mapping[str, str], accepted_yaml: str
+) -> dict[CodeBlockPreflightDiagnostic, list[str]]:
+    """Labels per advisory diagnostic, computed from every changed block rather than the
     budget-truncated ``stored_code`` so an oversized block still gets its note."""
-    labels_by_message: dict[str, list[str]] = {}
+    contracts = code_block_available_contracts_by_label(accepted_yaml)
+    labels_by_diagnostic: dict[CodeBlockPreflightDiagnostic, list[str]] = {}
     for label, code in sorted(changed_code_blocks.items()):
-        for diagnostic in advisory_code_block_diagnostics(code):
-            labels = labels_by_message.setdefault(diagnostic.message, [])
+        contract = contracts.get(label)
+        parameter_keys = contract.parameter_keys if contract is not None else ()
+        for diagnostic in advisory_code_block_diagnostics(code, parameter_keys=parameter_keys):
+            labels = labels_by_diagnostic.setdefault(diagnostic, [])
             if label not in labels:
                 labels.append(label)
-    return labels_by_message
+    return labels_by_diagnostic
 
 
 async def _scanner_advisory_labels_by_message(
@@ -860,10 +1028,6 @@ def _generated_code_preflight_reason_code(error: str | CodeBlockSecurityError) -
     if not reason_code.startswith("AUTHOR_PAGE_"):
         return None
     return reason_code
-
-
-def _declared_string_workflow_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
-    return declared_string_workflow_parameter_keys(parsed)
 
 
 def _clear_code_authoring_repair_context(ctx: AgentContext) -> None:
@@ -997,7 +1161,7 @@ def _schema_property_paths(schema: Mapping[str, object], *, prefix: str = "") ->
 
 
 def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    if not _copilot_authoring_capability(ctx).code_blocks:
         return set()
     paths: set[str] = set()
     # Criteria at this seam are polymorphic (typed CompletionCriterion plus lighter duck-typed
@@ -1024,7 +1188,7 @@ def _requested_output_child_paths(ctx: AgentContext) -> set[str]:
 
 
 def _contingent_antecedent_child_paths(ctx: AgentContext) -> set[str]:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    if not _copilot_authoring_capability(ctx).code_blocks:
         return set()
     paths: set[str] = set()
     for criterion in _active_completion_criteria(ctx):
@@ -1051,452 +1215,6 @@ def _active_completion_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
     if request_policy is None:
         return []
     return request_policy.graded_completion_criteria()
-
-
-class _DefinitionPlaneReject(NamedTuple):
-    criterion_ids: tuple[str, ...]
-    reason_codes: tuple[str, ...]
-    unreferenced_parameter_keys: tuple[str, ...]
-
-
-def _expression_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
-    if isinstance(expression, ast.Name) and isinstance(expression.ctx, ast.Load):
-        return set(bindings.get(expression.id, set()))
-    if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
-        local_bindings = {name: set(sources) for name, sources in bindings.items()}
-        comprehension_sources: set[str] = set()
-        for generator in expression.generators:
-            comprehension_sources.update(_expression_parameter_sources(generator.iter, local_bindings))
-            _bind_parameter_sources(generator.target, set(), local_bindings)
-            for condition in generator.ifs:
-                comprehension_sources.update(_expression_parameter_sources(condition, local_bindings))
-        if isinstance(expression, ast.DictComp):
-            comprehension_sources.update(_expression_parameter_sources(expression.key, local_bindings))
-            comprehension_sources.update(_expression_parameter_sources(expression.value, local_bindings))
-        else:
-            comprehension_sources.update(_expression_parameter_sources(expression.elt, local_bindings))
-        return comprehension_sources
-    if isinstance(expression, ast.Lambda):
-        local_bindings = {name: set(sources) for name, sources in bindings.items()}
-        for argument in (*expression.args.posonlyargs, *expression.args.args, *expression.args.kwonlyargs):
-            local_bindings[argument.arg] = set()
-        if expression.args.vararg is not None:
-            local_bindings[expression.args.vararg.arg] = set()
-        if expression.args.kwarg is not None:
-            local_bindings[expression.args.kwarg.arg] = set()
-        return _expression_parameter_sources(expression.body, local_bindings)
-    if isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return set()
-    sources: set[str] = set()
-    for child in ast.iter_child_nodes(expression):
-        sources.update(_expression_parameter_sources(child, bindings))
-    return sources
-
-
-def _awaited_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
-    if isinstance(expression, ast.Await):
-        return _expression_parameter_sources(expression.value, bindings)
-    if isinstance(expression, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return set()
-    sources: set[str] = set()
-    for child in ast.iter_child_nodes(expression):
-        sources.update(_awaited_parameter_sources(child, bindings))
-    return sources
-
-
-def _bind_parameter_sources(target: ast.expr, sources: set[str], bindings: dict[str, set[str]]) -> None:
-    if isinstance(target, ast.Name):
-        bindings[target.id] = set(sources)
-        return
-    if isinstance(target, (ast.Tuple, ast.List)):
-        for element in target.elts:
-            _bind_parameter_sources(element, sources, bindings)
-
-
-def _merge_parameter_bindings(left: Mapping[str, set[str]], right: Mapping[str, set[str]]) -> dict[str, set[str]]:
-    return {name: set(left.get(name, set())) | set(right.get(name, set())) for name in set(left) | set(right)}
-
-
-def _loop_body_has_reachable_break(statements: Sequence[ast.stmt]) -> bool:
-    for statement in statements:
-        if isinstance(statement, ast.Break):
-            return True
-        if isinstance(
-            statement, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
-            if not _statements_can_fall_through([statement]):
-                return False
-            continue
-        if isinstance(statement, ast.If):
-            if isinstance(statement.test, ast.Constant):
-                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
-                if _loop_body_has_reachable_break(selected_branch):
-                    return True
-            elif _loop_body_has_reachable_break(statement.body) or _loop_body_has_reachable_break(statement.orelse):
-                return True
-        elif isinstance(statement, (ast.Try, ast.TryStar)):
-            if statement.finalbody:
-                if _loop_body_has_reachable_break(statement.finalbody):
-                    return True
-                if not _statements_can_fall_through(statement.finalbody):
-                    return False
-            branches = [statement.body, statement.orelse]
-            branches.extend(handler.body for handler in statement.handlers)
-            if any(_loop_body_has_reachable_break(branch) for branch in branches):
-                return True
-        elif isinstance(statement, (ast.With, ast.AsyncWith)) and _loop_body_has_reachable_break(statement.body):
-            return True
-        elif isinstance(statement, ast.Match) and any(
-            _loop_body_has_reachable_break(case.body) for case in statement.cases
-        ):
-            return True
-        if not _statements_can_fall_through([statement]):
-            return False
-    return False
-
-
-def _statements_can_fall_through(statements: Sequence[ast.stmt]) -> bool:
-    for statement in statements:
-        if isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
-            return False
-        if isinstance(statement, ast.If):
-            if isinstance(statement.test, ast.Constant):
-                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
-                if not _statements_can_fall_through(selected_branch):
-                    return False
-                continue
-            if statement.orelse:
-                if not _statements_can_fall_through(statement.body) and not _statements_can_fall_through(
-                    statement.orelse
-                ):
-                    return False
-        if (
-            isinstance(statement, ast.While)
-            and isinstance(statement.test, ast.Constant)
-            and bool(statement.test.value)
-            and not _loop_body_has_reachable_break(statement.body)
-        ):
-            return False
-        if isinstance(statement, (ast.Try, ast.TryStar)):
-            if statement.finalbody and not _statements_can_fall_through(statement.finalbody):
-                return False
-            normal_falls_through = _statements_can_fall_through(statement.body) and _statements_can_fall_through(
-                statement.orelse
-            )
-            handler_falls_through = any(_statements_can_fall_through(handler.body) for handler in statement.handlers)
-            if not normal_falls_through and not handler_falls_through:
-                return False
-    return True
-
-
-def _statement_parameter_dataflow(
-    statements: Sequence[ast.stmt], bindings: dict[str, set[str]]
-) -> tuple[set[str], dict[str, set[str]]]:
-    consumed: set[str] = set()
-    current = {name: set(sources) for name, sources in bindings.items()}
-    for statement in statements:
-        if isinstance(statement, ast.Assign):
-            consumed.update(_awaited_parameter_sources(statement.value, current))
-            sources = _expression_parameter_sources(statement.value, current)
-            for target in statement.targets:
-                _bind_parameter_sources(target, sources, current)
-            continue
-        if isinstance(statement, ast.AnnAssign):
-            value = statement.value
-            sources = _expression_parameter_sources(value, current) if value is not None else set()
-            if value is not None:
-                consumed.update(_awaited_parameter_sources(value, current))
-            _bind_parameter_sources(statement.target, sources, current)
-            continue
-        if isinstance(statement, ast.AugAssign):
-            sources = _expression_parameter_sources(statement.target, current)
-            sources.update(_expression_parameter_sources(statement.value, current))
-            consumed.update(_awaited_parameter_sources(statement.value, current))
-            _bind_parameter_sources(statement.target, sources, current)
-            continue
-        if isinstance(statement, ast.Expr):
-            consumed.update(_awaited_parameter_sources(statement.value, current))
-            continue
-        if isinstance(statement, ast.Return):
-            if statement.value is not None:
-                consumed.update(_expression_parameter_sources(statement.value, current))
-            break
-        if isinstance(statement, ast.Raise):
-            if statement.exc is not None:
-                consumed.update(_expression_parameter_sources(statement.exc, current))
-            break
-        if isinstance(statement, ast.If):
-            consumed.update(_expression_parameter_sources(statement.test, current))
-            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
-                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.orelse, current)
-                consumed.update(branch_consumed)
-                current = branch_bindings
-                continue
-            if isinstance(statement.test, ast.Constant) and statement.test.value is True:
-                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.body, current)
-                consumed.update(branch_consumed)
-                current = branch_bindings
-                continue
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
-            consumed.update(body_consumed)
-            consumed.update(else_consumed)
-            body_falls_through = _statements_can_fall_through(statement.body)
-            else_falls_through = _statements_can_fall_through(statement.orelse)
-            if body_falls_through and else_falls_through:
-                current = _merge_parameter_bindings(body_bindings, else_bindings)
-            elif body_falls_through:
-                current = body_bindings
-            elif else_falls_through:
-                current = else_bindings
-            else:
-                break
-            continue
-        if isinstance(statement, (ast.For, ast.AsyncFor)):
-            consumed.update(_expression_parameter_sources(statement.iter, current))
-            loop_bindings = {name: set(sources) for name, sources in current.items()}
-            _bind_parameter_sources(statement.target, set(), loop_bindings)
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, loop_bindings)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
-            consumed.update(body_consumed)
-            consumed.update(else_consumed)
-            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
-            continue
-        if isinstance(statement, ast.While):
-            consumed.update(_expression_parameter_sources(statement.test, current))
-            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
-                else_consumed, current = _statement_parameter_dataflow(statement.orelse, current)
-                consumed.update(else_consumed)
-                continue
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
-            consumed.update(body_consumed)
-            consumed.update(else_consumed)
-            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
-            continue
-        if isinstance(statement, (ast.Try, ast.TryStar)):
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
-            consumed.update(body_consumed)
-            merged = body_bindings
-            for handler in statement.handlers:
-                handler_bindings = {name: set(sources) for name, sources in current.items()}
-                if handler.name:
-                    handler_bindings[handler.name] = set()
-                handler_consumed, handler_bindings = _statement_parameter_dataflow(handler.body, handler_bindings)
-                consumed.update(handler_consumed)
-                merged = _merge_parameter_bindings(merged, handler_bindings)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, body_bindings)
-            consumed.update(else_consumed)
-            merged = _merge_parameter_bindings(merged, else_bindings)
-            final_consumed, current = _statement_parameter_dataflow(statement.finalbody, merged)
-            consumed.update(final_consumed)
-            continue
-        if isinstance(statement, (ast.With, ast.AsyncWith)):
-            with_bindings = {name: set(sources) for name, sources in current.items()}
-            for item in statement.items:
-                consumed.update(_expression_parameter_sources(item.context_expr, current))
-                if item.optional_vars is not None:
-                    _bind_parameter_sources(item.optional_vars, set(), with_bindings)
-            body_consumed, current = _statement_parameter_dataflow(statement.body, with_bindings)
-            consumed.update(body_consumed)
-            continue
-        if isinstance(statement, ast.Match):
-            consumed.update(_expression_parameter_sources(statement.subject, current))
-            merged = {name: set(sources) for name, sources in current.items()}
-            for case in statement.cases:
-                if case.guard is not None:
-                    consumed.update(_expression_parameter_sources(case.guard, current))
-                case_consumed, case_bindings = _statement_parameter_dataflow(case.body, current)
-                consumed.update(case_consumed)
-                merged = _merge_parameter_bindings(merged, case_bindings)
-            current = merged
-            continue
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            function_bindings = {name: set(sources) for name, sources in current.items()}
-            for argument in (
-                *statement.args.posonlyargs,
-                *statement.args.args,
-                *statement.args.kwonlyargs,
-            ):
-                function_bindings[argument.arg] = set()
-            if statement.args.vararg is not None:
-                function_bindings[statement.args.vararg.arg] = set()
-            if statement.args.kwarg is not None:
-                function_bindings[statement.args.kwarg.arg] = set()
-            function_consumed, _ = _statement_parameter_dataflow(statement.body, function_bindings)
-            current[statement.name] = function_consumed
-            continue
-        if isinstance(statement, ast.ClassDef):
-            current[statement.name] = set()
-            continue
-        consumed.update(_expression_parameter_sources(statement, current))
-    return consumed, current
-
-
-def _code_runtime_parameter_sources(code: str, parameter_keys: set[str]) -> set[str] | None:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return None
-    initial_bindings = {key: {key} for key in parameter_keys}
-    consumed, _ = _statement_parameter_dataflow(tree.body, initial_bindings)
-    return consumed
-
-
-def _value_template_parameter_sources(value: Any, parameter_keys: set[str], depth: int = 0) -> set[str]:
-    if depth > 12:
-        return set()
-    if isinstance(value, str):
-        try:
-            return get_missing_variables(value, {}) & parameter_keys
-        except TemplateSyntaxError:
-            return set()
-    if isinstance(value, Mapping):
-        sources: set[str] = set()
-        raw_keys = value.get("parameter_keys")
-        if isinstance(raw_keys, list):
-            sources.update(key for key in raw_keys if key in parameter_keys)
-        for child in value.values():
-            sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
-        return sources
-    if isinstance(value, list):
-        list_sources: set[str] = set()
-        for child in value:
-            list_sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
-        return list_sources
-    return set()
-
-
-def _non_code_runtime_parameter_sources(parsed: Mapping[str, Any], parameter_keys: set[str]) -> set[str]:
-    definition = parsed.get("workflow_definition")
-    blocks = definition.get("blocks") if isinstance(definition, Mapping) else None
-    sources: set[str] = set()
-
-    def visit(value: Any) -> None:
-        if isinstance(value, list):
-            for child in value:
-                visit(child)
-            return
-        if not isinstance(value, Mapping):
-            return
-        is_block = "block_type" in value
-        if is_block and _enum_or_string_name(value.get("block_type")) != BlockType.CODE.value:
-            own_fields = {
-                key: child
-                for key, child in value.items()
-                if key not in {*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS}
-            }
-            sources.update(_value_template_parameter_sources(own_fields, parameter_keys))
-        for key in (*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS):
-            visit(value.get(key))
-
-    visit(blocks)
-    return sources
-
-
-def _workflow_runtime_parameter_sources(parsed: dict[str, Any]) -> set[str] | None:
-    parameter_keys = _declared_string_workflow_parameter_keys(parsed)
-    sources: set[str] = set()
-    for block in _workflow_code_blocks(parsed):
-        raw_parameter_keys = block.get("parameter_keys")
-        block_parameter_keys = (
-            {key for key in raw_parameter_keys if isinstance(key, str) and key}
-            if isinstance(raw_parameter_keys, list)
-            else set()
-        )
-        block_sources = _code_runtime_parameter_sources(str(block.get("code") or ""), block_parameter_keys)
-        if block_sources is None:
-            return None
-        sources.update(block_sources)
-    sources.update(_non_code_runtime_parameter_sources(parsed, parameter_keys))
-    return sources
-
-
-def _definition_plane_preflight_reject(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    *,
-    enforce_untagged_declared_inputs: bool = False,
-) -> _DefinitionPlaneReject | None:
-    definition_criteria = [
-        criterion for criterion in _active_completion_criteria(ctx) if criterion.level == "definition"
-    ]
-    code_only_browser = _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    if not definition_criteria and not (code_only_browser and enforce_untagged_declared_inputs):
-        return None
-    unreferenced_parameter_keys: tuple[str, ...] = ()
-    runtime_sources: set[str] | None = None
-    if code_only_browser:
-        parsed = parse_workflow_yaml(workflow_yaml)
-        if isinstance(parsed, dict):
-            runtime_sources = _workflow_runtime_parameter_sources(parsed)
-            if runtime_sources is None:
-                return None
-            parameter_keys = _declared_string_workflow_parameter_keys(parsed)
-            unreferenced_parameter_keys = tuple(sorted(parameter_keys - runtime_sources))
-    unsatisfied = [
-        verdict
-        for verdict in grade_definition_criteria(definition_criteria, workflow_yaml)
-        if verdict.state == "unsatisfied"
-    ]
-    if runtime_sources is not None and not unreferenced_parameter_keys:
-        unsatisfied = [
-            verdict for verdict in unsatisfied if verdict.reason_code != "definition_parameters_unreferenced"
-        ]
-    if not unsatisfied and not unreferenced_parameter_keys:
-        return None
-    return _DefinitionPlaneReject(
-        criterion_ids=tuple(verdict.criterion_id for verdict in unsatisfied)
-        or tuple(criterion.id for criterion in definition_criteria),
-        reason_codes=tuple(verdict.reason_code for verdict in unsatisfied)
-        or (("definition_parameters_unreferenced",) if unreferenced_parameter_keys else ()),
-        unreferenced_parameter_keys=unreferenced_parameter_keys,
-    )
-
-
-def _definition_plane_reject_error(rejection: _DefinitionPlaneReject) -> str:
-    if rejection.unreferenced_parameter_keys:
-        keys = ", ".join(f"`{key}`" for key in rejection.unreferenced_parameter_keys)
-        return f"The submitted workflow declares reusable parameters that no block references: {keys}."
-    return "The submitted workflow does not satisfy its active definition-level requirements."
-
-
-def _definition_plane_structural_payload(
-    workflow_yaml: str,
-    rejection: _DefinitionPlaneReject,
-    code_artifact_metadata: object = None,
-) -> tuple[dict[str, object], str | None]:
-    authored_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
-    return (
-        {
-            "reason_code": "definition_contract_unsatisfied",
-            "criterion_ids": rejection.criterion_ids,
-            "definition_reason_codes": rejection.reason_codes,
-            "unreferenced_parameter_keys": rejection.unreferenced_parameter_keys,
-            "authored_structure_signature": authored_signature,
-        },
-        authored_signature,
-    )
-
-
-def _definition_plane_structural_key(
-    workflow_yaml: str,
-    rejection: _DefinitionPlaneReject,
-    code_artifact_metadata: object = None,
-) -> str:
-    structural_payload, authored_signature = _definition_plane_structural_payload(
-        workflow_yaml,
-        rejection,
-        code_artifact_metadata,
-    )
-    outcome = recorded_outcome_from_author_time_reject(
-        reason_code="definition_contract_unsatisfied",
-        block_labels=sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml)),
-        structural_payload=structural_payload,
-        authored_structure_signature=authored_signature,
-        observed_evidence_summary=_definition_plane_reject_error(rejection),
-    )
-    return outcome.structural_key or authored_signature or ""
 
 
 def _judgment_output_paths(ctx: AgentContext) -> set[str]:
@@ -1630,8 +1348,7 @@ def _metadata_output_repair_context(
         metadata_contract_reason_code=coverage_reason_code,
         repair_instruction=(
             "Declare code_artifact_metadata goal_value_paths and extraction_schema for required output paths "
-            f"{path_text}, make the code return those paths, then rerun update_and_run_blocks."
-            + _declaration_repair_sentence(declaration)
+            f"{path_text}, and make the code return those paths." + _declaration_repair_sentence(declaration)
         ),
     )
 
@@ -1705,6 +1422,20 @@ def _path_segments(path: str) -> list[tuple[str, bool]]:
         if name:
             segments.append((name, is_array))
     return segments
+
+
+def code_artifact_metadata_block_labels(raw_metadata: object) -> set[str]:
+    """Block labels the submission claims to have authored a code artifact for, read from the raw rows:
+    a row normalization later drops for an unrelated field still names the block the model rebuilt."""
+    labels: set[str] = set()
+    for raw_item in _code_artifact_metadata_items(raw_metadata):
+        item = _raw_metadata_item_mapping(raw_item)
+        if item is None:
+            continue
+        label = str(item.get("block_label") or "").strip()
+        if label:
+            labels.add(label)
+    return labels
 
 
 def _metadata_item_for_block_label(raw_metadata: object, block_label: str) -> Mapping[str, Any] | None:
@@ -2309,7 +2040,7 @@ def _evaluate_output_contract_for_code_block(
     enforce_value_bearing_liveness: bool = False,
 ) -> _OutputContractEvaluation | None:
     """Evaluate factual metadata, schema, and return-path coverage for an authored code block."""
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    if not _copilot_authoring_capability(ctx).code_blocks:
         return None
     runtime_contract = _runtime_output_repair_contract_from_recorded_outcome(ctx)
     contract = _output_contract_required_paths_source(ctx)
@@ -2861,14 +2592,6 @@ def _compiled_authoring_user_summary() -> str:
     return "I need to bind the compiled browser-step code safely before saving this workflow."
 
 
-def _workflow_code_blocks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        block
-        for block in workflow_blocks(parsed)
-        if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value
-    ]
-
-
 def _raw_metadata_item_mapping(raw_item: Any) -> Mapping[str, Any] | None:
     if isinstance(raw_item, CodeArtifactMetadata):
         return raw_item.model_dump(mode="json", exclude_none=True)
@@ -3401,7 +3124,7 @@ def _verified_runtime_output_contract_paths(value: object, *, prefix: str = "") 
 
 
 def _verified_runtime_output_contract_paths_by_label(ctx: AgentContext, workflow_yaml: str) -> dict[str, set[str]]:
-    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+    if not _copilot_authoring_capability(ctx).code_blocks:
         return {}
     code_block_labels = set(_workflow_yaml_code_blocks_by_label(workflow_yaml))
     return {
@@ -3560,12 +3283,14 @@ def _artifact_declares_registration_keys(artifact: Mapping[str, Any]) -> bool:
 
 def _is_download_intent(artifact: Mapping[str, Any], code: str) -> bool:
     """Disjoint from extraction-intent (`goal_value_paths` on non-registration keys):
-    a block is download-intent when it claims a download, self-asserts a registration key in a
-    top-level dict, or declares a registration key as a goal path."""
+    a block is download-intent when it claims a download, captures one in a `with` block
+    (`page.expect_download()` or an `expect_event("download")` capture), self-asserts a registration
+    key in a top-level dict, or declares a registration key as a goal path."""
     if not code.strip():
         return False
     return (
         code_uses_download_claim(code)
+        or code_captures_download(code)
         or _code_returns_registration_keys(code)
         or _artifact_declares_registration_keys(artifact)
     )
@@ -3775,6 +3500,12 @@ _PERSISTENCE_MESSAGES: dict[PersistenceDisposition, str] = {
 }
 
 
+READINESS_WAIT_ADVISORY_REASON_CODE = "code_block_readiness_wait_advisory"
+# A nested `global` fails every run, but the run reports NameError at the use site and cannot
+# report that the block body is compiled inside a wrapper function the author never sees.
+WRAPPER_SCOPE_ADVISORY_REASON_CODE = "code_block_wrapper_scope_advisory"
+
+
 def persistence_disposition(ctx: AgentContext) -> PersistenceDisposition:
     return "staged_auto_apply" if ctx.auto_accept is True else "staged"
 
@@ -3787,7 +3518,27 @@ def carry_author_time_findings(update_result: dict[str, Any], result: dict[str, 
         return result
     carried = {
         key: update_data[key]
-        for key in ("findings", "stored_code", "stored_code_withheld", "persistence", "persistence_message")
+        for key in (
+            "findings",
+            "stored_code",
+            "stored_code_withheld",
+            "stored_code_rewritten",
+            "dropped_prior_blocks",
+            "block_type_changes",
+            "stored_goal_kept",
+            "stored_goal_kept_message",
+            "stored_goal_dropped",
+            "stored_goal_dropped_message",
+            "stored_notes_kept",
+            "stored_notes_kept_message",
+            "stored_notes_dropped",
+            "stored_notes_dropped_text",
+            "stored_notes_dropped_message",
+            "google_connection_resolution",
+            "persistence",
+            "persistence_message",
+            "google_sheet_tab_resolution",
+        )
         if update_data.get(key)
     }
     if not carried:
@@ -3805,7 +3556,7 @@ def _author_time_findings(
     *,
     schema_incompatibility: SchemaIncompatibility | None,
     metadata_violations: Sequence[str],
-    code_block_diagnostics: Mapping[str, list[str]] | None = None,
+    code_block_diagnostics: Mapping[CodeBlockPreflightDiagnostic, list[str]] | None = None,
     scanner_diagnostics: Mapping[str, list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Non-blocking labels on a draft that persisted anyway. Each entry needs a reason a
@@ -3830,18 +3581,20 @@ def _author_time_findings(
                 "summary": "\n".join(str(violation) for violation in metadata_violations),
             }
         )
-    # A contentless readiness wait is intermittent by construction: it passes on every run where the
-    # page happens to settle, so a green test-run cannot tell the author the wait encodes nothing.
-    if code_block_diagnostics:
-        findings.append(
-            {
-                "reason_code": "code_block_readiness_wait_advisory",
-                "summary": "\n".join(
-                    f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {message}"
-                    for message, labels in code_block_diagnostics.items()
-                ),
-            }
+    # Neither defect is visible to a green test-run: a contentless readiness wait passes whenever the
+    # page happens to settle, and a write-only wrapper-scope `global` silently drops the update.
+    summaries_by_reason_code: dict[str, list[str]] = {}
+    for diagnostic, labels in (code_block_diagnostics or {}).items():
+        reason_code = (
+            WRAPPER_SCOPE_ADVISORY_REASON_CODE
+            if diagnostic.code == WRAPPER_SCOPE_GLOBAL_REASON_CODE
+            else READINESS_WAIT_ADVISORY_REASON_CODE
         )
+        summaries_by_reason_code.setdefault(reason_code, []).append(
+            f"Code blocks {', '.join(f'`{label}`' for label in labels)}: {diagnostic.message}"
+        )
+    for reason_code, summaries in summaries_by_reason_code.items():
+        findings.append({"reason_code": reason_code, "summary": "\n".join(summaries)})
     # A scanner-flagged pattern is invisible to a test-run by construction: the code runs and
     # succeeds — that is exactly what makes the flagged behavior worth a warning to the author.
     if scanner_diagnostics:
@@ -3857,29 +3610,771 @@ def _author_time_findings(
     return findings
 
 
-async def _record_canonical_write_ownership(ctx: CopilotContext, workflow: Workflow) -> None:
-    """Stamp the turn's marker with what it just left canonical as.
+def strip_copilot_yaml_headers(workflow_yaml: str | None) -> str | None:
+    if not workflow_yaml:
+        return workflow_yaml
+    try:
+        data = safe_load_no_dates(workflow_yaml)
+        if not isinstance(data, dict):
+            return None
+        if strip_private_workflow_settings(data):
+            return dump_workflow_yaml(data)
+        return workflow_yaml
+    except Exception:  # noqa: BLE001 - PyYAML constructors can raise non-YAML exceptions.
+        return None
 
-    Best-effort: a missed stamp only costs this turn its rollback claim, while raising here
-    would fail a write that already succeeded. Canonical is re-read rather than fingerprinted
-    from the in-memory object so the value matches what reconcile computes.
+
+def copilot_workflow_yaml_matches(
+    submitted_yaml: str | None, *known_sources: str | None, inherited_proxy_location: ProxyLocationInput = None
+) -> bool:
+    submitted_yaml = strip_copilot_yaml_headers(submitted_yaml)
+    if not submitted_yaml:
+        return False
+    try:
+        for source in known_sources:
+            sanitized_source = strip_copilot_yaml_headers(source)
+            if not sanitized_source:
+                continue
+            source_canvas = _normalized_canvas_for_proposal_restore(
+                sanitized_source, inherited_proxy_location=inherited_proxy_location
+            )
+            submitted_with_notes, _, _ = carry_block_notes_from_versions(submitted_yaml, sanitized_source, None)
+            if (
+                _normalized_canvas_for_proposal_restore(
+                    submitted_with_notes,
+                    inherited_code_version=source_canvas.code_version,
+                    inherited_enable_self_healing=source_canvas.enable_self_healing,
+                    inherited_proxy_location=inherited_proxy_location,
+                )
+                == source_canvas
+            ):
+                return True
+    except Exception:  # noqa: BLE001 - Normalization reparses YAML with the same constructor failures.
+        return False
+    return False
+
+
+def _normalized_canvas_for_proposal_restore(
+    workflow_yaml: str,
+    *,
+    inherited_code_version: int | None = None,
+    inherited_enable_self_healing: bool | None = None,
+    inherited_proxy_location: ProxyLocationInput = None,
+) -> WorkflowCreateYAMLRequest:
+    """Normalize editor-only empty code outlines before comparing canvas custody.
+
+    The editor submits ``steps: []`` while a persisted code block round-trips that
+    same absence as ``steps: null``. Both execute identically, so this representational
+    difference must not make an unchanged canonical canvas suppress proposal recovery.
     """
-    with contextlib.suppress(Exception):
-        workflow_permanent_id = workflow.workflow_permanent_id
-        if not (ctx.workflow_copilot_chat_id and ctx.turn_id and workflow_permanent_id and ctx.organization_id):
-            return
-        persisted = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id=workflow_permanent_id,
+    normalized = _normalize_copilot_yaml(workflow_yaml)
+    normalized.webhook_callback_url = normalized.webhook_callback_url or None
+    normalized.description = normalized.description or None
+    normalized.proxy_location = resolve_proxy_location(normalized, inherited_proxy_location)
+    normalized.extra_http_headers = None
+    normalized.cdp_connect_headers = None
+    normalized.mask_secrets = bool(normalized.mask_secrets)
+    if normalized.code_version is None:
+        normalized.code_version = inherited_code_version
+    if normalized.enable_self_healing is None:
+        normalized.enable_self_healing = inherited_enable_self_healing
+
+    def normalize_blocks(blocks: Sequence[BLOCK_YAML_SUBCLASSES]) -> None:
+        for block in blocks:
+            block.notes = block.notes or None
+            block.trailing_notes = block.trailing_notes or None
+            block.description = block.description or None
+            if isinstance(block, CodeBlockYAML):
+                block.steps = block.steps or None
+                block.parameter_keys = block.parameter_keys or None
+            elif isinstance(block, (ForLoopBlockYAML, WhileLoopBlockYAML)) and block.loop_blocks:
+                normalize_blocks(block.loop_blocks)
+
+    normalize_blocks(normalized.workflow_definition.blocks)
+    return normalized
+
+
+def proposal_workflow_fingerprint(workflow: Workflow) -> str:
+    data = workflow.model_dump(mode="json")
+    if "extra_http_headers" in data:
+        data["extra_http_headers"] = data["extra_http_headers"] or None
+    if "cdp_connect_headers" in data:
+        data["cdp_connect_headers"] = None
+    return workflow_content_fingerprint(data)
+
+
+def proposal_workflow_fingerprint_matches(workflow: Workflow, fingerprint: str) -> bool:
+    # Current fingerprints exclude CDP maps because serialization masks them, but include literal extra HTTP headers.
+    # Legacy fingerprints hashed both serialized header maps and remain valid.
+    return fingerprint == proposal_workflow_fingerprint(workflow) or fingerprint == workflow_content_fingerprint(
+        workflow.model_dump(mode="json")
+    )
+
+
+async def proposal_is_displayable(proposal: object, workflow_permanent_id: str, organization_id: str) -> bool:
+    if not isinstance(proposal, dict):
+        return False
+    metadata = copilot_proposal_metadata(proposal)
+    if metadata is None:
+        return True
+    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
+    return canonical is not None and proposal_workflow_fingerprint_matches(canonical, metadata.canonical_fingerprint)
+
+
+def private_workflow_settings_from_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
+    private_settings = proposal.get(COPILOT_PRIVATE_SETTINGS_KEY)
+    proposal_yaml = proposal.get("_copilot_yaml")
+    submitted = submitted_private_workflow_settings(
+        private_settings if isinstance(private_settings, dict) else {},
+        private_workflow_settings_from_yaml(proposal_yaml if isinstance(proposal_yaml, str) else None),
+    )
+    if isinstance(private_settings, dict):
+        submitted.update(
+            {
+                key: value
+                for key, value in private_settings.items()
+                if key in ("extra_http_headers", "cdp_connect_headers")
+            }
+        )
+    return submitted
+
+
+ProposalAdoptionOutcome = Literal[
+    "adopted", "cleared", "kept", "metadata_invalid", "claimed", "canonical_fingerprint_mismatch", "read_failed"
+]
+
+
+async def _stored_candidate_proposal(ctx: CopilotContext) -> dict[str, Any] | None:
+    if not ctx.workflow_copilot_chat_id:
+        return None
+    chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=ctx.organization_id,
+        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+    )
+    if chat is None or chat.workflow_permanent_id != ctx.workflow_permanent_id:
+        return None
+    proposal = chat.proposed_workflow
+    return proposal if isinstance(proposal, dict) else None
+
+
+async def _validated_pending_workflow_proposal(
+    ctx: CopilotContext,
+    *,
+    required_workflow_run_id: str | None = None,
+) -> tuple[dict[str, Any], str] | None:
+    proposal = await _stored_candidate_proposal(ctx)
+    if proposal is None:
+        return None
+    metadata = copilot_proposal_metadata(proposal)
+    if metadata is not None:
+        # The token records the revision this turn observed, not the one it adopted. A turn that
+        # declines the candidate's content still has to supersede it when the model authors an edit,
+        # so every early return below this point keeps the token.
+        ctx.proposal_owner_turn_id = metadata.owner_turn_id
+        ctx.proposal_revision = metadata.revision
+        ctx.proposal_adopted = False
+        ctx.proposal_canonical_fingerprint = metadata.canonical_fingerprint
+    if required_workflow_run_id is not None and (
+        metadata is None or metadata.workflow_run_id != required_workflow_run_id
+    ):
+        LOG.info(
+            "copilot_pending_proposal_restore_rejected",
+            reason="associated_run_mismatch",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            required_workflow_run_id=required_workflow_run_id,
+            proposal_workflow_run_id=metadata.workflow_run_id if metadata is not None else None,
+        )
+        return None
+    canonical: Workflow | None = None
+    if metadata is not None:
+        canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
         )
-        if persisted is None:
-            return
-        await app.DATABASE.workflow_params.record_pending_copilot_turn_canonical_write(
+        if canonical is None or not proposal_workflow_fingerprint_matches(canonical, metadata.canonical_fingerprint):
+            LOG.info(
+                "copilot_pending_proposal_restore_rejected",
+                reason="canonical_fingerprint_mismatch",
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                expected_canonical_fingerprint=metadata.canonical_fingerprint,
+                observed_canonical_fingerprint=proposal_workflow_fingerprint(canonical)
+                if canonical is not None
+                else None,
+            )
+            return None
+    workflow_yaml = proposal.get("_copilot_yaml")
+    if not isinstance(workflow_yaml, str) or not workflow_yaml:
+        return None
+    sanitized_yaml = strip_copilot_yaml_headers(workflow_yaml)
+    if sanitized_yaml is None:
+        return None
+    # An explicit canvas edit remains the model's input to the normal update tool, so restore only over the
+    # saved canvas or the same pending proposal.
+    if ctx.workflow_yaml and not copilot_workflow_yaml_matches(
+        ctx.workflow_yaml,
+        sanitized_yaml,
+        saved_workflow_canvas(ctx, canonical),
+        inherited_proxy_location=canonical.proxy_location if canonical is not None else None,
+    ):
+        LOG.info(
+            "copilot_pending_proposal_restore_rejected",
+            reason="canvas_custody_mismatch",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+        )
+        ctx.canvas_rejected_proposal_yaml = sanitized_yaml
+        return None
+    return proposal, sanitized_yaml
+
+
+_PROXY_LOCATION_ADAPTER = TypeAdapter(WorkflowCreateYAMLRequest.model_fields["proxy_location"].annotation)
+
+
+def _effective_private_setting(name: str, value: object) -> object:
+    # Accept reads a null header map as {} and an empty string as unset, and validates proxy spellings the way
+    # canvas custody does.
+    if name in ("extra_http_headers", "cdp_connect_headers"):
+        return value or {}
+    if name != "proxy_location":
+        return value or None
+    if value is None:
+        return None
+    canonical = {"proxy_location": value}
+    _canonicalize_copilot_proxy_location(canonical)
+    try:
+        return _PROXY_LOCATION_ADAPTER.validate_python(canonical["proxy_location"])
+    except ValidationError:
+        return value
+
+
+def _written_private_setting(name: str, value: object) -> object:
+    # Equal effective headers can still differ in written keys: an unbound mask is an explicit entry Accept resolves.
+    value = _effective_private_setting(name, value)
+    if isinstance(value, dict) and name in ("extra_http_headers", "cdp_connect_headers"):
+        return dict.fromkeys(value, SECRET_HEADER_MASK)
+    return value
+
+
+def _effective_private_settings(*sources: Mapping[str, object]) -> dict[str, object]:
+    # The first source that names a setting wins; Accept fills settings the proposal omits from the saved workflow.
+    return {
+        name: _effective_private_setting(name, next((source[name] for source in sources if name in source), None))
+        for name in _PRIVATE_WORKFLOW_SETTINGS_FIELDS
+    }
+
+
+async def _parse_stored_candidate(
+    ctx: CopilotContext, proposal: dict[str, Any], restored_yaml: str, saved: Workflow | None
+) -> Workflow:
+    if "workflow_definition" in proposal:
+        workflow = Workflow.model_validate(proposal)
+        # A proposal froze its title in an earlier turn, so a rename saved between the two outranks
+        # it, the same way the YAML-only branch below resolves against the live row.
+        if ctx.opening_workflow_title and ctx.opening_workflow_title not in DEFAULT_WORKFLOW_TITLES:
+            workflow.title = ctx.opening_workflow_title
+        authored = _normalize_copilot_yaml(restored_yaml)
+        if "max_elapsed_time_minutes" in authored.model_fields_set:
+            workflow.max_elapsed_time_minutes = authored.max_elapsed_time_minutes
+        if (
+            "max_elapsed_time_minutes" not in authored.model_fields_set
+            and workflow.max_elapsed_time_minutes is None
+            and saved is not None
+        ):
+            workflow.max_elapsed_time_minutes = saved.max_elapsed_time_minutes
+        workflow.extra_http_headers = resolve_extra_http_headers(
+            authored, saved.extra_http_headers if saved is not None else None, copilot=True
+        )
+        workflow.cdp_connect_headers = resolve_cdp_connect_headers(
+            authored, saved.cdp_connect_headers if saved is not None else None
+        )
+        workflow.proxy_location = resolve_proxy_location(authored, saved.proxy_location if saved is not None else None)
+        workflow.totp_identifier = resolve_totp_identifier(
+            authored, saved.totp_identifier if saved is not None else None
+        )
+        workflow.totp_verification_url = resolve_totp_verification_url(
+            authored, saved.totp_verification_url if saved is not None else None
+        )
+        workflow.webhook_callback_url = resolve_webhook_callback_url(
+            authored, saved.webhook_callback_url if saved is not None else None
+        )
+    else:
+        # Older proposals persisted only YAML.
+        workflow = await _process_workflow_yaml(
+            workflow_id=ctx.workflow_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+            workflow_yaml=restored_yaml,
+            settings_fallback_yaml=ctx.persisted_workflow_yaml,
+            prefer_live_title=True,
+        )
+    return workflow
+
+
+class _CandidatePrivateSettings(NamedTuple):
+    proposal: dict[str, Any]
+    authored: dict[str, Any]
+    effective: dict[str, Any]
+
+    def overlay(self, stored_yaml: str) -> str:
+        if not self.effective:
+            return stored_yaml
+        return dump_workflow_yaml({**safe_load_no_dates(stored_yaml), **self.effective})
+
+    def own_and_turn_effective(
+        self, turn_settings: dict[str, Any], stored_document: Mapping[str, object], saved: Workflow | None
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        # Serialization masks CDP headers, so the saved side takes its real header maps from the row itself.
+        saved_settings = (
+            {**submitted_private_workflow_settings(saved.model_dump(mode="json")), **inherited_header_settings(saved)}
+            if saved is not None
+            else {}
+        )
+        own = merge_private_workflow_settings(
+            self.proposal, inherited_settings=inherited_header_settings(saved) if saved is not None else None
+        )
+        return (
+            _effective_private_settings(own, stored_document, saved_settings),
+            _effective_private_settings(turn_settings, stored_document, saved_settings),
+        )
+
+
+def _candidate_private_settings(
+    proposal: dict[str, Any], request_settings: dict[str, Any], saved: Workflow | None
+) -> _CandidatePrivateSettings:
+    proposal_settings = private_workflow_settings_from_proposal(proposal)
+    # Keep unresolved masks in the authored snapshot for Accept to resolve against the saved workflow.
+    proposal_settings = merge_private_workflow_settings(proposal_settings, inherited_settings=proposal_settings)
+    authored = submitted_private_workflow_settings(proposal_settings, request_settings)
+    for name in ("extra_http_headers", "cdp_connect_headers"):
+        headers = request_settings.get(name)
+        prior_headers = proposal_settings.get(name)
+        if isinstance(headers, dict) and isinstance(prior_headers, dict):
+            authored[name] = merge_masked_headers(headers, {**headers, **prior_headers})
+    effective = merge_private_workflow_settings(
+        proposal_settings,
+        request_settings,
+        inherited_settings=inherited_header_settings(saved) if saved is not None else None,
+    )
+    return _CandidatePrivateSettings(proposal_settings, authored, effective)
+
+
+def saved_workflow_canvas(ctx: CopilotContext, saved: Workflow | None = None) -> str | None:
+    """The saved row's canvas: ``persisted_workflow_yaml`` stays None when that row has no blocks."""
+    saved = saved or ctx.saved_workflow
+    if ctx.persisted_workflow_yaml is not None or saved is None:
+        return ctx.persisted_workflow_yaml
+    return workflow_to_copilot_yaml(saved)
+
+
+async def restore_pending_workflow_proposal(
+    ctx: CopilotContext,
+    *,
+    required_workflow_run_id: str | None = None,
+) -> None:
+    """Restore only the server's pending proposal, optionally constrained to its exact run."""
+    ctx.workflow_yaml = strip_copilot_yaml_headers(ctx.workflow_yaml)
+    if ctx.workflow_yaml is None:
+        ctx.workflow_yaml = strip_copilot_yaml_headers(ctx.persisted_workflow_yaml)
+    if ctx.staged_workflow is not None:
+        return
+    pending = await _validated_pending_workflow_proposal(ctx, required_workflow_run_id=required_workflow_run_id)
+    proposal = pending[0] if pending is not None else {}
+    request_settings = merge_private_workflow_settings(
+        ctx.private_workflow_settings, inherited_settings=ctx.private_workflow_settings
+    )
+    saved = None
+    if pending is not None or any(
+        isinstance(request_settings.get(name), dict) and SECRET_HEADER_MASK in request_settings[name].values()
+        for name in ("extra_http_headers", "cdp_connect_headers")
+    ):
+        saved = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
+        )
+    settings = _candidate_private_settings(proposal, request_settings, saved)
+    proposal_settings, private_settings = settings.proposal, settings.effective
+    ctx.authored_private_workflow_settings = settings.authored
+    ctx.private_workflow_settings = private_settings
+    if pending is None:
+        return
+    _, sanitized_yaml = pending
+    metadata = copilot_proposal_metadata(proposal)
+    stored_document = safe_load_no_dates(sanitized_yaml)
+    restored_yaml = settings.overlay(sanitized_yaml)
+    workflow = await _parse_stored_candidate(ctx, proposal, restored_yaml, saved)
+    own_effective, effective = settings.own_and_turn_effective(private_settings, stored_document, saved)
+    if effective == own_effective:
+        # The turn-end publish compares settings as written, so a request value that only echoes the proposal's
+        # effective value is recorded as the proposal wrote it.
+        for name, value in request_settings.items():
+            if _written_private_setting(name, value) != _written_private_setting(name, own_effective.get(name)):
+                continue
+            if name in proposal_settings:
+                ctx.authored_private_workflow_settings[name] = copy.deepcopy(proposal_settings[name])
+            else:
+                ctx.authored_private_workflow_settings.pop(name, None)
+    elif metadata is not None:
+        ctx.settings_diverged_proposal_token = (metadata.owner_turn_id, metadata.revision)
+        LOG.info(
+            "copilot_pending_proposal_settings_diverged",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            proposal_owner_turn_id=metadata.owner_turn_id,
+            proposal_revision=metadata.revision,
+            setting_names=sorted(name for name in own_effective if effective[name] != own_effective[name]),
+        )
+    strip_private_workflow_settings(own_effective)
+    strip_private_workflow_settings(effective)
+    # Run bind compares staged bytes to stored ones, and the model's next edit re-saves what it sees, so re-dump
+    # only when a visible setting changed.
+    workflow_yaml = sanitized_yaml if own_effective == effective else strip_copilot_yaml_headers(restored_yaml)
+    ctx.staged_workflow = workflow
+    ctx.staged_workflow_yaml = workflow_yaml
+    ctx.workflow_yaml = workflow_yaml
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = workflow_yaml
+    if metadata is not None:
+        ctx.proposal_workflow_run_id = metadata.workflow_run_id
+
+
+async def prior_draft_settings_match_stored_candidate(ctx: CopilotContext) -> bool | None:
+    """A prior draft parses under this turn's settings, so the stored bytes vouch for it only when those are its own.
+    None means no stored candidate built on the current saved workflow could be compared."""
+    try:
+        proposal = await _stored_candidate_proposal(ctx)
+        stored_yaml = strip_copilot_yaml_headers(proposal.get("_copilot_yaml")) if proposal is not None else None
+        if proposal is None or not isinstance(stored_yaml, str) or not stored_yaml:
+            return None
+        saved = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
+        )
+        metadata = copilot_proposal_metadata(proposal)
+        if metadata is not None and (
+            saved is None or not proposal_workflow_fingerprint_matches(saved, metadata.canonical_fingerprint)
+        ):
+            return None
+        own, turn = _candidate_private_settings(proposal, {}, saved).own_and_turn_effective(
+            ctx.private_workflow_settings, safe_load_no_dates(stored_yaml), saved
+        )
+    except Exception:
+        LOG.warning("copilot_prior_draft_settings_check_failed", exc_info=True)
+        return None
+    return own == turn
+
+
+async def adopt_stored_workflow_candidate(ctx: CopilotContext) -> ProposalAdoptionOutcome:
+    """Take the stored candidate's token and bytes together; the caller holds ``ctx.proposal_mutation_lock``."""
+    workflow: Workflow | None = None
+    workflow_yaml = ""
+    code_artifact_metadata: dict[str, dict[str, Any]] = {}
+    associations: dict[str, str] = {}
+    settings: _CandidatePrivateSettings | None = None
+    canonical: Workflow | None = None
+    try:
+        proposal = await _stored_candidate_proposal(ctx)
+        metadata = copilot_proposal_metadata(proposal)
+        if metadata is not None and metadata.claim_is_live(datetime.now(timezone.utc)):
+            return "claimed"
+        if proposal is not None and metadata is None:
+            return "metadata_invalid"
+        if metadata is not None and metadata.owner_turn_id == ctx.turn_id:
+            return "kept"
+        canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id, organization_id=ctx.organization_id
+        )
+        outcome: ProposalAdoptionOutcome = "cleared"
+        stored_yaml = proposal.get("_copilot_yaml") if proposal is not None else None
+        if proposal is not None and metadata is not None and isinstance(stored_yaml, str) and stored_yaml:
+            if canonical is None or not proposal_workflow_fingerprint_matches(
+                canonical, metadata.canonical_fingerprint
+            ):
+                outcome = "canonical_fingerprint_mismatch"
+            else:
+                # The candidate's own settings replace this turn's, as if the turn had published it.
+                settings = _candidate_private_settings(proposal, {}, canonical)
+                workflow = await _parse_stored_candidate(ctx, proposal, settings.overlay(stored_yaml), canonical)
+                workflow_yaml = stored_yaml
+                stored_metadata = proposal.get("_copilot_code_artifact_metadata")
+                code_artifact_metadata = copy.deepcopy(stored_metadata) if isinstance(stored_metadata, dict) else {}
+                associations = runner_code_block_associations(workflow_yaml)
+                outcome = "adopted"
+    except Exception:
+        LOG.warning(
+            "copilot_stored_candidate_adoption_read_failed",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            exc_info=True,
+        )
+        return "read_failed"
+
+    ctx.proposal_adopted = True
+    ctx.proposal_adoptions += 1
+    # The stored candidate does not record whether its author meant to delete the saved contract; keep it.
+    ctx.clear_persisted_completion_contract = False
+    ctx.proposal_owner_turn_id = metadata.owner_turn_id if metadata is not None else None
+    ctx.proposal_revision = metadata.revision if metadata is not None else None
+    ctx.proposal_canonical_fingerprint = metadata.canonical_fingerprint if metadata is not None else None
+    ctx.proposal_workflow_run_id = metadata.workflow_run_id if workflow is not None and metadata is not None else None
+    # This turn's own draft is gone, so no turn-end exit may present or re-publish it. The adopted candidate
+    # becomes this turn's result only once this turn edits it.
+    ctx.has_staged_proposal = False
+    ctx.edited_block_labels_this_turn = []
+    ctx.last_workflow = None
+    ctx.last_workflow_yaml = None
+    ctx.last_good_workflow = None
+    ctx.last_good_workflow_yaml = None
+    ctx.last_failed_workflow_yaml = None
+    if settings is not None:
+        ctx.authored_private_workflow_settings = settings.authored
+        ctx.private_workflow_settings = settings.effective
+        ctx.settings_diverged_proposal_token = None
+        ctx.workflow_yaml = workflow_yaml
+    elif canonical is not None:
+        # With no candidate left the saved row is the only source; omitted settings make edits inherit its own.
+        ctx.workflow_id = canonical.workflow_id
+        ctx.workflow_yaml = workflow_to_copilot_yaml(canonical)
+        ctx.authored_private_workflow_settings = {}
+        ctx.private_workflow_settings = {}
+    else:
+        ctx.workflow_yaml = ctx.persisted_workflow_yaml or ""
+    ctx.staged_workflow = workflow
+    ctx.staged_workflow_yaml = workflow_yaml if workflow is not None else None
+    ctx.prior_copilot_workflow_yaml = workflow_yaml if workflow is not None else None
+    ctx.code_artifact_metadata = code_artifact_metadata
+    ctx.workflow_verification_evidence.code_artifact_metadata = code_artifact_metadata
+    ctx.runner_code_block_associations_by_label = associations
+    ctx.last_full_workflow_test_ok = False
+    # Credit and receipts were earned under the replaced candidate's settings, which block fingerprints omit.
+    ctx.executed_block_fingerprints = {}
+    _invalidate_test_evidence_on_edit(ctx, None, workflow.workflow_definition if workflow is not None else None)
+    return outcome
+
+
+def unseen_adoption(ctx: CopilotContext) -> ProposalAdoptionOutcome | None:
+    """An adoption the latest model response had not seen: its calls were written against the replaced draft."""
+    if ctx.proposal_adoptions == ctx.proposal_adoptions_seen_by_model:
+        return None
+    return "adopted" if ctx.staged_workflow is not None else "cleared"
+
+
+def _unseen_adoption_edit_refusal(ctx: CopilotContext) -> dict[str, Any] | None:
+    adoption = unseen_adoption(ctx)
+    if adoption is None:
+        return None
+    LOG.info(
+        "copilot_candidate_publication_conflict",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        reason="token_changed",
+        adoption=adoption,
+    )
+    return proposal_conflict_result(
+        ctx, lost="This edit was not saved, so nothing was written.", reason="token_changed", adoption=adoption
+    )
+
+
+def proposal_conflict_result(
+    ctx: CopilotContext,
+    *,
+    lost: str,
+    reason: CopilotProposalConflictReason,
+    adoption: ProposalAdoptionOutcome,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"ok": False, "conflict_reason": reason, "adoption": adoption}
+    if adoption == "adopted":
+        result["error"] = f"{lost} Another change replaced the pending proposal, and this turn now works on it."
+        adopted_yaml = redact_raw_secrets_for_prompt(ctx.staged_workflow_yaml or "")
+        if not copilot_sees_notes(ctx):
+            adopted_yaml = drop_submitted_note_fields(adopted_yaml)
+        if len(adopted_yaml) > _BUILD_TEST_WORKFLOW_MAX_CHARS:
+            result["adopted_workflow_yaml"] = adopted_yaml[: _BUILD_TEST_WORKFLOW_MAX_CHARS - 3] + "..."
+            result["next_step"] = (
+                "adopted_workflow_yaml is the workflow this turn now works on, "
+                f"shortened at {_BUILD_TEST_WORKFLOW_MAX_CHARS} characters. "
+                "Change it with edit_block, or test it as it is."
+            )
+        else:
+            result["adopted_workflow_yaml"] = adopted_yaml
+            result["next_step"] = (
+                "adopted_workflow_yaml is the workflow this turn now works on. "
+                "Apply your change to it, or test it as it is."
+            )
+    elif adoption in ("cleared", "canonical_fingerprint_mismatch"):
+        result["error"] = (
+            f"{lost} The pending proposal was removed or no longer matches the saved workflow, "
+            "so this turn's draft was dropped."
+        )
+        result["next_step"] = "This turn now works from the saved workflow; read it again before editing."
+    elif adoption == "kept":
+        result["error"] = f"{lost} The proposal changed while this step was starting."
+        result["next_step"] = "This turn's current draft is unchanged; edit or test it again."
+    elif adoption == "claimed":
+        result["error"] = f"{lost} The pending proposal is being accepted."
+        result["next_step"] = "Wait for the accept to finish before editing or testing."
+    elif adoption == "metadata_invalid":
+        result["error"] = f"{lost} The pending proposal's record is unreadable, so this turn cannot replace it."
+    else:
+        result["error"] = f"{lost} The current proposal could not be read."
+    return result
+
+
+def _candidate_proposal_data(workflow: Workflow, workflow_yaml: str, ctx: CopilotContext) -> dict[str, Any]:
+    proposal = dict(workflow.model_dump(mode="json"))
+    proposal["_copilot_yaml"] = workflow_yaml
+    carried_settings = (
+        ctx.authored_private_workflow_settings
+        if ctx.authored_private_workflow_settings is not None
+        else ctx.private_workflow_settings
+    )
+    yaml_settings = private_workflow_settings_from_yaml(workflow_yaml)
+    for name in ("extra_http_headers", "cdp_connect_headers"):
+        headers = yaml_settings.get(name)
+        carried_headers = carried_settings.get(name)
+        if isinstance(headers, dict) and isinstance(carried_headers, dict):
+            yaml_settings[name] = merge_masked_headers(headers, {**headers, **carried_headers})
+    private_settings = submitted_private_workflow_settings(carried_settings, yaml_settings)
+    strip_private_workflow_settings(proposal)
+    proposal.pop("extra_http_headers", None)
+    proposal.pop("cdp_connect_headers", None)
+    proposal.pop("proxy_location", None)
+    proposal.update(copy.deepcopy(private_settings))
+    if private_settings:
+        proposal[COPILOT_PRIVATE_SETTINGS_KEY] = copy.deepcopy(private_settings)
+    proposal["_copilot_unvalidated"] = True
+    if ctx.code_artifact_metadata:
+        proposal["_copilot_code_artifact_metadata"] = ctx.code_artifact_metadata
+    return proposal
+
+
+class CopilotCanonicalWorkflowUnavailableError(Exception):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__("No active workflow exists for the bound permanent ID")
+        self.workflow_permanent_id = workflow_permanent_id
+
+
+_UNAVAILABLE_AGENT_FACTS = (
+    "Another save or test from this chat fails the same way. "
+    "Agents are selected or created on the Agents page at /agents."
+)
+CANONICAL_WORKFLOW_UNAVAILABLE_ERROR = (
+    "This chat's agent is unavailable: no active agent exists for its ID, so this change was not saved or tested. "
+    + _UNAVAILABLE_AGENT_FACTS
+)
+CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR = (
+    "This chat's agent is unavailable: no active agent exists for its ID, so this test was not started. "
+    + _UNAVAILABLE_AGENT_FACTS
+)
+
+
+def record_canonical_workflow_unavailable(
+    ctx: CopilotContext,
+    error: CopilotCanonicalWorkflowUnavailableError,
+    *,
+    refused: Literal["publication", "test_start"],
+) -> CanonicalWorkflowUnavailableFacts:
+    facts: CanonicalWorkflowUnavailableFacts = {
+        "workflow_permanent_id": error.workflow_permanent_id,
+        "test_started": False,
+        "detail": CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR,
+    }
+    # A test-start refusal says nothing about publication: a combined update-and-run may already have
+    # published this call's candidate before the agent became unavailable.
+    if refused == "publication":
+        facts["candidate_published"] = False
+        facts["detail"] = CANONICAL_WORKFLOW_UNAVAILABLE_ERROR
+    ctx.canonical_workflow_unavailable = facts
+    LOG.info(
+        "copilot_canonical_workflow_unavailable", workflow_permanent_id=error.workflow_permanent_id, refused=refused
+    )
+    return facts
+
+
+def canonical_workflow_unavailable_result(
+    ctx: CopilotContext,
+    error: CopilotCanonicalWorkflowUnavailableError,
+    *,
+    refused: Literal["publication", "test_start"],
+) -> dict[str, Any]:
+    facts = record_canonical_workflow_unavailable(ctx, error, refused=refused)
+    return {"ok": False, "canonical_workflow_unavailable": dict(facts), "error": facts["detail"]}
+
+
+async def require_active_canonical_workflow(ctx: CopilotContext) -> Workflow:
+    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        organization_id=ctx.organization_id,
+    )
+    if canonical is None:
+        raise CopilotCanonicalWorkflowUnavailableError(ctx.workflow_permanent_id)
+    return canonical
+
+
+async def publish_workflow_candidate(
+    ctx: CopilotContext,
+    *,
+    workflow: Workflow,
+    workflow_yaml: str,
+    disposition: ProposalDisposition = "review_untested",
+) -> str:
+    """Durably publish admitted bytes before they become staged or visible.
+
+    Returns the bytes that were stored. Accept reparses them without going back through
+    ``_process_workflow_yaml``, so the title is resolved here — once, before the first durable
+    write — and callers stage what was stored so every later equality check compares like with like.
+    """
+    if not ctx.workflow_copilot_chat_id:
+        ctx.authored_private_workflow_settings = submitted_private_workflow_settings(
+            ctx.authored_private_workflow_settings
+            if ctx.authored_private_workflow_settings is not None
+            else ctx.private_workflow_settings,
+            private_workflow_settings_from_yaml(workflow_yaml),
+        )
+        ctx.private_workflow_settings = merge_private_workflow_settings(
+            ctx.authored_private_workflow_settings,
+            inherited_settings=inherited_header_settings(workflow),
+        )
+        return strip_copilot_yaml_headers(workflow_yaml) or ""
+    # Deletion takes this lock, so the active-row read and the candidate write cannot straddle a delete.
+    async with app.DATABASE.workflows.acquire_workflow_creation_lock(ctx.workflow_permanent_id):
+        canonical = await require_active_canonical_workflow(ctx)
+        # The title this proposal froze was resolved when the turn parsed its YAML. Anything that renamed
+        # the row since the turn opened -- background naming, or the user from the header -- has to win
+        # here, or canonical_title would record that name while the bytes keep the stale one, and Accept
+        # would read the two as agreeing and write the stale one back.
+        # Anything that renamed the row since the turn opened -- background naming, or the user saving
+        # from the header -- outranks the title this proposal froze when the turn parsed its YAML. The
+        # baseline is the saved row at turn open: the submitted canvas can carry an unsaved rename that
+        # differs from the row without anything having landed, and a blockless agent has no saved YAML.
+        opening_title = ctx.opening_workflow_title
+        if opening_title is not None and canonical.title and canonical.title != opening_title:
+            workflow.title = canonical.title
+        workflow_yaml = with_workflow_yaml_title(workflow_yaml, workflow.title)
+        proposal = _candidate_proposal_data(workflow, workflow_yaml, ctx)
+        workflow_yaml = strip_copilot_yaml_headers(workflow_yaml) or ""
+        proposal["_copilot_yaml"] = workflow_yaml
+        updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
             organization_id=ctx.organization_id,
             workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
-            turn_id=ctx.turn_id,
-            fingerprint=workflow_content_fingerprint(persisted.model_dump(mode="json")),
+            proposal=proposal,
+            owner_turn_id=ctx.turn_id,
+            canonical_fingerprint=proposal_workflow_fingerprint(canonical),
+            canonical_title=canonical.title,
+            disposition=disposition,
+            expected_owner_turn_id=ctx.proposal_owner_turn_id,
+            expected_revision=ctx.proposal_revision,
         )
+    metadata = copilot_proposal_metadata(updated_chat.proposed_workflow)
+    if metadata is None:
+        raise RuntimeError("Candidate publication returned no ownership token")
+    ctx.proposal_owner_turn_id = metadata.owner_turn_id
+    ctx.proposal_revision = metadata.revision
+    ctx.proposal_adopted = False
+    ctx.proposal_canonical_fingerprint = metadata.canonical_fingerprint
+    ctx.authored_private_workflow_settings = proposal.get(COPILOT_PRIVATE_SETTINGS_KEY, {})
+    ctx.private_workflow_settings = merge_private_workflow_settings(
+        ctx.authored_private_workflow_settings,
+        inherited_settings=inherited_header_settings(workflow),
+    )
+    ctx.proposal_workflow_run_id = metadata.workflow_run_id
+    return workflow_yaml
 
 
 async def _update_workflow(
@@ -3888,6 +4383,7 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
     originating_call_id: str | None = None,
+    block_scoped_authoring_prior_yaml: str | None = None,
 ) -> dict[str, Any]:
     def _blocked(block: AuthorTimeBlock) -> dict[str, Any]:
         _clear_code_authoring_repair_context(ctx)
@@ -3898,24 +4394,30 @@ async def _update_workflow(
             result["data"] = block.data
         return result
 
-    def _tool_error(error: str, *, user_facing_summary: str | None = None) -> dict[str, Any]:
+    def _tool_error(
+        error: str, *, user_facing_summary: str | None = None, error_code: str | None = None
+    ) -> dict[str, Any]:
         # The submission cannot become a Workflow, so there is no authored artifact to refuse:
         # report it honestly without a block identity, a turn halt, or a churn increment.
         result: dict[str, Any] = {"ok": False, "error": error}
         if user_facing_summary is not None:
             result["user_facing_summary"] = user_facing_summary
+        if error_code is not None:
+            result["error_code"] = error_code
         return result
 
     authority_error = _authority_tool_error(ctx, "update_workflow")
     if authority_error is not None:
         return _tool_error(authority_error)
+    # Checked before the submission touches ctx; no await separates this from the metadata merge below.
+    if isinstance(ctx, CopilotContext) and (unseen_refusal := _unseen_adoption_edit_refusal(ctx)) is not None:
+        return unseen_refusal
 
     workflow_yaml = params["workflow_yaml"]
     submitted_workflow_yaml = workflow_yaml
     raw_conflict_marker_error = _raw_workflow_yaml_conflict_marker_error(workflow_yaml)
     if raw_conflict_marker_error is not None:
         return _tool_error(raw_conflict_marker_error, user_facing_summary=_compiled_authoring_user_summary())
-    ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     ctx.submitted_code_artifact_metadata_snapshot = copy.deepcopy(params.get("code_artifact_metadata"))
@@ -3933,6 +4435,7 @@ async def _update_workflow(
     prior_workflow_yaml = ctx.workflow_yaml
     existing_metadata = ctx.code_artifact_metadata
     previous_metadata_contract = contract_from_code_artifact_metadata(existing_metadata)
+    clear_persisted_completion_contract: bool | None = None
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
     code_safety_rejection_facts: list[CodeSafetyRejectionFact] = []
     if code_safety_errors:
@@ -3993,6 +4496,12 @@ async def _update_workflow(
                 },
             ),
         )
+    vault_login_error = bitwarden_binding_change_error(workflow_yaml, ctx.request_policy)
+    if vault_login_error is None:
+        workflow_yaml, vault_login_error = await import_bound_vault_logins(workflow_yaml, ctx)
+    if vault_login_error is not None:
+        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=vault_login_error))
+    params["workflow_yaml"] = workflow_yaml
     if allow_missing_credentials is None:
         allow_missing_credentials = ctx.allow_untested_workflow_draft is True
     if not allow_missing_credentials:
@@ -4012,7 +4521,6 @@ async def _update_workflow(
     output_policy_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
         workflow_yaml=workflow_yaml,
-        tool_arguments=params,
     )
     output_policy_steered_reasons = demote_author_time_steer_reasons(output_policy_verdict)
     if not output_policy_verdict.allowed:
@@ -4039,47 +4547,41 @@ async def _update_workflow(
         )
         return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=output_policy_error))
 
-    # Prefer the most-recent in-turn emission so cross-path flows (inline
-    # REPLACE_WORKFLOW followed by update_workflow) compare against what the
-    # LLM actually saw, not the turn-start persisted state.
-    last_yaml = ctx.last_workflow_yaml
-    prior_yaml = last_yaml if isinstance(last_yaml, str) and last_yaml else ctx.workflow_yaml
+    prior_yaml = _latest_draft_yaml(ctx)
 
-    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.TASK_V3_PURE:
-        task_v3_pure_violations = _task_v3_pure_policy_violations(workflow_yaml)
-        if task_v3_pure_violations:
-            violation_items = [(violation.label, violation.block_type) for violation in task_v3_pure_violations]
-            _record_banned_block_reject_span("_update_workflow", violation_items)
-            return _blocked(
-                AuthorTimeBlock(
-                    block_id=BANNED_BLOCKS_BLOCK_ID,
-                    error=_task_v3_pure_reject_message(task_v3_pure_violations),
-                    data={"violations": [violation.as_dict() for violation in task_v3_pure_violations]},
-                )
-            )
-
-    # Post-emission reject of copilot-v2 writes that introduce a banned
-    # block type. The schema pre_hook only fires when the LLM consults the
-    # schema; this safety net fires regardless of emission path. Label-based
-    # diff preserves legacy workflows — only NEW banned labels trip the reject.
-    banned_items = _detect_new_banned_blocks(
+    # Runs on every emission path, not only when the LLM consults the schema, and validates only the
+    # blocks this turn introduces or changes.
+    authoring_validation = reject_authoring_violations(
+        ctx,
         workflow_yaml,
-        ctx.workflow_yaml,
-        banned_types=_copilot_banned_block_types(ctx),
+        "_update_workflow",
+        prior_workflow_yaml=block_scoped_authoring_prior_yaml,
     )
-    if banned_items:
-        _record_banned_block_reject_span("_update_workflow", banned_items)
-        return _blocked(
-            AuthorTimeBlock(
-                block_id=BANNED_BLOCKS_BLOCK_ID,
-                error=_banned_block_reject_message(banned_items, ctx),
-            )
-        )
+    if authoring_validation.reject is not None:
+        return _blocked(authoring_validation.reject)
+    workflow_yaml = authoring_validation.workflow_yaml
 
     try:
         # Before redaction: a connection name equal to a registered scrub value would otherwise
         # reach the resolver already replaced by the placeholder.
         workflow_yaml, google_connection_resolution = await canonicalize_named_google_sheet_bindings(workflow_yaml, ctx)
+        workflow_yaml, google_sheet_tab_resolution = await resolve_google_sheet_tabs_from_gid(workflow_yaml, ctx)
+        # Ahead of redaction: this copies stored Goal bytes into the candidate, so they have to
+        # pass the scrub seam like any other submitted text.
+        goal_rewritten_labels = code_artifact_metadata_block_labels(ctx.submitted_code_artifact_metadata_snapshot)
+        goal_carry = carry_user_owned_goals_in_yaml(
+            workflow_yaml,
+            prior_yaml=prior_yaml,
+            rebuilt_labels=goal_rewritten_labels | set(params.get("_rebuilt_block_labels") or ()),
+            goal_rewritten_labels=goal_rewritten_labels,
+        )
+        workflow_yaml = goal_carry.workflow_yaml
+        if not copilot_sees_notes(ctx):
+            # Without the Doc editor the user cannot see notes, so Copilot keeps the saved ones untouched.
+            workflow_yaml = drop_submitted_note_fields(workflow_yaml)
+        workflow_yaml, kept_note_labels, dropped_note_labels = carry_block_notes_from_versions(
+            workflow_yaml, prior_yaml, ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None
+        )
         # Ahead of both persistence and the context assignment below, so the row, the draft the
         # model reads back, and the bytes apply_block_edit anchors against are one string. Scrubbing
         # the payload alone would leave the model reading redacted code and anchoring on raw code.
@@ -4097,9 +4599,36 @@ async def _update_workflow(
                 accepted_metadata_contract,
                 previous_contract=previous_metadata_contract,
             )
-            if isinstance(ctx, CopilotContext):
-                ctx.clear_persisted_completion_contract = clear_persisted_completion_contract
             params["workflow_yaml"] = workflow_yaml
+        submitted_definition = parse_workflow_yaml(workflow_yaml)
+        prior_definition = parse_workflow_yaml(prior_yaml) if prior_yaml else None
+        if isinstance(submitted_definition, dict) and isinstance(prior_definition, dict):
+            inherited_settings = {
+                key: prior_definition[key]
+                for key in ("max_elapsed_time_minutes",)
+                if key not in submitted_definition and key in prior_definition
+            }
+            if inherited_settings:
+                submitted_definition.update(inherited_settings)
+                workflow_yaml = dump_workflow_yaml(submitted_definition)
+                params["workflow_yaml"] = workflow_yaml
+        expected_exact_code_by_label = params.get("_expected_exact_code_by_label")
+        if isinstance(expected_exact_code_by_label, dict):
+            transformed_blocks_by_label = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+            changed_labels = [
+                label
+                for label, expected_source in expected_exact_code_by_label.items()
+                if not isinstance(label, str)
+                or not isinstance(expected_source, str)
+                or transformed_blocks_by_label.get(label, {}).get("code") != expected_source
+            ]
+            if changed_labels:
+                return _tool_error(
+                    "The executed source changed at the workflow persistence boundary, so it was not saved or run. "
+                    "Run the complete candidate again without embedding a live credential value, then promote its "
+                    "new source reference.",
+                    error_code="executed_source_changed_before_persistence",
+                )
         prior_workflow = await _get_prior_workflow(ctx)
         workflow = await _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
@@ -4108,60 +4637,79 @@ async def _update_workflow(
             workflow_yaml=workflow_yaml,
             settings_fallback_yaml=prior_yaml,
             settings_fallback_workflow=prior_workflow,
+            private_workflow_settings=ctx.private_workflow_settings if isinstance(ctx, CopilotContext) else None,
+            prefer_live_title=isinstance(ctx, CopilotContext) and ctx.agent_named_title is not None,
         )
         webhook_callback_url = workflow.webhook_callback_url
-        if isinstance(webhook_callback_url, str) and webhook_callback_url != getattr(
-            prior_workflow, "webhook_callback_url", None
+        if (
+            isinstance(submitted_definition, dict)
+            and "webhook_callback_url" in submitted_definition
+            and isinstance(webhook_callback_url, str)
+            and webhook_callback_url != getattr(prior_workflow, "webhook_callback_url", None)
         ):
-            workflow.webhook_callback_url = validate_webhook_url(webhook_callback_url)
+            workflow.webhook_callback_url = validate_webhook_url(
+                webhook_callback_url, field_name="webhook_callback_url"
+            )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
-        # Param / top-level setting changes go through canonical because
-        # prepare_workflow and the runtime parameter-row read consume canonical
-        # values; terminal handlers roll back on non-auto-accept.
-        requires_canonical_persist = _workflow_requires_canonical_persist(prior_workflow, workflow)
-        if requires_canonical_persist:
-            await app.WORKFLOW_SERVICE.update_workflow_definition(
-                workflow_id=ctx.workflow_id,
-                organization_id=ctx.organization_id,
-                title=workflow.title,
-                description=workflow.description,
-                workflow_definition=workflow.workflow_definition,
-                proxy_location=workflow.proxy_location,
-                webhook_callback_url=workflow.webhook_callback_url,
-                totp_verification_url=workflow.totp_verification_url,
-                totp_identifier=workflow.totp_identifier,
-                persist_browser_session=workflow.persist_browser_session,
-                reuse_browser_session=workflow.reuse_browser_session,
-                mask_secrets=getattr(workflow, "mask_secrets", False),
-                pin_saved_session_ip=workflow.pin_saved_session_ip,
-                browser_profile_id=workflow.browser_profile_id,
-                browser_profile_key=workflow.browser_profile_key,
-                model=workflow.model,
-                max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
-                extra_http_headers=workflow.extra_http_headers,
-                cdp_connect_headers=workflow.cdp_connect_headers,
-                run_with=workflow.run_with,
-                ai_fallback=workflow.ai_fallback,
-                cache_key=workflow.cache_key,
-                adaptive_caching=workflow.adaptive_caching,
-                enable_self_healing=workflow.enable_self_healing,
-                code_version=workflow.code_version,
-                run_sequentially=workflow.run_sequentially,
-                sequential_key=workflow.sequential_key,
-                edited_by="copilot",
-                preserve_completion_contract=not getattr(ctx, "clear_persisted_completion_contract", False),
-            )
-            ctx.canonical_was_persisted_due_to_param_change = True
-            # isinstance narrows the declared ``AgentContext`` to the marker-aware
-            # ``CopilotContext`` for mypy, matching the narrative-emit seam below.
-            if isinstance(ctx, CopilotContext):
-                await _record_canonical_write_ownership(ctx, workflow)
-        ctx.staged_workflow_yaml = workflow_yaml
-        ctx.staged_workflow = workflow
-        ctx.has_staged_proposal = True
-        ctx.workflow_yaml = workflow_yaml
+        # Runs materialize this proposal as their own version. The saved workflow
+        # remains unchanged until Accept, including parameter and setting edits.
         if isinstance(ctx, CopilotContext):
+            # The durable write and the staged fields it backs move together, so a parallel tool
+            # call cannot read a staged draft the store has not accepted.
+            async with ctx.proposal_mutation_lock:
+                # Publishing under an adopted token the model has not seen would overwrite that candidate.
+                if (unseen_refusal := _unseen_adoption_edit_refusal(ctx)) is not None:
+                    return unseen_refusal
+                # A sibling write may have published since entry; the dropped/retyped facts
+                # must name the draft this write replaces.
+                prior_yaml = _latest_draft_yaml(ctx)
+                try:
+                    workflow_yaml = await publish_workflow_candidate(
+                        ctx, workflow=workflow, workflow_yaml=workflow_yaml
+                    )
+                except CopilotProposalConflictError as conflict:
+                    stale_owner_turn_id, stale_revision = ctx.proposal_owner_turn_id, ctx.proposal_revision
+                    adoption = await adopt_stored_workflow_candidate(ctx)
+                    LOG.info(
+                        "copilot_candidate_publication_conflict",
+                        workflow_permanent_id=ctx.workflow_permanent_id,
+                        proposal_owner_turn_id=stale_owner_turn_id,
+                        proposal_revision=stale_revision,
+                        reason=conflict.reason,
+                        adoption=adoption,
+                        error=str(conflict),
+                    )
+                    return proposal_conflict_result(
+                        ctx,
+                        lost="This edit was not saved, so nothing was written.",
+                        reason=conflict.reason,
+                        adoption=adoption,
+                    )
+                except CopilotCanonicalWorkflowUnavailableError as unavailable:
+                    return canonical_workflow_unavailable_result(ctx, unavailable, refused="publication")
+                ctx.staged_workflow_yaml = workflow_yaml
+                ctx.staged_workflow = workflow
+                ctx.has_staged_proposal = True
+                ctx.workflow_yaml = workflow_yaml
+                # A refused edit must not leave its contract deletion for a later accept of other content.
+                if clear_persisted_completion_contract is not None:
+                    ctx.clear_persisted_completion_contract = clear_persisted_completion_contract
+                # Published under the lock so a waiting sibling reads this draft as its baseline;
+                # the wrapper re-assigns the same pair after the tool returns.
+                ctx.last_workflow = workflow
+                ctx.last_workflow_yaml = workflow_yaml
+        else:
+            workflow_yaml = strip_copilot_yaml_headers(workflow_yaml) or ""
+            ctx.staged_workflow_yaml = workflow_yaml
+            ctx.staged_workflow = workflow
+            ctx.has_staged_proposal = True
+            ctx.workflow_yaml = workflow_yaml
+        params["workflow_yaml"] = workflow_yaml
+        if isinstance(ctx, CopilotContext):
+            # Recorded only once the draft is durably published, and before the next await, so a stop
+            # during the draft announcement still sees the saved edit.
+            record_edited_block_labels(ctx, prior_yaml, workflow_yaml)
             ctx.runner_code_block_associations_by_label = runner_code_block_associations(
                 workflow_yaml,
                 prior_associations=ctx.runner_code_block_associations_by_label,
@@ -4171,7 +4719,7 @@ async def _update_workflow(
             turn_start_workflow = prior_workflow
             if ctx.google_connection_turn_start_bindings is None:
                 baseline_ready = True
-                turn_start_workflow_yaml = ctx.google_connection_turn_start_workflow_yaml
+                turn_start_workflow_yaml = ctx.turn_start_workflow_yaml
                 if turn_start_workflow_yaml:
                     try:
                         turn_start_workflow = await _process_workflow_yaml(
@@ -4179,6 +4727,7 @@ async def _update_workflow(
                             workflow_permanent_id=ctx.workflow_permanent_id,
                             organization_id=ctx.organization_id,
                             workflow_yaml=turn_start_workflow_yaml,
+                            private_workflow_settings=ctx.private_workflow_settings,
                         )
                     except Exception as baseline_err:
                         baseline_ready = False
@@ -4231,7 +4780,10 @@ async def _update_workflow(
         # otherwise-successful update_workflow tool call. ``isinstance``
         # narrows the parameter's declared ``AgentContext`` to the
         # envelope-aware ``CopilotContext`` for mypy.
-        changed_code_blocks = _changed_code_blocks(prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml)
+        changed_code_blocks, stored_code_rewritten = _changed_code_blocks(
+            prior_workflow_yaml, submitted_workflow_yaml, workflow_yaml
+        )
+        dropped_prior_blocks, block_type_changes = _block_definition_changes(prior_yaml, workflow_yaml)
         written_diffs: list[CodeWriteDiff] = []
         if isinstance(ctx, CopilotContext):
             # Best-effort — the workflow is already persisted, so a narrative detail must never
@@ -4259,7 +4811,7 @@ async def _update_workflow(
                 await emit_workflow_draft(
                     ctx.stream,
                     ctx,
-                    workflow,
+                    Workflow.model_validate(_candidate_proposal_data(workflow, workflow_yaml, ctx)),
                     code_diffs=written_diffs or None,
                     tool_call_id=originating_call_id,
                 )
@@ -4278,16 +4830,47 @@ async def _update_workflow(
             data["stored_code"] = stored_code
         if stored_code_withheld:
             data["stored_code_withheld"] = stored_code_withheld
+        if stored_code_rewritten:
+            data["stored_code_rewritten"] = stored_code_rewritten
+        if dropped_prior_blocks:
+            data["dropped_prior_blocks"] = dropped_prior_blocks
+        if block_type_changes:
+            data["block_type_changes"] = block_type_changes
+        data.update(user_owned_goal_carry_disclosure(goal_carry))
+        notes_visible = copilot_sees_notes(ctx)
+        if kept_note_labels and notes_visible:
+            data["stored_notes_kept"] = list(kept_note_labels)
+            data["stored_notes_kept_message"] = (
+                "The submitted YAML left out notes or descriptions on these blocks, so the values from the previous "
+                "draft or the saved workflow were kept. "
+                "A note or description sent as null or an empty string is deleted."
+            )
+            if isinstance(ctx, CopilotContext):
+                record_kept_note_texts(ctx, kept_note_labels, workflow_yaml)
+        # Without the Doc editor the person never sees notes, so a lost one is not mentioned at all.
+        if dropped_note_labels and notes_visible:
+            data["stored_notes_dropped"] = dropped_note_labels
+            data["stored_notes_dropped_message"] = (
+                "These blocks had notes but were removed or changed type in the accepted workflow, so their notes are gone: "
+                + ", ".join(dropped_note_labels)
+                + ". stored_notes_dropped_text has what they said."
+            )
+            data["stored_notes_dropped_text"] = stored_notes_for_labels(
+                dropped_note_labels,
+                prior_yaml,
+                ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None,
+            )
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",
                 returned_chars={label: len(code) for label, code in stored_code.items()},
                 withheld_labels=stored_code_withheld,
+                rewritten_labels=stored_code_rewritten,
             )
         # Best-effort — the workflow is already persisted by this point, so an advisory that trips on
         # crafted block code must never turn a successful update into a failed turn.
         try:
-            advisory_labels = _advisory_labels_by_message(changed_code_blocks)
+            advisory_labels = _advisory_labels_by_diagnostic(changed_code_blocks, workflow_yaml)
         except Exception as advisory_err:
             LOG.warning("copilot_advisory_code_block_diagnostics_failed", error=str(advisory_err))
             advisory_labels = {}
@@ -4302,10 +4885,17 @@ async def _update_workflow(
             code_block_diagnostics=advisory_labels,
             scanner_diagnostics=scanner_labels,
         )
+        findings = [*findings, *authoring_validation.findings]
         if findings:
             data["findings"] = findings
+        if authoring_validation.legacy_engine_blocks:
+            data["legacy_engine_blocks"] = list(authoring_validation.legacy_engine_blocks)
         if google_connection_resolution:
             data["google_connection_resolution"] = google_connection_resolution
+        if google_sheet_tab_resolution:
+            data["google_sheet_tab_resolution"] = google_sheet_tab_resolution
+        if isinstance(ctx, CopilotContext) and ctx.google_connection_notices:
+            data["google_connection_notices"] = [notice.to_payload() for notice in ctx.google_connection_notices]
         return {
             "ok": True,
             "data": data,
@@ -4313,10 +4903,10 @@ async def _update_workflow(
         }
     except (yaml.YAMLError, ValidationError, SkyvernHTTPException, BaseWorkflowHTTPException) as e:
         return _tool_error(
-            f"{INTERNAL_VALIDATION_FAILURE_PREFIX}{e}",
+            f"{INTERNAL_VALIDATION_FAILURE_PREFIX}{scrub_secrets_from_text(ctx, str(e))}",
             user_facing_summary=(
                 _code_seam_rejection_user_summary(metadata_rejected=False, code_rejected=True)
-                if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+                if _copilot_authoring_capability(ctx).code_blocks
                 else None
             ),
         )
@@ -4337,21 +4927,27 @@ def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow)
 
 
 def _record_workflow_update_result(
-    copilot_ctx: Any, result: dict[str, Any], prior_definition: object | None = None
+    copilot_ctx: Any, result: dict[str, Any], prior_definition: WorkflowDefinition | None = None
 ) -> None:
     if not (result.get("ok") and "_workflow" in result):
         return
 
-    wf = result["_workflow"]
+    wf: Workflow = result["_workflow"]
     copilot_ctx.last_workflow = wf
     copilot_ctx.last_workflow_yaml = copilot_ctx.workflow_yaml or None
-    copilot_ctx.effective_workflow_proxy_location = runtime_proxy_location(getattr(wf, "proxy_location", None))
+    copilot_ctx.effective_workflow_proxy_location = runtime_proxy_location(wf.proxy_location)
     data = result.get("data")
     if isinstance(data, dict):
         block_count = data.get("block_count")
         if isinstance(block_count, int):
             copilot_ctx.last_update_block_count = block_count
     copilot_ctx.update_workflow_called = True
+    _invalidate_test_evidence_on_edit(copilot_ctx, prior_definition, wf.workflow_definition)
+
+
+def _invalidate_test_evidence_on_edit(
+    copilot_ctx: CopilotContext, prior_definition: WorkflowDefinition | None, new_definition: WorkflowDefinition | None
+) -> None:
     copilot_ctx.test_after_update_done = False
     copilot_ctx.last_test_ok = None
     clear_active_run_evidence_on_workflow_edit(copilot_ctx)
@@ -4360,4 +4956,4 @@ def _record_workflow_update_result(
     # CopilotNonRetriableNavError with the old run's error, telling the user
     # to "verify the URL" for a URL they just corrected in the new draft.
     copilot_ctx.last_test_non_retriable_nav_error = None
-    _invalidate_verified_state_on_edit(copilot_ctx, prior_definition, getattr(wf, "workflow_definition", None))
+    _invalidate_verified_state_on_edit(copilot_ctx, prior_definition, new_definition)

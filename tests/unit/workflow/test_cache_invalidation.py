@@ -5,12 +5,19 @@ Verifies that changes to the model field (both at workflow settings level and bl
 do not trigger cache invalidation.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from skyvern.config import settings
 from skyvern.forge.sdk.workflow.models.block import BlockType, CodeBlock, CodeBlockStep, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
-from skyvern.forge.sdk.workflow.service import _get_workflow_definition_core_data
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
+from skyvern.forge.sdk.workflow.service import WorkflowService, _get_workflow_definition_core_data
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.run_enums import RunEngine
+from skyvern.schemas.workflows import WorkflowDefinitionYAML
 from skyvern.webeye.actions.action_types import ActionType
 
 
@@ -148,7 +155,7 @@ class TestCacheInvalidation:
         annotated = make_code_block(
             "code1",
             steps=[CodeBlockStep(description="Open the page", action_type=ActionType.GOTO_URL)],
-        )
+        ).model_copy(update={"user_owned_goal": True, "goal_needs_regeneration": True, "code_edited_by_hand": True})
 
         core_data_plain = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[plain]))
         core_data_annotated = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[annotated]))
@@ -161,11 +168,12 @@ class TestCacheInvalidation:
         block = make_code_block(
             "code1",
             steps=[CodeBlockStep(description="Click go", action_type=ActionType.CLICK)],
-        )
+        ).model_copy(update={"user_owned_goal": True, "goal_needs_regeneration": True, "code_edited_by_hand": True})
         core_data = _get_workflow_definition_core_data(WorkflowDefinition(parameters=[], blocks=[block]))
 
         for block_data in core_data.get("blocks", []):
-            assert "steps" not in block_data
+            for field in ("steps", "user_owned_goal", "goal_needs_regeneration", "code_edited_by_hand"):
+                assert field not in block_data
 
     def test_code_block_goal_change_still_detected(self) -> None:
         """A goal reprompt regenerates code and steps, so a goal edit must keep invalidating."""
@@ -215,3 +223,126 @@ class TestCacheInvalidation:
 
         # These should be identical (timestamps and IDs are excluded)
         assert core_data1 == core_data2, "Timestamps and IDs should be excluded from comparison"
+
+
+_TASK_BLOCK_LABELS = ("open", "approve", "nav")
+_CUTOFF = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+
+def _yaml_definition(nav_engine: str | None) -> WorkflowDefinitionYAML:
+    nav: dict = {"block_type": "navigation", "label": "nav", "url": "https://example.com", "navigation_goal": "Go"}
+    if nav_engine is not None:
+        nav["engine"] = nav_engine
+    return WorkflowDefinitionYAML.model_validate(
+        {
+            "parameters": [],
+            "blocks": [
+                {"block_type": "goto_url", "label": "open", "url": "https://example.com"},
+                {"block_type": "human_interaction", "label": "approve", "recipients": ["ops@example.com"]},
+                nav,
+            ],
+        }
+    )
+
+
+def _as_the_previous_image_stored_it(definition: WorkflowDefinition) -> dict:
+    # Before SKY-17436 every task block's engine defaulted to skyvern-1.0 and was always written.
+    stored = definition.model_dump(mode="json")
+    for block in stored["blocks"]:
+        if block["label"] in _TASK_BLOCK_LABELS and block.get("engine") is None:
+            block["engine"] = RunEngine.skyvern_v1.value
+    return stored
+
+
+async def _resave(
+    stored: dict,
+    resaved: WorkflowDefinition,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    born_at: datetime | None,
+    cutoff: datetime | None = _CUTOFF,
+) -> AsyncMock:
+    """Save ``resaved`` over a workflow whose previous version holds ``stored``; returns the cache clear."""
+    monkeypatch.setattr(settings, "TASK_V3_CHOSEN_ENGINE_CUTOFF", cutoff)
+    now = datetime.now(timezone.utc)
+    previous = Workflow(
+        workflow_id="w_1",
+        organization_id="o_1",
+        title="t",
+        workflow_permanent_id="wpid_1",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition.model_validate(stored),
+        created_at=now,
+        modified_at=now,
+    )
+    service = WorkflowService()
+    database = MagicMock()
+    database.workflows.get_workflow_by_permanent_id = AsyncMock(return_value=previous)
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app") as mock_app,
+        patch("skyvern.forge.sdk.experimentation.workflow_block_engine.app") as engine_app,
+        patch.object(service, "_partition_cached_blocks", AsyncMock(return_value=([MagicMock()], []))),
+        patch.object(service, "_clear_cached_block_groups", AsyncMock()) as clear_groups,
+    ):
+        mock_app.DATABASE = database
+        engine_app.DATABASE.workflows.get_workflow_permanent_id_created_at = AsyncMock(return_value=born_at)
+        await service.maybe_delete_cached_code(
+            previous.model_copy(update={"version": 2}), workflow_definition=resaved, organization_id="o_1"
+        )
+    return clear_groups
+
+
+@pytest.mark.parametrize(
+    ("born_at", "cutoff"),
+    [
+        (_CUTOFF - timedelta(days=30), _CUTOFF),
+        # No cutoff set: the two route alike whatever the birth lookup returns.
+        (None, None),
+    ],
+)
+@pytest.mark.parametrize(
+    "nav_engine",
+    [
+        # The editor, which sends the stored skyvern-1.0 back.
+        RunEngine.skyvern_v1.value,
+        # An API caller re-sending the YAML it created the workflow with, which omitted the engine.
+        None,
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unchanged_resave_of_a_previously_stored_definition_keeps_its_cached_scripts(
+    monkeypatch: pytest.MonkeyPatch, nav_engine: str | None, born_at: datetime | None, cutoff: datetime | None
+) -> None:
+    resaved = convert_workflow_definition(_yaml_definition(nav_engine), "w_1")
+    stored = _as_the_previous_image_stored_it(resaved)
+
+    clear_groups = await _resave(stored, resaved, monkeypatch, born_at=born_at, cutoff=cutoff)
+
+    clear_groups.assert_not_awaited()
+    if nav_engine is not None:
+        # What the editor saves is what was stored, in every engine field.
+        assert resaved.model_dump(mode="json") == stored
+
+
+@pytest.mark.parametrize(
+    "born_at",
+    [
+        _CUTOFF + timedelta(days=1),
+        # The birth lookup failed: the workflow may be past the cutoff, so the two stay distinct.
+        None,
+    ],
+)
+@pytest.mark.asyncio
+async def test_past_the_cutoff_switching_a_legacy_pin_to_default_is_a_change(
+    monkeypatch: pytest.MonkeyPatch, born_at: datetime | None
+) -> None:
+    # Unset runs on v3 there and skyvern-1.0 is an explicit pin, so the cached script must be cleared;
+    # the engine-inert blocks around it still compare equal.
+    stored = convert_workflow_definition(_yaml_definition(RunEngine.skyvern_v1.value), "w_1").model_dump(mode="json")
+    resaved = convert_workflow_definition(_yaml_definition(None), "w_1")
+
+    clear_groups = await _resave(stored, resaved, monkeypatch, born_at=born_at)
+
+    clear_groups.assert_awaited_once()
+    assert clear_groups.await_args.kwargs["plan"].label == "nav"

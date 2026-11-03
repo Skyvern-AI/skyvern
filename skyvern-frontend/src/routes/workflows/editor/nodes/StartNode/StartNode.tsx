@@ -20,13 +20,17 @@ import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { cn } from "@/util/utils";
 import { BuildModeOnly } from "../BuildModeOnly";
 import { isLoopNode } from "../LoopNode/types";
 import { WorkflowInputsSection } from "../../WorkflowInputs";
 import { WorkflowSettingsEditor } from "./WorkflowSettingsEditor";
+import {
+  reviewStatusOf,
+  useReviewAnnotation,
+} from "../../review/reviewAnnotation";
+import { ReviewStartChanges, ReviewStatusChip } from "../../review/ReviewParts";
 
 interface StartSettings {
   webhookCallbackUrl: string;
@@ -49,11 +53,13 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const [facing, setFacing] = useState<"front" | "back">("front");
   const [settingsAccordionValue, setSettingsAccordionValue] = useState("");
   const blockScriptStore = useBlockScriptStore();
-  const recordingStore = useRecordingStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
-  const isRecording = recordingStore.isRecording;
+  const reviewAnnotation = useReviewAnnotation();
+  const startReview =
+    reviewAnnotation?.kind === "start" ? reviewAnnotation : null;
+  const startReviewStatus = startReview ? reviewStatusOf(startReview) : null;
 
   const parentNode = parentId ? reactFlowInstance.getNode(parentId) : null;
   const isInsideConditional = parentNode?.type === "conditional";
@@ -181,8 +187,19 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
             )}
           >
             <div className="relative">
-              <header className="mb-4 mt-2">Start</header>
+              <header className="relative mb-4 mt-2">
+                Start
+                {startReview?.showStatus &&
+                startReviewStatus &&
+                startReviewStatus !== "unchanged" ? (
+                  <ReviewStatusChip
+                    status={startReviewStatus}
+                    className="absolute right-0 top-1/2 -translate-y-1/2"
+                  />
+                ) : null}
+              </header>
               <Separator />
+              {startReview ? <ReviewStartChanges review={startReview} /> : null}
               <BuildModeOnly renderInReadOnlyComparison={false}>
                 <WorkflowInputsSection editable={data.editable} />
                 <Accordion
@@ -203,7 +220,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                           className="h-4 w-4 text-muted-foreground"
                           aria-hidden
                         />
-                        Workflow Settings
+                        Agent Settings
                       </span>
                     </AccordionTrigger>
                     <AccordionContent className="pl-6 pr-1 pt-1">
@@ -232,11 +249,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   }
 
   return (
-    <div
-      className={cn({
-        "pointer-events-none opacity-50": isRecording,
-      })}
-    >
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}

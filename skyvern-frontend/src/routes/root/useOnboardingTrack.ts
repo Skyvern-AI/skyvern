@@ -22,13 +22,34 @@ const TRACK_KEYS = [
   "discord_joined",
   "social_followed",
 ] as const;
+// The layout served once activation rewards v2 is live; the parser accepts either
+// so a backend deploy ahead of the frontend doesn't blank the track.
+const REWARD_TRACK_KEYS = [
+  "questionnaire_completed",
+  "first_successful_run",
+  "run_feedback_given",
+  "first_scheduled_run",
+  "credential_saved",
+  "agent_edited",
+  "github_starred",
+  "discord_joined",
+] as const;
 const SECOND_AGENT_KEY = "second_agent_run" as const;
-type TrackKey = (typeof TRACK_KEYS)[number] | typeof SECOND_AGENT_KEY;
+type TrackKey =
+  | (typeof TRACK_KEYS)[number]
+  | (typeof REWARD_TRACK_KEYS)[number]
+  | typeof SECOND_AGENT_KEY;
 const SELF_ATTESTED_KEYS: ReadonlySet<TrackKey> = new Set([
   "github_starred",
   "discord_joined",
   "social_followed",
 ]);
+type TrackRewardState =
+  | "unearned"
+  | "pending"
+  | "blocked"
+  | "granted"
+  | "reversed";
 // Rows that count toward N/M. The teammate row stays out until its
 // destination exists; community rows are never counted.
 const COUNTED_KEYS: readonly TrackKey[] = [
@@ -36,6 +57,8 @@ const COUNTED_KEYS: readonly TrackKey[] = [
   "first_scheduled_run",
   "first_api_run",
   "mcp_installed",
+  "agent_edited",
+  "run_feedback_given",
   "credential_saved",
 ];
 type TrackState = "ineligible" | "active" | "dismissed" | "completed";
@@ -43,6 +66,9 @@ type OnboardingTrackItemV1 = {
   key: TrackKey;
   completed_at: string | null;
   verification: "server" | "self";
+  // Credits the milestone grants; null while reward grants are disabled.
+  reward_credits?: number | null;
+  reward_state?: TrackRewardState | null;
 };
 type TrackMutation =
   | { action: "dismiss" | "restore" }
@@ -54,7 +80,29 @@ type OnboardingTrackV1 = {
   completed_count: number;
   total_count: 8 | 9;
   items: OnboardingTrackItemV1[];
+  // Credits for answering the onboarding questionnaire; null while reward grants are disabled.
+  questionnaire_reward_credits?: number | null;
+  reward_credits_earned?: number | null;
+  reward_credits_cap?: number | null;
 };
+
+function isTrackRewardState(value: unknown): value is TrackRewardState {
+  return (
+    value === "unearned" ||
+    value === "pending" ||
+    value === "blocked" ||
+    value === "granted" ||
+    value === "reversed"
+  );
+}
+
+function wholeCredits(value: unknown, allowZero = false): number | null {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    (allowZero ? value >= 0 : value > 0)
+    ? value
+    : null;
+}
 
 function isTrackState(value: unknown): value is TrackState {
   return (
@@ -76,12 +124,17 @@ function parseOnboardingTrack(value: unknown): OnboardingTrackV1 | null {
     total_count !== items.length
   )
     return null;
+  const first: unknown = items[0];
+  const layout: readonly TrackKey[] =
+    isRecord(first) && first.key === REWARD_TRACK_KEYS[0]
+      ? REWARD_TRACK_KEYS
+      : TRACK_KEYS;
   const parsed: OnboardingTrackItemV1[] = [];
   for (const [index, item] of items.entries()) {
     const key =
-      index < TRACK_KEYS.length
-        ? TRACK_KEYS[index]
-        : index === TRACK_KEYS.length
+      index < layout.length
+        ? layout[index]
+        : index === layout.length
           ? SECOND_AGENT_KEY
           : undefined;
     if (key === undefined || !isRecord(item) || item.key !== key) return null;
@@ -89,7 +142,15 @@ function parseOnboardingTrack(value: unknown): OnboardingTrackV1 | null {
     if (!isTimestampOrNull(completedAt)) return null;
     const verification = SELF_ATTESTED_KEYS.has(key) ? "self" : "server";
     if (item.verification !== verification) return null;
-    parsed.push({ key, completed_at: completedAt, verification });
+    parsed.push({
+      key,
+      completed_at: completedAt,
+      verification,
+      reward_credits: wholeCredits(item.reward_credits),
+      reward_state: isTrackRewardState(item.reward_state)
+        ? item.reward_state
+        : null,
+    });
   }
   const derivedCount = parsed.filter((row) => row.completed_at !== null).length;
   if (completed_count !== derivedCount) return null;
@@ -101,17 +162,39 @@ function parseOnboardingTrack(value: unknown): OnboardingTrackV1 | null {
     completed_count: derivedCount,
     total_count: items.length,
     items: parsed,
+    questionnaire_reward_credits: wholeCredits(
+      value.questionnaire_reward_credits,
+    ),
+    reward_credits_earned: wholeCredits(value.reward_credits_earned, true),
+    reward_credits_cap: wholeCredits(value.reward_credits_cap),
   };
 }
 
-function useOnboardingTrack() {
+type UseOnboardingTrackOptions = {
+  /**
+   * For surfaces outside the track experiment: also load for users without a
+   * Clerk organization, and return the track for both arms.
+   */
+  outsideExperiment?: boolean;
+  /** When false, never fetch; the track reads as null. */
+  enabled?: boolean;
+};
+
+function useOnboardingTrack({
+  outsideExperiment = false,
+  enabled: callerEnabled = true,
+}: UseOnboardingTrackOptions = {}) {
   const credentialGetter = useCredentialGetter();
   const activeOrgId = useActiveOrgId();
   const activeUserId = useUser().get()?.id;
   const queryClient = useQueryClient();
-  const flag = useFeatureFlag(ONBOARDING_TRACK_FLAG);
+  const trackFlag = useFeatureFlag(ONBOARDING_TRACK_FLAG);
+  // Surfaces outside the experiment gate themselves, so only the holdout's own UI needs the flag.
   const enabled =
-    flag === true && activeOrgId !== undefined && activeUserId !== undefined;
+    callerEnabled &&
+    (trackFlag === true || outsideExperiment) &&
+    (activeOrgId !== undefined || outsideExperiment) &&
+    activeUserId !== undefined;
   const queryKey = getOrgScopedQueryKey(
     ["onboarding-track", activeUserId],
     getActiveOrgQueryKeyScope(activeOrgId),
@@ -148,9 +231,9 @@ function useOnboardingTrack() {
   });
   const track = enabled && !isError ? (data ?? null) : null;
   // An undefined flag, org, or user is still resolving; only an explicit
-  // `false` flag disables the track.
+  // `false` flag or `enabled: false` disables the track.
   const status: "disabled" | "loading" | "error" | "ready" = !enabled
-    ? flag === false
+    ? !callerEnabled || (trackFlag === false && !outsideExperiment)
       ? "disabled"
       : "loading"
     : isError
@@ -159,7 +242,11 @@ function useOnboardingTrack() {
         ? "loading"
         : "ready";
   return {
-    track: track?.arm === "treatment" ? track : null,
+    // The track experiment's own UI shows only where its flag is on, not for journey-only orgs.
+    track:
+      (trackFlag === true && track?.arm === "treatment") || outsideExperiment
+        ? track
+        : null,
     status,
     isPending,
     refetch,
@@ -183,9 +270,15 @@ function countedTrackItems(
 export {
   countedTrackItems,
   parseOnboardingTrack,
+  REWARD_TRACK_KEYS,
   SECOND_AGENT_KEY,
   SELF_ATTESTED_KEYS,
   TRACK_KEYS,
   useOnboardingTrack,
 };
-export type { OnboardingTrackItemV1, OnboardingTrackV1, TrackKey };
+export type {
+  OnboardingTrackItemV1,
+  OnboardingTrackV1,
+  TrackKey,
+  TrackRewardState,
+};

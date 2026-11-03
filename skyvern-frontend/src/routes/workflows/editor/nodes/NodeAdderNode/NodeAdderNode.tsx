@@ -1,19 +1,14 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
 import { useRef, useState } from "react";
-import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
-import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
-import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
-import { useDebugStore } from "@/store/useDebugStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import {
   BranchContext,
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
-import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
-import { useSettingsStore } from "@/store/SettingsStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { cn } from "@/util/utils";
 import {
   Tooltip,
@@ -25,26 +20,30 @@ import { toast } from "@/components/ui/use-toast";
 
 import type { NodeAdderNode } from "./types";
 import { WorkflowAddMenu } from "../../WorkflowAddMenu";
-import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
 import { SELECTED_RING_CLASSES } from "../../selection/selectedRingClasses";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { findBranchContextForInsertion } from "../../workflowInsertion";
+import {
+  blockLabelFor,
+  demonstrationInsertionFromNodes,
+  sopAttachmentDraft,
+  stageSopFile,
+} from "../../workspaceAuthoringActions";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
-  const workflowPermanentId = useWorkflowPermanentId();
   const edges = useEdges();
   const nodes = useNodes();
-  const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
-  const settingsStore = useSettingsStore();
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
+  const stageAttachment = useCopilotActionStore(
+    (state) => state.stageAttachment,
+  );
   const workflowSettingsStore = useWorkflowSettingsStore();
   const setWorkflowPanelState = useWorkflowPanelStore(
     (state) => state.setWorkflowPanelState,
   );
   const workflowStatePanel = useWorkflowPanelStore();
-  const setRecordedBlocks = useRecordedBlocksStore(
-    (state) => state.setRecordedBlocks,
-  );
 
   // SOP upload
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -86,62 +85,18 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     return incomingEdges[0]?.source;
   })();
 
-  const processRecordingMutation = useProcessRecordingMutation({
-    browserSessionId: settingsStore.browserSessionId,
-    onSuccess: (result) => {
-      setRecordedBlocks(result, {
-        previous: previous ?? null,
-        next: id,
-        parent: parentId,
-        connectingEdgeType: "default",
-      });
-    },
-  });
-
-  const sopToBlocksMutation = useSopToBlocksMutation({
-    onSuccess: (result) => {
-      // Reuse existing block insertion pattern
-      setRecordedBlocks(result, {
-        previous: previous ?? null,
-        next: id,
-        parent: parentId,
-        connectingEdgeType: "default",
-      });
-    },
-  });
-
-  // Derive upload state directly from mutation to avoid race conditions
-  const isUploadingSOP = sopToBlocksMutation.isPending;
-
-  const isProcessing =
-    processRecordingMutation.isPending || recordingStore.isCommitting;
-
-  const isBusy =
-    (isProcessing || recordingStore.isRecording) &&
-    (debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
-    settingsStore.isUsingABrowser &&
-    workflowStatePanel.workflowPanelState.data?.previous === previous &&
-    workflowStatePanel.workflowPanelState.data?.next === id &&
-    workflowStatePanel.workflowPanelState.data?.parent ===
-      (parentId || undefined);
-
   const isBlockedByFinally =
     !parentId && Boolean(workflowSettingsStore.finallyBlockLabel);
   // Read-only canvases (WorkflowComparisonPanel) must not let the `+`
   // affordance open the node library — selecting a block from there
   // would route through `addNode` and mutate the underlying workflow.
   const isReadOnlyScope = useWorkflowScopeReadOnly();
-  const isDisabled =
-    isReadOnlyScope ||
-    isBlockedByFinally ||
-    (!isBusy && recordingStore.isRecording);
+  const isDisabled = isReadOnlyScope || isBlockedByFinally;
   const disabledReason: string | null = isReadOnlyScope
     ? "This canvas is read-only"
     : isBlockedByFinally
       ? "Finally block must run last - choose a position above it"
-      : !isBusy && recordingStore.isRecording
-        ? "Stop recording to add a block"
-        : null;
+      : null;
 
   const updateWorkflowPanelState = (
     active: boolean,
@@ -169,30 +124,18 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   };
 
   const onRecord = () => {
-    if (recordingStore.isRecording) {
-      recordingStore.setIsRecording(false);
-    } else {
-      recordingStore.setIsRecording(true, {
-        workflowPermanentId: workflowPermanentId ?? null,
-        browserSessionId: settingsStore.browserSessionId,
+    const insertion = demonstrationInsertionFromNodes(nodes, {
+      previous: previous ?? null,
+      next: id,
+      parent: parentId,
+    });
+    if (!insertion) {
+      toast({
+        title: "Recording inside a loop or branch isn't supported yet",
       });
-      updateWorkflowPanelState(false);
-    }
-  };
-
-  const onEndRecord = () => {
-    // With live interpretation, the recording panel owns the commit so user
-    // edits/deletes to draft steps are honored.
-    if (recordingStore.isRecording && recordingStore.sessionRevision > 0) {
-      recordingStore.requestFinish();
       return;
     }
-
-    if (recordingStore.isRecording) {
-      recordingStore.setIsRecording(false);
-    }
-
-    processRecordingMutation.mutate();
+    startDemonstration?.({ insertion });
   };
 
   const onUploadSOP = () => {
@@ -201,20 +144,21 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const handleSOPFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) {
       return;
     }
-    if (!file.name.toLowerCase().endsWith(".pdf")) {
-      toast({
-        variant: "destructive",
-        title: "Invalid file type",
-        description: "Please select a PDF file",
-      });
-      e.target.value = "";
-      return;
-    }
-    sopToBlocksMutation.mutate(file);
-    e.target.value = "";
+    stageSopFile(
+      file,
+      sopAttachmentDraft(
+        demonstrationInsertionFromNodes(nodes, {
+          previous: previous ?? null,
+          next: id,
+          parent: parentId,
+        }),
+        blockLabelFor(nodes, parentId),
+      ),
+    );
   };
 
   // Highlight the + CTA the same way withSelectableBlock highlights a selected
@@ -259,39 +203,13 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       adderInner
     );
 
-  const busy = (
-    <WorkflowAdderBusy
-      color={isProcessing ? "gray" : "red"}
-      operation={isProcessing ? "processing" : "recording"}
-      onComplete={() => {
-        onEndRecord();
-      }}
-    >
-      {adder}
-    </WorkflowAdderBusy>
-  );
-
-  const handleCancelUpload = () => {
-    sopToBlocksMutation.cancel();
-  };
-
-  const sopUploadBusy = (
-    <WorkflowAdderBusy
-      color="#3b82f6"
-      operation="uploading"
-      onComplete={() => {}}
-      onCancel={handleCancelUpload}
-    >
-      {adder}
-    </WorkflowAdderBusy>
-  );
-
   const menu = (
     <WorkflowAddMenu
       onAdd={onAdd}
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
-      isUploadingSOP={isUploadingSOP}
+      canUploadSOP={stageAttachment !== null}
+      canRecordTask={startDemonstration !== null}
       onPinnedChange={setMenuPinned}
     >
       {adder}
@@ -319,13 +237,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
         id="b"
         className="opacity-0"
       />
-      {isUploadingSOP
-        ? sopUploadBusy
-        : isBusy
-          ? busy
-          : isDisabled
-            ? adder
-            : menu}
+      {isDisabled ? adder : menu}
     </div>
   );
 }

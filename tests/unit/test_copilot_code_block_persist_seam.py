@@ -11,39 +11,63 @@ import asyncio
 import json
 import textwrap
 from types import SimpleNamespace
-from typing import NoReturn
+from typing import Any, NoReturn
+from unittest.mock import AsyncMock
 
 import pytest
+from agents import FunctionTool
 
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import CredentialOriginRecovery, CredentialOriginRecoveryState
+from skyvern.forge.sdk.copilot.browser_code_contract import ExecutedBrowserCodeSourceResolution
 from skyvern.forge.sdk.copilot.code_block_preflight import CodeBlockScanFinding
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.output_utils import sanitize_block_label_for_display
 from skyvern.forge.sdk.copilot.request_policy import (
     CompletionCriterion,
     RequestPolicy,
 )
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER, register_secret_scrub_value
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.tools.guardrails import _authority_tool_error
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    READINESS_WAIT_ADVISORY_REASON_CODE,
+    WRAPPER_SCOPE_ADVISORY_REASON_CODE,
     CodeArtifactCompletionCriterion,
     _accepted_code_delta,
-    _advisory_labels_by_message,
+    _advisory_labels_by_diagnostic,
     _author_time_findings,
     _changed_code_blocks,
+    _labels_changed_between,
     _update_workflow,
+    carry_author_time_findings,
+    record_edited_block_labels,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
-from skyvern.forge.sdk.copilot.workflow_yaml import delete_block_from_workflow
+from skyvern.forge.sdk.copilot.workflow_yaml import (
+    BlockEditError,
+    apply_block_edit,
+    delete_block_from_workflow,
+    stored_block_code,
+    stored_workflow_yaml,
+)
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
+from skyvern.forge.sdk.workflow.secret_encryption import WORKFLOW_SECRET_MASK
+from skyvern.utils.yaml_loader import safe_load_no_dates
+from tests.unit._copilot_workflow_fakes import fake_workflow
 
 
 def _yaml(body: str) -> str:
     return textwrap.dedent(body).strip() + "\n"
 
 
-def _ctx(workflow_yaml: str = "") -> CopilotContext:
+def _ctx(
+    workflow_yaml: str = "", *, policy: BlockAuthoringPolicy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+) -> CopilotContext:
     ctx = CopilotContext(
         organization_id="o",
         workflow_id="w",
@@ -52,14 +76,26 @@ def _ctx(workflow_yaml: str = "") -> CopilotContext:
         browser_session_id=None,
         stream=None,
     )
-    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ctx.block_authoring_policy = policy
     ctx.request_policy = RequestPolicy(allow_update_workflow=True, allow_run_blocks=False)
     return ctx
 
 
-def _code_yaml(code: str, *, label: str = "submit_search", prompt: str | None = None) -> str:
+def _code_yaml(
+    code: str,
+    *,
+    label: str = "submit_search",
+    prompt: str | None = "The page shows the result.",
+    user_owned_goal: bool | None = None,
+    goal_needs_regeneration: bool | None = None,
+) -> str:
     indented = "\n".join(f"          {line}" for line in textwrap.dedent(code).strip().splitlines())
     prompt_line = f"    prompt: {json.dumps(prompt, ensure_ascii=False)}\n" if prompt is not None else ""
+    owned_lines = ""
+    if user_owned_goal is not None:
+        owned_lines += f"    user_owned_goal: {str(user_owned_goal).lower()}\n"
+    if goal_needs_regeneration is not None:
+        owned_lines += f"    goal_needs_regeneration: {str(goal_needs_regeneration).lower()}\n"
     return (
         "title: Search\n"
         "workflow_definition:\n"
@@ -67,6 +103,7 @@ def _code_yaml(code: str, *, label: str = "submit_search", prompt: str | None = 
         "  - block_type: code\n"
         f"    label: {label}\n"
         f"{prompt_line}"
+        f"{owned_lines}"
         "    code: |\n"
         f"{indented}\n"
     )
@@ -96,10 +133,8 @@ def _stub_successful_update(monkeypatch: pytest.MonkeyPatch, persisted: list[str
     async def _process(**kwargs: object) -> SimpleNamespace:
         if persisted is not None:
             persisted.append(str(kwargs["workflow_yaml"]))
-        return SimpleNamespace(
+        return fake_workflow(
             workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="submit_search")]),
-            proxy_location=None,
-            webhook_callback_url=None,
         )
 
     async def _prior(_ctx: CopilotContext) -> None:
@@ -129,10 +164,8 @@ async def test_concurrent_writes_stash_their_diffs_under_their_own_call_id(
             # Suspend the first write mid-persist so the second runs to completion inside it.
             first_entered.set()
             await gate.wait()
-        return SimpleNamespace(
+        return fake_workflow(
             workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label=label)]),
-            proxy_location=None,
-            webhook_callback_url=None,
         )
 
     async def _prior(_ctx: CopilotContext) -> None:
@@ -159,6 +192,25 @@ async def test_concurrent_writes_stash_their_diffs_under_their_own_call_id(
 
     assert [d["label"] for d in ctx.pending_code_write_diffs["c1"]] == ["alpha"]
     assert [d["label"] for d in ctx.pending_code_write_diffs["c2"]] == ["beta"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "asked", "declined"])
+async def test_origin_recovery_withdraws_neither_the_save_nor_the_run(
+    monkeypatch: pytest.MonkeyPatch, state: CredentialOriginRecoveryState
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    ctx.credential_origin_recovery = CredentialOriginRecovery("https://idp.example.test", state, "cred_service")
+    submitted = _code_yaml('return {"output": {"ok": True}}')
+
+    result = await _update_workflow({"workflow_yaml": submitted, "code_artifact_metadata": []}, ctx)
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    for tool_name in ("run_blocks_and_collect_debug", "edit_block_and_run", "update_and_run_blocks"):
+        assert _authority_tool_error(ctx, tool_name) is None
 
 
 @pytest.mark.asyncio
@@ -221,7 +273,7 @@ async def test_accept_path_preserves_model_authored_goal_prompt_bytes(monkeypatc
 async def test_accept_path_does_not_synthesize_an_omitted_goal_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     persisted: list[str] = []
     _stub_successful_update(monkeypatch, persisted)
-    submitted = _code_yaml('return {"output": {"status": "complete"}}')
+    submitted = _code_yaml('return {"output": {"status": "complete"}}', prompt=None)
     assert "prompt:" not in submitted
     ctx = _ctx()
 
@@ -238,6 +290,572 @@ async def test_accept_path_does_not_synthesize_an_omitted_goal_prompt(monkeypatc
     persisted_block = workflow_blocks(parse_workflow_yaml(persisted[0]))[0]
     assert "prompt" not in submitted_block
     assert "prompt" not in persisted_block
+
+
+def _user_owned_goal_yaml(*, prompt: str, code: str, needs_regeneration: bool) -> str:
+    return _code_yaml(code, prompt=prompt, user_owned_goal=True, goal_needs_regeneration=needs_regeneration)
+
+
+@pytest.mark.asyncio
+async def test_accept_path_keeps_the_user_written_goal_in_the_staged_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+    human_goal = "Download last month's invoice as a PDF"
+    prior = _user_owned_goal_yaml(
+        prompt=human_goal,
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml(_REBUILT_CODE, prompt="Check the order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": [_rebuild_artifact_row()]},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block["prompt"] == human_goal
+    assert staged_block["code"].strip() == _REBUILT_CODE
+    assert staged_block["user_owned_goal"] is True
+    assert staged_block["goal_needs_regeneration"] is False
+    assert result["data"]["stored_goal_kept"] == ["submit_search"]
+
+
+_REBUILT_CODE = 'await page.get_by_role("link", name="Invoice").click()\nreturn {"records": [{"number": "123"}]}'
+
+
+def _rebuild_artifact_row(label: str = "submit_search") -> dict[str, object]:
+    return {
+        "block_label": label,
+        "artifact_id": f"code_artifact:{label}",
+        "declared_goal": "The invoice PDF is downloaded.",
+        "claimed_outcomes": [
+            {
+                "id": "claim:invoice",
+                "scope": "outcome",
+                "text": "The invoice number is read",
+                "status": "observed_not_verified",
+                "depends_on": ["dependency:page"],
+                "covered_criteria": ["criterion:invoice"],
+                "goal_value_paths": ["records[].number"],
+                "observation_refs": ["obs1"],
+            }
+        ],
+        "page_dependencies": [
+            {"id": "dependency:page", "scope": "page", "status": "observed_not_verified", "observation_refs": ["obs1"]}
+        ],
+        "completion_criteria": [{"id": "criterion:invoice", "text": "The invoice is found", "level": "terminal"}],
+        "terminal_verifier_expectations": [
+            {
+                "id": "expectation:invoice",
+                "text": "The invoice number is returned",
+                "criteria_ids": ["criterion:invoice"],
+                "goal_value_paths": ["records[].number"],
+            }
+        ],
+        "observation_refs": [
+            {
+                "observation_ref": "obs1",
+                "dependency_id": "dependency:page",
+                "status": "observed_not_verified",
+                "source_tool": "scout_interaction",
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_metadata_row_that_names_the_block_clears_the_rebuild_even_when_normalization_drops_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('await page.get_by_role("link", name="Invoice").click()', prompt="Check the order status")
+    ctx = _ctx(prior)
+    bare_row = {"block_label": "submit_search", "declared_goal": "The invoice PDF is downloaded."}
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": [bare_row]},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert "submit_search" not in (ctx.code_artifact_metadata or {})
+    assert workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]["goal_needs_regeneration"] is False
+
+
+@pytest.mark.asyncio
+async def test_accept_path_leaves_the_rebuild_pending_when_no_artifact_claims_the_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    human_goal = "Download last month's invoice as a PDF"
+    prior = _user_owned_goal_yaml(
+        prompt=human_goal,
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('await page.get_by_role("link", name="Invoice").click()', prompt="Check the order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block["prompt"] == human_goal
+    assert staged_block["goal_needs_regeneration"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_block_scoped_code_edit_clears_the_rebuild_without_an_artifact_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    human_goal = "Download last month's invoice as a PDF"
+    prior = _user_owned_goal_yaml(
+        prompt=human_goal,
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('await page.get_by_role("link", name="Invoice").click()', prompt="Check the order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_preserve_code_block_associations": True,
+            "_rebuilt_block_labels": ["submit_search"],
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block["prompt"] == human_goal
+    assert staged_block["goal_needs_regeneration"] is False
+
+
+async def _edit_block(ctx: CopilotContext, **edit: object) -> dict[str, object]:
+    raw = await tools_module.edit_block_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="edit_block"),
+        json.dumps({"label": "submit_search", **edit}),
+    )
+    return json.loads(raw)
+
+
+def _staged_rebuild_flag(ctx: CopilotContext) -> bool:
+    return bool(workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]["goal_needs_regeneration"])
+
+
+@pytest.mark.asyncio
+async def test_edit_block_clears_the_rebuild_only_when_it_replaces_the_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+
+    ctx = _ctx(prior)
+    result = await _edit_block(ctx, fields={"continue_on_failure": True})
+    assert result["ok"] is True, result
+    assert _staged_rebuild_flag(ctx) is True
+
+    ctx = _ctx(prior)
+    result = await _edit_block(ctx, expected_code='"pending"', replacement_code='"done"')
+    assert result["ok"] is True, result
+    assert _staged_rebuild_flag(ctx) is False
+
+    ctx = _ctx(prior)
+    result = await _edit_block(ctx, fields={"code": 'return {"output": {"status": "done"}}'})
+    assert result["ok"] is True, result
+    assert _staged_rebuild_flag(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_a_block_edit_whose_publish_is_refused_names_no_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        workflow_update_module,
+        "publish_workflow_candidate",
+        AsyncMock(side_effect=CopilotProposalConflictError("candidate changed", reason="token_changed")),
+    )
+    monkeypatch.setattr(workflow_update_module, "adopt_stored_workflow_candidate", AsyncMock(return_value="kept"))
+    ctx = _ctx(_code_yaml('return {"status": "pending"}'))
+
+    result = await _edit_block(ctx, expected_code='"pending"', replacement_code='"done"')
+
+    assert result["ok"] is False
+    assert ctx.edited_block_labels_this_turn == []
+
+
+@pytest.mark.asyncio
+async def test_a_stop_while_the_draft_is_announced_still_leaves_the_edit_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    monkeypatch.setattr(workflow_update_module, "maybe_emit_design_end", AsyncMock(side_effect=asyncio.CancelledError))
+    ctx = _ctx(_code_yaml('return {"status": "pending"}'))
+    ctx.stream = SimpleNamespace()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _edit_block(ctx, expected_code='"pending"', replacement_code='"done"')
+
+    assert ctx.edited_block_labels_this_turn == ["submit_search"]
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_block_label_never_carries_a_registered_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    secret = "live-portal-password-9182"
+    ctx = _ctx(_code_yaml('return {"status": "pending"}', label=f"login_{secret}"))
+    register_secret_scrub_value(ctx, secret)
+
+    raw = await tools_module.edit_block_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="edit_block"),
+        json.dumps({"label": f"login_{secret}", "expected_code": '"pending"', "replacement_code": '"done"'}),
+    )
+
+    assert json.loads(raw)["ok"] is True
+    assert ctx.edited_block_labels_this_turn == [
+        sanitize_block_label_for_display(f"login_{REDACTED_SECRET_PLACEHOLDER}")
+    ]
+
+
+def _code_blocks_yaml(code_by_label: dict[str, str]) -> str:
+    blocks = "".join(
+        f"  - block_type: code\n    label: {label}\n    code: |\n      {code}\n"
+        for label, code in code_by_label.items()
+    )
+    return f"title: Search\nworkflow_definition:\n  blocks:\n{blocks}"
+
+
+_PENDING_CODE = 'return {"status": "pending"}'
+_TWO_BLOCKS = _code_blocks_yaml({"open_page": 'return {"output": "opened"}', "submit_search": _PENDING_CODE})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("opening_yaml", "write", "expected_labels"),
+    [
+        (_code_yaml(_PENDING_CODE), {"expected_code": '"pending"', "replacement_code": '"pending"'}, []),
+        (_TWO_BLOCKS, {"expected_code": '"pending"', "replacement_code": '"done"'}, ["submit_search"]),
+        (_code_yaml(_PENDING_CODE), _code_yaml(_PENDING_CODE), []),
+        (
+            _code_yaml(_PENDING_CODE),
+            _code_yaml(_PENDING_CODE, prompt="The page shows the saved row."),
+            ["submit_search"],
+        ),
+        (
+            _code_blocks_yaml(
+                {
+                    "open_page": 'return {"output": "opened"}',
+                    "fill_and_save": 'return {"output": "pending"}',
+                    "old_export": 'return {"output": "csv"}',
+                }
+            ),
+            _code_blocks_yaml(
+                {"open_page": 'return {"output": "opened"}', "fill_and_save": 'return {"output": "saved"}'}
+            ),
+            ["fill_and_save", "old_export"],
+        ),
+    ],
+    ids=[
+        "block-edit-no-op",
+        "block-edit-names-only-its-block",
+        "identical-resubmit",
+        "prompt-only-change",
+        "changed-and-dropped",
+    ],
+)
+async def test_a_write_names_exactly_the_blocks_it_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    opening_yaml: str,
+    write: dict[str, str] | str,
+    expected_labels: list[str],
+) -> None:
+    _stub_successful_update(monkeypatch)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    ctx = _ctx(opening_yaml)
+
+    if isinstance(write, str):
+        result = await _update_workflow(
+            {"workflow_yaml": write, "code_artifact_metadata": []}, ctx, allow_missing_credentials=True
+        )
+    else:
+        result = await _edit_block(ctx, **write)
+
+    assert result["ok"] is True
+    assert ctx.edited_block_labels_this_turn == expected_labels
+
+
+def _send_email_yaml(smtp_password: str, *, subject: str = "Report") -> str:
+    return (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: send_email\n"
+        "    label: notify\n"
+        f"    subject: {subject}\n"
+        f"    custom_smtp_password: {json.dumps(smtp_password)}\n"
+    )
+
+
+def _navigation_yaml(block_fields: str) -> str:
+    return (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: navigation\n"
+        "    label: open_statement\n"
+        "    url: https://example.com/statements\n"
+        "    navigation_goal: Open the latest statement\n"
+        f"{block_fields}"
+    )
+
+
+_FULL_NAVIGATION_PRIOR = _navigation_yaml(
+    "    next_block_label: read_statement\n"
+    "    output_parameter:\n"
+    "      key: open_statement_output\n"
+    "      parameter_type: output\n"
+    "    parameters:\n"
+    "    - key: account_number\n"
+    "      parameter_type: workflow\n"
+    "    model: null\n"
+    "    max_retries: 0\n"
+)
+_REQUEST_SHAPED_NAVIGATION = _navigation_yaml(
+    "    continue_on_failure: false\n    complete_verification: true\n    parameter_keys:\n    - account_number\n"
+)
+_FULL_CODE_PRIOR = _code_yaml(_PENDING_CODE).replace(
+    "    code: |\n",
+    "    output_parameter:\n      key: submit_search_output\n    parameters:\n    - key: x\n"
+    "    steps:\n    - action: click\n    user_owned_goal: false\n    code: |\n",
+)
+
+
+@pytest.mark.parametrize(
+    ("prior", "stored", "expected_labels"),
+    [
+        (_send_email_yaml(WORKFLOW_SECRET_MASK), _send_email_yaml(WORKFLOW_SECRET_MASK), []),
+        (_send_email_yaml(WORKFLOW_SECRET_MASK), _send_email_yaml("restored-smtp-password"), []),
+        (
+            _send_email_yaml(WORKFLOW_SECRET_MASK),
+            _send_email_yaml(WORKFLOW_SECRET_MASK, subject="Daily report"),
+            ["notify"],
+        ),
+        (_FULL_NAVIGATION_PRIOR, _REQUEST_SHAPED_NAVIGATION, []),
+        (
+            _FULL_NAVIGATION_PRIOR,
+            _REQUEST_SHAPED_NAVIGATION.replace("Open the latest statement", "Open the March statement"),
+            ["open_statement"],
+        ),
+        (_FULL_NAVIGATION_PRIOR, _navigation_yaml("    complete_verification: false\n"), ["open_statement"]),
+        (
+            _FULL_CODE_PRIOR,
+            _code_yaml(_PENDING_CODE).replace("    code: |\n", "    parameter_keys: [x]\n    code: |\n"),
+            [],
+        ),
+        (_FULL_CODE_PRIOR, _code_yaml(_PENDING_CODE, prompt="The page shows the saved row."), ["submit_search"]),
+    ],
+    ids=[
+        "masked-secret-unchanged",
+        "masked-secret-restored-by-save",
+        "masked-secret-block-edited",
+        "request-shape-resubmit",
+        "request-shape-goal-edit",
+        "request-shape-flag-edit",
+        "full-code-prior-resubmit",
+        "full-code-prior-prompt-edit",
+    ],
+)
+def test_save_normalization_names_no_block_but_a_real_edit_does(
+    prior: str, stored: str, expected_labels: list[str]
+) -> None:
+    assert _labels_changed_between(prior, stored) == expected_labels
+
+
+def test_a_save_that_changes_only_workflow_settings_still_follows_any_earlier_run() -> None:
+    opening = _code_yaml(_PENDING_CODE)
+    ctx = _ctx(opening)
+    ctx.record_dispatched_run("wr_before")
+
+    record_edited_block_labels(ctx, opening, opening)
+    assert not ctx.edited_after_dispatch("wr_before")
+
+    record_edited_block_labels(ctx, opening, opening.replace("title: Search", "title: Search v2"))
+    assert ctx.edited_block_labels_this_turn == []
+    assert ctx.edited_after_dispatch("wr_before")
+
+
+@pytest.mark.asyncio
+async def test_promoting_an_executed_source_clears_the_rebuild_for_that_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    executed = 'await page.get_by_role("link", name="Invoice").click()'
+    monkeypatch.setattr(
+        tools_module,
+        "resolve_executed_browser_code_source",
+        lambda _ctx, _reference: ExecutedBrowserCodeSourceResolution(status="valid", source=executed),
+    )
+    ctx = _ctx(prior)
+    update_params: dict[str, Any] = {"workflow_yaml": _code_yaml("", prompt="Check the order status")}
+
+    assert tools_module._promote_executed_sources(ctx, update_params, {"submit_search": "ref"}) is None
+    result = await _update_workflow(update_params, ctx, allow_missing_credentials=True)
+
+    assert result["ok"] is True, result
+    assert _single_code(ctx.staged_workflow_yaml).strip() == executed
+    assert _staged_rebuild_flag(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_a_goal_the_copilot_cannot_build_from_is_never_refused_at_author_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unbuildable_goal = "Open the Quarterly Rebates tab that this site does not have and export it"
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    submitted = _code_yaml('return {"output": {"status": "done"}}', prompt=unbuildable_goal)
+    ctx = _ctx()
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert "error" not in result
+    assert persisted
+    assert workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]["prompt"] == unbuildable_goal
+
+
+@pytest.mark.asyncio
+async def test_accept_path_leaves_a_model_owned_goal_alone_when_a_prior_goal_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prior = _code_yaml('return {"output": {"status": "pending"}}', prompt="Check the order status")
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml('return {"output": {"status": "done"}}', prompt="Report the final order status")
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert ctx.staged_workflow_yaml == submitted
+    assert "stored_goal_kept" not in result["data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("metadata_rows", "expected"),
+    [
+        pytest.param([], True, id="code-only-write-keeps-the-hand-edit-flag"),
+        pytest.param([_rebuild_artifact_row()], None, id="a-declared-goal-clears-it"),
+    ],
+)
+async def test_a_hand_edited_model_owned_block_clears_its_flag_only_when_the_write_declares_its_goal(
+    monkeypatch: pytest.MonkeyPatch, metadata_rows: list[dict[str, object]], expected: bool | None
+) -> None:
+    prior = _code_yaml('return {"output": {"status": "pending"}}', prompt="Check the order status").replace(
+        "    code: |", "    code_edited_by_hand: true\n    code: |"
+    )
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": _code_yaml(_REBUILT_CODE), "code_artifact_metadata": metadata_rows},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert staged_block.get("code_edited_by_hand") is expected
+
+
+@pytest.mark.asyncio
+async def test_a_scrub_value_inside_a_stored_goal_never_reaches_the_persisted_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    secret = "live-portal-password-9182"
+    prior = _user_owned_goal_yaml(
+        prompt=f"Sign in with {secret} and download the invoice",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    ctx = _ctx(prior)
+    register_secret_scrub_value(ctx, secret)
+    submitted = _code_yaml(
+        'await page.get_by_role("link", name="Invoice").click()',
+        prompt="Check the order status",
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert secret not in ctx.staged_workflow_yaml
+    assert persisted and secret not in persisted[0]
+    staged_block = workflow_blocks(parse_workflow_yaml(ctx.staged_workflow_yaml))[0]
+    assert REDACTED_SECRET_PLACEHOLDER in staged_block["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_block_reports_the_user_owned_goal_it_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = _user_owned_goal_yaml(
+        prompt="Download last month's invoice as a PDF",
+        code='return {"output": {"status": "pending"}}',
+        needs_regeneration=True,
+    )
+    _stub_successful_update(monkeypatch)
+    submitted = _code_yaml(
+        'return {"output": {"status": "done"}}',
+        label="fetch_invoice",
+        prompt="Fetch the invoice",
+    )
+    ctx = _ctx(prior)
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["stored_goal_dropped"] == ["submit_search"]
+    assert "submit_search" in result["data"]["stored_goal_dropped_message"]
 
 
 @pytest.mark.asyncio
@@ -317,16 +935,12 @@ async def test_google_notice_baseline_is_captured_before_an_update_without_sheet
 ) -> None:
     baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
     submitted_yaml = _code_yaml('return {"step": 1}')
-    baseline_workflow = SimpleNamespace(
+    baseline_workflow = fake_workflow(
         workflow_definition=SimpleNamespace(blocks=[]),
-        proxy_location=None,
-        webhook_callback_url=None,
         google_bindings=(("existing_sheet", "goac_existing"),),
     )
-    submitted_workflow = SimpleNamespace(
+    submitted_workflow = fake_workflow(
         workflow_definition=SimpleNamespace(blocks=[]),
-        proxy_location=None,
-        webhook_callback_url=None,
         google_bindings=(),
     )
 
@@ -368,10 +982,8 @@ async def test_google_notice_skips_lookup_when_turn_start_baseline_cannot_be_par
 ) -> None:
     baseline_yaml = _code_yaml('return {"turn_start": True}', label="turn_start")
     submitted_yaml = _code_yaml('return {"step": 1}')
-    submitted_workflow = SimpleNamespace(
+    submitted_workflow = fake_workflow(
         workflow_definition=SimpleNamespace(blocks=[]),
-        proxy_location=None,
-        webhook_callback_url=None,
         google_bindings=(("new_sheet", "goac_error"),),
     )
 
@@ -572,6 +1184,52 @@ async def test_model_declared_download_contract_keeps_write_seam_secret_redactio
 
 
 @pytest.mark.asyncio
+async def test_a_rewritten_submission_returns_the_stored_bytes_and_names_the_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A following anchored edit is matched against what the server stored, so the write result has
+    to say both what that is and that it is not what the model sent."""
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    secret = "hunter2-correct-horse"
+    register_secret_scrub_value(ctx, secret)
+    submitted = _code_yaml(f'await page.locator("#password").fill("{secret}")')
+
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+    stored = result["data"]["stored_code"]["submit_search"]
+    assert result["data"]["stored_code_rewritten"] == ["submit_search"]
+    assert stored == stored_block_code(stored_workflow_yaml(ctx), "submit_search")
+    assert secret not in stored
+    assert REDACTED_SECRET_PLACEHOLDER in stored
+
+    edited = apply_block_edit(
+        stored_workflow_yaml(ctx),
+        "submit_search",
+        expected_code=REDACTED_SECRET_PLACEHOLDER,
+        replacement_code="{password}",
+    )
+    assert "{password}" in edited
+
+    with pytest.raises(BlockEditError):
+        apply_block_edit(
+            stored_workflow_yaml(ctx), "submit_search", expected_code=secret, replacement_code="{password}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_submission_the_server_stored_verbatim_names_no_rewrite(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    submitted = _code_yaml('await page.locator("#go").click()')
+
+    result = await _update_workflow({"workflow_yaml": submitted}, ctx, allow_missing_credentials=True)
+
+    assert result["data"]["stored_code"]["submit_search"]
+    assert "stored_code_rewritten" not in result["data"]
+
+
+@pytest.mark.asyncio
 async def test_deleting_download_block_removes_its_model_declared_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -681,10 +1339,62 @@ async def test_registered_live_secret_is_redacted_at_hard_safety_boundary(monkey
 
 
 @pytest.mark.asyncio
+async def test_exact_source_promotion_persists_when_the_code_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    source = 'await page.locator("#submit").click()\n'
+    submitted = _code_yaml(source)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_expected_exact_code_by_label": {"submit_search": source},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert len(persisted) == 1
+    assert _single_code(persisted[0]) == source
+    assert _single_code(ctx.workflow_yaml) == source
+
+
+@pytest.mark.asyncio
+async def test_exact_source_promotion_rejects_a_persistence_scrub_that_would_change_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    source = 'await page.locator("#password").click()\n'
+    register_secret_scrub_value(ctx, "password")
+    submitted = _code_yaml(source)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": submitted,
+            "_expected_exact_code_by_label": {"submit_search": source},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error_code"] == "executed_source_changed_before_persistence"
+    assert persisted == []
+    assert ctx.workflow_yaml == ""
+
+
+@pytest.mark.asyncio
 async def test_run_path_rejects_changed_raw_load_balancer_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = _ctx()
     workflow_yaml = _code_yaml('return {"public_form_exists": False}', label="validate_public_path")
     raw_webhook_url = "https://service-123.elb.us-east-1.amazonaws.com/hook"
+    workflow_yaml += f"webhook_callback_url: {raw_webhook_url}\n"
 
     async def _prior(_ctx: CopilotContext) -> SimpleNamespace:
         return SimpleNamespace(webhook_callback_url="https://webhook.example.com/hook")
@@ -733,13 +1443,15 @@ class TestBodyReadinessAdvisoryDelivery:
         return _author_time_findings(
             schema_incompatibility=None,
             metadata_violations=[],
-            code_block_diagnostics=_advisory_labels_by_message(_changed_code_blocks(prior, accepted, accepted)),
+            code_block_diagnostics=_advisory_labels_by_diagnostic(
+                _changed_code_blocks(prior, accepted, accepted)[0], accepted
+            ),
         )
 
     def test_budget_withheld_block_still_carries_the_advisory(self) -> None:
         accepted = _code_yaml(self._oversized_block(), label="read_summary")
 
-        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted))
+        stored_code, withheld = _accepted_code_delta(_changed_code_blocks(None, accepted, accepted)[0])
         findings = self._findings(None, accepted)
 
         assert stored_code == {}
@@ -751,6 +1463,95 @@ class TestBodyReadinessAdvisoryDelivery:
         prior = _code_yaml(self._BODY_WAIT, label="read_summary")
 
         assert self._findings(prior, prior) == []
+
+
+@pytest.mark.asyncio
+async def test_wrapper_scope_advisory_is_its_own_finding_on_a_draft_that_persists_and_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    submitted = _code_yaml(
+        """
+        await page.locator("body").wait_for(state="visible", timeout=45000)
+        matches = 0
+
+        async def count_match():
+            global matches
+            matches += 1
+
+        for _ in range(3):
+            await count_match()
+        return {"output": {"matches": matches}}
+        """
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    assert persisted == [submitted]
+    findings = result["data"]["findings"]
+    assert [finding["reason_code"] for finding in findings] == [
+        READINESS_WAIT_ADVISORY_REASON_CODE,
+        WRAPPER_SCOPE_ADVISORY_REASON_CODE,
+    ]
+    assert "`global matches` at line 5 inside `count_match`" in findings[1]["summary"]
+    assert "`submit_search`" in findings[1]["summary"]
+    run_result = {"ok": False, "data": {"workflow_run_id": "wr_x", "overall_status": "failed"}}
+    carried = carry_author_time_findings(result, run_result)["data"]
+    assert carried["findings"] == findings
+    assert carried["workflow_run_id"] == "wr_x"
+
+
+@pytest.mark.asyncio
+async def test_wrapper_scope_advisory_covers_a_global_on_a_declared_workflow_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx()
+    code = "\n".join(
+        [
+            "          async def bump():",
+            "              global retries",
+            "              retries += 1",
+            "",
+            "          await bump()",
+            '          return {"output": {"retries": retries}}',
+        ]
+    )
+    submitted = (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "  - parameter_type: workflow\n"
+        "    workflow_parameter_type: integer\n"
+        "    key: retries\n"
+        "    default_value: 0\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: submit_search\n"
+        "    prompt: The page shows the result.\n"
+        "    parameter_keys: [retries]\n"
+        "    code: |\n"
+        f"{code}\n"
+    )
+
+    result = await _update_workflow(
+        {"workflow_yaml": submitted, "code_artifact_metadata": []},
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True
+    findings = result["data"]["findings"]
+    assert [finding["reason_code"] for finding in findings] == [WRAPPER_SCOPE_ADVISORY_REASON_CODE]
+    assert "`global retries` at line 2 inside `bump` for a workflow parameter" in findings[0]["summary"]
 
 
 @pytest.mark.asyncio
@@ -825,3 +1626,262 @@ async def test_oss_base_hook_yields_no_scanner_findings(monkeypatch: pytest.Monk
     assert result["ok"] is True
     assert persisted == [submitted]
     assert all(f["reason_code"] != "code_block_scanner_advisory" for f in result["data"].get("findings", []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placeholder", ['""', "|"], ids=["empty string", "empty block scalar"])
+async def test_executed_source_fills_an_empty_code_block_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, placeholder: str
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx()
+    executed = 'rows = await page.locator("tr").count()\nreturn {"rows": rows}'
+    draft = (
+        "title: Search\n"
+        "workflow_definition:\n"
+        "  blocks:\n"
+        "  - block_type: code\n"
+        "    label: count_rows\n"
+        f"    code: {placeholder}\n"
+    )
+    promoted = apply_block_edit(draft, "count_rows", expected_code="", replacement_code=executed)
+
+    result = await _update_workflow(
+        {
+            "workflow_yaml": promoted,
+            "code_artifact_metadata": [],
+            "_expected_exact_code_by_label": {"count_rows": executed},
+        },
+        ctx,
+        allow_missing_credentials=True,
+    )
+
+    assert result["ok"] is True, result
+    assert _single_code(ctx.workflow_yaml) == executed
+
+
+_PRIOR_SIX_BLOCK_WORKFLOW = _yaml(
+    """
+    title: Support contact
+    workflow_definition:
+      blocks:
+      - block_type: task
+        engine: skyvern-3.0
+        label: open_support_page
+        url: https://example.test/support
+        navigation_goal: Open the support page.
+      - block_type: task
+        engine: skyvern-3.0
+        label: read_support_contact
+        url: ''
+        navigation_goal: Find the support contact.
+        data_extraction_goal: Extract the support email address.
+      - block_type: task
+        engine: skyvern-3.0
+        label: confirm_contact_present
+        url: ''
+        navigation_goal: Confirm the support contact section is present.
+      - block_type: navigation
+        label: open_ticket_form
+        url: https://example.test/tickets/new
+        navigation_goal: Open the new ticket form.
+      - block_type: for_loop
+        label: each_ticket
+        loop_over_parameter_key: tickets
+        loop_blocks:
+        - block_type: task
+          engine: skyvern-3.0
+          label: read_ticket
+          url: ''
+          navigation_goal: Read the ticket.
+    """
+)
+_DROPPED_BY_SINGLE_CODE_WRITE = [
+    "confirm_contact_present",
+    "each_ticket",
+    "open_support_page",
+    "open_ticket_form",
+    "read_ticket",
+]
+_RETYPED_BY_SINGLE_CODE_WRITE = {"read_support_contact": {"from": "task", "to": "code"}}
+
+
+async def _public_update(monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, submitted: str) -> dict[str, object]:
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    raw = await tools_module.update_workflow_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="update_workflow"),
+        json.dumps({"workflow": safe_load_no_dates(submitted)}),
+    )
+    return json.loads(raw)
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_drops_and_retypes_prior_blocks_persists_and_names_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted: list[str] = []
+    _stub_successful_update(monkeypatch, persisted)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    submitted = _code_yaml('await page.goto("https://example.test/support")', label="read_support_contact")
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert persisted and "read_support_contact" in persisted[0]
+    data = result["data"]
+    assert data["dropped_prior_blocks"] == _DROPPED_BY_SINGLE_CODE_WRITE
+    assert data["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+    run_result = {"ok": True, "data": {"workflow_run_id": "wr_x", "overall_status": "completed"}}
+    skip_result = {"ok": True, "data": {"skipped_run": True, "skip_reason": "workflow_credential_inputs_unbound"}}
+    for combined in (run_result, skip_result):
+        carried = carry_author_time_findings(result, combined)["data"]
+        assert carried["dropped_prior_blocks"] == _DROPPED_BY_SINGLE_CODE_WRITE
+        assert carried["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_keeps_every_prior_block_names_no_drop_or_type_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    submitted = _PRIOR_SIX_BLOCK_WORKFLOW.replace("block_type: navigation", "block_type: browser_task") + (
+        '  - block_type: code\n    label: record_contact\n    code: |\n      return {"ok": True}\n'
+    )
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert "dropped_prior_blocks" not in result["data"]
+    assert "block_type_changes" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_a_second_write_in_a_turn_diffs_against_the_last_in_turn_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    ctx.last_workflow_yaml = _yaml(
+        """
+        title: Support contact
+        workflow_definition:
+          blocks:
+          - block_type: task
+            engine: skyvern-3.0
+            label: read_support_contact
+            url: ''
+            navigation_goal: Find the support contact.
+          - block_type: task
+            engine: skyvern-3.0
+            label: confirm_contact_present
+            url: ''
+            navigation_goal: Confirm the support contact section is present.
+        """
+    )
+    submitted = _code_yaml('await page.goto("https://example.test/support")', label="read_support_contact")
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert result["data"]["dropped_prior_blocks"] == ["confirm_contact_present"]
+    assert result["data"]["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_waited_on_a_sibling_write_diffs_against_what_it_replaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling that published and released the lock, but whose tool call has not returned yet, is
+    still the definition this write replaces; its blocks must not vanish unreported."""
+    _stub_successful_update(monkeypatch)
+    ctx = _ctx(_PRIOR_SIX_BLOCK_WORKFLOW, policy=BlockAuthoringPolicy.STANDARD)
+    ctx.last_workflow_yaml = _PRIOR_SIX_BLOCK_WORKFLOW
+    sibling_wrote = _yaml(
+        """
+        title: Support contact
+        workflow_definition:
+          blocks:
+          - block_type: task
+            engine: skyvern-3.0
+            label: read_support_contact
+            url: ''
+            navigation_goal: Find the support contact.
+          - block_type: navigation
+            label: added_by_sibling
+            url: https://example.test/tickets/new
+            navigation_goal: Open the new ticket form.
+        """
+    )
+
+    sibling = await workflow_update_module._update_workflow({"workflow_yaml": sibling_wrote}, ctx)
+    assert sibling["ok"] is True
+    submitted = _code_yaml('await page.goto("https://example.test/support")', label="read_support_contact")
+
+    result = await _public_update(monkeypatch, ctx, submitted)
+
+    assert result["ok"] is True
+    assert result["data"]["dropped_prior_blocks"] == ["added_by_sibling"]
+    assert result["data"]["block_type_changes"] == _RETYPED_BY_SINGLE_CODE_WRITE
+
+
+@pytest.mark.asyncio
+async def test_block_edits_sent_in_one_response_compose_on_each_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _process(**kwargs: object) -> SimpleNamespace:
+        # Yield mid-persist, as a real save does, so the sibling calls overlap.
+        await asyncio.sleep(0)
+        return fake_workflow(workflow_definition=SimpleNamespace(blocks=[]))
+
+    async def _prior(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _process)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _prior)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+    ctx = _ctx(
+        _yaml(
+            """
+            title: Search
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: first
+                code: |
+                  return {"output": {"step": "first"}}
+              - block_type: code
+                label: second
+                code: |
+                  return {"output": {"step": "second"}}
+            """
+        ),
+        policy=BlockAuthoringPolicy.STANDARD,
+    )
+
+    async def invoke(tool: FunctionTool, arguments: dict[str, object]) -> dict[str, object]:
+        raw = await tool.on_invoke_tool(SimpleNamespace(context=ctx, tool_name=tool.name), json.dumps(arguments))
+        return json.loads(raw)
+
+    results = await asyncio.gather(
+        invoke(
+            tools_module.add_block_tool,
+            {
+                "after_label": "second",
+                "block": {"block_type": "code", "label": "third", "code": 'return {"output": {"step": "third"}}'},
+            },
+        ),
+        invoke(
+            tools_module.edit_block_tool, {"label": "first", "expected_code": '"first"', "replacement_code": '"one"'}
+        ),
+        invoke(
+            tools_module.edit_block_tool, {"label": "second", "expected_code": '"second"', "replacement_code": '"two"'}
+        ),
+    )
+
+    assert [result["ok"] for result in results] == [True, True, True], results
+    stored = {
+        block["label"]: str(block["code"]) for block in workflow_blocks(parse_workflow_yaml(ctx.last_workflow_yaml))
+    }
+    assert list(stored) == ["first", "second", "third"]
+    assert '"one"' in stored["first"]
+    assert '"two"' in stored["second"]

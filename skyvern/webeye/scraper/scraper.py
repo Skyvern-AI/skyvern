@@ -3,6 +3,7 @@ import copy
 import json
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 from opentelemetry import trace as otel_trace
@@ -35,7 +36,8 @@ from skyvern.forge.sdk.trace import apply_context_attrs, traced, traced_span
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
-from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.action_deadline import bounded_lookup_call
+from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -45,16 +47,50 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.utils.document import get_main_document_loader_id
-from skyvern.webeye.utils.page import SkyvernFrame, load_js_script
+from skyvern.webeye.utils.flutter_semantics import (
+    FlutterSemanticsState,
+    SemanticsActivation,
+    activate_flutter_semantics,
+)
+from skyvern.webeye.utils.page import SkyvernFrame, load_js_script, with_dom_utils
 
 if TYPE_CHECKING:
     from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
+MAX_LOGGED_FRAME_COLLISION_PAIRS = 10
+
+# Reads every stamped element's live tag name, role and match count in one pass, open shadow roots
+# included, so a caller can resolve a whole subtree without a round trip per element.
+LIVE_ELEMENT_PROBE_JS = """(attrName) => {
+    // Element ids come from page attributes and can collide with Object.prototype keys.
+    const probes = Object.create(null);
+    const pending = [document.documentElement];
+    while (pending.length) {
+        const node = pending.pop();
+        if (!node) continue;
+        const elementId = node.getAttribute ? node.getAttribute(attrName) : null;
+        if (elementId) {
+            const probe = probes[elementId];
+            if (probe === undefined) {
+                probes[elementId] = {
+                    count: 1,
+                    tagName: node.tagName ? node.tagName.toLowerCase() : "",
+                    role: node.getAttribute("role"),
+                };
+            } else {
+                probe.count += 1;
+            }
+        }
+        for (const child of node.children || []) pending.push(child);
+        if (node.shadowRoot) pending.push(node.shadowRoot);
+    }
+    return probes;
+}"""
 
 
 async def build_scraping_failed_reason(
-    browser_state: BrowserState, requested_url: str, *, timed_out: bool = False
+    browser_state: BrowserState, requested_url: str, *, timed_out: bool = False, canvas_app: bool = False
 ) -> str:
     """Build the user-facing ScrapingFailed reason with the requested URL plus the landed URL when they differ.
 
@@ -77,6 +113,12 @@ async def build_scraping_failed_reason(
         base = (
             "Skyvern hit a page-analysis timeout while loading the website. "
             "The page took too long to load or become responsive during analysis."
+        )
+    elif canvas_app:
+        # Keeps "failed to load the website" as a substring: the page-load log filter and reports still match on it.
+        base = (
+            "Skyvern failed to load the website's controls. The page loaded, but it draws its interface on a "
+            "canvas and its accessibility tree did not come up, so there was nothing on it Skyvern could read."
         )
     else:
         base = (
@@ -267,9 +309,18 @@ def build_element_dict(
     id_to_frame_dict: dict[str, str] = {}
     id_to_element_hash: dict[str, str] = {}
     hash_to_element_ids: dict[str, list[str]] = {}
+    cross_frame_collision_ids: set[str] = set()
+    colliding_frame_pairs: set[tuple[str, str]] = set()
 
     for element in elements:
         element_id: str = element.get("id", "")
+        previous_frame = id_to_frame_dict.get(element_id)
+        if previous_frame is not None and previous_frame != element["frame"]:
+            cross_frame_collision_ids.add(element_id)
+            colliding_frame_pairs.add((previous_frame, element["frame"]))
+            # Frames arrive breadth-first, parents before children, so the first owner is the likelier target, and a
+            # frame's copy of its own iframe cannot re-point that iframe into its subtree and loop the frame chain.
+            continue
         # get_interactable_element_tree marks each interactable element with a SKYVERN_ID_ATTR attribute
         id_to_css_dict[element_id] = f"[{SKYVERN_ID_ATTR}='{element_id}']"
         id_to_element_dict[element_id] = element
@@ -277,6 +328,17 @@ def build_element_dict(
         element_hash = hash_element(element)
         id_to_element_hash[element_id] = element_hash
         hash_to_element_ids[element_hash] = hash_to_element_ids.get(element_hash, []) + [element_id]
+
+    if cross_frame_collision_ids:
+        iframe_collision_count = len(cross_frame_collision_ids & {element["frame"] for element in elements})
+        # A shared iframe id is the collision that can misroute an element's frame chain.
+        log = LOG.warning if iframe_collision_count else LOG.info
+        log(
+            "Element ids collide across frames; the earlier frame's element is kept",
+            collision_count=len(cross_frame_collision_ids),
+            iframe_collision_count=iframe_collision_count,
+            frame_pairs=sorted(colliding_frame_pairs)[:MAX_LOGGED_FRAME_COLLISION_PAIRS],
+        )
 
     return id_to_css_dict, id_to_element_dict, id_to_frame_dict, id_to_element_hash, hash_to_element_ids
 
@@ -299,6 +361,7 @@ async def scrape_website(
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
     allow_transient_ui_suppression: bool = False,
+    navigation_deadline: float | None = None,
 ) -> ScrapedPage:
     """
     ************************************************************************************************
@@ -336,6 +399,7 @@ async def scrape_website(
             wait_seconds=wait_seconds,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
     try:
@@ -381,13 +445,17 @@ async def scrape_website(
                 num_retry=num_retry,
                 url=url,
                 exc_info=True,
+                **browser_state.runtime_event_context.browser_dimension_fields(),
             )
             if isinstance(e, FailedToTakeScreenshot):
                 raise e
             else:
                 raise ScrapingFailed(
                     reason=await build_scraping_failed_reason(
-                        browser_state, url, timed_out=_scrape_timed_out(browser_state, e)
+                        browser_state,
+                        url,
+                        timed_out=_scrape_timed_out(browser_state, e),
+                        canvas_app=isinstance(e, NoElementFound) and e.canvas_app,
                     )
                 ) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
@@ -405,6 +473,7 @@ async def scrape_website(
             scroll=scroll,
             must_included_tags=must_included_tags,
             allow_transient_ui_suppression=allow_transient_ui_suppression,
+            navigation_deadline=navigation_deadline,
         )
 
 
@@ -462,6 +531,30 @@ def _should_use_page_ready_wait() -> bool:
     return bool(context and context.enable_page_ready_wait)
 
 
+async def _prepare_scrape_frame(
+    browser_state: BrowserState, page: Page, navigation_deadline: float | None, support_empty_page: bool
+) -> tuple[SkyvernFrame, str]:
+    """Get the working page ready for scraping and return its frame with the URL of the document being scraped.
+
+    Settles any in-flight navigation, rejects a dead blank page, injects the helpers, then waits for readiness.
+    Injection evaluates in the page, and evaluate calls are deferred while a cross-document navigation is pending,
+    so the navigation wait must come first. Only callers that pass a deadline (the step's scrape ladder) wait for it.
+    """
+    if navigation_deadline is not None:
+        await browser_state.wait_for_main_frame_navigation(page, navigation_deadline)
+    url = page.url
+    if url in BLANK_PAGE_URLS and not support_empty_page:
+        # A blank working page (about:blank or the ":" download-popup shape) is only scrapeable when
+        # a meaningful child frame renders real content (e.g. an Edge PDF interstitial); otherwise it
+        # is a dead blank and must fail classification so the caller can recover or fail closed.
+        if not page_has_meaningful_child_frame(page):
+            raise ScrapingFailedBlankPage()
+        LOG.info("blank page has meaningful child frames, proceeding with scraping")
+    skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
+    await _wait_for_scrape_ready(skyvern_frame)
+    return skyvern_frame, url
+
+
 async def _wait_for_scrape_ready(skyvern_frame: SkyvernFrame) -> None:
     if _should_use_page_ready_wait():
         await skyvern_frame.wait_for_page_ready(
@@ -516,6 +609,23 @@ def _record_scrape_span_attrs(
         span.set_attribute("screenshots_consumed", ctx.scrape_screenshots_consumed)
 
 
+def page_has_meaningful_child_frame(page: Page) -> bool:
+    # Blank/empty frame urls (ad iframes, tracking pixels, detached frames) don't make a blank page
+    # scrapeable; a real child frame (e.g. an Edge PDF interstitial rendered on about:blank) does.
+    return any(f.url and f.url not in ("about:blank", "") for f in page.main_frame.child_frames)
+
+
+def page_is_dead_blank(page: Page) -> bool:
+    return page.url in BLANK_PAGE_URLS and not page_has_meaningful_child_frame(page)
+
+
+def page_is_http_survivor(page: Page) -> bool:
+    # A usable fallback target: an open http/https page. Blank (":"/"about:blank") and
+    # chrome-error:// pages are not survivors, so recovery stays fail-closed when only dead pages
+    # remain (planning and execution-time rechecks share this one definition).
+    return not page.is_closed() and urlparse(page.url).scheme in ("http", "https")
+
+
 @traced(name="skyvern.agent.scrape")
 async def scrape_web_unsafe(
     browser_state: BrowserState,
@@ -533,6 +643,7 @@ async def scrape_web_unsafe(
     wait_seconds: float = 0,
     must_included_tags: list[str] | None = None,
     allow_transient_ui_suppression: bool = False,
+    navigation_deadline: float | None = None,
 ) -> ScrapedPage:
     """
     Asynchronous function that performs web scraping without any built-in error handling. This function is intended
@@ -541,7 +652,6 @@ async def scrape_web_unsafe(
 
     :param browser_context: BrowserContext instance used for scraping.
     :param url: URL of the web page to be scraped. Used only when creating a new page.
-    :param page: Optional Page instance for scraping, a new page is created if None.
     :return: Tuple containing Page instance, base64 encoded screenshot, and page elements.
     :note: This function does not handle exceptions. Ensure proper error handling in the calling context.
     """
@@ -554,21 +664,7 @@ async def scrape_web_unsafe(
     # We check if the scroll_y_px_old is the same as scroll_y_px to determine if we have reached the end of the page.
     # This also solves the issue where we can't scroll due to a popup.(e.g. geico first popup on the homepage after
     # clicking start my quote)
-    url = page.url
-    if url == "about:blank" and not support_empty_page:
-        # Allow scraping if the page has child frames with meaningful content
-        # (e.g., Edge PDF interstitial pages render content via iframes on about:blank).
-        # Filter out empty/blank frames (ad iframes, tracking pixels, detached frames).
-        meaningful_frames = [f for f in page.main_frame.child_frames if f.url and f.url not in ("about:blank", "")]
-        if not meaningful_frames:
-            raise ScrapingFailedBlankPage()
-        LOG.info(
-            "about:blank page has meaningful child frames, proceeding with scraping",
-            frame_count=len(meaningful_frames),
-        )
-
-    skyvern_frame = await SkyvernFrame.create_instance(page, engine_selection=browser_state.engine_selection)
-    await _wait_for_scrape_ready(skyvern_frame)
+    skyvern_frame, url = await _prepare_scrape_frame(browser_state, page, navigation_deadline, support_empty_page)
 
     if wait_seconds > 0:
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
@@ -576,23 +672,43 @@ async def scrape_web_unsafe(
 
     document_loader_id_before = await get_main_document_loader_id(page)
 
-    elements, element_tree, destinations = await get_interactable_element_tree(
-        page,
-        scrape_exclude,
-        must_included_tags,
-        engine_selection=browser_state.engine_selection,
-    )
-    empty_page_retry = False
-    if not elements and not support_empty_page:
-        LOG.warning("No elements found on the page, wait and retry")
-        await empty_page_retry_wait()
-        empty_page_retry = True
+    async def read_tree() -> tuple[list[dict], list[dict], dict[str, dict], FlutterSemanticsState]:
+        flutter_state = FlutterSemanticsState()
         elements, element_tree, destinations = await get_interactable_element_tree(
             page,
             scrape_exclude,
             must_included_tags,
             engine_selection=browser_state.engine_selection,
+            flutter_state=flutter_state,
         )
+        return elements, element_tree, destinations, flutter_state
+
+    async def enable_semantics(flutter_state: FlutterSemanticsState) -> SemanticsActivation | None:
+        # Keyed on the placeholder rather than on what was listed: banners, host controls and child frames can all be
+        # readable while the app itself is not.
+        if not flutter_state.needs_activation:
+            return None
+        return await activate_flutter_semantics(skyvern_frame)
+
+    elements, element_tree, destinations, flutter_state = await read_tree()
+    activation = await enable_semantics(flutter_state)
+    if activation is not None and activation.reading_stale:
+        # Switching on can rewrite the URL (an app's hash routing), and the reading must carry the URL it was taken at.
+        url = page.url
+        elements, element_tree, destinations, flutter_state = await read_tree()
+    empty_page_retry = False
+    # An activation never stands in for this wait: an app that draws its tree after the activation's budget is read
+    # here, where skipping ahead would reach the reload that switches its semantics off again.
+    if not elements and not support_empty_page:
+        LOG.warning("No elements found on the page, wait and retry")
+        await empty_page_retry_wait()
+        empty_page_retry = True
+        elements, element_tree, destinations, flutter_state = await read_tree()
+        # An app that mounted during the wait shows its placeholder only now.
+        activation = await enable_semantics(flutter_state)
+        if activation is not None and activation.reading_stale:
+            url = page.url
+            elements, element_tree, destinations, flutter_state = await read_tree()
 
     element_tree = await cleanup_element_tree(page, url, _deepcopy_element_tree(element_tree))
     element_tree_trimmed = trim_element_tree(_deepcopy_element_tree(element_tree))
@@ -680,7 +796,7 @@ async def scrape_web_unsafe(
 
     # if there are no elements, fail the scraping unless support_empty_page is True
     if not elements and not support_empty_page:
-        raise NoElementFound()
+        raise NoElementFound(canvas_app=flutter_state.tree_missing)
 
     text_content = await get_frame_text(page.main_frame, scrape_exclude)
 
@@ -823,7 +939,17 @@ async def add_frame_interactable_elements(
         # it will get stuck when we `frame.evaluate()` on an invisible iframe
         if not await frame_element.is_visible():
             return elements, element_tree
-        skyvern_id = await frame_element.get_attribute(SKYVERN_ID_ATTR)
+        # The iframe's ElementHandle is owned by the frame that resolved it -- its parent, or the main
+        # frame when an orphan attach briefly leaves `parent_frame` None -- so read the id there through
+        # the common evaluate abstraction, in the handle's own context. `get_attribute` would instead
+        # re-resolve the handle through the driver's `:scope` selector, blocking for the full 30s action
+        # timeout once the parent document navigated; evaluating in the owning context fails fast.
+        skyvern_id = await SkyvernFrame.evaluate(
+            frame=frame.parent_frame or frame.page.main_frame,
+            expression=f"(element) => element.getAttribute({json.dumps(SKYVERN_ID_ATTR)})",
+            arg=frame_element,
+            engine_selection=engine_selection,
+        )
         if not skyvern_id:
             LOG.info(
                 "No Skyvern id found for frame, skipping",
@@ -882,17 +1008,20 @@ async def get_interactable_element_tree(
     scrape_exclude: ScrapeExcludeFunc | None = None,
     must_included_tags: list[str] | None = None,
     engine_selection: "BrowserEngineSelection | None" = None,
+    *,
+    flutter_state: FlutterSemanticsState | None = None,
 ) -> tuple[list[dict], list[dict], dict[str, dict]]:
     """
     Get the element tree of the page, including all the elements that are interactable.
     :param page: Page instance to get the element tree from.
+    :param flutter_state: filled in with what the main frame showed of a Flutter app, when given.
     :return: Tuple of the interactable elements, the element tree, and the per-element
         destination-facts sidecar stripped out of them at the SkyvernFrame boundary.
     """
     # main page index is 0
     skyvern_page = await SkyvernFrame.create_instance(page, engine_selection=engine_selection)
     elements, element_tree, destinations = await skyvern_page.build_tree_from_body(
-        frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags
+        frame_name="main.frame", frame_index=0, must_included_tags=must_included_tags, flutter_state=flutter_state
     )
 
     context = skyvern_context.ensure_context()
@@ -944,6 +1073,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         # native analysis timeout; None (default) preserves the stock Playwright timeout identity.
         self.engine_selection = engine_selection
         self.last_used_element_tree_html: str | None = None
+        self._live_element_probes: dict[str, dict] | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
         self.element_tree_trimmed = element_tree_trimmed
@@ -979,6 +1109,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         self.id_to_css_dict, self.id_to_element_dict, _, _, _ = build_element_dict(incremental_elements)
 
         self.elements = incremental_elements
+        self._live_element_probes = None
 
         incremental_tree = await cleanup_element_tree(frame, frame.url, _deepcopy_element_tree(incremental_tree))
         trimmed_element_tree = trim_element_tree(_deepcopy_element_tree(incremental_tree))
@@ -989,7 +1120,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
         return self.element_tree_trimmed
 
     async def start_listen_dom_increment(self, element: ElementHandle | None = None) -> None:
-        js_script = "async (element) => await startGlobalIncrementalObserver(element)"
+        js_script = with_dom_utils(
+            "async (element) => await startGlobalIncrementalObserver(element)", ("startGlobalIncrementalObserver",)
+        )
         await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script, arg=element)
 
     async def stop_listen_dom_increment(self) -> None:
@@ -997,7 +1130,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
         js_script = "() => window.globalObserverForDOMIncrement === undefined"
         if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
             return
-        js_script = "async () => await stopGlobalIncrementalObserver()"
+        js_script = with_dom_utils(
+            "async () => await stopGlobalIncrementalObserver()", ("stopGlobalIncrementalObserver",)
+        )
         await SkyvernFrame.evaluate(
             frame=self.skyvern_frame.get_frame(),
             expression=js_script,
@@ -1005,13 +1140,72 @@ class IncrementalScrapePage(ElementTreeBuilder):
         )
 
     async def get_incremental_elements_num(self) -> int:
-        # check if the DOM has navigated away or refreshed
-        js_script = "() => window.globalOneTimeIncrementElements === undefined"
-        if await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script):
-            return 0
-
-        js_script = "() => window.globalOneTimeIncrementElements.length"
+        # A persistent browser page may still run an observer injected by another rolling-deploy build.
+        # The current observer (exact version match) and a transitional unstamped/mismatched build that
+        # already bumped the scalar both keep a correct cumulative count in globalIncrementalJobCount.
+        # A pre-splice build never bumped it, leaving a reinjection-zeroed scalar, so for that case fall
+        # back to the length of the monotonic history array the pre-splice callback only ever pushed to.
+        js_script = """() => {
+            const observer = window.globalObserverForDOMIncrement;
+            const currentVersion = window.INCREMENTAL_OBSERVER_VERSION;
+            const isCurrent = Boolean(
+                observer &&
+                currentVersion !== undefined &&
+                observer.skyvernObserverVersion === currentVersion
+            );
+            const jobCount = window.globalIncrementalJobCount;
+            if ((isCurrent || jobCount > 0) && jobCount !== undefined) {
+                return jobCount;
+            }
+            if (window.globalOneTimeIncrementElements !== undefined) {
+                return window.globalOneTimeIncrementElements.length;
+            }
+            return 0;
+        }"""
         return await SkyvernFrame.evaluate(frame=self.skyvern_frame.get_frame(), expression=js_script)
+
+    async def _get_live_element_probes(self) -> dict[str, dict]:
+        """Live tag name, role and match count of every stamped element in the frame, keyed by element id.
+
+        Read in one pass instead of a locator resolve plus an attribute read per element: an opened
+        dropdown menu can hold hundreds of elements, and each round trip to a remote browser costs
+        a fraction of a second. Cached until the next incremental scrape replaces the element tree.
+        """
+        cached = self._live_element_probes
+        if cached is not None:
+            return cached
+
+        probes: dict[str, dict] = await SkyvernFrame.evaluate(
+            frame=self.skyvern_frame.get_frame(), expression=LIVE_ELEMENT_PROBE_JS, arg=SKYVERN_ID_ATTR
+        )
+        self._live_element_probes = probes
+        return probes
+
+    async def find_option_list_element_id(self, root_element: dict) -> str | None:
+        """Id of the first <ul> or role="listbox" element in the subtree, the root element included."""
+        try:
+            probes = await self._get_live_element_probes()
+        except Exception:
+            # Same outcome the per-element reads had when the page wouldn't answer: no match.
+            LOG.debug("Failed to read the live element tree, no option list element found", exc_info=True)
+            return None
+
+        queue = [root_element]
+        index = 0
+        while index < len(queue):
+            element = queue[index]
+            index += 1
+            element_id: str = element.get("id", "")
+            probe = probes.get(element_id)
+            # An id matching no element, or more than one, is not addressable by its selector.
+            if probe is not None and probe.get("count") == 1:
+                if element.get("tagName") == "ul":
+                    return element_id
+                # The role may change after the scrape, so use the live probe as authoritative.
+                if probe.get("role") == "listbox":
+                    return element_id
+            queue.extend(element.get("children", []))
+        return None
 
     async def __validate_element_by_value(self, value: str, element: dict) -> tuple[Locator | None, bool]:
         """
@@ -1037,7 +1231,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
             if is_match:
                 if child_locator:
                     return child_locator, True
-                if interactable and parent_locator and await parent_locator.count() > 0:
+                if interactable and parent_locator and await bounded_lookup_call(parent_locator.count) > 0:
                     return parent_locator, True
                 return None, True
 
@@ -1048,7 +1242,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         if text != value:
             return None, False
 
-        if await parent_locator.count() == 0:
+        if await bounded_lookup_call(parent_locator.count) == 0:
             return None, False
 
         if not interactable:

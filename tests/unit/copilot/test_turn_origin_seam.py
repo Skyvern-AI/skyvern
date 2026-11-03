@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.turn_origin import (
     TurnOrigin,
     make_self_heal_session_id,
 )
+from tests.unit._mcp_browser_fakes import crash_free_browser_state
 
 
 class _FakeBrowser:
@@ -30,7 +31,7 @@ class _FakeBrowser:
 class _FakeBrowserContext:
     def __init__(self, *, connected: bool = True, closed: bool = False) -> None:
         self.browser = _FakeBrowser(connected=connected)
-        self._impl_obj = SimpleNamespace(_close_was_called=closed, _closed=closed)
+        self._impl_obj = SimpleNamespace(_closing_or_closed=closed, _closed=closed)
 
 
 def _make_stream() -> MagicMock:
@@ -57,15 +58,17 @@ def _make_ctx(**overrides: object) -> AgentContext:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("origin", [TurnOrigin.runtime_self_heal, "runtime_self_heal"])
+@pytest.mark.parametrize("origin", [TurnOrigin.code_block_ai_fallback, "code_block_ai_fallback"])
 async def test_ensure_browser_session_self_heal_requires_injected_state_no_auto_create(
     monkeypatch: pytest.MonkeyPatch,
     origin: object,
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
 
-    create_session = AsyncMock(side_effect=AssertionError("create_session must not run for runtime_self_heal"))
-    get_browser_state = AsyncMock(side_effect=AssertionError("get_browser_state must not run for runtime_self_heal"))
+    create_session = AsyncMock(side_effect=AssertionError("create_session must not run for code_block_ai_fallback"))
+    get_browser_state = AsyncMock(
+        side_effect=AssertionError("get_browser_state must not run for code_block_ai_fallback")
+    )
     mock_manager = SimpleNamespace(create_session=create_session, get_browser_state=get_browser_state)
     monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=mock_manager))
 
@@ -87,7 +90,7 @@ async def test_synthetic_session_unregisters_when_context_body_raises(
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=_FakeBrowserContext(),
         get_working_page=AsyncMock(return_value=MagicMock()),
     )
@@ -104,7 +107,7 @@ async def test_synthetic_session_unregisters_when_context_body_raises(
     monkeypatch.setattr(runtime, "unregister_copilot_session", unregister_mock)
 
     ctx = _make_ctx(
-        turn_origin=TurnOrigin.runtime_self_heal,
+        turn_origin=TurnOrigin.code_block_ai_fallback,
         injected_browser_state=fake_browser_state,
         heal_workflow_run_id="wr_777",
     )
@@ -126,12 +129,14 @@ async def test_self_heal_injected_state_assigns_synthetic_session_and_mcp_regist
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=_FakeBrowserContext(),
         get_working_page=AsyncMock(return_value=MagicMock()),
     )
     manager = SimpleNamespace(
-        get_browser_state=AsyncMock(side_effect=AssertionError("persistent lookup must not run for runtime_self_heal"))
+        get_browser_state=AsyncMock(
+            side_effect=AssertionError("persistent lookup must not run for code_block_ai_fallback")
+        )
     )
     monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
     monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
@@ -148,7 +153,7 @@ async def test_self_heal_injected_state_assigns_synthetic_session_and_mcp_regist
     workflow_run_id = "wr_123"
     expected_session_id = make_self_heal_session_id(workflow_run_id)
     ctx = _make_ctx(
-        turn_origin=TurnOrigin.runtime_self_heal,
+        turn_origin=TurnOrigin.code_block_ai_fallback,
         injected_browser_state=fake_browser_state,
         heal_workflow_run_id=workflow_run_id,
     )
@@ -191,7 +196,7 @@ async def test_self_heal_mcp_session_preserves_adopted_working_page_when_not_las
     fake_context = _FakeBrowserContext()
     fake_context.pages = [pinned_page, last_page]
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=fake_context,
         get_working_page=AsyncMock(return_value=pinned_page),
     )
@@ -207,7 +212,7 @@ async def test_self_heal_mcp_session_preserves_adopted_working_page_when_not_las
     monkeypatch.setattr(runtime, "unregister_copilot_session", MagicMock())
 
     ctx = _make_ctx(
-        turn_origin=TurnOrigin.runtime_self_heal,
+        turn_origin=TurnOrigin.code_block_ai_fallback,
         injected_browser_state=fake_browser_state,
         heal_workflow_run_id="wr_switch_tab",
     )
@@ -268,7 +273,7 @@ async def test_ensure_browser_session_interactive_still_auto_creates(monkeypatch
 @pytest.mark.parametrize(
     ("origin", "session_id"),
     [
-        pytest.param(TurnOrigin.runtime_self_heal, "selfheal:wr_123", id="runtime_self_heal_origin"),
+        pytest.param(TurnOrigin.code_block_ai_fallback, "selfheal:wr_123", id="code_block_ai_fallback_origin"),
         pytest.param(TurnOrigin.interactive, "selfheal:wr_123", id="selfheal_prefix_session"),
     ],
 )
@@ -279,7 +284,7 @@ async def test_resolve_browser_state_for_context_skips_persistent_lookup_for_sel
 ) -> None:
     import skyvern.forge.sdk.copilot.runtime as runtime
 
-    fake_browser_state = SimpleNamespace(
+    fake_browser_state = crash_free_browser_state(
         browser_context=_FakeBrowserContext(),
         get_working_page=AsyncMock(return_value=MagicMock()),
     )

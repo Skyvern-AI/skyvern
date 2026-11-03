@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
 
+import {
+  blockAttempts,
+  blockIdentity,
+  callRollup,
+  deriveActivityLog,
+  failedRowBlocks,
+  passedBlockCount,
+  summarizeFinishedTurn,
+} from "./copilotActivityLog";
 import capture from "./narrativeState.hydrationParity.fixture.json";
 import {
   ActivityEntry,
@@ -37,7 +46,103 @@ function replayLive(): TurnNarrativeState {
   );
 }
 
+// Everything a collapsed step line and the folded turn show.
+function logLines(
+  turn: TurnNarrativeState,
+  facts: TurnNarrativeState["turnFacts"],
+) {
+  const { rows } = deriveActivityLog(turn);
+  const fold = summarizeFinishedTurn(rows, facts);
+  const attempts = blockAttempts(turn);
+  return {
+    rows: rows.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      reason: row.reason,
+      rollup: callRollup(row.entries),
+      failed: failedRowBlocks(row).map((b) => b.workflowRunBlockId),
+      passed: passedBlockCount(row),
+      diff: row.codeDiffs.map((d) => [d.label, d.added, d.removed]),
+      attempts: row.blocks.map((b) => [
+        b.workflowRunBlockId,
+        b.workflowRunId,
+        attempts.get(blockIdentity(b))?.attempt,
+      ]),
+    })),
+    fold: {
+      ...fold,
+      stillFailing: fold.stillFailing.map((b) => b.workflowRunBlockId),
+    },
+  };
+}
+
+describe("activity log parity across hydration", () => {
+  it("renders the same step lines, failure pins and reasons live and after a reload", () => {
+    const hydrated = hydrateNarrativeFromPayload(persistedPayload)!;
+    const live = logLines(replayLive(), hydrated.turnFacts);
+
+    expect(logLines(hydrated, hydrated.turnFacts)).toEqual(live);
+    // The capture exercises each piece, so equality is not vacuous.
+    expect(live.rows.some((row) => row.failed.includes("wrb_first"))).toBe(
+      true,
+    );
+    // The capture's retried block ran but was not evaluated, so no row claims it passed.
+    expect(live.rows.some((row) => row.kind === "run")).toBe(true);
+    expect(live.rows.every((row) => row.passed === null)).toBe(true);
+    expect(live.rows.some((row) => row.reason !== null)).toBe(true);
+    expect(live.fold.failedTests).toBe(1);
+    expect(live.rows.flatMap((row) => row.attempts)).toEqual(
+      expect.arrayContaining([
+        ["wrb_first", "wr_first", 1],
+        ["wrb_retry", "wr_retry", 2],
+      ]),
+    );
+  });
+});
+
 describe("activity timestamp parity across hydration", () => {
+  it("preserves observed fail-edit-retry attempts across terminal replacement and hydration", () => {
+    const live = replayLive();
+    const hydrated = hydrateNarrativeFromPayload(persistedPayload)!;
+    const terminal = applyNarrativeEvent(live, {
+      type: "response",
+      workflow_copilot_chat_id: "chat-replay",
+      message: "done",
+      response_time: "2026-09-08T00:00:10Z",
+      proposal_disposition: "review_tested",
+      turn_id: "turn-replay",
+      narrative_payload: persistedPayload,
+    });
+
+    expect(live.draft?.blockCount).toBe(20);
+    expect(live.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_upstream",
+      "wrb_first",
+      "wrb_retry",
+    ]);
+    expect(live.blocks.map((block) => block.label)).toEqual([
+      "block_18",
+      "block_19",
+      "block_19",
+    ]);
+    // The failed run's completed upstream row keeps its own state, not the failure's verdict.
+    expect(live.blocks.map((block) => block.outcome)).toEqual([
+      undefined,
+      "not_demonstrated",
+      "not_evaluated",
+    ]);
+    expect(live.blocks[0]!.outcomeReason).toBeUndefined();
+    expect(live.blocks.map((block) => block.skippedBefore)).toEqual([
+      undefined,
+      undefined,
+      [{ label: "block_18", kind: "reused" }],
+    ]);
+    const rowFacts = (turn: TurnNarrativeState) =>
+      turn.blocks.map((b) => [b.outcome, b.outcomeReason, b.skippedBefore]);
+    expect(rowFacts(hydrated)).toEqual(rowFacts(live));
+    expect(terminal.blocks).toEqual(hydrated.blocks);
+  });
+
   it("stamps every persisted entry with the clock read its live update carried", () => {
     const live = replayLive();
     const hydrated = hydrateNarrativeFromPayload(persistedPayload);
@@ -53,6 +158,38 @@ describe("activity timestamp parity across hydration", () => {
     }
   });
 
+  it("rehydrates each run row's test input sources exactly as they streamed", () => {
+    const runRows = (turn: TurnNarrativeState) =>
+      turn.designActivity
+        .filter((entry) => entry.kind === "tool_result")
+        .map(({ id, workflowRunId, testInputs }) => ({
+          id,
+          workflowRunId,
+          testInputs,
+        }));
+    const live = runRows(replayLive());
+    expect(runRows(hydrateNarrativeFromPayload(persistedPayload)!)).toEqual(
+      live,
+    );
+    expect(live).toContainEqual({
+      id: "tr-run-first",
+      workflowRunId: "wr_first",
+      testInputs: undefined,
+    });
+    expect(live).toContainEqual({
+      id: "tr-call_test_end_to_end_turn-replay",
+      workflowRunId: "wr_button",
+      testInputs: [{ key: "login", source: "default", sourceRunId: undefined }],
+    });
+    expect(
+      live.find((row) => row.id === "tr-run-retry")?.testInputs,
+    ).toContainEqual({
+      key: "session_token",
+      source: "earlier_run",
+      sourceRunId: "wr_origin",
+    });
+  });
+
   it("renders the same grouped duration live and after a hydrated reload", () => {
     const liveDuration = groupedDuration(replayLive().designActivity);
     const hydratedDuration = groupedDuration(
@@ -62,7 +199,7 @@ describe("activity timestamp parity across hydration", () => {
     expect(hydratedDuration).toBe(liveDuration);
   });
 
-  it("hydrates a payload whose entries and blocks lack the new keys", () => {
+  it("hydrates legacy activity without inventing an evidence-free block", () => {
     const olderBackendPayload = {
       turnId: "turn-old",
       turnIndex: 0,
@@ -103,7 +240,7 @@ describe("activity timestamp parity across hydration", () => {
     expect(hydrated).not.toBeNull();
     expect(hydrated!.designActivity).toHaveLength(1);
     expect(hydrated!.designActivity[0]!.timestamp).toBeUndefined();
-    expect(hydrated!.blocks[0]!.workflowRunBlockId).toBe("");
+    expect(hydrated!.blocks).toEqual([]);
     expect(groupedDuration(hydrated!.designActivity)).toBeNull();
   });
 });

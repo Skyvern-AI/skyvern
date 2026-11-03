@@ -3,4 +3,5 @@
 export interface ClickContext {
     thought?: string;
     single_option_click?: boolean;
+    desired_state?: boolean;
 }

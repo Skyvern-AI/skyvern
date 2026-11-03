@@ -7,15 +7,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
-from skyvern.forge.sdk.routes import routers as routers_module
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.services import org_auth_service
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "org_oss"
 
@@ -38,6 +38,7 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMoc
     async def _fake_org() -> SimpleNamespace:
         return SimpleNamespace(organization_id=ORG_ID)
 
+    monkeypatch.setattr(forge_app.AGENT_FUNCTION, "credential_folders_restricted", AsyncMock(return_value=False))
     list_browser_profiles = AsyncMock()
     monkeypatch.setattr(
         forge_app.DATABASE.browser_sessions,
@@ -45,9 +46,8 @@ def _build_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMoc
         list_browser_profiles,
     )
 
-    fastapi_app = FastAPI()
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = _fake_org
-    fastapi_app.include_router(routers_module.base_router, prefix="/v1")
 
     @fastapi_app.exception_handler(SkyvernHTTPException)
     async def _handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
@@ -72,6 +72,7 @@ def test_list_browser_profiles_default_pagination(monkeypatch: pytest.MonkeyPatc
         page_size=10,
         search_key=None,
         managed=None,
+        exclude_search_profile_ids=set(),
     )
 
 
@@ -89,6 +90,7 @@ def test_list_browser_profiles_explicit_pagination(monkeypatch: pytest.MonkeyPat
         page_size=10,
         search_key=None,
         managed=None,
+        exclude_search_profile_ids=set(),
     )
 
 
@@ -124,6 +126,7 @@ def test_list_browser_profiles_alias_trailing_slash(monkeypatch: pytest.MonkeyPa
         page_size=5,
         search_key=None,
         managed=None,
+        exclude_search_profile_ids=set(),
     )
 
 
@@ -143,6 +146,7 @@ def test_list_browser_profiles_search_key_hit_on_name(monkeypatch: pytest.Monkey
         page_size=10,
         search_key="production",
         managed=None,
+        exclude_search_profile_ids=set(),
     )
 
 
@@ -162,6 +166,7 @@ def test_list_browser_profiles_search_key_hit_on_description(monkeypatch: pytest
         page_size=10,
         search_key="staging_login",
         managed=None,
+        exclude_search_profile_ids=set(),
     )
 
 
@@ -180,6 +185,7 @@ def test_list_browser_profiles_search_key_miss(monkeypatch: pytest.MonkeyPatch) 
         page_size=10,
         search_key="no_such_profile",
         managed=None,
+        exclude_search_profile_ids=set(),
     )
 
 
@@ -197,6 +203,7 @@ def test_list_browser_profiles_search_key_with_pagination(monkeypatch: pytest.Mo
         page_size=5,
         search_key="prod",
         managed=None,
+        exclude_search_profile_ids=set(),
     )
 
 
@@ -214,4 +221,5 @@ def test_list_browser_profiles_search_key_with_include_deleted(monkeypatch: pyte
         page_size=10,
         search_key="archived",
         managed=None,
+        exclude_search_profile_ids=set(),
     )

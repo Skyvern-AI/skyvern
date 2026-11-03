@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
 
 
 class FakeWorkflowRunContext:
@@ -33,8 +33,12 @@ class FakeWorkflowRunContext:
         self.workflow_id = "wf-id"
         self.workflow_permanent_id = "wf-perm-id"
         self.workflow_run_id = "wf-run-id"
+        self.organization_id: str | None = None
         self.browser_session_id: str | None = None
         self.workflow_run_outputs: dict[str, Any] = dict(workflow_run_outputs or {})
+        self.block_outcomes: dict[str, BlockOutcome] = {}
+        self.carried_block_labels: set[str] = set()
+        self.parameters: dict[str, Any] = {}
         self.workflow = None
 
     def get_block_metadata(self, label: str | None) -> dict[str, Any]:
@@ -54,11 +58,17 @@ class FakeWorkflowRunContext:
     def record_block_workflow_system_prompt(self, label: str, value: str | None) -> None:
         return None
 
+    def resolve_block_notes_section(self, label: str) -> str | None:
+        return None
+
     def has_value(self, key: str) -> bool:
         return key in self.values
 
     def set_value(self, key: str, value: Any) -> None:
         self.values[key] = value
+
+    async def cancel_failure_evidence_capture(self) -> None:
+        return None
 
     def build_workflow_run_summary(self) -> dict[str, Any]:
         return {}
@@ -71,5 +81,7 @@ class FakeWorkflowRunContext:
             return self.secrets[secret_id_or_value]
         return None
 
-    # Borrow the real implementation so scoping behavior cannot drift from production.
+    # Borrow the real implementations so scoping and outcome behavior cannot drift from production.
     credential_template_entries = WorkflowRunContext.credential_template_entries
+    record_block_outcome = WorkflowRunContext.record_block_outcome
+    get_block_outcome = WorkflowRunContext.get_block_outcome

@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { render, fireEvent, cleanup } from "@testing-library/react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { NarrativeView } from "./NarrativeView";
+import { describe, expect, it, vi } from "vitest";
 
-import { derivePhases } from "./copilotPhases";
 import {
   ActivityEntry,
   EMPTY_NARRATIVE,
@@ -11,7 +14,9 @@ import {
   hydrateHistoryNarrative,
   hydrateNarrativeFromPayload,
   mapBlockStatus,
+  terminalNarrativeText,
 } from "./narrativeState";
+
 import {
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
@@ -24,6 +29,100 @@ import {
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
+
+const testRun = vi.hoisted(() => ({
+  workflow_run_id: "wr_test",
+  status: "completed",
+  parameters: {
+    search_term: "copilot-value",
+    city: "page-value",
+    session_token: "reused-token",
+    region: "default-region",
+    notes: "",
+    login: "cred_saved_login",
+    backup_login: { username: "someone", password: "hunter2-secret" },
+  },
+  workflow: {
+    workflow_definition: {
+      parameters: [
+        {
+          parameter_type: "workflow",
+          key: "login",
+          workflow_parameter_type: "credential_id",
+        },
+        {
+          parameter_type: "workflow",
+          key: "backup_login",
+          workflow_parameter_type: "credential_id",
+        },
+      ],
+    },
+  },
+}));
+
+vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunByIdQuery: (workflowRunId: string | undefined) => ({
+    data: workflowRunId === testRun.workflow_run_id ? testRun : undefined,
+    isError: false,
+  }),
+}));
+
+describe("terminalNarrativeText — budget expiry", () => {
+  it("keeps authored drain text unchanged", () => {
+    const turn = {
+      ...EMPTY_NARRATIVE,
+      terminal: "response" as const,
+      narrativeSummary: "Earlier build activity.",
+      terminalMessage: "I saved the useful draft.",
+      budgetExpiry: {
+        budgetExpired: true as const,
+        source: "deadline" as const,
+        reportProduced: true,
+        stagedDraftId: "wf_draft",
+        drainFingerprint: "drain-1",
+        leftRunIds: [],
+      },
+    };
+    expect(terminalNarrativeText(turn)).toBe("I saved the useful draft.");
+  });
+
+  it.each([
+    [
+      "deadline",
+      null,
+      "This turn reached its time limit without producing a report.",
+    ],
+    [
+      "max_turns",
+      null,
+      "This turn reached its model-call limit without producing a report.",
+    ],
+    [
+      "max_turns",
+      "wf_draft",
+      "This turn reached its model-call limit without producing a report. A draft was staged during this session.",
+    ],
+  ] as const)(
+    "renders honest no-report status for %s with draft %s",
+    (source, stagedDraftId, expected) => {
+      const turn: TurnNarrativeState = {
+        ...EMPTY_NARRATIVE,
+        terminal: "error",
+        proposalDisposition: "no_proposal",
+        narrativeSummary: "Earlier build activity.",
+        budgetExpiry: {
+          budgetExpired: true,
+          source,
+          reportProduced: false,
+          stagedDraftId,
+          drainFingerprint: "drain-2",
+          leftRunIds: [],
+        },
+      };
+      expect(terminalNarrativeText(turn)).toBe(expected);
+    },
+  );
+});
 
 const turnStart = (
   overrides: Partial<WorkflowCopilotTurnStartUpdate> = {},
@@ -190,6 +289,45 @@ describe("applyNarrativeEvent — design phase", () => {
       blockLabels: ["block_one", "block_two"],
       summary: "two block workflow",
     });
+    expect(s.blocks).toEqual([]);
+  });
+
+  it.each([20, 100])(
+    "does not create chat rows from a %i-block workflow snapshot",
+    (count) => {
+      const blockLabels = Array.from(
+        { length: count },
+        (_, index) => `block_${String(index + 1).padStart(2, "0")}`,
+      );
+      const s = applyNarrativeEvent(
+        EMPTY_NARRATIVE,
+        workflowDraft({ block_count: count, block_labels: blockLabels }),
+      );
+
+      expect(s.draft?.blockLabels).toEqual(blockLabels);
+      expect(s.blocks).toEqual([]);
+    },
+  );
+
+  it("updates draft metadata without clearing or reordering observed attempts", () => {
+    let s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      blockProgress({
+        workflow_run_block_id: "wrb_first",
+        block_label: "first_attempt",
+        status: "failed",
+      }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      workflowDraft({ block_count: 1, block_labels: ["renamed_retry"] }),
+    );
+
+    expect(s.draft?.blockLabels).toEqual(["renamed_retry"]);
+    expect(s.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_first",
+    ]);
+    expect(s.blocks[0]?.state).toBe("failed");
   });
 
   it("shows a write's patch at write time, before its run reports back", () => {
@@ -312,6 +450,41 @@ describe("applyNarrativeEvent — block_progress", () => {
       state: "completed",
       lastSeenIteration: 2,
     });
+  });
+
+  it("appends full-run rows only as their execution events arrive", () => {
+    let s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      workflowDraft({
+        block_count: 3,
+        block_labels: ["block_one", "block_two", "block_three"],
+      }),
+    );
+    expect(s.blocks).toEqual([]);
+
+    const thirdCompleted = blockProgress({
+      workflow_run_block_id: "wrb_three",
+      block_label: "block_three",
+      status: "completed",
+    });
+    s = applyNarrativeEvent(s, thirdCompleted);
+    s = applyNarrativeEvent(s, thirdCompleted);
+    expect(s.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_three",
+    ]);
+
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({
+        workflow_run_block_id: "wrb_one",
+        block_label: "block_one",
+        status: "running",
+      }),
+    );
+    expect(s.blocks.map((block) => block.workflowRunBlockId)).toEqual([
+      "wrb_three",
+      "wrb_one",
+    ]);
   });
 
   it("keeps loop iterations as distinct rows when they share a block_label", () => {
@@ -653,12 +826,7 @@ describe("condenseActivityEntries", () => {
     expect(condensed.every((entry) => entry.attempts === undefined)).toBe(true);
   });
 
-  it("folds a retry across a narration sitting between two attempts (narration never breaks the fold)", () => {
-    // Array position can't reliably tell "narration between attempts" from
-    // "narration mid-flight during the retry itself" (see the regression
-    // pin below, where the same ordered shape arises from a genuinely
-    // different case) — so narration is never treated as a fold-breaking
-    // gap, full stop.
+  it("keeps standalone legacy text between failed and successful attempts", () => {
     const s = reduceEvents([
       toolCall({ tool_call_id: "c1", tool_name: "extract" }),
       toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
@@ -667,51 +835,13 @@ describe("condenseActivityEntries", () => {
       toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
     ]);
     const condensed = condenseActivityEntries(s.designActivity);
-    // Narration arrived before the merged (2nd-attempt) result, so the
-    // fold keeps that order — narration first, not stranded after a row
-    // whose content is chronologically later than it.
-    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
-    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
-  });
-
-  it("REGRESSION PIN: folds a retry when the narration fires mid-flight during the RETRY itself (Codex catch)", () => {
-    // Ordering fix (pass 1) puts this narration in the identical array
-    // position as narration genuinely between two attempts — attempt 1's
-    // clean result already sits before attempt 2's call, so the retry's
-    // own mid-flight narration lands right after it either way. Only a
-    // narration-agnostic fold (last TOOL row, not literal adjacency)
-    // survives this case.
-    const s = reduceEvents([
-      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
-      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
-      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
-      narration(),
-      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
+    expect(condensed.map((e) => e.kind)).toEqual([
+      "tool_result",
+      "narration",
+      "tool_result",
     ]);
-    const condensed = condenseActivityEntries(s.designActivity);
-    // The merge must not leave the (chronologically later) result parked
-    // at attempt 1's old position, ahead of narration that streamed
-    // before it arrived.
-    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
-    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
-  });
-
-  it("REGRESSION PIN: folds a retry even when the narration fires mid-flight, during the FIRST attempt (reviewer catch)", () => {
-    // The narrator can emit a progress narration while a call is still
-    // pending. Pairing (pass 1) then places attempt 1's result at attempt
-    // 1's call position, ahead of that narration — which used to make the
-    // narration look like it sat BETWEEN the two attempts and break the
-    // fold, even though nothing genuinely interrupted the retry.
-    const s = reduceEvents([
-      toolCall({ tool_call_id: "c1", tool_name: "extract" }),
-      narration(),
-      toolResult({ tool_call_id: "c1", tool_name: "extract", success: false }),
-      toolCall({ tool_call_id: "c2", tool_name: "extract" }),
-      toolResult({ tool_call_id: "c2", tool_name: "extract", success: true }),
-    ]);
-    const condensed = condenseActivityEntries(s.designActivity);
-    expect(condensed.map((e) => e.kind)).toEqual(["narration", "tool_result"]);
-    expect(condensed[1]).toMatchObject({ success: true, attempts: 2 });
+    expect(condensed[0]).toMatchObject({ success: false });
+    expect(condensed[2]).toMatchObject({ success: true });
   });
 
   it("does not fold two consecutive different-tool results", () => {
@@ -936,7 +1066,7 @@ describe("applyNarrativeEvent — terminal", () => {
 
     expect(s.terminal).toBe("response");
     expect(s.draft?.blockCount).toBe(2);
-    expect(s.blocks.map((b) => b.state)).toEqual(["drafted", "drafted"]);
+    expect(s.blocks).toEqual([]);
   });
 
   it("response closes design even when design_end was never emitted (CORR-3)", () => {
@@ -1040,6 +1170,48 @@ describe("hydrateNarrativeFromPayload — terminal adjudication fields", () => {
       }),
     );
     expect(turn?.responseKind).toBeNull();
+  });
+});
+
+describe("applyNarrativeEvent — screenshot", () => {
+  const frames = [
+    { artifactId: "a_1", capturedAt: "2026-06-10T07:23:00Z", toolCallId: "c1" },
+    { artifactId: "a_2", capturedAt: "2026-06-10T07:24:00Z", toolCallId: null },
+  ];
+
+  it("keeps the turn's frames in capture order live and after a reload, and ends on what the saved turn holds", () => {
+    let live = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
+    for (const frame of [frames[0]!, frames[1]!, frames[0]!]) {
+      live = applyNarrativeEvent(live, {
+        type: "screenshot",
+        artifact_id: frame.artifactId,
+        captured_at: frame.capturedAt,
+        tool_call_id: frame.toolCallId,
+      });
+    }
+    expect(live.screenshots).toEqual(frames);
+
+    const reloaded = hydrateNarrativeFromPayload(
+      reproClarifyPayload({
+        screenshots: [...frames, { artifactId: "a_3" }, "a_4", null],
+      }),
+    );
+    expect(reloaded?.screenshots).toEqual(live.screenshots);
+
+    const ended = applyNarrativeEvent(
+      live,
+      response({
+        narrative_payload: reproClarifyPayload({ screenshots: [frames[0]] }),
+      }),
+    );
+    expect(ended.turnId).toBe("turn-repro");
+    expect(ended.screenshots).toEqual([frames[0]]);
+
+    const endedWithoutFrames = applyNarrativeEvent(
+      live,
+      response({ narrative_payload: reproClarifyPayload() }),
+    );
+    expect(endedWithoutFrames.screenshots).toEqual([]);
   });
 });
 
@@ -1163,7 +1335,7 @@ describe("humanizeJudgeText", () => {
   });
 
   it("strips the instruction when the backend appends Evidence after it", () => {
-    // terminal_envelope.py appends " Evidence: <blocker_reason>" after the Reason sentence.
+    // Saved rows from before the terminal-envelope removal carry " Evidence: <reason>" after Reason.
     const withEvidence =
       "I could not confirm the goal was met. Reason: " +
       JUDGE_REASON +
@@ -1281,19 +1453,232 @@ describe("a real cancel's backend payload still renders neutrally", () => {
     expect(turn?.blocks[0]?.state).toBe("stopped");
   });
 
-  it("does not redden the rail for a run the user stopped", () => {
-    const turn = hydrateNarrativeFromPayload(cancelledPayload())!;
-    const phases = derivePhases(turn);
-    const byId = Object.fromEntries(phases.map((p) => [p.id, p.status]));
-    expect(byId.done).toBe("stopped");
-    expect(byId.test).toBe("stopped");
-  });
-
   it("keeps a genuine error turn's block failed when it was not cancelled", () => {
     const turn = hydrateNarrativeFromPayload({
       ...cancelledPayload(),
       cancelled: false,
     })!;
     expect(turn.blocks[0]?.state).toBe("failed");
+  });
+});
+
+describe("actor reason rendered projection", () => {
+  it("renders immutable distinct explanations above their actions live, settled and reopened", () => {
+    let turn: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "render-actor",
+      turnIndex: 0,
+      designStarted: true,
+    };
+    const reasons = ["Inspect the travel date", "Check the selected fare"];
+    for (const [index, id] of ["a", "b"].entries()) {
+      turn = applyNarrativeEvent(turn, {
+        type: "tool_call",
+        tool_name: "evaluate",
+        tool_call_id: id,
+        iteration: 0,
+        tool_input: {},
+        reason: reasons[index],
+        activity_bucket: { kind: "design" },
+        timestamp: `2026-01-01T00:00:0${index + 1}Z`,
+      });
+    }
+    const assertRendered = (state: TurnNarrativeState) => {
+      const view = render(createElement(NarrativeView, { turn: state }));
+      const fold = view.container.querySelector<HTMLButtonElement>(
+        "[data-activity-fold]",
+      );
+      if (fold) fireEvent.click(fold);
+      const html = view.container.innerHTML;
+      for (const [index, id] of ["a", "b"].entries()) {
+        const start = html.indexOf(`data-tool-call-id="${id}"`);
+        const next = html.indexOf('data-tool-call-id="', start + 1);
+        const owned = html.slice(start, next === -1 ? undefined : next);
+        expect(start).toBeGreaterThan(-1);
+        expect(owned).toContain(reasons[index]);
+        expect(owned).not.toContain(reasons[1 - index]);
+      }
+      cleanup();
+    };
+    assertRendered(turn);
+    for (const id of ["b", "a"])
+      turn = applyNarrativeEvent(turn, {
+        type: "tool_result",
+        tool_name: "evaluate",
+        tool_call_id: id,
+        iteration: 0,
+        success: id === "a",
+        summary: id === "a" ? "Read date" : "Fare unavailable",
+        timestamp: "2026-01-01T00:00:05Z",
+        reason: "This replacement must never be shown",
+        activity_bucket: { kind: "design" },
+      });
+    assertRendered(turn);
+    const payload = {
+      turnId: turn.turnId,
+      turnIndex: 0,
+      designActivity: turn.designActivity,
+      blocks: turn.blocks,
+      terminal: "response",
+      responseType: "REPLY",
+      responseKind: "answer",
+      terminalMessage: "Finished",
+      startedAt: null,
+      endedAt: "2026-01-01T00:00:06Z",
+    };
+    assertRendered(
+      applyNarrativeEvent(turn, {
+        type: "response",
+        workflow_copilot_chat_id: "chat_render",
+        proposal_disposition: "no_proposal",
+        message: "Finished",
+        response_time: "2026-01-01T00:00:06Z",
+        narrative_payload: payload,
+      }),
+    );
+    assertRendered(hydrateNarrativeFromPayload(payload)!);
+  });
+  it("keeps an explained run visible when its action renders as block cards", () => {
+    const turn: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      turnId: "run-cards",
+      turnIndex: 0,
+      designStarted: true,
+      designActivity: [
+        {
+          id: "tr-run",
+          kind: "tool_result",
+          toolName: "run_blocks_and_collect_debug",
+          iteration: 0,
+          text: "Test completed",
+          reason: "Test the booking before saving it",
+          success: true,
+          activityStartedAt: "2026-01-01T00:00:01Z",
+          timestamp: "2026-01-01T00:00:05Z",
+        },
+      ],
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_booking",
+          label: "booking",
+          blockType: "code",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-01-01T00:00:02Z",
+          endedAt: "2026-01-01T00:00:04Z",
+        },
+      ],
+    };
+    const html = renderToStaticMarkup(createElement(NarrativeView, { turn }));
+    expect(html).toContain("Test the booking before saving it");
+    expect(html).toContain("Booking");
+  });
+});
+
+describe("test run inputs under the run row", () => {
+  const runEntry: ActivityEntry = {
+    id: "tr-run",
+    kind: "tool_result",
+    toolName: "run_blocks_and_collect_debug",
+    iteration: 0,
+    text: "Test completed",
+    success: true,
+    activityStartedAt: "2026-01-01T00:00:01Z",
+    timestamp: "2026-01-01T00:00:05Z",
+    workflowRunId: "wr_test",
+    testInputs: [
+      { key: "search_term", source: "copilot" },
+      { key: "city", source: "page" },
+      { key: "session_token", source: "earlier_run", sourceRunId: "wr_origin" },
+      { key: "region", source: "default" },
+      { key: "notes", source: "placeholder" },
+      { key: "login", source: "copilot" },
+      { key: "backup_login", source: "copilot" },
+    ],
+  };
+  const turnWith = (
+    blocks: TurnNarrativeState["blocks"],
+  ): TurnNarrativeState => ({
+    ...EMPTY_NARRATIVE,
+    turnId: "run-inputs",
+    turnIndex: 0,
+    designStarted: true,
+    designActivity: [runEntry],
+    blocks,
+  });
+  const openInputs = (turn: TurnNarrativeState): string => {
+    const view = render(createElement(NarrativeView, { turn }));
+    const fold = view.container.querySelector<HTMLButtonElement>(
+      "[data-activity-fold]",
+    );
+    if (fold) fireEvent.click(fold);
+    fireEvent.click(view.getByRole("button", { name: "Test inputs (7)" }));
+    const html = view.container.innerHTML;
+    cleanup();
+    return html;
+  };
+
+  it.each([
+    ["a plain run row", []],
+    [
+      "a run row shown as block cards",
+      [
+        {
+          workflowRunBlockId: "wrb_search",
+          label: "search",
+          blockType: "code",
+          state: "completed" as const,
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: "2026-01-01T00:00:02Z",
+          endedAt: "2026-01-01T00:00:04Z",
+        },
+      ],
+    ],
+  ])("lists each value and where it came from on %s", (_name, blocks) => {
+    const html = openInputs(turnWith(blocks));
+    for (const text of [
+      "copilot-value",
+      "set by Copilot",
+      "page-value",
+      "from the page",
+      "reused-token",
+      'reused from run <a class="underline hover:text-foreground" href="/runs/wr_origin"',
+      "default-region",
+      "workflow default",
+      "left blank",
+      "cred_saved_login",
+      "hidden",
+    ]) {
+      expect(html).toContain(text);
+    }
+    expect(html).not.toContain("hunter2-secret");
+    expect(html).not.toContain("someone");
+  });
+
+  it("puts a failed run's inputs indented under its failure detail", () => {
+    const failedRun: ActivityEntry = {
+      ...runEntry,
+      success: false,
+      text: "The search block timed out.",
+    };
+    const view = render(
+      createElement(NarrativeView, {
+        turn: { ...turnWith([]), designActivity: [failedRun] },
+      }),
+    );
+    const fold = view.container.querySelector<HTMLButtonElement>(
+      "[data-activity-fold]",
+    );
+    if (fold) fireEvent.click(fold);
+    const html = view.container.innerHTML;
+    const disclosure = view.container.querySelector("[data-test-inputs]");
+    cleanup();
+    expect(disclosure?.classList.contains("ml-[18px]")).toBe(true);
+    expect(html.indexOf("The search block timed out.")).toBeGreaterThan(-1);
+    expect(html.indexOf("The search block timed out.")).toBeLessThan(
+      html.indexOf("data-test-inputs"),
+    );
   });
 });

@@ -12,6 +12,7 @@ from .ai_fallback_mode import AiFallbackMode
 from .branch_condition_yaml import BranchConditionYaml
 from .branch_criteria_yaml import BranchCriteriaYaml
 from .code_block_step_yaml import CodeBlockStepYaml
+from .code_block_yaml_data_schema import CodeBlockYamlDataSchema
 from .email_inbox_block_yaml_email_client import EmailInboxBlockYamlEmailClient
 from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
@@ -123,6 +124,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
     parameter_keys: typing.Optional[typing.List[str]] = None
     prompt: typing.Optional[str] = None
     steps: typing.Optional[typing.List[CodeBlockStepYaml]] = None
+    data_schema: typing.Optional[CodeBlockYamlDataSchema] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

@@ -27,7 +27,11 @@ from skyvern.webeye.actions.actions import (
     TelInputOutcome,
     TelInputStrategy,
 )
-from skyvern.webeye.actions.handler import ActionHandler, handle_input_text_action_direct
+from skyvern.webeye.actions.handler import (
+    ActionHandler,
+    _fill_secret_with_readback,
+    handle_input_text_action_direct,
+)
 from skyvern.webeye.actions.responses import ActionFailure, ActionSuccess
 from tests.unit.conftest import make_input_element_mock
 from tests.unit.helpers import make_organization, make_step, make_task
@@ -57,6 +61,7 @@ async def _run_input_text(
     blocker: MagicMock | None = None,
     input_or_select_context: InputOrSelectContext | None = None,
     current_value: str = "",
+    wrap_secret_readback: bool = False,
 ) -> tuple[list, AsyncMock, AsyncMock, AsyncMock, MagicMock, AsyncMock]:
     # Production always parses a real InputOrSelectContext (the parse never returns None), so default to an
     # ordinary all-unset context here -- a None default would exercise a branch that cannot occur in prod.
@@ -84,7 +89,9 @@ async def _run_input_text(
     )
     phone_format = AsyncMock(return_value=text)
     warning_log = MagicMock()
-    secret_readback = AsyncMock(return_value=None)
+    secret_readback = (
+        AsyncMock(wraps=_fill_secret_with_readback) if wrap_secret_readback else AsyncMock(return_value=None)
+    )
     # A resolved secret differs from the action's placeholder text; when equal, the value is not a secret.
     secret_return = text if resolved is None else resolved
 
@@ -513,6 +520,7 @@ async def test_ten_digit_tel_phone_uses_tel_readback_not_card_readback() -> None
         tag_name="input",
         expected_value="2245550199",
         allow_nanp_country_prefix=False,
+        dial_code_withheld=False,
         pattern=None,
         maxlength=None,
         engine_selection=None,
@@ -610,6 +618,7 @@ async def test_blocking_tel_input_rechecks_constraints_before_readback() -> None
         tag_name="input",
         expected_value="2245550199",
         allow_nanp_country_prefix=False,
+        dial_code_withheld=False,
         pattern="[0-9]{10}",
         maxlength="10",
         engine_selection=None,
@@ -634,6 +643,7 @@ async def test_secret_tel_value_uses_tel_verifier_not_secret_readback() -> None:
         tag_name="input",
         expected_value="2245550199",
         allow_nanp_country_prefix=False,
+        dial_code_withheld=False,
         pattern=None,
         maxlength=None,
         engine_selection=None,
@@ -714,6 +724,24 @@ async def test_non_contenteditable_custom_sink_url_keeps_sequential_fill() -> No
     el.input_sequentially.assert_awaited_once_with(text=url_value)
     el.input_fill.assert_not_awaited()
     el.refresh_locator_if_stale.assert_not_awaited()
+    secret_readback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_editing_host_child_without_attribute_uses_atomic_fill() -> None:
+    # Only the editing host carries the contenteditable attribute; a block inside it inherits editability and
+    # must take the same atomic path, or the per-character seam re-resolves its selector onto split blocks.
+    el = _mock_input({"type": None, "autocomplete": None, "name": None})
+    el.get_tag_name.return_value = "p"
+    el.is_content_editable = AsyncMock(return_value=True)
+    text = "first line\nsecond line\nthird line"
+
+    results, _, _, _, _, secret_readback = await _run_input_text(el, text, tag_name="p")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with(text)
+    el.refresh_locator_if_stale.assert_awaited_once()
+    el.input_sequentially.assert_not_awaited()
     secret_readback.assert_not_awaited()
 
 
@@ -838,6 +866,40 @@ async def test_totp_value_short_circuits_before_secret_readback() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "readback,succeeds",
+    [
+        ("123 456", True),  # the field groups the code for display
+        ("123-456", True),
+        ("654 321", False),  # reordered digits still fail closed
+        ("12 345", False),  # truncated code still fails closed
+        ("123a456", False),  # a non-separator character is not display grouping
+    ],
+)
+async def test_single_field_totp_readback_accepts_display_grouping(readback: str, succeeds: bool) -> None:
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "verification-code"})
+
+    with (
+        patch("skyvern.webeye.actions.handler.get_totp_secret_with_task", return_value="seed"),
+        patch("skyvern.webeye.actions.handler.generate_totp_value_from_secret", return_value="123456"),
+    ):
+        results, _, _, _, _, _ = await _run_input_text(
+            el,
+            "{{ totp }}",
+            resolved=str(BitwardenConstants.TOTP),
+            current_value=readback,
+            wrap_secret_readback=True,
+        )
+
+    assert len(results) == 1
+    assert results[0].success is succeeds
+    if succeeds:
+        el.input_sequentially.assert_not_awaited()
+    else:
+        assert results[0].exception_type == "SecretInputMismatch"
+
+
+@pytest.mark.asyncio
 async def test_ordinary_native_freetext_uses_atomic_fill() -> None:
     # SKY-13821 fill-first: an ordinary native input (non-secret, non-tel, no select context) is populated with
     # a single atomic fill instead of the per-character fill/type seam, so the caret race cannot reorder it.
@@ -877,6 +939,22 @@ async def test_atomic_fill_path_skips_truncation_heal() -> None:
     assert len(results) == 1 and isinstance(results[0], ActionSuccess)
     el.input_fill.assert_awaited_once_with("Ada Lovelace")
     heal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_atomic_fill_path_does_no_reorder_readback() -> None:
+    # An ordinary atomic-fill input is populated in one fill and never invokes the heal, so it pays no reorder
+    # (or prefix-loss) read-back. _observe_input_value is only reached from inside the heal, which is not called
+    # on the atomic-fill common path.
+    el = _mock_input({"type": "text", "autocomplete": None, "name": "full-name"})
+    observe = AsyncMock(return_value=(False, None))
+
+    with patch("skyvern.webeye.actions.handler._observe_input_value", new=observe):
+        results, *_ = await _run_input_text(el, "Ada Lovelace")
+
+    assert len(results) == 1 and isinstance(results[0], ActionSuccess)
+    el.input_fill.assert_awaited_once_with("Ada Lovelace")
+    observe.assert_not_awaited()  # no reorder (or prefix-loss) read-back on the atomic-fill common path
 
 
 @pytest.mark.asyncio

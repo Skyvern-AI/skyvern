@@ -12,10 +12,15 @@ from skyvern.forge.sdk.api.files import resolve_run_download_id, validate_local_
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.webeye.actions.actions import Action, KeypressAction
+from skyvern.webeye.actions.key_names import ENTER_KEY_ALIASES, normalize_key_name
 
 LOG = structlog.get_logger()
 
 _NATIVE_VALUE_SET_INPUT_TYPES = frozenset({"range", "date", "datetime-local", "month", "time", "week"})
+
+
+class UploadFileDownloadError(Exception):
+    pass
 
 
 async def _uses_native_value_set_fill(locator: Locator) -> bool:
@@ -31,34 +36,33 @@ async def download_file(
     file_url: str,
     action: dict[str, Any] | None = None,
     organization_id: str | None = None,
-) -> str | list[str]:
+) -> str:
     if file_url.startswith("/"):
         run_id = resolve_run_download_id(skyvern_context.current())
         try:
             return validate_local_file_path(file_url, run_id)
-        except PermissionError:
+        except PermissionError as exc:
             # Expected when the LLM/user supplies an absolute path outside the run's download
-            # directory. The containment guard is doing its job; the action fails cleanly rather
-            # than surfacing as an unhandled ERROR with a traceback.
+            # directory. The containment guard is doing its job; the caller turns this into an
+            # action failure.
             LOG.warning(
-                "Local file path is outside the allowed download directory, continuing without it",
+                "Local file path is outside the allowed download directory",
                 action=action,
                 file_url=file_url,
                 run_id=run_id,
             )
-            return []
+            raise UploadFileDownloadError("Local file path is outside the allowed download directory") from exc
 
     try:
         return await download_file_api(file_url, organization_id=organization_id)
-    except Exception:
-        # Fully self-recovering: the action proceeds without the file.
+    except Exception as exc:
         LOG.warning(
-            "Failed to download file, continuing without it",
+            "Failed to download file",
             action=action,
             file_url=file_url,
             exc_info=True,
         )
-        return []
+        raise UploadFileDownloadError("File download failed") from exc
 
 
 async def strategy_aware_input(
@@ -188,9 +192,6 @@ async def input_sequentially(locator: Locator, text: str, timeout: float = setti
     )
 
 
-ENTER_KEY_ALIASES = ("enter", "return")
-
-
 def keys_include_enter(keys: list[str]) -> bool:
     # "enter" and "return" both execute as the Enter key (see keypress() below).
     return any(key.lower() in ENTER_KEY_ALIASES for key in keys)
@@ -206,48 +207,7 @@ def should_stop_batch_after_dropdown_select(next_action: Action | None) -> bool:
 
 
 async def keypress(page: Page, keys: list[str], hold: bool = False, duration: float = 0, repeat: int = 1) -> None:
-    updated_keys = []
-    for key in keys:
-        key_lower_case = key.lower()
-        if key_lower_case in ENTER_KEY_ALIASES:
-            updated_keys.append("Enter")
-        elif key_lower_case == "space":
-            updated_keys.append(" ")
-        elif key_lower_case == "ctrl":
-            updated_keys.append("Control")
-        elif key_lower_case == "backspace":
-            updated_keys.append("Backspace")
-        elif key_lower_case == "pagedown":
-            updated_keys.append("PageDown")
-        elif key_lower_case == "pageup":
-            updated_keys.append("PageUp")
-        elif key_lower_case == "tab":
-            updated_keys.append("Tab")
-        elif key_lower_case == "shift":
-            updated_keys.append("Shift")
-        elif key_lower_case in ("arrowleft", "left"):
-            updated_keys.append("ArrowLeft")
-        elif key_lower_case in ("arrowright", "right"):
-            updated_keys.append("ArrowRight")
-        elif key_lower_case in ("arrowup", "up"):
-            updated_keys.append("ArrowUp")
-        elif key_lower_case in ("arrowdown", "down"):
-            updated_keys.append("ArrowDown")
-        elif key_lower_case == "home":
-            updated_keys.append("Home")
-        elif key_lower_case == "end":
-            updated_keys.append("End")
-        elif key_lower_case == "delete":
-            updated_keys.append("Delete")
-        elif key_lower_case == "esc":
-            updated_keys.append("Escape")
-        elif key_lower_case == "alt":
-            updated_keys.append("Alt")
-        elif key_lower_case.startswith("f") and key_lower_case[1:].isdigit():
-            # Handle function keys: f1 -> F1, f5 -> F5, etc.
-            updated_keys.append(key_lower_case.upper())
-        else:
-            updated_keys.append(key)
+    updated_keys = [normalize_key_name(key) for key in keys]
     keypress_str = "+".join(updated_keys)
     n = max(1, repeat)
     if hold:

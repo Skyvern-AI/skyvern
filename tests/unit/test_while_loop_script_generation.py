@@ -182,6 +182,7 @@ async def test_transform_whileloop_block_with_mocked_db() -> None:
         mock_get.return_value = mock_workflow_run_resp
         mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=mock_workflow)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[mock_while_run, mock_child])
+        mock_app.DATABASE.observer.workflow_run_has_block_on_engine = AsyncMock(return_value=False)
         mock_app.DATABASE.tasks.get_tasks_by_ids = AsyncMock(return_value=[mock_task])
         mock_app.DATABASE.tasks.get_tasks_actions = AsyncMock(return_value=[mock_action])
 

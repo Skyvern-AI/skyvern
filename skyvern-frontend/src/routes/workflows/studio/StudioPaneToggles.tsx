@@ -18,6 +18,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  COPILOT_ATTENTION_LABEL,
+  useCopilotHeaderStore,
+} from "@/store/useCopilotHeaderStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
@@ -92,6 +96,7 @@ export function StudioPaneToggles() {
     (s) => s.hasUnseenActivity,
   );
   const clearBrowserActivity = useStudioBrowserStore((s) => s.clearActivity);
+  const copilotAttention = useCopilotHeaderStore((s) => s.attention);
 
   const { runId, runStatus } = useStudioRunSignals();
   const labelsCollapsed = useLabelsCollapsed();
@@ -101,7 +106,7 @@ export function StudioPaneToggles() {
   // handler pushes ?wr= first; openPane then merges against the live URL, so
   // this materializes the run pane (overview) without dropping the new ?wr=.
   const onSelectRun = () => {
-    openPane("overview", { learn: true });
+    openPane("overview");
     setRunsSelectorOpen(false);
   };
 
@@ -109,7 +114,7 @@ export function StudioPaneToggles() {
     if (id === "browser" && !panes.includes("browser")) {
       clearBrowserActivity();
     }
-    togglePane(id, { learn: true });
+    togglePane(id);
   };
 
   const paneBlockedByDeletion = (id: StudioPaneId) =>
@@ -160,13 +165,14 @@ export function StudioPaneToggles() {
   return (
     <nav
       aria-label="Studio panes"
+      data-tour="studio-pane-toggles"
       className="flex shrink-0 items-center gap-1.5"
       onKeyDown={onKeyDown}
     >
       {STUDIO_PANE_IDS.map((id) => {
         const { icon: Icon } = STUDIO_PANE_META[id];
-        // The run pane's tab names the inspected run ("View Run: wr_…") so the
-        // run id reads from the top bar; railLabel falls back to "Past Runs".
+        // The top-bar run control names the inspected run; it falls back to
+        // "Past Runs" when there is no URL-addressed run.
         const label = railLabel(id, runId);
         const open = panes.includes(id);
         const blockedByDeletion = paneBlockedByDeletion(id);
@@ -174,12 +180,16 @@ export function StudioPaneToggles() {
         const disabled = blockedByDeletion;
         const showActivityDot =
           id === "browser" && hasUnseenBrowserActivity && !open;
+        // Shown even with the pane open: the request can still be off-screen behind other panes.
+        const awaiting = id === "copilot" ? copilotAttention : null;
         const showRunStatusDot = isRunControl && Boolean(runStatus);
         const ariaLabel = showActivityDot
           ? "Browser, new activity"
-          : isRunControl && runStatus
-            ? `${label}, ${runStatusLabel(runStatus)}`
-            : label;
+          : awaiting
+            ? `Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`
+            : isRunControl && runStatus
+              ? `${label}, ${runStatusLabel(runStatus)}`
+              : label;
         const iconAndDot = (
           <>
             <Icon className="size-3.5" aria-hidden />
@@ -192,6 +202,15 @@ export function StudioPaneToggles() {
               >
                 <span className="absolute inline-flex h-full w-full rounded-full bg-primary opacity-75 motion-safe:animate-ping" />
                 <span className="relative inline-flex size-2 rounded-full bg-primary" />
+              </span>
+            ) : awaiting ? (
+              <span
+                aria-hidden
+                title={`Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`}
+                className="absolute -right-0.5 -top-0.5 flex size-2"
+              >
+                <span className="absolute inline-flex h-full w-full rounded-full bg-amber-500 opacity-75 motion-safe:animate-ping" />
+                <span className="relative inline-flex size-2 rounded-full bg-amber-500" />
               </span>
             ) : showRunStatusDot && runStatus ? (
               <span

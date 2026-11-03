@@ -9,6 +9,7 @@ import {
   PANE_RESIZE_EPSILON_PX,
   paneRecenterViewport,
   relayoutDriftCorrection,
+  revealNodeViewport,
   START_ANCHOR_MARGIN_X_PX,
   START_ANCHOR_MIN_ZOOM,
   START_ANCHOR_TOP_PX,
@@ -413,6 +414,36 @@ describe("relayoutDriftCorrection", () => {
         xBefore: 0,
         xAfter: 0.4,
       }),
+    ).toBeNull();
+  });
+});
+
+describe("revealNodeViewport", () => {
+  const pane = { width: 800, height: 600 };
+
+  test("centers a node that fits the pane", () => {
+    const bounds = { x: 100, y: 300, width: 400, height: 200 };
+    const { x, y, zoom } = revealNodeViewport({ pane, bounds })!;
+    expect(zoom).toBe(1);
+    expect(bounds.x + bounds.width / 2 + x).toBeCloseTo(pane.width / 2);
+    expect(bounds.y + bounds.height / 2 + y).toBeCloseTo(pane.height / 2);
+  });
+
+  test("pins a node taller than the pane by its top so its header shows", () => {
+    const bounds = { x: 100, y: 2000, width: 400, height: 900 };
+    const { y } = revealNodeViewport({ pane, bounds })!;
+    const top = bounds.y + y;
+    expect(top).toBeGreaterThan(0);
+    expect(top).toBeLessThan(pane.height / 4);
+  });
+
+  test("degenerate panes and empty nodes return null", () => {
+    const bounds = { x: 0, y: 0, width: 400, height: 200 };
+    expect(
+      revealNodeViewport({ pane: { width: 0, height: 0 }, bounds }),
+    ).toBeNull();
+    expect(
+      revealNodeViewport({ pane, bounds: { ...bounds, width: 0, height: 0 } }),
     ).toBeNull();
   });
 });

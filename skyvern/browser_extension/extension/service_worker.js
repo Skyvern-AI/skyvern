@@ -1,6 +1,14 @@
 import { BridgeConnection } from "./bridge_connection.js";
-import { DebuggerRouter } from "./debugger_router.js";
-import { evaluateDom } from "./dom_router.js";
+import {
+  DebuggerRouter,
+  FOREIGN_FRAME_RECOVERY_LIMITS,
+} from "./debugger_router.js";
+import {
+  authorizeDomFill,
+  evaluateDom,
+  fillDomInput,
+  revokeDomFills,
+} from "./dom_router.js";
 import {
   ERROR_CODES,
   EVENTS,
@@ -9,6 +17,7 @@ import {
   ProtocolError,
   requireArgs,
 } from "./protocol.js";
+import { IndicatorState } from "./indicator_state.js";
 import { TabScope } from "./tab_scope.js";
 
 const PENDING_PAIRING_STORAGE_KEY = "pendingPairingOffer";
@@ -24,6 +33,38 @@ let lastResetEpoch = null;
 let lastResetGeneration = -1;
 let lastResetOk = null;
 
+const sendIndicatorMessage = (tabId, message) =>
+  chrome.tabs.sendMessage(tabId, message, { frameId: 0 });
+
+async function removeForeignFrames(tabId) {
+  let timeout;
+  try {
+    const reply = await Promise.race([
+      sendIndicatorMessage(tabId, {
+        type: "skyvern.foreignFrames.remove",
+        expiresAt: Date.now() + FOREIGN_FRAME_RECOVERY_LIMITS.removalExpiryMs,
+      }),
+      new Promise((resolve) => {
+        timeout = setTimeout(
+          () => resolve(null),
+          FOREIGN_FRAME_RECOVERY_LIMITS.removalTimeoutMs,
+        );
+      }),
+    ]);
+    return Number.isInteger(reply?.removed) && reply.removed >= 0
+      ? reply.removed
+      : 0;
+  } catch {
+    return 0;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+const indicator = new IndicatorState({
+  sendMessage: sendIndicatorMessage,
+  getCaptureTokens: (tabId) => debuggerRouter.getCaptureTokens(tabId),
+});
+
 const bridge = new BridgeConnection({
   onRequest: (op, args) => dispatchRequest(op, args),
   onAuthenticated: async () => {
@@ -31,26 +72,41 @@ const bridge = new BridgeConnection({
     resendPendingPairingApprovals();
   },
   onReset: (epoch, generation) => enqueueReset(epoch, generation),
+  onTransportLost: () => debuggerRouter?.handleTransportLoss(),
   onEvent: (event, params) => handleBrokerEvent(event, params),
-  onStateChange: () => updateActionState(),
+  onStateChange: (state) => {
+    if (state.connected) debuggerRouter?.handleTransportConnected();
+    indicator.setConnected(state.connected);
+    void updateActionState();
+  },
 });
 
 const tabScope = new TabScope({
+  onScopeChange: (tabId, scoped) => indicator.onScopeChange(tabId, scoped),
   sendEvent: (event, params) => bridge.sendEvent(event, params),
 });
 
 debuggerRouter = new DebuggerRouter({
+  isIndicatorVisible: (tabId) => indicator.isVisible(tabId),
+  sendIndicatorMessage,
+  removeForeignFrames,
+  isTransportConnected: () =>
+    bridge.getStatus().connected &&
+    bridge.socket?.readyState === WebSocket.OPEN,
+  getTransportGeneration: () => bridge.getTransportGeneration(),
   tabScope,
   sendEvent: (event, params) => bridge.sendEvent(event, params),
   onAttachedChange: () => updateActionState(),
 });
 tabScope.setDebuggerRouter(debuggerRouter);
+chrome.debugger.onDetach.addListener((source) => revokeDomFills(source.tabId));
 
 const handlers = new Map([
   [OPS.DEBUGGER_ATTACH, (args) => debuggerRouter.attach(args)],
   [OPS.DEBUGGER_DETACH, (args) => debuggerRouter.detach(args)],
   [OPS.DEBUGGER_SEND, (args) => debuggerRouter.send(args)],
   [OPS.DOM_EVALUATE, (args) => evaluateDom(tabScope, args)],
+  [OPS.DOM_FILL, (args) => fillDomInput(tabScope, args)],
   [OPS.TABS_CREATE, (args) => tabScope.create(args)],
   [OPS.TABS_REMOVE, (args) => tabScope.remove(args)],
   [OPS.TABS_ACTIVATE, (args) => tabScope.activate(args)],
@@ -161,6 +217,7 @@ function approveBrokerClient(approvalNonce) {
 }
 
 function enqueueReset(epoch, generation) {
+  const finishRelease = debuggerRouter.beginReleaseAll();
   const reset = resetQueue
     .catch(() => undefined)
     .then(async () => {
@@ -189,7 +246,8 @@ function enqueueReset(epoch, generation) {
       } finally {
         tabScope.finishReset();
       }
-    });
+    })
+    .finally(finishRelease);
   resetQueue = reset;
   return reset;
 }
@@ -424,10 +482,18 @@ initialized.catch((error) =>
   console.error("Skyvern bridge initialization failed", error),
 );
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "skyvern.indicator.query") {
+    sendResponse(indicator.query(sender));
+    return false;
+  }
   void initialized
     .catch(() => undefined)
-    .then(() => handlePopupMessage(message))
+    .then(() =>
+      message?.type === "skyvern.formFillAuthorize"
+        ? authorizeDomFill(tabScope, message, sender)
+        : handlePopupMessage(message),
+    )
     .then((result) => sendResponse({ ok: true, result }))
     .catch((error) => {
       const code =

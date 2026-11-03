@@ -82,7 +82,6 @@ beforeEach(() => {
   mocks.user = "user-test";
 });
 it.each([
-  [false, "org-test", "user-test"],
   [undefined, "org-test", "user-test"],
   [true, undefined, "user-test"],
   [true, "org-test", undefined],
@@ -97,26 +96,11 @@ it.each([
   expect(mocks.get).not.toHaveBeenCalled();
 });
 it.each([
-  [validPayload(), "active"],
-  [{ ...validPayload(), version: "onboarding_progress_v0" }, null],
-])("parses valid V1 and hides malformed versions", async (data, expected) => {
-  mocks.flags = {
-    [ONBOARDING_TRACK_FLAG]: true,
-    [ONBOARDING_PROGRESS_FLAG]: true,
-  };
-  mocks.org = "org-test";
-  mocks.user = "user-test";
-  mocks.get.mockResolvedValue({ data });
-  const { result } = renderProgress();
-  await waitFor(() => expect(mocks.get).toHaveBeenCalled());
-  await waitFor(() =>
-    expect(result.current.progress?.state ?? null).toBe(expected),
-  );
-});
-it.each([
-  ["track", true, false],
-  ["progress", false, true],
-])("GETs under the %s flag alone", async (_, trackFlag, progressFlag) => {
+  ["track-only", true, false],
+  ["progress-only", false, true],
+  ["both", true, true],
+  ["neither", false, false],
+])("gates progress under %s flags", async (_, trackFlag, progressFlag) => {
   mocks.flags = {
     [ONBOARDING_TRACK_FLAG]: trackFlag,
     [ONBOARDING_PROGRESS_FLAG]: progressFlag,
@@ -125,21 +109,16 @@ it.each([
 
   const { result } = renderProgress();
 
-  await waitFor(() => expect(mocks.get).toHaveBeenCalledOnce());
-  await waitFor(() => expect(result.current.status).toBe("ready"));
+  if (trackFlag || progressFlag) {
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    expect(mocks.get).toHaveBeenCalledOnce();
+    expect(result.current.progress).toEqual(validPayload());
+  } else {
+    expect(mocks.get).not.toHaveBeenCalled();
+    expect(result.current.status).toBe("disabled");
+  }
   expect(mocks.useFeatureFlag).toHaveBeenCalledWith(ONBOARDING_TRACK_FLAG);
   expect(mocks.useFeatureFlag).toHaveBeenCalledWith(ONBOARDING_PROGRESS_FLAG);
-});
-it("reports disabled when both onboarding flags are off", () => {
-  mocks.flags = {
-    [ONBOARDING_TRACK_FLAG]: false,
-    [ONBOARDING_PROGRESS_FLAG]: false,
-  };
-
-  const { result } = renderProgress();
-
-  expect(mocks.get).not.toHaveBeenCalled();
-  expect(result.current.status).toBe("disabled");
 });
 it("reports loading with null progress until the GET resolves, then ready", async () => {
   const pending = deferred<{ data: unknown }>();
@@ -164,6 +143,14 @@ it("reports an error with null progress after a 404", async () => {
   await waitFor(() => expect(result.current.status).toBe("error"));
   expect(result.current.progress).toBeNull();
 });
+it("reports an error with null progress when the first payload is malformed", async () => {
+  mocks.get.mockResolvedValueOnce({ data: { version: "nope" } });
+
+  const { result } = renderProgress();
+
+  await waitFor(() => expect(result.current.status).toBe("error"));
+  expect(result.current.progress).toBeNull();
+});
 it("keeps the last progress when a refetch fails", async () => {
   mocks.get
     .mockResolvedValueOnce({ data: validPayload() })
@@ -174,6 +161,24 @@ it("keeps the last progress when a refetch fails", async () => {
 
   await act(async () => {
     await result.current.refetch();
+  });
+
+  expect(mocks.get).toHaveBeenCalledTimes(2);
+  expect(result.current.status).toBe("ready");
+  expect(result.current.progress).toEqual(validPayload());
+});
+it("keeps the last progress when a refetch returns a malformed payload", async () => {
+  mocks.get
+    .mockResolvedValueOnce({ data: validPayload() })
+    .mockResolvedValueOnce({ data: { version: "nope" } });
+
+  const { result } = renderProgress();
+  await waitFor(() => expect(result.current.status).toBe("ready"));
+
+  await act(async () => {
+    const refetched = await result.current.refetch();
+    expect(refetched.isError).toBe(true);
+    expect(refetched.data).toEqual(validPayload());
   });
 
   expect(mocks.get).toHaveBeenCalledTimes(2);
@@ -336,8 +341,7 @@ it.each([
       ],
     },
   });
-  const { client } = renderProgress();
-  await waitFor(() =>
-    expect(client.getQueryCache().findAll()[0]?.state.data).toBeNull(),
-  );
+  const { result } = renderProgress();
+  await waitFor(() => expect(result.current.status).toBe("error"));
+  expect(result.current.progress).toBeNull();
 });

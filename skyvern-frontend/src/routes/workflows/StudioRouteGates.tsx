@@ -1,44 +1,27 @@
 import { Navigate, useLocation, useParams } from "react-router-dom";
 
-import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-
-import { DebugToBuildRedirect } from "./DebugToBuildRedirect";
 import { LegacyBuildRedirect } from "./LegacyBuildRedirect";
-import { Debugger } from "./debugger/Debugger";
 import { WorkflowEditor } from "./editor/WorkflowEditor";
+import { toReadableSearch } from "./studio/panes";
 
-/**
- * /build (and block-build) routes. With the studio preview on, these redirect
- * into the editor; off, they render the legacy Debugger.
- */
 export function BuildRoute() {
-  const studioEnabled = useWorkflowStudioEnabled();
-  return studioEnabled ? <LegacyBuildRedirect /> : <Debugger />;
+  return <LegacyBuildRedirect />;
 }
 
-/**
- * /debug (and block-debug) routes. With the studio preview on, these redirect
- * into the editor; off, they fall back to the legacy debug→build redirect.
- */
 export function DebugRoute() {
-  const studioEnabled = useWorkflowStudioEnabled();
-  return studioEnabled ? <LegacyBuildRedirect /> : <DebugToBuildRedirect />;
+  return <LegacyBuildRedirect />;
 }
 
-/**
- * /studio — the studio shell when the preview is on; off, bounce to the legacy
- * /edit editor so a shared studio link never strands a non-flagged user.
- */
 export function StudioRoute() {
-  const studioEnabled = useWorkflowStudioEnabled();
+  return <WorkflowEditor />;
+}
+
+export function EditRoute() {
   const { workflowPermanentId } = useParams();
   const location = useLocation();
-  if (studioEnabled) {
-    return <WorkflowEditor />;
-  }
   return (
     <Navigate
-      to={`/agents/${workflowPermanentId}/edit${location.search}`}
+      to={`/agents/${workflowPermanentId}/studio${location.search}`}
       state={location.state}
       replace
     />
@@ -46,21 +29,48 @@ export function StudioRoute() {
 }
 
 /**
- * /edit — the legacy editor when the preview is off; on, the studio lives at
- * /studio, so redirect there (preserving query + state) for old links.
+ * Legacy per-agent run URLs now land on the short run URL, where workflow runs
+ * render inside the studio.
  */
-export function EditRoute() {
-  const studioEnabled = useWorkflowStudioEnabled();
-  const { workflowPermanentId } = useParams();
+export function WorkflowRunRoute() {
+  const params = useParams();
+  const workflowRunId = params.workflowRunId;
   const location = useLocation();
-  if (studioEnabled) {
-    return (
-      <Navigate
-        to={`/agents/${workflowPermanentId}/studio${location.search}`}
-        state={location.state}
-        replace
-      />
-    );
+
+  if (!workflowRunId) {
+    return <Navigate to="/runs" replace />;
   }
-  return <WorkflowEditor />;
+
+  const legacySubview = params["*"]?.split("/")[0] || undefined;
+  const studioView = legacySubview
+    ? {
+        overview: "timeline",
+        blocks: "timeline",
+        output: "outputs",
+        parameters: "inputs",
+        recording: "recording",
+        code: "code",
+      }[legacySubview]
+    : undefined;
+  const searchParams = new URLSearchParams(location.search);
+  const routedStudioView =
+    searchParams.has("active") &&
+    (studioView === "outputs" || studioView === "inputs")
+      ? "timeline"
+      : studioView;
+  if (routedStudioView) {
+    searchParams.set("view", routedStudioView);
+  }
+
+  return (
+    <Navigate
+      to={{
+        pathname: `/runs/${encodeURIComponent(workflowRunId)}`,
+        search: toReadableSearch(searchParams),
+        hash: location.hash,
+      }}
+      state={location.state}
+      replace
+    />
+  );
 }

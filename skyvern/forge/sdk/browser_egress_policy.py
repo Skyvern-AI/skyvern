@@ -39,6 +39,14 @@ BLOCKED_HOST_SUFFIXES: tuple[str, ...] = (
 
 _BROWSER_EGRESS_ENROLLED_ATTR = "_skyvern_browser_egress_enrolled"
 
+# A resolution failure is a refusal, not an allowance. The browser resolves the hostname itself
+# (split-horizon DNS, or a proxy handed the name over HTTP CONNECT / SOCKS remote DNS), so a name
+# the worker cannot resolve can still reach an internal address from the browser's network; under a
+# two-valued contract an unchecked destination would be indistinguishable from a verified public
+# one. Callers that report a destination to the browser match on this to answer with the resolver's
+# verdict instead of a policy block.
+UNRESOLVED_DESTINATION_REASON = "blocked egress: the worker could not resolve the destination"
+
 
 class DestinationBlockedError(ValueError):
     """A destination is malformed or violates browser egress policy."""
@@ -77,9 +85,9 @@ def normalize_host(host: str) -> str:
 def to_ascii_host(host: str) -> str:
     """IDNA/UTS-46 ToASCII so a Unicode hostname resolves the way the browser does.
 
-    Without this, ``getaddrinfo`` on a raw Unicode IDN host fails and hits the
-    resolve fail-open, while the browser IDNA-encodes and can still reach an
-    internal A-record. Falls back to the input when encoding is not applicable.
+    Without this, ``getaddrinfo`` on a raw Unicode IDN host fails and the destination is refused
+    unresolvable, while the browser IDNA-encodes it and reaches a real A-record. Falls back to the
+    input when encoding is not applicable.
     """
     try:
         return host.encode("idna").decode("ascii")
@@ -120,7 +128,8 @@ def _parse_whatwg_ipv4(host: str) -> ipaddress.IPv4Address | None:
 
     The WHATWG URL parser accepts hex (0xa9fea9fe), octal (0251.0376.0251.0376),
     plain-integer (2852039166), and shortened dotted (169.254.43518) hosts as IPv4;
-    without this they would fall through to the DNS check and its fail-open.
+    without this they would fall through to the DNS check and be refused as unresolvable
+    rather than named as the internal address they are.
     """
     parts = host.split(".")
     if not 1 <= len(parts) <= 4:
@@ -152,6 +161,23 @@ def _ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
+def _locally_allowed_hosts() -> frozenset[str]:
+    """Hosts the operator named in ALLOWED_HOSTS, honoured only on a developer checkout.
+
+    The SSRF host guard already exempts these, and without the same exemption here brokered code
+    cannot reach a host-local fixture: the refusal surfaces to a code block as a bare
+    ERR_ADDRESS_UNREACHABLE. Empty for cloud and packaged deployments, and empty by default.
+    """
+    # Imported here rather than at module scope: this is a leaf policy module and agent_functions
+    # reaches back through it.
+    from skyvern.config import settings
+    from skyvern.forge.agent_functions import running_in_packaged_deployment
+
+    if settings.is_cloud_environment() or running_in_packaged_deployment():
+        return frozenset()
+    return frozenset(host.lower().rstrip(".") for host in settings.ALLOWED_HOSTS if host)
+
+
 def resolve_public_destination(url: str) -> ResolvedDestination | None:
     """Resolve one browser destination and reject every unusable or non-public peer."""
     # urlsplit matches the WHATWG parser's whitespace handling (strips C0/space,
@@ -173,7 +199,7 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
     except ValueError as exc:
         raise DestinationBlockedError("blocked egress: malformed host or port") from exc
     if not raw_host:
-        raise DestinationBlockedError("blocked egress: URL has no host")
+        raise DestinationBlockedError(f"blocked egress: URL has no host ({url!r})")
     if port is None:
         port = _DEFAULT_PORTS.get(scheme)
     if port is None or not 1 <= port <= 65535:
@@ -181,7 +207,9 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
 
     host = normalize_host(raw_host)
     if not host:
-        raise DestinationBlockedError("blocked egress: URL has no host")
+        raise DestinationBlockedError(f"blocked egress: URL has no host ({url!r})")
+
+    allowed_locally = host.lower().rstrip(".") in _locally_allowed_hosts()
 
     literal_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
     try:
@@ -189,12 +217,14 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
     except ValueError:
         literal_ip = _parse_whatwg_ipv4(host)
     if literal_ip is not None:
-        if not _ip_is_public(literal_ip):
+        if not allowed_locally and not _ip_is_public(literal_ip):
             raise DestinationBlockedError(f"blocked egress to internal address {raw_host}")
         return ResolvedDestination(host, port, (str(literal_ip),))
 
     normalized_host = to_ascii_host(host).lower()
-    if normalized_host in BLOCKED_HOST_NAMES or normalized_host.endswith(BLOCKED_HOST_SUFFIXES):
+    if not allowed_locally and (
+        normalized_host in BLOCKED_HOST_NAMES or normalized_host.endswith(BLOCKED_HOST_SUFFIXES)
+    ):
         raise DestinationBlockedError(f"blocked egress to internal hostname {raw_host}")
 
     try:
@@ -208,7 +238,7 @@ def resolve_public_destination(url: str) -> ResolvedDestination | None:
             resolved_ip = ipaddress.ip_address(address)
         except ValueError:
             continue
-        if not _ip_is_public(resolved_ip):
+        if not allowed_locally and not _ip_is_public(resolved_ip):
             raise DestinationBlockedError(f"blocked egress to internal hostname {host} (resolved {address})")
         numeric_address = str(resolved_ip)
         if numeric_address not in addresses:
@@ -254,13 +284,13 @@ async def resolve_public_destination_async(url: str, *, timeout_seconds: float) 
 
 
 def classify_url(url: str) -> str | None:
-    """Return a block reason for an internal destination, or None if allowed."""
+    """Return a block reason for an internal or unverifiable destination, or None if allowed."""
     try:
         resolve_public_destination(url)
     except DestinationBlockedError as exc:
         return str(exc)
     except DestinationResolutionError:
-        return None
+        return UNRESOLVED_DESTINATION_REASON
     return None
 
 

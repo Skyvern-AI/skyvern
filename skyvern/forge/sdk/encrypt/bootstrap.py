@@ -1,4 +1,4 @@
-"""Registers the AES encrypt method from deployment settings.
+"""Registers the AES-CBC and AES-GCM encrypt methods from deployment settings.
 
 Shared by the open-source forge app and the cloud bootstrap so both apply the same
 fail-closed rules to the configured key material.
@@ -12,6 +12,7 @@ from collections.abc import Iterable
 
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.aes import AES
+from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
 
 PLACEHOLDER_SECRET_KEY = "fillmein"
 
@@ -23,6 +24,14 @@ _IV_DERIVATION_LABEL = "skyvern.encryptor.aes.iv.v1"
 
 def _derive_from_secret_key(secret_key: str, label: str) -> str:
     return hmac.new(secret_key.encode("utf-8"), label.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _require_real_secret_key(secret_key: str) -> None:
+    if not secret_key or secret_key == PLACEHOLDER_SECRET_KEY:
+        raise RuntimeError(
+            "ENABLE_ENCRYPTION=true requires ENCRYPTOR_AES_SECRET_KEY to be set to a real "
+            "secret; empty values and the default placeholder 'fillmein' both fail closed."
+        )
 
 
 def create_aes_encryptor(
@@ -40,11 +49,7 @@ def create_aes_encryptor(
     fallback and fails closed: encrypting under a public default is worse than
     ENABLE_ENCRYPTION=false because operators believe the data is protected.
     """
-    if not secret_key or secret_key == PLACEHOLDER_SECRET_KEY:
-        raise RuntimeError(
-            "ENABLE_ENCRYPTION=true requires ENCRYPTOR_AES_SECRET_KEY to be set to a real "
-            "secret; empty values and the default placeholder 'fillmein' both fail closed."
-        )
+    _require_real_secret_key(secret_key)
     fallback_parameters = list(fallback_decrypt_keys or ())
     if not (salt and iv):
         # Legacy ciphertext has no version marker, so retry the pre-derivation parameters on decrypt.
@@ -54,6 +59,14 @@ def create_aes_encryptor(
         salt=salt or _derive_from_secret_key(secret_key, _SALT_DERIVATION_LABEL),
         iv=iv or _derive_from_secret_key(secret_key, _IV_DERIVATION_LABEL),
         fallback_decrypt_keys=fallback_parameters,
+    )
+
+
+def create_aes_gcm_encryptor(*, secret_key: str, salt: str | None = None) -> AESGCMEncryptor:
+    _require_real_secret_key(secret_key)
+    return AESGCMEncryptor(
+        secret_key=secret_key,
+        salt=salt or _derive_from_secret_key(secret_key, _SALT_DERIVATION_LABEL),
     )
 
 
@@ -72,3 +85,4 @@ def register_aes_encryptor(
             fallback_decrypt_keys=fallback_decrypt_keys,
         )
     )
+    encryptor.add_encrypt_method(create_aes_gcm_encryptor(secret_key=secret_key, salt=salt))

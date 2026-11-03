@@ -75,7 +75,7 @@ _BANNED_BLOCK_YAML = _yaml(
     title: Registry lookup
     workflow_definition:
       blocks:
-      - block_type: task
+      - block_type: task_v2
         label: do_the_thing
         prompt: Find the widget
     """
@@ -231,7 +231,7 @@ def test_tool_input_guardrail_allows_a_non_credential_verdict(monkeypatch: pytes
     monkeypatch.setattr(
         guardrails_module,
         "evaluate_output_policy",
-        lambda **_k: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.WORKFLOW_YAML_IN_REPLY]),
+        lambda **_k: OutputPolicyVerdict(reason_codes=[OutputPolicyReason.PERSISTENCE_STATE_MISMATCH]),
     )
 
     output = _workflow_yaml_output_policy_guardrail(SimpleNamespace(context=tool_context))  # type: ignore[arg-type]

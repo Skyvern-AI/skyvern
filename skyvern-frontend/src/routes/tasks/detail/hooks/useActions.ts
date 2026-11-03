@@ -8,6 +8,10 @@ import {
   TaskApiResponse,
 } from "@/api/types";
 import { isActionSuccess } from "@/routes/workflows/components/actionStatus";
+import {
+  getActionInputValue,
+  getActionSummary,
+} from "@/routes/workflows/workflowBlockUtils";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { statusIsNotFinalized } from "../../types";
@@ -63,7 +67,10 @@ function useActions({ id }: Props): {
   const { data: taskActions, isLoading: taskActionsIsLoading } = useQuery<
     Array<ActionsApiResponse>
   >({
-    queryKey: ["tasks", id, "actions"],
+    // The task's status is part of the answer: the poll is cancelled the instant the task query
+    // ticks to a terminal status, and the reader stays mounted through that, so without the status
+    // in the key the final actions the task wrote as it finished are never re-read.
+    queryKey: ["tasks", id, "actions", task?.status],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client
@@ -78,7 +85,7 @@ function useActions({ id }: Props): {
   const { data: steps, isLoading: stepsIsLoading } = useQuery<
     Array<StepApiResponse>
   >({
-    queryKey: ["task", id, "steps"],
+    queryKey: ["task", id, "steps", task?.status],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       return client.get(`/tasks/${id}/steps`).then((response) => response.data);
@@ -102,7 +109,7 @@ function useActions({ id }: Props): {
                 return null;
               }
               return {
-                reasoning: action.reasoning,
+                summary: getActionSummary(action),
                 confidence: action.confidence_float,
                 input: getActionInput(action),
                 type: action.action_type,
@@ -122,9 +129,9 @@ function useActions({ id }: Props): {
           .flat()
       : taskActions?.map((action, index) => {
           return {
-            reasoning: action.reasoning ?? "",
+            summary: getActionSummary(action),
             confidence: action.confidence_float ?? undefined,
-            input: action.response ?? "",
+            input: getActionInputValue(action) ?? "",
             type: action.action_type,
             success: isActionSuccess(action),
             stepId: action.step_id ?? "",

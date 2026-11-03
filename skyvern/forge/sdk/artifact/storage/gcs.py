@@ -30,8 +30,10 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
     download_checksums_by_uri,
+    is_file_from_retry_attempt,
     key_is_org_scoped,
     presign_with_sensitive_cap,
+    resolve_download_attempt_fail_open,
 )
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
@@ -137,7 +139,13 @@ class GcsStorage(BaseStorage):
             file_path=file_path,
         )
 
-    async def store_artifact(self, artifact: Artifact, data: bytes) -> None:
+    async def store_artifact(
+        self,
+        artifact: Artifact,
+        data: bytes,
+        supersede_queued_prefixes: bool = False,
+        prefix_uri: str | None = None,
+    ) -> None:
         storage_class = await self._get_storage_class_for_org(artifact.organization_id)
         tags = await self._get_tags_for_org(artifact.organization_id)
         LOG.debug(
@@ -169,6 +177,9 @@ class GcsStorage(BaseStorage):
             presign=self.async_client.create_signed_urls,
             presign_sensitive=lambda uris: self.async_client.create_signed_urls(
                 uris, expiry_hours=SENSITIVE_SHARE_URL_EXPIRY_HOURS
+            ),
+            presign_download=lambda uris: self.async_client.create_signed_urls(
+                uris, attachment_filenames=[None] * len(uris)
             ),
         )
 
@@ -357,7 +368,7 @@ class GcsStorage(BaseStorage):
     async def get_shared_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[FileInfo]:
-        # Artifact-first when keyring is configured — see s3.py for rationale.
+        # Artifact-first when the keyring is configured. Unlike S3, GCS still lists blobs when there are no rows.
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             try:
                 artifacts = await app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type(
@@ -374,7 +385,7 @@ class GcsStorage(BaseStorage):
                 )
                 artifacts = []
             # Filter out in-progress partials — user-facing listing must only
-            # show completed downloads. Mirrors s3.py.
+            # show completed downloads.
             artifacts = [a for a in artifacts if a.uri and not a.uri.endswith(BROWSER_DOWNLOADING_SUFFIX)]
             if artifacts:
                 return await _file_infos_from_download_artifacts(artifacts)
@@ -411,18 +422,17 @@ class GcsStorage(BaseStorage):
                 content_length = object_info.get("ContentLength")
 
             # Create FileInfo object
-            filename = os.path.basename(key)
+            filename = metadata.get("original_filename", os.path.basename(key)) if metadata else os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
 
-            # Get signed URL
-            signed_urls = await self.async_client.create_signed_urls([key])
+            signed_urls = await self.async_client.create_signed_urls([key], attachment_filenames=[filename])
             if not signed_urls:
                 continue
 
             file_info = FileInfo(
                 url=signed_urls[0],
                 checksum=checksum,
-                filename=metadata.get("original_filename", filename) if metadata else filename,
+                filename=filename,
                 file_size=content_length,
                 modified_at=modified_at,
             )
@@ -445,9 +455,9 @@ class GcsStorage(BaseStorage):
     ) -> list[FileInfo]:
         """Get recording files for a browser session.
 
-        Artifact-first when the keyring is configured — see s3.py for the
-        rationale. Falls back to direct GCS LIST + signed URLs for legacy
-        sessions and OSS-default deployments.
+        Artifact-first when the keyring is configured. Unlike S3, falls back to
+        direct GCS LIST + signed URLs when there are no rows, as well as when the
+        lookup raises or the keyring is unset (OSS default).
         """
         if settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             try:
@@ -544,6 +554,8 @@ class GcsStorage(BaseStorage):
         self,
         organization_id: str,
         run_id: str | None,
+        *,
+        attempt_number: int | None = None,
     ) -> None:
         storage_class = await self._get_storage_class_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -557,6 +569,7 @@ class GcsStorage(BaseStorage):
             run_id=run_id,
             storage_class=storage_class,
             tags=tags,
+            attempt_number=attempt_number,
         )
 
     async def _save_downloaded_files_from_local(
@@ -566,12 +579,19 @@ class GcsStorage(BaseStorage):
         run_id: str | None,
         storage_class: str,
         tags: dict[str, str] | None,
+        attempt_number: int | None = None,
     ) -> None:
         """Save files from local download directory to GCS."""
         download_dir = get_download_dir(run_id=run_id)
         files = os.listdir(download_dir)
         if not files:
             return
+        retry_workflow_run_id, attempt_number, retry_attempt_started_at = await resolve_download_attempt_fail_open(
+            organization_id, run_id, attempt_number=attempt_number
+        )
+        retry_attempt = run_id is not None and attempt_number > 1
+        if retry_attempt:
+            base_uri = f"{base_uri}/attempts/{attempt_number}"
         already_saved = (
             download_checksums_by_uri(
                 await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
@@ -582,12 +602,16 @@ class GcsStorage(BaseStorage):
         skipped_files: list[str] = []
         unchanged_file_count = 0
         for file in files:
+            if file.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
                 continue
             file = await wait_for_pending_extension_rename(download_dir, file)
             fpath = os.path.join(download_dir, file)
             if not os.path.isfile(fpath):
+                continue
+            if retry_attempt and not is_file_from_retry_attempt(fpath, retry_attempt_started_at):
                 continue
             uri = f"{base_uri}/{file}"
             checksum = calculate_sha256_for_file(fpath)
@@ -633,6 +657,7 @@ class GcsStorage(BaseStorage):
                         run_id=run_id,
                         uri=uri,
                         filename=file,
+                        workflow_run_id=retry_workflow_run_id if retry_attempt else None,
                         checksum=checksum,
                         file_size=file_size,
                     )
@@ -656,18 +681,27 @@ class GcsStorage(BaseStorage):
         if skipped_files:
             raise DownloadSaveIncompleteError(skipped_files)
 
-    async def get_downloaded_files(self, organization_id: str, run_id: str | None) -> list[FileInfo]:
-        # Artifact-first — see s3.py::get_downloaded_files for rationale. When
-        # the keyring isn't configured (OSS default) or no artifact rows exist
-        # (legacy run) we fall back to the legacy listing path so
-        # downloaded files remain reachable.
+    async def get_downloaded_files(
+        self, organization_id: str, run_id: str | None, attempt_started_at: datetime | None = None
+    ) -> list[FileInfo]:
+        # Artifact-first when the keyring is configured. Unlike S3, GCS lists blobs when the keyring is unset or
+        # the run has no artifact rows, so files saved before rows existed stay reachable.
+        download_artifacts: list[Artifact] | None = None
         if run_id is not None and settings.ARTIFACT_CONTENT_HMAC_KEYRING:
-            artifacts = await self._list_download_artifacts_safe(organization_id=organization_id, run_id=run_id)
-            artifacts = dedupe_run_scoped_download_artifacts(artifacts)
-            if artifacts:
-                return await _file_infos_from_download_artifacts(artifacts)
+            download_artifacts = await self._list_download_artifacts_safe(
+                organization_id=organization_id, run_id=run_id
+            )
+            download_artifacts = dedupe_run_scoped_download_artifacts(
+                download_artifacts, attempt_started_at=attempt_started_at
+            )
+            if download_artifacts:
+                return await _file_infos_from_download_artifacts(download_artifacts)
 
-        return await self._get_downloaded_files_via_blob_listing(organization_id=organization_id, run_id=run_id)
+        return await self._get_downloaded_files_via_blob_listing(
+            organization_id=organization_id,
+            run_id=run_id,
+            download_artifacts=download_artifacts,
+        )
 
     async def _list_download_artifacts_safe(self, *, organization_id: str, run_id: str) -> list[Artifact]:
         try:
@@ -686,8 +720,18 @@ class GcsStorage(BaseStorage):
             return []
 
     async def _get_downloaded_files_via_blob_listing(
-        self, *, organization_id: str, run_id: str | None
+        self,
+        *,
+        organization_id: str,
+        run_id: str | None,
+        download_artifacts: list[Artifact] | None = None,
     ) -> list[FileInfo]:
+        if download_artifacts is None and run_id is not None:
+            download_artifacts = await self._list_download_artifacts_safe(
+                organization_id=organization_id,
+                run_id=run_id,
+            )
+        artifacts_by_uri = {artifact.uri: artifact for artifact in download_artifacts or []}
         uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{DOWNLOAD_FILE_PREFIX}/{settings.ENV}/{organization_id}/{run_id}"
         object_keys = await self.async_client.list_files(uri=uri)
         if len(object_keys) == 0:
@@ -695,19 +739,24 @@ class GcsStorage(BaseStorage):
 
         file_infos: list[FileInfo] = []
         for key in object_keys:
+            if key.endswith(BROWSER_DOWNLOADING_SUFFIX):
+                continue
             object_uri = f"gs://{settings.GCS_BUCKET_UPLOADS}/{key}"
 
             metadata = {}
             content_length: int | None = None
+            blob_modified_at = None
             object_info = await _get_object_info_safe(self, object_uri)
             if object_info:
                 metadata = object_info.get("Metadata", {})
                 content_length = object_info.get("ContentLength")
+                blob_modified_at = object_info.get("LastModified")
             filename = os.path.basename(key)
             checksum = metadata.get("sha256_checksum") if metadata else None
             display_name = metadata.get("original_filename", filename) if metadata else filename
+            artifact = artifacts_by_uri.get(object_uri)
 
-            signed_urls = await self.async_client.create_signed_urls([object_uri])
+            signed_urls = await self.async_client.create_signed_urls([object_uri], attachment_filenames=[display_name])
             if not signed_urls:
                 continue
 
@@ -717,6 +766,8 @@ class GcsStorage(BaseStorage):
                     checksum=checksum,
                     filename=display_name,
                     file_size=content_length,
+                    modified_at=artifact.modified_at if artifact is not None else blob_modified_at,
+                    artifact_id=artifact.artifact_id if artifact is not None else None,
                 )
             )
 
@@ -766,7 +817,7 @@ class GcsStorage(BaseStorage):
             uploaded_uri=uploaded_uri,
         )
         # Generate a signed URL for the uploaded file
-        signed_urls = await self.async_client.create_signed_urls([uploaded_uri])
+        signed_urls = await self.async_client.create_signed_urls([uploaded_uri], attachment_filenames=[None])
         if not signed_urls:
             LOG.error(
                 "Failed to create signed URL for uploaded file",
@@ -962,6 +1013,12 @@ class GcsStorage(BaseStorage):
         """Download a managed org-scoped file from GCS."""
         self.assert_managed_file_access(uri, organization_id)
         return await self.async_client.download_file(uri, log_exception=False)
+
+    async def managed_file_size(self, uri: str, organization_id: str) -> int | None:
+        self.assert_managed_file_access(uri, organization_id)
+        info = await self.async_client.get_object_info(uri)
+        size = info.get("ContentLength") if info else None
+        return size if isinstance(size, int) else None
 
     async def file_exists(self, uri: str) -> bool:
         """Check if a file exists at the given GCS URI."""

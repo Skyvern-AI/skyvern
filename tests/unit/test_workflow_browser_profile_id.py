@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import copy
+import pickle
 from collections.abc import Generator
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
-from skyvern.exceptions import SkyvernHTTPException
+from skyvern.exceptions import SkyvernHTTPException, WorkflowHasNoBlocks
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.routes.agent_protocol import _workflow_run_request_to_legacy_request
+from skyvern.forge.sdk.workflow.models.block import ForLoopBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML
+from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
+from skyvern.schemas.runs import WorkflowRunRequest
+from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowDefinitionYAML, WorkflowStatus
 
 
 def _make_workflow(browser_profile_id: str | None = None) -> Workflow:
@@ -39,6 +46,14 @@ def test_workflow_pydantic_defaults_to_none() -> None:
 def test_workflow_pydantic_accepts_browser_profile_id() -> None:
     workflow = _make_workflow(browser_profile_id="bp_abc123")
     assert workflow.browser_profile_id == "bp_abc123"
+
+
+def test_default_workflow_deep_copies_and_pickles() -> None:
+    # Copilot block runs deep-copy the stored workflow, so every field default must be copyable.
+    workflow = _make_workflow()
+    assert copy.deepcopy(workflow) == workflow
+    assert workflow.model_copy(deep=True) == workflow
+    assert pickle.loads(pickle.dumps(workflow)) == workflow
 
 
 def test_workflow_create_yaml_request_defaults_to_none() -> None:
@@ -293,14 +308,46 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         backend_schedule_id="temporal_1",
         workflow_schedule_id="wfs_1",
         cron_expression="0 */6 * * *",
+        interval_seconds=None,
+        first_fire_at=None,
+        run_at=None,
+        dispatch_status=None,
         timezone="UTC",
         enabled=True,
         parameters={"url": "https://example.com"},
     )
+    interval_schedule_with_backend = SimpleNamespace(
+        backend_schedule_id="temporal_2",
+        workflow_schedule_id="wfs_2",
+        cron_expression=None,
+        interval_seconds=18000,
+        first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+        run_at=None,
+        dispatch_status=None,
+        timezone="America/New_York",
+        enabled=False,
+        parameters=None,
+    )
+    pending_one_time = SimpleNamespace(
+        backend_schedule_id="temporal_3",
+        workflow_schedule_id="wfs_3",
+        cron_expression=None,
+        interval_seconds=None,
+        first_fire_at=None,
+        run_at=datetime(2026, 11, 2, 8, 1, tzinfo=timezone.utc),
+        dispatch_status="pending",
+        timezone="America/Los_Angeles",
+        enabled=True,
+        parameters=None,
+    )
+    fired_one_time = SimpleNamespace(**{**vars(pending_one_time), "workflow_schedule_id": "wfs_4"})
+    fired_one_time.dispatch_status = "fired"
     schedule_without_backend = SimpleNamespace(
         backend_schedule_id=None,
         workflow_schedule_id="wfs_local",
         cron_expression="0 */12 * * *",
+        interval_seconds=None,
+        first_fire_at=None,
         timezone="UTC",
         enabled=False,
         parameters=None,
@@ -309,7 +356,13 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
     with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
         mock_app.DATABASE.workflows.get_browser_action_policy = AsyncMock(return_value=None)
         mock_app.DATABASE.schedules.get_workflow_schedules = AsyncMock(
-            return_value=[schedule_with_backend, schedule_without_backend]
+            return_value=[
+                schedule_with_backend,
+                interval_schedule_with_backend,
+                pending_one_time,
+                fired_one_time,
+                schedule_without_backend,
+            ]
         )
         mock_app.AGENT_FUNCTION.upsert_workflow_schedule = AsyncMock()
 
@@ -323,17 +376,50 @@ async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedu
         workflow_permanent_id="wpid_test",
         organization_id="org_1",
     )
-    mock_app.AGENT_FUNCTION.upsert_workflow_schedule.assert_awaited_once_with(
-        backend_schedule_id="temporal_1",
-        organization_id="org_1",
-        workflow_permanent_id="wpid_test",
-        workflow_schedule_id="wfs_1",
-        cron_expression="0 */6 * * *",
-        timezone="UTC",
-        enabled=True,
-        parameters={"url": "https://example.com"},
-        max_elapsed_time_minutes=360,
-    )
+    assert mock_app.AGENT_FUNCTION.upsert_workflow_schedule.await_args_list == [
+        call(
+            backend_schedule_id="temporal_1",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_1",
+            cron_expression="0 */6 * * *",
+            timezone="UTC",
+            enabled=True,
+            parameters={"url": "https://example.com"},
+            max_elapsed_time_minutes=360,
+            interval_seconds=None,
+            first_fire_at=None,
+            run_at=None,
+        ),
+        call(
+            backend_schedule_id="temporal_2",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_2",
+            cron_expression=None,
+            timezone="America/New_York",
+            enabled=False,
+            parameters=None,
+            max_elapsed_time_minutes=360,
+            interval_seconds=18000,
+            first_fire_at=datetime(2026, 10, 30, 15, 0, tzinfo=timezone.utc),
+            run_at=None,
+        ),
+        call(
+            backend_schedule_id="temporal_3",
+            organization_id="org_1",
+            workflow_permanent_id="wpid_test",
+            workflow_schedule_id="wfs_3",
+            cron_expression=None,
+            timezone="America/Los_Angeles",
+            enabled=True,
+            parameters=None,
+            max_elapsed_time_minutes=360,
+            interval_seconds=None,
+            first_fire_at=None,
+            run_at=datetime(2026, 11, 2, 8, 1, tzinfo=timezone.utc),
+        ),
+    ]
 
 
 def _make_workflow_update_service(
@@ -345,8 +431,13 @@ def _make_workflow_update_service(
 ) -> tuple[WorkflowService, SimpleNamespace]:
     service = WorkflowService()
     existing_workflow = SimpleNamespace(
+        workflow_id="wf_existing",
         version=2,
+        proxy_location=None,
+        totp_identifier=None,
+        totp_verification_url=None,
         cdp_connect_headers=None,
+        extra_http_headers=None,
         workflow_permanent_id="wpid_test",
         folder_id=None,
         code_version=None,
@@ -355,9 +446,16 @@ def _make_workflow_update_service(
         pin_saved_session_ip=existing_pin_saved_session_ip,
         webhook_callback_url=existing_webhook_callback_url,
         created_by=existing_created_by,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
-    updated_workflow = SimpleNamespace(workflow_id="wf_new", workflow_permanent_id="wpid_test")
+    updated_workflow = SimpleNamespace(
+        workflow_id="wf_new",
+        organization_id="org_1",
+        workflow_permanent_id="wpid_test",
+        version=3,
+        status=WorkflowStatus.published,
+    )
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=existing_workflow)  # type: ignore[method-assign]
     service.create_workflow = AsyncMock(return_value=potential_workflow)  # type: ignore[method-assign]
@@ -366,9 +464,11 @@ def _make_workflow_update_service(
     )
     service.validate_workflow_block_graph = Mock()  # type: ignore[method-assign]
     service._validate_payload_templates = Mock()  # type: ignore[method-assign]
+    service.schedule_workflow_saved_hook = Mock()  # type: ignore[method-assign]
     service.update_workflow_definition = AsyncMock(return_value=updated_workflow)  # type: ignore[method-assign]
     service.maybe_delete_cached_code = AsyncMock()  # type: ignore[method-assign]
     service._refresh_workflow_schedule_runtime_limits = AsyncMock()  # type: ignore[method-assign]
+    service.delete_workflow_by_id = AsyncMock()  # type: ignore[method-assign]
 
     return service, updated_workflow
 
@@ -397,6 +497,7 @@ def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, Sim
         organization_name="Test Org",
         default_llm_key=None,
         default_secondary_llm_key=None,
+        created_at=None,
     )
     return service, organization, workflow_run
 
@@ -411,13 +512,14 @@ def _configure_setup_app_mocks(mock_app: Any) -> None:
 def _make_workflow_stub(
     browser_profile_id: str | None,
     max_elapsed_time_minutes: int | None = None,
+    proxy_location: ProxyLocationInput = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         workflow_id="wf_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
         title="test",
-        proxy_location=None,
+        proxy_location=proxy_location,
         webhook_callback_url=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
@@ -527,6 +629,57 @@ async def test_setup_workflow_run_session_present_skips_workflow_default() -> No
     assert request.browser_profile_id is None
 
 
+async def _setup_run_proxy_location(
+    workflow_proxy_location: ProxyLocationInput, body: dict[str, Any]
+) -> WorkflowRequestBody:
+    """Run the public /run/agents body through the route conversion and setup_workflow_run.
+
+    The body is validated the way FastAPI validates it so an omitted proxy_location carries the
+    request model's RESIDENTIAL default, which is the state that used to shadow the workflow value.
+    """
+    workflow_stub = _make_workflow_stub(browser_profile_id=None, proxy_location=workflow_proxy_location)
+    service, organization, _ = _make_setup_service(workflow_stub)
+    request = _workflow_run_request_to_legacy_request(WorkflowRunRequest.model_validate(body))
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=request,
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    return request
+
+
+@pytest.mark.asyncio
+async def test_run_without_proxy_location_inherits_the_workflow_region() -> None:
+    request = await _setup_run_proxy_location(ProxyLocation.RESIDENTIAL_FR, {"workflow_id": "wpid_test"})
+
+    assert request.proxy_location == ProxyLocation.RESIDENTIAL_FR
+
+
+@pytest.mark.asyncio
+async def test_run_level_proxy_location_overrides_the_workflow_region() -> None:
+    request = await _setup_run_proxy_location(
+        ProxyLocation.RESIDENTIAL_FR,
+        {"workflow_id": "wpid_test", "proxy_location": ProxyLocation.RESIDENTIAL_IT.value},
+    )
+
+    assert request.proxy_location == ProxyLocation.RESIDENTIAL_IT
+
+
+@pytest.mark.asyncio
+async def test_run_without_proxy_location_on_a_regionless_workflow_stays_unset() -> None:
+    # Nothing configured anywhere still resolves to the residential default at launch, via
+    # runtime_proxy_location rather than a value baked onto the run.
+    request = await _setup_run_proxy_location(None, {"workflow_id": "wpid_test"})
+
+    assert request.proxy_location is None
+
+
 @pytest.mark.asyncio
 async def test_setup_workflow_run_prefers_request_max_elapsed_time_over_workflow_default() -> None:
     """A run-level runtime cap should override the workflow default for that run snapshot."""
@@ -574,3 +727,49 @@ async def test_setup_workflow_run_without_credentials_writes_no_sequential_crede
 
         update_mock = mock_app.DATABASE.workflow_runs.update_workflow_run
         assert all("sequential_credential_id" not in call.kwargs for call in update_mock.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_rejects_empty_workflow_before_creating_run() -> None:
+    service, organization, _ = _make_setup_service(_make_workflow_stub(browser_profile_id=None))
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+        with pytest.raises(WorkflowHasNoBlocks) as exc_info:
+            await service.setup_workflow_run(
+                request_id="req_test",
+                workflow_request=WorkflowRequestBody(data={}),
+                workflow_permanent_id="wpid_test",
+                organization=organization,
+                reject_empty_workflow=True,
+            )
+
+    assert exc_info.value.status_code == 400
+    cast(AsyncMock, service.create_workflow_run).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_allows_empty_loop_block_when_rejecting_empty_workflows() -> None:
+    workflow_stub = _make_workflow_stub(browser_profile_id=None)
+    output_parameter = OutputParameter(
+        key="loop_output",
+        output_parameter_id="op_test",
+        workflow_id="wf_test",
+        created_at=datetime.now(timezone.utc),
+        modified_at=datetime.now(timezone.utc),
+    )
+    empty_loop = ForLoopBlock(label="loop", output_parameter=output_parameter, loop_blocks=[])
+    workflow_stub.workflow_definition = SimpleNamespace(parameters=[], blocks=[empty_loop])
+    service, organization, _ = _make_setup_service(workflow_stub)
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        _configure_setup_app_mocks(mock_app)
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            reject_empty_workflow=True,
+        )
+
+    cast(AsyncMock, service.create_workflow_run).assert_awaited_once()

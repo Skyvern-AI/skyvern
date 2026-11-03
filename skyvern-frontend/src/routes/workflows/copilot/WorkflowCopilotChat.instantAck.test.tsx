@@ -7,11 +7,12 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
+
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = {
   message: string;
@@ -103,6 +104,8 @@ vi.mock("react-router-dom", async (importOriginal) => {
 });
 
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: (options?: { workflowRunId?: string }) =>
     workflowRunQueryMock(options),
 }));
@@ -138,9 +141,14 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 vi.mock("./WorkflowCopilotHistory", () => ({
   WorkflowCopilotHistory: ({
@@ -156,11 +164,7 @@ vi.mock("./WorkflowCopilotHistory", () => ({
   ),
 }));
 
-import { COPILOT_ACK_LINES } from "./NarrativeView";
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
-
 const BOOLEAN_FLAGS: Record<string, boolean> = {
-  ENABLE_WORKFLOW_COPILOT_V2: true,
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
 };
@@ -168,22 +172,14 @@ const BOOLEAN_FLAGS: Record<string, boolean> = {
 function chatUi() {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat />
     </FeatureFlagContext.Provider>
   );
 }
 
 async function renderChat() {
   const view = render(chatUi());
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(
-        /Message Skyvern Copilot|Ask Copilot to build/,
-      ),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -193,18 +189,14 @@ async function submit(value: string) {
   await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 }
 
+const ACK = "Copilot is working on your request…";
+
 function expectNoAckLines() {
-  for (const line of COPILOT_ACK_LINES) {
-    expect(screen.queryByText(line)).toBeNull();
-  }
+  expect(screen.queryByText(ACK)).toBeNull();
 }
 
-// The placeholder opens on a random line, so assert *some* ack line shows.
 function expectSomeAckLine() {
-  const present = COPILOT_ACK_LINES.some(
-    (line) => screen.queryByText(line) !== null,
-  );
-  expect(present).toBe(true);
+  expect(screen.getByText(ACK)).toBeTruthy();
 }
 
 async function completeStream(index: number, message: string) {
@@ -241,6 +233,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — instant acknowledgement", () => {
@@ -271,13 +264,57 @@ describe("WorkflowCopilotChat — instant acknowledgement", () => {
     expect(screen.getAllByRole("status")).toHaveLength(1);
   });
 
-  it("REGRESSION: an Ask reply clears the placeholder when the turn completes", async () => {
+  // Drives the real stream path, not the reducer: an SSE payload whose type has
+  // no case in the chat's switch is silently swallowed by its `default`, so a
+  // test that starts at applyNarrativeEvent cannot tell a wired frame from an
+  // unwired one. This is the only test that fails if the dispatch case goes.
+  it("REGRESSION: names the drafting blocks from codegen_progress frames arriving on the stream", async () => {
+    await renderChat();
+    await submit("build a workflow");
+    expectSomeAckLine();
+
+    await act(async () => {
+      streamCalls[0]!.onMessage({
+        type: "turn_start",
+        turn_id: "turn-1",
+        turn_index: 0,
+        mode: "build",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "design_start",
+        timestamp: "2026-06-10T00:00:00Z",
+      });
+      streamCalls[0]!.onMessage({
+        type: "codegen_progress",
+        tool_name: "update_and_run_blocks",
+        blocks_drafted: ["open_page", "fill_form"],
+        chars_streamed: 800,
+        iteration: 1,
+        timestamp: "2026-06-10T00:00:01Z",
+      });
+    });
+
+    const row = await waitFor(() => {
+      const found = document.querySelector(
+        '[data-activity-row-id="codegen-progress"]',
+      );
+      expect(found).not.toBeNull();
+      return found!;
+    });
+    const text = row.textContent ?? "";
+    expect(text).toContain("Writing the workflow code");
+    expect(text).toContain("Open Page");
+    expect(text).toContain("Fill Form");
+  });
+
+  it("REGRESSION: a narrative-less reply clears the placeholder when the turn completes", async () => {
     await renderChat();
     await submit("what does this workflow do?");
     expectSomeAckLine();
 
-    // Ask turns emit no narrative frames; the placeholder clears when the turn
-    // completes (isLoading falls) as the plain reply lands.
+    // Compatibility responses can emit no narrative frames; the placeholder
+    // clears when the turn completes as the plain reply lands.
     await completeStream(0, "It **scrapes** headlines.");
 
     expect(screen.getByText("scrapes", { selector: "strong" })).toBeTruthy();

@@ -130,7 +130,9 @@ class ClickContext(BaseModel):
 
 # Stamp on Task V3-persisted action rows. Their `reasoning` is the whole TURN's text, shared by
 # every action of the round — readers that assume per-action reasoning (cached-script prompt
-# inference) must key off this stamp and skip it.
+# inference) must key off this stamp and skip it. The literal prefix is also parsed by the frontend
+# (skyvern-frontend/src/routes/workflows/workflowBlockUtils.ts `taskV3CallText`), which cannot import
+# it across the OSS boundary, so changing the string is a cross-repo change.
 TASK_V3_ACTION_DESCRIPTION_PREFIX = "task_v3 "
 
 
@@ -173,6 +175,7 @@ class Action(BaseModel):
     # WebAction fields
     file_name: str | None = None
     file_url: str | None = None
+    download_url: str | None = Field(default=None, description="Origin URL recorded by a download action.")
     download: bool | None = None
     download_triggered: bool | None = None  # Whether a download was triggered by this action
     downloaded_files: list[str] | None = None  # List of file names downloaded by this action
@@ -313,6 +316,10 @@ class ClosePageAction(Action):
     action_type: ActionType = ActionType.CLOSE_PAGE
     # When set, close the open tab at this index in the open-tabs list instead of the current tab.
     tab_index: int | None = None
+    # Set only when the agent synthesized this close to recover from a dead blank working page.
+    # Persists into action_json via model_dump; gates recovery rechecks, completed-step guards, and
+    # cached-script support checks.
+    is_internal_recovery: bool = False
 
 
 class NewTabAction(Action):
@@ -396,7 +403,6 @@ class DownloadFileAction(Action):
     download: bool = True
     file_name: str
     byte: Annotated[bytes | None, Field(exclude=True)] = None  # bytes data
-    download_url: str | None = None  # URL to download file from
 
     def __repr__(self) -> str:
         return f"DownloadFileAction(file_name={self.file_name}, download_url={self.download_url}, has_byte={self.byte is not None})"

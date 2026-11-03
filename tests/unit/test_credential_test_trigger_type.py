@@ -137,8 +137,20 @@ async def test_test_login_trigger_type_from_user_agent(
             return_value=SimpleNamespace(vault_type=None, credential_id="cred_test", totp_identifier=None)
         )
     )
+    update_credential = AsyncMock(
+        return_value=SimpleNamespace(
+            vault_type=None,
+            credential_id="cred_test",
+            totp_identifier=None,
+            proxy_location=None,
+            proxy_session_id=None,
+        )
+    )
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
     monkeypatch.setattr(credentials, "_create_browser_profile_after_workflow", AsyncMock())
+    monkeypatch.setattr(
+        credentials.app, "DATABASE", SimpleNamespace(credentials=SimpleNamespace(update_credential=update_credential))
+    )
     monkeypatch.setattr(credentials.app, "WORKFLOW_SERVICE", _workflow_service(setup_mock))
     _patch_executor(monkeypatch)
 
@@ -150,6 +162,7 @@ async def test_test_login_trigger_type_from_user_agent(
     )
 
     setup_mock.assert_awaited_once()
+    assert update_credential.await_args.kwargs["is_test_login_temporary"] is True
     assert setup_mock.call_args.kwargs["trigger_type"] == expected
     assert response.workflow_run_id == "wr_test"
     # test_login fires _create_browser_profile_after_workflow via create_task; drain the
@@ -196,6 +209,7 @@ async def test_test_login_seeds_proxy_pin_workflow_request(monkeypatch: pytest.M
     )
 
     workflow_request = setup_mock.call_args.kwargs["workflow_request"]
+    assert mock_credentials.update_credential.await_args.kwargs["is_test_login_temporary"] is True
     assert workflow_request.proxy_location == ProxyLocation.RESIDENTIAL_ISP
     assert workflow_request.extra_http_headers == {"dedicated-ip": "abc1234567"}
     await asyncio.sleep(0)
@@ -274,8 +288,20 @@ def test_test_login_endpoint_wires_user_agent_header(
             return_value=SimpleNamespace(vault_type=None, credential_id="cred_test", totp_identifier=None)
         )
     )
+    update_credential = AsyncMock(
+        return_value=SimpleNamespace(
+            vault_type=None,
+            credential_id="cred_test",
+            totp_identifier=None,
+            proxy_location=None,
+            proxy_session_id=None,
+        )
+    )
     monkeypatch.setattr(credentials, "_get_credential_vault_service", AsyncMock(return_value=vault_service))
     monkeypatch.setattr(credentials, "_create_browser_profile_after_workflow", AsyncMock())
+    monkeypatch.setattr(
+        credentials.app, "DATABASE", SimpleNamespace(credentials=SimpleNamespace(update_credential=update_credential))
+    )
     monkeypatch.setattr(credentials.app, "WORKFLOW_SERVICE", _workflow_service(setup_mock))
     _patch_executor(monkeypatch)
 
@@ -291,5 +317,6 @@ def test_test_login_endpoint_wires_user_agent_header(
     )
 
     assert resp.status_code == 200
+    assert update_credential.await_args.kwargs["is_test_login_temporary"] is True
     setup_mock.assert_awaited_once()
     assert setup_mock.call_args.kwargs["trigger_type"] == expected

@@ -47,6 +47,9 @@ class _DesignationServer:
 
 def _ctx(server: _DesignationServer) -> SimpleNamespace:
     return SimpleNamespace(
+        browser_session_id="pbs-debug",
+        last_run_blocks_browser_session_id=None,
+        last_run_blocks_workflow_run_id=None,
         discovery_mcp_server=server,
         completion_criteria_turn_state=None,
         request_policy=None,
@@ -279,6 +282,12 @@ async def test_designation_probe_returns_every_verified_representation_without_c
         {
             "selector": "#analytics > section:nth-child(2) > span:nth-child(2)",
             "source": "structural",
+            "match_count": 1,
+            "position": 0,
+        },
+        {
+            "selector": 'section:has(h2:text-is("Visitors")) span.metric-value',
+            "source": "text_anchor",
             "match_count": 1,
             "position": 0,
         },

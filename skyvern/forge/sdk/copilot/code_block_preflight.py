@@ -6,13 +6,13 @@ import ast
 import asyncio
 import keyword
 import re
+import symtable
 import sys
 import tempfile
 import textwrap
+import unicodedata
 from dataclasses import dataclass
-from functools import cache
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Callable, Iterable, Iterator, Mapping
 
 from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
@@ -22,12 +22,13 @@ from jinja2.sandbox import SandboxedEnvironment
 from skyvern.forge.sdk.copilot.code_block_security import CodeBlockSecurityError, author_time_code_security_errors
 from skyvern.forge.sdk.copilot.code_block_synthesis import is_root_locator_selector
 from skyvern.forge.sdk.workflow.models._jinja import _json_finalize, _json_type_filter
-from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.utils.strings import join_phrases
 from skyvern.utils.templating import get_missing_variables
 
 RENDER_TEMPLATE_SYNTAX_REASON_CODE = "RENDER_TEMPLATE_SYNTAX"
 RENDER_UNDEFINED_NAME_REASON_CODE = "RENDER_UNDEFINED_NAME"
 SCANNER_ADVISORY_REASON_CODE = "SCANNER_ADVISORY"
+WRAPPER_SCOPE_GLOBAL_REASON_CODE = "WRAPPER_SCOPE_GLOBAL"
 SCANNER_ADVISORY_TIMEOUT_SECONDS = 3.0
 
 
@@ -58,17 +59,56 @@ class CodeBlockRenderDiagnostic:
     failing_expression: str
 
 
+@dataclass(frozen=True)
+class NestedHelperScope:
+    """A def nested in the block body, in block line coordinates."""
+
+    name: str
+    first_line: int
+    last_line: int
+    global_names: frozenset[str]
+    nonlocal_names: frozenset[str]
+    # (name, line) of each statement that reads a name while rebinding it (`n += 1`, `n = n + 1`):
+    # the shape that means the helper wanted the enclosing value rather than a fresh local.
+    read_write_bindings: frozenset[tuple[str, int]]
+
+    def contains_line(self, line: int) -> bool:
+        return self.first_line <= line <= self.last_line
+
+
+@dataclass(frozen=True)
+class WrapperScopeGlobal:
+    """A nested ``global`` naming a name the wrapper binds: a block-body assignment or a parameter key."""
+
+    names: tuple[str, ...]
+    line: int
+    helper: NestedHelperScope
+
+
+@dataclass(frozen=True)
+class WrapperScopeFacts:
+    bound_names: frozenset[str]
+    parameter_names: frozenset[str]
+    helpers: tuple[NestedHelperScope, ...]
+    globals: tuple[WrapperScopeGlobal, ...]
+
+    def innermost_helper_at(self, line: int) -> NestedHelperScope | None:
+        candidates = [helper for helper in self.helpers if helper.contains_line(line)]
+        return min(candidates, key=lambda helper: helper.last_line - helper.first_line, default=None)
+
+
 # Mirrors the runtime's strict-mode template formatter (jinja_json_finalize_strict_env)
 # regardless of the WORKFLOW_TEMPLATING_STRICTNESS deployment setting.
 _render_check_env = SandboxedEnvironment(undefined=StrictUndefined, finalize=_json_finalize)
 _render_check_env.filters["json"] = _json_type_filter
 
+_CURRENT_DATE_BINDING = "current_date"
 _RENDER_SYSTEM_BINDING_NAMES = (
     "workflow_title",
     "workflow_id",
     "workflow_permanent_id",
     "workflow_run_id",
-    "current_date",
+    _CURRENT_DATE_BINDING,
     "browser_session_id",
     "workflow_run_outputs",
     "workflow_run_summary",
@@ -167,7 +207,7 @@ def code_block_render_diagnostic(code: str, bound_names: Iterable[str]) -> CodeB
             if suggestion
             else (
                 " Only declared parameter keys, block labels, `<label>_output` values, and workflow "
-                "system names (e.g. `current_date`) are available as top-level template names."
+                f"system names (e.g. `{_CURRENT_DATE_BINDING}`) are available as top-level template names."
             )
         )
         return CodeBlockRenderDiagnostic(
@@ -204,7 +244,7 @@ _BROAD_BODY_TEXT_WAIT_NEEDLES = (
     "document.documentelement.textcontent",
 )
 _BROAD_TABLE_RECORD_KEYS = frozenset(("items", "locations", "records", "rows"))
-_BROAD_TABLE_SCAN_SELECTORS = frozenset({"article", "section", ".card", "li"})
+_BROAD_TABLE_SCAN_SELECTORS = ("section", ".card", "article", "li")
 _BROAD_TABLE_SELECTOR_METHODS = frozenset(("locator", "query_selector", "query_selector_all"))
 _LONE_LIST_ITEM_SELECTOR_EXEMPTION = frozenset({"li"})
 _GET_BY_TEXT_NARROWING_ATTRIBUTES = frozenset({"first", "last"})
@@ -230,141 +270,13 @@ _READINESS_WAIT_STATES = frozenset({"visible", "attached"})
 _READINESS_EXPECTATION_METHODS = frozenset({"to_be_attached", "to_be_visible"})
 # Advisory diagnostics reach the model as guidance only; keeping them out of the preflight
 # gate is what stops `skyvern_code_block_lint` from turning advice into a rejection.
-_ADVISORY_DIAGNOSTIC_CODES = frozenset({"ROOT_CONTAINER_READINESS_WAIT", "ROOT_CONTAINER_TEXT_READ"})
+_ADVISORY_DIAGNOSTIC_CODES = frozenset(
+    {"ROOT_CONTAINER_READINESS_WAIT", "ROOT_CONTAINER_TEXT_READ", WRAPPER_SCOPE_GLOBAL_REASON_CODE}
+)
+_WRAPPER_FUNCTION_NAME = "__code_block__"
 _WHOLE_PAGE_READ_METHODS = frozenset({"inner_text", "text_content", "all_inner_texts", "all_text_contents"})
 _TABLE_ROW_TAG_SELECTOR_RE = re.compile(r"(?<![a-z0-9_-])tr(?![a-z0-9_-])")
 _TABLE_ROW_ROLE_SELECTOR_RE = re.compile(r"\[role\s*=\s*(['\"]?)row\1\]")
-
-
-@cache
-def _sandbox_shim_surface() -> dict[str, frozenset[str]]:
-    return {
-        name: frozenset(vars(value))
-        for name, value in CodeBlock.build_safe_vars().items()
-        if isinstance(value, SimpleNamespace)
-    }
-
-
-def strip_redundant_sandbox_imports(code: str) -> tuple[str, list[str]]:
-    """Remove top-level imports the runtime sandbox already injects.
-
-    A module import is removed only when the runtime sandbox provides the same
-    name as a ``SimpleNamespace`` helper and every attribute the code reads on
-    that name is present on the injected helper. Aliased imports, submodule
-    imports, from-imports, compound-line imports, non-sandbox modules, imports
-    whose used surface exceeds the injected helper, and bare uses of the name as
-    a value are all left in place so ``CodeBlock.is_safe_code`` still rejects
-    them with immediate author-time feedback.
-    """
-
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return code, []
-
-    shim_surface = _sandbox_shim_surface()
-    attribute_use = _module_attribute_use(tree)
-    bare_use = _module_bare_use(tree)
-
-    removable_spans: list[tuple[int, int]] = []
-    stripped_modules: list[str] = []
-    occupied_lines = _occupied_line_numbers(tree)
-    for node in tree.body:
-        if not isinstance(node, ast.Import):
-            continue
-        candidate_modules = _strippable_module_names(node, shim_surface, attribute_use, bare_use)
-        if candidate_modules is None:
-            continue
-        if node.end_lineno is None:
-            continue
-        if _line_span_shares_other_statement(node, occupied_lines):
-            continue
-        removable_spans.append((node.lineno, node.end_lineno))
-        stripped_modules.extend(candidate_modules)
-
-    if not removable_spans:
-        return code, []
-
-    sanitized = _remove_line_spans(code, removable_spans)
-    try:
-        ast.parse(sanitized)
-    except SyntaxError:
-        return code, []
-    return sanitized, stripped_modules
-
-
-def _strippable_module_names(
-    node: ast.Import,
-    shim_surface: dict[str, frozenset[str]],
-    attribute_use: dict[str, set[str]],
-    bare_use: set[str],
-) -> list[str] | None:
-    modules: list[str] = []
-    for alias in node.names:
-        if alias.asname is not None or "." in alias.name:
-            return None
-        if alias.name not in shim_surface:
-            return None
-        if alias.name in bare_use:
-            return None
-        if not attribute_use.get(alias.name, set()).issubset(shim_surface[alias.name]):
-            return None
-        modules.append(alias.name)
-    return modules or None
-
-
-def _module_attribute_use(tree: ast.AST) -> dict[str, set[str]]:
-    usage: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and isinstance(node.value.ctx, ast.Load)
-        ):
-            usage.setdefault(node.value.id, set()).add(node.attr)
-    return usage
-
-
-def _module_bare_use(tree: ast.AST) -> set[str]:
-    # id() of each ast.Attribute value Name is stable across both walks of the same parsed tree.
-    attribute_base_names: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            attribute_base_names.add(id(node.value))
-    bare: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in attribute_base_names:
-            bare.add(node.id)
-    return bare
-
-
-def _occupied_line_numbers(tree: ast.AST) -> dict[int, set[int]]:
-    lines: dict[int, set[int]] = {}
-    for node in ast.iter_child_nodes(tree):
-        if not isinstance(node, ast.stmt):
-            continue
-        if node.lineno is None or node.end_lineno is None:
-            continue
-        for line in range(node.lineno, node.end_lineno + 1):
-            lines.setdefault(line, set()).add(id(node))
-    return lines
-
-
-def _line_span_shares_other_statement(node: ast.Import, occupied_lines: dict[int, set[int]]) -> bool:
-    if node.end_lineno is None:
-        return True
-    for line in range(node.lineno, node.end_lineno + 1):
-        if any(owner != id(node) for owner in occupied_lines.get(line, set())):
-            return True
-    return False
-
-
-def _remove_line_spans(code: str, spans: list[tuple[int, int]]) -> str:
-    drop_lines: set[int] = set()
-    for start, end in spans:
-        drop_lines.update(range(start, end + 1))
-    kept = [line for index, line in enumerate(code.splitlines(keepends=True), start=1) if index not in drop_lines]
-    return "".join(kept)
 
 
 def preflight_code_block(
@@ -442,17 +354,25 @@ def _may_invoke_locator_object(tree: ast.AST) -> bool:
     return False
 
 
-def author_time_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+def author_time_code_block_diagnostics(
+    code: str, *, parameter_keys: Iterable[str] = ()
+) -> list[CodeBlockPreflightDiagnostic]:
     tree, _ = _parse_static_ast(code)
     if tree is None:
         return []
-    return [*_author_time_security_diagnostics(code), *_author_time_ast_diagnostics(tree)]
+    return [
+        *_author_time_security_diagnostics(code),
+        *_author_time_ast_diagnostics(tree),
+        *wrapper_scope_diagnostics(code, parameter_keys=parameter_keys),
+    ]
 
 
-def advisory_code_block_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
+def advisory_code_block_diagnostics(
+    code: str, *, parameter_keys: Iterable[str] = ()
+) -> list[CodeBlockPreflightDiagnostic]:
     return [
         diagnostic
-        for diagnostic in author_time_code_block_diagnostics(code)
+        for diagnostic in author_time_code_block_diagnostics(code, parameter_keys=parameter_keys)
         if diagnostic.code in _ADVISORY_DIAGNOSTIC_CODES
     ]
 
@@ -503,18 +423,15 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
             if diagnostic.code not in _ADVISORY_DIAGNOSTIC_CODES
         ),
     ]
+    re_modules, re_functions = _re_bindings(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
-            continue
-        wizard_step_diagnostic = _wizard_step_selector_diagnostic(node)
-        if wizard_step_diagnostic is not None:
-            diagnostics.append(wizard_step_diagnostic)
             continue
         evaluate_diagnostic = _page_evaluate_diagnostic(node)
         if evaluate_diagnostic is not None:
             diagnostics.append(evaluate_diagnostic)
             continue
-        regex_diagnostic = _regex_literal_diagnostic(node)
+        regex_diagnostic = _regex_literal_diagnostic(node, re_modules, re_functions)
         if regex_diagnostic is not None:
             diagnostics.append(regex_diagnostic)
 
@@ -699,31 +616,6 @@ def _assignment_value_and_targets(node: ast.Assign | ast.AnnAssign) -> tuple[ast
     return node.value, [node.target]
 
 
-def _wizard_step_selector_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
-    func = node.func
-    if not isinstance(func, ast.Attribute) or func.attr != "locator" or not node.args:
-        return None
-
-    selector = node.args[0]
-    if not isinstance(selector, ast.Constant) or not isinstance(selector.value, str):
-        return None
-    normalized_selector = selector.value.lower()
-    if "data-next-step" not in normalized_selector and "data-step" not in normalized_selector:
-        return None
-    if "button" not in normalized_selector:
-        return None
-
-    return CodeBlockPreflightDiagnostic(
-        code="AMBIGUOUS_WIZARD_STEP_SELECTOR",
-        message=(
-            "Code block targets a wizard step button by metadata selector only. Step metadata can match "
-            "both forward and back controls under Playwright strict mode. Target the visible semantic control "
-            "instead, such as `page.get_by_role('button', name='Continue')`, or narrow the locator to visible "
-            "button text before clicking."
-        ),
-    )
-
-
 def _page_evaluate_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
     func = node.func
     if not isinstance(func, ast.Attribute) or func.attr != "evaluate":
@@ -755,7 +647,7 @@ def _global_get_by_text_wait_for_diagnostic(
         message=(
             "Code block waits on global `page.get_by_text(...).wait_for(...)`, which can collide with "
             "multiple matching text nodes under Playwright strict mode. Scope the text lookup "
-            "through a locator/container or narrow it with `first`, `nth`, or `filter` before waiting."
+            "through a locator/container or `filter` it before waiting."
         ),
     )
 
@@ -1000,11 +892,11 @@ def _broad_table_record_scan_diagnostic(tree: ast.AST) -> CodeBlockPreflightDiag
     return CodeBlockPreflightDiagnostic(
         code="BROAD_TABLE_RECORD_SCAN",
         message=(
-            "Code block appears to extract row-like records by scanning broad containers such as `section`, "
-            "`.card`, `article`, or `li`. For table-like or list-like records, iterate the actual row/item "
+            "Code block appears to extract row-like records by scanning broad containers such as "
+            f"{join_phrases([f'`{selector}`' for selector in _BROAD_TABLE_SCAN_SELECTORS], 'or')}. "
+            "For table-like or list-like records, iterate the actual row/item "
             'elements (`tr`, `[role="row"]`, or equivalent repeated item containers) and read fields from '
-            "the same row so fields from separate records cannot be mixed. Derive summary status fields only "
-            "from parsed row objects."
+            "the same row so fields from separate records cannot be mixed."
         ),
     )
 
@@ -1078,15 +970,29 @@ _RE_LITERAL_FUNCTIONS = frozenset(
 )
 
 
-def _regex_literal_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
+def _re_bindings(tree: ast.AST) -> tuple[frozenset[str], dict[str, str]]:
+    """Names bound to the `re` module, and names a from-import bound to one of its functions."""
+    modules = {"re"}
+    functions: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.asname or alias.name for alias in node.names if alias.name == "re")
+        elif isinstance(node, ast.ImportFrom) and node.module == "re" and not node.level:
+            functions.update({alias.asname or alias.name: alias.name for alias in node.names})
+    return frozenset(modules), functions
+
+
+def _regex_literal_diagnostic(
+    node: ast.Call, re_modules: frozenset[str], re_functions: dict[str, str]
+) -> CodeBlockPreflightDiagnostic | None:
     func = node.func
-    if (
-        not isinstance(func, ast.Attribute)
-        or func.attr not in _RE_LITERAL_FUNCTIONS
-        or not isinstance(func.value, ast.Name)
-        or func.value.id != "re"
-        or not node.args
-    ):
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in re_modules:
+        function_name = func.attr
+    elif isinstance(func, ast.Name) and func.id in re_functions:
+        function_name = re_functions[func.id]
+    else:
+        return None
+    if function_name not in _RE_LITERAL_FUNCTIONS or not node.args:
         return None
 
     pattern = node.args[0]
@@ -1099,17 +1005,138 @@ def _regex_literal_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | 
         return CodeBlockPreflightDiagnostic(
             code="INVALID_REGEX_LITERAL",
             message=(
-                f"Code block contains an invalid regex literal for `re.{func.attr}`: {exc}. "
+                f"Code block contains an invalid regex literal for `re.{function_name}`: {exc}. "
                 "Fix the pattern or avoid regex when simple string checks are enough."
             ),
         )
     return None
 
 
-def _build_typed_module(code: str, *, parameter_keys: Iterable[str]) -> str:
-    parameter_declarations = "\n".join(
-        f"{key}: Any" for key in dict.fromkeys(parameter_keys) if _valid_python_identifier(key)
+def _read_write_bindings(own_nodes: Iterable[ast.AST], offset: int) -> frozenset[tuple[str, int]]:
+    bindings: set[tuple[str, int]] = set()
+    for node in own_nodes:
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            bindings.add((node.target.id, node.lineno + offset))
+            continue
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        loaded = {child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)}
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in loaded:
+                bindings.add((target.id, node.lineno + offset))
+    return frozenset(bindings)
+
+
+def _own_scope_nodes(node: ast.AST) -> Iterator[ast.AST]:
+    """Descendants of ``node`` that belong to its own scope: nested defs, lambdas and classes are
+    yielded but not entered, so a statement is attributed to the innermost scope that owns it."""
+    for child in ast.iter_child_nodes(node):
+        yield child
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            yield from _own_scope_nodes(child)
+
+
+def wrapper_scope_facts(code: str, *, parameter_keys: Iterable[str] = ()) -> WrapperScopeFacts | None:
+    """Scope facts about the block body as the runtime compiles it: the body of a wrapper function,
+    so every top-level binding and every parameter key is that function's local. Both executors also
+    publish parameter keys as exec globals, so a nested ``global`` on one resolves to a copy the
+    wrapper body never reads."""
+    source = _build_typed_module(code, parameter_keys=parameter_keys)
+    try:
+        tree = ast.parse(source)
+        table = symtable.symtable(source, "<code_block>", "exec")
+    except SyntaxError:
+        return None
+    wrapper_node = next(
+        (node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == _WRAPPER_FUNCTION_NAME),
+        None,
     )
+    wrapper_table = next((child for child in table.get_children() if child.get_name() == _WRAPPER_FUNCTION_NAME), None)
+    if wrapper_node is None or wrapper_table is None:
+        return None
+    body_bound_names = frozenset(
+        symbol.get_name() for symbol in wrapper_table.get_symbols() if symbol.is_assigned() and symbol.is_local()
+    )
+    parameter_names = frozenset(
+        normalized
+        for normalized in (unicodedata.normalize("NFKC", key) for key in parameter_keys)
+        if _valid_python_identifier(normalized)
+    )
+    bound_names = body_bound_names | parameter_names
+    # The wrapper strips leading blank lines the runtime keeps, so add them back to land on the
+    # same line the runner reports.
+    dedented = textwrap.dedent(code)
+    offset = dedented[: len(dedented) - len(dedented.lstrip())].count("\n") - wrapper_node.lineno
+
+    helpers: list[NestedHelperScope] = []
+    globals_: list[WrapperScopeGlobal] = []
+    for node in ast.walk(wrapper_node):
+        if node is wrapper_node or not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        own_nodes = list(_own_scope_nodes(node))
+        global_statements = [child for child in own_nodes if isinstance(child, ast.Global)]
+        nonlocal_statements = [child for child in own_nodes if isinstance(child, ast.Nonlocal)]
+        helper = NestedHelperScope(
+            name=node.name,
+            first_line=node.lineno + offset,
+            last_line=(node.end_lineno or node.lineno) + offset,
+            global_names=frozenset(name for statement in global_statements for name in statement.names),
+            nonlocal_names=frozenset(name for statement in nonlocal_statements for name in statement.names),
+            read_write_bindings=_read_write_bindings(own_nodes, offset),
+        )
+        helpers.append(helper)
+        for statement in global_statements:
+            bound = tuple(name for name in statement.names if name in bound_names)
+            if bound:
+                globals_.append(WrapperScopeGlobal(names=bound, line=statement.lineno + offset, helper=helper))
+    return WrapperScopeFacts(
+        bound_names=bound_names,
+        parameter_names=parameter_names,
+        helpers=tuple(helpers),
+        globals=tuple(globals_),
+    )
+
+
+_WRAPPER_SCOPE_REMEDY = (
+    "Accumulate in a flat loop at the top level, or inside the helper declare the name `nonlocal`, "
+    "return the value, or mutate a list/dict accumulator."
+)
+
+
+def _wrapper_scope_global_message(hit: WrapperScopeGlobal, parameter_names: frozenset[str]) -> str:
+    declared = f"Code block declares `global {', '.join(hit.names)}` at line {hit.line} inside `{hit.helper.name}`"
+    if all(name in parameter_names for name in hit.names):
+        return (
+            f"{declared} for a workflow parameter. Parameters are arguments of the wrapper function the block "
+            "body runs in, so the helper's `global` reads and writes a separate module-level copy and the "
+            f"block's own reads never see the update: the run passes with stale output. {_WRAPPER_SCOPE_REMEDY}"
+        )
+    return (
+        f"{declared} for a name assigned at the block's top level. The block body runs as the body of a wrapper "
+        "function it never sees, so top-level names are that function's locals and `global` looks them "
+        "up in a module scope that never holds them: reading the name raises NameError (and "
+        "UnboundLocalError once the `global` is dropped), while a plain assignment writes that module "
+        f"scope instead, so the block silently returns the stale top-level value. {_WRAPPER_SCOPE_REMEDY}"
+    )
+
+
+def wrapper_scope_diagnostics(code: str, *, parameter_keys: Iterable[str] = ()) -> list[CodeBlockPreflightDiagnostic]:
+    facts = wrapper_scope_facts(code, parameter_keys=parameter_keys)
+    if facts is None:
+        return []
+    return [
+        CodeBlockPreflightDiagnostic(
+            code=WRAPPER_SCOPE_GLOBAL_REASON_CODE,
+            message=_wrapper_scope_global_message(hit, facts.parameter_names),
+        )
+        for hit in facts.globals
+    ]
+
+
+def _build_typed_module(code: str, *, parameter_keys: Iterable[str]) -> str:
+    normalized_keys = dict.fromkeys(unicodedata.normalize("NFKC", key) for key in parameter_keys)
+    parameter_declarations = "\n".join(f"{key}: Any" for key in normalized_keys if _valid_python_identifier(key))
     indented_code = textwrap.indent(textwrap.dedent(code).strip() or "pass", "    ")
     if parameter_declarations:
         parameter_declarations += "\n"

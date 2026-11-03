@@ -52,12 +52,14 @@ from skyvern.cli.core.browser_ops import (
     ref_map_from_elements,
     ref_to_selector,
     select_native_option_if_targeted,
+    selector_targets_password,
     serialize_elements,
 )
 from skyvern.cli.core.guards import (
     CREDENTIAL_HINT,
     JS_PASSWORD_PATTERN,
     PASSWORD_PATTERN,
+    STALE_FRAME_HINT,
     GuardError,
     check_password_prompt,
 )
@@ -65,12 +67,31 @@ from skyvern.cli.core.guards import resolve_ai_mode as _resolve_ai_mode
 from skyvern.cli.core.guards import (
     validate_wait_until,
 )
+from skyvern.cli.core.js_dispatch import (
+    cancel_aware,
+    cancellation_pending,
+    deadline_ended_the_call,
+    deadline_reached,
+    raise_if_cancelled,
+    record_browser_timeout,
+    record_unreported_timeout,
+    under_action_deadline,
+    unwrap_caller_js_error,
+    without_navigation_recovery,
+)
+from skyvern.cli.core.page_change import is_page_change_error
 from skyvern.cli.core.perception_telemetry import PerceptionSnapshotCategory, track_perception_snapshot
 from skyvern.cli.core.session_manager import ObserveV2State, get_observe_v2_state, is_stateless_http_mode
 from skyvern.cli.core.trajectory_store import append_trajectory_entry
 from skyvern.config import settings
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException
+from skyvern.exceptions import (
+    ActionDeadlineExceeded,
+    BlockedHost,
+    SkyvernHTTPException,
+    SkyvernPageAnalysisTimeout,
+    StaleFrameSelectionError,
+)
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.copilot.typed_value_policy import typed_text_looks_secret
 from skyvern.forge.sdk.core import skyvern_context
@@ -78,6 +99,10 @@ from skyvern.schemas.action_log import ActionLogOutcome, project_action_event
 from skyvern.schemas.run_blocks import CredentialType
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.actions.handler_utils import strategy_aware_input
+from skyvern.webeye.actions.key_names import normalize_key_chord
+from skyvern.webeye.browser_health import BrowserOperation, frame_kind_of
+from skyvern.webeye.navigation import reported_nav_error_code
+from skyvern.webeye.utils.page import SkyvernFrame
 
 from ._common import (
     AI_FALLBACK_DESCRIPTION,
@@ -91,17 +116,22 @@ from ._common import (
     save_artifact,
 )
 from ._element_state import (
+    ACTION_DEADLINE_HINT,
     ACTION_TIMEOUT_DESCRIPTION,
+    DEFAULT_ACTION_TIMEOUT_MS,
     MAX_ACTION_TIMEOUT_MS,
     MIN_ACTION_TIMEOUT_MS,
+    action_deadline_error,
     classify_element_state,
     element_state_error,
+    exception_message,
     is_direct_action,
     is_pointer_interception_error,
     make_direct_action_error,
     resolve_action_timeout_ms,
 )
 from ._localhost import is_localhost_url
+from ._read_retry import retry_read_on_page_change
 from ._session import (
     BrowserNotAvailableError,
     begin_session_ref_publication,
@@ -124,8 +154,6 @@ LOG = structlog.get_logger(__name__)
 # Matches `await` as a keyword, not inside single-line comments or strings.
 _AWAIT_RE = re.compile(r"\bawait\b")
 _SINGLE_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
-_ERROR_MESSAGE_MAX_CHARS = 500
-_ERROR_BODY_MESSAGE_KEYS = ("detail", "error", "message")
 _LOCAL_UPLOAD_MAX_FILES = 20
 _LOCAL_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
 _LOCAL_UPLOAD_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
@@ -330,54 +358,12 @@ def _add_timing_prefix(timing_ms: dict[str, int], elapsed_ms: int) -> dict[str, 
     return {name: duration if name == "attach" else elapsed_ms + duration for name, duration in timing_ms.items()}
 
 
-def _truncate_error_message(message: str) -> str:
-    message = message.strip()
-    if len(message) <= _ERROR_MESSAGE_MAX_CHARS:
-        return message
-    return f"{message[:_ERROR_MESSAGE_MAX_CHARS]}..."
-
-
-def _message_from_error_body(body: Any) -> str | None:
-    if isinstance(body, dict):
-        for key in _ERROR_BODY_MESSAGE_KEYS:
-            value = body.get(key)
-            if isinstance(value, str) and value.strip():
-                return _truncate_error_message(value)
-            if isinstance(value, dict):
-                nested = _message_from_error_body(value)
-                if nested:
-                    return nested
-    # Only whitelisted dict keys are surfaced. A raw string body (or any unrecognized shape)
-    # from an SDK ApiError can carry secrets/tokens, so it is never surfaced verbatim.
-    return None
-
-
 def _exception_details(exc: Exception) -> dict[str, Any]:
     details: dict[str, Any] = {"exception_type": type(exc).__name__}
     status_code = getattr(exc, "status_code", None)
     if status_code is not None:
         details["status_code"] = status_code
     return details
-
-
-def _exception_message(exc: Exception) -> str:
-    status_code = getattr(exc, "status_code", None)
-    # 5xx bodies carry the backend's wrapped internal exception text (see
-    # get_user_facing_exception_message's "Unexpected error: {exception}" fallback in
-    # skyvern/exceptions.py) — never surface them. 4xx bodies are the API's intended
-    # client-facing feedback (typed BadRequest/NotFound/UnprocessableEntity errors).
-    surface_body = status_code is None or (isinstance(status_code, int) and 400 <= status_code < 500)
-    body_message = _message_from_error_body(getattr(exc, "body", None)) if surface_body else None
-    if body_message:
-        return f"HTTP {status_code}: {body_message}" if status_code is not None else body_message
-    # API-error-shaped exceptions (SDK ApiError) have a leaky __str__ that renders headers
-    # and the raw body; never fall back to str(exc) for them — surface only status + type.
-    if status_code is not None or hasattr(exc, "body"):
-        return f"HTTP {status_code}: {type(exc).__name__}" if status_code is not None else type(exc).__name__
-    message = str(exc).strip()
-    if message:
-        return _truncate_error_message(message)
-    return type(exc).__name__
 
 
 def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
@@ -397,6 +383,24 @@ def _log_direct_failure_diagnostics(action: str, page: Any, selector: str, exc: 
         page_url=str(getattr(target, "url", None))[:200],
         element_state=(error.get("details") or {}).get("element_state"),
         playwright_error=str(exc)[:300],
+    )
+
+
+def _action_deadline_result(
+    action_result: Callable[..., dict[str, Any]],
+    action: str,
+    exc: ActionDeadlineExceeded,
+    ctx: BrowserContext,
+    timing_ms: dict[str, int] | None = None,
+    *,
+    mutating: bool = True,
+) -> dict[str, Any]:
+    return action_result(
+        action,
+        ok=False,
+        browser_context=ctx,
+        timing_ms=timing_ms,
+        error=action_deadline_error(exc, mutating=mutating),
     )
 
 
@@ -491,7 +495,7 @@ async def skyvern_navigate(
         return make_result(
             "skyvern_navigate",
             ok=False,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
 
     try:
@@ -515,14 +519,14 @@ async def skyvern_navigate(
                 "skyvern_navigate",
                 ok=False,
                 browser_context=ctx,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), hint),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), hint, exc=e),
             )
     except SkyvernHTTPException as e:
         return action_result(
             "skyvern_navigate",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL"),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL", exc=e),
         )
 
     # Any navigation attempt may destroy iframes — clear frame state upfront
@@ -548,15 +552,28 @@ async def skyvern_navigate(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
             )
         except Exception as e:
+            # A goto the driver itself timed out never committed, so the effect is known and the URL
+            # hint still applies; only a driver that stopped answering leaves the effect unknown.
+            deadline_exceeded = isinstance(e, ActionDeadlineExceeded)
+            timed_out = deadline_exceeded or isinstance(e, PlaywrightTimeoutError)
             return action_result(
                 "skyvern_navigate",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the URL is valid and accessible"),
+                error=make_error(
+                    ErrorCode.TIMEOUT if timed_out else ErrorCode.ACTION_FAILED,
+                    str(e),
+                    ACTION_DEADLINE_HINT if deadline_exceeded else "Check that the URL is valid and accessible",
+                    # The driver's own code, read from the exception it raised. A caller deciding who
+                    # owns the failure cannot get that from the message: this path returns str(e), and
+                    # a page or a model can write any sentence.
+                    details={"nav_error_code": await reported_nav_error_code(e, url)},
+                    exc=e,
+                ),
             )
         finally:
             # No publication made while navigation was in flight is trustworthy:
@@ -638,7 +655,7 @@ async def skyvern_click(
         return make_result(
             "skyvern_click",
             ok=False,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
     if coordinate_target is None:
         ai_mode, err = _resolve_ai_mode(selector, intent)
@@ -678,29 +695,36 @@ async def skyvern_click(
             if click_count is not None:
                 kwargs["click_count"] = click_count
 
+            # Each leg advertises the whole budget to the driver, so they are bounded one at a time:
+            # one bound spanning both would hand the second leg whatever the first left over.
             if coordinate_target is not None:
                 assert x is not None and y is not None
-                await do_click_at(
-                    page,
-                    x,
-                    y,
-                    button=button or "left",
-                    click_count=click_count if click_count is not None else 1,
-                )
+                # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                _ = page.locator_scope
+                async with under_action_deadline(budget_ms=action_timeout):
+                    await do_click_at(
+                        page,
+                        x,
+                        y,
+                        button=button or "left",
+                        click_count=click_count if click_count is not None else 1,
+                    )
                 resolved = coordinate_target
             else:
                 if selector is not None and (deterministic or ai_mode is None or ai_mode == "fallback"):
-                    native_option_selection = await select_native_option_if_targeted(
-                        page,
-                        selector,
-                        timeout=action_timeout,
-                    )
+                    async with under_action_deadline(budget_ms=action_timeout):
+                        native_option_selection = await select_native_option_if_targeted(
+                            page,
+                            selector,
+                            timeout=action_timeout,
+                        )
                 if native_option_selection is not None:
                     resolved = native_option_selection.select_selector
                 elif deterministic:
                     # selector_mode="direct": pin the selector, no overlay-dismiss or AI re-target, so a
                     # missed target fails fast and the agent re-derives it instead of AI scout-scrolling.
-                    resolved = await page.click(selector=selector, mode="direct", **kwargs)
+                    async with under_action_deadline(budget_ms=action_timeout):
+                        resolved = await page.click(selector=selector, mode="direct", **kwargs)
                 elif ai_mode is not None:
                     used_ai_path = True
                     resolved = await page.click(selector=selector, prompt=intent, ai=ai_mode, **kwargs)  # type: ignore[arg-type]
@@ -708,8 +732,13 @@ async def skyvern_click(
                     assert selector is not None
                     if isinstance(page, SkyvernPage):
                         kwargs["_skip_element_prep"] = skip_element_prep
-                    resolved = await page.click(selector=selector, **kwargs)
+                    # Doubled: this leg dismisses an overlay and clicks a second time, each with
+                    # the whole budget, and threading one deadline would change every SDK caller.
+                    async with under_action_deadline(budget_ms=2 * action_timeout):
+                        resolved = await page.click(selector=selector, **kwargs)
             timer.mark("sdk")
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_click", e, ctx, timer.timing_ms)
         except PlaywrightTimeoutError as e:
             if coordinate_target is not None:
                 return action_result(
@@ -721,6 +750,7 @@ async def skyvern_click(
                         ErrorCode.ACTION_FAILED,
                         str(e),
                         "Check that the coordinates are within the current viewport",
+                        exc=e,
                     ),
                 )
             if direct_action and selector is not None:
@@ -734,6 +764,7 @@ async def skyvern_click(
                     ErrorCode.SELECTOR_NOT_FOUND,
                     str(e),
                     "Verify the selector matches an element on the page, or use intent for AI-powered finding",
+                    exc=e,
                 ),
             )
         except Exception as e:
@@ -747,9 +778,10 @@ async def skyvern_click(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    _exception_message(e),
+                    exception_message(e),
                     "The element may be hidden, disabled, or intercepted by another element",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -898,6 +930,8 @@ async def skyvern_drag(
     with Timer() as timer:
         try:
             if use_selectors:
+                # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                _ = page.locator_scope
                 await page.page.drag_and_drop(
                     source_selector,
                     target_selector,
@@ -925,9 +959,10 @@ async def skyvern_drag(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SELECTOR_NOT_FOUND,
-                    _exception_message(e),
+                    exception_message(e),
                     "Verify source and target selectors match elements on the page",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
         except Exception as e:
@@ -947,9 +982,10 @@ async def skyvern_drag(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.ACTION_FAILED,
-                    _exception_message(e),
+                    exception_message(e),
                     "The drag operation failed",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -1110,6 +1146,8 @@ async def skyvern_file_upload(
             else:
                 assert selector is not None
                 assert local_uploads is not None
+                # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                _ = page.locator_scope
                 locator = page.page.locator(selector).first
                 await locator.set_input_files(local_uploads, timeout=action_timeout)
 
@@ -1128,6 +1166,7 @@ async def skyvern_file_upload(
                     ErrorCode.SELECTOR_NOT_FOUND,
                     str(e),
                     "Verify the selector matches the file input or upload button",
+                    exc=e,
                 ),
             )
         except Exception as e:
@@ -1141,7 +1180,9 @@ async def skyvern_file_upload(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(code, _exception_message(e), "File upload failed", details=_exception_details(e)),
+                error=make_error(
+                    code, exception_message(e), "File upload failed", details=_exception_details(e), exc=e
+                ),
             )
 
     return action_result(
@@ -1207,6 +1248,7 @@ async def skyvern_hover(
                     ErrorCode.SELECTOR_NOT_FOUND,
                     str(e),
                     "Verify the selector matches an element on the page, or use intent for AI-powered finding",
+                    exc=e,
                 ),
             )
         except Exception as e:
@@ -1220,9 +1262,10 @@ async def skyvern_hover(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    _exception_message(e),
+                    exception_message(e),
                     "The element may be hidden or not interactable",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -1276,6 +1319,14 @@ async def skyvern_type(
         Field(description="Clear existing content before coordinate typing; defaults to clear"),
     ] = None,
     press_enter: Annotated[bool, Field(description="Press Enter after typing")] = False,
+    input_method: Annotated[
+        Literal["keyboard", "value"],
+        Field(
+            description="keyboard preserves normal typing. value is an opt-in fixed extension form fill without "
+            "focusing the field or evaluating caller JavaScript. Requires a unique main-frame CSS selector, "
+            "clear=true, no intent/coordinates/delay/Enter, and a supported non-password text input or textarea."
+        ),
+    ] = "keyboard",
 ) -> dict[str, Any]:
     """Type using viewport coordinates, AI intent, CSS/XPath selector, or a selector with intent fallback.
     Clears field by default (set clear=false to append).
@@ -1283,13 +1334,39 @@ async def skyvern_type(
     """
     selector = _blank_to_none(selector)
     intent = _blank_to_none(intent)
+    clear_content = clear if clear_first is None else clear_first
+    if input_method not in {"keyboard", "value"} or (
+        input_method == "value"
+        and (
+            selector is None
+            or selector.startswith(("//", "xpath="))
+            or len(selector) > 4096
+            or len(text) > 65536
+            or intent is not None
+            or x is not None
+            or y is not None
+            or not clear
+            or clear_first is not None
+            or delay is not None
+            or press_enter
+        )
+    ):
+        return make_result(
+            "skyvern_type",
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Value mode requires a CSS selector, clear=true, and no intent, coordinates, delay, or Enter.",
+                "Use a unique selector of at most 4096 characters and plain text of at most 65536 characters.",
+            ),
+        )
     try:
         coordinate_target = _coordinate_target(x, y, selector)
     except GuardError as e:
         return make_result(
             "skyvern_type",
             ok=False,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
 
     target_text = f"{intent or ''} {selector or ''}"
@@ -1332,31 +1409,73 @@ async def skyvern_type(
     )
     source_url = _trajectory_source_url(page)
 
-    clear_content = clear if clear_first is None else clear_first
     deterministic = selector is not None and selector_mode == "direct"
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
     skip_element_prep = selector is not None and ai_mode is None and not deterministic
-    aggregate_timeout_seconds = action_timeout / 1000 if direct_action and action_timeout > 0 else None
+
+    if input_method == "value":
+        from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+
+        runtime = BrowserExtensionRuntime.instance()
+        with Timer() as timer:
+            try:
+                if ctx.mode != "extension" or runtime is None or cdp_url is not None:
+                    return action_result(
+                        "skyvern_type",
+                        ok=False,
+                        error=make_error(
+                            ErrorCode.INVALID_INPUT,
+                            "Value mode requires an extension session.",
+                            "Use the extension session or keep the default keyboard input method.",
+                        ),
+                    )
+                if page.locator_scope is not page.page:
+                    return action_result(
+                        "skyvern_type",
+                        ok=False,
+                        error=make_error(
+                            ErrorCode.INVALID_INPUT,
+                            "Value mode supports only the selected main frame.",
+                            "Select the main frame before using the fixed extension fill.",
+                        ),
+                    )
+                assert selector is not None
+                async with asyncio.timeout(action_timeout / 1000):
+                    await runtime.fill_input(page.page, selector, text, timeout=action_timeout / 1000)
+                timer.mark("extension")
+            except Exception as exc:
+                return action_result(
+                    "skyvern_type",
+                    ok=False,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.ACTION_FAILED,
+                        exception_message(exc),
+                        "Inspect the selected page before retrying. Keep existing permissions; no fallback was attempted.",
+                        exc=exc,
+                    ),
+                )
+        return action_result(
+            "skyvern_type",
+            data={"text_length": len(text), "input_method": "value"},
+            timing_ms=timer.timing_ms,
+        )
 
     with Timer() as timer:
         try:
-            async with asyncio.timeout(aggregate_timeout_seconds):
-                # DOM-level guard: inspect the same active-scope first match used by direct strategy typing.
-                scoped_first_locator = None
+            # Five sequential legs, none ours to thread: the password probe (which must carry the
+            # write's own timeout), the SDK input strategy's fill/change/blur, and the optional Enter.
+            # Coordinate typing is the same shape without inference, so it shares the bound.
+            bounded = (direct_action or coordinate_target is not None) and action_timeout > 0
+            async with under_action_deadline(budget_ms=5 * action_timeout if bounded else None):
                 if selector:
-                    try:
-                        scoped_first_locator = page.locator_scope.locator(selector).first
-                        is_password_field = await scoped_first_locator.evaluate(
-                            "el => el.tagName === 'INPUT' && "
-                            "(el.getAttribute('type') || '').toLowerCase() === 'password'"
-                        )
-                    except Exception as exc:
-                        # Selector may be invalid or the page may not be ready. Fall through to the
-                        # existing credential-intent guard in that case.
-                        LOG.debug("DOM password check failed for selector %r: %s", selector, exc)
-                        is_password_field = False
-                    if is_password_field:
+                    probe_scopes: list[Any] = [page.locator_scope]
+                    if ai_mode is not None and not deterministic and page.page is not probe_scopes[0]:
+                        # AI-assisted writes resolve the selector against the top document, so a
+                        # probe confined to the selected frame would miss the input they land in.
+                        probe_scopes.append(page.page)
+                    if await selector_targets_password(probe_scopes, selector, timeout=action_timeout):
                         return action_result(
                             "skyvern_type",
                             ok=False,
@@ -1372,6 +1491,8 @@ async def skyvern_type(
                 # sdk_equivalent for DOM-drift resilience.
                 if coordinate_target is not None:
                     assert x is not None and y is not None
+                    # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                    _ = page.locator_scope
                     await do_type_at(
                         page,
                         x,
@@ -1383,11 +1504,7 @@ async def skyvern_type(
                 elif clear_content:
                     if deterministic:
                         assert selector is not None
-                        locator = (
-                            scoped_first_locator
-                            if scoped_first_locator is not None
-                            else page.locator_scope.locator(selector).first
-                        )
+                        locator = page.locator_scope.locator(selector).first
                         await strategy_aware_input(
                             locator,
                             text,
@@ -1416,11 +1533,7 @@ async def skyvern_type(
                         kwargs["delay"] = delay
                     if deterministic:
                         assert selector is not None
-                        locator = (
-                            scoped_first_locator
-                            if scoped_first_locator is not None
-                            else page.locator_scope.locator(selector).first
-                        )
+                        locator = page.locator_scope.locator(selector).first
                         await strategy_aware_input(
                             locator,
                             text,
@@ -1446,8 +1559,10 @@ async def skyvern_type(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
             )
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_type", e, ctx, timer.timing_ms)
         except (TimeoutError, PlaywrightTimeoutError) as e:
             if isinstance(e, TimeoutError):
                 e = PlaywrightTimeoutError(f"Timeout {action_timeout}ms exceeded.")
@@ -1461,6 +1576,7 @@ async def skyvern_type(
                         ErrorCode.ACTION_FAILED,
                         str(e),
                         "Check that the coordinates are within the current viewport",
+                        exc=e,
                     ),
                 )
             if direct_action and selector is not None:
@@ -1476,6 +1592,7 @@ async def skyvern_type(
                     ErrorCode.SELECTOR_NOT_FOUND,
                     str(e),
                     "Verify the selector matches an editable element, or use intent for AI-powered finding",
+                    exc=e,
                 ),
             )
         except Exception as e:
@@ -1491,9 +1608,10 @@ async def skyvern_type(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    _exception_message(e),
+                    exception_message(e),
                     "The element may not be editable or may be hidden",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -1573,15 +1691,22 @@ async def skyvern_screenshot(
 
     with Timer() as timer:
         try:
-            result = await do_screenshot(page, full_page=full_page, selector=selector)
+            async with under_action_deadline(
+                budget_ms=DEFAULT_ACTION_TIMEOUT_MS, operation=BrowserOperation.SCREENSHOT
+            ):
+                result = await retry_read_on_page_change(
+                    "skyvern_screenshot", page, lambda: do_screenshot(page, full_page=full_page, selector=selector)
+                )
             timer.mark("sdk")
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_screenshot", e, ctx, timer.timing_ms, mutating=False)
         except Exception as e:
             return action_result(
                 "skyvern_screenshot",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the page or element is visible"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the page or element is visible", exc=e),
             )
 
     ts = datetime.now(timezone.utc).strftime("%H%M%S_%f")
@@ -1594,6 +1719,11 @@ async def skyvern_screenshot(
         session_id=ctx.session_id,
     )
 
+    viewport = (
+        {"viewport": {"width": result.viewport_css_px[0], "height": result.viewport_css_px[1]}}
+        if result.viewport_css_px
+        else {}
+    )
     if inline:
         data_b64 = base64.b64encode(result.data).decode("utf-8")
         return action_result(
@@ -1606,6 +1736,7 @@ async def skyvern_screenshot(
                 "mime": "image/png",
                 "bytes": len(result.data),
                 "sdk_equivalent": "await page.screenshot()",
+                **viewport,
             },
             artifacts=[artifact],
             timing_ms=timer.timing_ms,
@@ -1615,7 +1746,7 @@ async def skyvern_screenshot(
     return action_result(
         "skyvern_screenshot",
         browser_context=ctx,
-        data={"path": artifact.path, "sdk_equivalent": "await page.screenshot(path='screenshot.png')"},
+        data={"path": artifact.path, "sdk_equivalent": "await page.screenshot(path='screenshot.png')", **viewport},
         artifacts=[artifact],
         timing_ms=timer.timing_ms,
     )
@@ -1654,8 +1785,10 @@ async def skyvern_scroll(
         with Timer() as timer:
             try:
                 loc = page.locator(selector=selector, prompt=intent, ai=ai_mode)
-                await loc.scroll_into_view_if_needed()
+                await loc.scroll_into_view_if_needed(timeout=DEFAULT_ACTION_TIMEOUT_MS)
                 timer.mark("sdk")
+            except ActionDeadlineExceeded as e:
+                return _action_deadline_result(action_result, "skyvern_scroll", e, ctx, timer.timing_ms)
             except Exception as e:
                 code = ErrorCode.AI_FALLBACK_FAILED if ai_mode == "fallback" else ErrorCode.ACTION_FAILED
                 return action_result(
@@ -1665,9 +1798,10 @@ async def skyvern_scroll(
                     timing_ms=timer.timing_ms,
                     error=make_error(
                         code,
-                        _exception_message(e),
+                        exception_message(e),
                         "Could not find element to scroll into view",
                         details=_exception_details(e),
+                        exc=e,
                     ),
                 )
 
@@ -1698,18 +1832,23 @@ async def skyvern_scroll(
 
     with Timer() as timer:
         try:
-            if selector:
-                await page.locator(selector).evaluate(f"el => el.scrollBy({dx}, {dy})")
-            else:
-                await page.evaluate(f"window.scrollBy({dx}, {dy})")
+            async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+                if selector:
+                    await page.locator(selector).evaluate(f"el => el.scrollBy({dx}, {dy})")
+                else:
+                    # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                    _ = page.locator_scope
+                    await page.evaluate(f"window.scrollBy({dx}, {dy})")
             timer.mark("sdk")
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_scroll", e, ctx, timer.timing_ms)
         except Exception as e:
             return action_result(
                 "skyvern_scroll",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Scroll action failed"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Scroll action failed", exc=e),
             )
 
     return action_result(
@@ -1769,7 +1908,7 @@ async def skyvern_select_option(
         return make_result(
             "skyvern_select_option",
             ok=False,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
 
     try:
@@ -1784,19 +1923,32 @@ async def skyvern_select_option(
     direct_action = is_direct_action(selector, ai_mode, deterministic=deterministic)
     action_timeout = resolve_action_timeout_ms(timeout, direct_action=direct_action)
 
+    try:
+        scope = page.locator_scope
+    except StaleFrameSelectionError as e:
+        return action_result(
+            "skyvern_select_option",
+            ok=False,
+            browser_context=ctx,
+            error=make_error(ErrorCode.STALE_FRAME_SELECTION, str(e), STALE_FRAME_HINT, exc=e),
+        )
+
     # Credential safety runs OUTSIDE the custom-select gate and the kill switch: a password
     # target must never be filled or have its value forwarded to the AI-fallback LLM payload.
     # When the target type cannot be determined, fail closed for the value-bearing AI path.
     password_target: bool | None = False
     if selector is not None:
-        scope: Any = getattr(page, "_locator_scope", None) or getattr(page, "page", page)
+        probe_timeout = min(action_timeout, 1000)
         try:
-            password_target = bool(
-                await scope.locator(selector).first.evaluate(
-                    "el => el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password'",
-                    timeout=min(action_timeout, 1000),
+            async with under_action_deadline(budget_ms=probe_timeout):
+                password_target = bool(
+                    await scope.locator(selector).first.evaluate(
+                        "el => el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password'",
+                        timeout=probe_timeout,
+                    )
                 )
-            )
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_select_option", e, ctx, mutating=False)
         except Exception:
             password_target = None
     if password_target or (password_target is None and ai_mode is not None and not deterministic):
@@ -1820,17 +1972,20 @@ async def skyvern_select_option(
         custom_fallback_attempted = False
         with Timer() as custom_timer:
             try:
-                custom_selection = await do_select_option(
-                    getattr(page, "_locator_scope", None) or getattr(page, "page", page),
-                    selector,
-                    value,
-                    by_label=by_label,
-                    timeout=action_timeout,
-                    restore_value_on_failure=ai_mode == "fallback" and not deterministic,
-                    fail_closed_on_unknown=ai_mode is not None and not deterministic,
-                )
+                async with under_action_deadline(budget_ms=action_timeout):
+                    custom_selection = await do_select_option(
+                        scope,
+                        selector,
+                        value,
+                        by_label=by_label,
+                        timeout=action_timeout,
+                        restore_value_on_failure=ai_mode == "fallback" and not deterministic,
+                        fail_closed_on_unknown=ai_mode is not None and not deterministic,
+                    )
                 if custom_selection is not None:
                     custom_timer.mark("sdk")
+            except ActionDeadlineExceeded as e:
+                return _action_deadline_result(action_result, "skyvern_select_option", e, ctx, custom_timer.timing_ms)
             except CustomSelectPasswordError:
                 # Terminal for every call shape (direct AND hybrid): a password value must
                 # never reach the native SDK fill or the AI-fallback LLM payload.
@@ -1879,6 +2034,7 @@ async def skyvern_select_option(
                                 "requested_option": e.requested_option,
                                 "observed_options": e.observed_options,
                             },
+                            exc=e,
                         ),
                     )
                 custom_fallback_attempted = True
@@ -1893,9 +2049,10 @@ async def skyvern_select_option(
                         timing_ms=custom_timer.timing_ms,
                         error=make_error(
                             ErrorCode.ACTION_FAILED,
-                            _exception_message(e),
+                            exception_message(e),
                             "Could not open the dropdown to inspect its options",
                             details=_exception_details(e),
+                            exc=e,
                         ),
                     )
                 custom_fallback_attempted = True
@@ -1911,9 +2068,10 @@ async def skyvern_select_option(
                     timing_ms=custom_timer.timing_ms,
                     error=make_error(
                         ErrorCode.ACTION_FAILED,
-                        _exception_message(e),
+                        exception_message(e),
                         "The custom dropdown selection could not be verified",
                         details=_exception_details(e),
+                        exc=e,
                     ),
                 )
         if custom_fallback_attempted:
@@ -1951,14 +2109,19 @@ async def skyvern_select_option(
                 )
             else:
                 assert selector is not None
-                if by_label:
-                    # Bypass SkyvernPage to avoid value="" coercion conflicting with label kwarg.
-                    await page.page.locator(selector).select_option(label=value, timeout=action_timeout)
-                elif deterministic:
-                    await page.select_option(selector, value=value, ai=None, timeout=action_timeout)
-                else:
-                    await page.select_option(selector, value=value, timeout=action_timeout)
+                async with under_action_deadline(budget_ms=action_timeout):
+                    if by_label:
+                        # Bypass SkyvernPage to avoid value="" coercion conflicting with label kwarg.
+                        # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                        _ = page.locator_scope
+                        await page.page.locator(selector).select_option(label=value, timeout=action_timeout)
+                    elif deterministic:
+                        await page.select_option(selector, value=value, ai=None, timeout=action_timeout)
+                    else:
+                        await page.select_option(selector, value=value, timeout=action_timeout)
             timer.mark("sdk")
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_select_option", e, ctx, timer.timing_ms)
         except PlaywrightTimeoutError as e:
             if direct_action and selector is not None:
                 return await _direct_failure_result(
@@ -1974,9 +2137,10 @@ async def skyvern_select_option(
                     timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
                     error=make_error(
                         code,
-                        _exception_message(e),
+                        exception_message(e),
                         "Check selector and available options",
                         details=_exception_details(e),
+                        exc=e,
                     ),
                 )
             return action_result(
@@ -1986,9 +2150,10 @@ async def skyvern_select_option(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    _exception_message(e),
+                    exception_message(e),
                     "Check selector and available options",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
         except Exception as e:
@@ -2006,9 +2171,10 @@ async def skyvern_select_option(
                     timing_ms=_add_timing_prefix(timer.timing_ms, custom_attempt_ms),
                     error=make_error(
                         code,
-                        _exception_message(e),
+                        exception_message(e),
                         "Check selector and available options",
                         details=_exception_details(e),
+                        exc=e,
                     ),
                 )
             return action_result(
@@ -2018,9 +2184,10 @@ async def skyvern_select_option(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     code,
-                    _exception_message(e),
+                    exception_message(e),
                     "Check selector and available options",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -2076,6 +2243,7 @@ async def skyvern_press_key(
     Use `intent` or `selector` to focus a specific element before pressing.
     Without either, presses the key on the currently focused element.
     """
+    key = normalize_key_chord(key)
     selector = _blank_to_none(selector)
     intent = _blank_to_none(intent)
     try:
@@ -2098,10 +2266,16 @@ async def skyvern_press_key(
                     await loc.press(key, timeout=action_timeout)
                 else:
                     assert selector is not None
-                    await page.locator(selector).press(key, timeout=action_timeout)
+                    async with under_action_deadline(budget_ms=action_timeout):
+                        await page.locator(selector).press(key, timeout=action_timeout)
             else:
-                await page.keyboard.press(key)
+                # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+                _ = page.locator_scope
+                async with under_action_deadline(budget_ms=action_timeout):
+                    await page.keyboard.press(key)
             timer.mark("sdk")
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_press_key", e, ctx, timer.timing_ms)
         except Exception as e:
             if direct_action and selector is not None:
                 if isinstance(e, PlaywrightTimeoutError) or is_pointer_interception_error(e):
@@ -2115,9 +2289,10 @@ async def skyvern_press_key(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.ACTION_FAILED,
-                    _exception_message(e),
+                    exception_message(e),
                     "Check key name is valid",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -2151,6 +2326,25 @@ async def skyvern_press_key(
     )
 
 
+_ORPHANED_WAITERS: set[asyncio.Task[Any]] = set()
+
+
+def _release_waiter(task: asyncio.Task[Any]) -> None:
+    # An abandoned waiter that does not end cancelled reported something other than the cancellation it
+    # was sent, which the engine in use does not do. Selectors stay out of the log.
+    was_abandoned = task in _ORPHANED_WAITERS
+    _ORPHANED_WAITERS.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if was_abandoned:
+        LOG.warning(
+            "Browser wait selector task did not end cancelled",
+            error_type=type(error).__name__ if error is not None else None,
+            orphaned_waiters=len(_ORPHANED_WAITERS),
+        )
+
+
 async def _wait_for_either_selector(
     page: Any,
     selectors: tuple[str, str],
@@ -2165,9 +2359,23 @@ async def _wait_for_either_selector(
     tasks = {asyncio.create_task(page.wait_for_selector(sel, state=state, timeout=timeout)): sel for sel in selectors}
     pending = set(tasks)
     last_error: BaseException | None = None
+    loop = asyncio.get_running_loop()
+    # A waiter whose driver call never returns would otherwise outlast the timeout the caller declared,
+    # so the wait carries that declared bound itself rather than trusting each waiter to honour it.
+    deadline = loop.time() + timeout / 1000
     try:
         while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # A page that simply has neither state reaches here too, so this records the bound
+                # being spent rather than anything going wrong.
+                LOG.info(
+                    "Browser wait ended on its declared timeout",
+                    pending_waiters=len(pending),
+                    timeout_ms=timeout,
+                )
+                break
+            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
             for task in sorted(done, key=lambda settled: selectors.index(tasks[settled])):
                 error = task.exception()
                 if error is None:
@@ -2180,11 +2388,14 @@ async def _wait_for_either_selector(
                     last_error = error
         return None, last_error
     finally:
+        # Awaiting a loser whose driver call ignores cancellation would hold the answer forever, so
+        # the callback reaps it whenever it settles and the set keeps it alive until then. A call
+        # that never settles stays registered, and loop shutdown will still block gathering it.
         for task in tasks:
             task.cancel()
-        # asyncio.wait does not reap its children: drain every task so none outlives the call and
-        # no exception is left unretrieved.
-        await asyncio.gather(*tasks, return_exceptions=True)
+            if not task.done():
+                _ORPHANED_WAITERS.add(task)
+            task.add_done_callback(_release_waiter)
 
 
 async def skyvern_wait(
@@ -2255,7 +2466,7 @@ async def skyvern_wait(
                     if loop.time() >= deadline:
                         code = ErrorCode.SDK_ERROR if last_error else ErrorCode.TIMEOUT
                         msg = (
-                            _exception_message(last_error)
+                            exception_message(last_error)
                             if last_error
                             else f"Condition not met within {timeout}ms: {intent}"
                         )
@@ -2294,9 +2505,10 @@ async def skyvern_wait(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.TIMEOUT,
-                    _exception_message(e),
+                    exception_message(e),
                     hint,
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -2412,8 +2624,14 @@ async def skyvern_wait_for_either_state(
             timing_ms=timer.timing_ms,
             error=make_error(
                 ErrorCode.TIMEOUT,
-                _exception_message(failure) if failure else f"Neither selector reached {state!r}",
-                "The page settled into neither state; both selectors may be wrong for this page",
+                exception_message(failure)
+                if failure
+                else f"Neither {selector_a!r} nor {selector_b!r} reached {state!r} within {timeout}ms",
+                # The declared bound expires while both waiters are still outstanding whether the page
+                # simply lacks these states or the driver stopped answering, so neither is named here.
+                "Neither state was confirmed before the timeout elapsed"
+                if failure is None
+                else "The page settled into neither state; both selectors may be wrong for this page",
                 details=_exception_details(failure) if failure else None,
             ),
         )
@@ -2471,6 +2689,12 @@ async def skyvern_evaluate(
 
     For multi-line await, use an explicit return. Full responses are returned by default; use
     ``verbosity="summary"`` for an opt-in compact response. The mandatory response-size cap still applies.
+    On the page/CDP route an expression that never settles within the browser action deadline returns a
+    TIMEOUT result. Direct JavaScript evaluation is unavailable in extension mode.
+    The extension returns OP_NOT_ALLOWED, which this tool reports as ACTION_FAILED.
+    Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page.
+    Use skyvern_click or skyvern_type to interact. Do not enable User Scripts or reroute the
+    expression through CDP or another injection API.
     Security: executes in page context — use only with trusted expressions.
     """
     # Block JS that sets password field values
@@ -2499,29 +2723,19 @@ async def skyvern_evaluate(
         and cdp_url is None
         and (session_id is None or session_id == current_context.session_id)
     )
-    if direct_extension_evaluation and extension_runtime is not None and current_context is not None:
-        browser_context = current_context
-        with Timer() as timer:
-            try:
-                result = await extension_runtime.evaluate(js)
-                timer.mark("extension")
-            except Exception as exc:
-                return make_result(
-                    "skyvern_evaluate",
-                    ok=False,
-                    browser_context=browser_context,
-                    timing_ms=timer.timing_ms,
-                    error=make_error(
-                        ErrorCode.ACTION_FAILED,
-                        str(exc),
-                        "Select one HTTP(S) tab in Skyvern Controlled and enable Allow User Scripts",
-                    ),
-                )
+    if direct_extension_evaluation:
         return make_result(
             "skyvern_evaluate",
-            browser_context=browser_context,
-            data={"result": result, "sdk_equivalent": f"await page.evaluate({expression[:80]!r})"},
-            timing_ms=timer.timing_ms,
+            ok=False,
+            browser_context=current_context,
+            error=make_error(
+                ErrorCode.ACTION_FAILED,
+                "OP_NOT_ALLOWED: Direct JavaScript evaluation is unavailable in extension mode. "
+                "Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. "
+                "Use skyvern_click or skyvern_type to interact.",
+                "Use the normal browser controls. Do not enable User Scripts or reroute the expression "
+                "through CDP or another injection API.",
+            ),
         )
 
     try:
@@ -2531,17 +2745,46 @@ async def skyvern_evaluate(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
+    scope = None
     with Timer() as timer:
         try:
-            result = await page.locator_scope.evaluate(js)
+            scope = page.locator_scope
+            result = await SkyvernFrame._evaluate_expression(
+                frame=scope,
+                # Logged verbatim on timeout, and a caller's expression can carry data no log
+                # processor knows to redact; the evaluation itself runs the real expression below.
+                expression="skyvern_evaluate caller expression",
+                evaluate_expression=without_navigation_recovery(lambda: page.locator_scope.evaluate(js)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
             timer.mark("sdk")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            original = unwrap_caller_js_error(e)
+            if deadline_ended_the_call(original, deadline):
+                record_unreported_timeout(original, scope)
+                return action_result(
+                    "skyvern_evaluate",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(original),
+                        "The expression never settled, so whether it already took effect is unknown — read the page before retrying, since a re-run would repeat anything it did",
+                        exc=original,
+                    ),
+                )
             return action_result(
                 "skyvern_evaluate",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check JavaScript syntax"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(original), "Check JavaScript syntax", exc=original),
             )
 
     return action_result(
@@ -2584,7 +2827,7 @@ async def skyvern_extract(
             return make_result(
                 "skyvern_extract",
                 ok=False,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
             )
     else:
         parsed_schema = None
@@ -2606,7 +2849,7 @@ async def skyvern_extract(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
             )
         except Exception as e:
             return action_result(
@@ -2616,9 +2859,10 @@ async def skyvern_extract(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    _exception_message(e),
+                    exception_message(e),
                     "Check that the page has loaded and the prompt is clear",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -2784,6 +3028,9 @@ async def skyvern_evaluate_and_screenshot(
 ) -> dict[str, Any]:
     """Run JavaScript to read the page AND capture a screenshot in ONE call.
 
+    Direct JavaScript evaluation is unavailable in extension mode. This tool returns the evaluation
+    failure and can still return screenshot evidence. Use inspection and interaction tools instead.
+
     A single "do it and prove it" primitive: your JS returns the scraped values and the tool returns
     them together with a screenshot of the page as visual proof, so every fact you read is backed by
     an image without a second tool call. The screenshot is saved to a file path by default (pass
@@ -2930,9 +3177,10 @@ async def skyvern_validate(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    _exception_message(e),
+                    exception_message(e),
                     "Check that the page has loaded and the prompt is clear",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -2959,7 +3207,7 @@ async def skyvern_act(
         return make_result(
             "skyvern_act",
             ok=False,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
 
     try:
@@ -2979,7 +3227,7 @@ async def skyvern_act(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
             )
         except Exception as e:
             return action_result(
@@ -2989,9 +3237,10 @@ async def skyvern_act(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    _exception_message(e),
+                    exception_message(e),
                     "Simplify the prompt or break the task into steps",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -3069,6 +3318,7 @@ async def skyvern_run_task(
                     ErrorCode.INVALID_INPUT,
                     f"Invalid data_extraction_schema JSON: {e}",
                     "Provide schema as a valid JSON string",
+                    exc=e,
                 ),
             )
 
@@ -3102,9 +3352,10 @@ async def skyvern_run_task(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    _exception_message(e),
+                    exception_message(e),
                     "Check the prompt, URL, and timeout settings",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -3268,9 +3519,10 @@ async def skyvern_login(
                 timing_ms=timer.timing_ms,
                 error=make_error(
                     ErrorCode.SDK_ERROR,
-                    _exception_message(e),
+                    exception_message(e),
                     "Check credential_type and required fields for your credential provider",
                     details=_exception_details(e),
+                    exc=e,
                 ),
             )
 
@@ -3329,20 +3581,27 @@ async def skyvern_frame_switch(
 
     with Timer() as timer:
         try:
-            result = await do_frame_switch(page, selector=selector, name=name, index=index)
+            async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+                result = await do_frame_switch(page, selector=selector, name=name, index=index)
             timer.mark("sdk")
 
             # Persist frame on session state for subsequent MCP calls
             state = get_current_session()
             state._working_frame = page._working_frame
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+        except ActionDeadlineExceeded as e:
+            # The switch may still land after the deadline; keep the session in step with the page.
+            state = get_current_session()
+            state._working_frame = page._working_frame
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+            return _action_deadline_result(action_result, "skyvern_frame_switch", e, ctx, timer.timing_ms)
         except ValueError as e:
             return action_result(
                 "skyvern_frame_switch",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use skyvern_frame_list to find valid frames"),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use skyvern_frame_list to find valid frames", exc=e),
             )
         except Exception as e:
             return action_result(
@@ -3350,7 +3609,9 @@ async def skyvern_frame_switch(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "The iframe may not be loaded yet — try waiting"),
+                error=make_error(
+                    ErrorCode.ACTION_FAILED, str(e), "The iframe may not be loaded yet — try waiting", exc=e
+                ),
             )
 
     return action_result(
@@ -3420,15 +3681,18 @@ async def skyvern_frame_list(
 
     with Timer() as timer:
         try:
-            frames = await do_frame_list(page)
+            async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+                frames = await do_frame_list(page)
             timer.mark("sdk")
+        except ActionDeadlineExceeded as e:
+            return _action_deadline_result(action_result, "skyvern_frame_list", e, ctx, timer.timing_ms, mutating=False)
         except Exception as e:
             return action_result(
                 "skyvern_frame_list",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Ensure a page is loaded first"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Ensure a page is loaded first", exc=e),
             )
 
     return action_result(
@@ -3475,7 +3739,7 @@ async def skyvern_find(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
             )
         except Exception as e:
             return action_result(
@@ -3483,7 +3747,7 @@ async def skyvern_find(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check the locator type and value"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check the locator type and value", exc=e),
             )
 
     return action_result(
@@ -3500,11 +3764,17 @@ async def skyvern_find(
     )
 
 
-async def _ensure_clipboard_permissions(page: Any) -> None:
-    """Grant clipboard permissions on the browser context (lazy, idempotent)."""
+async def _ensure_clipboard_permissions(page: Any, deadline: float) -> None:
+    """Grant clipboard permissions on the browser context (lazy, idempotent).
+
+    Shares the caller's action deadline so a browser that stops answering the grant cannot outlast
+    the bound its tool promises; a grant that times out is skipped like any other failed grant."""
     try:
-        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
-    except Exception:
+        async with asyncio.timeout_at(deadline):
+            await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    except Exception as exc:
+        if cancellation_pending():
+            raise asyncio.CancelledError from exc
         LOG.debug("clipboard_permission_grant_skipped", exc_info=True)
 
 
@@ -3516,7 +3786,7 @@ async def skyvern_clipboard_read(
 
     Returns the current clipboard text content. Requires secure context
     (HTTPS or localhost). Clipboard permissions are granted automatically
-    on first use.
+    on first use. A read that never settles within the browser action deadline returns a TIMEOUT result.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -3525,19 +3795,51 @@ async def skyvern_clipboard_read(
 
     action_result = _action_result_factory(ctx=ctx, page=page)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            await _ensure_clipboard_permissions(page)
-            text = await page.evaluate("() => navigator.clipboard.readText()")
+            await _ensure_clipboard_permissions(page, deadline)
+            if deadline_reached(deadline):
+                # Dispatching now would start a call the expired deadline cancels mid-flight,
+                # leaving its effect unknown; nothing has been sent yet, so report that instead.
+                # The engine never ran, so nothing else will tally the browser that stopped answering.
+                record_browser_timeout(frame_kind=frame_kind_of(page.page))
+                raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
+            read_js = "() => navigator.clipboard.readText()"
+            text = await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                expression=read_js,
+                evaluate_expression=lambda: page.evaluate(read_js),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+            raise_if_cancelled()
             timer.mark("clipboard_read")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            if deadline_ended_the_call(e, deadline):
+                record_unreported_timeout(e, page.page)
+                return action_result(
+                    "skyvern_clipboard_read",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(e),
+                        "The clipboard read never settled — retry after focusing the page",
+                        exc=e,
+                    ),
+                )
             return action_result(
                 "skyvern_clipboard_read",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
                 error=make_error(
-                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)"
+                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)", exc=e
                 ),
             )
 
@@ -3557,8 +3859,9 @@ async def skyvern_clipboard_write(
     """Copy text to the browser clipboard (as if the user pressed Ctrl+C).
 
     The text can then be pasted into form fields or read back with
-    clipboard_read. Requires secure context (HTTPS or localhost).
-    Clipboard permissions are granted automatically on first use.
+    clipboard_read. Requires secure context (HTTPS or localhost). Clipboard permissions are
+    granted automatically on first use. A write that never settles within the browser action deadline
+    returns a TIMEOUT result.
     """
     try:
         page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
@@ -3567,19 +3870,51 @@ async def skyvern_clipboard_write(
 
     action_result = _action_result_factory(ctx=ctx, page=page, typed_text=text)
 
+    deadline = asyncio.get_running_loop().time() + DEFAULT_ACTION_TIMEOUT_MS / 1000
+
     with Timer() as timer:
         try:
-            await _ensure_clipboard_permissions(page)
-            await page.evaluate("(t) => navigator.clipboard.writeText(t)", text)
+            await _ensure_clipboard_permissions(page, deadline)
+            if deadline_reached(deadline):
+                # Dispatching now would start a write the expired deadline cancels mid-flight,
+                # leaving the clipboard in an unknown state; nothing has been sent yet.
+                # The engine never ran, so nothing else will tally the browser that stopped answering.
+                record_browser_timeout(frame_kind=frame_kind_of(page.page))
+                raise SkyvernPageAnalysisTimeout("The clipboard permission grant used the whole action deadline")
+            write_js = "(t) => navigator.clipboard.writeText(t)"
+            await SkyvernFrame._evaluate_expression(
+                frame=page.page,
+                expression=write_js,
+                evaluate_expression=cancel_aware(lambda: page.evaluate(write_js, text)),
+                timeout_ms=DEFAULT_ACTION_TIMEOUT_MS,
+                deadline=deadline,
+            )
+            raise_if_cancelled()
             timer.mark("clipboard_write")
         except Exception as e:
+            if cancellation_pending():
+                raise asyncio.CancelledError from e
+            if deadline_ended_the_call(e, deadline):
+                record_unreported_timeout(e, page.page)
+                return action_result(
+                    "skyvern_clipboard_write",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=make_error(
+                        ErrorCode.TIMEOUT,
+                        str(e),
+                        "The clipboard write never settled — retry after focusing the page",
+                        exc=e,
+                    ),
+                )
             return action_result(
                 "skyvern_clipboard_write",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
                 error=make_error(
-                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)"
+                    ErrorCode.ACTION_FAILED, str(e), "Ensure the page is a secure context (HTTPS or localhost)", exc=e
                 ),
             )
 
@@ -3950,6 +4285,55 @@ async def skyvern_observe(
             clear_session_ref_map(session_id=session_id, cdp_url=cdp_url, generation=lookup_generation)
         return make_result("skyvern_observe", ok=False, error=no_browser_error(exc))
 
+    with Timer() as timer:
+        try:
+            async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+                return await retry_read_on_page_change(
+                    "skyvern_observe",
+                    page,
+                    lambda: _observe_read_attempt(
+                        page,
+                        ctx,
+                        selector,
+                        session_id,
+                        cdp_url,
+                        interactive_only,
+                        max_elements,
+                        include_values,
+                        v2_enabled,
+                    ),
+                )
+        except ActionDeadlineExceeded as exc:
+            return _action_deadline_result(
+                _action_result_factory(ctx=ctx, page=page, selector=selector),
+                "skyvern_observe",
+                exc,
+                ctx,
+                timing_ms=timer.timing_ms,
+                mutating=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the MCP error envelope at the tool boundary.
+            error = (
+                _observe_frame_error(exc)
+                if isinstance(exc, ObserveFrameError)
+                else make_error(ErrorCode.ACTION_FAILED, str(exc), "Check that the page is loaded", exc=exc)
+            )
+            return _action_result_factory(ctx=ctx, page=page, selector=selector)(
+                "skyvern_observe", ok=False, browser_context=ctx, timing_ms=timer.timing_ms, error=error
+            )
+
+
+async def _observe_read_attempt(
+    page: Any,
+    ctx: BrowserContext,
+    selector: str | None,
+    session_id: str | None,
+    cdp_url: str | None,
+    interactive_only: bool,
+    max_elements: int,
+    include_values: bool,
+    v2_enabled: bool,
+) -> dict[str, Any]:
     action_result = _action_result_factory(ctx=ctx, page=page, selector=selector)
 
     observe_page_key = page_ref_key(page)
@@ -3973,6 +4357,7 @@ async def skyvern_observe(
             result = await _observe_with_v2_budget(
                 do_observe,
                 page,
+                propagate_page_change=True,
                 perception_category="model_visible",
                 session_id=ctx.session_id,
                 cdp_url=ctx.cdp_url,
@@ -3989,6 +4374,8 @@ async def skyvern_observe(
             else:
                 # Pre-v2 contract: a frame-error observe clears unconditionally.
                 clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+            if is_page_change_error(e):
+                raise
             return action_result(
                 "skyvern_observe",
                 ok=False,
@@ -3997,14 +4384,15 @@ async def skyvern_observe(
                 error=_observe_frame_error(e),
             )
         except Exception as e:
-            if v2_enabled:
+            # Even legacy refs must be cleared after a page change before a fresh attempt.
+            if v2_enabled or is_page_change_error(e):
                 clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url, generation=generation)
             return action_result(
                 "skyvern_observe",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the page is loaded"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check that the page is loaded", exc=e),
             )
 
     elements = serialize_elements(result.elements)
@@ -4088,8 +4476,10 @@ async def skyvern_observe(
         except asyncio.CancelledError:
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url, generation=generation)
             raise
-        except Exception:
+        except Exception as exc:
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url, generation=generation)
+            if is_page_change_error(exc):
+                raise
             accepted = False
     if not accepted:
         error = make_error(
@@ -4131,7 +4521,21 @@ _TOOL_NAME_MAP: dict[str, str] = {
 _TOOL_ACCEPTED_PARAMS: dict[str, frozenset[str]] = {
     "navigate": frozenset({"url", "timeout", "wait_until"}),
     "click": frozenset({"intent", "selector", "x", "y", "timeout", "click_count", "button"}),
-    "type": frozenset({"text", "intent", "selector", "x", "y", "clear_first", "press_enter", "timeout"}),
+    "type": frozenset(
+        {
+            "text",
+            "intent",
+            "selector",
+            "x",
+            "y",
+            "clear",
+            "clear_first",
+            "delay",
+            "press_enter",
+            "timeout",
+            "input_method",
+        }
+    ),
     "press_key": frozenset({"key", "intent", "selector", "timeout"}),
     "select_option": frozenset({"value", "intent", "selector", "timeout", "by_label"}),
     "hover": frozenset({"intent", "selector", "timeout"}),
@@ -4444,6 +4848,20 @@ async def skyvern_execute(
                 generation=operation_generation,
             )
             raise
+        except StaleFrameSelectionError as e:
+            # Refs were minted against the frame this batch can no longer reach, so they are
+            # dropped on the same terms a cancellation drops them rather than left spendable.
+            clear_session_ref_map(
+                session_id=ctx.session_id,
+                cdp_url=ctx.cdp_url,
+                generation=operation_generation,
+            )
+            return make_result(
+                "skyvern_execute",
+                ok=False,
+                browser_context=ctx,
+                error=make_error(ErrorCode.STALE_FRAME_SELECTION, str(e), STALE_FRAME_HINT, exc=e),
+            )
     else:
         batch_document_id = None
     if observe_v2_enabled() and batch_document_id is None:
@@ -4827,6 +5245,15 @@ async def skyvern_execute(
                         generation=operation_generation,
                     )
                     raise
+                except StaleFrameSelectionError:
+                    # A popup took focus mid-batch. The steps already ran, so the envelope still
+                    # reports them; only the refs that selection minted are dropped, unpublished.
+                    clear_session_ref_map(
+                        session_id=ctx.session_id,
+                        cdp_url=ctx.cdp_url,
+                        generation=operation_generation,
+                    )
+                    pending_ref_map = None
         timer.mark("sdk")
 
     step_results = []

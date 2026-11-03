@@ -29,7 +29,7 @@ vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
 
 vi.mock("./runview/RunView", () => ({
   RunView: (props: {
-    onFix?: (seedMessage?: string, failingLabel?: string | null) => void;
+    onFix?: (failingLabel?: string | null) => void;
     onRetry?: () => void;
     milestoneRerun?: Readonly<{ to: string; state?: unknown }>;
     runIdPending?: boolean;
@@ -48,10 +48,7 @@ vi.mock("./runview/RunView", () => ({
         </button>
       ) : null}
       {props.onFix ? (
-        <button
-          type="button"
-          onClick={() => props.onFix?.("Fix this run", "checkout")}
-        >
+        <button type="button" onClick={() => props.onFix?.("checkout")}>
           Fix with Copilot
         </button>
       ) : null}
@@ -188,12 +185,13 @@ describe("RunTab Fix navigation", () => {
     try {
       fireEvent.click(screen.getByRole("button", { name: "Fix with Copilot" }));
 
-      expect(writes).toEqual([
-        {
-          search: "?wr=run_1&selected-block=checkout",
-          state: { copilotMessage: "Fix this run" },
-        },
-      ]);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.search).toBe("?wr=run_1&selected-block=checkout");
+      const action = (writes[0]?.state as { copilotAction?: unknown })
+        ?.copilotAction as Record<string, unknown> | undefined;
+      expect(action?.kind).toBe("diagnose_run");
+      expect(action?.workflowRunId).toBe("run_1");
+      expect(typeof action?.nonce).toBe("string");
     } finally {
       unsubscribe();
       router.dispose();

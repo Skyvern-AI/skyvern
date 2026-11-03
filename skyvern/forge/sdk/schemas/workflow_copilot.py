@@ -1,14 +1,161 @@
+from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    PlainSerializer,
+    PrivateAttr,
+    SecretStr,
+    StringConstraints,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
+from skyvern.forge.sdk.copilot.ask_user import AccountGroupDecision, QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.context import (
+    ActivityBucket,
+    CopilotTestInput,
+    ProposalDisposition,
+    ResponseType,
+    SkippedPrefixBlock,
+    TurnNarrativePayload,
+)
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeRole, RunOutcomeVerdict
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import CopilotCancelSource, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    CopilotCancelSource,
+    CopilotRequestBrowserAllocations,
+    PersistedCopilotComposerMode,
+    TurnOutcome,
+)
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
+from skyvern.utils.secret_headers import mask_header_values
+from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
+
+
+def client_visible_proposed_workflow(proposal: dict[str, Any]) -> dict[str, Any]:
+    visible = deepcopy(proposal)
+    visible.pop(COPILOT_PRIVATE_SETTINGS_KEY, None)
+    mask_workflow_definition_secrets(visible.get("workflow_definition"))
+    if "cdp_connect_headers" in visible:
+        headers = visible["cdp_connect_headers"]
+        visible["cdp_connect_headers"] = mask_header_values(headers) if isinstance(headers, dict) else None
+    if "_copilot_yaml" in visible:
+        try:
+            document = safe_load_no_dates(visible["_copilot_yaml"])
+            if not isinstance(document, dict):
+                visible.pop("_copilot_yaml")
+            else:
+                changed = False
+                if isinstance(document.get("workflow_definition"), dict):
+                    changed = mask_workflow_definition_secrets(document["workflow_definition"])
+                if "cdp_connect_headers" in document:
+                    headers = document["cdp_connect_headers"]
+                    masked_headers = mask_header_values(headers) if isinstance(headers, dict) else None
+                    changed = changed or masked_headers != headers
+                    document["cdp_connect_headers"] = masked_headers
+                if changed:
+                    visible["_copilot_yaml"] = dump_workflow_yaml(document)
+        except Exception:  # noqa: BLE001 - Malformed legacy YAML must never bypass redaction.
+            visible.pop("_copilot_yaml")
+    return visible
+
+
+ClientVisibleProposedWorkflow = Annotated[
+    dict[str, Any], PlainSerializer(client_visible_proposed_workflow, when_used="json")
+]
+
+COPILOT_PROPOSAL_METADATA_KEY = "_copilot_proposal"
+COPILOT_PRIVATE_SETTINGS_KEY = "_copilot_private_settings"
+CopilotCandidateDisposition = Literal[
+    "no_proposal",
+    "auto_applicable",
+    "review_untested",
+    "review_tested",
+    "accepting",
+]
+
+
+# An accept holds the candidate exclusively between its claim and its canonical write, so nothing
+# can slip a newer candidate underneath the bytes it already read. The claim expires because the
+# same outage that kills an accept mid-flight also kills the write that would release it.
+COPILOT_PROPOSAL_CLAIM_LEASE = timedelta(minutes=5)
+
+
+class CopilotProposalMetadata(BaseModel):
+    """CAS token and exact run ownership for one durable Copilot candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_turn_id: str
+    revision: int = Field(ge=1)
+    canonical_fingerprint: str
+    # The canonical title at publication, or None on proposals written before it was recorded. A
+    # write-back compares against it to tell a rename that landed since from the title it froze.
+    canonical_title: str | None = None
+    disposition: CopilotCandidateDisposition
+    workflow_run_id: str | None = None
+    claimed_at: datetime | None = None
+
+    def claim_is_live(self, now: datetime) -> bool:
+        if self.disposition != "accepting":
+            return False
+        if self.claimed_at is None:
+            return False
+        return now - self.claimed_at < COPILOT_PROPOSAL_CLAIM_LEASE
+
+    def claim_expires_in(self, now: datetime) -> float | None:
+        """Seconds left on a live claim, or None when no claim holds the candidate."""
+        if self.claimed_at is None or not self.claim_is_live(now):
+            return None
+        return (self.claimed_at + COPILOT_PROPOSAL_CLAIM_LEASE - now).total_seconds()
+
+
+class CopilotProposalRunOutput(BaseModel):
+    output_parameter_id: str
+    value: JsonValue
+
+
+class CopilotProposalRunFacts(BaseModel):
+    workflow_run_id: str
+    status: str | None = None
+    available: bool
+    failure_reason: str | None = None
+    outputs: list[CopilotProposalRunOutput] = Field(default_factory=list)
+
+
+def copilot_proposal_metadata(value: object) -> CopilotProposalMetadata | None:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get(COPILOT_PROPOSAL_METADATA_KEY)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return CopilotProposalMetadata.model_validate(raw)
+    except ValueError:
+        return None
+
+
+MAX_STEER_MESSAGES_PER_TURN = 20
+
+
+class CopilotSteerMessage(BaseModel):
+    """A message the user sent into a running turn, stored as screened text only."""
+
+    steer_id: str
+    text: str
+    raw_secret_detected: bool = Field(default=False, exclude_if=lambda detected: not detected)
+    created_at: datetime
+    # None until the running loop hands the message to the model.
+    delivered_at: datetime | None = None
 
 
 class CopilotPendingTurn(BaseModel):
@@ -26,11 +173,25 @@ class CopilotPendingTurn(BaseModel):
     pre_turn_proposed_workflow: dict[str, Any] | None = None
     keep_pending_proposal: bool = False
     idempotency_digest: str | None = None
+    copilot_effective_mode: PersistedCopilotComposerMode | None = None
+    copilot_code_available: bool = False
     user_message_id: str | None = None
     recovering_at: datetime | None = None
+    # A credential pause stops the turn's budget clock, so reconcile measures abandonment from here
+    # too, as it does from a resolved question.
+    credential_resumed_at: datetime | None = None
     # Fingerprint of the canonical workflow as this turn last left it. None means the turn
     # never wrote canonical, so it owns no write to roll back.
     canonical_write_fingerprint: str | None = None
+    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
+    question_heartbeat_at: datetime | None = None
+    question_client_seen_at: datetime | None = None
+    cancel_token: str | None = None
+    request_browser_allocations: CopilotRequestBrowserAllocations | None = None
+    # Build-test runs this turn ended so it could take the chat's browser. Copilot owns this list;
+    # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
+    superseded_build_test_run_ids: list[str] = Field(default_factory=list)
+    steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -39,16 +200,41 @@ class WorkflowCopilotChat(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="ID for the workflow copilot chat")
     organization_id: str = Field(..., description="Organization ID for the chat")
     workflow_permanent_id: str = Field(..., description="Workflow permanent ID for the chat")
-    proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
+    proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
+        None, description="Latest workflow proposed by the copilot"
+    )
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
     auto_accept: bool | None = Field(False, description="Whether copilot auto-accepts workflow updates")
     pending_turns: dict[str, CopilotPendingTurn] = Field(
         default_factory=dict, description="In-flight turns keyed by turn id"
     )
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
+
+    @field_validator("accepted_turn_ids", mode="before")
+    @classmethod
+    def _accepted_turn_ids_or_empty(cls, value: Any) -> Any:
+        return [] if value is None else value
+
+    @field_serializer("pending_turns", when_used="json")
+    def _client_visible_pending_turns(self, turns: dict[str, CopilotPendingTurn]) -> dict[str, Any]:
+        serialized = {turn_id: turn.model_dump(mode="json") for turn_id, turn in turns.items()}
+        for turn in serialized.values():
+            proposal = turn.get("pre_turn_proposed_workflow")
+            if proposal is not None:
+                turn["pre_turn_proposed_workflow"] = client_visible_proposed_workflow(proposal)
+        return serialized
 
     @field_validator("pending_turns", mode="before")
     @classmethod
     def _default_pending_turns(cls, value: dict[str, Any] | None) -> dict[str, Any]:
         return value or {}
+
+    @field_validator("work_plan", mode="before")
+    @classmethod
+    def _default_work_plan(cls, value: list[str] | None) -> list[str]:
+        return value or []
 
     created_at: datetime = Field(..., description="When the chat was created")
     modified_at: datetime = Field(..., description="When the chat was last modified")
@@ -91,24 +277,141 @@ class NonAdoptableCriteriaSet:
 class WorkflowCopilotChatSender(StrEnum):
     USER = "user"
     AI = "ai"
+    PRODUCT = "product"
+
+
+# A product row records a click the user made, so it opens a turn on the human side of
+# the conversation; it is never rendered to the model as an assistant utterance.
+TURN_OPENER_SENDERS = frozenset({WorkflowCopilotChatSender.USER, WorkflowCopilotChatSender.PRODUCT})
+
+
+def chat_history_role(sender: WorkflowCopilotChatSender) -> str:
+    """The label a transcript line carries into the model. ``product`` is not a role the model is
+    told about, so a product row speaks in the same voice as the user whose click created it."""
+    return WorkflowCopilotChatSender.USER.value if sender in TURN_OPENER_SENDERS else sender.value
+
+
+_MAX_ATTACHED_FILENAME_CHARS = 255
+# The prompt lists this many files per turn, current message first, so every file one message
+# can carry is always visible to the model.
+MAX_ATTACHED_FILES_PER_MESSAGE = 20
+
+
+def _bounded_filename(value: Any) -> Any:
+    """Cap a stored display name: the upload limit measures only file contents, and this name is
+    replayed into every later prompt of the chat."""
+    return value[:_MAX_ATTACHED_FILENAME_CHARS] if isinstance(value, str) else value
+
+
+def _attached_files_or_empty(value: Any) -> Any:
+    """A row written before the column existed reads back as NULL, and ``model_validate`` on the
+    row passes that key explicitly — so a ``default_factory`` never fires and validation fails."""
+    return [] if value is None else value
+
+
+class CopilotVideoObservation(BaseModel):
+    timestamp_seconds: float = Field(..., ge=0, le=300)
+    description: str = Field(..., min_length=1, max_length=500)
+    confidence: Literal["low", "medium", "high"]
+
+
+class CopilotVideoEvidenceArtifact(BaseModel):
+    """Compact, reusable perception output; raw video frames never enter the acting-model loop."""
+
+    version: Literal["1"]
+    duration_seconds: float = Field(..., gt=0, le=300)
+    sampled_frame_count: int = Field(..., ge=1, le=120)
+    observations: tuple[CopilotVideoObservation, ...] = Field(..., min_length=1, max_length=80)
+
+
+class CopilotAttachedFile(BaseModel):
+    """An uploaded file the user attached to a copilot turn.
+
+    ``file_id`` is the only value a workflow dereferences: the storage URI behind it is read from
+    the organization's ``uploaded_files`` row, never from this record. ``available`` is resolved
+    fresh on every read, so an expired or deleted file reports as missing rather than as a
+    reference the model can still use.
+    """
+
+    file_id: str = Field(..., description="Uploaded file id from POST /v1/upload_file")
+    filename: Annotated[str, BeforeValidator(_bounded_filename)] = Field(
+        ..., description="Display name recorded at upload time"
+    )
+    size_bytes: int | None = Field(None, description="Size recorded at upload time")
+    available: bool = Field(True, description="Whether the file still resolves for this organization")
+    video_safety_status: Literal["unsafe"] | None = Field(
+        None,
+        description="Server-owned sticky status for a video in which the safety boundary detected a raw secret",
+    )
+    video_processing_status: Literal["too_long"] | None = Field(
+        None,
+        description="Server-owned terminal status for a video that exceeds the supported duration",
+    )
+    video_evidence: CopilotVideoEvidenceArtifact | None = Field(
+        None,
+        description="Server-owned, reusable visual-observation timeline derived from an attached video",
+    )
+
+
+WorkflowCopilotMessageFeedbackRating = Literal["up", "down"]
+
+
+class WorkflowCopilotMessageFeedback(BaseModel):
+    rating: WorkflowCopilotMessageFeedbackRating = Field(..., description="Whether the turn did what the user asked")
+    reason: str | None = Field(None, description="Optional free-text reason the user gave")
+    rated_at: datetime = Field(..., description="When the rating was last set")
+
+
+class WorkflowCopilotMessageFeedbackRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="Chat that owns the rated message")
+    workflow_copilot_chat_message_id: str | None = Field(None, description="Assistant message being rated")
+    turn_id: str | None = Field(
+        None, description="Turn whose assistant row is rated; a live turn knows this before the row id"
+    )
+    rating: WorkflowCopilotMessageFeedbackRating | None = Field(
+        None, description="Thumbs up or down; null clears a previous rating"
+    )
+    reason: str | None = Field(None, max_length=2000, description="Optional free-text reason")
+
+    @model_validator(mode="after")
+    def _require_a_target(self) -> "WorkflowCopilotMessageFeedbackRequest":
+        if not self.workflow_copilot_chat_message_id and not self.turn_id:
+            raise ValueError("workflow_copilot_chat_message_id or turn_id is required")
+        return self
+
+
+class WorkflowCopilotMessageFeedbackResponse(BaseModel):
+    workflow_copilot_chat_message_id: str
+    feedback: WorkflowCopilotMessageFeedback | None
 
 
 class WorkflowCopilotChatMessage(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+    _narrative_payload_unreadable: bool = PrivateAttr(default=False)
 
     workflow_copilot_chat_message_id: str = Field(..., description="ID for the workflow copilot chat message")
     workflow_copilot_chat_id: str = Field(..., description="ID of the parent workflow copilot chat")
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
     audio_artifact_id: str | None = Field(None, description="Artifact ID for audio captured during dictation")
+    attached_files: Annotated[list[CopilotAttachedFile], BeforeValidator(_attached_files_or_empty)] = Field(
+        default_factory=list, description="Uploaded files the user attached to this message"
+    )
     global_llm_context: str | None = Field(None, description="Optional global LLM context for the message")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows)")
     narrative_payload: TurnNarrativePayload | None = Field(
         None,
         description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
     )
+    feedback: WorkflowCopilotMessageFeedback | None = Field(None, description="User's rating of this assistant turn")
     created_at: datetime = Field(..., description="When the message was created")
     modified_at: datetime = Field(..., description="When the message was last modified")
+
+
+class WorkflowCopilotDemonstrationInsertion(BaseModel):
+    after_label: str | None = Field(default=None, max_length=200)
+    before_label: str | None = Field(default=None, max_length=200)
 
 
 class WorkflowCopilotChatRequest(BaseModel):
@@ -121,16 +424,42 @@ class WorkflowCopilotChatRequest(BaseModel):
         description="Optional persistent browser session ID to reuse instead of creating a new one.",
     )
     message: str = Field(..., description="The message that user sends")
+    selected_connected_account_id: str | None = Field(
+        None, description="Google account explicitly selected in the chat picker; validated against this organization."
+    )
+    selected_connected_account_from_pending_proposal: bool = Field(
+        False,
+        description=(
+            "Server-set provenance for selected_connected_account_id: true when the route derived it from the "
+            "pending proposal's binding instead of the user picking it. Carries no authority; a client-sent "
+            "value can only weaken the recorded claim."
+        ),
+    )
     audio_artifact_id: str | None = Field(
         None,
         description="Artifact ID for audio captured while dictating this message.",
     )
+    attached_file_ids: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=64)]] = Field(
+        default_factory=list,
+        max_length=MAX_ATTACHED_FILES_PER_MESSAGE,
+        description=(
+            "Ids of files uploaded through POST /v1/upload_file that the user attached to this message. "
+            "Only ids are accepted; the display name is read from this organization's own upload record."
+        ),
+    )
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
-    mode: Literal["ask", "build"] | None = Field(
-        None, description="Per-request copilot path selector; None falls back to feature flags."
+    mode: Literal["build"] | None = Field(
+        None,
+        description="Deprecated Build-only compatibility field; cached Build clients may still send it.",
     )
     code_block: bool | None = Field(
-        None, description="Per-request code-block authoring; honored only on the build/v2 path."
+        None,
+        description="Per-request code-block authoring selection. Omission means plain non-code Build.",
+    )
+    doc_editor_enabled: bool = Field(
+        False,
+        description="The client may opt out of Doc note-aware Copilot behavior; the server controls enablement.",
+        json_schema_extra={"x-internal": True},
     )
     cancel_token: str | None = Field(
         None,
@@ -158,6 +487,31 @@ class WorkflowCopilotChatRequest(BaseModel):
             "resolving references like 'this block' — never a directive to act on that block."
         ),
     )
+    supports_question_tool: bool = Field(False, description="The client can display and answer ask_user requests.")
+    supports_account_group_card: bool = Field(
+        False, description="The client can display account group review and receipt cards."
+    )
+    supports_credential_delete_card: bool = Field(
+        False, description="The client can display the credential deletion card and post its confirmation."
+    )
+    supports_google_setup_card: bool = Field(
+        False, description="The client can display Gmail and Google Sheets connection cards with a scope profile."
+    )
+    supports_demonstration_offer: bool = Field(
+        False, description="The client can display the demonstration offer card and start a demonstration from it."
+    )
+    credential_recovery_token: SecretStr | None = Field(
+        None,
+        repr=False,
+        exclude=True,
+        description="Client-held capability for restoring this turn's pending credential card.",
+    )
+    supports_credential_pause_recovery: bool = Field(
+        False, description="The client restores pending credential cards from chat history."
+    )
+    supports_credential_generation: bool = Field(
+        False, description="The client can render a registration card and post its Generate and save answer."
+    )
     supports_credential_pause: bool = Field(
         False,
         description=(
@@ -173,13 +527,19 @@ class WorkflowCopilotChatRequest(BaseModel):
             "a new proposal, so the client can keep rendering an actionable review gate."
         ),
     )
-    product_action: Literal["test_end_to_end"] | None = Field(
+    product_action: Literal["test_end_to_end", "diagnose_run", "demonstrate"] | None = Field(
         None,
         description=(
             "Structured product action for this turn, dispatched by the server instead of the agent. "
             "'test_end_to_end' runs every block of the pending proposal in a browser session minted "
-            "for that run."
+            "for that run. 'diagnose_run' opens repair on the finished run named by workflow_run_id. "
+            "'demonstrate' replays a completed browser demonstration before the first model call."
         ),
+    )
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    demonstration_insertion: WorkflowCopilotDemonstrationInsertion | None = Field(
+        None,
+        description="Optional placement bounds for blocks authored after a demonstration.",
     )
     eval_entrypoint_url: str | None = Field(
         None,
@@ -191,6 +551,7 @@ class WorkflowCopilotChatRequest(BaseModel):
 
 
 class WorkflowCopilotCancelRequest(BaseModel):
+    workflow_copilot_chat_id: str | None = None
     cancel_token: str = Field(..., description="The cancel_token sent on the original /chat-post request")
     source: CopilotCancelSource | None = Field(
         default=None,
@@ -202,17 +563,111 @@ class WorkflowCopilotCancelRequest(BaseModel):
     )
 
 
+class WorkflowCopilotSteerRequest(BaseModel):
+    workflow_copilot_chat_id: str
+    cancel_token: str = Field(..., description="The cancel_token sent on the running turn's /chat-post request")
+    steer_id: str = Field(..., max_length=64, description="Client-generated id; a retry with the same id is a no-op")
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class WorkflowCopilotQuestionResponseRequest(QuestionResponse):
+    workflow_copilot_chat_id: str
+    interaction_id: str
+    account_group_decision: AccountGroupDecision | None = None
+
+
+class WorkflowCopilotCredentialDeletionRequest(BaseModel):
+    workflow_copilot_chat_id: str
+    interaction_id: str
+    credential_ids: list[str] = Field(min_length=1)
+
+
 class WorkflowCopilotCredentialResponseRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
     workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
     resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
-    action: Literal["connected", "skip"] = Field(..., description="The user's response to the credential card")
+    action: Literal["connected", "skip", "signing_in", "signed_in"] = Field(
+        ...,
+        description=(
+            "The user's response to the credential card: 'signing_in' when they start signing in themselves in "
+            "the live browser, 'signed_in' when they finish"
+        ),
+    )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+
+
+class WorkflowCopilotDemonstrationControlRequest(BaseModel):
+    demonstration_id: str = Field(max_length=64)
+    action: Literal["navigate", "fill_credential", "upload_file", "stop", "cancel"]
+    url: str | None = Field(default=None, max_length=2048)
+    selector: str | None = Field(default=None, max_length=2000)
+    credential_id: str | None = Field(default=None, max_length=128)
+    field: Literal["password", "totp"] | None = None
+    # A stop the user did not ask for, e.g. a browser restart, so replay reports the recording as interrupted.
+    stop_reason: Literal["browser_gone"] | None = None
+
+
+class WorkflowCopilotDemonstrationControlResult(BaseModel):
+    seq: int
+    action_count: int | None = None
+    file_id: str | None = None
+
+
+class WorkflowCopilotDemonstrationRecordRequest(BaseModel):
+    workflow_permanent_id: str = Field(max_length=128)
+    browser_session_id: str = Field(max_length=128)
+    demonstration_id: str | None = Field(default=None, max_length=64)
+    insertion: WorkflowCopilotDemonstrationInsertion | None = None
+
+
+class WorkflowCopilotDemonstrationActiveResult(BaseModel):
+    demonstration_id: str
+    status: Literal["recording", "stopping", "stopped"]
+    action_count: int
+    action_labels: list[str]
+    can_fill_credentials: bool
+    can_resume: bool
+    insertion: WorkflowCopilotDemonstrationInsertion | None = None
+
+
+class WorkflowCopilotCredentialGenerateRequest(BaseModel):
+    turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
+    workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
+    resume_token: str = Field(..., description="One-time resume token from the matching credential_required frame")
+
+
+class WorkflowCopilotCredentialGenerateResult(BaseModel):
+    result: Literal["connected", "rejected", "unknown", "created_not_connected"] = Field(
+        ...,
+        description=(
+            "'rejected' means nothing was saved; 'unknown' means the vault did not confirm the save, and the "
+            "card stays open without Generate"
+        ),
+    )
+    credential_id: str | None = Field(None, description="The saved credential, when one is known to exist")
+    name: str | None = None
+    username: str | None = None
+    expires_at: datetime | None = Field(
+        None, description="The reopened card's new deadline after 'rejected' or 'unknown'"
+    )
+
+
+class WorkflowCopilotCredentialResponseResult(BaseModel):
+    result: Literal["accepted", "signed_in", "no_sign_in_found", "save_failed"]
+    expires_at: datetime | None = Field(None, description="The pause's new deadline after 'signing_in'")
+    host: str | None = Field(None, description="The sign-in site the browser cookies were read for")
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's sign-in")
 
 
 class WorkflowCopilotClearProposedWorkflowRequest(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="The chat ID to update")
     auto_accept: bool = Field(..., description="Whether to auto-accept future workflow updates")
+    owner_turn_id: str | None = Field(None, description="Owner token returned with a typed proposal")
+    revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
+
+
+class WorkflowCopilotDisableAutoAcceptRequest(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="The chat whose auto-accept should be turned off")
 
 
 class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
@@ -221,25 +676,34 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
         False,
         description="If true, flip the chat to auto-accept mode so future turns persist directly without review",
     )
+    owner_turn_id: str | None = Field(
+        None, description="Owner turn for the proposal; used to match typed proposals and record tokenless Accepts"
+    )
+    revision: int | None = Field(None, ge=1, description="Revision token returned with a typed proposal")
 
 
 class WorkflowCopilotChatHistoryMessage(BaseModel):
+    workflow_copilot_chat_message_id: str | None = Field(
+        None, description="Persisted row id; absent on rows synthesized in-process"
+    )
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
+    turn_id: str | None = Field(None, description="Turn that owns this row")
+    feedback: WorkflowCopilotMessageFeedback | None = Field(None, description="User's rating of this assistant turn")
     audio_artifact_id: str | None = Field(None, description="Artifact ID for captured dictation audio")
+    attached_files: Annotated[list[CopilotAttachedFile], BeforeValidator(_attached_files_or_empty)] = Field(
+        default_factory=list, description="Uploaded files the user attached to this message"
+    )
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
-    narrative_payload: TurnNarrativePayload | None = Field(
+    narrative_payload: dict[str, Any] | None = Field(
         None,
         description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
     )
     created_at: datetime = Field(..., description="When the message was created")
-
-
-class WorkflowCopilotChatHistoryResponse(BaseModel):
-    workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
-    chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
-    proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
-    auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+    modified_at: datetime | None = Field(
+        None,
+        description="When this version was persisted; legacy in-process constructors may omit it",
+    )
 
 
 class WorkflowCopilotChatSummary(BaseModel):
@@ -253,7 +717,7 @@ class WorkflowCopilotChatSummary(BaseModel):
     modified_at: datetime = Field(..., description="When the chat was last modified")
     awaiting_user_input: bool = Field(
         False,
-        description="Whether the chat's most recent message is a copilot turn that asked the user a question",
+        description="Whether the chat has a pending question record still waiting on the user",
     )
 
 
@@ -278,8 +742,10 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     DESIGN_END = "design_end"
     WORKFLOW_DRAFT = "workflow_draft"
     CREDENTIAL_REQUIRED = "credential_required"
+    CREDENTIAL_PAUSE_RESOLVED = "credential_pause_resolved"
     CODEGEN_PROGRESS = "codegen_progress"
     TITLE_UPDATE = "title_update"
+    SCREENSHOT = "screenshot"
 
 
 class WorkflowCopilotProcessingUpdate(BaseModel):
@@ -296,7 +762,7 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     )
     workflow_copilot_chat_id: str = Field(..., description="The chat ID")
     message: str = Field(..., description="The message sent to the user")
-    updated_workflow: dict | None = Field(None, description="The updated workflow")
+    updated_workflow: ClientVisibleProposedWorkflow | None = Field(None, description="The updated workflow")
     response_time: datetime = Field(..., description="When the assistant message was created")
     total_tokens: int | None = Field(
         None,
@@ -310,6 +776,9 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
             "None when unknown."
         ),
     )
+    eval_llm_config_overrides: dict[str, str] | None = None
+    eval_llm_config_overrides_sha256: str | None = None
+    llm_cost: dict[str, Any] | None = None
     proposal_disposition: ProposalDisposition = Field(
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
@@ -318,6 +787,8 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         False,
         description="True when the backend already committed this terminal workflow proposal.",
     )
+    proposed_workflow_metadata: CopilotProposalMetadata | None = None
+    proposed_workflow_run: CopilotProposalRunFacts | None = None
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
@@ -338,9 +809,12 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         None,
         description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
     )
-    terminal_envelope: dict[str, Any] | None = Field(
+    work_plan: list[str] | None = Field(
         None,
-        description="Shadow-only terminal outcome envelope for end-of-turn typed-state validation.",
+        description=(
+            "Latest work plan the copilot model wrote, as of this turn's end. An empty list means the "
+            "model cleared it; None means this frame carries no snapshot and clients keep what they have."
+        ),
     )
 
 
@@ -379,6 +853,8 @@ class WorkflowCopilotStreamErrorUpdate(BaseModel):
 
 
 class WorkflowCopilotToolCallUpdate(BaseModel):
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_CALL, description="Message type"
     )
@@ -394,9 +870,19 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
         None,
         description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
     )
+    browser_session_id: str | None = Field(
+        None,
+        description=(
+            "Browser session a page-acting call resolves to when it is emitted; null for other tools and for "
+            "an unavailable target. Not persisted on the activity entry."
+        ),
+    )
 
 
 class WorkflowCopilotToolResultUpdate(BaseModel):
+    activity_started_at: datetime | None = None
+    reason: str | None = None
+    activity_bucket: ActivityBucket | None = None
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.TOOL_RESULT, description="Message type"
     )
@@ -413,6 +899,14 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
         None,
         description="Per changed code block: its label, the +N/-M line delta, and a size-capped scrubbed patch",
     )
+    work_plan: list[str] | None = Field(
+        None,
+        description="The plan a successful set_work_plan stored, as stored. None for every other tool",
+    )
+    browser_steps: list[str] | None = Field(
+        None,
+        description="A successful run_browser_code call's reported operations as display phrases, in order",
+    )
     detail: str | None = Field(
         None,
         description=(
@@ -426,6 +920,17 @@ class WorkflowCopilotToolResultUpdate(BaseModel):
             "The workflow run a block-running tool created, when this result came from one "
             "(update_and_run_blocks / run_blocks_and_collect_debug). Present whether the run "
             "passed or failed; None for non-run tools."
+        ),
+    )
+    test_inputs: list[CopilotTestInput] | None = Field(
+        None,
+        description="Where each input of the run this result dispatched came from. Keys and sources only, never values",
+    )
+    executed_source_reference: str | None = Field(
+        None,
+        description=(
+            "Opaque reference to the exact source executed by a run_browser_code result. "
+            "Present for that tool only so a later promotion can be tied to the executed cell."
         ),
     )
     timestamp: datetime | None = Field(
@@ -484,6 +989,10 @@ class WorkflowCopilotRunStartedUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.RUN_STARTED, description="Message type"
     )
     workflow_run_id: str = Field(..., description="Run id, emitted once the run row exists and before it produces work")
+    skipped_prefix: list[SkippedPrefixBlock] = Field(
+        default_factory=list,
+        description="Requested blocks before the run's start that it will not execute; shown before its first block",
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -533,6 +1042,9 @@ class WorkflowCopilotTurnStartUpdate(BaseModel):
         None,
         description="Block count of the canonical workflow at turn entry; drives the FE edit-vs-build chip.",
     )
+    workflow_copilot_chat_id: str | None = Field(
+        None, description="The chat this turn runs in, known to a client that opened the chat with this turn"
+    )
 
 
 class WorkflowCopilotDesignStartUpdate(BaseModel):
@@ -557,7 +1069,7 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
     block_labels: list[str] = Field(default_factory=list, description="Ordered block labels in the drafted workflow")
     summary: str | None = Field(None, description="Optional one-line description; populated by a follow-up PR")
     timestamp: datetime = Field(..., description="Server timestamp")
-    workflow: dict | None = Field(
+    workflow: ClientVisibleProposedWorkflow | None = Field(
         None,
         description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
     )
@@ -583,6 +1095,32 @@ class WorkflowCopilotTitleUpdate(BaseModel):
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
+class WorkflowCopilotScreenshotUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.SCREENSHOT, description="Message type"
+    )
+    artifact_id: str = Field(..., description="Chat-owned artifact holding the full-size PNG")
+    captured_at: datetime = Field(..., description="Server clock read when the frame was staged for the model")
+    tool_call_id: str | None = Field(None, description="The tool call that staged the frame, when known")
+
+
+class CredentialRegistration(BaseModel):
+    username: str = Field(..., description="Username or email to register with, exactly as the user gave it")
+    credential_name: str = Field(..., description="Name to save the new credential under")
+    password_length: int = Field(24, description="Generated password length; 24 to 128")
+    charset: Literal["alphanumeric", "alphanumeric_symbols"] = Field(
+        "alphanumeric_symbols", description="Characters the site accepts in a password"
+    )
+
+
+class WorkflowCopilotCredentialRegistration(CredentialRegistration):
+    attempted: bool = Field(False, description="Generate and save was used; the card offers it once")
+    outcome: Literal["rejected", "unknown"] | None = Field(None, description="Why an attempt did not connect")
+
+
+CredentialBinding = Literal["saved_workflow", "matched_by_saved_url", "not_bound"]
+
+
 class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED, description="Message type"
@@ -595,13 +1133,83 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
         "missing_credential_run_failure",
         "credential_deferred_draft",
         "login_credentials_unresolved",
+        "credential_missing_totp",
+        "credential_rejected_by_site",
+        "credential_registration",
     ] = Field(..., description="Typed signal that triggered the pause")
     message: str = Field(..., description="The agent's explanatory text at the moment of pausing")
     login_page_urls: list[str] = Field(default_factory=list, description="Candidate login page URLs, if known")
     credential_refs: list[str] = Field(default_factory=list, description="Credential IDs or names referenced")
+    named_credential_id: str | None = Field(
+        None, description="The one credential the user named this turn, offered for a one-click confirmation"
+    )
     timeout_seconds: int = Field(..., description="How long the backend will wait before degrading to terminal")
     expires_at: datetime = Field(..., description="Server time after which the pause degrades to terminal")
+    anchor_tool_call_id: str | None = Field(
+        None, description="Tool call whose activity row was newest when the pause was raised"
+    )
+    sign_in_browser_session_id: str | None = Field(
+        None, description="The live browser the user may sign in to themselves; absent when the card does not offer it"
+    )
+    signing_in: bool = Field(False, description="The user has started signing in themselves")
+    credential_binding: CredentialBinding | None = Field(
+        None, description="How the credential an update card names is bound; absent on other cards"
+    )
+    registration: WorkflowCopilotCredentialRegistration | None = Field(
+        None, description="Account details a Generate and save answer would store; never a password"
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
+
+
+CredentialPauseResolvedOutcome = Literal["connected", "skipped", "not_admitted", "signed_in"]
+
+
+class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.CREDENTIAL_PAUSE_RESOLVED, description="Message type"
+    )
+    turn_id: str = Field(..., description="UUID for the paused turn")
+    workflow_copilot_chat_id: str = Field(..., description="The chat ID")
+    resume_token: str = Field(..., description="Token of the credential_required card this answer resolves")
+    outcome: CredentialPauseResolvedOutcome = Field(
+        ..., description="The waiter's final verdict, after admission; never the raw POSTed action"
+    )
+    credential_id: str | None = Field(None, description="The connected credential; set only when connected")
+    name: str | None = Field(
+        None, description="Display name of the connected credential, or of the profile saved from a sign-in"
+    )
+    browser_profile_id: str | None = Field(None, description="The profile saved from the user's own sign-in")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotChatHistoryResponse(BaseModel):
+    pending_credential_requests: list[WorkflowCopilotCredentialRequiredUpdate] = Field(default_factory=list)
+    question_interactions: list[QuestionInteraction] = Field(default_factory=list)
+    pending_question_cancel_token: str | None = None
+    workflow_copilot_chat_id: str | None = Field(None, description="Latest chat ID for the workflow")
+    request_turn_id: str | None = Field(
+        None, description="Turn matched by request_cancel_token when recovery requests provide one"
+    )
+    request_browser_allocations: CopilotRequestBrowserAllocations | None = None
+    chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
+    accepted_turn_ids: list[str] = Field(
+        default_factory=list, description="Turns whose manual Accept completed on the server"
+    )
+    proposed_workflow: ClientVisibleProposedWorkflow | None = Field(
+        None, description="Latest workflow proposed by the copilot"
+    )
+    proposed_workflow_metadata: CopilotProposalMetadata | None = None
+    proposed_claim_expires_in_seconds: float | None = Field(
+        None,
+        description=(
+            "Seconds the server's accepting claim has left. None when no live claim holds the proposal. "
+            "A duration rather than a deadline, so a client with a skewed clock still agrees with the server."
+        ),
+    )
+    proposed_workflow_run: CopilotProposalRunFacts | None = None
+    auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+
+    work_plan: list[str] = Field(default_factory=list, description="Latest work plan the copilot model wrote")
 
 
 class WorkflowCopilotCodegenProgressUpdate(BaseModel):
@@ -617,6 +1225,10 @@ class WorkflowCopilotCodegenProgressUpdate(BaseModel):
     )
     chars_streamed: int = Field(..., description="Cumulative argument characters streamed so far in this call")
     iteration: int = Field(..., description="Agent loop iteration number; matches the TOOL_CALL frame that follows")
+    generation_id: str | None = Field(
+        None,
+        description="New for every model response; the authoring calls within one response share it",
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -627,3 +1239,16 @@ class WorkflowYAMLConversionRequest(BaseModel):
 
 class WorkflowYAMLConversionResponse(BaseModel):
     workflow_definition: dict = Field(..., description="Converted workflow definition with blocks")
+
+
+class WorkflowCopilotGoalSuggestionRequest(BaseModel):
+    label: str = Field(..., max_length=256, description="Label of the code block whose Goal is suggested")
+    code: str = Field(..., max_length=200_000, description="The block's code as the person edited it")
+    current_goal: str = Field("", max_length=20_000, description="The block's Goal before the suggestion")
+    parameter_keys: list[Annotated[str, StringConstraints(max_length=256)]] = Field(
+        default_factory=list, max_length=500, description="Workflow parameters the block can read"
+    )
+
+
+class WorkflowCopilotGoalSuggestionResponse(BaseModel):
+    goal: str | None = Field(None, description="Suggested Goal written from the code; null when none was produced")

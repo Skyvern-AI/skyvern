@@ -30,8 +30,10 @@ LOG = structlog.get_logger(__name__)
 
 ACTION_LOG_QUEUE_MAX_ENTRIES = 256
 ACTION_LOG_QUEUE_MAX_BYTES = 1024 * 1024
-ACTION_LOG_HTTP_TIMEOUT_SECONDS = 2
-ACTION_LOG_SHUTDOWN_TIMEOUT_SECONDS = 2.5
+# Delivery runs off the tool path, so it waits out the API's slow tail instead of dropping batches the API still writes.
+ACTION_LOG_HTTP_TIMEOUT_SECONDS = 10
+# Session close and app shutdown must outlast one in-flight batch POST, or they drop a batch the API is still writing.
+ACTION_LOG_SHUTDOWN_TIMEOUT_SECONDS = ACTION_LOG_HTTP_TIMEOUT_SECONDS + 0.5
 ACTION_LOG_CLIENT_MAX_EVENTS_PER_BATCH = 10
 ACTION_LOG_DROP_LOG_INTERVAL_SECONDS = 30.0
 ACTION_LOG_SESSION_INDEX_CAP = 1_024

@@ -39,6 +39,7 @@ function EmailInboxBlockFormBody({
       newerThanDays: data.newerThanDays,
       maxResults: data.maxResults,
       includeBody: data.includeBody,
+      downloadAttachments: data.downloadAttachments,
       parameterKeys: data.parameterKeys,
     }),
     [
@@ -51,6 +52,7 @@ function EmailInboxBlockFormBody({
       data.newerThanDays,
       data.maxResults,
       data.includeBody,
+      data.downloadAttachments,
       data.parameterKeys,
     ],
   );

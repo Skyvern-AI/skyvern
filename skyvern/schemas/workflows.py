@@ -9,9 +9,24 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol, TypeVar
 
 import structlog
-from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    StrictInt,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    field_serializer,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from skyvern.config import settings
+from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -23,10 +38,16 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
-from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
+from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES
+from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
+from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
+from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.strings import sanitize_identifier
-from skyvern.utils.templating import replace_jinja_reference
+from skyvern.utils.templating import (
+    mask_jinja_control_blocks,
+    replace_jinja_reference,
+)
 
 LOG = structlog.get_logger()
 
@@ -78,6 +99,18 @@ def _get_text_prompt_model_name_by_llm_key() -> dict[str, str]:
         if llm_key and llm_key not in reverse_mapping:
             reverse_mapping[llm_key] = model_name
     return reverse_mapping
+
+
+ENGINE_PINNED_DESCRIPTION = (
+    "Set to true only when skyvern-1.0 was explicitly chosen for this block; leave it unset otherwise."
+)
+
+FORCE_OCR_DESCRIPTION = (
+    "PDF only: ignore the PDF's embedded text layer and read the pages with vision OCR instead. "
+    "Use it when a PDF's text layer is unreadable in a way Skyvern does not detect on its own. "
+    f"OCR reads at most the first {MAX_PDF_OCR_PAGES} pages, so a longer PDF loses the rest; "
+    "leave this off unless the text layer is unusable."
+)
 
 
 class _LLMSelectionBlock(Protocol):
@@ -494,15 +527,19 @@ class BlockType(StrEnum):
     GOTO_URL = "goto_url"
     PDF_PARSER = "pdf_parser"
     HTTP_REQUEST = "http_request"
+    WEB_SEARCH = "web_search"
     HUMAN_INTERACTION = "human_interaction"
     PRINT_PAGE = "print_page"
     WORKFLOW_TRIGGER = "workflow_trigger"
     GOOGLE_SHEETS_READ = "google_sheets_read"
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
+    POWERBI_QUERY = "powerbi_query"
     PDF_FILL = "pdf_fill"
     SPLIT_PDF = "split_pdf"
     EMAIL_INBOX = "email_inbox"
     DATA_EXPORT = "data_export"
+    TERMINATE = "terminate"
+    AGENT_STEP = "agent_step"
 
 
 class AIFallbackMode(StrEnum):
@@ -529,6 +566,15 @@ class BlockStatus(StrEnum):
     skipped = "skipped"
 
 
+class CodeBlockFailureKind(StrEnum):
+    """Whose failure a failed CodeBlock was: the block's own code, or the runner executing it."""
+
+    user_exception = "user_exception"
+    browser_operation_failed = "browser_operation_failed"
+    runner_timeout = "runner_timeout"
+    runner_error = "runner_error"
+
+
 @dataclass(frozen=True)
 class BlockResult:
     success: bool
@@ -542,6 +588,13 @@ class BlockResult:
     # missing block label) so callers can distinguish them from real child-block
     # results. Set explicitly at the synthetic construction sites in loop helpers.
     is_synthetic_loop_failure: bool = False
+    # False when retry/continuation cannot change the outcome, such as invalid
+    # CodeBlock source that fails before execution.
+    can_continue_after_failure: bool = True
+    # A failed CodeBlock's failing tab showed a sign-in form. Kept off the output so templates never see it.
+    sign_in_form_visible: bool = False
+    # Set only by an executor that can classify a failed CodeBlock; None means unclassified, not "no failure".
+    codeblock_failure_kind: CodeBlockFailureKind | None = None
 
 
 class FileType(StrEnum):
@@ -684,6 +737,7 @@ class BitwardenLoginCredentialParameterYAML(ParameterYAML):
     bitwarden_collection_id: str | None = None
     # bitwarden item id to request the login credential
     bitwarden_item_id: str | None = None
+    totp_identifier: str | None = None
 
 
 class CredentialParameterYAML(ParameterYAML):
@@ -735,6 +789,7 @@ class OnePasswordCredentialParameterYAML(ParameterYAML):
     vault_id: str
     item_id: str
     totp_field_name: str | None = None
+    totp_identifier: str | None = None
 
 
 class AzureVaultCredentialParameterYAML(ParameterYAML):
@@ -772,9 +827,40 @@ class OutputParameterYAML(ParameterYAML):
     parameter_type: Literal[ParameterType.OUTPUT] = ParameterType.OUTPUT  # type: ignore
 
 
+BLOCK_NOTE_MAX_LENGTH = 2000
+
+
 class BlockYAML(BaseModel, abc.ABC):
     block_type: BlockType
     label: str = Field(description="Author-facing identifier; must be unique per workflow.")
+    notes: str | None = Field(
+        default=None,
+        max_length=BLOCK_NOTE_MAX_LENGTH,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Plain-text instructions written directly above this block. At run time the agent reads them "
+        "on this block and on the block before it in the same sequence. {{ }} references to parameters and loop values "
+        "render; references to page data, block outputs, values not yet available, and credentials are sent as "
+        "written. Omit to keep the saved notes; send null or an empty "
+        "string to delete them.",
+    )
+    trailing_notes: str | None = Field(
+        default=None,
+        max_length=BLOCK_NOTE_MAX_LENGTH,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="Plain-text instructions written after the last block of a sequence (the workflow, a loop body "
+        "or a branch). Only this block reads them at run time. Omit to keep the saved text; send null or an empty "
+        "string to delete it.",
+    )
+    description: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        json_schema_extra={"x-internal": True},
+        description="What this block does, for people reading the workflow. The agent never reads it, and "
+        "changing it never clears cached scripts. Omitting it on an update keeps the saved description; send null "
+        "or an empty string to delete it.",
+    )
     next_block_label: str | None = Field(
         default=None,
         description="Optional pointer to the label of the next block. "
@@ -789,6 +875,15 @@ class BlockYAML(BaseModel, abc.ABC):
     # Only valid for blocks inside a for loop block
     # Whether to continue to the next iteration when the block fails
     next_loop_on_failure: bool = False
+
+    @model_serializer(mode="wrap")
+    def _preserve_explicit_note_clears(self, handler: SerializerFunctionWrapHandler):  # type: ignore[no-untyped-def]
+        data = handler(self)
+        if isinstance(data, dict):
+            for field in ("notes", "trailing_notes", "description"):
+                if field in self.model_fields_set and getattr(self, field) is None:
+                    data[field] = None
+        return data
 
     @field_validator("label")
     @classmethod
@@ -820,7 +915,8 @@ class TaskBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     data_extraction_goal: str | None = None
     data_schema: dict[str, Any] | list | str | None = None
@@ -848,7 +944,7 @@ class ForLoopBlockYAML(BlockYAML):
     # to infer the type of the parameter_type attribute.
     block_type: Literal[BlockType.FOR_LOOP] = BlockType.FOR_LOOP  # type: ignore
 
-    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    loop_blocks: list["BLOCK_YAML_TYPES"]
     loop_over_parameter_key: str = ""
     loop_variable_reference: str | None = None
     complete_if_empty: bool = False
@@ -864,7 +960,7 @@ class BranchCriteriaYAML(BaseModel):
 class WhileLoopBlockYAML(BlockYAML):
     block_type: Literal[BlockType.WHILE_LOOP] = BlockType.WHILE_LOOP  # type: ignore
 
-    loop_blocks: list["BLOCK_YAML_SUBCLASSES"]
+    loop_blocks: list["BLOCK_YAML_TYPES"]
     condition: BranchCriteriaYAML
 
 
@@ -901,7 +997,6 @@ class ConditionalBlockYAML(BlockYAML):
 
 
 class CodeBlockStepYAML(BaseModel):
-    title: str | None = None
     description: str | None = None
     # str (not ActionType) so this module does not import skyvern.webeye; the converter coerces to the enum.
     action_type: str = "null_action"
@@ -910,7 +1005,6 @@ class CodeBlockStepYAML(BaseModel):
 
 
 ERROR_CODE_MAX_LENGTH = 128
-ERROR_CODE_REASONING_MAX_LENGTH = 2000
 ERROR_CODE_MAPPING_MAX_ENTRIES = 64
 ERROR_CODE_MAPPING_MAX_UTF8_BYTES = 32768
 
@@ -993,12 +1087,7 @@ def _validate_code_block_error_code_mapping(mapping: Any) -> None:
 
 
 def _direct_code_block_error_code_raises(code: str) -> set[tuple[int, str]]:
-    sanitized = re.sub(
-        r"\{%.*?%\}",
-        lambda match: "\n".join("# __JINJA_BLOCK__" for _ in range(match.group().count("\n") + 1)),
-        textwrap.dedent(code),
-        flags=re.DOTALL,
-    )
+    sanitized = mask_jinja_control_blocks(textwrap.dedent(code))
     try:
         tree = ast.parse(sanitized)
     except SyntaxError as exc:
@@ -1049,9 +1138,13 @@ def _direct_code_block_error_code_raises(code: str) -> set[tuple[int, str]]:
             direct.add((node.lineno, code_node.value))
             accepted.add(id(call))
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ErrorCode":
-            if id(node) not in accepted:
-                raise ValueError("ErrorCode must be constructed directly in a raise statement")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ErrorCode"
+            and id(node) not in accepted
+        ):
+            raise ValueError("ErrorCode must be constructed directly in a raise statement")
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id == "ErrorCode":
             raise ValueError("ErrorCode aliases are not allowed")
     return direct
@@ -1078,7 +1171,23 @@ class CodeBlockYAML(BlockYAML):
     )
     steps: list[CodeBlockStepYAML] | None = Field(
         default=None,
-        description="Plain-language step outline mapped to code line ranges; derived from the code when omitted",
+        description="Plain-language step outline mapped to code line ranges; always rebuilt from the code on save, so any value sent is ignored",
+    )
+    data_schema: dict[str, Any] | list | str | None = Field(
+        default=None,
+        description="JSON schema of the object this block's return produces; keys match the return keys; null when the block returns nothing",
+    )
+    user_owned_goal: bool | None = Field(
+        default=None,
+        description="True when a person wrote this block's Goal, so copilot regenerations keep their text. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
+    goal_needs_regeneration: bool | None = Field(
+        default=None,
+        description="True when a person edited the Goal and the code has not been rebuilt from it yet. Set by the editor or the workflow API; a value the copilot submits is ignored in favour of the stored one",
+    )
+    code_edited_by_hand: bool | None = Field(
+        default=None,
+        description="True when a person edited this block's code in the editor's code field since the Goal was last confirmed, so the Goal may no longer describe the code. Set by the editor; a value the copilot submits is ignored in favour of the stored one",
     )
 
     @model_validator(mode="before")
@@ -1089,11 +1198,21 @@ class CodeBlockYAML(BlockYAML):
         if isinstance(data, dict) and "parameters" in data:
             raise ValueError(
                 "Code blocks do not accept a 'parameters' field; use 'parameter_keys' "
-                "(a list of workflow parameter names) to inject parameters into the code block."
+                "(a list of workflow parameter names and earlier block outputs, `<label>_output`) "
+                "to inject parameters into the code block."
             )
         if isinstance(data, dict):
             _validate_code_block_error_code_mapping(data.get("error_code_mapping"))
+            # Saves rebuild steps from the code, so malformed submitted steps must not reject valid code.
+            if data.get("steps") is not None:
+                try:
+                    _CODE_BLOCK_STEPS_ADAPTER.validate_python(data["steps"])
+                except ValidationError:
+                    data = {**data, "steps": None}
         return data
+
+
+_CODE_BLOCK_STEPS_ADAPTER = TypeAdapter(list[CodeBlockStepYAML])
 
 
 class TextPromptBlockYAML(BlockYAML):
@@ -1147,7 +1266,7 @@ class FileUploadBlockYAML(BlockYAML):
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
     azure_folder_path: str | None = None
-    google_credential_id: str | None = None
+    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1184,11 +1303,36 @@ class SendEmailBlockYAML(BlockYAML):
     custom_smtp_port: int | None = Field(default=None, ge=1, le=65535)
     custom_smtp_username: str | None = None
     custom_smtp_password: str | None = None
-    sender: str
+    sender: str = Field(default="", description="From address. Required unless transport is 'gmail'.")
     recipients: list[str]
     subject: str
     body: str
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
     file_attachments: list[str] | None = None
+    transport: EmailTransport | None = Field(
+        default=None,
+        description="How the email is sent. Omit for SMTP. 'gmail' sends from the connected Google account named "
+        "by credential_id; sender and the SMTP settings are then unused.",
+    )
+    credential_id: str | None = Field(
+        default=None,
+        description="ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
+        json_schema_extra={"x-skyvern-connected-account": True},
+    )
+    cc: list[str] = Field(default_factory=list, description="Cc recipients. Only with transport 'gmail'.")
+    bcc: list[str] = Field(default_factory=list, description="Bcc recipients. Only with transport 'gmail'.")
+
+    @model_validator(mode="after")
+    def _validate_transport_fields(self) -> "SendEmailBlockYAML":
+        if self.transport == EmailTransport.GMAIL:
+            custom_smtp_text = (self.custom_smtp_host, self.custom_smtp_username, self.custom_smtp_password)
+            if self.custom_smtp_port is not None or any(value and value.strip() for value in custom_smtp_text):
+                raise ValueError("custom SMTP settings cannot be combined with the gmail transport")
+        elif "sender" not in self.model_fields_set:
+            raise ValueError("sender is required unless the transport is gmail")
+        elif any(entry.strip() for entry in (*self.cc, *self.bcc)):
+            raise ValueError("cc and bcc are only supported with the gmail transport")
+        return self
 
 
 class FileParserBlockYAML(BlockYAML):
@@ -1197,6 +1341,8 @@ class FileParserBlockYAML(BlockYAML):
     file_url: str
     file_type: FileType = FileType.AUTO_DETECT
     json_schema: dict[str, Any] | None = None
+    worksheet: str | None = None
+    force_ocr: bool = Field(default=False, description=FORCE_OCR_DESCRIPTION)
 
 
 class PDFParserBlockYAML(BlockYAML):
@@ -1209,7 +1355,8 @@ class PDFParserBlockYAML(BlockYAML):
 class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
@@ -1224,7 +1371,8 @@ class ActionBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     selector: str | None = None
     ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
@@ -1247,7 +1395,8 @@ class NavigationBlockYAML(BlockYAML):
     navigation_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1272,7 +1421,8 @@ class ExtractionBlockYAML(BlockYAML):
     data_extraction_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     data_schema: dict[str, Any] | list | str | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1292,7 +1442,8 @@ class LoginBlockYAML(BlockYAML):
 
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     navigation_goal: str | None = None
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
@@ -1325,6 +1476,7 @@ class HumanInteractionBlockYAML(BlockYAML):
     recipients: list[str]
     subject: str = "Human interaction required for workflow run"
     body: str = "Your interaction is required for a workflow run!"
+    body_format: EmailBodyFormat = EmailBodyFormat.TEXT
 
 
 class DataExportBlockYAML(BlockYAML):
@@ -1334,6 +1486,95 @@ class DataExportBlockYAML(BlockYAML):
     data_schema: dict[str, Any]
     file_name: str | None = None
     parameter_keys: list[str] | None = None
+
+
+class TerminateBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.TERMINATE] = BlockType.TERMINATE  # type: ignore
+
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] = Field(
+        description="Why the run ends here; supports Jinja templating."
+    )
+    error_code: str | None = Field(
+        default=None,
+        description=(
+            "Optional error code added to the run's error codes; supports Jinja templating. "
+            "A literal code must be at most 128 characters. The rendered code must be at most 128 characters "
+            "and may contain only ASCII letters, digits, underscores, periods, colons, and hyphens."
+        ),
+    )
+
+    @field_validator("error_code", mode="before")
+    @classmethod
+    def normalize_error_code(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if re.search(r"\{[{%#]", value):
+            if _contains_unicode_category_c(value):
+                raise ValueError("error code keys must not contain Unicode category-C characters")
+            return value
+        if unusable := error_code_key_error(value):
+            raise ValueError(unusable)
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+            raise ValueError(
+                "literal error codes may contain only ASCII letters, digits, underscores, periods, colons, and hyphens"
+            )
+        return value
+
+
+class AgentStepBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.AGENT_STEP] = BlockType.AGENT_STEP  # type: ignore
+
+    prompt: str = Field(
+        description="What the step must work out or get done. Rendered as a Jinja template against the run's "
+        "parameters and earlier block outputs before the step starts."
+    )
+    data_schema: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        },
+        description="JSON Schema (type object) of the answer the step returns through its finish tool. Later blocks "
+        "read the answer as {{ <label>_output.output }}.",
+    )
+    max_turns: int = Field(
+        default=25,
+        ge=1,
+        le=200,
+        description="Model turns the step may take. When they run out, the step gets one more turn in which only "
+        "finish runs.",
+    )
+    parameter_keys: list[str] | None = Field(
+        default=None, description="Keys of the workflow parameters and earlier block outputs the step uses."
+    )
+    tools: list[str] | None = Field(
+        default=None,
+        description="The tools the step may call. A block it runs through run_block is named by its block type, such "
+        "as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a "
+        "credential parameter. Without a list the step has no other tools.",
+    )
+
+    @field_validator("tools")
+    @classmethod
+    def validate_tools(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if unknown := sorted(set(value) - AGENT_STEP_TOOL_NAMES):
+            raise ValueError(f"Unknown tools {unknown}. Valid tools: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.")
+        return value
+
+    @field_validator("data_schema")
+    @classmethod
+    def validate_data_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            Draft202012Validator.check_schema(value)
+        except SchemaError as exc:
+            raise ValueError(f"data_schema is not a valid JSON Schema: {exc.message.rstrip('.')}.") from exc
+        # The schema becomes the finish tool's parameters, and tool parameters must be an object.
+        if value.get("type") != "object":
+            raise ValueError('data_schema must describe an object ("type": "object").')
+        return value
 
 
 class FileDownloadBlockYAML(BlockYAML):
@@ -1348,7 +1589,7 @@ class FileDownloadBlockYAML(BlockYAML):
     azure_storage_account_name: str | None = None
     azure_storage_account_key: str | None = None
     azure_blob_container_name: str | None = None
-    google_credential_id: str | None = None
+    google_credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     google_drive_folder_id: str | None = None
     sftp_host: str | None = None
     sftp_port: int | None = None
@@ -1358,13 +1599,15 @@ class FileDownloadBlockYAML(BlockYAML):
     sftp_private_key_passphrase: str | None = None
     sftp_remote_path: str | None = None
     sftp_host_key: str | None = None
+    sftp_source_path: str | None = None
     path: str | None = None
     prompt: str | None = None
     continue_on_empty: bool = False
     navigation_goal: str
     url: str | None = None
     title: str = ""
-    engine: RunEngine = RunEngine.skyvern_v1
+    engine: RunEngine | None = None
+    engine_pinned: bool = Field(default=False, description=ENGINE_PINNED_DESCRIPTION)
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     max_steps_per_run: int | None = None
@@ -1402,6 +1645,73 @@ class TaskV2BlockYAML(BlockYAML):
         json_schema_extra={"default": 25},
     )
     disable_cache: bool = False
+
+
+def _normalize_outcome_error_code(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if not value:
+        raise ValueError("Outcome error codes must not be blank.")
+    return value
+
+
+def _validate_no_match_error_code_prompt(no_match_error_code: str | None, prompt: str | None) -> None:
+    if no_match_error_code is not None and (prompt is None or not prompt.strip()):
+        raise ValueError("No Match Error Code requires a Prompt.")
+
+
+class WebSearchBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.WEB_SEARCH] = BlockType.WEB_SEARCH  # type: ignore
+    query: str = Field(min_length=1)
+    provider: Literal["auto", "google", "exa"] = "auto"
+    num_results: int = Field(default=10, ge=1, le=100, strict=True)
+    no_results_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Deprecated. Use error_code_mapping.",
+        json_schema_extra={"deprecated": True},
+    )
+    no_match_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Deprecated. Use error_code_mapping.",
+        json_schema_extra={"deprecated": True},
+    )
+    error_code_mapping: dict[str, str] | None = None
+    prompt: str | None = None
+    json_schema: dict[str, Any] | None = None
+    parameter_keys: list[str] | None = None
+
+    _normalize_outcome_error_codes = field_validator("no_results_error_code", "no_match_error_code", mode="before")(
+        _normalize_outcome_error_code
+    )
+
+    @model_validator(mode="after")
+    def validate_no_match_error_code_prompt(self) -> "WebSearchBlockYAML":
+        _validate_no_match_error_code_prompt(self.no_match_error_code, self.prompt)
+        return self
+
+    @field_validator("json_schema")
+    @classmethod
+    def validate_search_schema(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        def contains_template(item: Any) -> bool:
+            if isinstance(item, str):
+                return "{{" in item or "{%" in item
+            if isinstance(item, dict):
+                return any(contains_template(key) or contains_template(val) for key, val in item.items())
+            if isinstance(item, list):
+                return any(contains_template(val) for val in item)
+            return False
+
+        if value is not None and not contains_template(value):
+            try:
+                Draft202012Validator.check_schema(value)
+            except SchemaError as exc:
+                raise ValueError(f"The Data Schema is not a valid JSON Schema: {exc.message.rstrip('.')}.") from exc
+        return value
 
 
 class HttpRequestBlockYAML(BlockYAML):
@@ -1492,7 +1802,7 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = None
+    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     has_header_row: bool = True
     parameter_keys: list[str] | None = None
 
@@ -1500,7 +1810,7 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
 class EmailInboxBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
     email_client: Literal["gmail", "outlook"]
-    credential_id: str | None = None
+    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     folder: str | None = None
     prompt: str | None = None
     sender: str | None = None
@@ -1508,6 +1818,9 @@ class EmailInboxBlockYAML(BlockYAML):
     newer_than_days: int | None = None
     max_results: int = 25
     include_body: bool = True
+    download_attachments: bool = Field(
+        default=False, description="Download non-inline attachments from matched emails for downstream blocks."
+    )
     parameter_keys: list[str] | None = None
 
 
@@ -1516,12 +1829,34 @@ class GoogleSheetsWriteBlockYAML(BlockYAML):
     spreadsheet_url: str
     sheet_name: str | None = None
     range: str | None = None
-    credential_id: str | None = None
+    credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     write_mode: Literal["append", "update"] = "append"
     values: str = ""
     column_mapping: dict[str, str] | None = None
     create_sheet_if_missing: bool = False
     parameter_keys: list[str] | None = None
+
+
+class PowerBIQueryBlockYAML(BlockYAML):
+    """Documented ahead of release; saves are unavailable until the Power BI catalog status is live."""
+
+    block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
+    connection_id: str = Field(
+        min_length=1,
+        description="Microsoft OAuth credential ID for this user.",
+        json_schema_extra={"x-skyvern-connected-account": True},
+    )
+    dataset_id: str = Field(min_length=1)
+    query: str = Field(min_length=1, description="A single read-only DAX query.")
+    max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
+    parameter_keys: list[str] | None = None
+
+    @field_validator("connection_id")
+    @classmethod
+    def validate_literal_connection_id(cls, value: str) -> str:
+        if not value.strip() or _has_jinja_syntax(value):
+            raise ValueError("Power BI connection_id must be a literal credential ID.")
+        return value
 
 
 PARAMETER_YAML_SUBCLASSES = (
@@ -1558,10 +1893,13 @@ BLOCK_YAML_SUBCLASSES = (
     | HumanInteractionBlockYAML
     | FileDownloadBlockYAML
     | DataExportBlockYAML
+    | TerminateBlockYAML
+    | AgentStepBlockYAML
     | UrlBlockYAML
     | PDFParserBlockYAML
     | TaskV2BlockYAML
     | HttpRequestBlockYAML
+    | WebSearchBlockYAML
     | ConditionalBlockYAML
     | PrintPageBlockYAML
     | PdfFillBlockYAML
@@ -1570,6 +1908,7 @@ BLOCK_YAML_SUBCLASSES = (
     | GoogleSheetsReadBlockYAML
     | EmailInboxBlockYAML
     | GoogleSheetsWriteBlockYAML
+    | PowerBIQueryBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
 
@@ -1583,17 +1922,82 @@ def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASS
     return any(isinstance(block, ConditionalBlockYAML) or block.next_block_label is not None for block in blocks)
 
 
+class WorkflowRetryRule(BaseModel):
+    status: Literal["completed", "failed", "terminated", "canceled", "timed_out"] = Field(
+        description=(
+            "Terminal status that triggers a retry rule; canceled is accepted for forward compatibility, "
+            "but a canceled run never retries in the current runtime, including explicit API/UI cancels."
+        )
+    )
+    error_codes: list[Annotated[str, Field(min_length=1)]] | None = Field(
+        default=None,
+        description="Optional error codes. The rule matches when any listed code is present.",
+    )
+
+    @field_validator("error_codes")
+    @classmethod
+    def deduplicate_error_codes(cls, error_codes: list[str] | None) -> list[str] | None:
+        if error_codes is None:
+            return None
+        return list(dict.fromkeys(error_codes))
+
+
+class WorkflowRetryPolicy(BaseModel):
+    max_retries: StrictInt = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Maximum number of retries after the initial attempt",
+    )
+    delay_seconds: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=3600,
+        description="Fixed delay before the next attempt, in seconds",
+    )
+    webhook_on_retry: Literal["final_only", "every_attempt"] = Field(
+        default="final_only",
+        description="Whether to send a webhook for every attempt or only the final attempt",
+    )
+    retry_on: list[WorkflowRetryRule] = Field(
+        min_length=1,
+        description="Terminal status rules that enable retries",
+    )
+
+    @field_validator("retry_on")
+    @classmethod
+    def validate_unique_statuses(cls, retry_on: list[WorkflowRetryRule]) -> list[WorkflowRetryRule]:
+        statuses = [rule.status for rule in retry_on]
+        if len(statuses) != len(set(statuses)):
+            raise ValueError("retry_on must contain each status at most once")
+        return retry_on
+
+
 class WorkflowDefinitionYAML(BaseModel):
     version: int | None = None
     parameters: list[PARAMETER_YAML_TYPES]
     blocks: list[BLOCK_YAML_TYPES]
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
+    retry_policy: WorkflowRetryPolicy | None = Field(
+        default=None,
+        description="Optional policy for retrying eligible terminal workflow runs",
+    )
     workflow_system_prompt: str | None = None
     completion_contract: dict[str, Any] | None = Field(
         default=None,
         description="Copilot-managed: what a run of this workflow must produce, graded at run finalization. Derived from the request when a workflow is accepted; not intended to be authored by hand.",
     )
+    browser_settings: BrowserSettings | None = Field(
+        default=None,
+        description="Settings applied to every browser this workflow version creates. Omit to keep the previous "
+        "version's settings; set to null to clear them.",
+    )
+
+    @field_validator("browser_settings")
+    @classmethod
+    def validate_browser_settings(cls, value: BrowserSettings | None) -> BrowserSettings | None:
+        return require_known_timezone(value)
 
     @model_validator(mode="after")
     def validate_unique_block_labels(self) -> "WorkflowDefinitionYAML":
@@ -1628,10 +2032,28 @@ class WorkflowDefinitionYAML(BaseModel):
 class WorkflowCreateYAMLRequest(BaseModel):
     title: str
     description: str | None = None
-    proxy_location: ProxyLocation | GeoTarget | dict | None = None
-    webhook_callback_url: str | None = None
-    totp_verification_url: str | None = None
-    totp_identifier: str | None = None
+    proxy_location: ProxyLocation | GeoTarget | dict | None = Field(
+        default=None,
+        description="On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it.",
+    )
+    webhook_callback_url: str | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+            " URL validation errors identify the field and failure class without returning the URL or host."
+        ),
+    )
+    totp_verification_url: str | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it."
+            " URL validation errors identify the field and failure class without returning the URL or host."
+        ),
+    )
+    totp_identifier: str | None = Field(
+        default=None,
+        description="On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it.",
+    )
     persist_browser_session: bool = False
     reuse_browser_session: bool = False
     mask_secrets: bool | None = Field(
@@ -1647,16 +2069,33 @@ class WorkflowCreateYAMLRequest(BaseModel):
     is_saved_task: bool = False
     max_screenshot_scrolls: MaxScreenshotScrolls = Field(default=None)
     max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
-    extra_http_headers: dict[str, str] | None = None
-    cdp_connect_headers: dict[str, str] | None = None
+    extra_http_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. "
+            "An empty object ({}) clears the header map. Values, including ***, are literal."
+        ),
+    )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "On PUT updates, omission keeps the stored value, null clears it, and a supplied value replaces it. "
+            "An empty object ({}) clears the header map; each masked *** entry keeps the stored value for that key."
+        ),
+    )
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str = "agent"
+    browser_type: str | None = Field(
+        default=None,
+        description="Browser engine for runs of this workflow, one of the supported browser types "
+        "(e.g. msedge, chrome, stealth-chromium). A workflow-run setting overrides this. "
+        "Null means the system default.",
+    )
     ai_fallback: bool = True
     cache_key: str | None = "default"
     adaptive_caching: bool = False
-    # None = inherit from the existing workflow on update (mirrors code_version);
-    # treated as False on first create. Prevents older clients that omit the field
-    # from silently disabling self-healing on save.
+    # Kept for compatibility and has no runtime effect; None keeps the stored value on update
+    # and is treated as False on first create.
     enable_self_healing: bool | None = None
     code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False
@@ -1673,6 +2112,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_validator("browser_type", mode="before")
+    @classmethod
+    def _normalize_browser_type(cls, v: str | None) -> str | None:
+        return normalize_browser_type(v)
 
     @field_validator("browser_profile_key", mode="before")
     @classmethod

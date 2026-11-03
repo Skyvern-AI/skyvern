@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+INTEGRATION_PLATFORM_RUN_TAG_KEY = "skyvern.integration_platform"
+
 
 class TagSource(StrEnum):
     """Provenance source for a tag-event row."""

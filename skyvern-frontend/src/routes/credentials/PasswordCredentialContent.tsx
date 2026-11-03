@@ -1,3 +1,4 @@
+import { CredentialForwardingAddress } from "@/components/emailForwarding/CredentialForwardingAddress";
 import googleAuthenticatorIcon from "@/assets/authenticators/google-authenticator.jpg";
 import { ConnectedEmailAccountPicker } from "@/components/ConnectedEmailAccountPicker";
 import { QRCodeIcon } from "@/components/icons/QRCodeIcon";
@@ -11,7 +12,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { useForwardingCapability } from "@/hooks/useEmailForwarding";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { TwilioPhoneNumberPicker } from "@/routes/integrations/twilio/TwilioPhoneNumberPicker";
 import { cn } from "@/util/utils";
 import {
   CheckIcon,
@@ -53,7 +56,10 @@ type PasswordCredentialContentValues = {
 };
 
 type Props = {
+  credentialId?: string;
+  savedTotpType?: string;
   values: PasswordCredentialContentValues;
+  hasTotp?: boolean;
   onChange: (values: PasswordCredentialContentValues) => void;
   /** Login page URL value — when onUrlChange is provided, a URL field is rendered after Name */
   url?: string;
@@ -66,6 +72,8 @@ type Props = {
   afterUrl?: React.ReactNode;
   /** Slot rendered directly under the password input, inside the credential-fields section */
   afterPassword?: React.ReactNode;
+  /** Called when Enter is pressed in the password field */
+  onPasswordEnter?: () => void;
   /** Slot rendered right before the separator between Name/URL and Username/Password */
   beforeCredentialFields?: React.ReactNode;
   editMode?: boolean;
@@ -82,6 +90,8 @@ type Props = {
   editingGroups?: { name: boolean; values: boolean };
   onEnableEditName?: () => void;
   onEnableEditValues?: () => void;
+  onForwardingAddressChange?: (identifier: string) => void;
+  onForwardingActionPendingChange?: (pending: boolean) => void;
   totpError?: string | null;
   /** Server-side authenticator setup error surfaced inline near the key field */
   authenticatorSaveError?: AuthenticatorSaveError | null;
@@ -126,35 +136,48 @@ function useAdditionalTwoFactorMethodEnabled(
 function AdditionalTwoFactorMethodCard({
   method,
   selected,
+  configured,
   onSelect,
 }: {
   method: CredentialAdditionalTwoFactorMethod;
   selected: boolean;
+  configured: boolean;
   onSelect: () => void;
 }) {
   const enabled = useAdditionalTwoFactorMethodEnabled(method);
   if (!enabled) {
     return null;
   }
+  const locked = Boolean(method.gate?.locked && !configured);
 
   return (
     <button
       type="button"
-      aria-pressed={selected}
+      aria-pressed={selected && !locked}
+      aria-disabled={locked ? true : undefined}
       className={cn(
         "relative flex h-36 cursor-pointer items-center justify-center gap-2 rounded-lg border border-transparent bg-slate-elevation1 hover:bg-slate-elevation3",
         selected &&
+          !locked &&
           "border-blue-400 bg-slate-elevation3 ring-1 ring-blue-400/60",
+        locked && "opacity-60",
       )}
       onClick={onSelect}
     >
-      {selected && (
+      {selected && !locked && (
         <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
           <CheckIcon className="size-3" />
         </span>
       )}
       {method.icon}
-      <Label className="cursor-pointer text-center">{method.label}</Label>
+      <div className="flex flex-col items-center gap-2">
+        <Label className="cursor-pointer text-center">{method.label}</Label>
+        {locked && method.gate && (
+          <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+            {method.gate.badgeLabel}
+          </span>
+        )}
+      </div>
     </button>
   );
 }
@@ -166,6 +189,7 @@ function AdditionalTwoFactorMethodFields({
   disabled,
   isEditMode,
   configured,
+  locked,
   error,
 }: {
   method: CredentialAdditionalTwoFactorMethod;
@@ -174,6 +198,7 @@ function AdditionalTwoFactorMethodFields({
   disabled: boolean;
   isEditMode: boolean;
   configured: boolean;
+  locked: boolean;
   error?: string | null;
 }) {
   const enabled = useAdditionalTwoFactorMethodEnabled(method);
@@ -186,6 +211,25 @@ function AdditionalTwoFactorMethodFields({
         <span className="text-xs text-muted-foreground">Configured</span>
       </div>
     ) : null;
+  }
+
+  if (locked && method.gate) {
+    return (
+      <div className="space-y-4 rounded-md border border-input bg-background p-4">
+        <p className="text-sm text-muted-foreground">
+          {method.gate.description}
+        </p>
+        <Button asChild>
+          <a
+            href={method.gate.cta.href}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {method.gate.cta.label}
+          </a>
+        </Button>
+      </div>
+    );
   }
 
   return (
@@ -208,7 +252,10 @@ function AdditionalTwoFactorMethodFields({
 }
 
 function PasswordCredentialContent({
+  credentialId,
+  savedTotpType = "none",
   values,
+  hasTotp = false,
   onChange,
   url,
   onUrlChange,
@@ -216,6 +263,7 @@ function PasswordCredentialContent({
   urlDisabled,
   afterUrl,
   afterPassword,
+  onPasswordEnter,
   beforeCredentialFields,
   editMode,
   configuredAdditionalTwoFactorMethod,
@@ -225,9 +273,12 @@ function PasswordCredentialContent({
   editingGroups,
   onEnableEditName,
   onEnableEditValues,
+  onForwardingAddressChange,
+  onForwardingActionPendingChange,
   totpError,
   authenticatorSaveError,
 }: Props) {
+  const forwardingEnabled = useForwardingCapability("list");
   const { enterpriseApps, additionalTwoFactorMethods = [] } =
     useCredentialAuthenticatorSupport();
   const { name, username, password, totp, totp_type, totp_identifier } = values;
@@ -253,9 +304,20 @@ function PasswordCredentialContent({
   const nameReadOnly = editMode && !editingGroups?.name;
   const valuesReadOnly = editMode && !editingGroups?.values;
 
-  const [totpMethod, setTotpMethod] = useState<string>(
-    totp_type === "none" ? "authenticator" : totp_type,
+  const [totpMethod, setTotpMethod] = useState<string>(totp_type);
+  const [lockedMethodValue, setLockedMethodValue] = useState<string | null>(
+    null,
   );
+  const lockedMethodIsLocked = Boolean(
+    lockedMethodValue &&
+    additionalTwoFactorMethods.some(
+      ({ value, gate }) =>
+        value === lockedMethodValue &&
+        gate?.locked &&
+        configuredAdditionalTwoFactorMethod !== value,
+    ),
+  );
+
   const [totpAccordionValue, setTotpAccordionValue] = useState<string>("");
   const [showPassword, setShowPassword] = useState(false);
   const [qrCodeScanError, setQrCodeScanError] = useState<string | null>(null);
@@ -359,17 +421,18 @@ function PasswordCredentialContent({
   // Sync totpMethod and auto-expand accordion when totp_type prop changes
   // (e.g. edit data arriving after mount)
   useEffect(() => {
-    setTotpMethod((current) =>
-      totp_type === "none"
-        ? current === "none"
-          ? "none"
-          : "authenticator"
-        : totp_type,
-    );
+    setTotpMethod(totp_type);
     if (totp_type && totp_type !== "none") {
       setTotpAccordionValue("two-factor-authentication");
     }
   }, [totp_type]);
+  // A remembered locked method must be cleared when its gate unlocks so fields
+  // return to the selection-driven method instead of rendering uninvited.
+  useEffect(() => {
+    if (lockedMethodValue && !lockedMethodIsLocked) {
+      setLockedMethodValue(null);
+    }
+  }, [lockedMethodIsLocked, lockedMethodValue]);
 
   useEffect(() => {
     if (
@@ -417,6 +480,13 @@ function PasswordCredentialContent({
     }
   }, [authenticatorTypeOptionIds, enterpriseUpgradeError?.vendor]);
 
+  const authenticatorPrecedenceNotice = hasTotp ? (
+    <p className="text-sm text-muted-foreground">
+      Authenticator key present — Skyvern uses authenticator codes instead of
+      SMS or email codes while a key is set.
+    </p>
+  ) : null;
+
   const prevUsernameRef = useRef(username);
   const totpIdentifierLabel =
     totpMethod === "text"
@@ -441,6 +511,35 @@ function PasswordCredentialContent({
     },
     [name, onChange, password, totp, totp_identifier, totp_type, username],
   );
+
+  // A gate can resolve after a user selects an additional method. Do not keep
+  // a newly selected method pending once its gate locks; otherwise save maps
+  // the unsupported value to "none" and silently drops the entered material.
+  useEffect(() => {
+    const pendingMethod = additionalTwoFactorMethods.find(
+      ({ value }) => value === totpMethod && value === totp_type,
+    );
+    if (
+      !pendingMethod?.gate?.locked ||
+      configuredAdditionalTwoFactorMethod === pendingMethod.value
+    ) {
+      return;
+    }
+
+    setTotpMethod("none");
+    setLockedMethodValue(pendingMethod.value);
+    updateValues({ totp: "", totp_type: "none", totp_identifier: "" });
+    onAdditionalTwoFactorStateChange?.(pendingMethod.value, {
+      ...(pendingMethod.initialState ?? {}),
+    });
+  }, [
+    additionalTwoFactorMethods,
+    configuredAdditionalTwoFactorMethod,
+    onAdditionalTwoFactorStateChange,
+    totpMethod,
+    totp_type,
+    updateValues,
+  ]);
 
   // Keep totp_identifier in sync ONLY when the user renames their username
   // and the identifier was previously auto-filled to match that username.
@@ -468,6 +567,7 @@ function PasswordCredentialContent({
   // defaults here (rather than in a useEffect) so data-hydration setTotpMethod
   // calls don't accidentally trigger them.
   const handleTotpMethodChange = (method: string) => {
+    setLockedMethodValue(null);
     onEnableEditValues?.();
     const prevMethod = totpMethod;
     setTotpMethod(method);
@@ -501,24 +601,23 @@ function PasswordCredentialContent({
 
     updateValues(updates);
   };
+  const handleAdditionalTwoFactorMethodSelect = (
+    method: CredentialAdditionalTwoFactorMethod,
+  ) => {
+    const locked = Boolean(
+      method.gate?.locked &&
+      configuredAdditionalTwoFactorMethod !== method.value,
+    );
+    if (locked) {
+      setLockedMethodValue(method.value);
+      return;
+    }
+    setLockedMethodValue(null);
+    handleTotpMethodChange(totpMethod === method.value ? "none" : method.value);
+  };
 
   const handleTotpAccordionValueChange = (value: string) => {
     setTotpAccordionValue(value);
-    if (valuesReadOnly) {
-      return;
-    }
-    if (value === "two-factor-authentication") {
-      // Opening the section activates a concrete method (there is no "None"
-      // tile); default to the authenticator app when nothing is selected yet.
-      if (totp_type === "none") {
-        handleTotpMethodChange(
-          totpMethod === "none" ? "authenticator" : totpMethod,
-        );
-      }
-    } else if (totp_type !== "none") {
-      // Collapsing the section is how the user turns two-factor off.
-      handleTotpMethodChange("none");
-    }
   };
 
   const handleAuthenticatorTotpChange = (value: string) => {
@@ -708,6 +807,7 @@ function PasswordCredentialContent({
         </div>
         <div className="relative w-full">
           <Input
+            data-tour="credential-username"
             value={username}
             onChange={(e) => updateValues({ username: e.target.value })}
             readOnly={valuesReadOnly}
@@ -744,10 +844,17 @@ function PasswordCredentialContent({
         ) : (
           <div className="relative w-full">
             <Input
+              data-tour="credential-password"
               className="pr-9"
               type={showPassword ? "text" : "password"}
               value={password}
               onChange={(e) => updateValues({ password: e.target.value })}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  onPasswordEnter?.();
+                }
+              }}
               placeholder={editMode ? "••••••••" : undefined}
             />
             <div
@@ -776,7 +883,12 @@ function PasswordCredentialContent({
       >
         <AccordionItem value="two-factor-authentication" className="border-b-0">
           <AccordionTrigger className="py-2">
-            Two-Factor Authentication
+            <span className="flex items-center gap-2">
+              Two-Factor Authentication
+              <span className="text-xs font-normal text-muted-foreground">
+                Optional
+              </span>
+            </span>
           </AccordionTrigger>
           <AccordionContent>
             <div className="space-y-4">
@@ -795,7 +907,11 @@ function PasswordCredentialContent({
                         totpMethod === "authenticator",
                     },
                   )}
-                  onClick={() => handleTotpMethodChange("authenticator")}
+                  onClick={() =>
+                    handleTotpMethodChange(
+                      totpMethod === "authenticator" ? "none" : "authenticator",
+                    )
+                  }
                 >
                   {totpMethod === "authenticator" && (
                     <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
@@ -817,7 +933,11 @@ function PasswordCredentialContent({
                         totpMethod === "email",
                     },
                   )}
-                  onClick={() => handleTotpMethodChange("email")}
+                  onClick={() =>
+                    handleTotpMethodChange(
+                      totpMethod === "email" ? "none" : "email",
+                    )
+                  }
                 >
                   {totpMethod === "email" && (
                     <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
@@ -837,7 +957,11 @@ function PasswordCredentialContent({
                         totpMethod === "text",
                     },
                   )}
-                  onClick={() => handleTotpMethodChange("text")}
+                  onClick={() =>
+                    handleTotpMethodChange(
+                      totpMethod === "text" ? "none" : "text",
+                    )
+                  }
                 >
                   {totpMethod === "text" && (
                     <span className="absolute right-3 top-3 flex size-5 items-center justify-center rounded-full bg-blue-500 text-white">
@@ -854,12 +978,18 @@ function PasswordCredentialContent({
                     key={method.value}
                     method={method}
                     selected={totpMethod === method.value}
-                    onSelect={() => handleTotpMethodChange(method.value)}
+                    configured={
+                      configuredAdditionalTwoFactorMethod === method.value
+                    }
+                    onSelect={() =>
+                      handleAdditionalTwoFactorMethodSelect(method)
+                    }
                   />
                 ))}
               </div>
               {additionalTwoFactorMethods.map((method) =>
-                totpMethod === method.value ? (
+                lockedMethodValue === method.value ||
+                (!lockedMethodValue && totpMethod === method.value) ? (
                   <AdditionalTwoFactorMethodFields
                     key={method.value}
                     method={method}
@@ -877,12 +1007,17 @@ function PasswordCredentialContent({
                     configured={
                       configuredAdditionalTwoFactorMethod === method.value
                     }
+                    locked={Boolean(
+                      method.gate?.locked &&
+                      configuredAdditionalTwoFactorMethod !== method.value,
+                    )}
                     error={additionalTwoFactorError}
                   />
                 ) : null,
               )}
               {(totpMethod === "text" || totpMethod === "email") && (
                 <>
+                  {authenticatorPrecedenceNotice}
                   <div className="space-y-2">
                     <div className="flex items-center gap-12">
                       <div className="w-40 shrink-0">
@@ -932,17 +1067,28 @@ function PasswordCredentialContent({
                           </div>
                         ) : (
                           <div className="relative w-full">
-                            <Input
-                              value={totp_identifier}
-                              onChange={(event) =>
+                            <TwilioPhoneNumberPicker
+                              value={totp_identifier || null}
+                              onChange={(value) =>
                                 updateValues({
-                                  totp_identifier: event.target.value,
+                                  totp_identifier: value ?? "",
                                 })
                               }
-                              readOnly={valuesReadOnly}
-                              className={cn({
-                                "pr-9 opacity-70": valuesReadOnly,
-                              })}
+                              disabled={valuesReadOnly}
+                              renderManualInput={() => (
+                                <Input
+                                  value={totp_identifier}
+                                  onChange={(event) =>
+                                    updateValues({
+                                      totp_identifier: event.target.value,
+                                    })
+                                  }
+                                  readOnly={valuesReadOnly}
+                                  className={cn({
+                                    "pr-9 opacity-70": valuesReadOnly,
+                                  })}
+                                />
+                              )}
                             />
                             {valuesReadOnly && (
                               <button
@@ -962,6 +1108,26 @@ function PasswordCredentialContent({
                       {totpIdentifierHelper}
                     </p>
                   </div>
+                  {totpMethod === "email" && forwardingEnabled && (
+                    <CredentialForwardingAddress
+                      key={credentialId ?? "unsaved"}
+                      credentialId={credentialId}
+                      identifier={totp_identifier}
+                      savedTotpType={savedTotpType}
+                      disabled={Boolean(valuesReadOnly)}
+                      onPendingChange={onForwardingActionPendingChange}
+                      onChange={(identifier) => {
+                        if (onForwardingAddressChange) {
+                          onForwardingAddressChange(identifier);
+                        } else {
+                          updateValues({
+                            totp_identifier: identifier,
+                            totp_type: "email",
+                          });
+                        }
+                      }}
+                    />
+                  )}
                   <p className="text-sm text-slate-400">
                     {enterpriseContactUrl && (
                       <>
@@ -978,7 +1144,7 @@ function PasswordCredentialContent({
                       </>
                     )}
                     <Link
-                      to="https://www.skyvern.com/docs/running-tasks/advanced-features#time-based-one-time-password-totp"
+                      to="https://www.skyvern.com/docs/credentials#two-factor-authentication"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="underline underline-offset-2"
@@ -1000,7 +1166,7 @@ function PasswordCredentialContent({
                         <span className="text-destructive"> *</span>
                       </Label>
                     </div>
-                    {valuesReadOnly ? (
+                    {valuesReadOnly && totp_type === "authenticator" ? (
                       <div className="relative w-full">
                         <Input
                           value="••••••••"
@@ -1072,6 +1238,7 @@ function PasswordCredentialContent({
                       )}
                     </div>
                   )}
+                  {authenticatorPrecedenceNotice}
                   {enterpriseUpgradeError && (
                     <div
                       id={enterpriseUpgradeErrorId}

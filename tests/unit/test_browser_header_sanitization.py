@@ -14,6 +14,7 @@ import pytest
 import structlog
 
 import skyvern.webeye.browser_factory as browser_factory
+from skyvern.exceptions import UnknownErrorWhileCreatingBrowserContext
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserContextFactory, sanitize_browser_headers
 
@@ -64,10 +65,13 @@ class _FakeBrowserContext:
 
 
 class _FakeAgentFunction:
-    def __init__(self, *, route_handlers_allowed: bool) -> None:
+    def __init__(self, *, route_handlers_allowed: bool, route_policy_error: Exception | None = None) -> None:
         self.route_handlers_allowed = route_handlers_allowed
+        self.route_policy_error = route_policy_error
         self.route_permission_checks = 0
+        self.route_permission_kwargs: dict[str, Any] | None = None
         self.extension_setup_calls = 0
+        self.extension_setup_kwargs: dict[str, Any] | None = None
         self.header_route_origins: list[Any] = []
 
     def strip_proxy_session_extra_http_headers(
@@ -78,6 +82,9 @@ class _FakeAgentFunction:
 
     async def browser_context_route_handlers_allowed(self, **kwargs: Any) -> bool:
         self.route_permission_checks += 1
+        self.route_permission_kwargs = kwargs
+        if self.route_policy_error is not None and kwargs.get("_fail_on_error"):
+            raise self.route_policy_error
         return self.route_handlers_allowed
 
     async def should_apply_banked_cookies(self, organization_id: str | None) -> bool:
@@ -85,6 +92,7 @@ class _FakeAgentFunction:
 
     async def setup_browser_context_extensions(self, **kwargs: Any) -> None:
         self.extension_setup_calls += 1
+        self.extension_setup_kwargs = kwargs
 
     def on_origin_scoped_headers_route_installed(self, browser_context: Any, target_origin: Any) -> None:
         self.header_route_origins.append(target_origin)
@@ -95,6 +103,11 @@ async def _factory_context(
     *,
     route_handlers_allowed: bool = True,
     target_url: str | None = "https://target.test/start",
+    route_policy_url: str | None = None,
+    task_id: str | None = None,
+    reconcile_persistent_init_scripts: bool = False,
+    sessionless_init_script_registrations: tuple[Any, ...] = (),
+    route_policy_error: Exception | None = None,
 ) -> tuple[_FakeBrowserContext, dict[str, Any], _FakeAgentFunction]:
     captured_creator_kwargs: dict[str, Any] = {}
     contexts: list[_FakeBrowserContext] = []
@@ -105,7 +118,10 @@ async def _factory_context(
         contexts.append(context)
         return context, BrowserArtifacts(), None
 
-    agent_function = _FakeAgentFunction(route_handlers_allowed=route_handlers_allowed)
+    agent_function = _FakeAgentFunction(
+        route_handlers_allowed=route_handlers_allowed,
+        route_policy_error=route_policy_error,
+    )
 
     class FakeApp:
         AGENT_FUNCTION = agent_function
@@ -122,6 +138,10 @@ async def _factory_context(
     await BrowserContextFactory.create_browser_context(
         playwright=object(),  # type: ignore[arg-type]
         url=target_url,
+        _browser_context_route_policy_url=route_policy_url,
+        _reconcile_persistent_init_scripts=reconcile_persistent_init_scripts,
+        _sessionless_init_script_registrations=sessionless_init_script_registrations,
+        task_id=task_id,
         extra_http_headers={
             "X-Test-Credential": "fake-token",
             "X-Automation": "automation-value",
@@ -264,3 +284,51 @@ async def test_routes_not_permitted_omits_caller_headers(monkeypatch: pytest.Mon
         "event": "Omitting caller HTTP headers because browser context route handlers are not permitted",
         "log_level": "warning",
     } in logs
+
+
+@pytest.mark.asyncio
+async def test_route_policy_url_does_not_trigger_initial_navigation(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, creator_kwargs, agent_function = await _factory_context(
+        monkeypatch,
+        route_handlers_allowed=False,
+        target_url=None,
+        route_policy_url="https://accounts.example.test/login",
+        task_id="task-1",
+    )
+
+    assert creator_kwargs["url"] is None
+    assert "_browser_context_route_policy_url" not in creator_kwargs
+    assert agent_function.route_permission_kwargs is not None
+    assert agent_function.route_permission_kwargs["task_id"] == "task-1"
+    assert agent_function.route_permission_kwargs["url"] == "https://accounts.example.test/login"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_route_policy_error_aborts_before_recovery_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(UnknownErrorWhileCreatingBrowserContext, match="route policy unavailable"):
+        await _factory_context(
+            monkeypatch,
+            target_url=None,
+            route_policy_url="https://accounts.example.test/login",
+            task_id="task-1",
+            reconcile_persistent_init_scripts=True,
+            route_policy_error=RuntimeError("route policy unavailable"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_forwards_sessionless_init_scripts_only_to_context_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = object()
+    _, creator_kwargs, agent_function = await _factory_context(
+        monkeypatch,
+        reconcile_persistent_init_scripts=True,
+        sessionless_init_script_registrations=(registration,),
+    )
+
+    assert "_sessionless_init_script_registrations" not in creator_kwargs
+    assert agent_function.extension_setup_kwargs is not None
+    assert agent_function.extension_setup_kwargs["_sessionless_init_script_registrations"] == (registration,)

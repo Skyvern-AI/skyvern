@@ -1,42 +1,72 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import re
 from collections.abc import Collection, Sequence
 from typing import Any
 
 import structlog
 import yaml
+from fastapi import HTTPException
 
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    clear_tool_blocker_signals_for_reason_codes,
+)
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
     credential_reference_spans,
-    grounded_credential_references,
     grounded_references,
     load_credentials,
+    loggable_origin,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.vault_logins import (
+    VAULT_LOGIN_REF_PREFIX,
+    load_vault_logins,
+    vault_login_credential,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    LEGACY_BITWARDEN_PARAM_ID_PREFIX,
+    bitwarden_login_parameter_credential_id,
+    bitwarden_secret_bindings,
     block_credential_ids,
     credential_param_ids,
+    declared_non_credential_keys,
+    parse_workflow_yaml,
     saved_credential_ids,
+    url_origin,
     workflow_blocks,
+    workflow_credential_ids_from_parsed,
 )
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
+from skyvern.forge.sdk.credential_site_policy import describe_login_sites
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
-from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, CredentialVaultType, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
-from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
+from skyvern.forge.sdk.services.credential.credential_creation_service import VaultItemImport, import_vault_items
+from skyvern.forge.sdk.services.credential.credential_vault_service import (
+    LISTED_VAULT_TYPES,
+    VaultLogin,
+    VaultLoginListing,
+)
+from skyvern.forge.sdk.services.request_principal import get_request_principal, human_user_id
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.schemas.google_sheets import extract_sheet_gid, extract_spreadsheet_id, is_plain_cell_range
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import _iter_yaml_blocks, _workflow_definition_as_dict
+from .banned_blocks import CREDENTIAL_CODE_ACCESSORS, ONE_TIME_CODE_TOTP_TYPES, credential_code_accessors
 
 LOG = structlog.get_logger()
 
 
+LIST_CREDENTIALS_MAX_PAGE_SIZE = 50
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 
 
@@ -93,6 +123,10 @@ def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[st
 
     found: list[str] = []
     for parameter in parameters:
+        vault_id = bitwarden_login_parameter_credential_id(parameter)
+        if vault_id is not None:
+            found.append(vault_id)
+            continue
         slot_field = _credential_parameter_slot_field(parameter)
         if slot_field is None:
             continue
@@ -173,7 +207,24 @@ def _google_sheet_connection_bindings_from_workflow_definition(
 
 
 _GOOGLE_SHEETS_BLOCK_TYPES = {"google_sheets_read", "google_sheets_write"}
+_UNRESOLVED_GOOGLE_SLOT_NOTE = (
+    "The slot was left as written, and a slot still holding an unresolved reference cannot run."
+)
+_UNRESOLVED_GOOGLE_CONNECTION_TEXT = {
+    "ambiguous": "More than one of the organization's Google connections matches this reference.",
+    "not_found": "None of the organization's Google connections matches this reference.",
+    "ineligible": (
+        "This reference matches one Google connection, but that connection is not an active one with Google "
+        "Sheets access."
+    ),
+    "not_cited": "The user's message for this turn does not name this reference on its own, so it was not resolved.",
+    "lookup_failed": (
+        "The organization's Google connections could not be read, so this is not evidence that the connection "
+        "is missing."
+    ),
+}
 _GOOGLE_CONNECTION_PREFIX = "goac_"
+_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE = "unapproved_google_connection_reference"
 
 
 def _is_templated_credential_value(value: str) -> bool:
@@ -220,17 +271,21 @@ def _named_google_sheet_blocks(
     ]
 
 
-def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Collection[str]) -> list[str]:
+def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], selected_labels: set[str] | None) -> list[str]:
     """Templated Sheets `credential_id` slots not backed by credential-typed workflow parameters.
     A slot is backed only when it is a bare `{{ key }}` for such a parameter; a dotted path, a
     filter, or a `{% %}` expression names no parameter the boundary can vouch for, so it renders at
     run time with no citation, approval, state, or scope check and carries no authority of its own."""
     definition = parsed.get("workflow_definition")
     parameters = definition.get("parameters") if isinstance(definition, dict) else None
-    credential_keys = set(credential_param_ids(parameters))
+    credential_keys = {
+        key
+        for key, ids in credential_param_ids(parameters).items()
+        if not any(credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX) for credential_id in ids)
+    }
     return [
         reference
-        for block in workflow_blocks(parsed, selected_labels=set(labels))
+        for block in workflow_blocks(parsed, selected_labels=selected_labels)
         if block.get("block_type") in _GOOGLE_SHEETS_BLOCK_TYPES
         and isinstance((reference := block.get("credential_id")), str)
         and _is_templated_credential_value(reference)
@@ -241,16 +296,18 @@ def _unbacked_templated_google_sheet_slots(parsed: dict[str, Any], labels: Colle
     ]
 
 
-def _google_connection_reference_ids(workflow_definition: Any, labels: Collection[str]) -> list[str]:
+def _google_connection_reference_ids(workflow_definition: Any, labels: Collection[str] | None) -> list[str]:
+    """Unresolved Google connection references; `labels=None` reads the whole workflow definition."""
     parsed = {"workflow_definition": _workflow_definition_as_dict(workflow_definition)}
+    selected_labels = set(labels) if labels is not None else None
     return list(
         dict.fromkeys(
             [
                 *(
                     str(block["credential_id"]).strip()
-                    for block in _named_google_sheet_blocks(parsed, selected_labels=set(labels))
+                    for block in _named_google_sheet_blocks(parsed, selected_labels=selected_labels)
                 ),
-                *_unbacked_templated_google_sheet_slots(parsed, labels),
+                *_unbacked_templated_google_sheet_slots(parsed, selected_labels),
             ]
         )
     )
@@ -264,6 +321,17 @@ def _connection_row_facts(credential: GoogleOAuthCredentialBase) -> dict[str, An
         "state": credential.state,
         "scopes_granted": list(credential.scopes_granted),
     }
+
+
+def _eligible_sheets_connections(
+    connections: Sequence[GoogleOAuthCredentialBase],
+) -> list[GoogleOAuthCredentialBase]:
+    return [
+        credential
+        for credential in connections
+        if credential.state == google_oauth_service.STATE_ACTIVE
+        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in credential.scopes_granted
+    ]
 
 
 async def canonicalize_named_google_sheet_bindings(
@@ -298,12 +366,7 @@ async def canonicalize_named_google_sheet_bindings(
         )
         visible = None
 
-    eligible = [
-        credential
-        for credential in (visible or [])
-        if credential.state == google_oauth_service.STATE_ACTIVE
-        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in credential.scopes_granted
-    ]
+    eligible = _eligible_sheets_connections(visible or [])
     eligible_ids = {credential.id for credential in eligible}
 
     facts: list[dict[str, Any]] = []
@@ -338,6 +401,8 @@ async def canonicalize_named_google_sheet_bindings(
                     fact["status"] = "ineligible"
         if not fact["canonicalized"]:
             fact["eligible_connections"] = [_connection_row_facts(candidate) for candidate in eligible]
+            text = _UNRESOLVED_GOOGLE_CONNECTION_TEXT.get(fact["status"])
+            fact["detail"] = f"{text} {_UNRESOLVED_GOOGLE_SLOT_NOTE}" if text else _UNRESOLVED_GOOGLE_SLOT_NOTE
         facts.append(fact)
 
     if changed:
@@ -346,6 +411,132 @@ async def canonicalize_named_google_sheet_bindings(
             "copilot_google_connection_name_canonicalized",
             organization_id=ctx.organization_id,
             connection_ids=[fact["connection_id"] for fact in facts if fact["canonicalized"]],
+        )
+    scrubbed: list[dict[str, Any]] = scrub_secrets_from_structure(ctx, facts)
+    return workflow_yaml, scrubbed
+
+
+_GID_TAB_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+
+async def _fetch_sheet_tabs(organization_id: str, credential_id: str, url: str) -> list[google_sheets_service.SheetTab]:
+    token = await app.AGENT_FUNCTION.get_google_sheets_credentials(organization_id, credential_id)
+    if token is None:
+        raise RuntimeError("no Google Sheets access token")
+    return await google_sheets_service.get_spreadsheet_tabs(token, url)
+
+
+async def resolve_google_sheet_tabs_from_gid(
+    workflow_yaml: str,
+    ctx: AgentContext,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Fill an empty Sheets `sheet_name` with the title of the tab whose id is the `gid` in the block's
+    literal `spreadsheet_url`, read through the block's bound connection. Never falls back to another tab."""
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return workflow_yaml, []
+    if not isinstance(parsed, dict):
+        return workflow_yaml, []
+    candidates = [
+        (block, url, gid)
+        for block in workflow_blocks(parsed)
+        if block.get("block_type") in _GOOGLE_SHEETS_BLOCK_TYPES
+        and not str(block.get("sheet_name") or "").strip()
+        and isinstance((url := block.get("spreadsheet_url")), str)
+        and not _is_templated_credential_value(url)
+        and (gid := extract_sheet_gid(url)) is not None
+    ]
+    if not candidates:
+        return workflow_yaml, []
+
+    try:
+        eligible_ids: set[str] | None = {
+            credential.id
+            for credential in _eligible_sheets_connections(
+                await google_oauth_service.get_visible_credentials_for_org(ctx.organization_id)
+            )
+        }
+    except Exception:
+        LOG.warning("copilot_google_sheet_tab_lookup_failed", organization_id=ctx.organization_id, exc_info=True)
+        eligible_ids = None
+
+    # Reading tab titles discloses spreadsheet metadata, so it needs the same turn approval dispatch requires.
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    approved_ids = set(policy.run_approved_google_connection_ids) if policy is not None else set()
+    approved_ids.update(
+        await _approve_server_verified_google_sheet_bindings(
+            [(str(block.get("label")), str(block.get("credential_id"))) for block, _, _ in candidates],
+            tool_activity=ctx.tool_activity,
+            organization_id=ctx.organization_id,
+            request_policy=policy,
+        )
+    )
+
+    # A slow Sheets API must not stall the save: one bounded lookup per spreadsheet, failures included.
+    tabs_by_spreadsheet: dict[tuple[str, str], list[google_sheets_service.SheetTab] | None] = {}
+    facts: list[dict[str, Any]] = []
+    changed = False
+    for block, url, gid in candidates:
+        label = block.get("label")
+        credential_id = block.get("credential_id")
+        cell_range = block.get("range")
+        fact: dict[str, Any] = {"label": label if isinstance(label, str) else None, "gid": gid, "resolved": False}
+        facts.append(fact)
+        has_range = cell_range is not None and str(cell_range).strip() != ""
+        if has_range and not (isinstance(cell_range, str) and is_plain_cell_range(cell_range)):
+            fact.update(status="ineligible", reason="range_not_plain_cells")
+            continue
+        if not isinstance(credential_id, str) or not credential_id.strip():
+            fact["status"] = "no_connection"
+            continue
+        if _is_templated_credential_value(credential_id):
+            fact.update(status="ineligible", reason="templated_credential")
+            continue
+        if eligible_ids is None:
+            fact["status"] = "lookup_failed"
+            continue
+        if credential_id not in eligible_ids:
+            fact.update(status="ineligible", reason="not_eligible_connection")
+            continue
+        if credential_id not in approved_ids:
+            fact.update(status="ineligible", reason="connection_not_approved")
+            continue
+        try:
+            lookup_key = (credential_id, extract_spreadsheet_id(url))
+            if lookup_key not in tabs_by_spreadsheet:
+                tabs_by_spreadsheet[lookup_key] = None
+                tabs_by_spreadsheet[lookup_key] = await asyncio.wait_for(
+                    _fetch_sheet_tabs(ctx.organization_id, credential_id, url),
+                    timeout=_GID_TAB_LOOKUP_TIMEOUT_SECONDS,
+                )
+            tabs = tabs_by_spreadsheet[lookup_key]
+            if tabs is None:
+                raise RuntimeError("tab lookup already failed for this spreadsheet")
+        except Exception:
+            LOG.warning(
+                "copilot_google_sheet_tab_lookup_failed",
+                organization_id=ctx.organization_id,
+                connection_id=credential_id,
+                exc_info=True,
+            )
+            fact["status"] = "lookup_failed"
+            continue
+        fact["available_tabs"] = [tab.title for tab in tabs]
+        match = next((tab for tab in tabs if tab.sheet_id == gid), None)
+        if match is None:
+            fact["status"] = "gid_not_found"
+            continue
+        block["sheet_name"] = match.title
+        fact.update(status="resolved", resolved=True, sheet_name=match.title)
+        changed = True
+
+    if changed:
+        workflow_yaml = dump_workflow_yaml(parsed)
+        LOG.info(
+            "copilot_google_sheet_tab_resolved_from_gid",
+            organization_id=ctx.organization_id,
+            labels=[fact["label"] for fact in facts if fact["resolved"]],
         )
     scrubbed: list[dict[str, Any]] = scrub_secrets_from_structure(ctx, facts)
     return workflow_yaml, scrubbed
@@ -382,10 +573,13 @@ def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[s
         return []
 
     findings: list[dict[str, str]] = []
+    declared_keys = declared_non_credential_keys({"workflow_definition": workflow_definition})
 
     def _scan_value(value: Any, location: str, field: str) -> None:
         if isinstance(value, str):
             for credential_id in _CREDENTIAL_ID_RE.findall(value):
+                if credential_id in declared_keys:
+                    continue
                 findings.append({"location": location, "field": field, "credential_id": credential_id})
         elif isinstance(value, list):
             for item in value:
@@ -444,6 +638,15 @@ def _unapproved_credential_reference_tool_error(unapproved_credential_ids: list[
         "Credential approval blocked this Copilot run before dispatch. "
         f"Reason codes: unapproved_credential_reference. Unapproved credential {id_word}: {formatted_ids}. "
         "Ask the user to select or confirm the saved credential for this request before running the workflow."
+        + (
+            " A `bitwarden_login_credential` parameter runs only once the saved workflow binds it; bind a "
+            "credential from `list_credentials` instead."
+            if any(
+                credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX)
+                for credential_id in unapproved_credential_ids
+            )
+            else ""
+        )
     )
 
 
@@ -451,7 +654,11 @@ def _saved_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
     # Read from the saved workflow row at turn start. Deliberately not the submitted YAML: that is the
     # live canvas, which carries a copilot proposal until the user accepts or rejects it, so a binding
     # the model staged would come back as authority on the next turn.
-    return saved_credential_ids(request_policy.persisted_workflow_credential_ids)
+    return saved_credential_ids(request_policy.persisted_workflow_credential_ids) | {
+        credential_id
+        for credential_id in request_policy.persisted_workflow_credential_ids
+        if credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX)
+    }
 
 
 def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[str]:
@@ -502,12 +709,7 @@ async def _approve_server_verified_google_sheet_bindings(
 
     # Citation is judged against every visible row, the same set author time sees, so a longer
     # sibling name in the error state still shadows the shorter one; only active rows are eligible.
-    eligible = [
-        connection
-        for connection in visible_connections
-        if connection.state == google_oauth_service.STATE_ACTIVE
-        and google_oauth_service.GOOGLE_SHEETS_DATA_SCOPE in connection.scopes_granted
-    ]
+    eligible = _eligible_sheets_connections(visible_connections)
     eligible_ids = {connection.id for connection in eligible}
     return [
         connection_id
@@ -521,6 +723,18 @@ async def _approve_server_verified_google_sheet_bindings(
 
 
 def _same_turn_listed_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
+    # A connection the server just used to open the sheet is one it would have listed, so it counts as listed.
+    opened = {
+        connection_id
+        for activity in tool_activity
+        if activity.get("tool") == "read_google_sheet" and isinstance(activity.get("opened_connection_ids"), list)
+        for connection_id in activity["opened_connection_ids"]
+        if isinstance(connection_id, str)
+    }
+    return _latest_listing_google_sheet_ids(tool_activity) | opened
+
+
+def _latest_listing_google_sheet_ids(tool_activity: Sequence[dict[str, Any]]) -> set[str]:
     for activity in reversed(tool_activity):
         if activity.get("tool") != "list_integrations":
             continue
@@ -583,6 +797,8 @@ def _credential_run_approval_blocker_signal(
     *,
     additional_approved_ids: Collection[str] = (),
     google_reference_ids: Collection[str] = (),
+    action: str = "run the workflow",
+    blocked_tool: str = "update_and_run_blocks",
 ) -> CopilotToolBlockerSignal | None:
     approved_ids = _approved_run_credential_ids(request_policy) | set(additional_approved_ids)
     references = [
@@ -596,14 +812,82 @@ def _credential_run_approval_blocker_signal(
         blocker_kind="authority_denied",
         agent_steering_text="Ask the user to choose one of the server-provided connected Google accounts.",
         user_facing_reason=(
-            "Choose one of the connected Google accounts below so I can run the workflow. "
+            f"Choose one of the connected Google accounts below so I can {action}. "
             "Reconnect any unavailable account on the Integrations page first."
         ),
         recovery_hint="ask_user_clarifying",
         preserves_workflow_draft=True,
-        internal_reason_code="unapproved_google_connection_reference",
-        blocked_tool="update_and_run_blocks",
+        internal_reason_code=_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE,
+        blocked_tool=blocked_tool,
+        # The id list is the opaque subset; the count covers every reference, including named
+        # connections and template expressions the trace deliberately does not carry.
+        extra={
+            "unapproved_google_connection_ids": [
+                reference
+                for reference in unapproved_google_ids
+                if reference.startswith(_GOOGLE_CONNECTION_PREFIX) and not _is_templated_credential_value(reference)
+            ],
+            "unapproved_google_reference_count": len(unapproved_google_ids),
+        },
     )
+
+
+def _workflow_wide_unapproved_google_references(workflow_definition: Any, approved_ids: set[str]) -> set[str]:
+    google_ids = {
+        credential_id
+        for credential_id in _extract_credential_ids_from_workflow_definition(workflow_definition)
+        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
+    }
+    return (google_ids | set(_google_connection_reference_ids(workflow_definition, None))) - approved_ids
+
+
+def _non_sheets_google_connection_ids(workflow_definition: Any) -> set[str]:
+    definition = _workflow_definition_as_dict(workflow_definition)
+    return {
+        credential_id
+        for block in workflow_blocks({"workflow_definition": definition})
+        if block.get("block_type") not in _GOOGLE_SHEETS_BLOCK_TYPES
+        for credential_id in _extract_credential_ids_from_tool_value(block.get("credential_id"))
+        if credential_id.startswith(_GOOGLE_CONNECTION_PREFIX)
+    }
+
+
+def _saved_unapproved_google_connection_ids(request_policy: RequestPolicy | None, approved_ids: set[str]) -> set[str]:
+    if request_policy is None:
+        return set()
+    return {
+        credential_id
+        for credential_id in request_policy.persisted_workflow_credential_ids
+        if not _CREDENTIAL_ID_RE.fullmatch(credential_id.strip())
+        and not credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX)
+    } - approved_ids
+
+
+def _retire_stale_google_connection_denial(
+    ctx: CopilotContext,
+    *,
+    workflow_definition: Any,
+    additional_approved_ids: Collection[str] = (),
+) -> None:
+    """Drop an earlier attempt's denial once nothing it could have named is unapproved any more.
+    The clear removes every signal holding this reason code, including a later dispatch's live
+    denial, so any Google reference still unapproved in the executing or the saved definition
+    keeps them all standing."""
+    stale = ctx.blocker_signal
+    if not isinstance(stale, CopilotToolBlockerSignal):
+        return
+    if stale.internal_reason_code != _UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE:
+        return
+    durably_approved = _approved_run_credential_ids(ctx.request_policy)
+    approved = durably_approved | set(additional_approved_ids)
+    if _workflow_wide_unapproved_google_references(workflow_definition, approved):
+        return
+    if _non_sheets_google_connection_ids(workflow_definition) - durably_approved:
+        return
+    if _saved_unapproved_google_connection_ids(ctx.request_policy, approved):
+        return
+    clear_tool_blocker_signals_for_reason_codes(ctx, frozenset({_UNAPPROVED_GOOGLE_CONNECTION_REASON_CODE}))
+    ctx.connected_account_recovery_choices = []
 
 
 async def _server_verified_google_account_choices(
@@ -630,19 +914,210 @@ async def _server_verified_google_account_choices(
     return choices or None
 
 
+async def import_vault_login(organization_id: str, login: VaultLogin) -> str:
+    """The saved credential id for a listed vault login, importing it first when it has none."""
+    if login.credential_id:
+        return login.credential_id
+    try:
+        [(credential, _created)] = await import_vault_items(
+            organization_id,
+            login.vault_type,
+            [
+                VaultItemImport(
+                    vault_id=login.vault_id,
+                    item_id=login.item_id,
+                    name=login.title,
+                    credential_type=CredentialType.PASSWORD,
+                    tested_url=login.tested_url,
+                )
+            ],
+            created_by=human_user_id(principal, organization_id) if (principal := get_request_principal()) else None,
+        )
+    except HTTPException as exc:
+        raise PermissionError(f"vault login import refused with status {exc.status_code}") from exc
+    return credential.credential_id
+
+
+async def import_bound_vault_logins(workflow_yaml: str, ctx: AgentContext) -> tuple[str, str | None]:
+    """Import each listed vault login the draft binds and bind its saved credential in its place. Nothing is
+    imported unless each login's own sites cover every block URL it is bound at, and it is bound at one."""
+    parsed = parse_workflow_yaml(workflow_yaml)
+    definition = parsed.get("workflow_definition") if isinstance(parsed, dict) else None
+    if not isinstance(definition, dict):
+        return workflow_yaml, None
+    params_by_key = credential_param_ids(definition.get("parameters"))
+    block_urls: dict[str, set[str]] = {}
+    for block in workflow_blocks(parsed):
+        url = block.get("url")
+        if isinstance(url, str) and url.strip():
+            for credential_id in block_credential_ids(block, params_by_key):
+                block_urls.setdefault(credential_id, set()).add(url.strip())
+    policy = ctx.request_policy
+    prior_origins = policy.existing_workflow_credential_origins if isinstance(policy, RequestPolicy) else {}
+    refs = sorted(
+        credential_id
+        for credential_id in workflow_credential_ids_from_parsed(parsed)
+        if credential_id.startswith(VAULT_LOGIN_REF_PREFIX)
+    )
+    new_placements = {
+        credential_id: urls
+        for credential_id in block_urls
+        if credential_id.startswith(("cred_", LEGACY_BITWARDEN_PARAM_ID_PREFIX))
+        and (
+            urls := {
+                url for url in block_urls[credential_id] if url_origin(url) not in prior_origins.get(credential_id, [])
+            }
+        )
+    }
+    if not refs and not new_placements:
+        return workflow_yaml, None
+    logins, listing = await load_vault_logins(ctx.organization_id, policy)
+    # A `bitwarden_login_credential` parameter names an item in the connected Bitwarden vault.
+    logins = logins | {
+        f"{LEGACY_BITWARDEN_PARAM_ID_PREFIX}{login.item_id}": login
+        for login in logins.values()
+        if login.vault_type == CredentialVaultType.BITWARDEN_CONNECTED
+    }
+    unread_parameters = [
+        credential_id
+        for credential_id in new_placements
+        if credential_id.startswith(LEGACY_BITWARDEN_PARAM_ID_PREFIX) and credential_id not in logins
+    ]
+    if unread_parameters:
+        return workflow_yaml, (
+            "A `bitwarden_login_credential` parameter is bound at a new site, and its item is not a login the "
+            "connected Bitwarden vault lists now, so the websites it is saved for cannot be checked. Keep it on the "
+            "sites the workflow already used it on, or bind a credential from `list_credentials` instead."
+        )
+    unlisted = [ref for ref in refs if ref not in logins]
+    if unlisted:
+        return workflow_yaml, (
+            f"{', '.join(f'`{ref}`' for ref in unlisted)} is not a login `list_credentials` lists now. "
+            "Call `list_credentials` and bind a `credential_id` it returns."
+        )
+    pageless = [ref for ref in refs if not block_urls.get(ref)]
+    if pageless:
+        return workflow_yaml, (
+            f"{', '.join(f'`{ref}`' for ref in pageless)} is not bound at any block with a literal login page URL, "
+            "so its vault sites cannot be checked. Bind it at the block whose `url` is the sign-in page."
+        )
+    # An imported login without a tested_url is scoped by its vault sites alone, so no tested_url check covers it.
+    placements = {ref: block_urls[ref] for ref in refs} | {
+        credential_id: urls
+        for credential_id, urls in new_placements.items()
+        if credential_id in logins and logins[credential_id].tested_url is None
+    }
+    off_site = sorted(
+        (credential_id, url)
+        for credential_id, urls in placements.items()
+        for url in urls
+        if not any(site.admits(url) for site in logins[credential_id].sites)
+    )
+    if off_site:
+        return workflow_yaml, " ".join(
+            [
+                *(
+                    f"`{credential_id}` is bound at {loggable_origin(url) or url}, but as saved in its vault it fills "
+                    f"only on {describe_login_sites(logins[credential_id].sites)}."
+                    for credential_id, url in off_site
+                ),
+                "Bind a vault login only at a block on a site it fills on.",
+            ]
+        )
+    unlisted_ids = [credential_id for credential_id in new_placements if credential_id not in logins]
+    unseen_vaults = LISTED_VAULT_TYPES if listing.hidden else frozenset(listing.unreadable)
+    if unseen_vaults and unlisted_ids:
+        unchecked = [
+            credential.credential_id
+            for credential in await load_credentials(ctx.organization_id, credential_ids=unlisted_ids)
+            if credential.vault_type in unseen_vaults and credential.tested_url is None
+        ]
+        if unchecked:
+            names = ", ".join(f"`{credential_id}`" for credential_id in unchecked)
+            if listing.hidden:
+                return workflow_yaml, (
+                    f"{names} comes from a vault whose logins credential folder access hides from this user, so the "
+                    "websites it is saved for cannot be checked at a new site. Keep it on the sites the workflow "
+                    "already uses it on, or ask a user no folder restricts to make this change."
+                )
+            return workflow_yaml, (
+                f"{names} comes from a vault that cannot be read now, so the websites it is saved for cannot be "
+                "checked. Ask the user to check that vault's connection on the Integrations page."
+            )
+    if not refs:
+        return workflow_yaml, None
+    imported: dict[str, str] = {}
+    for ref in refs:
+        try:
+            imported[ref] = await import_vault_login(ctx.organization_id, logins[ref])
+        except PermissionError:
+            return workflow_yaml, (
+                f"`{ref}` cannot be imported from the vault for this user, so it cannot be bound. Bind a saved "
+                "`credential_id` from `list_credentials`, or ask an admin to import the login."
+            )
+        if isinstance(policy, RequestPolicy):
+            policy.adopt_imported_vault_login(ref, imported[ref])
+    for parameter in definition.get("parameters") or []:
+        if isinstance(parameter, dict) and parameter.get("key") in params_by_key:
+            for field in ("credential_id", "default_value"):
+                value = parameter.get(field)
+                if isinstance(value, str):
+                    parameter[field] = imported.get(value, value)
+            credential_ids = parameter.get("credential_ids")
+            if isinstance(credential_ids, list):
+                parameter["credential_ids"] = [
+                    imported.get(item, item) if isinstance(item, str) else item for item in credential_ids
+                ]
+    for block in workflow_blocks(parsed):
+        value = block.get("credential_id")
+        if isinstance(value, str):
+            block["credential_id"] = imported.get(value, value)
+    return dump_workflow_yaml(parsed), None
+
+
+async def run_input_vault_placement_error(
+    workflow_definition: object, run_parameters: object, ctx: AgentContext
+) -> str | None:
+    """A run input binds a credential as a parameter default does, so it gets the same vault-site placement check."""
+    if not isinstance(run_parameters, dict) or not run_parameters:
+        return None
+    refs = [
+        value
+        for value in run_parameters.values()
+        if isinstance(value, str) and value.startswith(VAULT_LOGIN_REF_PREFIX)
+    ]
+    if refs:
+        return (
+            f"{', '.join(f'`{ref}`' for ref in refs)} is a vault login that is not a saved credential yet, so a run "
+            "input cannot carry it. Bind it in the workflow, which imports it once its sites are checked."
+        )
+    parsed = {"workflow_definition": copy.deepcopy(_workflow_definition_as_dict(workflow_definition))}
+    for parameter in parsed["workflow_definition"].get("parameters") or []:
+        key = parameter.get("key") if isinstance(parameter, dict) else None
+        if isinstance(key, str) and isinstance(run_parameters.get(key), str):
+            parameter["default_value"] = run_parameters[key]
+    # A stored definition lists each block's parameters instead of their keys.
+    for block in workflow_blocks(parsed):
+        embedded = block.get("parameters")
+        if "parameter_keys" not in block and isinstance(embedded, list):
+            block["parameter_keys"] = [item["key"] for item in embedded if isinstance(item, dict) and "key" in item]
+    _, error = await import_bound_vault_logins(dump_workflow_yaml(parsed), ctx)
+    return error
+
+
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
     if not credential_ids:
         return None
     google_connection_ids = [credential_id for credential_id in credential_ids if credential_id.startswith("goac_")]
+    # A `bitwarden_login_credential` parameter binds a vault item, not a row; the run gate decides it.
     password_credential_ids = [
-        credential_id for credential_id in credential_ids if not credential_id.startswith("goac_")
+        credential_id
+        for credential_id in credential_ids
+        if not credential_id.startswith(("goac_", LEGACY_BITWARDEN_PARAM_ID_PREFIX))
     ]
     try:
         existing_credentials = (
-            await app.DATABASE.credentials.get_credentials_by_ids(
-                password_credential_ids,
-                organization_id=ctx.organization_id,
-            )
+            await load_credentials(ctx.organization_id, credential_ids=password_credential_ids)
             if password_credential_ids
             else []
         )
@@ -678,12 +1153,21 @@ async def _credential_ids_validation_error(credential_ids: list[str], ctx: Agent
     return None
 
 
+def bitwarden_binding_change_error(workflow_yaml: str, policy: RequestPolicy | None) -> str | None:
+    existing = policy.existing_bitwarden_secret_bindings if policy is not None else set()
+    if not bitwarden_secret_bindings(workflow_yaml) - existing:
+        return None
+    return (
+        "Copilot cannot add or change a `bitwarden_login_credential`, `bitwarden_sensitive_information` or "
+        "`bitwarden_credit_card_data` parameter. Bind a login from `list_credentials` as a `credential` "
+        "parameter instead; the user can add a Bitwarden parameter in the workflow editor."
+    )
+
+
 async def _credential_reference_validation_error(value: Any, ctx: AgentContext) -> str | None:
     if isinstance(value, str):
-        credential_ids = _extract_credential_ids_from_workflow_yaml(value)
-    else:
-        credential_ids = _extract_credential_ids_from_tool_value(value)
-    return await _credential_ids_validation_error(credential_ids, ctx)
+        return await _credential_ids_validation_error(_extract_credential_ids_from_workflow_yaml(value), ctx)
+    return await _credential_ids_validation_error(_extract_credential_ids_from_tool_value(value), ctx)
 
 
 def _serialize_credential(credential: Credential) -> dict[str, Any]:
@@ -693,12 +1177,15 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         "credential_type": str(credential.credential_type),
         "tested_url": credential.tested_url,
     }
+    accessors = credential_code_accessors(credential.credential_type, credential.totp_type)
+    if accessors:
+        entry["code"] = {"workflow_parameter_type": "credential_id", "accessors": list(accessors)}
     if credential.username:
         entry["username"] = credential.username
         entry["totp_type"] = str(credential.totp_type) if credential.totp_type else None
         if credential.totp_identifier:
             entry["totp_identifier"] = credential.totp_identifier
-        if credential.totp_type in {TotpType.AUTHENTICATOR, TotpType.EMAIL, TotpType.TEXT}:
+        if credential.totp_type in ONE_TIME_CODE_TOTP_TYPES:
             scouting: dict[str, Any]
             if credential.totp_type == TotpType.AUTHENTICATOR:
                 scouting = {
@@ -714,7 +1201,7 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
                 "scouting": scouting,
                 "code": {
                     "workflow_parameter_type": "credential_id",
-                    "accessor": "await <credential_parameter_key>.otp()",
+                    "accessor": CREDENTIAL_CODE_ACCESSORS[CredentialType.PASSWORD].otp,
                 },
             }
     elif credential.card_last4:
@@ -725,12 +1212,57 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
     return entry
 
 
-def _reference_is_typed_resume(reference: str, policy: RequestPolicy) -> bool:
-    return any(
-        credential.credential_id in policy.current_turn_named_credential_ids
+_DENIED_PASS_ROUTES = ["typed_resume", "request_credential_tool", "literal_credential_id"]
+
+
+def _typed_resume_arm(reference: str, policy: RequestPolicy, matches: list[Credential]) -> str | None:
+    """Which server record already answered which credential this reference names, if any. Each arm is
+    a server-owned record of an identifier, never an interpretation of prose: the user settled the id
+    this turn, the server bound it from a login page it admitted, or the user approved it earlier in
+    this chat. ``matches`` is what the live inventory resolves the reference to.
+    """
+
+    def keyed(credential: Credential) -> bool:
+        # A name on a stored record can have moved to another credential since it was written, so an
+        # arm vouches only for the one the live inventory resolved. Passing when the inventory did not
+        # resolve exactly one leaves the not-found and ambiguous answers below to report themselves.
+        return len(matches) != 1 or matches[0].credential_id == credential.credential_id
+
+    named_this_turn = policy.current_turn_named_credential_ids | policy.credential_pause_connected_credential_ids
+    if any(
+        credential.credential_id in named_this_turn
         and reference in {credential.credential_id, credential.name}
+        and keyed(credential)
         for credential in policy.resolved_credentials
-    )
+    ):
+        return "user_named_this_turn"
+    if any(
+        reference in {credential.credential_id, credential.name} and keyed(credential)
+        for credential in policy.auto_bound_credentials
+    ):
+        return "server_auto_bound"
+    # Durable approval records the user's own answer, not a page's vouch; the recorder skips a
+    # page-stamped id except the carried proposal a citation passed, which keeps its admitting origin.
+    # It is recorded by id, so it reads the resolved id directly rather than any stored name.
+    if len(matches) == 1 and matches[0].credential_id in policy.prior_approved_credential_ids:
+        return "user_approved_earlier_turn"
+    return None
+
+
+async def _unimported_vault_logins(ctx: AgentContext) -> tuple[list[tuple[str, VaultLogin]], VaultLoginListing]:
+    logins, listing = await load_vault_logins(ctx.organization_id, ctx.request_policy)
+    return [(ref, login) for ref, login in logins.items() if login.credential_id is None], listing
+
+
+def _unseen_vault_login_facts(listing: VaultLoginListing | None) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    if listing is None:
+        return facts
+    if listing.unreadable:
+        facts["unreadable_vaults"] = [str(vault_type) for vault_type in listing.unreadable]
+    if listing.hidden:
+        facts["vault_logins_hidden_by_folder_access"] = True
+    return facts
 
 
 async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[str, Any]:
@@ -745,46 +1277,93 @@ async def _resolve_exact_credential(reference: str, ctx: AgentContext) -> dict[s
             },
         }
 
-    credentials = await load_credentials(ctx.organization_id)
-    grounded_references = grounded_credential_references(policy.canonical_user_message, credentials)
+    saved_credentials = await load_credentials(ctx.organization_id)
+    # A login title can look like a saved credential id, so only a real one skips the vault listing.
+    vault_logins, listing = (
+        ([], None)
+        if any(credential.credential_id == reference for credential in saved_credentials)
+        else await _unimported_vault_logins(ctx)
+    )
+    vault_credentials = [vault_login_credential(ctx.organization_id, ref, login) for ref, login in vault_logins]
+    # A vault login is named by its title only: its ref is an internal id, never something a user types.
+    grounded = grounded_references(
+        policy.canonical_user_message,
+        [
+            *(value for credential in saved_credentials for value in (credential.name, credential.credential_id)),
+            *(credential.name for credential in vault_credentials),
+        ],
+    )
     matches_by_id = {
         credential.credential_id: credential
-        for credential in credentials
-        if credential.credential_id == reference or credential.name == reference
+        for credential in [*saved_credentials, *vault_credentials]
+        if credential.name == reference
+        or (credential.credential_id == reference and not reference.startswith(VAULT_LOGIN_REF_PREFIX))
     }
     matches = list(matches_by_id.values())
     literal_reference = bool(credential_reference_spans(policy.canonical_user_message, reference))
-    typed_resume = _reference_is_typed_resume(reference, policy)
+    typed_resume_arm = _typed_resume_arm(reference, policy, matches)
+    if len(matches) == 1 and matches[0].credential_id in _saved_workflow_credential_ids(policy):
+        typed_resume_arm = typed_resume_arm or "saved_workflow"
     # The agent owns natural-language interpretation. This boundary verifies only
-    # objective provenance and identity: the proposed exact reference must be a
-    # complete saved reference in the literal current turn. It deliberately does
-    # not implement a second English policy language beside the agent.
-    if not typed_resume and reference not in grounded_references and (matches or not literal_reference):
+    # objective provenance and identity: an exact reference is grounded in the current
+    # turn, a structured selection, or the server-saved workflow. It deliberately
+    # does not implement a second English policy language beside the agent.
+    if typed_resume_arm is None and reference not in grounded and (matches or not literal_reference):
+        LOG.info(
+            "copilot_credential_reference_not_literal",
+            reference_is_saved_credential=bool(matches),
+            named_credential_id_count=len(policy.current_turn_named_credential_ids),
+            auto_bound_credential_id_count=len(policy.auto_bound_credentials),
+            pass_routes=_DENIED_PASS_ROUTES,
+        )
         return {
             "ok": False,
             "data": {
                 "status": "denied",
                 "reference": reference,
                 "reason": "reference_not_literal_in_current_user_turn",
+                "pass_routes": _DENIED_PASS_ROUTES,
             },
         }
     if len(matches) != 1:
-        status = "not_found" if not matches else "ambiguous"
-        return {
-            "ok": False,
-            "data": {
-                "status": status,
-                "reference": reference,
-                "candidates": [_serialize_credential(credential) for credential in matches],
-            },
+        data: dict[str, Any] = {
+            "status": "ambiguous" if matches else "not_found",
+            "reference": reference,
+            "candidates": [_serialize_credential(credential) for credential in matches],
+            **_unseen_vault_login_facts(listing),
         }
+        if not matches:
+            withdrawn = policy.record_named_login_not_found()
+            data["page_login_binding"] = "off_for_this_turn"
+            data["withdrawn_credential_ids"] = withdrawn
+            LOG.info("copilot_named_login_not_found", withdrawn_credential_ids=withdrawn)
+        return {"ok": False, "data": data}
 
     credential = matches[0]
     policy.resolved_credentials = [
         *[item for item in policy.resolved_credentials if item.credential_id != credential.credential_id],
         credential,
     ]
-    policy.current_turn_named_credential_ids.add(credential.credential_id)
+    # A literal span the grounded check dropped — a shorter saved name sitting inside a longer one the
+    # user actually typed — is not the user naming this credential; no arm here already implies grounded.
+    user_named = typed_resume_arm is None or reference in grounded
+    if user_named:
+        policy.current_turn_named_credential_ids.add(credential.credential_id)
+        # A carried origin answers where the secret belongs only while nobody better has. The user
+        # naming the credential for a site they gave this turn is better, and the fill seam reads the
+        # origin ahead of every other route, so a stale one would refuse the site they just named.
+        if credential.credential_id in policy.seeded_proposal_credential_ids:
+            policy.live_page_admitted_urls.pop(credential.credential_id, None)
+    if typed_resume_arm == "server_auto_bound" and credential.credential_id in policy.seeded_proposal_credential_ids:
+        # The carry passed this citation. Whether it stands as the user's answer is decided at turn
+        # end, when what they settled is final — the card resume and a second resolve both write that
+        # set after this point, so deciding here would read it before the answer landed.
+        policy.carry_cited_credential_ids.add(credential.credential_id)
+    LOG.info(
+        "copilot_credential_reference_resolved",
+        credential_id=credential.credential_id,
+        pass_arm=typed_resume_arm or "literal_in_current_user_turn",
+    )
     return {
         "ok": True,
         "data": {
@@ -802,25 +1381,29 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
             return {"ok": False, "error": "exact_reference must be a non-empty exact saved name or credential ID"}
         return await _resolve_exact_credential(exact_reference, ctx)
 
+    vault_logins, listing = await _unimported_vault_logins(ctx)
     page = max(1, params.get("page", 1))
-    page_size = min(max(1, params.get("page_size") or 10), 50)
-    credentials = await app.DATABASE.credentials.get_credentials(
-        organization_id=ctx.organization_id,
-        page=page,
-        page_size=page_size,
-    )
+    page_size = min(max(1, params.get("page_size") or 10), LIST_CREDENTIALS_MAX_PAGE_SIZE)
+    credentials = await load_credentials(ctx.organization_id, page=page, page_size=page_size)
     serialized = [_serialize_credential(credential) for credential in credentials]
     _record_discovered_credentials_on_policy(ctx, credentials)
-    return {
-        "ok": True,
-        "data": {
-            "credentials": serialized,
-            "page": page,
-            "page_size": page_size,
-            "count": len(serialized),
-            "has_more": len(serialized) == page_size,
-        },
+    data: dict[str, Any] = {
+        "credentials": serialized,
+        "vault_logins": [
+            {
+                "credential_id": ref,
+                "name": login.title,
+                "site": loggable_origin(login.urls[0]) if login.urls else None,
+            }
+            for ref, login in vault_logins[(page - 1) * page_size : page * page_size]
+        ],
+        "page": page,
+        "page_size": page_size,
+        "count": len(serialized),
+        "has_more": len(serialized) == page_size or len(vault_logins) > page * page_size,
+        **_unseen_vault_login_facts(listing),
     }
+    return {"ok": True, "data": data}
 
 
 def _record_discovered_credentials_on_policy(ctx: AgentContext, credentials: list[Credential]) -> None:

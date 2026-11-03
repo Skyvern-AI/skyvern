@@ -7,13 +7,16 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.models import TaskGenerationModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.services.task_v1_service import generate_task
+from skyvern.forge.sdk.schemas.tasks import TaskRequest
+from skyvern.schemas.runs import RunEngine
+from skyvern.services.task_v1_service import InvalidTaskV1ModelError, generate_task, run_task
 
 
 @pytest_asyncio.fixture
@@ -212,3 +215,22 @@ async def test_generate_task_forwards_organization_id_to_cache_lookup(monkeypatc
     await generate_task("test prompt", organization)
 
     assert lookup_kwargs["organization_id"] == organization.organization_id
+
+
+@pytest.mark.asyncio
+async def test_run_task_rejects_ui_tars_when_volcengine_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENABLE_VOLCENGINE", False)
+    create_task_calls: list[object] = []
+
+    async def fake_create_task(*args: object, **kwargs: object) -> None:
+        create_task_calls.append(args)
+
+    monkeypatch.setattr(app, "agent", SimpleNamespace(create_task=fake_create_task))
+    now = datetime.now(timezone.utc)
+    organization = Organization(organization_id="o_1", organization_name="org", created_at=now, modified_at=now)
+
+    with pytest.raises(InvalidTaskV1ModelError):
+        await run_task(
+            TaskRequest(url="https://example.com", navigation_goal="go"), organization, engine=RunEngine.ui_tars
+        )
+    assert create_task_calls == []

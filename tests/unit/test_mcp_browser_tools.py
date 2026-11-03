@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterator
+from enum import Enum
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime
-from skyvern.cli.core import browser_ops
+from skyvern.cli.core import browser_ops, js_dispatch
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.browser_ops import (
@@ -27,18 +31,35 @@ from skyvern.cli.mcp_tools import _element_state
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.cli.mcp_tools import cdp_input as mcp_cdp_input
 from skyvern.cli.mcp_tools import mcp
+from skyvern.cli.mcp_tools import tabs as mcp_tabs
 from skyvern.client.errors import InternalServerError, UnprocessableEntityError
 from skyvern.config import settings
 from skyvern.constants import TEXT_PRESS_MAX_LENGTH
+from skyvern.exceptions import SkyvernPageAnalysisTimeout, StaleFrameSelectionError
+from skyvern.forge.sdk.copilot.tools import mcp_hooks
 from skyvern.forge.sdk.forge_log import codeblock_parameter_log_redaction
+from skyvern.library.ai_locator import AILocator
+from skyvern.webeye import action_deadline
+from skyvern.webeye.browser_health import BrowserOperation
+from skyvern.webeye.browser_object_predicates import is_page_like
+from skyvern.webeye.main_world_eval import configure_main_world_prefix
 from tests.unit._mcp_browser_fakes import (
+    HANGING_BOUND_MS,
+    HANGING_HEADROOM_MS,
+    HANGING_PAGE_URL,
+    HangingDriverCall,
+    StaleScopePage,
+    make_hanging_page,
     make_mock_page,
     make_probe_locator,
     make_real_wait_for_timeout,
     make_select_like_page,
     make_select_option_page,
     make_skyvern_page,
+    make_tab_page,
     patch_get_page,
+    patch_hanging_driver,
+    patch_tab_session,
 )
 
 
@@ -158,12 +179,13 @@ async def test_skyvern_login_success_returns_run_data(monkeypatch: pytest.Monkey
 
     result = await mcp_browser.skyvern_login(
         credential_type="skyvern",
-        credential_id="cred_123",
+        credential_id="cred_onepassword_imported",
     )
 
     assert result["ok"] is True
     assert result["data"]["run_id"] == "wr_123"
     assert result["data"]["status"] == "completed"
+    assert page.agent.login.await_args.kwargs["credential_id"] == "cred_onepassword_imported"
 
 
 @pytest.mark.asyncio
@@ -283,7 +305,7 @@ def _direct_click_page(
     raw_page = MagicMock()
     raw_page.locator = MagicMock(return_value=locator)
     click = AsyncMock(side_effect=click_error, return_value="#target")
-    page = SimpleNamespace(page=raw_page, click=click)
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, click=click)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return click, locator
@@ -301,7 +323,7 @@ def _direct_type_page(
     raw_page = MagicMock()
     raw_page.locator = MagicMock(return_value=locator)
     fill = AsyncMock(side_effect=fill_error, return_value="typed")
-    page = SimpleNamespace(page=raw_page, evaluate=AsyncMock(return_value=False), fill=fill)
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, evaluate=AsyncMock(return_value=False), fill=fill)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return fill, locator
@@ -530,7 +552,8 @@ async def test_skyvern_click_selector_is_resilient_by_default(monkeypatch: pytes
 @pytest.mark.asyncio
 async def test_skyvern_click_page_adapter_never_receives_private_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
     click = AsyncMock(return_value="#resolved")
-    page = SimpleNamespace(page=MagicMock(), click=click)
+    raw_page = MagicMock()
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, click=click)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
 
@@ -758,7 +781,7 @@ async def test_skyvern_click_direct_failure_masks_a_parameter_straddling_the_det
         click_error=mcp_browser.PlaywrightTimeoutError(message),
     )
 
-    with codeblock_parameter_log_redaction(lambda value: value.replace(parameter_value, "[REDACTED]")):
+    with codeblock_parameter_log_redaction(lambda value: value.replace(parameter_value, "[REDACTED]"), {}):
         result = await mcp_browser.skyvern_click(selector="#target", selector_mode="direct")
 
     detail = result["error"]["details"]["exception_detail"]
@@ -775,7 +798,7 @@ async def test_skyvern_click_direct_failure_probes_working_frame(monkeypatch: py
     raw_page = MagicMock()
     raw_page.locator = MagicMock(return_value=main_locator)
     click = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
-    page = SimpleNamespace(page=raw_page, click=click, _locator_scope=frame)
+    page = SimpleNamespace(page=raw_page, click=click, locator_scope=frame)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
 
@@ -784,7 +807,7 @@ async def test_skyvern_click_direct_failure_probes_working_frame(monkeypatch: py
     assert result["ok"] is False
     # Main frame has count=0: a main-frame probe would say not_found; hidden proves the frame was probed.
     assert result["error"]["details"]["element_state"] == "hidden"
-    frame.locator.assert_called_once_with("#in-iframe")
+    frame.locator.assert_called_with("#in-iframe")
 
 
 @pytest.mark.asyncio
@@ -839,6 +862,23 @@ async def test_skyvern_press_key_selector_only_uses_fast_default_timeout(monkeyp
 
     assert result["ok"] is True
     press.assert_awaited_once_with("Enter", timeout=5000)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "pressed"), [("CTRL+a", "Control+a"), ("left", "ArrowLeft"), ("esc", "Escape")])
+async def test_skyvern_press_key_sends_the_driver_the_key_name_it_accepts(
+    monkeypatch: pytest.MonkeyPatch, key: str, pressed: str
+) -> None:
+    # The driver raises "Unknown key" on these spellings, which models write routinely.
+    press = AsyncMock()
+    page = SimpleNamespace(locator=MagicMock(return_value=SimpleNamespace(press=press)))
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_press_key(key=key, selector="#field")
+
+    assert result["ok"] is True
+    press.assert_awaited_once_with(pressed, timeout=5000)
 
 
 @pytest.mark.asyncio
@@ -898,7 +938,7 @@ async def test_skyvern_press_key_direct_failure_reports_element_state(monkeypatc
     raw_page.locator = MagicMock(return_value=probe_locator)
     press_locator = MagicMock()
     press_locator.press = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 5000ms exceeded."))
-    page = SimpleNamespace(page=raw_page, locator=MagicMock(return_value=press_locator))
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, locator=MagicMock(return_value=press_locator))
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
 
@@ -975,10 +1015,11 @@ async def test_skyvern_click_intent_only_uses_proactive_ai(monkeypatch: pytest.M
 
 
 def _action_page(monkeypatch: pytest.MonkeyPatch, *, skyvern_page: bool = False, **methods: AsyncMock) -> object:
+    raw_page = MagicMock()
     page = (
-        make_skyvern_page(MagicMock())
+        make_skyvern_page(raw_page)
         if skyvern_page
-        else SimpleNamespace(page=MagicMock(), url="https://example.test/two-factor")
+        else SimpleNamespace(page=raw_page, locator_scope=raw_page, url="https://example.test/two-factor")
     )
     if skyvern_page:
         page.evaluate = AsyncMock(return_value=False)
@@ -1010,7 +1051,7 @@ def _native_option_page(
             side_effect=lambda selector: option_locator if selector == option_selector else select_locator
         )
     )
-    page = SimpleNamespace(page=raw_page, click=AsyncMock(return_value="#unexpected-click"))
+    page = SimpleNamespace(page=raw_page, locator_scope=raw_page, click=AsyncMock(return_value="#unexpected-click"))
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     return page, select_option
@@ -1161,7 +1202,7 @@ async def test_click_native_option_sdk_equivalent_quotes_observed_strings(
 
 
 @pytest.mark.asyncio
-async def test_evaluate_uses_direct_extension_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_evaluate_refuses_direct_extension_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     get_page = AsyncMock(side_effect=AssertionError("extension evaluation must bypass Playwright"))
     evaluate = AsyncMock(return_value={"answer": 42})
     runtime = SimpleNamespace(evaluate=evaluate)
@@ -1179,9 +1220,18 @@ async def test_evaluate_uses_direct_extension_runtime(monkeypatch: pytest.Monkey
 
     result = await mcp_browser.skyvern_evaluate(expression="({ answer: 6 * 7 })")
 
-    assert result["ok"] is True
-    assert result["data"]["result"] == {"answer": 42}
-    evaluate.assert_awaited_once_with("({ answer: 6 * 7 })")
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert result["error"]["message"] == (
+        "OP_NOT_ALLOWED: Direct JavaScript evaluation is unavailable in extension mode. "
+        "Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. "
+        "Use skyvern_click or skyvern_type to interact."
+    )
+    assert result["error"]["hint"] == (
+        "Use the normal browser controls. Do not enable User Scripts or reroute the expression "
+        "through CDP or another injection API."
+    )
+    evaluate.assert_not_called()
     get_page.assert_not_awaited()
 
 
@@ -1210,6 +1260,1165 @@ async def test_evaluate_does_not_reclaim_tab_without_active_extension_session(
     assert result["error"]["code"] == mcp_browser.ErrorCode.NO_ACTIVE_BROWSER
     evaluate.assert_not_awaited()
     get_page.assert_awaited_once_with(session_id=None, cdp_url=None)
+
+
+class _EvaluateScope:
+    """Locator scope whose evaluation only settles when the test releases it."""
+
+    def __init__(self, value: object = None, *, hangs: bool = True) -> None:
+        self.value = value
+        self.hangs = hangs
+        self.awaits = 0
+        self.released = asyncio.Event()
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.awaits += 1
+        if self.hangs:
+            await self.released.wait()
+        return self.value
+
+
+def _evaluate_page(monkeypatch: pytest.MonkeyPatch, scope: _EvaluateScope) -> MagicMock:
+    page = make_skyvern_page(make_mock_page())
+    page.locator_scope = scope
+    monkeypatch.setattr(mcp_browser, "get_current_session", lambda: SimpleNamespace(context=None))
+    monkeypatch.setattr(
+        mcp_browser,
+        "get_page",
+        AsyncMock(return_value=(page, BrowserContext(mode="local"))),
+    )
+    return page
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_bounds_a_never_resolving_expression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope()
+    page = _evaluate_page(monkeypatch, scope)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 150)
+    close_session = AsyncMock()
+    monkeypatch.setattr(session_manager, "_close_session_state", close_session)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})")
+    elapsed = loop.time() - started
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
+    assert elapsed < 1.0
+    assert scope.awaits == 1
+    page.page.evaluate.assert_not_awaited()
+    close_session.assert_not_awaited()
+
+    scope.hangs = False
+    scope.value = "9.42K"
+    follow_up = await mcp_browser.skyvern_evaluate(expression="document.title")
+
+    assert follow_up["ok"] is True
+    assert follow_up["data"]["result"] == "9.42K"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_propagates_external_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope()
+    _evaluate_page(monkeypatch, scope)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 30000)
+
+    task = asyncio.create_task(mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})"))
+    while scope.awaits == 0:
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+class _CancelTranslatingScope:
+    """Locator scope whose driver reports a torn-down target instead of honouring a cancellation, so
+    an external cancel reaches the tool as an ordinary exception."""
+
+    def __init__(self) -> None:
+        self.awaits = 0
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.awaits += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise PlaywrightError("Target page, context or browser has been closed") from None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_propagates_a_cancellation_the_driver_translated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _CancelTranslatingScope()
+    _evaluate_page(monkeypatch, scope)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 30000)
+
+    task = asyncio.create_task(mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})"))
+    while scope.awaits == 0:
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_returns_a_finite_value_from_the_active_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope(value={"visitors": "9.42K"}, hangs=False)
+    page = _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="({ visitors: '9.42K' })")
+
+    assert result["ok"] is True
+    assert result["data"]["result"] == {"visitors": "9.42K"}
+    assert scope.awaits == 1
+    page.page.evaluate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_keeps_caller_js_out_of_the_deadline_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _EvaluateScope(value="ok", hangs=False)
+    _evaluate_page(monkeypatch, scope)
+    recorded: dict[str, Any] = {}
+
+    async def record(**kwargs: Any) -> Any:
+        recorded.update(kwargs)
+        return await kwargs["evaluate_expression"]()
+
+    monkeypatch.setattr(mcp_browser.SkyvernFrame, "_evaluate_expression", record)
+
+    result = await mcp_browser.skyvern_evaluate(expression="fetch('/orders?token=tok-do-not-log')")
+
+    assert result["ok"] is True
+    assert "tok-do-not-log" not in recorded["expression"]
+
+
+class _DeadlineTransportScope:
+    """The real-browser shape: cancelling a large in-flight evaluate at the deadline surfaces the
+    driver's own transport error instead of the engine's timeout."""
+
+    def __init__(self) -> None:
+        self.awaits = 0
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.awaits += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # The driver reports the torn-down target rather than honouring the cancellation, so
+            # asyncio surfaces this instead of converting the deadline into a TimeoutError.
+            raise PlaywrightError("Target page, context or browser has been closed") from None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_reports_a_deadline_transport_error_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    scope = _DeadlineTransportScope()
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="fetch('/slow')")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert "Check JavaScript syntax" not in result["error"].get("hint", "")
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_records_a_browser_strike_for_a_translated_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine tallies the strike in its own timeout handler, which a driver error never reaches.
+
+    Without the tally, repeated hangs never accumulate toward BrowserHealth.is_degraded."""
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    context = SkyvernContext(request_id="test")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    scope = _DeadlineTransportScope()
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="fetch('/slow')")
+
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert context.browser_health.consecutive_timeouts == 1
+    assert context.browser_health.stuck_operations == {BrowserOperation.EVALUATE}
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_does_not_double_count_an_engine_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+    context = SkyvernContext(request_id="test")
+    monkeypatch.setattr(skyvern_context, "current", lambda: context)
+    scope = _EvaluateScope()
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="await new Promise(() => {})")
+
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    # The engine's own handler already recorded this one.
+    assert context.browser_health.consecutive_timeouts == 1
+
+
+class _ContextDestroyedScope:
+    """Locator scope whose caller expression dies the one way the engine still recovers from. Any
+    second evaluate or settle is that recovery re-running JavaScript whose effects are unknown."""
+
+    def __init__(self, failing_expression: str) -> None:
+        self.failing_expression = failing_expression
+        self.expressions: list[str] = []
+        self.settles = 0
+
+    async def evaluate(self, expression: str, arg: object | None = None) -> object:
+        self.expressions.append(expression)
+        if expression == self.failing_expression:
+            raise PlaywrightError("Execution context was destroyed, most likely because of a navigation")
+        return None
+
+    async def wait_for_load_state(self, state: str, timeout: float | None = None) -> None:
+        self.settles += 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_dispatches_caller_js_once_when_the_context_dies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _ContextDestroyedScope("postOrder()")
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="postOrder()")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.ACTION_FAILED
+    assert "Execution context was destroyed" in result["error"]["message"]
+    assert scope.expressions == ["postOrder()"]
+    assert scope.settles == 0
+
+
+class _PrefixedContext:
+    def __init__(self) -> None:
+        self.new_cdp_session = AsyncMock()
+
+
+class _PageLikeScope(_EvaluateScope):
+    """Structurally a top-level page, so a registered prefix would reroute a frame-agnostic
+    dispatch through the main-world CDP hook."""
+
+    def __init__(self, context: _PrefixedContext, value: object) -> None:
+        super().__init__(value, hangs=False)
+        self.context = context
+        self.main_frame = SimpleNamespace()
+
+    async def bring_to_front(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_action_lifecycle_keeps_the_original_dispatch_on_a_prefixed_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _PrefixedContext()
+    configure_main_world_prefix(context, "/* main world */\n")
+    scope = _PageLikeScope(context, value="9.42K")
+    assert is_page_like(scope)
+    _evaluate_page(monkeypatch, scope)
+
+    result = await mcp_browser.skyvern_evaluate(expression="document.title")
+
+    assert result["ok"] is True
+    assert result["data"]["result"] == "9.42K"
+    assert scope.awaits == 1
+    context.new_cdp_session.assert_not_awaited()
+
+
+class _CancelTranslatingDriverCall:
+    """Driver that reports a torn-down target instead of honouring a cancellation."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, *_args: object, **_kwargs: object) -> None:
+        self.calls += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise PlaywrightError("Target page, context or browser has been closed") from None
+
+
+class _CancelOnceThenHangingDriverCall:
+    """Driver that ignores its first cancellation and keeps hanging until the next one."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cancels = 0
+
+    async def __call__(self, *_args: object, **_kwargs: object) -> None:
+        self.calls += 1
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                self.cancels += 1
+                if self.cancels > 1:
+                    raise
+
+
+class _CancelSwallowingDriverCall:
+    """Driver that returns normally after ignoring a cancellation."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, *_args: object, **_kwargs: object) -> None:
+        self.calls += 1
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            return None
+
+
+class _SlowDriverCall:
+    """Driver leg that answers only after ``delay_ms``, modelling a legitimately long AI resolve."""
+
+    def __init__(self, delay_ms: int) -> None:
+        self.delay_ms = delay_ms
+        self.calls = 0
+
+    async def __call__(self, *_args: object, **_kwargs: object) -> None:
+        self.calls += 1
+        await asyncio.sleep(self.delay_ms / 1000)
+
+
+def _navigate_page(monkeypatch: pytest.MonkeyPatch, goto: Callable[..., Awaitable[object]]) -> SimpleNamespace:
+    page = make_hanging_page(goto)
+    patch_hanging_driver(monkeypatch, page, goto)
+    return page
+
+
+def _verb_page(monkeypatch: pytest.MonkeyPatch, driver_call: Callable[..., Awaitable[object]]) -> SimpleNamespace:
+    page = make_hanging_page(driver_call)
+    patch_hanging_driver(monkeypatch, page, driver_call)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_bounds_a_page_that_never_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    goto = HangingDriverCall()
+    page = _navigate_page(monkeypatch, goto)
+    close_session = AsyncMock()
+    monkeypatch.setattr(session_manager, "_close_session_state", close_session)
+    strikes: list[object] = []
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=HANGING_BOUND_MS)
+    elapsed = loop.time() - started
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
+    assert result["error"]["hint"] == mcp_browser.ACTION_DEADLINE_HINT
+    assert elapsed < 2.0
+    assert goto.calls == 1
+    assert strikes == []
+    close_session.assert_not_awaited()
+
+    goto.hangs = False
+    follow_up = await mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=HANGING_BOUND_MS)
+
+    assert follow_up["ok"] is True, follow_up
+    assert follow_up["data"]["title"] == "Metrics"
+    assert page.title.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_propagates_external_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    goto = HangingDriverCall()
+    _navigate_page(monkeypatch, goto)
+
+    task = asyncio.create_task(mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=30000))
+    while goto.calls == 0:
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_navigate_with_a_zero_timeout_stays_unbounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    goto = _SlowDriverCall(2 * (HANGING_BOUND_MS + HANGING_HEADROOM_MS))
+    page = _navigate_page(monkeypatch, goto)
+
+    result = await browser_ops.do_navigate(page, HANGING_PAGE_URL, timeout=0)
+
+    assert result.load_state == "load"
+    assert result.title == "Metrics"
+    assert goto.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_screenshot_deadline_is_not_held_by_cursor_restoration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        browser_ops.SettingsManager, "get_settings", lambda: SimpleNamespace(BROWSER_CURSOR_VISUALIZATION=True)
+    )
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "hide_cursor_overlay", AsyncMock())
+    restore = HangingDriverCall()
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "show_cursor_overlay", restore)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", HANGING_HEADROOM_MS)
+    monkeypatch.setattr(browser_ops, "_CURSOR_RESTORE_TIMEOUT_SECONDS", HANGING_BOUND_MS / 1000)
+    screenshot = HangingDriverCall()
+    page = SimpleNamespace(screenshot=screenshot)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        async with js_dispatch.under_action_deadline(budget_ms=HANGING_BOUND_MS):
+            await browser_ops.do_screenshot(page)
+
+    assert loop.time() - started < 2.0
+    assert screenshot.calls == 1
+    await asyncio.sleep(0.01)
+    assert restore.calls == 1
+    assert browser_ops._CURSOR_RESTORES
+    await asyncio.sleep(2 * HANGING_BOUND_MS / 1000)
+    assert not browser_ops._CURSOR_RESTORES
+
+
+@pytest.mark.asyncio
+async def test_frame_switch_deadline_keeps_the_session_in_step_with_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _verb_page(monkeypatch, HangingDriverCall())
+    state = SimpleNamespace(_working_frame=None, context=None)
+    monkeypatch.setattr(mcp_browser, "get_current_session", lambda: state)
+
+    async def late_switch(target: SimpleNamespace, **_kwargs: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            target._working_frame = "late-frame"
+
+    monkeypatch.setattr(mcp_browser, "do_frame_switch", late_switch)
+
+    result = await mcp_browser.skyvern_frame_switch(index=1)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"] == mcp_browser.ACTION_DEADLINE_HINT
+    assert state._working_frame == "late-frame"
+
+
+@pytest.mark.asyncio
+async def test_ai_locator_bounds_the_driver_call_after_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", HANGING_HEADROOM_MS)
+    press = HangingDriverCall()
+    raw_page = MagicMock()
+    raw_page.locator = MagicMock(return_value=SimpleNamespace(press=press))
+    page_ai = MagicMock()
+    page_ai.ai_locate_element = AsyncMock(return_value="//button")
+    located = AILocator(raw_page, page_ai, "the search box")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        await located.press("Enter", timeout=HANGING_BOUND_MS)
+
+    assert loop.time() - started < 2.0
+    assert page_ai.ai_locate_element.await_count == 1
+    assert press.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ai_locator_bounds_the_selector_probe_before_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", HANGING_HEADROOM_MS)
+    count = HangingDriverCall()
+    raw_page = MagicMock()
+    raw_page.locator = MagicMock(return_value=SimpleNamespace(count=count, press=AsyncMock()))
+    page_ai = MagicMock()
+    page_ai.ai_locate_element = AsyncMock(return_value="//button")
+    located = AILocator(raw_page, page_ai, "the search box", selector="#q")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        await located.press("Enter", timeout=HANGING_BOUND_MS)
+
+    assert loop.time() - started < 2.0
+    assert count.calls == 1
+    page_ai.ai_locate_element.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_action_deadline_rearms_after_a_leg_swallows_its_first_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", HANGING_HEADROOM_MS)
+    monkeypatch.setattr(action_deadline, "DEADLINE_REARM_INTERVAL_SECONDS", HANGING_BOUND_MS / 1000)
+    monkeypatch.setattr(
+        browser_ops.SettingsManager, "get_settings", lambda: SimpleNamespace(BROWSER_CURSOR_VISUALIZATION=True)
+    )
+    hide = _CancelTranslatingDriverCall()
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "hide_cursor_overlay", hide)
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "show_cursor_overlay", AsyncMock())
+    screenshot = HangingDriverCall()
+    page = SimpleNamespace(screenshot=screenshot)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        async with action_deadline.under_action_deadline(budget_ms=HANGING_BOUND_MS):
+            await browser_ops.do_screenshot(page)
+
+    assert loop.time() - started < 3.0
+    assert hide.calls == 1
+    assert screenshot.calls == 1
+    assert not action_deadline.cancellation_pending()
+
+
+@pytest.mark.asyncio
+async def test_action_deadline_stops_rearming_when_a_base_exception_leaves_the_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", HANGING_HEADROOM_MS)
+    monkeypatch.setattr(action_deadline, "DEADLINE_REARM_INTERVAL_SECONDS", HANGING_BOUND_MS / 1000)
+
+    class _Abort(BaseException):
+        pass
+
+    async def swallow_the_timeout_then_abort_on_the_rearm() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise _Abort from None
+
+    with pytest.raises(_Abort):
+        async with action_deadline.under_action_deadline(budget_ms=HANGING_BOUND_MS):
+            await swallow_the_timeout_then_abort_on_the_rearm()
+
+    # A stray re-arm would cancel this sleep.
+    await asyncio.sleep(4 * HANGING_BOUND_MS / 1000)
+    assert not action_deadline.cancellation_pending()
+
+
+@pytest.mark.asyncio
+async def test_scroll_ai_leg_reports_a_driver_that_never_answers_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hang = HangingDriverCall()
+    page = _verb_page(monkeypatch, hang)
+    page_ai = MagicMock()
+    page_ai.ai_locate_element = AsyncMock(return_value="//table")
+    page.locator = lambda selector=None, prompt=None, ai=None, **_kwargs: AILocator(page.page, page_ai, prompt or "")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_scroll(direction="down", intent="the pricing table")
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"] == mcp_browser.ACTION_DEADLINE_HINT
+    assert loop.time() - started < 2.0
+    assert hang.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_press_key_ai_leg_reports_a_driver_that_never_answers_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hang = HangingDriverCall()
+    page = _verb_page(monkeypatch, hang)
+    page_ai = MagicMock()
+    page_ai.ai_locate_element = AsyncMock(return_value="//input")
+    page.locator = lambda selector=None, prompt=None, ai=None, **_kwargs: AILocator(page.page, page_ai, prompt or "")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_press_key(key="Enter", intent="the search box", timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"] == mcp_browser.ACTION_DEADLINE_HINT
+    assert loop.time() - started < 2.0
+    assert hang.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinate_typing_reports_a_driver_that_never_answers_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hang = HangingDriverCall()
+    _verb_page(monkeypatch, hang)
+    monkeypatch.setattr(mcp_browser, "do_type_at", hang)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_type(x=10, y=20, text="hi", timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert loop.time() - started < 3.0
+    assert hang.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_screenshot_restores_the_cursor_when_the_hide_step_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", HANGING_HEADROOM_MS)
+    monkeypatch.setattr(
+        browser_ops.SettingsManager, "get_settings", lambda: SimpleNamespace(BROWSER_CURSOR_VISUALIZATION=True)
+    )
+    hide = HangingDriverCall()
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "hide_cursor_overlay", hide)
+    show = AsyncMock()
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "show_cursor_overlay", show)
+    screenshot = AsyncMock(return_value=b"png")
+    page = SimpleNamespace(screenshot=screenshot)
+
+    with pytest.raises(SkyvernPageAnalysisTimeout):
+        async with action_deadline.under_action_deadline(budget_ms=HANGING_BOUND_MS):
+            await browser_ops.do_screenshot(page)
+
+    await asyncio.sleep(0.01)
+    assert hide.calls == 1
+    screenshot.assert_not_awaited()
+    show.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_cursor_restore_wrapper_cancels_the_driver_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    cancelled = asyncio.Event()
+
+    async def show_cursor_overlay(_page: object) -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "show_cursor_overlay", show_cursor_overlay)
+    wrapper = asyncio.create_task(browser_ops._restore_cursor_overlay(SimpleNamespace()))
+    await asyncio.sleep(0.01)
+
+    wrapper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await wrapper
+
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_failure_still_restores_the_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        browser_ops.SettingsManager, "get_settings", lambda: SimpleNamespace(BROWSER_CURSOR_VISUALIZATION=True)
+    )
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "hide_cursor_overlay", AsyncMock())
+    show = AsyncMock()
+    monkeypatch.setattr(browser_ops.SkyvernFrame, "show_cursor_overlay", show)
+    page = SimpleNamespace(screenshot=AsyncMock(side_effect=RuntimeError("no such element")))
+
+    with pytest.raises(RuntimeError):
+        await browser_ops.do_screenshot(page)
+
+    show.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_propagates_an_external_cancellation_the_driver_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    goto = _CancelSwallowingDriverCall()
+    _navigate_page(monkeypatch, goto)
+
+    task = asyncio.create_task(mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=30000))
+    while goto.calls == 0:
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_propagates_a_cancellation_the_driver_translated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    goto = _CancelTranslatingDriverCall()
+    _navigate_page(monkeypatch, goto)
+
+    task = asyncio.create_task(mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=30000))
+    while goto.calls == 0:
+        await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize(
+    "goto_factory",
+    [
+        pytest.param(_CancelTranslatingDriverCall, id="deadline_translated_by_the_driver"),
+        pytest.param(_CancelSwallowingDriverCall, id="deadline_swallowed_by_the_driver"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_reports_an_expired_deadline_however_the_driver_surfaces_it(
+    monkeypatch: pytest.MonkeyPatch,
+    goto_factory: Callable[[], Callable[..., Awaitable[object]]],
+) -> None:
+    goto = goto_factory()
+    _navigate_page(monkeypatch, goto)
+    close_session = AsyncMock()
+    monkeypatch.setattr(session_manager, "_close_session_state", close_session)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"] == mcp_browser.ACTION_DEADLINE_HINT
+    assert loop.time() - started < 2.0
+    close_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_keeps_the_url_hint_for_a_driver_goto_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _navigate_page(monkeypatch, AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 200ms exceeded.")))
+
+    result = await mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
+    assert result["error"]["hint"] == "Check that the URL is valid and accessible"
+    assert "nav_error_code" in result["error"]["details"]
+
+
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_degrades_when_a_load_state_never_fires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _navigate_page(monkeypatch, HangingDriverCall(hangs=False))
+    page.wait_for_load_state = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("load never fired"))
+
+    result = await mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is True, result
+    assert result["data"]["load_state"] == "commit"
+
+
+@pytest.mark.asyncio
+async def test_navigate_action_lifecycle_reports_a_driver_that_goes_dark_after_commit_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _navigate_page(monkeypatch, HangingDriverCall(hangs=False))
+    page.wait_for_load_state = HangingDriverCall()
+    strikes: list[object] = []
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_browser.skyvern_navigate(url=HANGING_PAGE_URL, timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"] == mcp_browser.ACTION_DEADLINE_HINT
+    assert loop.time() - started < 3.0
+    assert strikes == []
+
+
+@pytest.mark.asyncio
+async def test_tab_new_reports_a_navigate_that_never_answered_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    goto = HangingDriverCall()
+    page = make_hanging_page(goto)
+    patch_hanging_driver(monkeypatch, page, goto)
+    monkeypatch.setattr(mcp_tabs, "validate_fetch_url", lambda url: url)
+    monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(page, BrowserContext(mode="local"))))
+    monkeypatch.setattr(
+        mcp_tabs,
+        "do_navigate",
+        lambda *args, **kwargs: browser_ops.do_navigate(page, HANGING_PAGE_URL, timeout=HANGING_BOUND_MS),
+    )
+    browser = SimpleNamespace(_browser_context=SimpleNamespace(pages=[page], new_page=AsyncMock(return_value=page)))
+    state = session_manager.SessionState(
+        _active_page=page,
+        _implicit_page=None,
+        _working_frame=None,
+        selection_lost=False,
+        _page_events=deque(maxlen=8),
+    )
+    monkeypatch.setattr(mcp_tabs, "get_current_session", lambda: state)
+    monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(browser, BrowserContext(mode="local"))))
+
+    result = await mcp_tabs.skyvern_tab_new(url=HANGING_PAGE_URL)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"].startswith(mcp_browser.ACTION_DEADLINE_HINT)
+    assert "remains open and active" in result["error"]["hint"]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs", "driver"),
+    [
+        pytest.param("skyvern_tab_new", {}, "new_page", id="tab_new"),
+        pytest.param("skyvern_tab_close", {"index": 0}, "close", id="tab_close"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tab_verbs_share_the_action_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    kwargs: dict[str, Any],
+    driver: str,
+) -> None:
+    hang = HangingDriverCall()
+    page = make_tab_page(close=hang if driver == "close" else None)
+    patch_tab_session(monkeypatch, [page], new_page=hang if driver == "new_page" else None)
+    close_session = AsyncMock()
+    monkeypatch.setattr(session_manager, "_close_session_state", close_session)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await getattr(mcp_tabs, tool_name)(**kwargs)
+    elapsed = loop.time() - started
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"].startswith(mcp_browser.ACTION_DEADLINE_HINT)
+    assert elapsed < 2.0
+    assert "could not be created" not in result["error"]["hint"]
+    if driver == "new_page":
+        assert "list the tabs" in result["error"]["hint"]
+    assert hang.calls == 1
+    close_session.assert_not_awaited()
+
+
+@pytest.mark.parametrize("closes_before_reply", [True, False], ids=["closed", "still_open"])
+@pytest.mark.asyncio
+async def test_tab_close_that_lands_after_the_deadline_forgets_the_closed_tab(
+    monkeypatch: pytest.MonkeyPatch,
+    closes_before_reply: bool,
+) -> None:
+    page = make_tab_page()
+
+    async def late_close(*_args: object, **_kwargs: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if closes_before_reply:
+                page.is_closed = lambda: True
+
+    page.close = late_close
+    state = patch_tab_session(monkeypatch, [page])
+    state._active_page = page
+    state._hooked_page_ids.add(id(page))
+    monkeypatch.setattr(
+        mcp_tabs, "get_page", AsyncMock(return_value=(SimpleNamespace(page=page), BrowserContext(mode="local")))
+    )
+
+    result = await mcp_tabs.skyvern_tab_close(index=0)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    assert state._active_page is None
+    if closes_before_reply:
+        assert "no longer selected" in result["error"]["hint"]
+        assert id(page) not in state._hooked_page_ids
+    else:
+        assert "selects a live tab" in result["error"]["hint"]
+        assert id(page) in state._hooked_page_ids
+
+
+@pytest.mark.asyncio
+async def test_tab_new_bounds_a_blank_tab_title_read_that_swallows_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_tabs, "TAB_TITLE_TIMEOUT_SECONDS", HANGING_BOUND_MS / 1000)
+    monkeypatch.setattr(action_deadline, "DEADLINE_REARM_INTERVAL_SECONDS", HANGING_BOUND_MS / 1000)
+    title = _CancelOnceThenHangingDriverCall()
+    page = make_tab_page()
+    page.title = title
+    state = patch_tab_session(monkeypatch, [page])
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_tabs.skyvern_tab_new()
+    elapsed = loop.time() - started
+
+    assert result["ok"] is True, result
+    assert result["data"]["title"] == ""
+    assert elapsed < 2.0
+    assert title.cancels == 2
+    assert state._active_page is page
+
+
+@pytest.mark.asyncio
+async def test_tab_switch_bounds_a_front_raise_that_never_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    hang = HangingDriverCall()
+    page = make_tab_page(bring_to_front=hang)
+    page.title = HangingDriverCall()
+    state = patch_tab_session(monkeypatch, [page])
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await mcp_tabs.skyvern_tab_switch(index=0)
+    elapsed = loop.time() - started
+
+    assert result["ok"] is True, result
+    assert result["data"]["title"] == ""
+    assert elapsed < 2.0
+    assert hang.calls == 1
+    assert state._active_page is page
+
+
+def test_outer_ceilings_arm_after_the_action_deadline_they_wrap() -> None:
+    inner_bound_seconds = (_element_state.DEFAULT_ACTION_TIMEOUT_MS + js_dispatch.ACTION_DEADLINE_HEADROOM_MS) / 1000
+
+    assert js_dispatch.outer_cap_seconds(_element_state.DEFAULT_ACTION_TIMEOUT_MS) > inner_bound_seconds
+    assert mcp_hooks._EVALUATE_OVERLAY_TIMEOUT_SECONDS > inner_bound_seconds
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    [
+        pytest.param("skyvern_click", {"selector": "#buy", "timeout": HANGING_BOUND_MS}, id="click"),
+        pytest.param("skyvern_type", {"selector": "#q", "text": "hi", "timeout": HANGING_BOUND_MS}, id="type_text"),
+        pytest.param("skyvern_scroll", {"direction": "down"}, id="scroll"),
+        pytest.param("skyvern_screenshot", {}, id="screenshot"),
+        pytest.param(
+            "skyvern_select_option",
+            {"selector": "#plan", "value": "pro", "timeout": HANGING_BOUND_MS},
+            id="select",
+        ),
+        pytest.param(
+            "skyvern_press_key",
+            {"key": "Enter", "selector": "#q", "timeout": HANGING_BOUND_MS},
+            id="press_key",
+        ),
+        pytest.param("skyvern_frame_list", {}, id="frame_list"),
+        pytest.param("skyvern_frame_switch", {"index": 1}, id="frame_switch"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_model_path_verbs_share_the_action_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    kwargs: dict[str, Any],
+) -> None:
+    hang = HangingDriverCall()
+    _verb_page(monkeypatch, hang)
+    close_session = AsyncMock()
+    monkeypatch.setattr(session_manager, "_close_session_state", close_session)
+    strikes: list[object] = []
+    monkeypatch.setattr(
+        js_dispatch.skyvern_context, "record_browser_timeout", lambda operation, **_: strikes.append(operation)
+    )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await getattr(mcp_browser, tool_name)(**kwargs)
+    elapsed = loop.time() - started
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT, result
+    read_only = tool_name in {"skyvern_screenshot", "skyvern_frame_list", "skyvern_select_option"}
+    expected_hint = _element_state.ACTION_DEADLINE_READ_HINT if read_only else mcp_browser.ACTION_DEADLINE_HINT
+    assert result["error"]["hint"] == expected_hint
+    assert elapsed < 2.0
+    assert hang.calls == 1
+    # A verb whose budget can fall to MIN_ACTION_TIMEOUT_MS cannot tell a slow page from a dead
+    # browser, so only screenshot's generous deadline feeds the run-failing degraded heuristic.
+    assert strikes == ([BrowserOperation.SCREENSHOT] if tool_name == "skyvern_screenshot" else [])
+    close_session.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    [
+        pytest.param("skyvern_click", {"intent": "the buy button"}, id="click"),
+        pytest.param("skyvern_type", {"intent": "the search box", "text": "hi"}, id="type_text"),
+        pytest.param("skyvern_scroll", {"direction": "down", "intent": "the pricing table"}, id="scroll"),
+        pytest.param(
+            "skyvern_press_key",
+            {"key": "Enter", "intent": "the search box", "timeout": HANGING_BOUND_MS},
+            id="press_key",
+        ),
+        pytest.param(
+            "skyvern_select_option",
+            {"value": "pro", "intent": "the plan dropdown", "timeout": HANGING_BOUND_MS},
+            id="select_option",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_ai_leg_may_outlast_the_action_timeout_and_still_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    kwargs: dict[str, Any],
+) -> None:
+    slow = _SlowDriverCall(2 * (HANGING_BOUND_MS + HANGING_HEADROOM_MS))
+    _verb_page(monkeypatch, slow)
+
+    result = await getattr(mcp_browser, tool_name)(**kwargs)
+
+    assert result["ok"] is True, result
+    assert slow.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_each_click_leg_gets_the_whole_budget_rather_than_the_first_leg_s_remainder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slow = _SlowDriverCall(HANGING_BOUND_MS)
+    _verb_page(monkeypatch, slow)
+    native_probe = _SlowDriverCall(HANGING_BOUND_MS)
+    monkeypatch.setattr(mcp_browser, "select_native_option_if_targeted", native_probe)
+
+    result = await mcp_browser.skyvern_click(selector="#buy", timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is True, result
+    assert native_probe.calls == 1
+    assert slow.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_the_click_bound_covers_the_sdk_overlay_dismiss_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    slow = _SlowDriverCall(int(1.75 * HANGING_BOUND_MS))
+    _verb_page(monkeypatch, slow)
+
+    result = await mcp_browser.skyvern_click(selector="#buy", timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is True, result
+
+
+@pytest.mark.asyncio
+async def test_the_native_option_ladder_shares_one_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    budget_ms = 5000
+    stale_index_ms = 50
+
+    async def _stale_index_then_success(**kwargs: object) -> None:
+        if kwargs.get("index") is not None:
+            await asyncio.sleep(stale_index_ms / 1000)
+            raise RuntimeError("stale option index")
+
+    _, select_option = _native_option_page(
+        monkeypatch,
+        option_info={"select_selector": "#region", "value": "east", "label": "East", "index": 3},
+        select_side_effect=_stale_index_then_success,
+    )
+
+    result = await mcp_browser.skyvern_click(selector="#region > option:nth-of-type(4)", timeout=budget_ms)
+
+    assert result["ok"] is True, result
+    handed = [attempt.kwargs["timeout"] for attempt in select_option.await_args_list]
+    assert len(handed) == 2
+    assert budget_ms - 50 <= handed[0] <= budget_ms
+    assert handed[1] < budget_ms - stale_index_ms + 10
+
+
+@pytest.mark.asyncio
+async def test_the_scroll_intent_leg_carries_a_driver_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sdk_equivalent_page(monkeypatch)
+    page, _ = await mcp_browser.get_page()
+
+    result = await mcp_browser.skyvern_scroll(direction="down", intent="the pricing table")
+
+    assert result["ok"] is True, result
+    page.locator.return_value.scroll_into_view_if_needed.assert_awaited_once_with(
+        timeout=_element_state.DEFAULT_ACTION_TIMEOUT_MS
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "kwargs"),
+    [
+        pytest.param("skyvern_navigate", {"url": HANGING_PAGE_URL, "timeout": HANGING_BOUND_MS}, id="navigate"),
+        pytest.param("skyvern_click", {"selector": "#buy", "timeout": HANGING_BOUND_MS}, id="click"),
+        pytest.param("skyvern_type", {"selector": "#q", "text": "hi", "timeout": HANGING_BOUND_MS}, id="type_text"),
+        pytest.param("skyvern_scroll", {"direction": "down"}, id="scroll"),
+        pytest.param("skyvern_screenshot", {}, id="screenshot"),
+        pytest.param(
+            "skyvern_select_option",
+            {"selector": "#plan", "value": "pro", "timeout": HANGING_BOUND_MS},
+            id="select",
+        ),
+        pytest.param(
+            "skyvern_press_key",
+            {"key": "Enter", "selector": "#q", "timeout": HANGING_BOUND_MS},
+            id="press_key",
+        ),
+        pytest.param("skyvern_frame_list", {}, id="frame_list"),
+        pytest.param("skyvern_frame_switch", {"index": 1}, id="frame_switch"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_analyzer_page_timeout_is_not_reported_as_an_action_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    kwargs: dict[str, Any],
+) -> None:
+    raising = AsyncMock(side_effect=SkyvernPageAnalysisTimeout("page analysis timed out"))
+    _verb_page(monkeypatch, raising)
+
+    result = await getattr(mcp_browser, tool_name)(**kwargs)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] != mcp_browser.ErrorCode.TIMEOUT, result
+    assert result["error"]["hint"] != mcp_browser.ACTION_DEADLINE_HINT, result
+
+
+@pytest.mark.asyncio
+async def test_direct_click_keeps_driver_diagnostics_inside_the_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hang = HangingDriverCall()
+    page = _verb_page(monkeypatch, hang)
+    page.click = AsyncMock(side_effect=mcp_browser.PlaywrightTimeoutError("Timeout 200ms exceeded."))
+    page.locator_scope.locator.return_value.count = AsyncMock(return_value=0)
+
+    result = await mcp_browser.skyvern_click(selector="#buy", selector_mode="direct", timeout=HANGING_BOUND_MS)
+
+    assert result["ok"] is False, result
+    assert result["error"]["code"] == mcp_browser.ErrorCode.SELECTOR_NOT_FOUND, result
+    assert result["error"]["details"]["actionability_timeout_ms"] == HANGING_BOUND_MS
 
 
 @pytest.mark.asyncio
@@ -1264,7 +2473,7 @@ async def test_skyvern_type_direct_uses_event_strategy_deterministically(monkeyp
     )
 
     assert result["ok"] is True, result.get("error")
-    raw_page.locator.assert_called_once_with("#first_name")
+    assert raw_page.locator.call_args_list == [call("#first_name"), call("#first_name")]
     clear_field.assert_awaited_once_with(
         raw_page,
         locator,
@@ -1316,7 +2525,7 @@ async def test_skyvern_type_direct_event_strategy_handles_aggregate_playwright_t
 
 
 @pytest.mark.asyncio
-async def test_skyvern_type_missing_selector_preflight_uses_aggregate_direct_timeout(
+async def test_skyvern_type_missing_selector_preflight_is_bound_by_the_action_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     preflight_cancelled = asyncio.Event()
@@ -1337,29 +2546,26 @@ async def test_skyvern_type_missing_selector_preflight_uses_aggregate_direct_tim
     first_match.evaluate = AsyncMock(side_effect=wait_for_missing_selector)
     matches.first = first_match
     active_frame.locator.return_value = matches
-    page = SimpleNamespace(page=raw_page, locator_scope=active_frame, _locator_scope=active_frame)
+    page = SimpleNamespace(page=raw_page, locator_scope=active_frame)
     context = BrowserContext(mode="cloud_session", session_id="pbs_test")
     monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
     strategy_aware_input = AsyncMock()
     monkeypatch.setattr(mcp_browser, "strategy_aware_input", strategy_aware_input)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 100)
 
-    loop = asyncio.get_running_loop()
-    started_at = loop.time()
     result = await asyncio.wait_for(
         mcp_browser.skyvern_type(
             selector="#missing",
             text="Noor",
             selector_mode="direct",
-            timeout=1000,
+            timeout=200,
         ),
         timeout=1.5,
     )
 
-    assert loop.time() - started_at < 1.5
     assert preflight_cancelled.is_set()
     assert result["ok"] is False
-    assert result["error"]["code"] == mcp_browser.ErrorCode.SELECTOR_NOT_FOUND
-    assert result["error"]["details"]["actionability_timeout_ms"] == 1000
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
     strategy_aware_input.assert_not_awaited()
 
 
@@ -1475,7 +2681,7 @@ async def test_skyvern_type_direct_event_strategy_uses_active_iframe_and_first_m
     )
 
     assert result["ok"] is True, result
-    active_frame.locator.assert_called_once_with(".shared-name")
+    active_frame.locator.assert_called_with(".shared-name")
     raw_page.locator.assert_not_called()
     clear_field.assert_awaited_once_with(
         raw_page,
@@ -1527,6 +2733,74 @@ async def test_skyvern_type_direct_event_strategy_refuses_active_iframe_password
     first_match.evaluate.assert_awaited_once()
     raw_page.evaluate.assert_not_awaited()
     strategy_aware_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear", [True, False], ids=["fill", "append"])
+async def test_skyvern_type_with_intent_refuses_top_document_password_match(
+    monkeypatch: pytest.MonkeyPatch,
+    clear: bool,
+) -> None:
+    top_match = MagicMock()
+    top_match.first = top_match
+    top_match.evaluate = AsyncMock(return_value=True)
+    top_match.type = AsyncMock()
+    raw_page = MagicMock()
+    raw_page.url = "https://example.test/form"
+    raw_page.locator = MagicMock(return_value=top_match)
+    frame_match = MagicMock()
+    frame_match.first = frame_match
+    frame_match.evaluate = AsyncMock(return_value=False)
+    active_frame = MagicMock()
+    active_frame.locator = MagicMock(return_value=frame_match)
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = active_frame
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_type(
+        selector=".shared-field",
+        intent="the promo code box",
+        text="opaque-value",
+        clear=clear,
+    )
+
+    assert result["ok"] is False
+    assert "password" in result["error"]["message"].lower()
+    top_match.type.assert_not_awaited()
+    page.fill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_append_with_intent_builds_the_ai_locator_on_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = MagicMock()
+    probe.first = probe
+    probe.evaluate = AsyncMock(return_value=False)
+    raw_page = MagicMock()
+    raw_page.url = "https://example.test/form"
+    raw_page.locator = MagicMock(return_value=probe)
+    active_frame = MagicMock()
+    active_frame.locator = MagicMock(return_value=probe)
+    ai_locator = MagicMock()
+    ai_locator.type = AsyncMock()
+    page = make_skyvern_page(raw_page)
+    page.locator_scope = active_frame
+    page.locator = MagicMock(return_value=ai_locator)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_browser.skyvern_type(
+        selector=".promo-field",
+        intent="the promo code box",
+        text="opaque-value",
+        clear=False,
+    )
+
+    assert result["ok"] is True, result.get("error")
+    page.locator.assert_called_once_with(selector=".promo-field", prompt="the promo code box", ai="fallback")
+    ai_locator.type.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1622,7 +2896,9 @@ async def test_skyvern_click_native_option_selector_uses_parent_select(monkeypat
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(value="east", timeout=5000)
+    select_option.assert_awaited_once()
+    assert select_option.await_args.kwargs["value"] == "east"
+    assert 0 < select_option.await_args.kwargs["timeout"] <= 5000
     assert result["data"]["resolved_selector"] == "#region"
     assert result["data"]["selected_option"] == {
         "select_selector": "#region",
@@ -1643,8 +2919,14 @@ async def test_skyvern_click_native_option_selector_can_fall_back_to_label(
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    assert select_option.await_args_list[0].kwargs == {"value": "east", "timeout": 5000}
-    assert select_option.await_args_list[1].kwargs == {"label": "East", "timeout": 5000}
+    assert [
+        call.kwargs["value"] if "value" in call.kwargs else call.kwargs["label"]
+        for call in select_option.await_args_list
+    ] == [
+        "east",
+        "East",
+    ]
+    assert all(0 < call.kwargs["timeout"] <= 5000 for call in select_option.await_args_list)
     assert result["data"]["selected_option"]["selected_by"] == "label"
     assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', label='East')"
 
@@ -1662,7 +2944,9 @@ async def test_skyvern_click_native_option_selector_selects_by_index(monkeypatch
 
     assert result["ok"] is True
     page.click.assert_not_awaited()
-    select_option.assert_awaited_once_with(index=3, timeout=5000)
+    select_option.assert_awaited_once()
+    assert select_option.await_args.kwargs["index"] == 3
+    assert 0 < select_option.await_args.kwargs["timeout"] <= 5000
     assert result["data"]["selected_option"]["selected_by"] == "index"
     assert result["data"]["selected_option"]["index"] == 3
     assert result["data"]["sdk_equivalent"] == "await page.select_option('#region', index=3)"
@@ -1673,7 +2957,7 @@ def test_exception_message_suppresses_body_outside_4xx() -> None:
         status_code = 200
         body = {"detail": "should not be surfaced"}
 
-    message = mcp_browser._exception_message(NonErrorStatusException())
+    message = mcp_browser.exception_message(NonErrorStatusException())
 
     assert "should not be surfaced" not in message
 
@@ -1757,7 +3041,7 @@ async def test_skyvern_type_ai_error_string_body_does_not_leak_token(monkeypatch
 @pytest.mark.asyncio
 async def test_skyvern_act_sdk_error_does_not_leak_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     # The SDK/agent handlers (act/extract/validate/run_task/login) must also route ApiError
-    # through _exception_message, not str(e) — otherwise ApiError.__str__ leaks headers/body.
+    # through exception_message, not str(e) — otherwise ApiError.__str__ leaks headers/body.
     _action_page(monkeypatch)
     monkeypatch.setattr(
         mcp_browser,
@@ -2084,7 +3368,7 @@ async def test_do_select_option_rejects_substring_value_false_commit(
         before,
         {**before, "expanded": "false"},
     ]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(RuntimeError, match="did not commit 'OR'"):
@@ -2186,7 +3470,7 @@ async def test_do_select_option_rejects_toggle_deselect_of_requested_value(
         before,
         {**before, "optionVisible": False, "optionPresent": True, "optionSelected": False},
     ]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(RuntimeError, match="did not commit 'OR'"):
@@ -2219,7 +3503,7 @@ async def test_do_select_option_ignores_unrelated_stable_data_attribute(
         before,
         {**before, "optionVisible": False},
     ]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(RuntimeError, match="did not commit 'OR'"):
@@ -2301,7 +3585,7 @@ async def test_do_select_option_bare_input_rejects_preexisting_neighbor_option(
     scoped_options = AsyncMock(return_value=[])
     monkeypatch.setattr(browser_ops, "_scoped_custom_options", scoped_options)
     control.evaluate.side_effect = [target, True]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(CustomSelectMatchError):
@@ -2342,7 +3626,7 @@ async def test_do_select_option_bare_input_fill_value_does_not_verify_commit(
         "optionSelected": False,
     }
     control.evaluate.side_effect = [target, True, before, {**before, "text": "Idle"}]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(RuntimeError, match="did not commit 'Fairview'"):
@@ -2376,7 +3660,7 @@ async def test_do_select_option_editable_list_close_requires_absent_container_ch
         before,
         {**before, "expanded": "false", "optionVisible": False},
     ]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(RuntimeError, match="did not commit 'Lakewood'"):
@@ -2458,7 +3742,7 @@ async def test_do_select_option_rejects_new_unrelated_container_channel(
             "optionVisible": False,
         },
     ]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(RuntimeError, match="did not commit 'Lakewood'"):
@@ -2540,13 +3824,13 @@ async def test_do_select_option_retries_editable_with_real_key_events_when_fill_
     monkeypatch.setattr(
         browser_ops,
         "time",
-        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0.5, 1.01, 1.02, 1.03])),
+        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 0.5, 1.01, 1.01, 1.01, 1.02, 1.03])),
     )
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     assert await do_select_option(page, "#city", "Lakewood", timeout=2000) == "Lakewood"
-    assert control.fill.await_args_list == [call("Lakewood", timeout=2000), call("", timeout=2000)]
-    control.press_sequentially.assert_awaited_once_with("Lakewood", timeout=2000)
+    assert control.fill.await_args_list == [call("Lakewood", timeout=2000), call("", timeout=990)]
+    control.press_sequentially.assert_awaited_once_with("Lakewood", timeout=990)
     assert observe.await_count == (2 if bare_input else 1)
 
 
@@ -2569,7 +3853,7 @@ async def test_do_select_option_retry_failure_restores_original_value(
     monkeypatch.setattr(
         browser_ops,
         "time",
-        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1.01])),
+        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1.01, 1.01, 1.01])),
     )
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
@@ -2584,7 +3868,7 @@ async def test_do_select_option_retry_failure_restores_original_value(
 
     assert control.fill.await_args_list == [
         call("Lakewood", timeout=2000),
-        call("", timeout=2000),
+        call("", timeout=990),
         call("Original city", timeout=1000),
     ]
 
@@ -2609,7 +3893,7 @@ async def test_do_select_option_retry_restore_failure_is_terminal(
     monkeypatch.setattr(
         browser_ops,
         "time",
-        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1.01])),
+        SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1.01])),
     )
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
@@ -2663,7 +3947,7 @@ async def test_do_select_option_surfaces_option_click_failure(monkeypatch: pytes
         {"text": "Choose", "value": "", "dataValues": [], "expanded": "true", "optionSelected": False},
     ]
     control.click.side_effect = [None, RuntimeError("click intercepted by overlay")]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 1])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 1])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     with pytest.raises(RuntimeError, match="click intercepted by overlay"):
@@ -2689,7 +3973,7 @@ async def test_do_select_option_scan_observed_control_without_options_uses_bound
     scoped_options = AsyncMock(return_value=[])
     monkeypatch.setattr(browser_ops, "_scoped_custom_options", scoped_options)
     control.evaluate.side_effect = [target, True]
-    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 4])))
+    monkeypatch.setattr(browser_ops, "time", SimpleNamespace(monotonic=Mock(side_effect=[0, 0, 0, 4])))
     monkeypatch.setattr(browser_ops, "asyncio", SimpleNamespace(sleep=AsyncMock()))
 
     result = await do_select_option(page, "#empty", "anything", timeout=30000)
@@ -3170,6 +4454,7 @@ def _write_grid_page(*, focused_is_password: bool) -> tuple[SimpleNamespace, Sim
         click=AsyncMock(),
         evaluate=AsyncMock(return_value=focused_is_password),
     )
+    page.locator_scope = raw_page
     return page, cdp
 
 
@@ -3282,7 +4567,7 @@ async def test_navigating_paired_tools_invalidate_refs_around_navigation(
         return NavigateResult(url="https://example.test", title="Example", load_state="load")
 
     monkeypatch.setattr(mcp_browser, "do_navigate", AsyncMock(side_effect=navigate))
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     monkeypatch.setattr(mcp_browser, "do_extract", AsyncMock(return_value=SimpleNamespace(extracted={"value": 1})))
     monkeypatch.setattr(
         mcp_browser,
@@ -3347,7 +4632,7 @@ async def test_navigating_paired_tools_surface_the_degraded_load_state(
         "do_navigate",
         AsyncMock(return_value=NavigateResult(url="https://example.test", title="Example", load_state="commit")),
     )
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     monkeypatch.setattr(
         mcp_browser,
         "save_artifact",
@@ -3669,7 +4954,7 @@ async def test_paired_read_failure_keeps_screenshot_and_reports_failure(
 @pytest.mark.asyncio
 async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPatch) -> None:
     _sdk_equivalent_page(monkeypatch)
-    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=SimpleNamespace(data=b"png")))
+    monkeypatch.setattr(mcp_browser, "do_screenshot", AsyncMock(return_value=browser_ops.ScreenshotResult(data=b"png")))
     artifact = Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)
     monkeypatch.setattr(mcp_browser, "save_artifact", Mock(return_value=artifact))
 
@@ -3679,21 +4964,35 @@ async def test_inline_screenshot_is_also_persisted(monkeypatch: pytest.MonkeyPat
     assert result["artifacts"] == [artifact.to_dict()]
 
 
+class _WaiterKind(Enum):
+    """Waiter shapes a delay cannot express: settling before the first suspension point, and ignoring
+    cancellation the way a driver call that never returns does."""
+
+    SETTLES_ON_FIRST_STEP = "settles_on_first_step"
+    IGNORES_CANCELLATION = "ignores_cancellation"
+
+
 def _either_wait_page(
     monkeypatch: pytest.MonkeyPatch,
-    outcomes: dict[str, float | Exception],
-) -> list[asyncio.Task]:
+    outcomes: dict[str, float | Exception | _WaiterKind | None],
+) -> asyncio.Event:
     """Fake a page whose per-selector waits resolve after a delay, raise, or time out: an outcome of
     None means the selector never appears, so that waiter times out the way Playwright's does. Returns
-    the waiter tasks so a caller can assert the tool drained them.
+    the event that releases any waiter configured to ignore cancellation.
     """
-    waiters: list[asyncio.Task] = []
+    release = asyncio.Event()
 
     async def wait_for_selector(selector: str, timeout: float = 30000, **_: object) -> SimpleNamespace:
-        task = asyncio.current_task()
-        if task is not None:
-            waiters.append(task)
         outcome = outcomes.get(selector)
+        if outcome is _WaiterKind.SETTLES_ON_FIRST_STEP:
+            return SimpleNamespace(selector=selector)
+        if outcome is _WaiterKind.IGNORES_CANCELLATION:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+            raise mcp_browser.PlaywrightTimeoutError(f"Wedged waiter released for {selector}")
         if isinstance(outcome, Exception):
             raise outcome
         if outcome is None:
@@ -3703,7 +5002,35 @@ def _either_wait_page(
         return SimpleNamespace(selector=selector)
 
     _action_page(monkeypatch, wait_for_selector=AsyncMock(side_effect=wait_for_selector))
-    return waiters
+    return release
+
+
+@pytest.fixture(autouse=True)
+def _clear_orphaned_waiters() -> Iterator[None]:
+    """A waiter that ignores cancellation is only discarded through the loop, and pytest-asyncio closes
+    the loop first, so without this every wedged fake outlives its own test."""
+    yield
+    mcp_browser._ORPHANED_WAITERS.clear()
+
+
+async def _drain_released_waiters(release: asyncio.Event, held: set[asyncio.Task]) -> None:
+    release.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if not held & mcp_browser._ORPHANED_WAITERS:
+            return
+
+
+async def _answer_within(call: Awaitable[dict[str, Any]], seconds: float = 5) -> dict[str, Any]:
+    """Await a wait-tool call under a bound that cannot itself be absorbed. ``wait_for`` enforces its
+    deadline by cancelling, so a regression that swallows cancellation would hang the run instead of
+    failing it."""
+    pending = asyncio.ensure_future(call)
+    settled, _ = await asyncio.wait({pending}, timeout=seconds)
+    if not settled:
+        pending.cancel()
+        raise AssertionError(f"wait tool did not answer within {seconds}s")
+    return pending.result()
 
 
 @pytest.mark.asyncio
@@ -3758,6 +5085,129 @@ async def test_wait_for_either_state_reports_the_observed_failed_wait_duration(
 
 
 @pytest.mark.asyncio
+async def test_wait_for_either_state_answers_while_the_losing_waiter_ignores_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The declared timeout is 120s and the losing waiter never unwinds, so anything the caller can act
+    on has to come back without it, and a waiter that answers late is only reportable once it settles."""
+    warnings: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        mcp_browser.LOG, "warning", lambda event, **fields: warnings.append((event, fields)), raising=False
+    )
+    release = _either_wait_page(monkeypatch, {"#login": 0.01, "#home": _WaiterKind.IGNORES_CANCELLATION})
+    before = set(mcp_browser._ORPHANED_WAITERS)
+
+    result = await _answer_within(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=120000)
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["matched_selector"] == "#login"
+    assert result["data"]["matched"] == "selector_a"
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    held = mcp_browser._ORPHANED_WAITERS - before
+    assert len(held) == 1
+    assert warnings == []
+
+    await _drain_released_waiters(release, held)
+
+    assert held & mcp_browser._ORPHANED_WAITERS == set()
+    settled = [fields for event, fields in warnings if "did not end cancelled" in event]
+    assert len(settled) == 1
+    assert set(settled[0]) == {"error_type", "orphaned_waiters"}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_times_out_while_the_losing_waiter_ignores_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(mcp_browser.LOG, "warning", lambda event, **fields: warnings.append(event), raising=False)
+    release = _either_wait_page(monkeypatch, {"#login": None, "#home": _WaiterKind.IGNORES_CANCELLATION})
+
+    result = await _answer_within(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=1000)
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
+    # A page missing both states and a driver that stopped answering both land here, so the report
+    # names the elapsed bound and the selectors it waited on rather than a cause it cannot see.
+    assert result["error"]["message"] == "Neither '#login' nor '#home' reached 'visible' within 1000ms"
+    assert result["error"]["hint"] == "Neither state was confirmed before the timeout elapsed"
+    # No driver exception was ever constructed on this path, so the field that would name one stays empty.
+    assert result["error"]["details"] == {}
+    assert result["data"]["source_url"] == "https://example.test/two-factor"
+    assert result["data"]["result_url"] == "https://example.test/two-factor"
+    assert result["data"]["selector_a"] == "#login"
+    assert result["data"]["selector_b"] == "#home"
+
+    await _drain_released_waiters(release, set(mcp_browser._ORPHANED_WAITERS))
+
+    # Both losers were abandoned at the deadline; only the one that did not end cancelled is worth
+    # reporting, so the selector that unwound normally must leave nothing behind.
+    assert [event for event in warnings if "did not end cancelled" in event] == [
+        "Browser wait selector task did not end cancelled"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_prefers_the_declared_first_of_a_winning_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both waiters win in the same batch, so only the declared-first ordering decides the answer and
+    neither task is left registered."""
+    _either_wait_page(
+        monkeypatch,
+        {"#login": _WaiterKind.SETTLES_ON_FIRST_STEP, "#home": _WaiterKind.SETTLES_ON_FIRST_STEP},
+    )
+    before = set(mcp_browser._ORPHANED_WAITERS)
+
+    result = await mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home")
+
+    assert result["data"]["matched_selector"] == "#login"
+    assert result["data"]["matched"] == "selector_a"
+    assert mcp_browser._ORPHANED_WAITERS - before == set()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_keeps_a_raisers_error_over_a_silent_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selector that raises settles long before the declared bound, so its error is the one on hand
+    when the wait gives up and the caller learns what was actually wrong."""
+    _either_wait_page(monkeypatch, {"#login": ValueError("bad selector"), "#home": None})
+
+    result = await _answer_within(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=1000)
+    )
+
+    assert result["ok"] is False
+    assert "bad selector" in result["error"]["message"]
+    assert result["error"]["hint"] == "The page settled into neither state; both selectors may be wrong for this page"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_either_state_propagates_caller_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = _either_wait_page(monkeypatch, {"#login": None, "#home": _WaiterKind.IGNORES_CANCELLATION})
+    pending_call = asyncio.ensure_future(
+        mcp_browser.skyvern_wait_for_either_state(selector_a="#login", selector_b="#home", timeout=120000)
+    )
+    await asyncio.sleep(0.05)
+
+    pending_call.cancel()
+
+    # Bounding this with wait_for would cancel the call to enforce its own deadline, and a wait that
+    # absorbs cancellation absorbs that one too, so the guard has to observe without cancelling.
+    settled, _ = await asyncio.wait({pending_call}, timeout=5)
+    assert settled, "cancelling the caller did not unwind the wait"
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending_call
+    await _drain_released_waiters(release, set(mcp_browser._ORPHANED_WAITERS))
+
+
+@pytest.mark.asyncio
 async def test_wait_for_either_state_rejects_states_where_absence_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     _either_wait_page(monkeypatch, {"#login": 0.01, "#home": 0.01})
 
@@ -3793,3 +5243,284 @@ def test_either_state_output_schema_accepts_both_envelope_modes(concise: bool) -
             jsonschema.validate(envelope, mcp_browser.EITHER_STATE_OUTPUT_SCHEMA)
     finally:
         set_concise_responses(False)
+
+
+@pytest.mark.asyncio
+async def test_password_probe_waits_as_long_as_the_write_it_guards() -> None:
+    """A probe bounded tighter than the write answers 'not a password' for a field the write
+    then waits for and types into, so the bound must be the write's own timeout."""
+    probe = make_probe_locator(is_password=True)
+    scope = MagicMock()
+    scope.locator = MagicMock(return_value=probe)
+
+    assert await browser_ops.selector_targets_password([scope], "#pw", timeout=30_000) is True
+    assert probe.evaluate.await_args.kwargs["timeout"] == 30_000
+
+
+@pytest.mark.asyncio
+async def test_native_option_probe_refuses_a_frame_owned_by_another_page() -> None:
+    """Pins the ownership read inside the probe itself.
+
+    skyvern_click refuses a stale selection further down as well, so deleting this probe's read
+    leaves every tool-level row green; only a direct call proves the probe still carries it.
+    """
+    raw = make_mock_page()
+    page = StaleScopePage(raw)
+
+    with pytest.raises(StaleFrameSelectionError):
+        await browser_ops.select_native_option_if_targeted(page, "#ship option[value='ground']", timeout=1000)
+
+    raw.locator.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_grid_refuses_a_frame_owned_by_another_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """focus_xy dispatches page-space CDP input, so it must refuse an unowned selection too."""
+    raw, _cdp = _write_grid_page(focused_is_password=False)
+    page = StaleScopePage(raw)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_cdp_input, "get_page", AsyncMock(return_value=(page, context)))
+
+    result = await mcp_cdp_input.skyvern_write_grid(rows=[["hello"]], focus_xy=[10.0, 20.0], screenshot=False)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.STALE_FRAME_SELECTION
+    raw.page.context.new_cdp_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"clear": False},
+        {"clear_first": False},
+        {"clear_first": True},
+        {"clear": False, "clear_first": True},
+        {"clear": True, "clear_first": False},
+        {"press_enter": True},
+        {"delay": 10},
+        {"intent": "email field"},
+        {"x": 1, "y": 2, "selector": None},
+        {"selector": "//input"},
+        {"selector": "#password"},
+    ],
+)
+async def test_fixed_fill_rejects_incompatible_options_before_browser_access(
+    monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
+) -> None:
+    get_page = AsyncMock()
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+    arguments = {"text": "example", "selector": "#email", "input_method": "value", **options}
+
+    result = await mcp_browser.skyvern_type(**arguments)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["main", "frame", "cloud"])
+async def test_fixed_fill_is_extension_main_frame_only_and_never_evaluates(
+    monkeypatch: pytest.MonkeyPatch, scope: str
+) -> None:
+    raw = MagicMock(url="https://example.test/form")
+    page = make_skyvern_page(raw)
+    page.locator_scope = raw if scope != "frame" else MagicMock()
+    ctx = BrowserContext(mode="cloud_session" if scope == "cloud" else "extension")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, ctx)))
+    runtime = SimpleNamespace(fill_input=AsyncMock(return_value={"textLength": 7}))
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", classmethod(lambda cls: runtime))
+    keyboard = AsyncMock()
+    monkeypatch.setattr(mcp_browser, "strategy_aware_input", keyboard)
+
+    result = await mcp_browser.skyvern_type(text="example", selector="#email", input_method="value")
+
+    assert result["ok"] is (scope == "main")
+    if scope == "main":
+        assert runtime.fill_input.await_args.args == (raw, "#email", "example")
+    else:
+        runtime.fill_input.assert_not_awaited()
+    raw.evaluate.assert_not_called()
+    raw.locator.assert_not_called()
+    keyboard.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_failure_does_not_fall_back_to_keyboard_or_scripts(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = MagicMock(url="https://example.test/form")
+    page = make_skyvern_page(raw)
+    page.locator_scope = raw
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, BrowserContext(mode="extension"))))
+    runtime = SimpleNamespace(fill_input=AsyncMock(side_effect=RuntimeError("Selected document changed")))
+    monkeypatch.setattr(BrowserExtensionRuntime, "instance", classmethod(lambda cls: runtime))
+    keyboard = AsyncMock()
+    monkeypatch.setattr(mcp_browser, "strategy_aware_input", keyboard)
+
+    result = await mcp_browser.skyvern_type(text="example", selector="#email", input_method="value")
+
+    assert result["ok"] is False
+    assert runtime.fill_input.await_count == 1
+    keyboard.assert_not_awaited()
+    raw.evaluate.assert_not_called()
+    raw.locator.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options", [{"clear": False}, {"delay": 10}])
+async def test_execute_keeps_options_that_fixed_fill_must_reject(
+    monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
+) -> None:
+    get_page = AsyncMock()
+    monkeypatch.setattr(mcp_browser, "get_page", get_page)
+    step = mcp_browser.ExecuteStep(
+        tool="type", params={"selector": "#email", "text": "example", "input_method": "value", **options}
+    )
+    with pytest.raises(mcp_browser.ToolStepError) as rejected:
+        await mcp_browser._dispatch_step(step, {}, session_id=None, cdp_url=None)
+    assert rejected.value.error["code"] == mcp_browser.ErrorCode.INVALID_INPUT
+    get_page.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message, attempts", [("Execution context was destroyed", 2), ("Not visible", 1)])
+async def test_screenshot_page_change_retry(monkeypatch: pytest.MonkeyPatch, message: str, attempts: int) -> None:
+    page = make_mock_page()
+    page.is_closed.return_value = False
+    ctx = BrowserContext(mode="local")
+    state = session_manager.SessionState(context=ctx, _active_page=page)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
+    read = AsyncMock(side_effect=[RuntimeError(message), browser_ops.ScreenshotResult(data=b"png")])
+    monkeypatch.setattr(mcp_browser, "do_screenshot", read)
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+
+    async with session_manager.scoped_session(state):
+        result = await mcp_browser.skyvern_screenshot()
+
+    assert read.await_count == attempts
+    assert result["ok"] is (attempts == 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["active_page", "closed"])
+async def test_screenshot_page_change_retry_requires_same_live_page(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    page = make_mock_page()
+    page.is_closed.return_value = False
+    ctx = BrowserContext(mode="local")
+    state = session_manager.SessionState(context=ctx, _active_page=page)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        if change == "active_page":
+            state._active_page = make_mock_page()
+        else:
+            page.is_closed.return_value = True
+        raise RuntimeError("Execution context was destroyed")
+
+    read = AsyncMock(side_effect=fail)
+    monkeypatch.setattr(mcp_browser, "do_screenshot", read)
+    async with session_manager.scoped_session(state):
+        result = await mcp_browser.skyvern_screenshot()
+
+    assert result["ok"] is False
+    assert read.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_screenshot_page_change_retry_deadline_expires_during_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = make_mock_page()
+    page.is_closed.return_value = False
+    ctx = BrowserContext(mode="local")
+    state = session_manager.SessionState(context=ctx, _active_page=page)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 30)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    attempts = 0
+
+    async def read(*args: Any, **kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            await asyncio.sleep(0.01)
+            raise RuntimeError("Execution context was destroyed")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(mcp_browser, "do_screenshot", read)
+    async with session_manager.scoped_session(state):
+        result = await mcp_browser.skyvern_screenshot()
+
+    assert attempts == 1
+    assert result["ok"] is False
+    assert result["error"]["code"] == "TIMEOUT"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["screenshot", "get_html", "observe"])
+@pytest.mark.parametrize("stop", ["success", "deadline", "page_switch", "closed", "other_error"])
+async def test_read_tools_retry_backoff(monkeypatch: pytest.MonkeyPatch, tool: str, stop: str) -> None:
+    from skyvern.cli.mcp_tools import _read_retry
+    from skyvern.cli.mcp_tools import inspection as mcp_inspection
+
+    page = make_mock_page()
+    page.is_closed.return_value = False
+    ctx = BrowserContext(mode="local")
+    state = session_manager.SessionState(context=ctx, _active_page=page)
+    patch_get_page(monkeypatch, mcp_browser, page, ctx)
+    patch_get_page(monkeypatch, mcp_inspection, page, ctx)
+    monkeypatch.setattr(action_deadline, "ACTION_DEADLINE_HEADROOM_MS", 0)
+    attempts = 0
+    delays = []
+    original_sleep = asyncio.sleep
+
+    async def backoff(delay: float) -> None:
+        delays.append(delay)
+        if stop == "deadline":
+            await original_sleep(delay)
+        elif stop == "page_switch":
+            state._active_page = make_mock_page()
+        elif stop == "closed":
+            page.is_closed.return_value = True
+
+    async def read(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if stop == "other_error" and attempts == 2:
+            raise RuntimeError("Unrelated read failure")
+        if attempts <= 6:
+            raise RuntimeError("Execution context was destroyed")
+        if tool == "screenshot":
+            return browser_ops.ScreenshotResult(data=b"png")
+        if tool == "get_html":
+            return "<p>fresh</p>"
+        return {"ok": True, "data": {"fresh": True}}
+
+    monkeypatch.setattr(_read_retry, "sleep", backoff)
+    monkeypatch.setattr(mcp_browser, "DEFAULT_ACTION_TIMEOUT_MS", 30 if stop == "deadline" else 30000)
+    monkeypatch.setattr(mcp_inspection, "DEFAULT_ACTION_TIMEOUT_MS", 30 if stop == "deadline" else 30000)
+    monkeypatch.setattr(mcp_browser, "do_screenshot", read)
+    monkeypatch.setattr(browser_ops, "do_get_html", read)
+    monkeypatch.setattr(mcp_browser, "_observe_read_attempt", read)
+    monkeypatch.setattr(
+        mcp_browser,
+        "save_artifact",
+        Mock(return_value=Artifact(kind="screenshot", path="/tmp/shot.png", mime="image/png", bytes=3)),
+    )
+    async with session_manager.scoped_session(state):
+        if tool == "screenshot":
+            result = await mcp_browser.skyvern_screenshot()
+        elif tool == "get_html":
+            result = await mcp_inspection.skyvern_get_html(selector="body")
+        else:
+            result = await mcp_browser.skyvern_observe()
+
+    assert result["ok"] is (stop == "success")
+    if stop == "deadline":
+        assert result["error"]["code"] == "TIMEOUT"
+    assert attempts == (7 if stop == "success" else 2 if stop == "other_error" else 1)
+    assert delays == ([0.1, 0.2, 0.4, 0.8, 1.0, 1.0] if stop == "success" else [0.1])

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { nextAnsweringMessage, questionCardAdjacency } from "./cardAdjacency";
+import { nextAnsweringMessage, previousAskingMessage } from "./cardAdjacency";
 import type { ChatMessage } from "./WorkflowCopilotChat";
 
 const msg = (
@@ -46,38 +46,29 @@ describe("nextAnsweringMessage", () => {
   });
 });
 
-// The card renders BOTH of its adjacency props from questionCardAdjacency. Asserting
-// nextAnsweringMessage alone left either prop free to revert to raw messages[index + 1] with the
-// suite still green — the green-under-mutation shape SKY-15619 was filed for.
-describe("questionCardAdjacency", () => {
-  it("derives both card props across a synthetic row", () => {
+describe("previousAskingMessage", () => {
+  // The account-selection receipt maps the user's raw connection id back to its friendly label
+  // via the ask above it. A synthetic row sitting between the ask and the selection must be
+  // skipped, or the receipt reads null and the transcript exposes the raw id.
+  it("skips a lifecycle row inserted before the answer and finds the real ask", () => {
     const messages = [
       msg("ask", "ai"),
       lifecycle("run-started"),
       msg("answer", "user"),
     ];
 
-    expect(questionCardAdjacency(messages, 0)).toEqual({
-      answeredFrom: "answer",
-      hasFollowingMessage: true,
-    });
+    expect(previousAskingMessage(messages, 2)?.id).toBe("ask");
   });
 
-  it("leaves the card live when only a synthetic row follows the ask", () => {
-    const messages = [msg("ask", "ai"), lifecycle("run-started")];
+  it("reports nothing prior when only synthetic rows precede the answer", () => {
+    const messages = [lifecycle("run-started"), msg("answer", "user")];
 
-    expect(questionCardAdjacency(messages, 0)).toEqual({
-      answeredFrom: null,
-      hasFollowingMessage: false,
-    });
+    expect(previousAskingMessage(messages, 1)).toBeUndefined();
   });
 
-  it("reports a following AI turn as consuming without offering it as a receipt", () => {
-    const messages = [msg("ask", "ai"), msg("next-turn", "ai")];
+  it("still finds an immediately adjacent ask", () => {
+    const messages = [msg("ask", "ai"), msg("answer", "user")];
 
-    expect(questionCardAdjacency(messages, 0)).toEqual({
-      answeredFrom: null,
-      hasFollowingMessage: true,
-    });
+    expect(previousAskingMessage(messages, 1)?.id).toBe("ask");
   });
 });

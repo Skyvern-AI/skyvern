@@ -365,12 +365,12 @@ export const topRankedFootballTeam = {
   errorCodeMapping: null,
 };
 
-export const extractIntegrationsFromGong = {
-  url: "https://www.gong.io",
+export const extractIntegrationsFromSkyvern = {
+  url: "https://skyvern.com",
   navigationGoal:
-    "Navigate to the 'Integrations' page on the Gong website. COMPLETE when the page displaying a list of integrations is fully loaded. Ensure not to click on any external links or advertisements.",
+    "Navigate to 'Resources' -> 'Integrations'. COMPLETE when the page listing the supported integrations is fully loaded.",
   dataExtractionGoal:
-    "Extract the names and descriptions of all integrations listed on the Gong integrations page.",
+    "Extract the names and descriptions of all the supported integrations.",
   navigationPayload: null,
   extractedInformationSchema: null,
   webhookCallbackUrl: null,
@@ -421,8 +421,8 @@ export function getSample(sample: SampleCase) {
     case "topRankedFootballTeam": {
       return topRankedFootballTeam;
     }
-    case "extractIntegrationsFromGong": {
-      return extractIntegrationsFromGong;
+    case "extractIntegrationsFromSkyvern": {
+      return extractIntegrationsFromSkyvern;
     }
     case "blank": {
       return blank;
@@ -460,15 +460,35 @@ export function generatePhoneNumber() {
   return phoneNumber;
 }
 
-function transformKV([key, value]: [string, unknown]) {
-  if (value !== null && typeof value === "object") {
-    return [key, JSON.stringify(value, null, 2)];
+function asFormFieldValue(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
   }
-  return [key, value];
+  if (typeof value === "string") {
+    return value;
+  }
+  return JSON.stringify(value, null, 2);
 }
 
 export function getSampleForInitialFormValues(
   sample: SampleCase,
 ): CreateNewTaskFormValues {
-  return Object.fromEntries(Object.entries(getSample(sample)).map(transformKV));
+  const sampleValues = getSample(sample);
+  return {
+    url: sampleValues.url,
+    navigationGoal: asFormFieldValue(sampleValues.navigationGoal),
+    dataExtractionGoal: asFormFieldValue(sampleValues.dataExtractionGoal),
+    navigationPayload: asFormFieldValue(sampleValues.navigationPayload),
+    extractedInformationSchema: asFormFieldValue(
+      sampleValues.extractedInformationSchema,
+    ),
+    errorCodeMapping: asFormFieldValue(sampleValues.errorCodeMapping),
+    webhookCallbackUrl: asFormFieldValue(sampleValues.webhookCallbackUrl),
+    totpIdentifier: asFormFieldValue(sampleValues.totpIdentifier),
+    extraHttpHeaders: null,
+    cdpAddress: null,
+    proxyLocation: null,
+    includeActionHistoryInVerification: null,
+    maxScreenshotScrolls: null,
+  };
 }

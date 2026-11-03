@@ -9,11 +9,29 @@ user cannot reach directly -- reading geometry, scrolling an element into view, 
 from __future__ import annotations
 
 import asyncio
+import base64
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict, TypeVar
+
+import structlog
 
 from skyvern.webeye.skycdp.errors import CdpError, CdpExecutionContextLost, CdpTimeoutError
 from skyvern.webeye.skycdp.facade.evaluation import RemoteHandle, evaluate
+from skyvern.webeye.skycdp.facade.timeouts import DEFAULT_ACTION_TIMEOUT_MS, seconds_from_ms
+
+LOG = structlog.get_logger()
+
+_T = TypeVar("_T")
+
+
+class FilePayload(TypedDict):
+    name: str
+    mimeType: str
+    buffer: bytes
+
+
+InputFiles = str | Path | FilePayload | list[str | Path | FilePayload]
 
 if TYPE_CHECKING:
     from skyvern.webeye.skycdp.facade.page import Frame
@@ -32,6 +50,111 @@ function() {
   return rect.width > 0 && rect.height > 0;
 }
 """
+
+# Measured misses do not separate one rAF from two; two is used because the first callback runs before its frame
+# paints. The 500ms cap is not tuned: it only keeps a frame that never fires rAF (hidden, throttled) from hanging.
+_PRESENTED_JS = """
+function() {
+  return new Promise(resolve => {
+    setTimeout(resolve, 500);
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  });
+}
+"""
+
+
+async def _wait_presented(wait: Awaitable[Any]) -> None:
+    # Per frame, so one frame's failure does not skip the rest. It fails when a page replaces
+    # requestAnimationFrame with a non-function; the click can still land, so this must not fail it.
+    try:
+        await wait
+    except CdpError:
+        LOG.warning("skycdp could not wait for a frame to render before clicking", exc_info=True)
+
+
+# null when the element can never hold text, otherwise whether it is editable now. isContentEditable is
+# false on every form control, and readonly is read as the attribute because <select> has no readOnly property.
+_EDITABLE_JS = """
+function(allowSelect) {
+  const name = this.localName;
+  const control = name === 'input' || name === 'textarea' || (allowSelect && name === 'select');
+  if (!control && (name === 'select' || !this.isContentEditable)) return null;
+  return !this.matches(':disabled') && !(control && this.hasAttribute('readonly'));
+}
+"""
+
+
+# Playwright's fill rules by input type: text-like types take typed text, date/range-like types take an assigned
+# value plus input/change events, and every other type (checkbox, file, button...) cannot be filled. With checkOnly
+# it returns 'ok' after the refusals and touches nothing, so a refused fill never moves focus.
+_PREPARE_FILL_JS = """
+function([value, checkOnly]) {
+  if (this.localName === 'input') {
+    const type = this.type.toLowerCase();
+    const assigned = ['color', 'date', 'time', 'datetime-local', 'month', 'range', 'week'].includes(type);
+    const typed = ['', 'email', 'number', 'password', 'search', 'tel', 'text', 'url'].includes(type);
+    if (!assigned && !typed) return 'type:' + type;
+    if (type === 'number' && isNaN(Number(value.trim()))) return 'not-a-number';
+    if (checkOnly) return 'ok';
+    if (assigned) {
+      value = value.trim();
+      this.value = value;
+      if (this.value !== value) return 'malformed';
+      this.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+      this.dispatchEvent(new Event('change', {bubbles: true}));
+      return 'done';
+    }
+    this.select();
+    return type === 'number' ? 'trim' : 'typed';
+  }
+  if (checkOnly) return 'ok';
+  if (this.select) { this.select(); return 'typed'; }
+  const range = this.ownerDocument.createRange();
+  range.selectNodeContents(this);
+  const selection = this.ownerDocument.defaultView.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return 'typed';
+}
+"""
+
+
+def _raise_if_refused(outcome: str) -> None:
+    if outcome == "malformed":
+        raise CdpError("fill: Malformed value")
+    if outcome == "not-a-number":
+        raise CdpError("fill: Cannot type text into input[type=number]")
+    if outcome.startswith("type:"):
+        raise CdpError(f'fill: Input of type "{outcome[5:]}" cannot be filled')
+
+
+def not_editable_error(name: str, timeout: float | None) -> CdpTimeoutError:
+    budget = DEFAULT_ACTION_TIMEOUT_MS if timeout is None else timeout
+    return CdpTimeoutError(f"{name}: element is not editable (read-only or disabled) within {budget}ms")
+
+
+async def wait_until_editable(
+    probe: Callable[[], Awaitable[_T | None]], *, timeout: float | None, on_deadline: Callable[[], CdpTimeoutError]
+) -> _T:
+    """Only the budget running out becomes ``on_deadline()``; a CdpTimeoutError the probe raises is an
+    unanswered CDP call and propagates as itself."""
+    probe_timeout: CdpTimeoutError | None = None
+
+    async def guarded() -> _T | None:
+        nonlocal probe_timeout
+        try:
+            return await probe()
+        except CdpTimeoutError as exc:
+            probe_timeout = exc
+            raise
+
+    try:
+        return await wait_for(guarded, timeout=seconds_from_ms(timeout), description="element to be editable")
+    except CdpTimeoutError as exc:
+        if exc is probe_timeout:
+            raise
+        raise on_deadline() from exc
+
 
 _CLICK_POINT_JS = """
 function() {
@@ -59,6 +182,28 @@ function(values) {
   this.dispatchEvent(new Event('input', {bubbles: true}));
   this.dispatchEvent(new Event('change', {bubbles: true}));
   return selected;
+}
+"""
+
+
+# Playwright's cap on in-memory upload payloads; anything larger has to be passed as a file path.
+MAX_UPLOAD_PAYLOAD_BYTES = 50 * 1024 * 1024
+
+# An in-memory payload has no file on disk for DOM.setFileInputFiles, which would also derive the type from a file
+# name. Playwright builds the File in the page with its declared type and fires the events a real pick fires.
+_SET_INPUT_FILE_PAYLOADS_JS = """
+function(payloads) {
+  if (this.nodeName.toLowerCase() !== 'input' || (this.getAttribute('type') || '').toLowerCase() !== 'file')
+    throw new Error('not an input[type=file] element');
+  if (payloads.length > 1 && !this.multiple) throw new Error('Non-multiple file input can only accept single file');
+  const transfer = new DataTransfer();
+  for (const payload of payloads) {
+    const bytes = Uint8Array.from(atob(payload.buffer), (c) => c.charCodeAt(0));
+    transfer.items.add(new File([bytes], payload.name, {type: payload.mimeType}));
+  }
+  this.files = transfer.files;
+  this.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+  this.dispatchEvent(new Event('change', {bubbles: true}));
 }
 """
 
@@ -145,11 +290,16 @@ class ElementHandle(JSHandle):
         )
 
     async def is_editable(self) -> bool:
-        return bool(
-            await self._bound(
-                "function() { return !this.disabled && !this.readOnly && this.isContentEditable !== false; }"
-            )
-        )
+        editable = await self._bound(_EDITABLE_JS, True)
+        if editable is None:
+            raise CdpError("Element is not an <input>, <textarea>, <select> or [contenteditable] element")
+        return bool(editable)
+
+    async def _fillable(self, name: str) -> bool:
+        editable = await self._bound(_EDITABLE_JS, False)
+        if editable is None:
+            raise CdpError(f"{name}: element is not an <input>, <textarea> or [contenteditable] element")
+        return bool(editable)
 
     async def bounding_box(self) -> dict[str, float] | None:
         box = await self._bound(
@@ -181,6 +331,16 @@ class ElementHandle(JSHandle):
         )
 
     async def _click_point(self) -> tuple[float, float]:
+        if self._session is not self._frame.page.session:
+            # Chrome routes input into an out-of-process frame by browser-side hit testing, which only
+            # knows the frame once every embedder above it has rendered it in. Until then a correctly
+            # addressed click is delivered to an embedding <iframe> element instead, and nothing raises.
+            await self.scroll_into_view_if_needed()
+            await _wait_presented(self._bound(_PRESENTED_JS))
+            embedder = self._frame.parent_frame
+            while embedder is not None:
+                await _wait_presented(embedder.evaluate(_PRESENTED_JS))
+                embedder = embedder.parent_frame
         point = await self._bound(_CLICK_POINT_JS)
         if not point:
             raise CdpError("element has no layout box and cannot be clicked")
@@ -220,25 +380,28 @@ class ElementHandle(JSHandle):
         await self._bound("function() { this.blur(); }")
 
     async def fill(self, value: str, *, timeout: float | None = None, **_: Any) -> None:
-        """Replace the element's content using only trusted events.
+        async def fillable() -> bool:
+            # wait_for retries a lost context, but a handle cannot follow a navigation, so fail now.
+            try:
+                return await self._fillable("fill")
+            except CdpExecutionContextLost as exc:
+                raise CdpError("fill: Element is not attached to the DOM") from exc
 
-        Focus, select everything already there, then either commit the new text with
-        ``Input.insertText`` or -- for an empty value -- delete the selection. Chrome raises the
-        resulting ``input`` event itself, so a framework's change handler sees ``isTrusted`` true
-        and keeps the value instead of reverting it on the next render.
-        """
+        await wait_until_editable(fillable, timeout=timeout, on_deadline=lambda: not_editable_error("fill", timeout))
+        await self._commit_fill(value)
+
+    # Commits with trusted Input.insertText, or a Delete for an empty value, so a framework's input handler
+    # sees isTrusted and keeps the value instead of reverting it on the next render.
+    async def _commit_fill(self, value: str) -> None:
+        _raise_if_refused(await self._bound(_PREPARE_FILL_JS, [value, True]))
         await self.scroll_into_view_if_needed()
         await self.focus()
-        await self._bound(
-            """function() {
-                if (this.select) { this.select(); return; }
-                const range = this.ownerDocument.createRange();
-                range.selectNodeContents(this);
-                const selection = this.ownerDocument.defaultView.getSelection();
-                selection.removeAllRanges();
-                selection.addRange(range);
-            }"""
-        )
+        outcome = await self._bound(_PREPARE_FILL_JS, [value, False])
+        _raise_if_refused(outcome)
+        if outcome == "done":
+            return
+        if outcome == "trim":
+            value = value.strip()
         keyboard = self._frame.page.keyboard
         if value:
             await keyboard.insert_text(value)
@@ -272,8 +435,27 @@ class ElementHandle(JSHandle):
     ) -> list[str]:
         return await self._bound(_SELECT_OPTION_JS, value)
 
-    async def set_input_files(self, files: str | list[str], *, timeout: float | None = None, **_: Any) -> None:
-        paths = [files] if isinstance(files, str) else list(files)
+    async def set_input_files(self, files: InputFiles, *, timeout: float | None = None, **_: Any) -> None:
+        items = files if isinstance(files, (list, tuple)) else [files]
+        payloads = [item for item in items if isinstance(item, dict)]
+        if payloads:
+            if len(payloads) != len(items):
+                raise CdpError("File paths cannot be mixed with buffers")
+            if sum(len(payload["buffer"]) for payload in payloads) > MAX_UPLOAD_PAYLOAD_BYTES:
+                raise CdpError(
+                    "Cannot set buffer larger than 50Mb, please write it to a file and pass its path instead."
+                )
+            encoded = [
+                {
+                    "name": payload["name"],
+                    "mimeType": payload["mimeType"],
+                    "buffer": base64.b64encode(payload["buffer"]).decode(),
+                }
+                for payload in payloads
+            ]
+            await self._bound(_SET_INPUT_FILE_PAYLOADS_JS, encoded)
+            return
+        paths = [str(item) for item in items]
         # Chrome accepts a path that does not exist and simply attaches nothing, so the upload fails
         # later as an empty submission rather than here as a bad argument.
         missing = [path for path in paths if not Path(path).is_file()]

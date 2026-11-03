@@ -6,12 +6,18 @@ import structlog
 
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.block_notes import strip_inert_block_fields
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import workflow_service
 from skyvern.webeye.actions.action_types import ActionType
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.actions.actions import Action, reasoning_is_turn_scoped
 
 LOG = structlog.get_logger(__name__)
+
+
+class TaskV3RunNotScriptableError(Exception):
+    """Task V3 actions carry no element data, so a script built from them has dead selectors."""
 
 
 @dataclass
@@ -30,6 +36,10 @@ def _process_action_for_block(
 ) -> dict[str, Any]:
     """Process a single action and add block-specific context like data extraction goal."""
     action_dump = action.model_dump()
+    if reasoning_is_turn_scoped(action_dump.get("description")):
+        # A v3 row's intention is a timeline display label ("Clicked a button"), not a prompt or a
+        # field-naming hint, so code generation keeps seeing none.
+        action_dump["intention"] = None
     action_dump["xpath"] = action.get_xpath()
     action_dump["has_mini_agent"] = action.has_mini_agent
     if (
@@ -160,6 +170,7 @@ def _process_forloop_children(
             loop_block_dump = loop_block_def.model_dump()
         else:
             loop_block_dump = dict(loop_block_def)
+        loop_block_dump = strip_inert_block_fields(loop_block_dump)
         loop_block_label = loop_block_dump.get("label")
 
         child_run_block = child_run_blocks_by_label.get(loop_block_label) if loop_block_label else None
@@ -241,7 +252,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
     )
     if not workflow:
         raise ValueError(f"Workflow {run_request.workflow_id} not found")
-    workflow_json = workflow.model_dump()
+    workflow_json = strip_inert_block_fields(workflow.model_dump())
 
     # get the original workflow definition blocks (with templated information)
     workflow_definition_blocks = workflow.workflow_definition.blocks
@@ -254,6 +265,10 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         workflow_run_id=workflow_run_id, organization_id=organization_id
     )
     workflow_run_blocks.sort(key=lambda x: x.created_at)
+    # Both this check and the re-read after the actions are needed: actions are fetched for the task ids read
+    # here, and a retry can move a v3 row to a new task and relabel it v1 before the re-read.
+    if any(block.engine == RunEngine.skyvern_v3 for block in workflow_run_blocks):
+        raise TaskV3RunNotScriptableError(workflow_run_id)
 
     # Create mapping from definition blocks by label for quick lookup
     workflow_run_blocks_by_label = {block.label: block for block in workflow_run_blocks if block.label}
@@ -294,6 +309,13 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
             action_count=len(all_actions),
         )
 
+    # Read after the actions: a block row is labeled v3 before any v3 action exists (the cached-script fallback
+    # stamps an existing row), so an in-flight mint that read a v3 action always sees the label here.
+    if await app.DATABASE.observer.workflow_run_has_block_on_engine(
+        workflow_run_id=workflow_run_id, engine=RunEngine.skyvern_v3, organization_id=organization_id
+    ):
+        raise TaskV3RunNotScriptableError(workflow_run_id)
+
     workflow_block_dump = []
     actions_by_task: dict[str, list[dict[str, Any]]] = {}
     task_v2_child_blocks = {}
@@ -311,7 +333,7 @@ async def transform_workflow_run_to_code_gen_input(workflow_run_id: str, organiz
         final_dump = {}
         if run_block:
             # Start with the original templated definition block
-            final_dump = definition_block.model_dump()
+            final_dump = strip_inert_block_fields(definition_block.model_dump())
         else:
             # the run_block is not a top level block - for now we will skip non top level blocks, like any blocks defined inside a loop block
             continue

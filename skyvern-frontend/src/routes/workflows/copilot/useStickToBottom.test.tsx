@@ -75,23 +75,19 @@ describe("computeFollowSignature", () => {
     expect(sig(s)).not.toBe(before);
   });
 
-  it("keeps changing after the activity cap is reached (rotated tail)", () => {
+  it("keeps changing when standalone status rotates at its activity cap", () => {
     let s = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
-    s = applyNarrativeEvent(
-      s,
-      blockProgress({ block_label: "one", status: "running" }),
-    );
-    // Fill well past MAX_ACTIVITY_ENTRIES so length is pinned at the cap.
-    for (let i = 0; i < 40; i++) {
-      s = applyNarrativeEvent(s, narration(`step ${i}`));
+    const status = (i: number) => ({
+      ...narration(`step ${i}`),
+      timestamp: new Date(Date.UTC(2026, 4, 25, 0, 0, i)).toISOString(),
+    });
+    for (let i = 0; i < 60; i++) {
+      s = applyNarrativeEvent(s, status(i));
     }
     const atCap = sig(s);
-    const cappedBlock = s.blocks[0];
-    expect(cappedBlock).toBeDefined();
-    const cappedLength = cappedBlock!.activity.length;
-    s = applyNarrativeEvent(s, narration("one more step"));
-    // Length is unchanged at the cap, but the signature still moves.
-    expect(s.blocks[0]!.activity.length).toBe(cappedLength);
+    const cappedLength = s.designActivity.length;
+    s = applyNarrativeEvent(s, status(60));
+    expect(s.designActivity.length).toBe(cappedLength);
     expect(sig(s)).not.toBe(atCap);
   });
 

@@ -129,6 +129,8 @@ class SheetGridProperties:
     title: str
     column_count: int
     row_count: int
+    merges: list[dict[str, int]] | None = None
+    merges_complete: bool = False
 
 
 def _escape_drive_q(value: str) -> str:
@@ -461,7 +463,7 @@ async def get_sheet_id_by_title(
     return None
 
 
-def _grid_props_from_sheet(sheet: dict[str, Any]) -> SheetGridProperties | None:
+def _grid_props_from_sheet(sheet: dict[str, Any], *, include_merges: bool = False) -> SheetGridProperties | None:
     props = sheet.get("properties") or {}
     sheet_id = props.get("sheetId")
     title = props.get("title")
@@ -475,11 +477,42 @@ def _grid_props_from_sheet(sheet: dict[str, Any]) -> SheetGridProperties | None:
         or not isinstance(row_count, int)
     ):
         return None
+    merges: list[dict[str, int]] | None = None
+    if include_merges:
+        if type(sheet_id) is not int or type(column_count) is not int or type(row_count) is not int:
+            return None
+        if sheet_id < 0 or column_count <= 0 or row_count <= 0:
+            return None
+        raw_merges = sheet.get("merges", [])
+        if not isinstance(raw_merges, list):
+            return None
+        merges = []
+        for raw in raw_merges:
+            if not isinstance(raw, dict):
+                return None
+            bounds = {
+                "sheetId": raw.get("sheetId", 0),
+                "startRowIndex": raw.get("startRowIndex", 0),
+                "endRowIndex": raw.get("endRowIndex", row_count),
+                "startColumnIndex": raw.get("startColumnIndex", 0),
+                "endColumnIndex": raw.get("endColumnIndex", column_count),
+            }
+            if any(type(value) is not int for value in bounds.values()):
+                return None
+            if (
+                bounds["sheetId"] != sheet_id
+                or not 0 <= bounds["startRowIndex"] < bounds["endRowIndex"] <= row_count
+                or not 0 <= bounds["startColumnIndex"] < bounds["endColumnIndex"] <= column_count
+            ):
+                return None
+            merges.append(bounds)
     return SheetGridProperties(
         sheet_id=int(sheet_id),
         title=title,
         column_count=int(column_count),
         row_count=int(row_count),
+        merges=merges,
+        merges_complete=include_merges,
     )
 
 
@@ -488,18 +521,23 @@ async def get_sheet_grid_properties(
     access_token: str,
     spreadsheet_id: str,
     sheet_title: str,
+    include_merges: bool = False,
 ) -> SheetGridProperties | None:
     """Return the named tab's grid dimensions, or None if missing or malformed."""
     payload = await values_get(
         access_token=access_token,
         spreadsheet_id=spreadsheet_id,
         ranges="",
-        fields="sheets(properties(sheetId,title,gridProperties(columnCount,rowCount)))",
+        fields=(
+            "sheets(properties(sheetId,title,gridProperties(columnCount,rowCount)),merges)"
+            if include_merges
+            else "sheets(properties(sheetId,title,gridProperties(columnCount,rowCount)))"
+        ),
     )
     for sheet in payload.get("sheets") or []:
         if str((sheet.get("properties") or {}).get("title")) != sheet_title:
             continue
-        return _grid_props_from_sheet(sheet)
+        return _grid_props_from_sheet(sheet, include_merges=include_merges)
     return None
 
 

@@ -13,9 +13,6 @@ import type {
   RecoveryGuidanceAssignment,
 } from "@/store/onboarding/types";
 import { useRefreshOnboardingOnRunCompletion } from "./useRefreshOnboardingOnRunCompletion";
-vi.mock("@clerk/clerk-react", () => ({
-  useAuth: () => ({ userId: "user-a" }),
-}));
 
 const ONBOARDING_KEY = { queryKey: ["userOnboarding", "user-a"] };
 const ONBOARDING_PREFIX = { queryKey: ["userOnboarding"] };
@@ -48,6 +45,7 @@ function onboardingResponse(
   return {
     onboarding_state: {
       tour_completed_at: null,
+      studio_tour_completed_at: null,
       modal_dismissed_at: null,
       first_save_at: null,
       first_run_at: null,
@@ -206,5 +204,32 @@ describe("useRefreshOnboardingOnRunCompletion", () => {
     });
 
     expect(fetchOnboarding).toHaveBeenCalledTimes(1);
+  });
+
+  it("finds the matching assignment when another cached user entry comes first", async () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    queryClient.setQueryData(
+      ["userOnboarding", "previous-user"],
+      onboardingResponse(null),
+    );
+    queryClient.setQueryData(
+      ONBOARDING_KEY.queryKey,
+      onboardingResponse(assignment),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+
+    renderHook(({ wr }) => useRefreshOnboardingOnRunCompletion(wr), {
+      wrapper,
+      initialProps: { wr: run(Status.Failed) },
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+
+    expect(onboardingInvalidations(invalidateSpy)).toBe(1);
   });
 });

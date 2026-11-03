@@ -11,6 +11,18 @@ export type CodeBlockNodeData = NodeBaseData & {
   errorCodeMapping: string;
   prompt: string | null;
   steps: Array<CodeBlockStep> | null;
+  dataSchema: string;
+  userOwnedGoal: boolean | null;
+  goalNeedsRegeneration: boolean | null;
+  codeEditedByHand: boolean | null;
+  // Editor-only: the Goal as it was before the pending change, so Undo can restore it. Never saved.
+  goalBeforeEdit?: GoalBeforeEdit | null;
+};
+
+export type GoalBeforeEdit = {
+  prompt: string | null;
+  userOwnedGoal: boolean | null;
+  goalNeedsRegeneration: boolean | null;
 };
 
 export type CodeBlockNode = Node<CodeBlockNodeData, "codeBlock">;
@@ -36,5 +48,9 @@ export const codeBlockNodeDefaultData: CodeBlockNodeData = {
   errorCodeMapping: "null",
   prompt: "",
   steps: null,
+  dataSchema: "null",
+  userOwnedGoal: null,
+  goalNeedsRegeneration: null,
+  codeEditedByHand: null,
   model: null,
 } as const;

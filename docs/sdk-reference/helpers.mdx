@@ -1,0 +1,516 @@
+---
+title: "Helpers"
+description: "Shortcuts for common jobs: sign in to a site, download files, check the server version."
+slug: sdk-reference/helpers
+keywords:
+  - "login"
+  - "download"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Helpers run a purpose-built agent for a common job and return its run.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+---
+
+## login
+
+Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault
+
+<CodeGroup>
+```python Python
+await skyvern.login(
+    credential_type: CredentialType,
+    *,
+    url: str | None = None,
+    credential_id: str | None = None,
+    bitwarden_collection_id: str | None = None,
+    bitwarden_item_id: str | None = None,
+    onepassword_vault_id: str | None = None,
+    onepassword_item_id: str | None = None,
+    prompt: str | None = None,
+    webhook_url: str | None = None,
+    proxy_location: ProxyLocationInput = None,
+    totp_identifier: str | None = None,
+    totp_url: str | None = None,
+    browser_session_id: str | None = None,
+    browser_address: str | None = None,
+    extra_http_headers: dict[str, str] | None = None,
+    max_screenshot_scrolling_times: int | None = None,
+    azure_vault_name: str | None = None,
+    azure_vault_username_key: str | None = None,
+    azure_vault_password_key: str | None = None,
+    azure_vault_totp_secret_key: str | None = None,
+    wait_for_completion: bool = False,
+    timeout: float = 1800,
+) -> WorkflowRunResponse
+```
+
+```typescript TypeScript
+skyvern.login(request: LoginOptions): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"credential_type"} type={"CredentialType"} required>
+Where to get the credential from
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+Website URL
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"credential_id"} type={"str | None"}>
+ID of the Skyvern credential to use for login.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"bitwarden_collection_id"} type={"str | None"}>
+Bitwarden collection ID. You can find it in the Bitwarden collection URL. e.g. `https://vault.bitwarden.com/vaults/collection_id/items`
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"bitwarden_item_id"} type={"str | None"}>
+Bitwarden item ID
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"onepassword_vault_id"} type={"str | None"}>
+1Password vault ID
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"onepassword_item_id"} type={"str | None"}>
+1Password item ID
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"prompt"} type={"str | None"}>
+Login instructions. Skyvern has default prompt/instruction for login if this field is not provided.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+Webhook URL to send status updates
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocationInput"}>
+Proxy location to use
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP (Time-based One-Time Password) if required
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+TOTP URL to fetch one-time passwords
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"browser_session_id"} type={"str | None"}>
+ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"browser_address"} type={"str | None"}>
+The CDP address for the task.
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str] | None"}>
+Additional HTTP headers to include in requests
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"max_screenshot_scrolling_times"} type={"int | None"}>
+Maximum number of times to scroll for screenshots
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_name"} type={"str | None"}>
+Azure Vault Name
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_username_key"} type={"str | None"}>
+Azure Vault username key
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_password_key"} type={"str | None"}>
+Azure Vault password key
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"azure_vault_totp_secret_key"} type={"str | None"}>
+Azure Vault TOTP secret key
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"wait_for_completion"} type={"bool"}>
+Wait for the run to reach a final status before returning.
+
+Default: `False` · TypeScript: `waitForCompletion`
+</ParamField>
+
+<ParamField path={"timeout"} type={"float"}>
+Maximum time to wait for completion, in seconds.
+
+Default: `1800`
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"string"}>
+ID of a browser profile to reuse for this run
+
+TypeScript only
+</ParamField>
+
+<ParamField path={"cdp_connect_headers"} type={"Record<string, string | undefined>"}>
+HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
+
+TypeScript only
+</ParamField>
+
+**Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
+
+<Accordion title="WorkflowRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_with` | `str \| None` | Whether the workflow run was executed with agent or code |
+| `ai_fallback` | `bool \| None` | Whether to fallback to AI if code run fails. |
+| `script_id` | `str \| None` | ID of the cached script used for this workflow run, if any. |
+| `run_request` | `WorkflowRunRequestOutput \| None` | The original request parameters used to start this workflow run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+from skyvern.schemas.credential_type import CredentialType
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.login(
+        credential_type=CredentialType.skyvern,
+        url="https://example.com/login",
+        credential_id="cred_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.login({
+    url: "https://example.com/login",
+    credential_type: "skyvern",
+    credential_id: "cred_123",
+});
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## download_files
+
+Download a file from a website by navigating and clicking download buttons
+
+<CodeGroup>
+```python Python
+await skyvern.download_files(
+    *,
+    navigation_goal: str,
+    user_agent: str | None = None,
+    url: str | None = ...,
+    webhook_url: str | None = ...,
+    proxy_location: ProxyLocation | None = ...,
+    totp_identifier: str | None = ...,
+    totp_url: str | None = ...,
+    browser_session_id: str | None = ...,
+    browser_profile_id: str | None = ...,
+    browser_address: str | None = ...,
+    extra_http_headers: dict[str, str | None] | None = ...,
+    cdp_connect_headers: dict[str, str | None] | None = ...,
+    max_screenshot_scrolling_times: int | None = ...,
+    download_suffix: str | None = ...,
+    download_timeout: float | None = ...,
+    max_steps_per_run: int | None = ...,
+) -> WorkflowRunResponse
+```
+
+```typescript TypeScript
+skyvern.downloadFiles(request: DownloadFilesOptions): Promise<WorkflowRunResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"navigation_goal"} type={"str"} required>
+Instructions for navigating to and downloading the file
+</ParamField>
+
+<ParamField path={"user_agent"} type={"str | None"}>
+User-Agent string the browser sends.
+
+Default: `None` · TypeScript: `x-user-agent`
+</ParamField>
+
+<ParamField path={"url"} type={"str | None"}>
+Website URL
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"webhook_url"} type={"str | None"}>
+Webhook URL to send status updates
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"proxy_location"} type={"ProxyLocation | None"}>
+Proxy location to use
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"totp_identifier"} type={"str | None"}>
+Identifier for TOTP (Time-based One-Time Password) if required
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"totp_url"} type={"str | None"}>
+TOTP URL to fetch one-time passwords
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_session_id"} type={"str | None"}>
+ID of the browser session to use, which is prefixed by `pbs_` e.g. `pbs_123456`
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_profile_id"} type={"str | None"}>
+ID of a browser profile to reuse for this run
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"browser_address"} type={"str | None"}>
+The CDP address for the task.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"extra_http_headers"} type={"dict[str, str | None] | None"}>
+Additional HTTP headers to include in requests
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"cdp_connect_headers"} type={"dict[str, str | None] | None"}>
+HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"max_screenshot_scrolling_times"} type={"int | None"}>
+Maximum number of times to scroll for screenshots
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"download_suffix"} type={"str | None"}>
+Suffix or complete filename for the downloaded file
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"download_timeout"} type={"float | None"}>
+Timeout in seconds for the download operation
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"max_steps_per_run"} type={"int | None"}>
+Maximum number of steps to execute
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"waitForCompletion"} type={"boolean"}>
+TypeScript only
+</ParamField>
+
+<ParamField path={"timeout"} type={"number"}>
+TypeScript only
+</ParamField>
+
+**Returns** `WorkflowRunResponse` · TypeScript `Promise<WorkflowRunResponse>`
+
+<Accordion title="WorkflowRunResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str` | Unique identifier for this run. Run ID starts with `tsk_` for task runs and `wr_` for workflow runs. |
+| `status` | `"created" \| "queued" \| "running" \| "paused" \| "timed_out" \| "failed" \| "terminated" \| "completed" \| "canceled"` | Current status of the run |
+| `output` | `dict[str, Any \| None] \| list[Any \| None] \| str \| None` | Output data from the run, if any. Format/schema depends on the data extracted by the run. |
+| `downloaded_files` | `list[FileInfo] \| None` | List of files downloaded during the run |
+| `recording_url` | `str \| None` | URL to the recording of the run |
+| `recording_archived` | `bool \| None` | True when the recording exists but has been archived to cold storage and is not currently accessible. |
+| `screenshot_urls` | `list[str] \| None` | List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. |
+| `failure_reason` | `str \| None` | Reason for failure if the run failed or terminated |
+| `created_at` | `datetime` | Timestamp when this run was created |
+| `modified_at` | `datetime` | Timestamp when this run was last modified |
+| `queued_at` | `datetime \| None` | Timestamp when this run was queued |
+| `started_at` | `datetime \| None` | Timestamp when this run started execution |
+| `finished_at` | `datetime \| None` | Timestamp when this run finished |
+| `app_url` | `str \| None` | URL to the application UI where the run can be viewed |
+| `browser_session_id` | `str \| None` | ID of the Skyvern persistent browser session used for this run |
+| `browser_profile_id` | `str \| None` | ID of the browser profile used for this run |
+| `max_screenshot_scrolls` | `int \| None` | The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot |
+| `script_run` | `ScriptRunResponse \| None` | The script run result |
+| `errors` | `list[dict[str, Any \| None]] \| None` | The errors for the run |
+| `step_count` | `int \| None` | Total number of steps executed in this run |
+| `run_with` | `str \| None` | Whether the workflow run was executed with agent or code |
+| `ai_fallback` | `bool \| None` | Whether to fallback to AI if code run fails. |
+| `script_id` | `str \| None` | ID of the cached script used for this workflow run, if any. |
+| `run_request` | `WorkflowRunRequestOutput \| None` | The original request parameters used to start this workflow run |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.download_files(
+        navigation_goal="Download the latest invoice",
+        url="https://example.com/billing",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.downloadFiles({
+    url: "https://example.com/billing",
+    navigation_goal: "Download the latest invoice",
+});
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## get_version
+
+Returns the current Skyvern server version (git SHA for official builds).
+
+<CodeGroup>
+```python Python
+await skyvern.get_version() -> dict[str, str]
+```
+
+```typescript TypeScript
+skyvern.getVersion(): Promise<Record<string, string>>
+```
+</CodeGroup>
+
+**Returns** `dict[str, str]` · TypeScript `Promise<Record<string, string>>` — Current server version
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.get_version()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.getVersion();
+console.log(result);
+```
+</CodeGroup>

@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import litellm  # type: ignore[import-not-found]
 import pytest  # type: ignore[import-not-found]
+import structlog
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -30,11 +31,14 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
+    EmptyLLMResponseError,
     InvalidLLMResponseFormat,
+    InvalidLLMResponseType,
     LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
+from skyvern.forge.sdk.copilot.cost_telemetry import copilot_cost_scope
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
@@ -119,6 +123,7 @@ class HandlerOutcome:
     update_thought_calls: list[dict[str, Any]] = field(default_factory=list)
     block_cost_calls: list[dict[str, Any]] = field(default_factory=list)
     usage_events: list[dict[str, Any]] = field(default_factory=list)
+    metrics_events: list[dict[str, Any]] = field(default_factory=list)
     span: ReadableSpan | None = None
 
     @property
@@ -190,7 +195,12 @@ def _stub_common(mp: pytest.MonkeyPatch, outcome: HandlerOutcome, context: Skyve
     def capture_info(_event: str, **fields: Any) -> None:
         if fields.get("log_code") == "copilot_model_usage":
             outcome.usage_events.append(fields)
+        if _event == "LLM API handler duration metrics":
+            outcome.metrics_events.append(fields)
 
+    # Patching `info` on the shared lazy proxy leaves a stale bound method behind on undo, which detaches the
+    # module's logger from later `capture_logs()` calls; a throwaway proxy keeps the shared one untouched.
+    mp.setattr(api_handler_factory, "LOG", structlog.get_logger())
     mp.setattr(api_handler_factory.LOG, "info", capture_info)
 
     artifact_manager = MagicMock()
@@ -231,6 +241,8 @@ def _handler_call_kwargs(
     organization_id: str | None,
     screenshots: list[bytes] | None,
     parameters: dict[str, Any] | None,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "prompt": prompt,
@@ -240,6 +252,8 @@ def _handler_call_kwargs(
         "workflow_run_block_id": workflow_run_block_id,
         "organization_id": organization_id,
         "screenshots": screenshots,
+        "recording_attempt_id": recording_attempt_id,
+        "interpretation_session_id": interpretation_session_id,
     }
     if parameters is not None:
         kwargs["parameters"] = dict(parameters)
@@ -261,7 +275,9 @@ async def _run_direct(
     organization_id: str | None = None,
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
-    force_parse_failure: bool = False,
+    parse_failure: BaseException | None = None,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
 ) -> HandlerOutcome:
     outcome = HandlerOutcome()
     next_response = _response_feeder(responses)
@@ -281,11 +297,11 @@ async def _run_direct(
 
         mp.setattr(api_handler_factory.litellm, "acompletion", fake_acompletion)
         _stub_common(mp, outcome, context)
-        if force_parse_failure:
+        if parse_failure is not None:
             mp.setattr(
                 api_handler_factory,
                 "parse_api_response",
-                MagicMock(side_effect=ValueError("invalid response")),
+                MagicMock(side_effect=parse_failure),
             )
 
         span_exporter.clear()
@@ -293,7 +309,16 @@ async def _run_direct(
         try:
             outcome.parsed = await handler(
                 **_handler_call_kwargs(
-                    prompt, prompt_name, step, thought, workflow_run_block_id, organization_id, screenshots, parameters
+                    prompt,
+                    prompt_name,
+                    step,
+                    thought,
+                    workflow_run_block_id,
+                    organization_id,
+                    screenshots,
+                    parameters,
+                    recording_attempt_id,
+                    interpretation_session_id,
                 )
             )
         except BaseException as exc:
@@ -319,7 +344,9 @@ async def _run_router(
     organization_id: str | None = None,
     screenshots: list[bytes] | None = None,
     parameters: dict[str, Any] | None = None,
-    force_parse_failure: bool = False,
+    parse_failure: BaseException | None = None,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
 ) -> HandlerOutcome:
     outcome = HandlerOutcome()
     next_response = _response_feeder(responses)
@@ -366,11 +393,11 @@ async def _run_router(
 
         mp.setattr(api_handler_factory.litellm, "acompletion", fake_acompletion)
         _stub_common(mp, outcome, context)
-        if force_parse_failure:
+        if parse_failure is not None:
             mp.setattr(
                 api_handler_factory,
                 "parse_api_response",
-                MagicMock(side_effect=ValueError("invalid response")),
+                MagicMock(side_effect=parse_failure),
             )
 
         span_exporter.clear()
@@ -378,7 +405,16 @@ async def _run_router(
             handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router(ROUTER_LLM_KEY)
             outcome.parsed = await handler(
                 **_handler_call_kwargs(
-                    prompt, prompt_name, step, thought, workflow_run_block_id, organization_id, screenshots, parameters
+                    prompt,
+                    prompt_name,
+                    step,
+                    thought,
+                    workflow_run_block_id,
+                    organization_id,
+                    screenshots,
+                    parameters,
+                    recording_attempt_id,
+                    interpretation_session_id,
                 )
             )
         except BaseException as exc:
@@ -392,11 +428,13 @@ async def _run_router(
 
 @pytest.mark.asyncio
 async def test_happy_path_parses_and_records_identically(span_exporter: InMemorySpanExporter) -> None:
-    direct = await _run_direct(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
-    router = await _run_router(span_exporter, responses=[ParityResponse("gpt-4")], step=_make_step(), parameters={})
+    response = ParityResponse("gpt-4", cache_creation_tokens=404)
+    direct = await _run_direct(span_exporter, responses=[response], step=_make_step(), parameters={})
+    router = await _run_router(span_exporter, responses=[response], step=_make_step(), parameters={})
 
     assert direct.error is None and router.error is None
     assert direct.parsed == router.parsed == {"actions": []}
+    assert [outcome.metrics_events[0]["cache_creation_tokens"] for outcome in (direct, router)] == [404, 404]
 
     assert len(direct.completion_calls) == 1 and not direct.router_calls
     assert len(router.router_calls) == 1 and not router.completion_calls
@@ -450,6 +488,78 @@ async def test_happy_path_parses_and_records_identically(span_exporter: InMemory
 
 
 @pytest.mark.asyncio
+async def test_recording_correlation_is_present_on_cost_telemetry_for_both_handlers(
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    correlation = {
+        "recording_attempt_id": "attempt-1",
+        "interpretation_session_id": "interpretation-1",
+    }
+    direct = await _run_direct(
+        span_exporter,
+        responses=[ParityResponse("gpt-4")],
+        parameters={},
+        **correlation,
+    )
+    router = await _run_router(
+        span_exporter,
+        responses=[ParityResponse("gpt-4")],
+        parameters={},
+        **correlation,
+    )
+
+    for outcome in (direct, router):
+        assert outcome.error is None
+        for key, value in correlation.items():
+            assert outcome.metrics_events[0][key] == value
+            assert outcome.span_attrs[key] == value
+            assert outcome.event_attrs[key] == value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parse_failure",
+    [
+        InvalidLLMResponseFormat("invalid response"),
+        EmptyLLMResponseError("empty response"),
+        InvalidLLMResponseType("list"),
+    ],
+    ids=["invalid-format", "empty-response", "invalid-type"],
+)
+async def test_recording_correlation_survives_response_parse_failure(
+    span_exporter: InMemorySpanExporter,
+    parse_failure: BaseException,
+) -> None:
+    correlation = {
+        "recording_attempt_id": "attempt-1",
+        "interpretation_session_id": "interpretation-1",
+    }
+    direct = await _run_direct(
+        span_exporter,
+        responses=[ParityResponse("gpt-4", content="not json")],
+        parameters={},
+        parse_failure=parse_failure,
+        **correlation,
+    )
+    router = await _run_router(
+        span_exporter,
+        responses=[ParityResponse("gpt-4", content="not json")],
+        parameters={},
+        parse_failure=parse_failure,
+        **correlation,
+    )
+
+    for outcome in (direct, router):
+        assert outcome.error is not None
+        assert len(outcome.metrics_events) == 1
+        assert outcome.span_attrs["status"] == "error"
+        assert not any(event.name == LLM_REQUEST_COMPLETED_EVENT for event in outcome.span.events)
+        for key, value in correlation.items():
+            assert outcome.metrics_events[0][key] == value
+            assert outcome.span_attrs[key] == value
+
+
+@pytest.mark.asyncio
 async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
     span_exporter: InMemorySpanExporter,
 ) -> None:
@@ -463,20 +573,21 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
             provider="openai",
         )
 
-    direct = await _run_direct(
-        span_exporter,
-        responses=[response()],
-        model_name="gpt-4",
-        prompt_name="workflow-copilot-narration",
-        parameters={},
-    )
-    router = await _run_router(
-        span_exporter,
-        responses=[response()],
-        main_model_group="gpt-4",
-        prompt_name="workflow-copilot-narration",
-        parameters={},
-    )
+    with copilot_cost_scope() as ledger:
+        direct = await _run_direct(
+            span_exporter,
+            responses=[response()],
+            model_name="gpt-4",
+            prompt_name="workflow-copilot-narration",
+            parameters={},
+        )
+        router = await _run_router(
+            span_exporter,
+            responses=[response()],
+            main_model_group="gpt-4",
+            prompt_name="workflow-copilot-narration",
+            parameters={},
+        )
 
     expected = {
         "log_code": "copilot_model_usage",
@@ -493,6 +604,9 @@ async def test_copilot_model_usage_is_emitted_once_by_router_and_single_handler(
     }
     assert direct.error is None and router.error is None
     assert direct.usage_events == router.usage_events == [expected]
+    assert ledger.snapshot()["known_cost_usd"] == pytest.approx(LLM_COST * 2)
+    assert ledger.snapshot()["observed_call_count"] == 2
+    assert ledger.snapshot()["pricing_sources"] == ["litellm_estimate"]
 
 
 @pytest.mark.asyncio
@@ -512,20 +626,48 @@ async def test_copilot_model_usage_survives_response_parse_failure(
         responses=[ParityResponse("openai/gpt-4.1", content="not json", provider="openai")],
         prompt_name="workflow-copilot-narration",
         parameters={},
-        force_parse_failure=True,
+        parse_failure=InvalidLLMResponseFormat("invalid response"),
     )
     router = await _run_router(
         span_exporter,
         responses=[ParityResponse("openai/gpt-4.1", content="not json", provider="openai")],
         prompt_name="workflow-copilot-narration",
         parameters={},
-        force_parse_failure=True,
+        parse_failure=InvalidLLMResponseFormat("invalid response"),
     )
 
     assert direct.error is not None and router.error is not None
     assert len(direct.usage_events) == len(router.usage_events) == 1
     assert direct.usage_events[0]["gen_ai.response.model"] == "openai/gpt-4.1"
     assert router.usage_events[0]["gen_ai.response.model"] == "openai/gpt-4.1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_id, expected",
+    [
+        ("gen-provider-issued-1", {"response_id": "gen-provider-issued-1"}),
+        # What litellm stamps when the provider sent no id.
+        (litellm.ModelResponse().id, {}),
+        (None, {}),
+    ],
+    ids=["provider-id", "litellm-synthesized", "no-id"],
+)
+async def test_metrics_log_carries_only_a_provider_issued_response_id(
+    span_exporter: InMemorySpanExporter, response_id: str | None, expected: dict[str, str]
+) -> None:
+    def response() -> ParityResponse:
+        r = ParityResponse("gpt-4")
+        r.id = response_id  # type: ignore[attr-defined]
+        return r
+
+    direct = await _run_direct(span_exporter, responses=[response()], parameters={})
+    router = await _run_router(span_exporter, responses=[response()], parameters={})
+
+    for outcome in (direct, router):
+        assert outcome.error is None
+        (metrics,) = outcome.metrics_events
+        assert {k: v for k, v in metrics.items() if k == "response_id"} == expected
 
 
 @pytest.mark.asyncio
@@ -556,31 +698,31 @@ async def test_zero_usage_records_none_token_fields_on_both(span_exporter: InMem
 async def test_provider_prefixed_response_model(span_exporter: InMemorySpanExporter) -> None:
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         step=_make_step(),
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         step=_make_step(),
         parameters={},
     )
 
     assert direct.error is None and router.error is None
     # Both variants normalize the persisted model to the bare name.
-    assert direct.update_step_calls[0]["last_llm_model"] == "gemini-2.5-flash"
-    assert router.update_step_calls[0]["last_llm_model"] == "gemini-2.5-flash"
+    assert direct.update_step_calls[0]["last_llm_model"] == "gemini-3-flash-preview"
+    assert router.update_step_calls[0]["last_llm_model"] == "gemini-3-flash-preview"
 
     # drift: the router span/event record the raw provider-prefixed response.model while
     # the direct handler records the normalized bare name.
-    assert direct.span_attrs["llm_model"] == "gemini-2.5-flash"
-    assert direct.event_attrs["model"] == "gemini-2.5-flash"
-    assert router.span_attrs["llm_model"] == "vertex_ai/gemini-2.5-flash"
-    assert router.event_attrs["model"] == "vertex_ai/gemini-2.5-flash"
+    assert direct.span_attrs["llm_model"] == "gemini-3-flash-preview"
+    assert direct.event_attrs["model"] == "gemini-3-flash-preview"
+    assert router.span_attrs["llm_model"] == "vertex_ai/gemini-3-flash-preview"
+    assert router.event_attrs["model"] == "vertex_ai/gemini-3-flash-preview"
 
 
 @pytest.mark.parametrize(
@@ -719,17 +861,17 @@ async def test_vertex_cache_attached_for_gemini_extract_actions(span_exporter: I
 
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         context=cached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         context=cached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
@@ -742,8 +884,8 @@ async def test_vertex_cache_attached_for_gemini_extract_actions(span_exporter: I
     assert len(router.completion_calls) == 1 and not router.router_calls
     assert direct.completion_calls[0]["cached_content"] == cache_name
     assert router.completion_calls[0]["cached_content"] == cache_name
-    assert direct.completion_calls[0]["model"] == "gemini-2.5-flash"
-    assert router.completion_calls[0]["model"] == "vertex_ai/gemini-2.5-flash"
+    assert direct.completion_calls[0]["model"] == "gemini-3-flash-preview"
+    assert router.completion_calls[0]["model"] == "vertex_ai/gemini-3-flash-preview"
     assert direct.completion_calls[0]["timeout"] == settings.LLM_CONFIG_TIMEOUT
     assert router.completion_calls[0]["timeout"] == settings.LLM_CONFIG_TIMEOUT
 
@@ -757,17 +899,17 @@ async def test_no_vertex_cache_when_prompt_caching_disabled(span_exporter: InMem
 
     direct = await _run_direct(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        model_name="gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        model_name="gemini-3-flash-preview",
         context=uncached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},
     )
     router = await _run_router(
         span_exporter,
-        responses=[ParityResponse("vertex_ai/gemini-2.5-flash")],
-        main_model_group="vertex-gemini-2.5-flash",
-        litellm_model="vertex_ai/gemini-2.5-flash",
+        responses=[ParityResponse("vertex_ai/gemini-3-flash-preview")],
+        main_model_group="vertex-gemini-3-flash-preview",
+        litellm_model="vertex_ai/gemini-3-flash-preview",
         context=uncached_context(),
         prompt_name=EXTRACT_ACTION_PROMPT_NAME,
         parameters={},

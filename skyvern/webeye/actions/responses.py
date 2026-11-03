@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from skyvern.webeye.string_util import remove_whitespace
 
@@ -18,21 +18,36 @@ class ActionResult(BaseModel):
     needs_followup: bool | None = None
     followup_message: str | None = None
     downloaded_files: list[str] | None = None  # Actual file names that were downloaded
+    # Server 5xx status passively observed for an admitted xhr/fetch request during the download action
+    # when no file was received. Set only by the download flow on the no-file path, and never when a file
+    # actually downloaded. Carries no URL, host, header, or body — just the integer status.
+    download_failure_status: int | None = None
+    _attributed_download_failure_status: int | None = PrivateAttr(default=None)
     # None is used for old data so that we can differentiate between old and new data which only has boolean
     interacted_with_sibling: bool | None = None
     interacted_with_parent: bool | None = None
     skip_remaining_actions: bool | None = None
     tool_call_result: dict[str, Any] | None = None
-    # Set by an action setup that physically performed the interaction, as opposed to one that
-    # suppressed it because the control already held the desired state. Both shapes stop the raw
-    # click, so callers mirroring the setup contract have no other way to tell them apart.
+    # Set by a site-specific click setup that handled the interaction itself, either by performing it
+    # or confirming that the control already held the requested state, so the raw click must not run.
+    # For an ActionAbort, the persisted status treats this as completed.
     setup_performed: bool = False
-    # Observational commit evidence for an autocomplete selection: the clicked option's label and
-    # the control value observed immediately afterward. Set together only when both are
-    # boundary-delimited fragments of the option label (a selection-specific transition); both stay
-    # None on a no-op, unrelated transform, ambiguous, failed, or secret selection.
+    # Set by the desired-state click guard when it verifies that the control holds the requested state
+    # (already matching, set natively, or a grid row drive); the raw click is still suppressed, so the
+    # result stays an ActionAbort, but the requested outcome holds.
+    desired_state_reached: bool = False
+    # Observational commit evidence for a custom-select / autocomplete selection: committed_option is the selected
+    # option's label and committed_value is the closed display observed after (evidence — it may differ from the label,
+    # e.g. a ui-select closed template omitting an identifier the row carries). Both stay None unless a selection lands.
     committed_option: str | None = None
     committed_value: str | None = None
+
+    @property
+    def attributed_download_failure_status(self) -> int | None:
+        return self._attributed_download_failure_status
+
+    def mark_download_failure_attributed(self, status: int) -> None:
+        self._attributed_download_failure_status = status
 
     def __str__(self) -> str:
         results = [f"ActionResult(success={self.success}"]
@@ -55,6 +70,8 @@ class ActionResult(BaseModel):
             results.append(f"followup_message={self.followup_message}")
         if self.downloaded_files is not None:
             results.append(f"downloaded_files={self.downloaded_files}")
+        if self.download_failure_status is not None:
+            results.append(f"download_failure_status={self.download_failure_status}")
         if self.interacted_with_sibling is not None:
             results.append(f"interacted_with_sibling={self.interacted_with_sibling}")
         if self.interacted_with_parent is not None:
@@ -128,6 +145,7 @@ class ActionAbort(ActionResult):
         interacted_with_sibling: bool = False,
         interacted_with_parent: bool = False,
         setup_performed: bool = False,
+        desired_state_reached: bool = False,
     ):
         super().__init__(
             success=True,
@@ -135,6 +153,7 @@ class ActionAbort(ActionResult):
             interacted_with_sibling=interacted_with_sibling,
             interacted_with_parent=interacted_with_parent,
             setup_performed=setup_performed,
+            desired_state_reached=desired_state_reached,
         )
 
 

@@ -3,15 +3,24 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  token: null as { token: string; modified_at: string } | null,
+  status: null as {
+    configured: boolean;
+    source: "organization" | "instance_default" | null;
+    instance_default_available: boolean;
+    modified_at: string | null;
+  } | null,
   isLoading: false,
+  isError: false,
+  createOrUpdateTokenError: null as string | null,
 }));
 
 vi.mock("@/hooks/useOnePasswordToken", () => ({
   useOnePasswordToken: () => ({
-    onePasswordToken: mocks.token,
+    onePasswordStatus: mocks.status,
     isLoading: mocks.isLoading,
+    isError: mocks.isError,
     createOrUpdateToken: vi.fn(),
+    createOrUpdateTokenError: mocks.createOrUpdateTokenError,
     isUpdating: false,
     clearToken: vi.fn(),
     isClearing: false,
@@ -23,8 +32,15 @@ import { OnePasswordTokenForm } from "./OnePasswordTokenForm";
 const A_STEP_BODY = /Vault permissions/;
 
 beforeEach(() => {
-  mocks.token = null;
+  mocks.status = {
+    configured: false,
+    source: null,
+    instance_default_available: false,
+    modified_at: null,
+  };
   mocks.isLoading = false;
+  mocks.isError = false;
+  mocks.createOrUpdateTokenError = null;
 });
 
 afterEach(cleanup);
@@ -37,7 +53,12 @@ describe("OnePasswordTokenForm setup guide", () => {
   });
 
   it("collapses the steps once a token is configured", () => {
-    mocks.token = { token: "ops_test", modified_at: "2026-08-20T00:00:00Z" };
+    mocks.status = {
+      configured: true,
+      source: "organization",
+      instance_default_available: false,
+      modified_at: "2026-08-20T00:00:00Z",
+    };
 
     render(<OnePasswordTokenForm />);
 
@@ -56,9 +77,23 @@ describe("OnePasswordTokenForm setup guide", () => {
     expect(screen.queryByText(A_STEP_BODY)).toBeNull();
 
     mocks.isLoading = false;
-    mocks.token = { token: "ops_test", modified_at: "2026-08-20T00:00:00Z" };
+    mocks.status = {
+      configured: true,
+      source: "organization",
+      instance_default_available: false,
+      modified_at: "2026-08-20T00:00:00Z",
+    };
     view.rerender(<OnePasswordTokenForm />);
 
     expect(screen.queryByText(A_STEP_BODY)).toBeNull();
+  });
+
+  it("shows token validation failures inline", () => {
+    mocks.createOrUpdateTokenError = "This service account token is invalid.";
+    render(<OnePasswordTokenForm />);
+
+    expect(
+      screen.getByText("This service account token is invalid."),
+    ).toBeTruthy();
   });
 });

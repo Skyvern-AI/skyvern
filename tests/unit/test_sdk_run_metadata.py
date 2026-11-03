@@ -852,3 +852,89 @@ async def test_connect_to_cloud_browser_session_threads_app_url(monkeypatch: pyt
 
     assert browser.app_url == "https://app.example.test/browser-sessions/pbs_123"
     assert browser.browser_session_id == "pbs_123"
+
+
+@pytest.mark.asyncio
+async def test_connect_to_cloud_browser_session_hands_downloads_back_to_the_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = LibrarySkyvern(base_url="https://api.example.test", api_key="test-key")
+    sent: list[tuple[str, dict]] = []
+    detached: list[bool] = []
+
+    async def send(method: str, params: dict) -> dict:
+        sent.append((method, params))
+        return {}
+
+    async def detach() -> None:
+        detached.append(True)
+
+    cdp_browser = SimpleNamespace(
+        contexts=[SimpleNamespace(_loop=None)],
+        new_browser_cdp_session=AsyncMock(return_value=SimpleNamespace(send=send, detach=detach)),
+    )
+    fake_playwright = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=cdp_browser)))
+    monkeypatch.setattr(client, "_get_playwright", AsyncMock(return_value=fake_playwright))
+    browser_session = SimpleNamespace(
+        browser_session_id="pbs_123",
+        browser_address="wss://cdp.example.test",
+        app_url="https://app.example.test/browser-sessions/pbs_123",
+    )
+
+    await client._connect_to_cloud_browser_session(browser_session)
+
+    assert sent == [("Browser.setDownloadBehavior", {"behavior": "default", "eventsEnabled": True})]
+    assert detached == []
+
+
+_CREATED_AT_QUERY = {"created_at_start": "2020-01-01T00:00:00Z", "created_at_end": "2020-02-01T00:00:00Z"}
+
+
+def _assert_org_runs_request_carries_created_at(request: httpx.Request) -> None:
+    assert request.method == "GET"
+    assert request.url.path == "/v1/agents/runs"
+    assert request.url.params["search_key"] == "acme"
+    assert request.url.params["created_at_start"] == _CREATED_AT_QUERY["created_at_start"]
+    assert request.url.params["created_at_end"] == _CREATED_AT_QUERY["created_at_end"]
+
+
+def test_get_workflow_runs_accepts_created_at_bounds_as_additional_query_parameters() -> None:
+    # The generated SDK has no typed created_at arguments for the org-wide list; request_options is the
+    # documented way to search past the default window until the SDK is regenerated.
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(status_code=200, json=[_workflow_run_payload()])
+
+    client = Skyvern(
+        base_url="https://api.example.test",
+        api_key="test-key",
+        httpx_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    runs = client.get_workflow_runs(
+        search_key="acme", request_options={"additional_query_parameters": dict(_CREATED_AT_QUERY)}
+    )
+
+    assert runs[0].workflow_run_id == "wr_123"
+    _assert_org_runs_request_carries_created_at(captured_requests[0])
+
+
+def test_async_get_workflow_runs_accepts_created_at_bounds_as_additional_query_parameters() -> None:
+    captured_requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(status_code=200, json=[_workflow_run_payload()])
+
+    async def call() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as httpx_client:
+            client = AsyncSkyvern(base_url="https://api.example.test", api_key="test-key", httpx_client=httpx_client)
+            runs = await client.get_workflow_runs(
+                search_key="acme", request_options={"additional_query_parameters": dict(_CREATED_AT_QUERY)}
+            )
+            assert runs[0].workflow_run_id == "wr_123"
+
+    asyncio.run(call())
+    _assert_org_runs_request_carries_created_at(captured_requests[0])

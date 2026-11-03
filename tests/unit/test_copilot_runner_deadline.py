@@ -32,6 +32,7 @@ from tests.unit.copilot_test_helpers import (
     count_record_and_send,
     failed_second_factor_run,
     handback_ctx,
+    make_copilot_ctx,
 )
 
 
@@ -49,6 +50,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -67,7 +69,7 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
         hanging_stream,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with pytest.raises(CopilotTotalTimeoutError):
         await run_with_enforcement(
@@ -77,6 +79,9 @@ async def test_runner_deadline_raises_total_timeout_when_tool_exceeds_budget(
             stream=stream,
         )
     assert ctx.copilot_total_timeout_exceeded is True
+    assert ctx.budget_expiry_state.hard_backstop_reached is True
+    assert ctx.budget_expiry_state.source == "deadline"
+    assert ctx.budget_expiry_state.drain_attempted is False
 
 
 @pytest.mark.asyncio
@@ -84,6 +89,7 @@ async def test_runner_deadline_protects_context_overflow_recovery_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -118,7 +124,7 @@ async def test_runner_deadline_protects_context_overflow_recovery_path(
         fake_recover,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with pytest.raises(CopilotTotalTimeoutError):
         await run_with_enforcement(
@@ -155,7 +161,7 @@ async def test_runner_deadline_does_not_fire_when_tool_completes_in_time(
         quick_stream,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     returned = await run_with_enforcement(
         agent=MagicMock(),
@@ -167,8 +173,8 @@ async def test_runner_deadline_does_not_fire_when_tool_completes_in_time(
     assert ctx.copilot_total_timeout_exceeded is False
 
 
-def _cancellation_ctx() -> MagicMock:
-    ctx = MagicMock()
+def _cancellation_ctx() -> CopilotContext:
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     ctx.copilot_credential_pause_seconds = 0.0
     ctx.copilot_turn_cancelled_iteration = None
@@ -247,19 +253,21 @@ async def _cancel_at_boundary(
     return logs, stream_calls["n"]
 
 
+@pytest.mark.parametrize("elapsed", [588.0, TOTAL_TIMEOUT_SECONDS + 50.0])
 @pytest.mark.parametrize("boundary", ["first", "overflow", "retry"])
 @pytest.mark.asyncio
-async def test_sub_budget_cancellation_records_once_at_every_model_call_boundary(
+async def test_a_cancellation_records_once_at_every_model_call_boundary_and_never_as_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
+    elapsed: float,
 ) -> None:
     ctx = _cancellation_ctx()
 
-    logs, stream_calls = await _cancel_at_boundary(monkeypatch, boundary=boundary, elapsed=588.0, ctx=ctx)
+    logs, stream_calls = await _cancel_at_boundary(monkeypatch, boundary=boundary, elapsed=elapsed, ctx=ctx)
 
     events = _cancellation_events(logs)
     assert len(events) == 1
-    assert 588.0 <= events[0]["elapsed_seconds"] < TOTAL_TIMEOUT_SECONDS
+    assert events[0]["elapsed_seconds"] >= elapsed
     assert events[0]["iteration"] == 0
     assert events[0]["deadline_exceeded"] is False
     assert _deadline_events(logs) == []
@@ -270,45 +278,11 @@ async def test_sub_budget_cancellation_records_once_at_every_model_call_boundary
 
 
 @pytest.mark.asyncio
-async def test_over_budget_cancellation_records_the_deadline_beside_the_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _cancellation_ctx()
-
-    logs, _ = await _cancel_at_boundary(monkeypatch, boundary="first", elapsed=950.0, ctx=ctx)
-
-    events = _cancellation_events(logs)
-    assert len(events) == 1
-    assert events[0]["elapsed_seconds"] >= TOTAL_TIMEOUT_SECONDS
-    assert events[0]["deadline_exceeded"] is True
-    assert len(_deadline_events(logs)) == 1
-    assert ctx.copilot_total_timeout_exceeded is True
-
-
-@pytest.mark.asyncio
-async def test_a_broken_recorder_neither_masks_nor_delays_the_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def exploding_mark(ctx: Any, start_time: float, iteration: int) -> None:
-        raise RuntimeError("recorder is broken")
-
-    monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.enforcement._mark_copilot_total_timeout_if_elapsed",
-        exploding_mark,
-    )
-    ctx = _cancellation_ctx()
-
-    logs, _ = await _cancel_at_boundary(monkeypatch, boundary="first", elapsed=588.0, ctx=ctx)
-
-    assert _cancellation_events(logs) == []
-    assert any(entry.get("event") == "Failed to record a copilot turn cancellation" for entry in logs)
-
-
-@pytest.mark.asyncio
 async def test_deadline_event_names_the_operation_still_open_when_the_budget_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -325,7 +299,7 @@ async def test_deadline_event_names_the_operation_still_open_when_the_budget_exp
 
     monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", hanging_stream)
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):
@@ -364,6 +338,7 @@ async def test_the_deadline_names_the_inner_operation_that_returned_over_the_out
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -384,7 +359,7 @@ async def test_the_deadline_names_the_inner_operation_that_returned_over_the_out
         stream_stalling_after_a_tool_returned,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):
@@ -402,6 +377,7 @@ async def test_the_deadline_names_an_operation_that_exited_by_exception_and_neve
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
 
     stream = MagicMock()
@@ -423,7 +399,7 @@ async def test_the_deadline_names_an_operation_that_exited_by_exception_and_neve
         stream_stalling_after_a_tool_failed,
     )
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):
@@ -449,6 +425,7 @@ async def test_the_deadline_path_is_unchanged_when_the_fingerprint_contributes_n
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.HARD_BACKSTOP_ALLOWANCE_SECONDS", 0)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.MIN_DEADLINE_REMAINING_SECONDS", 0.02)
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.pending_operation_fields", dict)
 
@@ -465,7 +442,7 @@ async def test_the_deadline_path_is_unchanged_when_the_fingerprint_contributes_n
 
     monkeypatch.setattr("skyvern.forge.sdk.copilot.streaming_adapter.stream_to_sse", hanging_stream)
 
-    ctx = MagicMock()
+    ctx = make_copilot_ctx()
     ctx.copilot_total_timeout_exceeded = False
     with capture_logs() as logs:
         with pytest.raises(CopilotTotalTimeoutError):
@@ -526,8 +503,10 @@ async def test_completed_run_survives_an_enrichment_probe_cancelled_by_the_deadl
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cancelled: list[str] = []
+    probe_entered = asyncio.Event()
 
     async def _hanging(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object] | None]:
+        probe_entered.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -537,11 +516,17 @@ async def test_completed_run_survives_an_enrichment_probe_cancelled_by_the_deadl
 
     ctx, counts = await _run_with_failing_enrichment(monkeypatch, _hanging)
 
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(
-            _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx),
-            timeout=0.05,
-        )
+    run = asyncio.ensure_future(
+        _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+    )
+    try:
+        await asyncio.wait_for(probe_entered.wait(), timeout=5)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(run, timeout=0.05)
+    finally:
+        run.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run
 
     assert cancelled == ["cancelled"]
     _assert_later_run_survived(ctx, counts)

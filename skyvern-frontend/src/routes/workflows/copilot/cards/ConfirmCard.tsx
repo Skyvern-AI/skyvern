@@ -22,15 +22,25 @@ export function shouldShowConfirmCard(turn: TurnNarrativeState): boolean {
 type ConfirmCardProps = {
   onConfirm: () => void;
   onChangeInstead: () => void;
+  disabled?: boolean;
+  // Why Confirm is inert, when that is a hold rather than a missing handler.
+  lockReason?: string | null;
 };
 
-export function ConfirmCard({ onConfirm, onChangeInstead }: ConfirmCardProps) {
+export function ConfirmCard({
+  onConfirm,
+  onChangeInstead,
+  disabled = false,
+  lockReason,
+}: ConfirmCardProps) {
   return (
-    <div className="flex flex-wrap gap-2 pl-1">
+    <div className="flex flex-wrap gap-2 pl-1" title={lockReason ?? undefined}>
       <button
         type="button"
         onClick={onConfirm}
-        className="rounded-md bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:opacity-90"
+        disabled={disabled}
+        title={lockReason ?? undefined}
+        className="rounded-md bg-success px-3 py-1.5 text-xs font-semibold text-success-foreground hover:opacity-90 disabled:cursor-default disabled:opacity-50"
       >
         Confirm
       </button>

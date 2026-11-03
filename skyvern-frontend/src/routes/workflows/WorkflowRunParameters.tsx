@@ -6,7 +6,7 @@ import { RunWorkflowForm } from "./RunWorkflowForm";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ProxyLocation } from "@/api/types";
-import { getInitialValues } from "./utils";
+import { getInitialValues, resolveInitialBrowserType } from "./utils";
 import { isMaskedHeaders } from "@/util/secretHeaders";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 
@@ -103,6 +103,13 @@ function WorkflowRunParameters() {
         cdpConnectHeaders: cdpConnectHeaders ?? storedCdpConnectHeaders,
         cdpAddress: null,
         runWith,
+        // A rerun/retry carries the executed run's effective browser_type in location state. A
+        // non-null value preselects what actually ran; a null OR absent value inherits the workflow's
+        // current browser_type (a run-level null means "inherit the workflow setting").
+        browserType: resolveInitialBrowserType(
+          location.state,
+          workflow.browser_type,
+        ),
       }}
     />
   );

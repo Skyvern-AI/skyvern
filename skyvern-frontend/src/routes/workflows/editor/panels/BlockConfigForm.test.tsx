@@ -84,7 +84,7 @@ describe("BLOCK_FORMS dispatcher", () => {
     }
   });
 
-  test("contains the 30 expected node.type keys", () => {
+  test("contains the 34 expected node.type keys", () => {
     expect(new Set(BLOCK_FORM_KEYS)).toEqual(
       new Set([
         "task",
@@ -109,17 +109,21 @@ describe("BLOCK_FORMS dispatcher", () => {
         "human_interaction",
         "url",
         "http_request",
+        "web_search",
         "printPage",
         "workflowTrigger",
         "googleSheetsRead",
         "googleSheetsWrite",
+        "powerBIQuery",
         "pdfFill",
         "splitPdf",
         "dataExport",
+        "terminate",
+        "agentStep",
         "emailInbox",
       ]),
     );
-    expect(BLOCK_FORM_KEYS).toHaveLength(30);
+    expect(BLOCK_FORM_KEYS).toHaveLength(34);
   });
 
   test("conditional routes to a sidebar form that shows branch prompts", () => {

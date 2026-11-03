@@ -1,7 +1,8 @@
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
 import { getClient } from "@/api/AxiosClient";
 import { Status } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { statusIsNotFinalized } from "@/routes/tasks/types";
+
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { WorkflowRunTimelineItem } from "../types/workflowRunTypes";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
@@ -17,9 +18,13 @@ import {
 // this endpoint; the two must not drift apart or their counts disagree on screen.
 const RUNNING_TIMELINE_REFETCH_INTERVAL_MS = 2500;
 
-function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
+function useWorkflowRunTimelineQuery(options?: {
+  workflowRunId: string | undefined;
+}) {
   const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
-  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
+  // Same caller-intent rule as the run hooks this forwards to; `??` here would
+  // resolve a cleared caller id back to the route's run.
+  const workflowRunId = options ? options.workflowRunId : urlWorkflowRunId;
   const credentialGetter = useCredentialGetter();
   const activeOrgId = useActiveOrgId();
   const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
@@ -27,7 +32,7 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(options);
   const workflow = workflowRun?.workflow;
   const workflowPermanentId = workflow?.workflow_permanent_id;
-  const runIsLive = !!workflowRun && statusIsNotFinalized(workflowRun);
+  const runIsLive = !!workflowRun && runIsLogicallyActive(workflowRun);
   // Only a running run writes timeline rows. Created, queued and paused are live but idle, and a
   // paused run waits on a human for as long as that takes.
   const runIsWriting = workflowRun?.status === Status.Running;
@@ -45,6 +50,8 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
         workflowPermanentId,
         workflowRunId,
         workflowRun?.status,
+        workflowRun?.attempt,
+        workflowRun?.retry_pending,
       ],
       activeOrgQueryKeyScope,
     ),
@@ -58,7 +65,7 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
         params.set("template", "true");
       }
       const { data } = await client.get(
-        `/workflows/${workflowPermanentId}/runs/${workflowRunId}/timeline`,
+        `/workflows/${workflowPermanentId}/runs/${encodeURIComponent(workflowRunId ?? "")}/timeline`,
         { params, signal },
       );
       // axios hands back the raw string when a 2xx body fails JSON.parse, so an
@@ -77,7 +84,7 @@ function useWorkflowRunTimelineQuery(options?: { workflowRunId?: string }) {
       if (query.state.status === "error") {
         return false;
       }
-      return runIsLive ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS : false;
+      return runIsWriting ? RUNNING_TIMELINE_REFETCH_INTERVAL_MS : false;
     },
     // The interval otherwise pauses while the window is unfocused, and a run watched from another
     // window keeps writing blocks the whole time. Scoped to a running run so a backgrounded tab

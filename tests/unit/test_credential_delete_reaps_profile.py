@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -5,6 +6,7 @@ import pytest
 import structlog.testing
 from fastapi import BackgroundTasks
 
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.routes import credentials
 
 
@@ -16,20 +18,43 @@ def _setup_app(
     reap_raises: bool = False,
     db_raises: bool = False,
     engine_enabled: bool = True,
+    is_test_login_temporary: bool = False,
+    assert_lock_during_reap: bool = False,
 ) -> SimpleNamespace:
+    lock_state = {"held": False}
+    lock_calls: list[tuple[str, str]] = []
     get_credential = AsyncMock(
         return_value=SimpleNamespace(
             vault_type=credentials.CredentialVaultType.BITWARDEN,
             item_id="item_1",
             organization_id="o_test",
             browser_profile_id=browser_profile_id,
+            created_by="user_1",
+            created_at=naive_utc_now(),
+            is_test_login_temporary=is_test_login_temporary,
         )
     )
     has_live = AsyncMock(return_value=has_refs)
     db_delete_profile = AsyncMock(side_effect=RuntimeError("db down") if db_raises else None)
     # reap_raises fails the S3 erasure (the security-critical path), which must be best-effort.
-    storage_delete_profile = AsyncMock(side_effect=RuntimeError("boom") if reap_raises else None)
+
+    async def delete_profile(**kwargs: object) -> None:
+        if assert_lock_during_reap:
+            assert lock_state["held"]
+        if reap_raises:
+            raise RuntimeError("boom")
+
+    storage_delete_profile = AsyncMock(side_effect=delete_profile)
     vault_service = SimpleNamespace(delete_credential=AsyncMock(), post_delete_credential_item=AsyncMock())
+
+    @asynccontextmanager
+    async def credential_write_lock(*, organization_id: str, credential_id: str):
+        lock_calls.append((organization_id, credential_id))
+        lock_state["held"] = True
+        try:
+            yield
+        finally:
+            lock_state["held"] = False
 
     fake_app = SimpleNamespace(
         DATABASE=SimpleNamespace(
@@ -44,15 +69,19 @@ def _setup_app(
         AGENT_FUNCTION=SimpleNamespace(
             is_browser_memory_engine_enabled_for_org=AsyncMock(return_value=engine_enabled),
             should_lock_credential_write=AsyncMock(return_value=False),
+            credential_write_lock=credential_write_lock,
         ),
     )
     monkeypatch.setattr(credentials, "app", fake_app)
     monkeypatch.setattr(credentials, "_clear_cached_totp_code_preview", lambda **kwargs: None)
+    monkeypatch.setattr(credentials, "record_request_audit_event", AsyncMock())
     return SimpleNamespace(
         has_live=has_live,
         db_delete_profile=db_delete_profile,
         storage_delete_profile=storage_delete_profile,
         vault_service=vault_service,
+        lock_state=lock_state,
+        lock_calls=lock_calls,
     )
 
 
@@ -61,6 +90,15 @@ async def _delete() -> None:
         background_tasks=BackgroundTasks(),
         credential_id="cred_1",
         current_org=SimpleNamespace(organization_id="o_test"),
+    )
+
+
+async def _delete_temporary() -> None:
+    await credentials.delete_organization_credential(
+        organization_id="o_test",
+        credential_id="cred_1",
+        background_tasks=BackgroundTasks(),
+        expected_created_by="user_1",
     )
 
 
@@ -74,6 +112,21 @@ async def test_reaps_profile_when_no_live_owner(monkeypatch: pytest.MonkeyPatch)
     mocks.db_delete_profile.assert_awaited_once_with(profile_id="bp_1", organization_id="o_test")
     # hard_delete=True is the security contract: purge all versions so cookies are truly erased.
     mocks.storage_delete_profile.assert_awaited_once_with(organization_id="o_test", profile_id="bp_1", hard_delete=True)
+
+
+@pytest.mark.asyncio
+async def test_temporary_delete_holds_credential_lock_through_profile_reap(monkeypatch: pytest.MonkeyPatch) -> None:
+    mocks = _setup_app(
+        monkeypatch,
+        browser_profile_id="bp_1",
+        is_test_login_temporary=True,
+        assert_lock_during_reap=True,
+    )
+
+    await _delete_temporary()
+
+    assert mocks.lock_calls == [("o_test", "cred_1")]
+    assert mocks.lock_state["held"] is False
 
 
 @pytest.mark.asyncio

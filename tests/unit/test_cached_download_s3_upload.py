@@ -11,6 +11,8 @@ Validates that the cached download flow:
 from __future__ import annotations
 
 import asyncio
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.api import files as files_module
+from skyvern.services import script_service
 from tests.unit._fingerprint_expectations import expected_fingerprint
 
 MODULE = "skyvern.services.script_service"
@@ -59,6 +63,7 @@ def mock_context():
     ctx.browser_session_id = None
     ctx.run_id = ctx.workflow_run_id
     ctx.prompt = None
+    ctx.download_suffix_applied_files = {}
     return ctx
 
 
@@ -99,7 +104,13 @@ def setup(mock_context, tmp_path):
                 new_callable=AsyncMock,
                 return_value=("wrb_1", "tsk_1", "stp_1"),
             ),
-            patch(f"{MODULE}._render_template_with_label", side_effect=lambda p, _: p),
+            patch(
+                f"{MODULE}._render_template_with_label",
+                side_effect=lambda p, _, extra_template_data=None: p.replace(
+                    "{{ original_filename }}",
+                    extra_template_data["original_filename"] if extra_template_data else "{{ original_filename }}",
+                ),
+            ),
             patch(f"{MODULE}.skyvern_context.ensure_context", return_value=mock_context),
             patch(f"{MODULE}._prepare_cached_block_inputs", new_callable=AsyncMock),
             patch(f"{MODULE}._run_cached_function", new=run_cached_mock),
@@ -124,6 +135,7 @@ def setup(mock_context, tmp_path):
             "update_block": update_block_mock,
             "rename": rename,
             "run_cached": run_cached_mock,
+            "context": mock_context,
             "wait_downloads": wait_downloads_mock,
             "get_download_dir": get_download_dir_mock,
         }
@@ -140,6 +152,7 @@ def test_render_template_with_label_injects_workflow_run_id():
     context = SimpleNamespace(workflow_run_id="wr_cached_run", script_run_parameters={}, loop_metadata=None)
     workflow_run_context = SimpleNamespace(
         values={},
+        secrets={},
         workflow_title="Cached workflow",
         workflow_id="wf_cached",
         workflow_permanent_id="wpid_cached",
@@ -158,6 +171,35 @@ def test_render_template_with_label_injects_workflow_run_id():
         rendered = _render_template_with_label("exports/{{ workflow_run_id }}")
 
     assert rendered == "exports/wr_cached_run"
+
+
+def test_render_template_with_label_uses_workflow_parameter_over_extra_binding():
+    context = SimpleNamespace(workflow_run_id="wr_cached_run", script_run_parameters={}, loop_metadata=None)
+    workflow_run_context = SimpleNamespace(
+        values={"original_filename": "custom.pdf"},
+        secrets={},
+        workflow_title="Cached workflow",
+        workflow_id="wf_cached",
+        workflow_permanent_id="wpid_cached",
+        workflow_run_id="wr_cached_run",
+        browser_session_id=None,
+    )
+    mock_app = MagicMock()
+    mock_app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value = workflow_run_context
+
+    with (
+        patch(f"{MODULE}.app", mock_app),
+        patch(f"{MODULE}.skyvern_context.current", return_value=context),
+    ):
+        from skyvern.services.script_service import _render_template_with_label
+        from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
+
+        rendered = _render_template_with_label(
+            "ACME_{{ original_filename }}",
+            extra_template_data={"original_filename": ORIGINAL_FILENAME_MARKER},
+        )
+
+    assert rendered == "ACME_custom.pdf"
 
 
 @pytest.mark.asyncio
@@ -240,6 +282,7 @@ async def test_cached_download_awaits_in_flight_downloads_before_snapshot(setup,
                 download_dir=download_dir,
                 organization_id="o_test_org",
                 browser_session_id=None,
+                attempt_started_at=None,
             )
 
         with patch.object(
@@ -261,6 +304,7 @@ async def test_cached_download_awaits_in_flight_downloads_before_snapshot(setup,
             download_dir=download_dir,
             organization_id="o_test_org",
             browser_session_id=None,
+            attempt_started_at=None,
         )
         dispatch_files.assert_awaited_once()
     finally:
@@ -585,33 +629,238 @@ async def test_cached_download_rename_emits_finalize_lineage(setup, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_verification_raises_when_no_new_file(setup):
-    """When no new file appears on local filesystem, the poll loop should exhaust
-    the grace period and fall back to AI."""
+async def test_cached_download_renders_filename_template_before_substituting_site_name(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    abs_path = str(download_dir / "Q4 Report.pdf")
+    rename_mock = MagicMock()
     refs = setup(
-        get_side_effect=[[], [], [], []],
-        list_files_side_effect=[[] for _ in range(10)],  # before + polls all empty
+        get_side_effect=[[], ["Q4 Report.pdf"]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+        rename_mock=rename_mock,
     )
     try:
         from skyvern.services.script_service import download
 
-        call_count = 0
-
-        def advancing_time():
-            nonlocal call_count
-            call_count += 1
-            return call_count * 30.0
-
-        with (
-            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock),
-            patch(f"{MODULE}.asyncio.get_running_loop") as mock_loop,
+        with patch(
+            f"{MODULE}._render_template_with_label",
+            side_effect=lambda value, _, extra_template_data=None: value.replace("{{ fund }}", "Fund A").replace(
+                "{{ original_filename }}",
+                extra_template_data["original_filename"] if extra_template_data else "{{ original_filename }}",
+            ),
         ):
-            mock_loop.return_value.time = advancing_time
-            await download(prompt="Download invoice", label="test_block")
+            await download(
+                prompt="Download invoice",
+                download_suffix="{{ fund }}_{{ original_filename }}",
+                label="test_block",
+            )
 
-        refs["fallback"].assert_called_once()
-        error_arg = refs["fallback"].call_args.kwargs.get("error")
-        assert "no file produced" in str(error_arg).lower() or "did not produce" in str(error_arg).lower()
+        rename_mock.assert_called_once_with(abs_path, "Fund%20A_Q4 Report.pdf")
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_applies_suffix_at_download_time_and_preserves_original_name(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    expected_name = "Fund_Q4 Report.pdf"
+    abs_path = str(download_dir / expected_name)
+    refs = setup(
+        get_side_effect=[[], [expected_name]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+    )
+    refs["context"].download_suffix = None
+    saved_targets = []
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.actions.handler import _download_target_path
+
+        async def save_download(_cached_fn):
+            target = _download_target_path(download_dir, "Q4 Report.pdf")
+            saved_targets.append(target)
+            target.touch()
+
+        refs["run_cached"].side_effect = save_download
+        with patch(f"{MODULE}.skyvern_context.current", return_value=refs["context"]):
+            await download(
+                prompt="Download invoice",
+                download_suffix="Fund_{{ original_filename }}",
+                label="test_block",
+            )
+
+        assert [target.name for target in saved_targets] == [expected_name]
+        assert refs["context"].download_suffix_applied_files[expected_name][0] == "Q4 Report.pdf"
+        assert refs["context"].download_suffix is None
+        refs["rename"].assert_not_called()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_rejects_transformations_on_original_filename(setup):
+    refs = setup(list_files_side_effect=[[], []])
+    try:
+        from skyvern.services.script_service import download
+
+        with pytest.raises(ValueError, match="must be used without Jinja transformations"):
+            await download(
+                prompt="Download invoice",
+                download_suffix="{{ original_filename | upper }}",
+                label="test_block",
+            )
+
+        refs["run_cached"].assert_not_awaited()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_allows_filters_on_workflow_owned_original_filename(setup):
+    refs = setup(get_side_effect=[[]], list_files_side_effect=[[], []])
+    refs["app"].WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context.return_value.values = {
+        "original_filename": "custom.pdf"
+    }
+    refs["run_cached"].side_effect = RuntimeError("cached function failed")
+    try:
+        from skyvern.services.script_service import download
+
+        with patch(
+            f"{MODULE}._render_template_with_label",
+            side_effect=lambda value, *_args, **_kwargs: (
+                "CUSTOM.PDF" if value == "{{ original_filename | upper }}" else value
+            ),
+        ):
+            await download(
+                prompt="Download invoice",
+                download_suffix="{{ original_filename | upper }}",
+                label="test_block",
+            )
+
+        assert refs["fallback"].await_args.kwargs["download_suffix"] == "CUSTOM.PDF"
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_passes_rendered_suffix_to_ai_fallback(setup):
+    refs = setup(get_side_effect=[[]], list_files_side_effect=[[], []])
+    refs["context"].download_suffix = "ambient_suffix"
+    refs["run_cached"].side_effect = RuntimeError("cached function failed")
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
+
+        await download(
+            prompt="Download invoice",
+            download_suffix="Fund_{{ original_filename }}",
+            label="test_block",
+        )
+
+        refs["fallback"].assert_awaited_once()
+        assert refs["fallback"].await_args.kwargs["download_suffix"] == f"Fund_{ORIGINAL_FILENAME_MARKER}"
+        assert refs["context"].download_suffix == "ambient_suffix"
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_recovers_extension_with_dotted_prefix(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    target_name = "Acme.L.P._export"
+    abs_path = str(download_dir / target_name)
+    rename_mock = MagicMock()
+    refs = setup(
+        get_side_effect=[[], [f"{target_name}.xlsx"]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.cdp_download_interceptor import ORIGINAL_FILENAME_MARKER
+
+        async def mark_cdp_target(_cached_fn):
+            refs["context"].download_suffix_applied_files[target_name] = (
+                "export",
+                f"Acme.L.P._{ORIGINAL_FILENAME_MARKER}",
+            )
+
+        refs["run_cached"].side_effect = mark_cdp_target
+        with patch(f"{MODULE}.recover_download_extension", return_value=".xlsx") as recover_extension:
+            await download(
+                prompt="Download invoice",
+                download_suffix="Acme.L.P._{{ original_filename }}",
+                label="test_block",
+            )
+
+        recover_extension.assert_called_once_with(abs_path, f"Acme.L.P._{ORIGINAL_FILENAME_MARKER}")
+        rename_mock.assert_called_once_with(abs_path, f"{target_name}.xlsx")
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_preserves_explicit_suffix_extension(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    target_name = "custom.txt"
+    abs_path = str(download_dir / target_name)
+    rename_mock = MagicMock()
+    refs = setup(
+        get_side_effect=[[], [target_name]],
+        list_files_side_effect=[[], [abs_path], [abs_path], [abs_path]],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+
+        async def mark_cdp_target(_cached_fn):
+            refs["context"].download_suffix_applied_files[target_name] = ("report.pdf", target_name)
+
+        refs["run_cached"].side_effect = mark_cdp_target
+        await download(
+            prompt="Download invoice",
+            download_suffix=target_name,
+            label="test_block",
+        )
+
+        rename_mock.assert_not_called()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_dedupes_recovered_extension_for_already_named_file(setup, tmp_path):
+    download_dir = tmp_path / "downloads"
+    abs_path = str(download_dir / "ACME_export")
+    existing_path = str(download_dir / "ACME_export.xlsx")
+    rename_mock = MagicMock()
+    refs = setup(
+        get_side_effect=[[], ["ACME_export.xlsx"]],
+        list_files_side_effect=[
+            [existing_path],
+            [existing_path, abs_path],
+            [existing_path, abs_path],
+            [existing_path, abs_path],
+        ],
+        rename_mock=rename_mock,
+    )
+    try:
+        from skyvern.services.script_service import download
+        from skyvern.webeye.cdp_download_interceptor import _marked_download_suffix
+
+        async def mark_cdp_target(_cached_fn):
+            refs["context"].download_suffix_applied_files["ACME_export"] = (
+                "export",
+                _marked_download_suffix("ACME_{{ original_filename }}"),
+            )
+
+        refs["run_cached"].side_effect = mark_cdp_target
+        with patch(f"{MODULE}.recover_download_extension", return_value=".xlsx"):
+            await download(
+                prompt="Download invoice",
+                download_suffix="ACME_{{ original_filename }}",
+                label="test_block",
+            )
+
+        rename_mock.assert_called_once_with(abs_path, "ACME_export_1.xlsx")
     finally:
         _cleanup(refs)
 
@@ -639,14 +888,18 @@ async def test_verification_retries_before_failing(setup, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_save_timeout_skips_verification(setup, tmp_path):
-    """TimeoutError on save_downloaded_files should skip S3 verification entirely.
-    No point retrying get_downloaded_files when we know S3 is degraded.
-    Local file verification still passes since a file was downloaded."""
+@pytest.mark.parametrize(
+    "save_error",
+    [asyncio.TimeoutError(), RuntimeError("S3 permission denied")],
+    ids=["timeout", "generic"],
+)
+async def test_save_failure_skips_verification(setup, tmp_path, save_error):
+    """A save_downloaded_files failure (timeout or any other error, as agent.py catches both) skips S3
+    verification entirely; local file verification still passes since a file was downloaded."""
     download_dir = tmp_path / "downloads"
     local_file = str(download_dir / "file.pdf")
     refs = setup(
-        save_side_effect=asyncio.TimeoutError(),
+        save_side_effect=save_error,
         get_side_effect=[[]],  # only the before-check runs; after-check is skipped
         list_files_side_effect=[[], [local_file]],  # local verification passes
     )
@@ -664,71 +917,31 @@ async def test_save_timeout_skips_verification(setup, tmp_path):
         _cleanup(refs)
 
 
-@pytest.mark.asyncio
-async def test_save_generic_exception_skips_verification(setup, tmp_path):
-    """Non-timeout S3 failure (e.g., permission error) should also skip S3 verification.
-    Matches agent.py which catches both TimeoutError and generic Exception.
-    Local file verification still passes since a file was downloaded."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    refs = setup(
-        save_side_effect=RuntimeError("S3 permission denied"),
-        get_side_effect=[[]],  # only the before-check runs; after-check is skipped
-        list_files_side_effect=[[], [local_file]],  # local verification passes
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        await download(prompt="Download invoice", label="test_block")
-
-        # S3 verification skipped, but local verification passed → block completes
-        refs["fallback"].assert_not_called()
-        refs["update_block"].assert_called_once()
-        # get_downloaded_files called only once (before-check), not 3 more times for after
-        assert refs["storage"].get_downloaded_files.call_count == 1
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
-async def test_get_before_timeout_skips_verification(setup, tmp_path):
-    """If the before-check times out, S3 verification should be skipped entirely
-    to avoid spurious AI fallbacks under degraded storage.
-    Local file verification still passes since a file was downloaded."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    refs = setup(
-        get_side_effect=asyncio.TimeoutError(),
-        list_files_side_effect=[[], [local_file]],  # local verification passes
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        with patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
-            await download(prompt="Download invoice", label="test_block")
-
-        # Should NOT fall back — local verification passed, S3 verification skipped
-        refs["fallback"].assert_not_called()
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
-async def test_get_after_timeout_skips_verification(setup, tmp_path):
-    """If the after-check times out, S3 verification should be skipped.
-    Local file verification still passes since a file was downloaded."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    call_count = {"n": 0}
+def _timeout_after_first_get():
+    calls = {"n": 0}
 
     async def get_side_effect(**kwargs):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
+        calls["n"] += 1
+        if calls["n"] == 1:
             return []  # before-check succeeds
         raise asyncio.TimeoutError()
 
+    return get_side_effect
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "get_side_effect_factory",
+    [asyncio.TimeoutError, _timeout_after_first_get],
+    ids=["before", "after"],
+)
+async def test_get_timeout_skips_verification(setup, tmp_path, get_side_effect_factory):
+    """A timed-out before- or after-check skips S3 verification, avoiding spurious AI fallbacks under
+    degraded storage; local file verification still passes since a file was downloaded."""
+    download_dir = tmp_path / "downloads"
+    local_file = str(download_dir / "file.pdf")
     refs = setup(
-        get_side_effect=get_side_effect,
+        get_side_effect=get_side_effect_factory(),
         list_files_side_effect=[[], [local_file]],  # local verification passes
     )
     try:
@@ -814,26 +1027,6 @@ async def test_rename_handles_name_collision(setup, tmp_path):
         await download(prompt="Download invoice", download_suffix="invoice", label="test_block")
 
         rename_mock.assert_called_once_with(new_file, "invoice_1.pdf")
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
-async def test_block_marked_completed_on_success(setup, tmp_path):
-    """On successful download + verification, block should be marked completed."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    refs = setup(
-        get_side_effect=[[], ["file.pdf"]],
-        list_files_side_effect=[[], [local_file]],  # local verification passes
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        await download(prompt="Download invoice", label="test_block")
-
-        refs["update_block"].assert_called_once()
-        refs["fallback"].assert_not_called()
     finally:
         _cleanup(refs)
 
@@ -1090,5 +1283,85 @@ async def test_poll_succeeds_with_late_start_and_long_running_crdownload(setup, 
         refs["fallback"].assert_not_called()
         refs["update_block"].assert_called_once()
         refs["storage"].save_downloaded_files.assert_called_once()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_download_does_not_dispatch_stale_file_appearing_after_baseline(setup, tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    stale = download_dir / "old.pdf"
+    fresh = download_dir / "fresh.pdf"
+    for path, offset in ((stale, -1), (fresh, 0)):
+        path.write_bytes(b"download")
+        os.utime(path, (started_at.timestamp() + offset,) * 2)
+    refs = setup(
+        get_side_effect=[[], ["fresh.pdf"]],
+        list_files_side_effect=[[], [str(stale), str(fresh)]],
+    )
+    try:
+        with (
+            patch(
+                "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+                AsyncMock(return_value=("wr_test_run", 2, started_at)),
+            ),
+            patch.object(script_service.FileDownloadBlock, "_dispatch_files_to_storage", autospec=True) as dispatch,
+        ):
+            await script_service.download(
+                prompt="Download report",
+                label="test_block",
+                download_target="s3",
+                s3_bucket="bucket",
+                aws_access_key_id="access-key",
+                aws_secret_access_key="secret-key",
+                region_name="us-east-1",
+            )
+        assert dispatch.await_args.kwargs["files_to_upload"] == [str(fresh)]
+        refs["fallback"].assert_not_awaited()
+    finally:
+        _cleanup(refs)
+
+
+@pytest.mark.asyncio
+async def test_cached_retry_download_does_not_wait_for_retained_partial(setup):
+    refs = setup(get_side_effect=[[], ["current.pdf"]])
+    download_dir = refs["download_dir"]
+    stale = download_dir / "previous.pdf.crdownload"
+    stale.write_bytes(b"old partial")
+    os.utime(stale, (100, 100))
+    current = download_dir / "current.pdf"
+
+    async def download_current(*_args, **_kwargs):
+        current.write_bytes(b"new download")
+
+    refs["run_cached"].side_effect = download_current
+    try:
+        with (
+            patch(
+                "skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt",
+                new=AsyncMock(return_value=("wr_test_run", 2, datetime.fromtimestamp(200, tz=UTC))),
+            ),
+            patch.object(script_service, "list_files_in_directory", files_module.list_files_in_directory),
+            patch.object(
+                script_service,
+                "check_downloading_files_and_wait_for_download_to_complete",
+                files_module.check_downloading_files_and_wait_for_download_to_complete,
+            ),
+            patch.object(script_service.FileDownloadBlock, "_dispatch_files_to_storage", new=AsyncMock()) as dispatch,
+        ):
+            async with asyncio.timeout(2):
+                await script_service.download(
+                    prompt="Download report",
+                    label="download",
+                    download_target="s3",
+                    s3_bucket="bucket",
+                    aws_access_key_id="test-key",
+                    aws_secret_access_key="test-secret",
+                    region_name="us-east-1",
+                )
+        assert dispatch.await_args.kwargs["files_to_upload"] == [str(current)]
+        assert stale.read_bytes() == b"old partial"
+        refs["fallback"].assert_not_awaited()
     finally:
         _cleanup(refs)

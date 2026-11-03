@@ -18,6 +18,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from skyvern.forge.sdk.copilot import secret_scrub
 from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.trace import record_span_exception, traced_span
 
 _REGISTERED_CREDENTIAL = "fake-span-pa55w0rd-4b7e2d"
@@ -85,6 +86,22 @@ def test_credential_is_redacted_from_the_span_error_status(registered_credential
     assert REDACTED_SECRET_PLACEHOLDER in blob
 
 
+def test_a_short_credential_is_redacted_from_a_span_exception_with_no_context() -> None:
+    # Log lines apply another session's values only from four characters; span exceptions apply them at any length.
+    short_credential = "q7x"
+    secret_scrub._SESSION_SCRUB_VALUES.clear()
+    secret_scrub._SESSION_SCRUB_VALUES["pbs_other"] = [short_credential]
+    try:
+        assert skyvern_context.current() is None
+        events, descriptions = _record_and_export(short_credential)
+    finally:
+        secret_scrub._SESSION_SCRUB_VALUES.clear()
+
+    exported = events + "".join(d or "" for d in descriptions)
+    assert short_credential not in exported
+    assert REDACTED_SECRET_PLACEHOLDER in exported
+
+
 def test_span_exception_stays_useful_for_debugging(registered_credential: str) -> None:
     events, _ = _record_and_export(registered_credential)
     assert "RuntimeError" in events
@@ -132,8 +149,14 @@ def _bare_span_start_sites() -> list[str]:
             if path == helper:
                 continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeDecodeError):
+                source = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if "start_as_current_span" not in source:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
                 continue
             for node in ast.walk(tree):
                 if (
@@ -167,8 +190,14 @@ def _bare_record_exception_sites() -> list[str]:
             if path == helper:
                 continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeDecodeError):
+                source = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if "record_exception" not in source:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
                 continue
             for node in ast.walk(tree):
                 if (

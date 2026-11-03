@@ -27,6 +27,9 @@ class HealSkipReason(StrEnum):
     insecure_code = "insecure_code"
     unclassifiable = "unclassifiable"
     user_defined_error = "user_defined_error"
+    no_goal = "no_goal"
+    proxy_transport = "proxy_transport"
+    authoring_run = "authoring_run"
 
 
 class OutputObligation(StrEnum):
@@ -192,9 +195,12 @@ def summarize_run_heals(episodes: list[HealEpisode]) -> RunHealSummary:
         episodes_by_block.setdefault(episode.block_label, []).append(episode)
 
     blocks_healed = 0
+    blocks_with_heal_attempt = 0
     blocks_outcome_risk: list[str] = []
     for block_label, block_episodes in episodes_by_block.items():
         outcome = resolve_block_outcome(block_episodes)
+        if outcome in {"healed", "unverified", "failed"}:
+            blocks_with_heal_attempt += 1
         if outcome == "healed":
             blocks_healed += 1
             continue
@@ -209,7 +215,7 @@ def summarize_run_heals(episodes: list[HealEpisode]) -> RunHealSummary:
     return RunHealSummary(
         blocks_healed=blocks_healed,
         blocks_outcome_risk=sorted(blocks_outcome_risk),
-        blocks_with_heal_attempt=len(episodes_by_block),
+        blocks_with_heal_attempt=blocks_with_heal_attempt,
     )
 
 

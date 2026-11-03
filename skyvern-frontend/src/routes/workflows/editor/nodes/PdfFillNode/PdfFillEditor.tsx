@@ -96,6 +96,7 @@ function PdfFillEditorBody({
           <HelpTooltip content={helpTooltips["pdf_fill"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
+          name="fileUrl"
           nodeId={blockId}
           value={data.fileUrl}
           onChange={(next) => update({ fileUrl: next })}
@@ -109,6 +110,7 @@ function PdfFillEditorBody({
           <HelpTooltip content={helpTooltips["pdf_fill"]["prompt"]} />
         </div>
         <WorkflowBlockInputTextarea
+          name="prompt"
           nodeId={blockId}
           value={data.prompt}
           onChange={(next) => update({ prompt: next })}
@@ -144,6 +146,7 @@ function PdfFillEditorBody({
           </Popover>
         </div>
         <CodeEditor
+          deferKey={JSON.stringify([blockId, "payload"])}
           className="w-full"
           language="json"
           value={data.payload}
@@ -194,6 +197,7 @@ function PdfFillEditorBody({
                   <HelpTooltip content={helpTooltips["pdf_fill"]["llmKey"]} />
                 </div>
                 <WorkflowBlockInput
+                  name="llmKey"
                   nodeId={blockId}
                   value={data.llmKey}
                   onChange={(next) => update({ llmKey: next })}

@@ -1,6 +1,8 @@
 import { Cross2Icon, ReloadIcon } from "@radix-ui/react-icons";
 
 import { Label } from "@/components/ui/label";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
 import { cn } from "@/util/utils";
@@ -13,11 +15,19 @@ import {
 
 type Props = {
   steps: Array<CodeBlockStep>;
+  hasCode?: boolean;
   generating?: boolean;
   onStop?: () => void;
+  stopBlockedReason?: string | null;
 };
 
-function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
+function CodeBlockPlainCard({
+  steps,
+  hasCode = false,
+  generating = false,
+  onStop,
+  stopBlockedReason = null,
+}: Props) {
   return (
     <div data-testid="code-block-plain-card" className="space-y-2">
       <div className="flex items-center justify-between gap-2">
@@ -29,14 +39,22 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
               Generating…
             </span>
             {onStop && (
-              <button
-                type="button"
-                onClick={onStop}
-                className="nodrag nopan flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-tertiary-foreground hover:bg-slate-elevation2"
-              >
-                <Cross2Icon className="size-3" />
-                Stop
-              </button>
+              <TooltipProvider>
+                <ControlTooltip
+                  content={stopBlockedReason ?? "Stop generating"}
+                  blocked={stopBlockedReason !== null}
+                >
+                  <button
+                    type="button"
+                    onClick={onStop}
+                    disabled={stopBlockedReason !== null}
+                    className="nodrag nopan flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-tertiary-foreground hover:bg-slate-elevation2 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Cross2Icon className="size-3" />
+                    Stop
+                  </button>
+                </ControlTooltip>
+              </TooltipProvider>
             )}
           </div>
         ) : (
@@ -64,7 +82,9 @@ function CodeBlockPlainCard({ steps, generating = false, onStop }: Props) {
         </ol>
       ) : steps.length === 0 ? (
         <p className="rounded-md border border-dashed border-border/70 px-3 py-4 text-xs text-muted-foreground">
-          No steps yet. Steps appear once Skyvern generates them.
+          {hasCode
+            ? "No browser steps found in this code."
+            : "No steps yet. Steps appear once Skyvern generates them."}
         </p>
       ) : (
         <ol className="space-y-1.5">

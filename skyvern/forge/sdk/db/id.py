@@ -45,8 +45,13 @@ CREDENTIAL_FOLDER_PREFIX = "cfld"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
+BROWSER_RECORDING_PREFIX = "br"
+GMAIL_SEND_DISPATCH_PREFIX = "gsd"
 GOOGLE_OAUTH_CREDENTIAL_PREFIX = "goac"
 MICROSOFT_OAUTH_CREDENTIAL_PREFIX = "moac"
+EMAIL_CONFIG_PREFIX = "emc"
+FORWARDING_ADDRESS_PREFIX = "fea"
+INBOUND_EMAIL_PREFIX = "ibe"
 ORGANIZATION_BITWARDEN_COLLECTION_PREFIX = "obc"
 TASK_V2_ID = "tsk_v2"
 THOUGHT_ID = "ot"
@@ -64,6 +69,8 @@ TASK_GENERATION_PREFIX = "tg"
 TASK_PREFIX = "tsk"
 TASK_RUN_PREFIX = "tr"
 TOTP_CODE_PREFIX = "totp"
+SMS_CONFIG_PREFIX = "smsc"
+PHONE_NUMBER_PREFIX = "pn"
 USER_PREFIX = "u"
 WORKFLOW_PARAMETER_PREFIX = "wp"
 WORKFLOW_PERMANENT_ID_PREFIX = "wpid"
@@ -81,16 +88,24 @@ SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 HEAL_EPISODE_PREFIX = "he"
 HEAL_PROPOSAL_PREFIX = "hp"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
+WORKFLOW_RUN_GROUP_PREFIX = "wrg"
 TAG_EVENT_PREFIX = "tge"
 RUN_TAG_EVENT_PREFIX = "rtge"
 TAG_KEY_PREFIX = "tkey"
 TAG_VALUE_PREFIX = "tval"
 UPLOADED_FILE_PREFIX = "file"
+RUN_FEEDBACK_PREFIX = "fb"
+AGENT_FEEDBACK_PREFIX = "afb"
 
 
 def generate_workflow_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_PREFIX}_{int_id}"
+
+
+def generate_browser_recording_id() -> str:
+    int_id = generate_id()
+    return f"{BROWSER_RECORDING_PREFIX}_{int_id}"
 
 
 def generate_workflow_permanent_id() -> str:
@@ -203,6 +218,31 @@ def generate_totp_code_id() -> str:
     return f"{TOTP_CODE_PREFIX}_{int_id}"
 
 
+def generate_email_config_id() -> str:
+    int_id = generate_id()
+    return f"{EMAIL_CONFIG_PREFIX}_{int_id}"
+
+
+def generate_forwarding_address_id() -> str:
+    int_id = generate_id()
+    return f"{FORWARDING_ADDRESS_PREFIX}_{int_id}"
+
+
+def generate_inbound_email_id() -> str:
+    int_id = generate_id()
+    return f"{INBOUND_EMAIL_PREFIX}_{int_id}"
+
+
+def generate_sms_config_id() -> str:
+    int_id = generate_id()
+    return f"{SMS_CONFIG_PREFIX}_{int_id}"
+
+
+def generate_phone_number_id() -> str:
+    int_id = generate_id()
+    return f"{PHONE_NUMBER_PREFIX}_{int_id}"
+
+
 def generate_action_id() -> str:
     int_id = generate_id()
     return f"{ACTION_PREFIX}_{int_id}"
@@ -288,6 +328,21 @@ def generate_uploaded_file_id() -> str:
     return f"{UPLOADED_FILE_PREFIX}_{int_id}"
 
 
+def generate_run_feedback_id() -> str:
+    int_id = generate_id()
+    return f"{RUN_FEEDBACK_PREFIX}_{int_id}"
+
+
+def generate_agent_feedback_id() -> str:
+    int_id = generate_id()
+    return f"{AGENT_FEEDBACK_PREFIX}_{int_id}"
+
+
+def generate_gmail_send_dispatch_id() -> str:
+    int_id = generate_id()
+    return f"{GMAIL_SEND_DISPATCH_PREFIX}_{int_id}"
+
+
 def generate_google_oauth_credential_id() -> str:
     int_id = generate_id()
     return f"{GOOGLE_OAUTH_CREDENTIAL_PREFIX}_{int_id}"
@@ -366,6 +421,11 @@ def generate_heal_proposal_id() -> str:
 def generate_workflow_schedule_id() -> str:
     int_id = generate_id()
     return f"{WORKFLOW_SCHEDULE_PREFIX}_{int_id}"
+
+
+def generate_workflow_run_group_id() -> str:
+    int_id = generate_id()
+    return f"{WORKFLOW_RUN_GROUP_PREFIX}_{int_id}"
 
 
 ############# Helper functions below ##############

@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import InvalidElementForTextInput, NoIncrementalElementFoundForAutoCompletion
+from skyvern.exceptions import (
+    InvalidElementForTextInput,
+    NoIncrementalElementFoundForAutoCompletion,
+    SkyvernPageAnalysisTimeout,
+)
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.webeye.actions.actions import InputOrSelectContext
 from skyvern.webeye.actions.handler import (
@@ -142,6 +146,36 @@ async def test_location_single_option_skips_llm() -> None:
 
         # Result should indicate success
         assert isinstance(result.action_result, ActionSuccess)
+
+
+@pytest.mark.asyncio
+async def test_auto_completion_propagates_page_analysis_timeout() -> None:
+    frame = _mock_frame()
+    frame.locator.return_value.count = AsyncMock(side_effect=SkyvernPageAnalysisTimeout("lookup timed out"))
+    skyvern_el = _mock_skyvern_element(frame)
+    inc_scrape = _mock_incremental_scrape(SINGLE_ELEMENT)
+
+    with (
+        patch(
+            "skyvern.webeye.actions.handler.SkyvernFrame.create_instance",
+            new=AsyncMock(return_value=MagicMock(safe_wait_for_animation_end=AsyncMock())),
+        ),
+        patch("skyvern.webeye.actions.handler.IncrementalScrapePage", return_value=inc_scrape),
+    ):
+        with pytest.raises(SkyvernPageAnalysisTimeout):
+            await choose_auto_completion_dropdown(
+                context=_make_location_context(),
+                page=MagicMock(),
+                scraped_page=MagicMock(),
+                dom=MagicMock(),
+                text="123 Main St",
+                skyvern_element=skyvern_el,
+                step=_STEP,
+                task=_TASK,
+                preserved_elements=[{"id": "preserved"}],
+                is_secret_value=False,
+                is_location_input=True,
+            )
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,8 @@
-"""Skyvern MCP workflow-schedule tools — CRUD + enable/disable via ``client.schedules.*``."""
+"""Skyvern MCP workflow-schedule tools — CRUD, enable/disable and cancel via ``client.schedules.*``."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Any
 
 import structlog
@@ -22,6 +23,11 @@ def _serialize_schedule(s: Any) -> dict[str, Any]:
         "organization_id": s.organization_id,
         "workflow_permanent_id": s.workflow_permanent_id,
         "cron_expression": s.cron_expression,
+        "interval_seconds": s.interval_seconds,
+        "first_fire_at": s.first_fire_at.isoformat() if s.first_fire_at else None,
+        "run_at": s.run_at.isoformat() if s.run_at else None,
+        "dispatch_status": s.dispatch_status,
+        "workflow_run_id": s.workflow_run_id,
         "timezone": s.timezone,
         "enabled": s.enabled,
         "parameters": s.parameters,
@@ -49,6 +55,11 @@ def _serialize_org_schedule_item(item: Any) -> dict[str, Any]:
         "workflow_permanent_id": item.workflow_permanent_id,
         "workflow_title": item.workflow_title,
         "cron_expression": item.cron_expression,
+        "interval_seconds": item.interval_seconds,
+        "first_fire_at": item.first_fire_at.isoformat() if item.first_fire_at else None,
+        "run_at": item.run_at.isoformat() if item.run_at else None,
+        "dispatch_status": item.dispatch_status,
+        "workflow_run_id": item.workflow_run_id,
         "timezone": item.timezone,
         "enabled": item.enabled,
         "parameters": item.parameters,
@@ -180,8 +191,32 @@ async def skyvern_schedule_get(
 
 async def skyvern_schedule_create(
     workflow_permanent_id: Annotated[str, Field(description="Workflow ID (starts with wpid_)")],
-    cron_expression: Annotated[str, Field(description="Cron expression, e.g. '0 9 * * *'")],
+    *,
+    cron_expression: Annotated[
+        str | None,
+        Field(description="Cron expression, e.g. '0 9 * * *'. Set exactly one of this, interval_seconds or run_at."),
+    ] = None,
     timezone: Annotated[str, Field(description="IANA timezone, e.g. 'UTC' or 'America/New_York'")],
+    interval_seconds: Annotated[
+        int | None,
+        Field(
+            description="Run every N seconds (minimum 300), e.g. 259200 for every 72 hours. Set exactly one of this, "
+            "cron_expression or run_at."
+        ),
+    ] = None,
+    first_fire_at: Annotated[
+        datetime | None,
+        Field(
+            description="First run of an interval schedule, ISO 8601 with offset. Defaults to one interval from now."
+        ),
+    ] = None,
+    run_at: Annotated[
+        datetime | None,
+        Field(
+            description="Run once at this instant instead of recurring, ISO 8601 with UTC offset, at least 60 "
+            "seconds ahead."
+        ),
+    ] = None,
     enabled: Annotated[bool, Field(description="Whether the schedule fires immediately. Defaults to True.")] = True,
     parameters: Annotated[
         dict[str, Any] | None,
@@ -190,9 +225,9 @@ async def skyvern_schedule_create(
     name: Annotated[str | None, Field(description="Human-readable schedule name.")] = None,
     description: Annotated[str | None, Field(description="Optional description.")] = None,
 ) -> dict[str, Any]:
-    """Create a recurring schedule for an existing workflow.
+    """Create a schedule for an existing workflow: on a cron, on a fixed interval, or once at run_at.
 
-    Cron expression and timezone are validated server-side; a 400 is surfaced
+    Cadence and timezone are validated server-side and errors are surfaced
     verbatim. Returns 501 if workflow schedules are disabled in this build.
     """
     if err := validate_workflow_id(workflow_permanent_id, "skyvern_schedule_create"):
@@ -204,6 +239,9 @@ async def skyvern_schedule_create(
             resp = await skyvern.schedules.create(
                 workflow_permanent_id,
                 cron_expression=cron_expression,
+                interval_seconds=interval_seconds,
+                first_fire_at=first_fire_at,
+                run_at=run_at,
                 timezone=timezone,
                 enabled=enabled,
                 parameters=parameters,
@@ -264,6 +302,8 @@ def _check_update_mutex(
 
 def _check_update_exact_completeness(
     cron_expression: str | None,
+    interval_seconds: int | None,
+    run_at: datetime | None,
     timezone: str | None,
     enabled: bool | None,
     parameters: dict[str, Any] | None,
@@ -280,8 +320,8 @@ def _check_update_exact_completeness(
     and silently flip a paused schedule active or wipe metadata.
     """
     missing: list[str] = []
-    if cron_expression is None:
-        missing.append("cron_expression")
+    if cron_expression is None and interval_seconds is None and run_at is None:
+        missing.append("cron_expression, interval_seconds or run_at")
     if timezone is None:
         missing.append("timezone")
     if enabled is None:
@@ -305,6 +345,17 @@ async def skyvern_schedule_update(
     workflow_permanent_id: Annotated[str, Field(description="Workflow ID (starts with wpid_)")],
     workflow_schedule_id: Annotated[str, Field(description="Schedule ID (starts with wfs_)")],
     cron_expression: Annotated[str | None, Field(description="New cron expression.")] = None,
+    interval_seconds: Annotated[
+        int | None, Field(description="New fixed interval in seconds (minimum 300); switches a cron schedule.")
+    ] = None,
+    first_fire_at: Annotated[
+        datetime | None,
+        Field(description="New future first run for an interval schedule, ISO 8601 with offset."),
+    ] = None,
+    run_at: Annotated[
+        datetime | None,
+        Field(description="New instant for a one-time schedule that has not fired yet, ISO 8601 with offset."),
+    ] = None,
     timezone: Annotated[str | None, Field(description="New IANA timezone.")] = None,
     enabled: Annotated[bool | None, Field(description="New enabled flag.")] = None,
     parameters: Annotated[dict[str, Any] | None, Field(description="New workflow input parameters.")] = None,
@@ -339,7 +390,20 @@ async def skyvern_schedule_update(
     if err := _check_update_mutex(parameters, clear_parameters, name, clear_name, description, clear_description):
         return err
 
-    any_value_set = any(v is not None for v in (cron_expression, timezone, enabled, parameters, name, description))
+    any_value_set = any(
+        v is not None
+        for v in (
+            cron_expression,
+            interval_seconds,
+            first_fire_at,
+            run_at,
+            timezone,
+            enabled,
+            parameters,
+            name,
+            description,
+        )
+    )
     any_clear_set = any((clear_parameters, clear_name, clear_description))
     if not exact and not any_value_set and not any_clear_set:
         return _input_error(
@@ -360,6 +424,8 @@ async def skyvern_schedule_update(
         if exact:
             if err := _check_update_exact_completeness(
                 cron_expression,
+                interval_seconds,
+                run_at,
                 timezone,
                 enabled,
                 parameters,
@@ -372,6 +438,9 @@ async def skyvern_schedule_update(
                 return err
             # In exact mode, every field is supplied explicitly; clear flags map to None.
             body_cron = cron_expression
+            body_interval = interval_seconds
+            body_first_fire_at = first_fire_at
+            body_run_at = run_at
             body_tz = timezone
             body_enabled = enabled
             body_params = None if clear_parameters else parameters
@@ -408,9 +477,29 @@ async def skyvern_schedule_update(
                 snapshot_modified_at=existing.modified_at.isoformat() if existing.modified_at else None,
             )
 
-            body_cron = cron_expression if cron_expression is not None else existing.cron_expression
+            if cron_expression is None and interval_seconds is None and first_fire_at is None and run_at is None:
+                body_cron = existing.cron_expression
+                body_interval = existing.interval_seconds
+                # Omitted, the route keeps the stored anchor even once it is past.
+                body_first_fire_at = None
+                body_run_at = existing.run_at
+            else:
+                # Never merge a stored cadence into a new one of the other kind; the server rejects mixed cadences.
+                body_cron = cron_expression
+                body_interval = interval_seconds
+                body_first_fire_at = first_fire_at
+                body_run_at = run_at
+                if cron_expression is None and interval_seconds is None and run_at is None:
+                    if existing.interval_seconds is None:
+                        return _input_error(
+                            "skyvern_schedule_update",
+                            "first_fire_at applies only to interval schedules; this schedule runs on cron.",
+                            "Pass interval_seconds with first_fire_at to switch it to an interval schedule.",
+                        )
+                    body_interval = existing.interval_seconds
             body_tz = timezone if timezone is not None else existing.timezone
-            body_enabled = enabled if enabled is not None else existing.enabled
+            # Omitted, the route keeps the stored state, so a concurrent pause/resume is not undone.
+            body_enabled = enabled
             body_params = None if clear_parameters else (parameters if parameters is not None else existing.parameters)
             body_name = None if clear_name else (name if name is not None else existing.name)
             body_description = (
@@ -422,11 +511,14 @@ async def skyvern_schedule_update(
                 workflow_permanent_id,
                 workflow_schedule_id,
                 cron_expression=body_cron,
+                interval_seconds=body_interval,
+                first_fire_at=body_first_fire_at,
+                run_at=body_run_at,
                 timezone=body_tz,
-                enabled=body_enabled,
                 parameters=body_params,
                 name=body_name,
                 description=body_description,
+                **({} if body_enabled is None else {"enabled": body_enabled}),
             )
             timer.mark("sdk_update")
         except ApiError as e:
@@ -523,6 +615,36 @@ async def skyvern_schedule_disable(
     )
 
 
+async def skyvern_schedule_cancel(
+    workflow_permanent_id: Annotated[str, Field(description="Workflow ID (starts with wpid_)")],
+    workflow_schedule_id: Annotated[str, Field(description="Schedule ID (starts with wfs_)")],
+) -> dict[str, Any]:
+    """Cancel a one-time schedule before it fires; it stays readable with dispatch_status canceled.
+    Fails with a conflict once the schedule has fired or was already canceled."""
+    if err := validate_workflow_id(workflow_permanent_id, "skyvern_schedule_cancel"):
+        return err
+    if err := validate_schedule_id(workflow_schedule_id, "skyvern_schedule_cancel"):
+        return err
+
+    skyvern = get_skyvern()
+    with Timer() as timer:
+        try:
+            resp = await skyvern.schedules.cancel(workflow_permanent_id, workflow_schedule_id)
+            timer.mark("sdk")
+        except ApiError as e:
+            if e.status_code == 404:
+                return _not_found_404("skyvern_schedule_cancel", workflow_schedule_id, timer)
+            return _api_error("skyvern_schedule_cancel", e, timer, hint="Read the schedule to see its dispatch_status.")
+        except Exception as e:
+            return _api_error("skyvern_schedule_cancel", e, timer)
+
+    return make_result(
+        "skyvern_schedule_cancel",
+        data=_serialize_schedule_response(resp),
+        timing_ms=timer.timing_ms,
+    )
+
+
 async def skyvern_schedule_delete(
     workflow_permanent_id: Annotated[str, Field(description="Workflow ID (starts with wpid_)")],
     workflow_schedule_id: Annotated[str, Field(description="Schedule ID (starts with wfs_)")],
@@ -566,6 +688,7 @@ async def skyvern_schedule_delete(
 
 
 __all__ = [
+    "skyvern_schedule_cancel",
     "skyvern_schedule_create",
     "skyvern_schedule_delete",
     "skyvern_schedule_disable",

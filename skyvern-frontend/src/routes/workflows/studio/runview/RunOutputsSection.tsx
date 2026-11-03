@@ -3,7 +3,7 @@ import { DownloadIcon, FileIcon } from "@radix-ui/react-icons";
 import { ArtifactDownloadLink } from "@/components/ArtifactDownloadLink";
 import { SummarizeOutput } from "@/components/SummarizeOutput";
 
-import { outputFieldEntries } from "../runProjections";
+import { outputFieldEntries, runErrorRows } from "../runProjections";
 import { OverviewCodeBlock } from "./OverviewCodeBlock";
 import { OverviewField } from "./OverviewField";
 import { RunFieldValue } from "./RunFieldValue";
@@ -27,65 +27,6 @@ type RunOutputsSectionProps = {
   onSummary: (summary: string | null) => void;
 };
 
-function readStringField(
-  record: Record<string, unknown>,
-  keys: Array<string>,
-): string | null {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value !== "string") {
-      continue;
-    }
-    const trimmed = value.trim();
-    if (trimmed !== "") {
-      return trimmed;
-    }
-  }
-  return null;
-}
-
-function getErrorCode(error: RunOutputError): string | null {
-  return readStringField(error, ["error_code", "code"]);
-}
-
-function getErrorMessage(error: RunOutputError): string | null {
-  return readStringField(error, [
-    "reasoning",
-    "message",
-    "detail",
-    "error",
-    "error_message",
-    "description",
-  ]);
-}
-
-type RunErrorRow = { code: string | null; message: string | null };
-
-// One row per distinct (code, message); a code-only entry stays a row so a
-// failure with no prose still shows its code.
-function getErrorRows(errors: RunOutputError[]): RunErrorRow[] {
-  const seen = new Set<string>();
-  const rows: RunErrorRow[] = [];
-  for (const error of errors) {
-    const code = getErrorCode(error);
-    const message = getErrorMessage(error);
-    if (!code && !message) {
-      continue;
-    }
-    const key = `${code ?? ""}\u0000${message ?? ""}`;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    rows.push({ code, message });
-  }
-  return rows;
-}
-
-function hasRenderableErrors(errors: RunOutputError[]): boolean {
-  return getErrorRows(errors).length > 0;
-}
-
 /**
  * The run's errors as a field among the Outputs fields — same label grammar
  * as "Extracted information" and "Run outputs", one row per error, the code
@@ -93,7 +34,7 @@ function hasRenderableErrors(errors: RunOutputError[]): boolean {
  * and its actions; this view is the data.
  */
 function RunErrorsField({ errors }: { errors: RunOutputError[] }) {
-  const rows = getErrorRows(errors);
+  const rows = runErrorRows(errors);
   if (rows.length === 0) {
     return null;
   }
@@ -143,7 +84,7 @@ export function RunOutputsSection({
   const hasExtracted =
     extractedInformation != null &&
     Object.values(extractedInformation).some((value) => value !== null);
-  const hasErrors = hasRenderableErrors(errors);
+  const hasErrors = runErrorRows(errors).length > 0;
   // extracted_information renders in its own section, so the remaining keys are the
   // per-block returned values. Gate the run-outputs block on real per-field content
   // or a persisted summary — an empty header + Summarize would render over nothing.

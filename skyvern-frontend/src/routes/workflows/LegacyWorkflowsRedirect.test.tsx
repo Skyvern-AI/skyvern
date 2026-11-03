@@ -116,25 +116,4 @@ describe("LegacyWorkflowsRedirect", () => {
       ),
     );
   });
-
-  it("composes the 3-hop chain: legacy /debug → /agents/debug → /agents/build when studio is off", async () => {
-    studioState.enabled = false;
-    renderAt("/workflows/wpid_1/debug?wr=wr_1#frame");
-    await waitFor(() =>
-      expect(screen.getByTestId("location").textContent).toBe(
-        "/agents/wpid_1/build?wr=wr_1#frame",
-      ),
-    );
-  });
-
-  it("stays on /agents build (no further hop) when studio is off", async () => {
-    studioState.enabled = false;
-    renderAt("/workflows/wpid_1/build?wr=wr_1");
-    await waitFor(() =>
-      expect(screen.getByTestId("location").textContent).toBe(
-        "/agents/wpid_1/build?wr=wr_1",
-      ),
-    );
-    expect(screen.getByText("debugger")).toBeTruthy();
-  });
 });

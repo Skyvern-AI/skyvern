@@ -4,7 +4,6 @@ from collections.abc import Awaitable, Callable
 import pytest
 
 from skyvern.forge.sdk.experimentation.providers import (
-    FEATURE_FLAG_CACHE_BYPASS_NAMES,
     BaseExperimentationProvider,
     DataHashFreshnessCache,
 )
@@ -78,24 +77,16 @@ async def test_data_hash_freshness_cache_bypass_refetches_each_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_feature_enabled_cached_bypasses_known_kill_switch_flags() -> None:
-    provider = SequenceExperimentationProvider([False, True, False])
+@pytest.mark.parametrize(
+    "method", ["is_feature_enabled_cached", "resolve_feature_flag_cached", "resolve_feature_flag_strict"]
+)
+async def test_cached_boolean_resolutions_reuse_rate_limit_results(method: str) -> None:
+    provider = SequenceExperimentationProvider([False, True])
+    resolve = getattr(provider, method)
 
-    assert await provider.is_feature_enabled_cached("RATE_LIMITING_ENABLED", "org_123") is False
-    assert await provider.is_feature_enabled_cached("RATE_LIMITING_ENABLED", "org_123") is True
-    assert await provider.is_feature_enabled_cached("NOT_A_KILL_SWITCH", "org_123") is False
-    assert await provider.is_feature_enabled_cached("NOT_A_KILL_SWITCH", "org_123") is False
-
-    assert "RATE_LIMITING_ENABLED" in FEATURE_FLAG_CACHE_BYPASS_NAMES
-    assert provider.enabled_calls == 3
-    # Freshness runs before every cached consult (TTL-gated inside the
-    # provider), so hits also record a cached-mode prepare call.
-    assert provider.prepare_calls == [
-        ("RATE_LIMITING_ENABLED", False),
-        ("RATE_LIMITING_ENABLED", False),
-        ("NOT_A_KILL_SWITCH", True),
-        ("NOT_A_KILL_SWITCH", True),
-    ]
+    assert await resolve("RATE_LIMITING_ENABLED", "test-user", {"tier": "standard"}) is False
+    assert await resolve("RATE_LIMITING_ENABLED", "test-user", {"tier": "standard"}) is False
+    assert await resolve("RATE_LIMITING_ENABLED", "test-user", {"tier": "premium"}) is True
 
 
 @pytest.mark.asyncio

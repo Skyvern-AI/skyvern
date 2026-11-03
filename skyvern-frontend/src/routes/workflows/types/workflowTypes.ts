@@ -217,16 +217,20 @@ export type WorkflowBlock =
   | ExtractionBlock
   | LoginBlock
   | WaitBlock
+  | TerminateBlock
+  | AgentStepBlock
   | FileDownloadBlock
   | PDFParserBlock
   | Taskv2Block
   | URLBlock
   | HttpRequestBlock
+  | WebSearchBlock
   | PrintPageBlock
   | WorkflowTriggerBlock
   | EmailInboxBlock
   | GoogleSheetsReadBlock
   | GoogleSheetsWriteBlock
+  | PowerBIQueryBlock
   | PdfFillBlock
   | SplitPdfBlock;
 
@@ -250,16 +254,20 @@ export const WorkflowBlockTypes = {
   Extraction: "extraction",
   Login: "login",
   Wait: "wait",
+  Terminate: "terminate",
+  AgentStep: "agent_step",
   FileDownload: "file_download",
   PDFParser: "pdf_parser",
   Taskv2: "task_v2",
   URL: "goto_url",
   HttpRequest: "http_request",
+  WebSearch: "web_search",
   PrintPage: "print_page",
   WorkflowTrigger: "workflow_trigger",
   EmailInbox: "email_inbox",
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
+  PowerBIQuery: "powerbi_query",
   PDFFill: "pdf_fill",
   SplitPDF: "split_pdf",
 } as const;
@@ -308,7 +316,15 @@ export const WorkflowEditorParameterTypes = {
 export type WorkflowEditorParameterType =
   (typeof WorkflowEditorParameterTypes)[keyof typeof WorkflowEditorParameterTypes];
 
-export type WorkflowBlockBase = {
+// Text shown in the Doc view. `notes` sits above a block and `trailing_notes` after the last block of a sequence;
+// both are read by the agent at run time. `description` is for people only.
+export type WorkflowBlockDocFields = {
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
+};
+
+export type WorkflowBlockBase = WorkflowBlockDocFields & {
   label: string;
   block_type: WorkflowBlockType;
   output_parameter: OutputParameter;
@@ -317,6 +333,9 @@ export type WorkflowBlockBase = {
   model: WorkflowModel | null;
   next_block_label?: string | null;
   ignore_workflow_system_prompt?: boolean;
+  notes?: string | null;
+  trailing_notes?: string | null;
+  description?: string | null;
 };
 
 export const BranchCriteriaTypes = {
@@ -366,6 +385,7 @@ export type TaskBlock = WorkflowBlockBase & {
   disable_cache?: boolean;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type Taskv2Block = WorkflowBlockBase & {
@@ -394,12 +414,17 @@ export type WhileLoopBlock = WorkflowBlockBase & {
 };
 
 export type CodeBlockStep = {
-  title?: string | null;
   description?: string | null;
   action_type: string;
   line_start?: number | null;
   line_end?: number | null;
 };
+
+export type CodeBlockDataSchema =
+  | Record<string, unknown>
+  | Array<unknown>
+  | string
+  | null;
 
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
@@ -408,6 +433,10 @@ export type CodeBlock = WorkflowBlockBase & {
   error_code_mapping: Record<string, string> | null;
   prompt?: string | null;
   steps?: Array<CodeBlockStep> | null;
+  data_schema?: CodeBlockDataSchema;
+  user_owned_goal?: boolean | null;
+  goal_needs_regeneration?: boolean | null;
+  code_edited_by_hand?: boolean | null;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
@@ -453,6 +482,9 @@ export type FileUploadBlock = WorkflowBlockBase & {
   sftp_host_key: string | null;
 };
 
+export type EmailBodyFormat = "text" | "html";
+export type EmailTransport = "smtp" | "gmail";
+
 export type SendEmailBlock = WorkflowBlockBase & {
   block_type: "send_email";
   smtp_host?: AWSSecretParameter;
@@ -467,7 +499,12 @@ export type SendEmailBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
   file_attachments: Array<string>;
+  transport?: EmailTransport | null;
+  credential_id?: string | null;
+  cc?: Array<string>;
+  bcc?: Array<string>;
 };
 
 export type FileURLParserBlock = WorkflowBlockBase & {
@@ -475,6 +512,8 @@ export type FileURLParserBlock = WorkflowBlockBase & {
   file_url: string;
   file_type: "auto_detect" | "csv" | "excel" | "pdf" | "image" | "docx" | "zip";
   json_schema: Record<string, unknown> | null;
+  worksheet: string | null;
+  force_ocr: boolean;
 };
 
 export type ValidationBlock = WorkflowBlockBase & {
@@ -485,6 +524,7 @@ export type ValidationBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type HumanInteractionBlock = WorkflowBlockBase & {
@@ -499,6 +539,7 @@ export type HumanInteractionBlock = WorkflowBlockBase & {
   recipients: Array<string>;
   subject: string;
   body: string;
+  body_format?: EmailBodyFormat;
 };
 
 export type DataExportBlock = WorkflowBlockBase & {
@@ -524,6 +565,7 @@ export type ActionBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type NavigationBlock = WorkflowBlockBase & {
@@ -543,6 +585,7 @@ export type NavigationBlock = WorkflowBlockBase & {
   complete_criterion: string | null;
   terminate_criterion: string | null;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   include_action_history_in_verification: boolean;
 };
 
@@ -557,6 +600,7 @@ export type ExtractionBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   export_enabled?: boolean;
   export_data_schema?: Record<string, unknown> | null;
   export_file_name?: string | null;
@@ -579,11 +623,27 @@ export type LoginBlock = WorkflowBlockBase & {
   terminate_criterion: string | null;
   include_action_history_in_verification: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
 };
 
 export type WaitBlock = WorkflowBlockBase & {
   block_type: "wait";
   wait_sec?: number;
+};
+
+export type TerminateBlock = WorkflowBlockBase & {
+  block_type: "terminate";
+  reason: string;
+  error_code?: string | null;
+};
+
+export type AgentStepBlock = WorkflowBlockBase & {
+  block_type: "agent_step";
+  prompt: string;
+  data_schema: Record<string, unknown>;
+  max_turns: number;
+  tools?: Array<string> | null;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type FileDownloadBlock = WorkflowBlockBase & {
@@ -600,6 +660,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   totp_identifier?: string | null;
   disable_cache?: boolean;
   engine: RunEngine | null;
+  engine_pinned?: boolean;
   download_timeout: number | null; // seconds
   download_target: "website" | "s3" | "azure" | "google_drive" | "sftp";
   path: string;
@@ -622,6 +683,7 @@ export type FileDownloadBlock = WorkflowBlockBase & {
   sftp_private_key_passphrase: string | null;
   sftp_remote_path: string | null;
   sftp_host_key: string | null;
+  sftp_source_path: string | null;
   continue_on_empty: boolean;
 };
 
@@ -634,6 +696,19 @@ export type PDFParserBlock = WorkflowBlockBase & {
 export type URLBlock = WorkflowBlockBase & {
   block_type: "goto_url";
   url: string;
+};
+
+export type WebSearchBlock = WorkflowBlockBase & {
+  block_type: "web_search";
+  query: string;
+  provider: "auto" | "google" | "exa";
+  num_results: number;
+  prompt: string | null;
+  error_code_mapping: Record<string, string> | null;
+  no_results_error_code: string | null;
+  no_match_error_code: string | null;
+  json_schema: Record<string, unknown> | null;
+  parameters: Array<WorkflowParameter>;
 };
 
 export type HttpRequestBlock = WorkflowBlockBase & {
@@ -682,6 +757,7 @@ export type EmailInboxBlock = WorkflowBlockBase & {
   newer_than_days: number | null;
   max_results: number;
   include_body: boolean;
+  download_attachments: boolean;
   parameters: Array<WorkflowParameter>;
 };
 
@@ -708,6 +784,15 @@ export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type PowerBIQueryBlock = WorkflowBlockBase & {
+  block_type: "powerbi_query";
+  connection_id: string;
+  dataset_id: string;
+  query: string;
+  max_rows: number;
+  parameters: Array<WorkflowParameter>;
+};
+
 export type PdfFillBlock = WorkflowBlockBase & {
   block_type: "pdf_fill";
   file_url: string;
@@ -725,7 +810,26 @@ export type SplitPdfBlock = WorkflowBlockBase & {
   parameters: Array<WorkflowParameter>;
 };
 
+export type WorkflowRetryStatus =
+  | "completed"
+  | "failed"
+  | "terminated"
+  | "canceled"
+  | "timed_out";
+export type WorkflowRetryRule = {
+  status: WorkflowRetryStatus;
+  error_codes?: Array<string> | null;
+};
+export type WorkflowRetryWebhookMode = "final_only" | "every_attempt";
+export type WorkflowRetryPolicy = {
+  max_retries: number;
+  delay_seconds: number;
+  webhook_on_retry: WorkflowRetryWebhookMode;
+  retry_on: Array<WorkflowRetryRule>;
+};
+
 export type WorkflowDefinition = {
+  retry_policy?: WorkflowRetryPolicy | null;
   version?: number | null;
   parameters: Array<Parameter>;
   blocks: Array<WorkflowBlock>;
@@ -742,7 +846,7 @@ export type WorkflowApiResponse = {
   title: string;
   workflow_permanent_id: string;
   version: number;
-  description: string;
+  description: string | null;
   workflow_definition: WorkflowDefinition;
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
@@ -763,10 +867,12 @@ export type WorkflowApiResponse = {
   modified_at: string;
   deleted_at: string | null;
   run_with: string; // 'agent' or 'code'
+  browser_type?: string | null; // BrowserType value; null = system default
   cache_key: string | null;
   ai_fallback: boolean | null;
   enable_self_healing: boolean | null;
   adaptive_caching: boolean | null;
+  generate_script_on_terminal?: boolean;
   code_version: number | null;
   mask_secrets: boolean;
   run_sequentially: boolean | null;
@@ -775,10 +881,23 @@ export type WorkflowApiResponse = {
   import_error: string | null;
   created_by?: string | null;
   edited_by?: string | null;
+  original_created_by?: string | null;
+  original_created_at?: string | null;
   copilot_authored?: boolean | null;
+  effective_default_engine?: RunEngine | null;
 };
 
+// Each save inserts a new version row, so created_at is the latest save; the list endpoint adds the first version's.
+export function workflowCreatedAt(workflow: WorkflowApiResponse): string {
+  return workflow.original_created_at ?? workflow.created_at;
+}
+
 export type WorkflowSettings = {
+  totpVerificationUrl: string | null;
+  totpIdentifier: string | null;
+  adaptiveCaching: boolean;
+  generateScriptOnTerminal: boolean;
+  retryPolicy: WorkflowRetryPolicy | null;
   proxyLocation: ProxyLocation | null;
   webhookCallbackUrl: string | null;
   persistBrowserSession: boolean;
@@ -792,10 +911,10 @@ export type WorkflowSettings = {
   extraHttpHeaders: string | null;
   cdpConnectHeaders: string | null;
   runWith: string; // 'agent' or 'code'
+  browserType?: string | null; // BrowserType value; null = system default
   codeVersion: number | null;
   scriptCacheKey: string | null;
   aiFallback: boolean | null;
-  enableSelfHealing: boolean | null;
   maskSecrets: boolean;
   runSequentially: boolean;
   sequentialKey: string | null;

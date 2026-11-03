@@ -6,13 +6,75 @@ DB / LLM / agent mocks; these helpers keep that wiring in one place.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, nullcontext
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
+from skyvern.forge.sdk.schemas.workflow_copilot import COPILOT_PROPOSAL_METADATA_KEY, copilot_proposal_metadata
+
+
+def terminal_narrative_payload() -> dict[str, Any]:
+    return {
+        "turnId": "turn-1",
+        "turnIndex": 0,
+        "mode": "build",
+        "designStarted": True,
+        "designEnded": True,
+        "draft": None,
+        "blocks": [],
+        "terminal": "response",
+        "terminalMessage": "done",
+        "narrativeSummary": "done",
+        "priorBlockCount": None,
+        "designActivity": [],
+        "startedAt": None,
+        "endedAt": None,
+    }
+
+
+def narrative_payload_with_run(run_id: str | None) -> dict[str, Any]:
+    return {
+        **terminal_narrative_payload(),
+        "turnFacts": {
+            "factsAvailable": True,
+            "evaluationState": None,
+            "runId": run_id,
+            "runCompleted": None,
+            "terminalCause": None,
+            "blocksRunThisTurn": None,
+            "ranCleanOnCurrentSource": False,
+        },
+    }
+
+
+def install_candidate_store(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    async def publish(**kwargs: Any) -> SimpleNamespace:
+        metadata = {
+            "owner_turn_id": kwargs["owner_turn_id"],
+            "revision": 1,
+            "canonical_fingerprint": kwargs["canonical_fingerprint"],
+            "canonical_title": kwargs["canonical_title"],
+            "disposition": kwargs["disposition"],
+        }
+        return SimpleNamespace(proposed_workflow={**kwargs["proposal"], COPILOT_PROPOSAL_METADATA_KEY: metadata})
+
+    store = AsyncMock(side_effect=publish)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", SimpleNamespace(publish_workflow_copilot_candidate=store))
+    monkeypatch.setattr(app.DATABASE.workflows, "acquire_workflow_creation_lock", lambda _key: nullcontext())
+    return store
+
+
+@asynccontextmanager
+async def no_finalisation_fence(*_: object) -> AsyncIterator[None]:
+    yield
 
 
 def install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
@@ -56,14 +118,34 @@ def setup_new_copilot_mocks(
         agent_result.narrative_summary = None
     if not hasattr(agent_result, "narrative_payload"):
         agent_result.narrative_payload = None
+    if not hasattr(agent_result, "work_plan"):
+        agent_result.work_plan = None
     if not hasattr(agent_result, "executed_block_fingerprints"):
         agent_result.executed_block_fingerprints = {}
     if not hasattr(agent_result, "cancellation_iteration"):
         agent_result.cancellation_iteration = None
     if not hasattr(agent_result, "cancellation_last_recorded_phase"):
         agent_result.cancellation_last_recorded_phase = None
+    if not hasattr(agent_result, "cancellation_workflow_run_id"):
+        agent_result.cancellation_workflow_run_id = None
+    if not hasattr(agent_result, "cancellation_stopped_facts"):
+        agent_result.cancellation_stopped_facts = None
+    if not hasattr(agent_result, "proposal_owner_turn_id"):
+        agent_result.proposal_owner_turn_id = None
+    if not hasattr(agent_result, "proposal_revision"):
+        agent_result.proposal_revision = None
+    if not hasattr(agent_result, "proposal_workflow_run_id"):
+        agent_result.proposal_workflow_run_id = None
+    if not hasattr(chat, "workflow_permanent_id"):
+        chat.workflow_permanent_id = getattr(original_workflow, "workflow_permanent_id", "wpid-1")
+    if not hasattr(original_workflow, "workflow_permanent_id"):
+        original_workflow.workflow_permanent_id = chat.workflow_permanent_id
+    if not hasattr(chat, "pending_turns"):
+        chat.pending_turns = {}
     if not hasattr(original_workflow, "modified_at"):
         original_workflow.modified_at = datetime(2026, 4, 14, tzinfo=timezone.utc)
+    if not hasattr(original_workflow, "title"):
+        original_workflow.title = "Original"
     if not hasattr(original_workflow, "model_dump"):
         original_workflow.model_dump = MagicMock(return_value={"workflow_id": original_workflow.workflow_id})
 
@@ -82,6 +164,58 @@ def setup_new_copilot_mocks(
         restore_mock,
     )
 
+    async def publish_workflow_copilot_candidate(**kwargs: Any) -> SimpleNamespace:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        expected = (kwargs["expected_owner_turn_id"], kwargs["expected_revision"])
+        if (current is None and expected != (None, None)) or (
+            current is not None and expected != (current.owner_turn_id, current.revision)
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        owner_turn_id = kwargs["owner_turn_id"]
+        metadata = {
+            "owner_turn_id": owner_turn_id,
+            "revision": current.revision + 1 if current is not None and current.owner_turn_id == owner_turn_id else 1,
+            "canonical_fingerprint": kwargs["canonical_fingerprint"],
+            "canonical_title": kwargs["canonical_title"],
+            "disposition": kwargs["disposition"],
+        }
+        proposal = {**kwargs["proposal"], COPILOT_PROPOSAL_METADATA_KEY: metadata}
+        chat.proposed_workflow = proposal
+        return SimpleNamespace(proposed_workflow=proposal)
+
+    async def clear_workflow_copilot_candidate(**kwargs: Any) -> None:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        expected = (kwargs["expected_owner_turn_id"], kwargs["expected_revision"])
+        if (current is None and expected != (None, None)) or (
+            current is not None and expected != (current.owner_turn_id, current.revision)
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        chat.proposed_workflow = None
+
+    async def enrich_workflow_copilot_candidate(**kwargs: Any) -> SimpleNamespace:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        if current is None or (current.owner_turn_id, current.revision) != (
+            kwargs["expected_owner_turn_id"],
+            kwargs["expected_revision"],
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        metadata = current.model_copy(update={"disposition": kwargs["disposition"]})
+        proposal = {**kwargs["proposal"], COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json")}
+        chat.proposed_workflow = proposal
+        return SimpleNamespace(proposed_workflow=proposal)
+
+    async def claim_workflow_copilot_candidate(**kwargs: Any) -> SimpleNamespace:
+        current = copilot_proposal_metadata(chat.proposed_workflow)
+        if current is None or (current.owner_turn_id, current.revision) != (
+            kwargs["expected_owner_turn_id"],
+            kwargs["expected_revision"],
+        ):
+            raise CopilotProposalConflictError("Copilot proposal changed")
+        metadata = current.model_copy(update={"disposition": "accepting", "claimed_at": datetime.now(UTC)})
+        proposal = {**chat.proposed_workflow, COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json")}
+        chat.proposed_workflow = proposal
+        return SimpleNamespace(proposed_workflow=proposal)
+
     monkeypatch.setattr(
         "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
         AsyncMock(return_value=agent_result),
@@ -91,6 +225,10 @@ def setup_new_copilot_mocks(
         get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
         get_workflow_copilot_chat_messages=AsyncMock(return_value=[]),
         update_workflow_copilot_chat=AsyncMock(),
+        publish_workflow_copilot_candidate=AsyncMock(side_effect=publish_workflow_copilot_candidate),
+        enrich_workflow_copilot_candidate=AsyncMock(side_effect=enrich_workflow_copilot_candidate),
+        clear_workflow_copilot_candidate=AsyncMock(side_effect=clear_workflow_copilot_candidate),
+        claim_workflow_copilot_candidate=AsyncMock(side_effect=claim_workflow_copilot_candidate),
         create_workflow_copilot_chat_message=AsyncMock(
             return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
         ),
@@ -102,7 +240,10 @@ def setup_new_copilot_mocks(
         ),
         replace_workflow_copilot_chat_message=AsyncMock(),
         claim_pending_copilot_turn=AsyncMock(return_value=True),
+        claim_pending_copilot_turn_for_finalisation=AsyncMock(return_value="claimed"),
+        hold_copilot_turn_finalisation=no_finalisation_fence,
         clear_pending_copilot_turn=AsyncMock(),
+        get_workflow_copilot_claim_expires_in=AsyncMock(return_value=None),
     )
     app.DATABASE.workflow_params = workflow_params
     app.DATABASE.workflows = SimpleNamespace(
@@ -111,8 +252,9 @@ def setup_new_copilot_mocks(
     app.DATABASE.observer = SimpleNamespace(
         get_workflow_run_blocks=AsyncMock(return_value=[]),
     )
-    app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
-    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(
+        return_value=CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.TASK_V3_PURE)
+    )
 
     return restore_mock, workflow_params

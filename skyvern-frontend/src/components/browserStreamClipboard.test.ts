@@ -79,7 +79,7 @@ describe("browserStreamClipboard", () => {
     expect(rfb.clipboardPasteFrom).toHaveBeenCalledWith("https://example.test");
     expect(getHeldMetaSides).toHaveBeenCalledTimes(2);
     expect(rfb.sendKey).toHaveBeenCalledTimes(6);
-    expect(rfb.sendKey).toHaveBeenNthCalledWith(1, 0xffe9, "MetaLeft", false);
+    expect(rfb.sendKey).toHaveBeenNthCalledWith(1, 0xffeb, "MetaLeft", false);
     expect(rfb.sendKey).toHaveBeenNthCalledWith(2, 0xffe3, "ControlLeft", true);
     expect(rfb.sendKey).toHaveBeenNthCalledWith(3, 0x0076, "KeyV", true);
     expect(rfb.sendKey).toHaveBeenNthCalledWith(4, 0x0076, "KeyV", false);
@@ -89,7 +89,7 @@ describe("browserStreamClipboard", () => {
       "ControlLeft",
       false,
     );
-    expect(rfb.sendKey).toHaveBeenNthCalledWith(6, 0xffe9, "MetaLeft", true);
+    expect(rfb.sendKey).toHaveBeenNthCalledWith(6, 0xffeb, "MetaLeft", true);
     expect(rfb.clipboardPasteFrom.mock.invocationCallOrder[0]).toBeLessThan(
       rfb.sendKey.mock.invocationCallOrder[0]!,
     );
@@ -247,6 +247,25 @@ describe("browserStreamClipboard", () => {
     expect(event.preventDefault).toHaveBeenCalledOnce();
     expect(onPasteError).toHaveBeenCalledWith(error);
     expect(onPasteError).toHaveBeenCalledTimes(1);
+    expect(rfb.clipboardPasteFrom).not.toHaveBeenCalled();
+    expect(rfb.sendKey).not.toHaveBeenCalled();
+  });
+
+  it("reports an empty clipboard instead of pasting nothing", async () => {
+    const event = pasteEvent();
+    const rfb = rfbMock();
+    const onEmptyClipboard = vi.fn();
+    const onPasted = vi.fn();
+
+    await handleVncClipboardPasteShortcut(event, rfb, {
+      onEmptyClipboard,
+      onPasted,
+      readClipboardText: async () => "",
+      syncDelayMs: 0,
+    });
+
+    expect(onEmptyClipboard).toHaveBeenCalledTimes(1);
+    expect(onPasted).not.toHaveBeenCalled();
     expect(rfb.clipboardPasteFrom).not.toHaveBeenCalled();
     expect(rfb.sendKey).not.toHaveBeenCalled();
   });

@@ -1,4 +1,4 @@
-import { useFeatureFlagEnabled } from "posthog-js/react";
+import { usePostHogFeatureFlagEnabled as useFeatureFlagEnabled } from "@/hooks/usePostHogFeatureFlag";
 
 import { WORKFLOWS_DIRECTORY_TREE_FLAG } from "@/util/featureFlags";
 

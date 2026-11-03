@@ -1,16 +1,21 @@
 import hashlib
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import pyotp
 import pytest
+from structlog.testing import capture_logs
 
+import skyvern.forge.sdk.services.credentials as credentials_module
 from skyvern.forge.sdk.services.credentials import (
     generate_totp_code,
     is_unresolved_totp_value,
     normalize_totp_config,
     parse_totp_config,
     parse_totp_secret,
+    wait_for_fresh_totp_window,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def test_empty_string_returns_empty() -> None:
@@ -20,6 +25,16 @@ def test_empty_string_returns_empty() -> None:
 @pytest.mark.parametrize("marker", ["OP_TOTP", "BW_TOTP", "AZ_TOTP"])
 def test_unresolved_totp_value_detects_embedded_provider_marker(marker: str) -> None:
     assert is_unresolved_totp_value(f"code={marker} user=resolved-secret")
+
+
+def test_an_invalid_secret_is_discarded_without_logging_any_of_it() -> None:
+    secret = "WXYZ-not-a-base32-seed-0189"
+    with capture_logs() as logs:
+        assert parse_totp_secret(secret) == ""
+    assert logs, "the discard should still be logged"
+    rendered = repr(logs)
+    for fragment in ("WXYZ", "not-a-base32", "0189"):
+        assert fragment not in rendered
 
 
 def test_valid_base32_secret() -> None:
@@ -189,3 +204,19 @@ def test_invalid_base32_short_returns_empty() -> None:
 def test_regex_extraction_invalid_secret_returns_empty() -> None:
     value = "https://example.com?secret=not_valid!!!"
     assert parse_totp_secret(value) == ""
+
+
+@pytest.mark.asyncio
+async def test_a_late_wake_from_the_window_wait_waits_again_for_a_fresh_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = {"now": 28.5}
+    late_by = [13.5, 0.0]
+
+    async def _sleep(seconds: float) -> None:
+        clock["now"] += seconds + late_by.pop(0)
+
+    monkeypatch.setattr(credentials_module, "asyncio", ScopedAsyncio(sleep=_sleep))
+    monkeypatch.setattr(credentials_module, "time", SimpleNamespace(time=lambda: clock["now"]))
+
+    await wait_for_fresh_totp_window("JBSWY3DPEHPK3PXP", min_remaining_seconds=20)
+
+    assert 30 - (clock["now"] % 30) >= 20

@@ -1,10 +1,14 @@
+import { CreatorDirectoryBoundary } from "@/components/CreatorDirectoryBoundary";
+
 import { RunHistory } from "./RunHistory";
 
 function HistoryPage() {
   return (
-    <div className="space-y-6">
-      <RunHistory />
-    </div>
+    <CreatorDirectoryBoundary>
+      <div className="space-y-6">
+        <RunHistory />
+      </div>
+    </CreatorDirectoryBoundary>
   );
 }
 

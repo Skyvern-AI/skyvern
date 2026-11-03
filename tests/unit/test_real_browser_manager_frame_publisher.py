@@ -327,6 +327,7 @@ async def test_cleanup_for_workflow_run_stops_child_publishers(
         browser_artifacts=SimpleNamespace(traces_dir=None, needs_cdp_frame_publisher=True),
         close=AsyncMock(),
         add_on_close=lambda _cb: None,
+        mark_run_released=lambda: None,
     )
     manager.pages = {
         "wfr_parent": shared_state,

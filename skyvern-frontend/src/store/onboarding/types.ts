@@ -3,6 +3,11 @@ export const QUESTIONNAIRE_USER_INTENTS_V1 = [
   "extract_data",
   "monitor_website",
   "something_else",
+  "invoices",
+  "job_applications",
+  "healthcare",
+  "government",
+  "employee_onboarding",
 ] as const;
 
 export type QuestionnaireUserIntentV1 =
@@ -24,7 +29,10 @@ export type QuestionnaireRoleV1 =
   | "product_manager"
   | "founder_or_executive"
   | "other"
-  | "prefer_not_to_say";
+  | "prefer_not_to_say"
+  | "founder"
+  | "executive"
+  | "sales_or_marketing";
 
 export type QuestionnaireCompanyContextV1 =
   | "personal_or_individual"
@@ -53,13 +61,48 @@ export type QuestionnaireReferralSourceV1 =
   | "event_or_community"
   | "podcast"
   | "other"
-  | "prefer_not_to_say";
+  | "prefer_not_to_say"
+  | "github";
 
+export type QuestionnaireReferralSourceDetailV1 =
+  | "chatgpt"
+  | "claude"
+  | "perplexity"
+  | "gemini"
+  | "other_ai_assistant"
+  | "reddit"
+  | "x"
+  | "linkedin"
+  | "youtube"
+  | "other_social";
+
+export type QuestionnaireAudienceV1 =
+  | "just_me"
+  | "my_team"
+  | "my_company"
+  | "my_customers"
+  | "school"
+  | "research";
+
+export type QuestionnaireWeeklyRunVolumeV1 =
+  | "under_10"
+  | "10_to_100"
+  | "100_to_1000"
+  | "over_1000"
+  | "not_sure";
+
+// The welcome page answers audience and weekly_run_volume in place of company_context and scale_intent.
 export type QuestionnaireAnswersV1 = {
   role: QuestionnaireRoleV1;
-  company_context: QuestionnaireCompanyContextV1;
-  scale_intent: QuestionnaireScaleIntentV1;
+  company_context?: QuestionnaireCompanyContextV1;
+  scale_intent?: QuestionnaireScaleIntentV1;
   referral_source: QuestionnaireReferralSourceV1;
+  referral_source_detail?: QuestionnaireReferralSourceDetailV1 | null;
+  role_other?: string | null;
+  referral_source_other?: string | null;
+  audience?: QuestionnaireAudienceV1 | null;
+  weekly_run_volume?: QuestionnaireWeeklyRunVolumeV1 | null;
+  organization_name?: string | null;
 };
 
 export type QuestionnairePatchV1 =
@@ -68,6 +111,7 @@ export type QuestionnairePatchV1 =
       mutation_id: string;
       expected_revision: number;
       action: "complete" | "update";
+      project_owner?: ProjectOwnerPatchV1;
     } & QuestionnaireAnswersV1)
   | {
       version: 1;
@@ -80,9 +124,36 @@ export type QuestionnairePromptPatchV1 = { version: 1; action: "reserve" };
 
 export type QuestionnairePromptResultV1 =
   | { status: "reserved"; prompted_at: string }
-  | { status: "flag_disabled" | "ineligible" | "already_prompted" };
+  | {
+      status:
+        | "flag_disabled"
+        | "flag_unavailable"
+        | "ineligible"
+        | "already_prompted";
+    };
 
 export type QuestionnaireStatusV1 = "completed" | "skipped" | "deferred";
+
+export type ProjectOwnerFieldsV1 = {
+  name?: string | null;
+  professional_email?: string | null;
+  role?: string | null;
+};
+
+export type ProjectOwnerPatchV1 =
+  | ({ action: "set"; expected_organization_id: string } & ProjectOwnerFieldsV1)
+  | { action: "clear"; expected_organization_id: string };
+
+export type ProjectOwnerReportV1 = ProjectOwnerFieldsV1 & {
+  version: 1;
+  organization_id: string;
+  reported_by_user_id: string;
+  source: "signup_user_reported";
+  verification: "unverified";
+  contact_permission: "not_granted";
+  reported_at: string;
+  updated_at: string;
+};
 
 export type QuestionnaireStateV1 = {
   version: 1;
@@ -94,20 +165,31 @@ export type QuestionnaireStateV1 = {
   company_context: QuestionnaireCompanyContextV1 | null;
   scale_intent: QuestionnaireScaleIntentV1 | null;
   referral_source: QuestionnaireReferralSourceV1 | null;
+  referral_source_detail?: QuestionnaireReferralSourceDetailV1 | null;
+  role_other?: string | null;
+  referral_source_other?: string | null;
+  audience?: QuestionnaireAudienceV1 | null;
+  weekly_run_volume?: QuestionnaireWeeklyRunVolumeV1 | null;
+  organization_name?: string | null;
   completed_at: string | null;
   skipped_at: string | null;
   deferred_at: string | null;
   updated_at: string;
   defer_prompt_count: 0 | 1;
+  project_owner?: ProjectOwnerReportV1 | null;
 };
 
 export type OnboardingState = {
   tour_completed_at: string | null;
+  studio_tour_completed_at: string | null;
   modal_dismissed_at: string | null;
   first_save_at: string | null;
   first_run_at: string | null;
   ab_variant: string | null;
   user_intent: string | null;
+  user_intents?: string[] | null;
+  user_intent_detail?: string | null;
+  email_domain_type?: "company" | "webmail" | null;
   questionnaire_prompted_at?: string | null;
   questionnaire?: QuestionnaireStateV1 | null;
   seen_canvas: boolean | null;
@@ -129,6 +211,7 @@ export type RecoveryGuidanceAssignment = {
 
 export type OnboardingStateResponse = {
   onboarding_state: OnboardingState;
+  project_owner_supported?: boolean;
   launch_date_at_signup: string | null;
   recovery_guidance_assignment: RecoveryGuidanceAssignment | null;
   questionnaire_prompt_result?: QuestionnairePromptResultV1 | null;
@@ -136,6 +219,8 @@ export type OnboardingStateResponse = {
 };
 
 export type ConfirmedWriteCode =
+  | "project_owner_organization_conflict"
+  | "project_owner_invalid"
   | "questionnaire_revision_conflict"
   | "questionnaire_requires_user_intent"
   | "questionnaire_update_requires_response"

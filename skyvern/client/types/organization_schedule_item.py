@@ -5,6 +5,7 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
+from .one_time_dispatch_status import OneTimeDispatchStatus
 
 
 class OrganizationScheduleItem(UniversalBaseModel):
@@ -21,7 +22,12 @@ class OrganizationScheduleItem(UniversalBaseModel):
     organization_id: str
     workflow_permanent_id: str
     workflow_title: str
-    cron_expression: str
+    cron_expression: typing.Optional[str] = None
+    interval_seconds: typing.Optional[int] = None
+    first_fire_at: typing.Optional[dt.datetime] = None
+    run_at: typing.Optional[dt.datetime] = None
+    dispatch_status: typing.Optional[OneTimeDispatchStatus] = None
+    workflow_run_id: typing.Optional[str] = None
     timezone: str
     enabled: bool
     parameters: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None

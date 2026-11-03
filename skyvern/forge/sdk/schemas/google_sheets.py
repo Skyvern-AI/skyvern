@@ -39,6 +39,8 @@ class GetSheetDimensionsResponse(BaseModel):
     row_count: int
     last_column_letter: str
     headers: list[SheetHeader]
+    merges: list[dict[str, int]] | None = None
+    merges_complete: bool = False
 
 
 class CreateGoogleSpreadsheetRequest(BaseModel):

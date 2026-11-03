@@ -127,6 +127,7 @@ function ConditionalBlockFormBody({
               )}
             </div>
             <WorkflowBlockInputTextarea
+              name={`branches:${branch.id}:criteria.expression:sidebar`}
               nodeId={blockId}
               value={branchExpression}
               disabled={!data.editable || isDefaultBranch}

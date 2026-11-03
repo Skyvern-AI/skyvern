@@ -2,20 +2,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI, HTTPException, status
+from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.routes import ui_session
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from tests.unit.shared_route_app import shared_route_app
 
 
 @pytest.fixture
-def client() -> TestClient:
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
-    return TestClient(fastapi_app)
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    return TestClient(shared_route_app(monkeypatch))
 
 
 @pytest.mark.parametrize("prefix", ["/v1", "/api/v1"])
@@ -29,7 +26,12 @@ def test_ui_session_route_mints_from_api_key_only(
     minted_token = "minted-ui-session-canary"
     expires_at = 1_893_456_789
 
-    async def resolve_org(api_key: str, _db: object, token_types: tuple[OrganizationAuthTokenType, ...]) -> object:
+    async def resolve_org(
+        api_key: str,
+        _db: object,
+        token_types: tuple[OrganizationAuthTokenType, ...],
+        **_kwargs: object,
+    ) -> object:
         assert api_key == caller_key
         assert token_types == (OrganizationAuthTokenType.api,)
         return SimpleNamespace(organization=SimpleNamespace(organization_id=organization_id))
@@ -57,7 +59,12 @@ def test_ui_session_route_returns_not_found_when_org_disappears(
     organizations = SimpleNamespace(get_organization=AsyncMock(return_value=None))
     database = SimpleNamespace(organizations=organizations)
 
-    async def resolve_org(api_key: str, _db: object, token_types: tuple[OrganizationAuthTokenType, ...]) -> object:
+    async def resolve_org(
+        api_key: str,
+        _db: object,
+        token_types: tuple[OrganizationAuthTokenType, ...],
+        **_kwargs: object,
+    ) -> object:
         assert api_key == caller_key
         assert token_types == (OrganizationAuthTokenType.api,)
         return SimpleNamespace(organization=SimpleNamespace(organization_id=organization_id))
@@ -82,6 +89,7 @@ def test_ui_session_route_rejects_ui_session_credential(
         api_key: str,
         _db: object,
         token_types: tuple[OrganizationAuthTokenType, ...],
+        **_kwargs: object,
     ) -> object:
         assert api_key == session_credential
         assert token_types == (OrganizationAuthTokenType.api,)

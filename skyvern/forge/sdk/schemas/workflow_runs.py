@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from skyvern.forge.sdk.schemas.task_v2 import Thought
 from skyvern.schemas.runs import RunEngine, ScriptRunResponse
@@ -16,6 +16,7 @@ class WorkflowRunBlock(BaseModel):
     workflow_run_block_id: str
     block_workflow_run_id: str | None = None
     workflow_run_id: str
+    attempt_number: int | None = None
     organization_id: str
     description: str | None = None
     parent_workflow_run_block_id: str | None = None
@@ -87,8 +88,12 @@ class WorkflowRunTimelineType(StrEnum):
 
 class WorkflowRunTimeline(BaseModel):
     type: WorkflowRunTimelineType
+    attempt: int = 1
     block: WorkflowRunBlock | None = None
     thought: Thought | None = None
     children: list[WorkflowRunTimeline] = []
+    # The timeline replaces a task_v2 block with its inner run's rows; the first block row keeps the replaced
+    # blocks here, innermost first, so a reader can still show each step's own status, duration and output.
+    task_v2_blocks: list[WorkflowRunBlock] | None = Field(default=None, json_schema_extra={"x-internal": True})
     created_at: datetime
     modified_at: datetime

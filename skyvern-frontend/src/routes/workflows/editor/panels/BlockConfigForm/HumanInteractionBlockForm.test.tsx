@@ -119,6 +119,7 @@ function setHumanInteractionNode(
     recipients: string;
     subject: string;
     body: string;
+    bodyFormat: "text" | "html";
     negativeDescriptor: string;
     positiveDescriptor: string;
     editable: boolean;
@@ -135,6 +136,7 @@ function setHumanInteractionNode(
       recipients: overrides.recipients ?? "",
       subject: overrides.subject ?? "Human interaction required for agent run",
       body: overrides.body ?? "Your interaction is required for an agent run!",
+      bodyFormat: overrides.bodyFormat ?? "text",
       negativeDescriptor: overrides.negativeDescriptor ?? "Reject",
       positiveDescriptor: overrides.positiveDescriptor ?? "Approve",
       editable: overrides.editable ?? true,
@@ -168,6 +170,7 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
       recipients: "alice@example.com",
       subject: "Hi",
       body: "Body content",
+      bodyFormat: "html",
       negativeDescriptor: "No",
       positiveDescriptor: "Yes",
     });
@@ -219,6 +222,9 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
     expect(
       (screen.getByPlaceholderText("Approve") as HTMLInputElement).value,
     ).toBe("Yes");
+    expect(
+      screen.getByRole("combobox", { name: "Body format" }).textContent,
+    ).toBe("HTML");
   });
 
   test("editing instructions propagates", () => {

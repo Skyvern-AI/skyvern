@@ -1,4 +1,7 @@
 import asyncio
+from collections.abc import Awaitable, Callable, Coroutine, Hashable
+from datetime import datetime, timedelta
+from typing import Any, TypeVar, TypeVarTuple
 
 import structlog
 from fastapi import HTTPException, status
@@ -6,12 +9,15 @@ from fastapi import HTTPException, status
 from skyvern.config import settings
 from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNotFound
 from skyvern.forge import app
-from skyvern.forge.sdk.schemas.tasks import TaskStatus
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.forge.sdk.workflow.service import (
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.response_value_caps import (
     truncate_oversized_response_text,
     truncate_oversized_response_value,
 )
+from skyvern.forge.sdk.workflow.retry_policy import LEASE_TAKEOVER_SECONDS, RetryDecision, get_recorded_decision
 from skyvern.schemas.runs import (
     BulkCancelRunsResponse,
     RunEngine,
@@ -31,16 +37,59 @@ from skyvern.services import (
 
 LOG = structlog.get_logger()
 
+# A cancel of a run live longer than this sends its final webhook at once rather than leaving it to the run's finalizer.
+CANCEL_SENDS_FINAL_WEBHOOK_AFTER_RUNNING = timedelta(hours=4)
+
+T = TypeVar("T")
+Ts = TypeVarTuple("Ts")
+
+_IN_FLIGHT: dict[tuple[Hashable, ...], asyncio.Task[Any]] = {}
+
+
+async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *args: *Ts) -> T:
+    """Overlapping calls of one build with equal arguments await a single run of it, and a finished result is never
+    reused. A caller that joins an in-flight build can get a result older than its own request."""
+    # The key is the whole call, so the build must take everything that changes its result as an argument.
+    key = (build, *args)
+    task = _IN_FLIGHT.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(build(*args))
+        _IN_FLIGHT[key] = task
+
+        def _forget(done: asyncio.Task[T]) -> None:
+            if _IN_FLIGHT.get(key) is done:
+                del _IN_FLIGHT[key]
+            if not done.cancelled():
+                # Marks the exception retrieved so asyncio does not log it when every waiter cancelled.
+                done.exception()
+
+        task.add_done_callback(_forget)
+    # Shielded so one poller disconnecting does not cancel the build the other pollers are waiting on.
+    return await asyncio.shield(task)
+
+
+async def get_run_response_coalesced(run_id: str, organization_id: str, cap_output_values: bool) -> RunResponse | None:
+    return await coalesce_in_flight(get_run_response, run_id, organization_id, cap_output_values)
+
 
 async def get_run_response(
     run_id: str, organization_id: str | None = None, cap_output_values: bool = False
 ) -> RunResponse | None:
-    run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
-    if not run:
-        # try to see if it's a workflow run id for task v2
-        task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(run_id, organization_id=organization_id)
-        if task_v2:
-            run = await app.DATABASE.tasks.get_run(task_v2.observer_cruise_id, organization_id=organization_id)
+    # Task responses are built outside this scope because they read storage between queries, which would hold its
+    # connection; the workflow status build hands the connection back before its own storage reads.
+    async with app.DATABASE.Session.reading():
+        run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
+        if not run:
+            # try to see if it's a workflow run id for task v2
+            task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+                run_id, organization_id=organization_id
+            )
+            if task_v2:
+                run = await app.DATABASE.tasks.get_run(task_v2.observer_cruise_id, organization_id=organization_id)
+        if run and run.task_run_type == RunType.workflow_run:
+            return await workflow_service.get_workflow_run_response(
+                run.run_id, organization_id=organization_id, cap_output_values=cap_output_values
+            )
 
     if not run:
         return None
@@ -98,7 +147,9 @@ async def get_run_response(
             downloaded_files=task_v1_response.downloaded_files,
             run_request=TaskRunRequest(
                 engine=run_engine,
-                prompt=task_v1_response.request.navigation_goal,
+                # An extraction-only task has no navigation goal, so resolve the prompt the same
+                # way the agent resolves its first-turn goal instead of failing validation.
+                prompt=task_v1_response.request.navigation_goal or task_v1_response.request.data_extraction_goal or "",
                 url=task_v1_response.request.url,
                 webhook_url=task_v1_response.request.webhook_callback_url,
                 totp_identifier=task_v1_response.request.totp_identifier,
@@ -117,38 +168,85 @@ async def get_run_response(
         if not task_v2:
             return None
         return await task_v2_service.build_task_v2_run_response(task_v2, cap_output_values=cap_output_values)
-    elif run.task_run_type == RunType.workflow_run:
-        return await workflow_service.get_workflow_run_response(
-            run.run_id, organization_id=organization_id, cap_output_values=cap_output_values
-        )
     raise ValueError(f"Invalid task run type: {run.task_run_type}")
 
 
-async def cancel_task_v1(task_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
+async def cancel_task_v1(
+    task_id: str,
+    organization_id: str | None = None,
+    api_key: str | None = None,
+    on_transition: Callable[[], Awaitable[None]] | None = None,
+    audit_actor: RequestPrincipal | None = None,
+) -> bool:
     task = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
     if not task:
         raise TaskNotFound(task_id=task_id)
-    task = await app.agent.update_task(task, status=TaskStatus.canceled)
+    task, transitioned = await app.agent.update_task_for_cancel(
+        task, audit_actor=audit_actor, on_transition=on_transition
+    )
     # A cancel short-circuits the run's own teardown, so the attachments are deleted here
     # instead. Same ordering as teardown: bytes gone before the webhook announces the run.
     await uploaded_file_service.delete_files_attached_to_run(run_id=task_id)
     await app.agent.execute_task_webhook(task=task, api_key=api_key)
+    return transitioned
 
 
-async def cancel_task_v2(task_id: str, organization_id: str | None = None) -> None:
+async def cancel_task_v2(
+    task_id: str,
+    organization_id: str | None = None,
+    on_transition: Callable[[], Awaitable[None]] | None = None,
+    audit_actor: RequestPrincipal | None = None,
+) -> bool:
     task_v2 = await app.DATABASE.observer.get_task_v2(task_id, organization_id=organization_id)
     if not task_v2:
         raise TaskNotFound(task_id=task_id)
+
+    transitioned = False
+
+    async def _on_transition() -> None:
+        nonlocal transitioned
+        transitioned = True
+        if on_transition is not None:
+            await on_transition()
+
     await task_v2_service.mark_task_v2_as_canceled(
-        task_v2_id=task_id, workflow_run_id=task_v2.workflow_run_id, organization_id=organization_id
+        task_v2_id=task_id,
+        workflow_run_id=task_v2.workflow_run_id,
+        organization_id=organization_id,
+        on_transition=_on_transition,
+        audit_actor=audit_actor,
+        requested_externally=True,
     )
     # A task v2's attachments are bound to the workflow run it executes as, not to task_id.
     if task_v2.workflow_run_id:
         await uploaded_file_service.delete_files_attached_to_run(run_id=task_v2.workflow_run_id)
+    return transitioned
+
+
+async def _live_execution_sends_final_webhook(before_cancel: WorkflowRun, after_cancel: WorkflowRun) -> bool:
+    # A retried cancel reads the row its first request already canceled, while the run it stopped may still be live.
+    retried_cancel_of_started_run = (
+        before_cancel.status == WorkflowRunStatus.canceled and before_cancel.started_at is not None
+    )
+    if (
+        before_cancel.status not in (WorkflowRunStatus.running, WorkflowRunStatus.paused)
+        and not retried_cancel_of_started_run
+    ):
+        return False
+    if after_cancel.status != WorkflowRunStatus.canceled:
+        return False
+    live_since = to_naive_utc(before_cancel.started_at or before_cancel.created_at)
+    if live_since is None or naive_utc_now() - live_since > CANCEL_SENDS_FINAL_WEBHOOK_AFTER_RUNNING:
+        return False
+    return await AsyncExecutorFactory.get_executor().sends_final_webhook_after_cancel(before_cancel)
 
 
 async def cancel_workflow_run(
-    workflow_run_id: str, organization_id: str | None = None, api_key: str | None = None
+    workflow_run_id: str,
+    organization_id: str | None = None,
+    api_key: str | None = None,
+    on_transition: Callable[[], Awaitable[None]] | None = None,
+    audit_actor: RequestPrincipal | None = None,
 ) -> None:
     workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
         workflow_run_id=workflow_run_id,
@@ -156,6 +254,7 @@ async def cancel_workflow_run(
     )
     if not workflow_run:
         raise WorkflowRunNotFound(workflow_run_id=workflow_run_id)
+    before_cancel = workflow_run
 
     # get all the child workflow runs and cancel them
     child_workflow_runs = await app.DATABASE.workflow_runs.get_workflow_runs_by_parent_workflow_run_id(
@@ -170,19 +269,91 @@ async def cancel_workflow_run(
             WorkflowRunStatus.paused,
         ]:
             continue
-        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(child_workflow_run.workflow_run_id)
-    await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
-    await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
-    await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key)
+        await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(
+            child_workflow_run.workflow_run_id, requested_externally=True
+        )
+
+    attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    if workflow_run.status.is_final() and attempt_rows:
+        latest_attempt = max(attempt_rows, key=lambda attempt: attempt.attempt_number)
+        await app.DATABASE.workflow_run_attempts.revoke_or_abandon_attempt(
+            workflow_run_id=workflow_run_id,
+            attempt_number=latest_attempt.attempt_number,
+            decision="revoked",
+            reason="cancel",
+        )
+        workflow_run = (
+            await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            or workflow_run
+        )
+
+    cancel_kwargs: dict[str, Any] = {}
+    if on_transition is not None:
+        cancel_kwargs["on_transition"] = on_transition
+    if audit_actor is not None:
+        cancel_kwargs["audit_actor"] = audit_actor
+    workflow_run = await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(
+        workflow_run_id, requested_externally=True, **cancel_kwargs
+    )
+    attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    if attempt_rows:
+        decision = await get_recorded_decision(workflow_run_id)
+        if decision is None:
+            attempt_number = max(attempt_rows, key=lambda attempt: attempt.attempt_number).attempt_number
+            decision = RetryDecision(False, attempt_number, 0, True, "cancel")
+        attempt = next((row for row in attempt_rows if row.attempt_number == decision.attempt_number), None)
+        side_effects_claim_at = getattr(attempt, "side_effects_released_at", None)
+        if isinstance(side_effects_claim_at, datetime):
+            await app.WORKFLOW_SERVICE._run_terminal_side_effects_with_retries(
+                workflow_run,
+                decision,
+                api_key=api_key,
+                side_effects_claim_at=side_effects_claim_at,
+                side_effects_stale_before=naive_utc_now() - timedelta(seconds=LEASE_TAKEOVER_SECONDS),
+            )
+        else:
+            await app.WORKFLOW_SERVICE._run_terminal_side_effects_with_retries(
+                workflow_run,
+                decision,
+                api_key=api_key,
+            )
+    else:
+        await uploaded_file_service.delete_files_attached_to_run(run_id=workflow_run_id)
+        # The execution's own webhook after teardown carries the run's downloaded files and recording.
+        if await _live_execution_sends_final_webhook(before_cancel, workflow_run):
+            LOG.info(
+                "Leaving the canceled run's final webhook to its execution",
+                workflow_run_id=workflow_run_id,
+                status_before_cancel=before_cancel.status,
+            )
+            return
+        await app.WORKFLOW_SERVICE.execute_workflow_webhook(workflow_run, api_key=api_key, finalizer="api_cancel")
 
 
-async def cancel_run(run_id: str, organization_id: str | None = None, api_key: str | None = None) -> None:
+async def cancel_run(
+    run_id: str,
+    organization_id: str | None = None,
+    api_key: str | None = None,
+    on_transition: Callable[[RunType], Awaitable[None]] | None = None,
+    audit_actor: RequestPrincipal | None = None,
+) -> bool:
     run = await app.DATABASE.tasks.get_run(run_id, organization_id=organization_id)
     if not run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Run not found {run_id}",
         )
+
+    transitioned = False
+
+    async def _on_transition() -> None:
+        nonlocal transitioned
+        transitioned = True
+        if on_transition is not None:
+            await on_transition(run.task_run_type)
 
     if run.task_run_type in [
         RunType.task_v1,
@@ -192,34 +363,80 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
         RunType.yutori_navigator,
         RunType.task_v3,
     ]:
-        await cancel_task_v1(run_id, organization_id=organization_id, api_key=api_key)
+        await cancel_task_v1(
+            run_id,
+            organization_id=organization_id,
+            api_key=api_key,
+            on_transition=_on_transition,
+            audit_actor=audit_actor,
+        )
     elif run.task_run_type == RunType.task_v2:
-        await cancel_task_v2(run_id, organization_id=organization_id)
+        await cancel_task_v2(
+            run_id, organization_id=organization_id, on_transition=_on_transition, audit_actor=audit_actor
+        )
     elif run.task_run_type == RunType.workflow_run:
-        await cancel_workflow_run(run_id, organization_id=organization_id, api_key=api_key)
+        await cancel_workflow_run(
+            run_id,
+            organization_id=organization_id,
+            api_key=api_key,
+            on_transition=_on_transition,
+            audit_actor=audit_actor,
+        )
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid run type to cancel: {run.task_run_type}",
         )
+    return transitioned
 
 
-async def bulk_cancel_runs(
-    run_ids: list[str], organization_id: str | None = None, api_key: str | None = None
-) -> BulkCancelRunsResponse:
-    cancelled: list[str] = []
+async def bulk_cancel_runs_with_types(
+    run_ids: list[str],
+    organization_id: str | None = None,
+    api_key: str | None = None,
+    audit_actor: RequestPrincipal | None = None,
+) -> tuple[BulkCancelRunsResponse, list[tuple[str, RunType]]]:
+    cancelled: list[tuple[str, RunType]] = []
     failed: list[str] = []
 
     async def _cancel_one(run_id: str) -> None:
+        transitioned_type: RunType | None = None
+
+        async def _record_transition(run_type: RunType) -> None:
+            nonlocal transitioned_type
+            transitioned_type = run_type
+
         try:
-            await cancel_run(run_id, organization_id=organization_id, api_key=api_key)
-            cancelled.append(run_id)
+            transitioned = await cancel_run(
+                run_id,
+                organization_id=organization_id,
+                api_key=api_key,
+                on_transition=_record_transition,
+                audit_actor=audit_actor,
+            )
         except Exception:
             LOG.warning("bulk_cancel_runs: failed to cancel run", run_id=run_id, exc_info=True)
+            transitioned = transitioned_type is not None
+
+        if transitioned and transitioned_type is not None:
+            cancelled.append((run_id, transitioned_type))
+        else:
             failed.append(run_id)
 
     await asyncio.gather(*[_cancel_one(run_id) for run_id in dict.fromkeys(run_ids)])
-    return BulkCancelRunsResponse(cancelled=cancelled, failed=failed)
+    return BulkCancelRunsResponse(cancelled=[run_id for run_id, _ in cancelled], failed=failed), cancelled
+
+
+async def bulk_cancel_runs(
+    run_ids: list[str],
+    organization_id: str | None = None,
+    api_key: str | None = None,
+    audit_actor: RequestPrincipal | None = None,
+) -> BulkCancelRunsResponse:
+    response, _ = await bulk_cancel_runs_with_types(
+        run_ids, organization_id=organization_id, api_key=api_key, audit_actor=audit_actor
+    )
+    return response
 
 
 async def retry_run_webhook(

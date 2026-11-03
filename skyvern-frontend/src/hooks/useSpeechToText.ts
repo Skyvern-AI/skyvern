@@ -146,6 +146,8 @@ export interface UseSpeechToTextResult {
   start: () => void;
   /** Resolves with captured audio when available; callers may ignore it. */
   stop: () => Promise<Blob | null>;
+  /** Stops immediately and drops any transcript still in flight. */
+  cancel: () => void;
   toggle: () => void;
   takeAudioBlob: () => Blob | null;
 }
@@ -222,6 +224,7 @@ export function useSpeechToText(
     null,
   );
   const isStartingRef = useRef(false);
+  const startTokenRef = useRef(0);
 
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
@@ -407,6 +410,16 @@ export function useSpeechToText(
     teardownRecognition,
   ]);
 
+  const cancel = useCallback(() => {
+    startTokenRef.current += 1;
+    shouldKeepListeningRef.current = false;
+    isListeningRef.current = false;
+    setIsListening(false);
+    clearHearingSpeech();
+    teardownRecognition();
+    void stopAudioCapture();
+  }, [clearHearingSpeech, stopAudioCapture, teardownRecognition]);
+
   const beginRecognition = useCallback(() => {
     const SpeechRecognitionCtor = getSpeechRecognitionConstructor();
     if (
@@ -555,12 +568,17 @@ export function useSpeechToText(
     }
 
     isStartingRef.current = true;
+    const startToken = ++startTokenRef.current;
 
     void (async () => {
       try {
         await requestMicrophonePermission();
 
-        if (!enabledRef.current || isListeningRef.current) {
+        if (
+          startToken !== startTokenRef.current ||
+          !enabledRef.current ||
+          isListeningRef.current
+        ) {
           return;
         }
 
@@ -609,6 +627,7 @@ export function useSpeechToText(
     isHearingSpeech,
     start,
     stop,
+    cancel,
     toggle,
     takeAudioBlob,
   };

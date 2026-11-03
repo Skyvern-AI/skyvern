@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 import yaml
 from fastmcp import Client
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
+from skyvern.cli.core import client as client_mod
 from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.mcp_tools import mcp
 from skyvern.cli.mcp_tools.response import MCP_MAX_RESPONSE_CHARS, size_capped
+from skyvern.client.core.client_wrapper import AsyncClientWrapper
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
     WorkflowRequest,
@@ -23,7 +27,7 @@ from tests.unit._mcp_test_helpers import patch_skyvern_client as _patch_skyvern_
 
 
 def _fake_workflow_response() -> SimpleNamespace:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return SimpleNamespace(
         workflow_permanent_id="wpid_test",
         workflow_id="wf_test",
@@ -195,14 +199,77 @@ def _known_drift_definition(block_type: str) -> dict[str, object]:
             "type": "array",
             "items": {"type": "object", "properties": {"id": {"type": "integer"}}},
         }
+    elif block_type == "terminate":
+        block["reason"] = "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        block["error_code"] = "ACCOUNT_NOT_FOUND"
+    elif block_type == "powerbi_query":
+        block.update(
+            connection_id="moc_user_123",
+            dataset_id="cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+            query="EVALUATE VALUES('{{ table_name }}')",
+            max_rows=500,
+            parameter_keys=["table_name"],
+        )
     else:
         raise ValueError(f"Unsupported known drift block type: {block_type}")
 
+    parameters = (
+        [
+            {
+                "parameter_type": "workflow",
+                "key": "table_name",
+                "workflow_parameter_type": "string",
+                "default_value": "Sales",
+            }
+        ]
+        if block_type == "powerbi_query"
+        else []
+    )
     return {
         "title": f"{block_type} workflow",
         "workflow_definition": {
-            "parameters": [],
+            "parameters": parameters,
             "blocks": [block],
+        },
+    }
+
+
+def _nested_powerbi_definition() -> dict[str, object]:
+    return {
+        "title": "Nested Power BI workflow",
+        "workflow_definition": {
+            "parameters": [
+                {
+                    "parameter_type": "workflow",
+                    "key": "table_names",
+                    "workflow_parameter_type": "json",
+                    "default_value": ["Sales"],
+                },
+                {
+                    "parameter_type": "workflow",
+                    "key": "table_name",
+                    "workflow_parameter_type": "string",
+                    "default_value": "Sales",
+                },
+            ],
+            "blocks": [
+                {
+                    "block_type": "for_loop",
+                    "label": "iterate",
+                    "loop_over_parameter_key": "table_names",
+                    "loop_blocks": [
+                        {
+                            "block_type": "powerbi_query",
+                            "label": "query_sales",
+                            "connection_id": "moc_user_123",
+                            "dataset_id": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+                            "query": "EVALUATE VALUES('{{ table_name }}')",
+                            "max_rows": 500,
+                            "parameter_keys": ["table_name"],
+                        }
+                    ],
+                }
+            ],
         },
     }
 
@@ -257,7 +324,9 @@ def _heavy_workflow_run_payload(*, include_expanded_outputs: bool = True) -> dic
     }
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export"])
+@pytest.mark.parametrize(
+    "block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export", "terminate", "powerbi_query"]
+)
 @pytest.mark.asyncio
 async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
@@ -277,11 +346,23 @@ async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
     elif block_type == "data_export":
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
+    elif block_type == "terminate":
+        assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
+    elif block_type == "powerbi_query":
+        assert {key: sent_block[key] for key in ("connection_id", "dataset_id", "query", "max_rows")} == {
+            "connection_id": "moc_user_123",
+            "dataset_id": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+            "query": "EVALUATE VALUES('{{ table_name }}')",
+            "max_rows": 500,
+        }
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export"])
+@pytest.mark.parametrize(
+    "block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill", "data_export", "terminate", "powerbi_query"]
+)
 @pytest.mark.asyncio
 async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
@@ -318,8 +399,89 @@ async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
         assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
     elif block_type == "data_export":
         assert sent_block["data_schema"]["items"]["properties"]["id"]["type"] == "integer"
+    elif block_type == "terminate":
+        assert sent_block["reason"] == "ACCOUNT_NOT_FOUND: {{ account_number }}"
+        assert sent_block["error_code"] == "ACCOUNT_NOT_FOUND"
+    elif block_type == "powerbi_query":
+        assert {key: sent_block[key] for key in ("connection_id", "dataset_id", "query", "max_rows")} == {
+            "connection_id": "moc_user_123",
+            "dataset_id": "cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+            "query": "EVALUATE VALUES('{{ table_name }}')",
+            "max_rows": 500,
+        }
     else:
         assert sent_block["file_url"] == "{{ source_pdf }}"
+
+
+@pytest.mark.asyncio
+async def test_raw_http_mcp_workflow_round_trip_preserves_nested_powerbi_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested_definition = _nested_powerbi_definition()
+    workflow_response = {
+        **_fake_workflow_dict(
+            workflow_permanent_id="wpid_nested_powerbi",
+            workflow_id="wf_nested_powerbi",
+            title="Nested Power BI workflow",
+        ),
+        "proxy_location": "RESIDENTIAL",
+        "workflow_definition": nested_definition["workflow_definition"],
+    }
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET" and request.url.path == "/v1/workflows":
+            return httpx.Response(200, json=[workflow_response])
+        if request.method == "GET" and request.url.path == "/api/v1/workflows/wpid_nested_powerbi":
+            return httpx.Response(200, json=workflow_response)
+        if request.method == "POST" and request.url.path in (
+            "/v1/workflows",
+            "/v1/workflows/wpid_nested_powerbi",
+        ):
+            return httpx.Response(200, json=workflow_response)
+        return httpx.Response(404, json={"detail": "unexpected test route"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as base_client:
+        client_wrapper = AsyncClientWrapper(
+            api_key="sk_test",
+            base_url="https://api.example.test",
+            timeout=60,
+            httpx_client=base_client,
+        )
+        _patch_skyvern_client(monkeypatch, SimpleNamespace(_client_wrapper=client_wrapper))
+
+        listed = await workflow_tools.skyvern_workflow_list(page_size=10)
+        fetched = await workflow_tools.skyvern_workflow_get("wpid_nested_powerbi")
+        created = await workflow_tools.skyvern_workflow_create(definition=json.dumps(nested_definition), format="json")
+        updated = await workflow_tools.skyvern_workflow_update(
+            workflow_id="wpid_nested_powerbi",
+            definition=json.dumps(nested_definition),
+            format="json",
+        )
+
+    assert listed["ok"] is True, listed
+    assert fetched["ok"] is True, fetched
+    assert created["ok"] is True, created
+    assert updated["ok"] is True, updated
+    expected_block = nested_definition["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+    fields = ("connection_id", "dataset_id", "query", "max_rows", "parameter_keys")
+    fetched_block = fetched["data"]["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+    assert {key: fetched_block[key] for key in fields} == {key: expected_block[key] for key in fields}
+
+    posts = [request for request in requests if request.method == "POST"]
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/v1/workflows"),
+        ("GET", "/api/v1/workflows/wpid_nested_powerbi"),
+        ("POST", "/v1/workflows"),
+        ("GET", "/api/v1/workflows/wpid_nested_powerbi"),
+        ("POST", "/v1/workflows/wpid_nested_powerbi"),
+    ]
+    assert len(posts) == 2
+    for request in posts:
+        sent_definition = json.loads(request.content)["json_definition"]
+        sent_block = sent_definition["workflow_definition"]["blocks"][0]["loop_blocks"][0]
+        assert {key: sent_block[key] for key in fields} == {key: expected_block[key] for key in fields}
 
 
 @pytest.mark.asyncio
@@ -1119,6 +1281,87 @@ async def test_workflow_status_uses_workflow_run_route_for_wr_ids(monkeypatch: p
     assert data["artifact_summary"]["artifact_id_count"] == 36
     assert data["output_summary"]["nested_screenshot_count"] == 0
     assert data["output_summary"]["has_extracted_information"] is True
+
+
+def _nested_output(depth: int, width: int) -> dict[str, object]:
+    if depth == 0:
+        return {"value": "leaf", "items": [1, 2]}
+    return {f"child_{idx}": _nested_output(depth - 1, width) for idx in range(width)}
+
+
+def _jsonable_visits(value: object) -> int:
+    if isinstance(value, dict):
+        return 1 + sum(_jsonable_visits(item) for item in value.values())
+    if isinstance(value, list):
+        return 1 + sum(_jsonable_visits(item) for item in value)
+    return 1
+
+
+async def _status_summary_jsonable_calls(monkeypatch: pytest.MonkeyPatch, outputs: dict[str, object]) -> int:
+    payload = {"workflow_run_id": "wr_nested", "status": "completed", "outputs": outputs}
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(), _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request))
+    )
+    _patch_skyvern_client(monkeypatch, fake_client)
+    calls = 0
+    real_jsonable = workflow_tools._jsonable
+
+    def counting_jsonable(value: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real_jsonable(value)
+
+    monkeypatch.setattr(workflow_tools, "_jsonable", counting_jsonable)
+    result = await workflow_tools.skyvern_workflow_status(run_id="wr_nested")
+    monkeypatch.setattr(workflow_tools, "_jsonable", real_jsonable)
+    assert result["ok"] is True
+    assert result["data"]["output_summary"]["present"] is True
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_summary_normalizes_each_output_node_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Re-normalizing every subtree during the stats scan made summary work grow with output depth on the event loop.
+    small = {"block": _nested_output(depth=0, width=3)}
+    nested = {"block": _nested_output(depth=6, width=3)}
+
+    small_calls = await _status_summary_jsonable_calls(monkeypatch, small)
+    nested_calls = await _status_summary_jsonable_calls(monkeypatch, nested)
+
+    assert nested_calls - small_calls == _jsonable_visits(nested) - _jsonable_visits(small)
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_summary_stats_respect_scan_depth_and_preview_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deep: dict[str, object] = {"task_screenshot_artifact_ids": ["too_deep"], "task_screenshots": ["too_deep.png"]}
+    for _ in range(12):
+        deep = {"next": deep}
+    outputs = {
+        "block_a": {
+            "task_screenshot_artifact_ids": ["a1", "a2", "a1"],
+            "task_screenshots": ["s1.png", "s2.png"],
+            "extracted_information": {"x": 1},
+        },
+        "block_b": [{"workflow_screenshots": ["w1.png"]}, {"task_screenshot_artifact_ids": ["a3", "a4", "a5"]}],
+        "deep": deep,
+    }
+    payload = {"workflow_run_id": "wr_stats", "status": "completed", "outputs": outputs}
+    request = AsyncMock(return_value=_fake_http_response(payload))
+    fake_client = SimpleNamespace(
+        get_run=AsyncMock(), _client_wrapper=SimpleNamespace(httpx_client=SimpleNamespace(request=request))
+    )
+    _patch_skyvern_client(monkeypatch, fake_client)
+
+    result = await workflow_tools.skyvern_workflow_status(run_id="wr_stats")
+
+    data = result["data"]
+    assert data["output_summary"]["has_extracted_information"] is True
+    assert data["output_summary"]["nested_screenshot_count"] == 3
+    assert data["artifact_summary"]["artifact_id_count"] == 6
+    assert data["artifact_summary"]["artifact_ids_preview"] == ["a1", "a2", "a3", "a4"]
 
 
 @pytest.mark.asyncio
@@ -3700,55 +3943,7 @@ async def test_workflow_update_does_not_duplicate_keys_on_positional_reinjection
 
 
 @pytest.mark.asyncio
-async def test_code_only_update_auto_wires_new_parameter_and_preserves_existing_link(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
-    existing = {
-        "proxy_location": "RESIDENTIAL",
-        "workflow_definition": {
-            "parameters": [
-                {"parameter_type": "workflow", "key": "old", "workflow_parameter_type": "string"},
-            ],
-            "blocks": [
-                {
-                    "block_type": "code",
-                    "label": "use_values",
-                    "parameter_keys": ["old"],
-                    "code": "return old",
-                }
-            ],
-        },
-    }
-    get_workflow_by_id = AsyncMock(return_value=existing)
-    _patch_get_workflow_by_id(monkeypatch, get_workflow_by_id)
-    definition = {
-        "title": "Updated workflow",
-        "proxy_location": "RESIDENTIAL",
-        "workflow_definition": {
-            "parameters": [
-                {"parameter_type": "workflow", "key": "old", "workflow_parameter_type": "string"},
-                {"parameter_type": "workflow", "key": "new", "workflow_parameter_type": "string"},
-            ],
-            "blocks": [{"block_type": "code", "label": "use_values", "code": "return old, new"}],
-        },
-    }
-
-    result = await workflow_tools.skyvern_workflow_update(
-        workflow_id="wpid_test",
-        definition=json.dumps(definition),
-        format="json",
-        code_only=True,
-    )
-
-    assert result["ok"] is True, result
-    sent = request_mock.await_args.kwargs["json"]["json_definition"]
-    assert sent["workflow_definition"]["blocks"][0]["parameter_keys"] == ["old", "new"]
-    get_workflow_by_id.assert_awaited_once_with("wpid_test")
-
-
-@pytest.mark.asyncio
-async def test_code_only_update_auto_wires_nested_loop_blocks_and_respects_empty_opt_out(
+async def test_update_auto_wires_nested_loop_blocks_and_respects_empty_opt_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
@@ -3781,7 +3976,6 @@ async def test_code_only_update_auto_wires_nested_loop_blocks_and_respects_empty
         workflow_id="wpid_test",
         definition=json.dumps(definition),
         format="json",
-        code_only=True,
     )
 
     assert result["ok"] is True, result
@@ -3792,7 +3986,7 @@ async def test_code_only_update_auto_wires_nested_loop_blocks_and_respects_empty
 
 
 @pytest.mark.asyncio
-async def test_code_only_update_never_auto_wires_misdeclared_existing_credential(
+async def test_update_never_auto_wires_misdeclared_existing_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
@@ -3813,7 +4007,7 @@ async def test_code_only_update_never_auto_wires_misdeclared_existing_credential
                 {"parameter_type": "workflow", "key": "secret", "workflow_parameter_type": "string"},
                 {"parameter_type": "workflow", "key": "public", "workflow_parameter_type": "string"},
             ],
-            "blocks": [{"block_type": "code", "label": "use_values", "code": "return public"}],
+            "blocks": [{"block_type": "code", "label": "new_block", "code": "return public"}],
         },
     }
 
@@ -3821,7 +4015,6 @@ async def test_code_only_update_never_auto_wires_misdeclared_existing_credential
         workflow_id="wpid_test",
         definition=json.dumps(definition),
         format="json",
-        code_only=True,
     )
 
     assert result["ok"] is True, result
@@ -4761,3 +4954,139 @@ async def test_registered_large_workflow_get_reports_skills_with_overflow_hint(
     assert f"carries {len(prompt)} persisted skill-instruction characters" in skills["hint"]
     assert "--id wpid_test --version 7 --definition-file wf.json" in skills["hint"]
     assert "data.workflow_definition.workflow_system_prompt" not in skills["hint"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "run",
+    [
+        {
+            "workflow_run_id": "wr_api",
+            "status": "terminated",
+            "created_at": "2026-09-20T08:30:00+00:00",
+            "trigger_type": "api",
+            "copilot_session_id": "wcc_1",
+        },
+        SimpleNamespace(
+            workflow_run_id="wr_api",
+            status="terminated",
+            created_at=datetime(2026, 9, 20, 8, 30, tzinfo=UTC),
+            trigger_type=WorkflowRunTriggerType.api,
+            copilot_session_id="wcc_1",
+        ),
+    ],
+    ids=["api_json", "typed"],
+)
+async def test_workflow_run_list_summary_carries_when_and_how_each_run_started(
+    run: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", AsyncMock(return_value=[run]))
+
+    result = await workflow_tools.skyvern_workflow_run_list("wpid_x", status=["terminated"])
+
+    summary = json.loads(json.dumps(result))["data"]["runs"][0]
+    assert summary["created_at"] == "2026-09-20T08:30:00+00:00"
+    assert summary["trigger_type"] == "api"
+    assert summary["copilot_session_id"] == "wcc_1"
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_list_does_not_report_absent_run_details_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_row = {"workflow_run_id": "wr_done", "status": "completed", "created_at": "2026-10-06T06:40:10+00:00"}
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", AsyncMock(return_value=[list_row]))
+    status_payload = {
+        **list_row,
+        "recording_url": None,
+        "screenshot_urls": None,
+        "downloaded_files": None,
+        "outputs": None,
+    }
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_status", AsyncMock(return_value=status_payload))
+
+    listed = (await workflow_tools.skyvern_workflow_run_list("wpid_x"))["data"]
+    status = (await workflow_tools.skyvern_workflow_status("wr_done"))["data"]
+
+    summary = listed["runs"][0]
+    assert "output_summary" not in summary
+    assert "recording_available" not in summary.get("artifact_summary", {})
+    assert "artifact_id_count" not in summary.get("artifact_summary", {})
+    assert "skyvern_workflow_status" in listed["run_details_hint"]
+    assert status["output_summary"] == {"present": False}
+    assert status["artifact_summary"]["recording_available"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_count", [13, 10])
+async def test_workflow_run_list_pages_through_every_run_in_order(
+    run_count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_ids = [f"wr_{i}" for i in range(run_count)]
+
+    async def list_runs(workflow_id: str, *, page: int, page_size: int, **_: object) -> list[dict[str, str]]:
+        offset = (page - 1) * page_size
+        return [{"workflow_run_id": run_id, "status": "terminated"} for run_id in run_ids[offset : offset + page_size]]
+
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", list_runs)
+
+    seen: list[str] = []
+    for page in range(1, 10):
+        data = (await workflow_tools.skyvern_workflow_run_list("wpid_x", page=page, page_size=5))["data"]
+        assert data["runs"], f"has_more promised page {page}, which was empty"
+        seen.extend(run["run_id"] for run in data["runs"])
+        if not data["has_more"]:
+            break
+
+    assert seen == run_ids
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_sends_max_steps_override_and_ai_fallback_to_the_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_mod.settings, "SKYVERN_BASE_URL", "http://skyvern.test")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "run_id": "wr_123",
+                "run_type": "workflow_run",
+                "status": "queued",
+                "created_at": "2026-01-01T00:00:00Z",
+                "modified_at": "2026-01-01T00:00:00Z",
+            },
+        )
+
+    token = client_mod.set_api_key_override("sk_test")
+    try:
+        skyvern = client_mod.get_skyvern()
+    finally:
+        client_mod.reset_api_key_override(token)
+    skyvern._client_wrapper.httpx_client.httpx_client._transport = httpx.MockTransport(handler)
+    _patch_skyvern_client(monkeypatch, skyvern)
+    try:
+        result = await workflow_tools.skyvern_workflow_run(
+            workflow_id="wpid_123", max_steps_override=7, ai_fallback=False
+        )
+    finally:
+        await skyvern.aclose()
+
+    assert result["ok"] is True, result
+    assert requests[0].headers["x-max-steps-override"] == "7"
+    assert json.loads(requests[0].content)["ai_fallback"] is False
+    assert "max_steps_override=7" in result["data"]["sdk_equivalent"]
+    assert "ai_fallback=False" in result["data"]["sdk_equivalent"]
+
+
+def test_notes_kept_by_server_names_blocks_whose_saved_note_the_submission_omitted() -> None:
+    def definition(*blocks: dict[str, object]) -> dict[str, object]:
+        return {"workflow_definition": {"blocks": list(blocks)}}
+
+    kept = definition({"block_type": "navigation", "label": "open", "notes": "Never click Delete."})
+    submitted = definition({"block_type": "navigation", "label": "open"})
+
+    assert workflow_tools._notes_kept_by_server(submitted, None, kept) == ["open"]

@@ -49,3 +49,21 @@ async def test_run_block_response_includes_resolved_browser_session(
 
     assert response.browser_session_id == resolved_browser_session_id
     assert execute_blocks.await_args.kwargs["browser_session_id"] == resolved_browser_session_id
+
+
+@pytest.mark.asyncio
+async def test_ensure_workflow_run_marks_block_runs_as_block_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+    prepare = AsyncMock(return_value=SimpleNamespace(workflow_run_id="wr_123"))
+    monkeypatch.setattr(agent_protocol.block_service.workflow_service, "prepare_workflow", prepare)
+    monkeypatch.setattr(
+        agent_protocol.block_service.skyvern_context, "ensure_context", lambda: SimpleNamespace(request_id="req_1")
+    )
+
+    await agent_protocol.block_service.ensure_workflow_run(
+        organization=SimpleNamespace(organization_id="org_123"),
+        template=False,
+        workflow_permanent_id="wpid_123",
+        block_run_request=BlockRunRequest(workflow_id="wpid_123", block_labels=["block_1"]),
+    )
+
+    assert prepare.await_args.kwargs["block_scoped"] is True

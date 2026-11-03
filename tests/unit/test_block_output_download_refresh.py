@@ -273,6 +273,51 @@ async def test_refresh_substitutes_screenshot_urls_from_map():
 
 
 @pytest.mark.asyncio
+async def test_refresh_scopes_screenshots_to_the_current_attempt():
+    """A retried run's block outputs carry screenshot ids from every attempt; only the current
+    attempt's artifacts are resolved when no historical scope is active."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    block_output = {
+        "task_screenshot_artifact_ids": ["s_1", "s_2"],
+        "workflow_screenshot_artifact_ids": ["ws_1"],
+        "downloaded_file_artifact_ids": [],
+    }
+    artifacts = {
+        "s_1": _make_artifact("s_1", "s3://bucket/s1.png"),
+        "s_2": _make_artifact("s_2", "s3://bucket/s2.png"),
+        "ws_1": _make_artifact("ws_1", "s3://bucket/ws1.png"),
+    }
+    get_artifacts_by_ids = AsyncMock(side_effect=lambda ids, _org: [artifacts[aid] for aid in ids])
+
+    with (
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.get_artifacts_by_ids", new=get_artifacts_by_ids
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds",
+            new=AsyncMock(return_value=3600),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_share_url",
+            new=AsyncMock(
+                side_effect=lambda artifact, **_: f"https://api.skyvern.com/v1/artifacts/{artifact.artifact_id}/content"
+            ),
+        ),
+    ):
+        result = await WorkflowService()._refresh_output_urls(
+            block_output,
+            organization_id="o_1",
+            workflow_run_id="wr_1",
+            current_attempt_artifacts=[artifacts["s_2"]],
+        )
+
+    assert result["task_screenshots"] == ["https://api.skyvern.com/v1/artifacts/s_2/content"]
+    assert result["workflow_screenshots"] == []
+    get_artifacts_by_ids.assert_awaited_once_with(["s_2"], "o_1")
+
+
+@pytest.mark.asyncio
 async def test_refresh_leaves_legacy_outputs_untouched():
     """Block outputs persisted before this change have no
     ``downloaded_file_artifact_ids`` field. Refresh must not invent rows or
@@ -521,3 +566,57 @@ async def test_refresh_fallback_skips_when_run_lookup_finds_no_match():
 
     # No match → stored URL preserved.
     assert refreshed["downloaded_files"][0]["url"] == "https://skyvern-uploads.s3.amazonaws.com/.../legacy.zip?sig=x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_artifact_ids", [True, False])
+async def test_refresh_decodes_local_snapshot_filenames(via_artifact_ids: bool):
+    # Local storage percent-encodes a retry snapshot's name in its file URI; block outputs and the
+    # legacy filename match must see the original name, not the encoded basename.
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    persisted_block_output = {
+        "task_id": "tsk_1",
+        "task_screenshot_artifact_ids": [],
+        "workflow_screenshot_artifact_ids": [],
+        "downloaded_file_artifact_ids": ["a_local"] if via_artifact_ids else None,
+        "downloaded_files": [
+            {
+                "url": "file:///tmp/downloads/wr_1/report%20%231.pdf",
+                "checksum": "sha-1",
+                "filename": "report #1.pdf",
+                "modified_at": None,
+                "artifact_id": "a_local" if via_artifact_ids else None,
+            }
+        ],
+        "downloaded_file_urls": ["file:///tmp/downloads/wr_1/report%20%231.pdf"],
+    }
+    snapshot = _make_artifact(
+        "a_local", "file:///tmp/artifacts/downloads/local/o_1/wr_1/attempts/2/report%20%231.pdf", checksum="sha-1"
+    )
+    fresh_url = "https://api.skyvern.com/v1/artifacts/a_local/content?sig=fresh"
+
+    with (
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.get_artifacts_by_ids",
+            new=AsyncMock(return_value=[snapshot]),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.list_artifacts_for_run_by_type",
+            new=AsyncMock(return_value=[snapshot]),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds",
+            new=AsyncMock(return_value=3600),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_share_url",
+            new=AsyncMock(return_value=fresh_url),
+        ),
+    ):
+        refreshed = await WorkflowService()._refresh_output_urls(
+            persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
+        )
+
+    assert [(file["filename"], file["url"]) for file in refreshed["downloaded_files"]] == [("report #1.pdf", fresh_url)]
+    assert refreshed["downloaded_file_urls"] == [fresh_url]

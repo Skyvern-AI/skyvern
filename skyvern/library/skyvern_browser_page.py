@@ -1,4 +1,6 @@
 # ruff: noqa: E402
+import asyncio
+from contextvars import Context
 from typing import TYPE_CHECKING, Any
 
 from skyvern.exceptions import require_local_extra_modules
@@ -8,6 +10,7 @@ require_local_extra_modules("skyvern.library.skyvern_browser_page")
 from playwright.async_api import Frame, Page
 
 from skyvern.core.script_generations.skyvern_page import SkyvernPage
+from skyvern.forge.sdk.api.files import local_file_requires_organization
 from skyvern.library.skyvern_browser_page_agent import SkyvernBrowserPageAgent
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 
@@ -41,7 +44,31 @@ class SkyvernBrowserPage(SkyvernPage):
     def __init__(self, browser: "SkyvernBrowser", page: Page):
         super().__init__(page, SdkSkyvernPageAi(browser, page))
         self._browser = browser
+        self._file_organization_id: str | None = None
         self.agent = SkyvernBrowserPageAgent(browser, page)
+
+    async def _get_file_organization_id(self, file_url: str) -> str | None:
+        organization_id = await super()._get_file_organization_id(file_url)
+        if organization_id:
+            return organization_id
+        if not local_file_requires_organization(file_url):
+            return None
+        if self._file_organization_id is not None:
+            return self._file_organization_id
+        client = self._browser.skyvern
+        if not client._api_key and client._embedded_client is None:
+            return None
+        # Embedded middleware must not inherit or mutate the caller's context object.
+        response = await asyncio.create_task(
+            client._client_wrapper.httpx_client.request("api/v1/organizations/me", method="GET"),
+            context=Context(),
+        )
+        response.raise_for_status()
+        organization_id = response.json().get("organization_id")
+        if not isinstance(organization_id, str) or not organization_id:
+            raise PermissionError("Authenticated organization response has no organization ID")
+        self._file_organization_id = organization_id
+        return organization_id
 
     async def frame_switch(
         self,

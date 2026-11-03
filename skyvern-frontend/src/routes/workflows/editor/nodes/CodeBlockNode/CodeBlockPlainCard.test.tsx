@@ -29,7 +29,7 @@ describe("CodeBlockPlainCard", () => {
   it("uses a singular label for a single step", () => {
     render(
       <CodeBlockPlainCard
-        steps={[{ action_type: "extract", title: "Summarize the page" }]}
+        steps={[{ action_type: "extract", description: "Summarize the page" }]}
       />,
     );
 
@@ -79,7 +79,7 @@ describe("CodeBlockPlainCard", () => {
     expect(screen.getByText("Go Forward")).toBeDefined();
   });
 
-  it("falls back to the readable action type for the step text when title and description are absent", () => {
+  it("falls back to the readable action type for the step text when the description is absent", () => {
     const steps: Array<CodeBlockStep> = [
       { action_type: "extract", line_start: 1, line_end: 1 },
     ];
@@ -95,6 +95,15 @@ describe("CodeBlockPlainCard", () => {
     render(<CodeBlockPlainCard steps={[]} />);
 
     expect(screen.getByText(/No steps yet/)).toBeDefined();
+  });
+
+  it("says no browser steps were found when the block has code but no steps", () => {
+    render(<CodeBlockPlainCard steps={[]} hasCode />);
+
+    expect(
+      screen.getByText("No browser steps found in this code."),
+    ).toBeDefined();
+    expect(screen.queryByText(/No steps yet/)).toBeNull();
   });
 
   it("shows a generating indicator and stop control while generating", () => {

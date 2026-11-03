@@ -118,6 +118,15 @@ class LoginRequest(BaseRunBlockRequest):
 
 class DownloadFilesRequest(BaseRunBlockRequest):
     navigation_goal: str = Field(..., description="Instructions for navigating to and downloading the file")
-    download_suffix: str | None = Field(default=None, description="Suffix or complete filename for the downloaded file")
+    download_suffix: str | None = Field(
+        default=None,
+        description=(
+            "Complete filename for the downloaded file. Supports {{ original_filename }}, which keeps the name the "
+            "site gave the file, so {{ original_filename }} alone preserves it and prefix_{{ original_filename }} "
+            "prefixes it. The source extension is used unless the configured filename includes an extension, which "
+            "overrides it. {{ original_filename }} must be a standalone interpolation without filters or other "
+            "transformations."
+        ),
+    )
     download_timeout: float | None = Field(default=None, description="Timeout in seconds for the download operation")
     max_steps_per_run: int | None = Field(default=None, description="Maximum number of steps to execute")

@@ -19,6 +19,7 @@ LOG = structlog.get_logger()
 
 class TurnHaltKind(StrEnum):
     BROWSER_SESSION_LOST = "browser_session_lost"
+    BUILD_TEST_SUPERSEDED = "build_test_superseded"
 
 
 class TurnHaltVerdict(StrEnum):
@@ -65,6 +66,19 @@ def stash_turn_halt_from_blocker_signal(ctx: Any, signal: object, *, source: str
     return halt
 
 
+def stash_build_test_superseded_halt(ctx: Any, *, workflow_run_id: str | None) -> TurnHalt | None:
+    existing = getattr(ctx, "turn_halt", None)
+    if isinstance(existing, TurnHalt):
+        return existing
+    halt = TurnHalt(
+        kind=TurnHaltKind.BUILD_TEST_SUPERSEDED,
+        run_refs={"workflow_run_id": workflow_run_id},
+    )
+    ctx.turn_halt = halt
+    LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
+    return halt
+
+
 def raise_if_turn_halt(ctx: Any, *, verified: bool = False) -> None:
     del verified
     halt = getattr(ctx, "turn_halt", None)
@@ -78,6 +92,7 @@ def turn_halt_to_trace_data(halt: TurnHalt) -> dict[str, Any]:
         "turn_halt_kind": halt.kind.value,
         "turn_halt_verdict": halt.verdict.value,
         "turn_halt_extra": dict(halt.extra),
+        "turn_halt_run_refs": dict(halt.run_refs),
     }
     if halt.blocker_signal is not None:
         data.update(blocker_signal_to_trace_data(halt.blocker_signal))

@@ -195,6 +195,8 @@ export class Schedules {
     }
 
     /**
+     * Create a cron, fixed-interval or one-time schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. A one-time schedule runs once at run_at. Returns the stored schedule and its next upcoming run times.
+     *
      * @param {string} workflowPermanentId
      * @param {Skyvern.WorkflowScheduleUpsertRequest} request
      * @param {Schedules.RequestOptions} requestOptions - Request-specific configuration.
@@ -203,7 +205,6 @@ export class Schedules {
      *
      * @example
      *     await client.schedules.create("workflow_permanent_id", {
-     *         cron_expression: "cron_expression",
      *         timezone: "timezone"
      *     })
      */
@@ -279,6 +280,8 @@ export class Schedules {
     }
 
     /**
+     * Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, parameters, enabled state, and next upcoming run times.
+     *
      * @param {string} workflowPermanentId
      * @param {string} workflowScheduleId
      * @param {Schedules.RequestOptions} requestOptions - Request-specific configuration.
@@ -359,6 +362,8 @@ export class Schedules {
     }
 
     /**
+     * Replace a schedule's cron expression, interval or one-time run_at, timezone, run parameters, and enabled state. A one-time schedule stays one-time and can change only until it fires; afterwards this returns 409. Returns the updated schedule and its next upcoming run times.
+     *
      * @param {string} workflowPermanentId
      * @param {string} workflowScheduleId
      * @param {Skyvern.WorkflowScheduleUpsertRequest} request
@@ -368,7 +373,6 @@ export class Schedules {
      *
      * @example
      *     await client.schedules.update("workflow_permanent_id", "workflow_schedule_id", {
-     *         cron_expression: "cron_expression",
      *         timezone: "timezone"
      *     })
      */
@@ -678,6 +682,88 @@ export class Schedules {
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
                     "Timeout exceeded when calling POST /v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Cancel a one-time schedule that has not fired yet. The schedule stays readable with dispatch_status canceled. Returns 409 once it has fired or was already canceled, and 422 for a recurring schedule.
+     *
+     * @param {string} workflowPermanentId
+     * @param {string} workflowScheduleId
+     * @param {Schedules.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.schedules.cancel("workflow_permanent_id", "workflow_schedule_id")
+     */
+    public cancel(
+        workflowPermanentId: string,
+        workflowScheduleId: string,
+        requestOptions?: Schedules.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.WorkflowScheduleResponse> {
+        return core.HttpResponsePromise.fromPromise(
+            this.__cancel(workflowPermanentId, workflowScheduleId, requestOptions),
+        );
+    }
+
+    private async __cancel(
+        workflowPermanentId: string,
+        workflowScheduleId: string,
+        requestOptions?: Schedules.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.WorkflowScheduleResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/agents/${core.url.encodePathParam(workflowPermanentId)}/schedules/${core.url.encodePathParam(workflowScheduleId)}/cancel`,
+            ),
+            method: "POST",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.WorkflowScheduleResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling POST /v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/cancel.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({

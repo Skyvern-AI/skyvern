@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,10 +24,14 @@ from skyvern.forge.sdk.workflow.models.block import (
     FailedToFormatJinjaStyleParameter,
     WorkflowTriggerBlock,
     jinja_sandbox_env,
+    render_failure_reason,
+    render_failure_record,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
+from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_settings import BrowserSettings
 from skyvern.schemas.workflows import BlockType
 
 
@@ -103,8 +109,14 @@ class TestRenderTemplateValue:
     def test_mid_string_json_marker_raises(self) -> None:
         block = _make_block()
         bad_value = f"prefix-{_JSON_TYPE_MARKER}1234{_JSON_TYPE_MARKER}"
-        with pytest.raises(FailedToFormatJinjaStyleParameter, match="complete value replacement"):
+        with pytest.raises(FailedToFormatJinjaStyleParameter, match="complete value replacement") as excinfo:
             self._render(block, "prefix-{{ x | json }}", bad_value)
+        assert render_failure_record(excinfo.value, lambda value: value) == {
+            "kind": "`| json` combined with other text",
+            "field": None,
+            "expression": None,
+            "line": None,
+        }
 
 
 class TestRenderTemplatesInPayload:
@@ -234,6 +246,27 @@ class TestPayloadTemplateRenderError:
         with pytest.raises(PayloadTemplateRenderError) as excinfo:
             self._render_payload_live(block, {'weird"key': bad})
         assert excinfo.value.path == 'payload["weird\\"key"]'
+
+    @pytest.mark.parametrize("prefix_keys", [["a"], ["k" * 100]])
+    def test_failure_reason_never_carries_a_secret_payload_key(self, prefix_keys: list[str]) -> None:
+        secret = 'Sec"ret\\Key-Value'
+        payload: dict[str, Any] = {secret: "{{ foo. }}"}
+        for key in reversed(prefix_keys):
+            payload = {key: payload}
+        block = _make_block()
+        with pytest.raises(PayloadTemplateRenderError) as excinfo:
+            self._render_payload_live(block, payload)
+        ctx = MagicMock()
+        ctx.secrets = {"secret-id": secret}
+
+        reason = render_failure_reason("Failed to resolve templates:", excinfo.value, block.secret_redactor(ctx))
+
+        assert reason.startswith(
+            f"Failed to resolve templates: Syntax error in `foo.` (field payload, line 1) at payload.{prefix_keys[0]}"
+        )
+        assert len(reason) < 200
+        for leaked in (secret, json.dumps(secret)[1:-1]):
+            assert leaked[:9] not in reason
 
     def test_good_templates_render_normally(self) -> None:
         # Sanity: live Jinja2 env renders a valid template referencing nothing.
@@ -373,17 +406,17 @@ class TestCheckTriggerDepth:
     """Test _check_trigger_depth: boundary conditions at/above/below MAX_TRIGGER_DEPTH."""
 
     @pytest.mark.asyncio
-    async def test_no_parent_returns_zero(self) -> None:
+    async def test_no_parent_returns_the_run_itself(self) -> None:
         block = _make_block()
         mock_run = MagicMock()
         mock_run.parent_workflow_run_id = None
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=mock_run)
-            depth = await block._check_trigger_depth("wr_current")
-        assert depth == 0
+            root = await block._check_trigger_depth("wr_current")
+        assert root == "wr_current"
 
     @pytest.mark.asyncio
-    async def test_single_parent_returns_one(self) -> None:
+    async def test_single_parent_returns_the_parent(self) -> None:
         block = _make_block()
         run_with_parent = MagicMock()
         run_with_parent.parent_workflow_run_id = "wr_parent"
@@ -392,8 +425,8 @@ class TestCheckTriggerDepth:
 
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=[run_with_parent, run_no_parent])
-            depth = await block._check_trigger_depth("wr_current")
-        assert depth == 1
+            root = await block._check_trigger_depth("wr_current")
+        assert root == "wr_parent"
 
     @pytest.mark.asyncio
     async def test_depth_at_max_raises(self) -> None:
@@ -420,16 +453,16 @@ class TestCheckTriggerDepth:
 
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=runs)
-            depth = await block._check_trigger_depth("wr_current")
-        assert depth == block.MAX_TRIGGER_DEPTH - 1
+            root = await block._check_trigger_depth("wr_current")
+        assert root == f"wr_parent_{block.MAX_TRIGGER_DEPTH - 2}"
 
     @pytest.mark.asyncio
-    async def test_run_not_found_returns_zero(self) -> None:
+    async def test_run_not_found_returns_the_run_id(self) -> None:
         block = _make_block()
         with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
             mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=None)
-            depth = await block._check_trigger_depth("wr_nonexistent")
-        assert depth == 0
+            root = await block._check_trigger_depth("wr_nonexistent")
+        assert root == "wr_nonexistent"
 
 
 @pytest.mark.asyncio
@@ -487,7 +520,7 @@ async def test_sync_trigger_preserves_parent_feature_flag_summary(monkeypatch: p
 
     monkeypatch.setattr(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock())
     monkeypatch.setattr(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None)
-    monkeypatch.setattr(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0))
+    monkeypatch.setattr(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent"))
     monkeypatch.setattr(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock())
     monkeypatch.setattr(WorkflowTriggerBlock, "build_block_result", AsyncMock(return_value=MagicMock()))
 
@@ -556,11 +589,12 @@ async def test_sync_trigger_fails_closed_when_child_resolves_sequential_credenti
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
         patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
-        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0)),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent")),
         patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock()),
         patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
     ):
         mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=None)
         mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(return_value=child_run)
         mock_app.WORKFLOW_SERVICE.execute_workflow = AsyncMock()
         mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final = AsyncMock()
@@ -586,6 +620,7 @@ async def _run_sync_trigger_fence(
     *,
     created_session_id: str | None,
     setup_raises: bool = False,
+    target_workflow: SimpleNamespace | None = None,
 ) -> tuple[MagicMock, dict[str, Any]]:
     child_run = MagicMock()
     child_run.workflow_run_id = "wr_child"
@@ -606,16 +641,19 @@ async def _run_sync_trigger_fence(
         patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
         patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
         patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
-        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value=0)),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent")),
         patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock()),
         patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
     ):
         mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=None)
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(proxy_location=None))
         created_session = MagicMock()
         created_session.persistent_browser_session_id = created_session_id
         mock_app.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=created_session)
         mock_app.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
+        if target_workflow is not None:
+            mock_app.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(return_value=target_workflow)
         if setup_raises:
             mock_app.WORKFLOW_SERVICE.setup_workflow_run = AsyncMock(side_effect=RuntimeError("setup boom"))
         else:
@@ -642,12 +680,35 @@ async def test_sync_trigger_closes_fresh_session_when_fence_fires() -> None:
 
     mock_app, captured = await _run_sync_trigger_fence(block, created_session_id="pbs_fresh")
 
+    assert (
+        mock_app.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs["session_kind"]
+        == BrowserSessionKind.workflow_run
+    )
     mock_app.WORKFLOW_SERVICE.execute_workflow.assert_not_awaited()
     mock_app.WORKFLOW_SERVICE.mark_workflow_run_as_failed_if_not_final.assert_awaited_once()
     assert captured["success"] is False
     mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with(
         "org_parent", "pbs_fresh", reason=BrowserSessionCloseReason.aborted
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_trigger_creates_the_child_session_with_the_target_version_timezone() -> None:
+    target_workflow = SimpleNamespace(
+        workflow_id="w_child_v3",
+        browser_type=None,
+        workflow_definition=SimpleNamespace(browser_settings=BrowserSettings(timezone_id="Africa/Kampala")),
+    )
+
+    mock_app, _ = await _run_sync_trigger_fence(
+        _make_block(), created_session_id="pbs_fresh", target_workflow=target_workflow
+    )
+
+    create_kwargs = mock_app.PERSISTENT_SESSIONS_MANAGER.create_session.await_args.kwargs
+    setup_kwargs = mock_app.WORKFLOW_SERVICE.setup_workflow_run.await_args.kwargs
+    assert create_kwargs["browser_settings"].timezone_id == "Africa/Kampala"
+    assert create_kwargs["created_for_workflow_run_id"] is not None
+    assert create_kwargs["created_for_workflow_run_id"] == setup_kwargs["workflow_run_id"]
 
 
 @pytest.mark.asyncio
@@ -673,6 +734,237 @@ async def test_sync_trigger_closes_fresh_session_when_setup_raises() -> None:
     mock_app.PERSISTENT_SESSIONS_MANAGER.close_session.assert_awaited_once_with(
         "org_parent", "pbs_fresh", reason=BrowserSessionCloseReason.aborted
     )
+
+
+def _make_parent_context() -> SkyvernContext:
+    """A parent workflow-run context seeded with the identity and flag fields a real run carries."""
+    return SkyvernContext(
+        organization_id="org_parent",
+        organization_name="Org Parent",
+        task_id="tsk_parent",
+        workflow_id="wf_parent",
+        workflow_permanent_id="wfp_parent",
+        workflow_run_id="wr_parent",
+        root_workflow_run_id="wr_parent",
+        run_id="wr_parent",
+        browser_session_id="pbs_parent",
+        copilot_session_id="chat_parent",
+        feature_flag_entries={"PARENT_FLAG": True},
+        use_flex_llm_routing=True,
+    )
+
+
+def _make_child_identity_context() -> SkyvernContext:
+    """The child identity ``run_workflow`` installs via ``skyvern_context.replace`` (service.py)."""
+    return SkyvernContext(
+        organization_id="org_parent",
+        organization_name="Org Parent",
+        workflow_id="wf_child",
+        workflow_permanent_id="wfp_child",
+        workflow_run_id="wr_child",
+        root_workflow_run_id="wr_parent",
+        run_id="wr_parent",
+    )
+
+
+def _assert_parent_context_intact(parent: SkyvernContext) -> None:
+    """The exact parent object is ambient again and none of its fields were mutated."""
+    assert skyvern_context.current() is parent
+    assert parent.workflow_run_id == "wr_parent"
+    assert parent.workflow_id == "wf_parent"
+    assert parent.workflow_permanent_id == "wfp_parent"
+    assert parent.root_workflow_run_id == "wr_parent"
+    assert parent.run_id == "wr_parent"
+    assert parent.task_id == "tsk_parent"
+    assert parent.browser_session_id == "pbs_parent"
+    assert parent.organization_id == "org_parent"
+    assert parent.copilot_session_id == "chat_parent"
+    assert parent.feature_flag_entries == {"PARENT_FLAG": True}
+    assert parent.use_flex_llm_routing is True
+
+
+async def _run_async_trigger(run_workflow_stub: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Execute a fire-and-forget WorkflowTriggerBlock with ``run_workflow`` stubbed.
+
+    Returns ``(build_result_kwargs, record_output_context)`` — the latter captures the ambient
+    context at the moment the block records its own output parameter, so a test can assert the
+    parent's output is attributed to the parent and not the dispatched child.
+    """
+    block = _make_block(wait_for_completion=False)
+
+    organization = MagicMock()
+    organization.organization_id = "org_parent"
+    organization.organization_name = "Org Parent"
+
+    captured: dict[str, Any] = {}
+    record_ctx: dict[str, Any] = {}
+
+    async def _build_result(**kwargs: Any) -> Any:
+        captured["success"] = kwargs.get("success")
+        captured["failure_reason"] = kwargs.get("failure_reason")
+        return MagicMock()
+
+    async def _capture_record(*_: Any, **__: Any) -> None:
+        record_ctx["ctx"] = skyvern_context.current()
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+        patch("skyvern.services.workflow_service.run_workflow", side_effect=run_workflow_stub),
+        patch.object(WorkflowTriggerBlock, "get_workflow_run_context", lambda self, workflow_run_id: MagicMock()),
+        patch.object(WorkflowTriggerBlock, "format_potential_template_parameters", lambda self, ctx: None),
+        patch.object(WorkflowTriggerBlock, "_check_trigger_depth", AsyncMock(return_value="wr_parent")),
+        patch.object(WorkflowTriggerBlock, "record_output_parameter_value", AsyncMock(side_effect=_capture_record)),
+        patch.object(WorkflowTriggerBlock, "build_block_result", AsyncMock(side_effect=_build_result)),
+    ):
+        mock_app.DATABASE.organizations.get_organization = AsyncMock(return_value=organization)
+        mock_app.DATABASE.workflow_run_groups.get_item_by_workflow_run_id = AsyncMock(return_value=None)
+        await block.execute(
+            workflow_run_id="wr_parent",
+            workflow_run_block_id="wrb_parent",
+            organization_id="org_parent",
+            browser_session_id=None,
+        )
+    return captured, record_ctx
+
+
+@pytest.mark.asyncio
+async def test_async_trigger_restores_parent_context_on_success() -> None:
+    # The fire-and-forget branch calls run_workflow, which replaces the ambient context with the
+    # child's identity (service.py setup_workflow_run). Without a scope the child identity survives
+    # the await and mislabels the parent's remaining execution; the dispatch must be scoped like the
+    # synchronous branch so the exact parent object is ambient again afterward.
+    parent = _make_parent_context()
+    child_identity = _make_child_identity_context()
+    observed: dict[str, Any] = {}
+
+    async def _run_workflow(**_: Any) -> Any:
+        observed["entry"] = skyvern_context.current()
+        skyvern_context.replace(child_identity)
+        observed["after_replace"] = skyvern_context.current()
+        result = MagicMock()
+        result.workflow_run_id = "wr_child"
+        return result
+
+    skyvern_context.set(parent)
+    try:
+        captured, record_ctx = await _run_async_trigger(_run_workflow)
+
+        # Dispatch runs under its own child scope — never the parent object.
+        assert observed["entry"] is not None
+        assert observed["entry"] is not parent
+        assert observed["after_replace"] is child_identity
+        # Dispatch succeeded and the parent's output was recorded under the restored parent.
+        assert captured["success"] is True
+        assert record_ctx["ctx"] is parent
+        _assert_parent_context_intact(parent)
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_async_trigger_restores_parent_context_on_dispatch_exception() -> None:
+    # A dispatch failure after run_workflow has already mutated the context must still restore the
+    # parent before the failure is recorded, so the parent's failure output is attributed correctly.
+    parent = _make_parent_context()
+    child_identity = _make_child_identity_context()
+
+    async def _run_workflow(**_: Any) -> Any:
+        skyvern_context.replace(child_identity)
+        raise RuntimeError("dispatch boom")
+
+    skyvern_context.set(parent)
+    try:
+        captured, record_ctx = await _run_async_trigger(_run_workflow)
+
+        assert captured["success"] is False
+        assert captured["failure_reason"] is not None
+        assert "Failed to dispatch triggered workflow" in captured["failure_reason"]
+        assert record_ctx["ctx"] is parent
+        _assert_parent_context_intact(parent)
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_async_trigger_restores_parent_context_on_cancellation() -> None:
+    # Cancellation raised mid-dispatch must propagate unchanged (never swallowed by the except
+    # Exception clause or a finally) while the parent context is still restored.
+    parent = _make_parent_context()
+    child_identity = _make_child_identity_context()
+
+    async def _run_workflow(**_: Any) -> Any:
+        skyvern_context.replace(child_identity)
+        raise asyncio.CancelledError()
+
+    skyvern_context.set(parent)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await _run_async_trigger(_run_workflow)
+        _assert_parent_context_intact(parent)
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_nested_async_triggers_isolate_each_level() -> None:
+    # Root dispatches a child which, in-process, dispatches a grandchild. Each dispatch must see its
+    # own scope, and LIFO restoration must return to the child level after the grandchild unwinds and
+    # to the root object after the child unwinds.
+    root = _make_parent_context()
+    child_identity = _make_child_identity_context()
+    grandchild_identity = SkyvernContext(
+        organization_id="org_parent",
+        organization_name="Org Parent",
+        workflow_id="wf_grandchild",
+        workflow_permanent_id="wfp_grandchild",
+        workflow_run_id="wr_grandchild",
+        root_workflow_run_id="wr_parent",
+        run_id="wr_parent",
+    )
+
+    inner_block = _make_block(wait_for_completion=False)
+    observed: dict[str, Any] = {}
+    calls = {"n": 0}
+
+    async def _nested_run_workflow(**_: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            observed["root_entry"] = skyvern_context.current()
+            skyvern_context.replace(child_identity)
+            observed["root_after_replace"] = skyvern_context.current()
+            await inner_block.execute(
+                workflow_run_id="wr_child",
+                workflow_run_block_id="wrb_child",
+                organization_id="org_parent",
+                browser_session_id=None,
+            )
+            observed["root_after_inner"] = skyvern_context.current()
+            result = MagicMock()
+            result.workflow_run_id = "wr_child"
+            return result
+        observed["child_entry"] = skyvern_context.current()
+        skyvern_context.replace(grandchild_identity)
+        result = MagicMock()
+        result.workflow_run_id = "wr_grandchild"
+        return result
+
+    skyvern_context.set(root)
+    try:
+        captured, _ = await _run_async_trigger(_nested_run_workflow)
+
+        assert calls["n"] == 2
+        assert captured["success"] is True
+        # Every dispatch level runs under a scope distinct from the others.
+        assert observed["root_entry"] is not root
+        assert observed["root_after_replace"] is child_identity
+        assert observed["child_entry"] is not root
+        assert observed["child_entry"] is not child_identity
+        # LIFO restoration: back to the child level after the grandchild unwinds.
+        assert observed["root_after_inner"] is child_identity
+        # And back to the exact root object after the child dispatch unwinds.
+        _assert_parent_context_intact(root)
+    finally:
+        skyvern_context.reset()
 
 
 class TestBlockMetadata:

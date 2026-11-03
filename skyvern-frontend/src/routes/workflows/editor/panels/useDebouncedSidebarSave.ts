@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef } from "react";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 
 // Records `lastUpdatedAt` for the sidebar footer 300ms after a block's form
-// value changes. Backend persistence happens via Cmd+S (`useSaveWorkflow`);
+// value changes. Backend persistence happens on an explicit save (`useSaveWorkflow`);
 // this hook is footer bookkeeping only. `commit()` flushes the pending
 // debounce so block switches never leave a block with un-stamped edits.
 

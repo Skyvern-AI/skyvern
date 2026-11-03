@@ -14,7 +14,7 @@ import functools
 from typing import Callable, ParamSpec, TypeVar
 
 import structlog
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, StatementError
 
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 
@@ -83,7 +83,11 @@ def db_operation(
         @functools.wraps(fn)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:  # type: ignore[return]
             try:
-                return await fn(*args, **kwargs)  # type: ignore[misc]
+                try:
+                    return await fn(*args, **kwargs)  # type: ignore[misc]
+                except StatementError as exc:
+                    exc.hide_parameters = True
+                    raise
             except _PASSTHROUGH_EXCEPTIONS:
                 if log_errors:
                     LOG.warning("BusinessLogicError", operation=operation_name, exc_info=True)

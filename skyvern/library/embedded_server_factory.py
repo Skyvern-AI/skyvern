@@ -9,7 +9,7 @@ import httpx
 from httpx import ASGITransport
 
 from skyvern.config import settings
-from skyvern.forge.api_app import create_api_app
+from skyvern.forge.api_app import create_api_app, ensure_sqlite_schema
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
@@ -168,6 +168,13 @@ def create_embedded_server(
 
             if use_in_memory_db:
                 self._api_key = await self._bootstrap_in_memory_db()
+            else:
+                # ASGITransport never runs the FastAPI lifespan, so a persistent local SQLite
+                # database gets the server's schema bootstrap here instead.
+                from skyvern.forge import app as forge_app  # noqa: PLC0415
+
+                if forge_app.DATABASE.engine.dialect.name == "sqlite":
+                    await ensure_sqlite_schema(forge_app.DATABASE)
 
             self._transport = ASGITransport(app=api_app)
 
@@ -179,7 +186,6 @@ def create_embedded_server(
             from skyvern.forge.sdk.core.security import create_access_token  # noqa: PLC0415
             from skyvern.forge.sdk.db.agent_db import AgentDB  # noqa: PLC0415
             from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType  # noqa: PLC0415
-            from skyvern.forge.sdk.db.models import Base  # noqa: PLC0415
 
             # Only replace the engine if cloud/__init__.py swapped it to Postgres.
             # When _apply_sqlite_overrides() runs before create_api_app(), the engine
@@ -201,8 +207,7 @@ def create_embedded_server(
             forge_app.STORAGE = StorageFactory.get_storage()
 
             db = forge_app.DATABASE
-            async with db.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+            await ensure_sqlite_schema(db)
 
             org = await db.organizations.create_organization(organization_name="local")
             token = create_access_token(org.organization_id, expires_delta=timedelta(days=365 * 10))

@@ -1,3 +1,7 @@
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
 import { useCallback, useEffect, useState } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
@@ -140,6 +144,7 @@ function WorkflowTriggerEditorBody({
     [update, useParentBrowserSession],
   );
 
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
   const handleTitleChange = useCallback(
     (title: string) => {
       update({ workflowTitle: title });
@@ -148,9 +153,9 @@ function WorkflowTriggerEditorBody({
   );
 
   useEffect(() => {
-    if (fetchedTitle && fetchedTitle !== workflowTitle) {
+    if (!mutationLocked && fetchedTitle && fetchedTitle !== workflowTitle) {
       beginInternalUpdate();
-      update({ workflowTitle: fetchedTitle });
+      update({ workflowTitle: fetchedTitle }, { source: "workflow" });
       let ended = false;
       const timer = setTimeout(() => {
         ended = true;
@@ -165,6 +170,7 @@ function WorkflowTriggerEditorBody({
     }
   }, [
     fetchedTitle,
+    mutationLocked,
     workflowTitle,
     update,
     beginInternalUpdate,
@@ -242,6 +248,7 @@ function WorkflowTriggerEditorBody({
         </div>
         {useDynamicBrowserSession ? (
           <WorkflowBlockInputTextarea
+            name="browserSessionId"
             nodeId={blockId}
             onChange={(next) => {
               update({

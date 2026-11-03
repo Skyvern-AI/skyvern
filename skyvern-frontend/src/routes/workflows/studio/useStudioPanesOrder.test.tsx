@@ -8,23 +8,24 @@ import {
   useLocation,
   useNavigate,
 } from "react-router-dom";
-import { beforeEach, describe, expect, test } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 
-import { useStudioShellStore } from "@/store/StudioShellStore";
-
+import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { type StudioPaneId } from "./panes";
+import { StudioShellContext } from "./StudioShellContext";
 import { useStudioPanes } from "./useStudioPanes";
 
 beforeEach(() => {
   localStorage.clear();
-  useStudioShellStore.getState().reset();
 });
 
 function OrderProbe({ order }: { order: StudioPaneId[] }) {
   const { panes, setPanesOrder, setOpenPanes } = useStudioPanes();
+  const location = useLocation();
   return (
     <div>
       <output data-testid="panes">{panes.join(",")}</output>
+      <output data-testid="search">{location.search}</output>
       <button onClick={() => setPanesOrder(order)}>set-order</button>
       <button onClick={() => setOpenPanes(order)}>set-open</button>
     </div>
@@ -34,13 +35,16 @@ function OrderProbe({ order }: { order: StudioPaneId[] }) {
 function renderWithPanes(search: string, order: StudioPaneId[]) {
   return render(
     <MemoryRouter initialEntries={[`/studio${search}`]}>
-      <OrderProbe order={order} />
+      <StudioPaneDefaultsProvider hasBlocks={true}>
+        <OrderProbe order={order} />
+      </StudioPaneDefaultsProvider>
     </MemoryRouter>,
   );
 }
 
-function CopilotMemoryProbe() {
-  const { panes, togglePane, openPane } = useStudioPanes();
+function CopilotVisitProbe() {
+  const { panes, togglePane, openPane, closePane, setPanesOrder } =
+    useStudioPanes();
   const location = useLocation();
   const navigate = useNavigate();
   const address = `${location.pathname}${location.search}${location.hash}`;
@@ -54,6 +58,12 @@ function CopilotMemoryProbe() {
       <button onClick={() => togglePane("copilot")}>toggle-copilot</button>
       <button onClick={() => togglePane("browser")}>toggle-browser</button>
       <button onClick={() => togglePane("editor")}>toggle-editor</button>
+      <button onClick={() => openPane("browser")}>open-browser</button>
+      <button onClick={() => closePane("copilot")}>close-copilot</button>
+      <button onClick={() => openPane("copilot")}>open-copilot</button>
+      <button onClick={() => setPanesOrder(["copilot", "browser"])}>
+        drag-copilot-first
+      </button>
       <button
         onClick={() =>
           openPane("copilot", {
@@ -66,7 +76,7 @@ function CopilotMemoryProbe() {
       <button
         onClick={() =>
           navigate(
-            "/studio?via=blank&panes=copilot,editor,browser&wr=wr_1#proof",
+            "/studio?cache-key-value=x&panes=copilot,editor,browser&wr=wr_1#proof",
           )
         }
       >
@@ -74,7 +84,9 @@ function CopilotMemoryProbe() {
       </button>
       <button
         onClick={() =>
-          navigate("/studio?via=blank&panes=copilot,editor,browser#proof")
+          navigate(
+            "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
+          )
         }
       >
         return-to-studio
@@ -83,21 +95,50 @@ function CopilotMemoryProbe() {
   );
 }
 
-function renderCopilotMemory(entry: string) {
+function renderCopilotVisit(entry: string) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
-      <CopilotMemoryProbe />
+      <StudioPaneDefaultsProvider hasBlocks={true}>
+        <CopilotVisitProbe />
+      </StudioPaneDefaultsProvider>
     </MemoryRouter>,
   );
 }
 
-describe("useStudioPanes Copilot context memory", () => {
-  test("restores independent Studio and past-run selections without changing the URL", () => {
+describe("useStudioPanes visit-scoped Copilot selection", () => {
+  test("restores an expanded pane before a nested pane action, even when the target is already open", () => {
+    const restoreExpandedPane = vi.fn();
+    render(
+      <StudioShellContext.Provider
+        value={{
+          copilotPortalEl: null,
+          panelPortalEl: null,
+          setEditorStreamSlot: vi.fn(),
+          setBrowserStreamSlot: vi.fn(),
+          setRunStreamSlot: vi.fn(),
+          restoreExpandedPane,
+        }}
+      >
+        <MemoryRouter initialEntries={["/studio?panes=editor,browser"]}>
+          <StudioPaneDefaultsProvider hasBlocks={true}>
+            <CopilotVisitProbe />
+          </StudioPaneDefaultsProvider>
+        </MemoryRouter>
+      </StudioShellContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByText("open-browser"));
+
+    expect(restoreExpandedPane).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("panes").textContent).toBe("editor,browser");
+  });
+
+  test("reapplies shared entry panes when navigating between Studio and runs", () => {
     const studioAddress =
-      "/studio?via=blank&panes=copilot,editor,browser#proof";
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof";
     const runAddress =
-      "/studio?via=blank&panes=copilot,editor,browser&wr=wr_1#proof";
-    renderCopilotMemory(studioAddress);
+      "/studio?cache-key-value=x&panes=copilot,editor,browser&wr=wr_1#proof";
+    renderCopilotVisit(studioAddress);
 
     expect(screen.getByTestId("panes").textContent).toBe(
       "copilot,editor,browser",
@@ -112,7 +153,7 @@ describe("useStudioPanes Copilot context memory", () => {
     );
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
 
-    // Record an explicit open choice for the run context.
+    // The run entry starts its own slot memory, so Copilot reopens in place.
     fireEvent.click(screen.getByText("toggle-copilot"));
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
     fireEvent.click(screen.getByText("toggle-copilot"));
@@ -122,7 +163,9 @@ describe("useStudioPanes Copilot context memory", () => {
     expect(screen.getByTestId("address").textContent).toBe(runAddress);
 
     fireEvent.click(screen.getByText("return-to-studio"));
-    expect(screen.getByTestId("panes").textContent).toBe("editor,browser");
+    expect(screen.getByTestId("panes").textContent).toBe(
+      "copilot,editor,browser",
+    );
     expect(screen.getByTestId("address").textContent).toBe(studioAddress);
 
     fireEvent.click(screen.getByText("inspect-run"));
@@ -133,8 +176,8 @@ describe("useStudioPanes Copilot context memory", () => {
   });
 
   test("keeps route-state handoffs while preserving pathname, search, and hash", () => {
-    const address = "/studio?via=blank&panes=editor,browser#proof";
-    renderCopilotMemory(address);
+    const address = "/studio?cache-key-value=x&panes=editor,browser#proof";
+    renderCopilotVisit(address);
 
     fireEvent.click(screen.getByText("open-copilot-with-state"));
 
@@ -148,40 +191,41 @@ describe("useStudioPanes Copilot context memory", () => {
 
     fireEvent.click(screen.getByText("toggle-browser"));
     expect(screen.getByTestId("panes").textContent).toBe("editor,copilot");
-    expect(screen.getByTestId("address").textContent).toBe(
-      "/studio?via=blank&panes=editor#proof",
-    );
+    expect(screen.getByTestId("address").textContent).toBe(address);
     expect(screen.getByTestId("route-state").textContent).toBe(
       '{"copilotMessage":"Fix this run"}',
     );
   });
 
-  test("does not leak a runtime Copilot choice through a later URL pane write", () => {
-    renderCopilotMemory("/studio?via=blank&panes=copilot,editor,browser#proof");
+  test("preserves the incoming URL through multiple pane toggles", () => {
+    renderCopilotVisit(
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
+    );
 
     fireEvent.click(screen.getByText("toggle-copilot"));
     fireEvent.click(screen.getByText("toggle-browser"));
 
     expect(screen.getByTestId("panes").textContent).toBe("editor");
     expect(screen.getByTestId("address").textContent).toBe(
-      "/studio?via=blank&panes=copilot,editor#proof",
+      "/studio?cache-key-value=x&panes=copilot,editor,browser#proof",
     );
   });
 
-  test("keeps URL-owned Copilot order through a non-Copilot pane write", () => {
-    renderCopilotMemory("/studio?panes=editor,copilot,browser#proof");
+  test("keeps Copilot order through a non-Copilot pane toggle", () => {
+    renderCopilotVisit("/studio?panes=editor,copilot,browser#proof");
 
     fireEvent.click(screen.getByText("toggle-editor"));
 
     expect(screen.getByTestId("panes").textContent).toBe("copilot,browser");
     expect(screen.getByTestId("address").textContent).toBe(
-      "/studio?panes=copilot,browser#proof",
+      "/studio?panes=editor,copilot,browser#proof",
     );
   });
 
-  test("restores Copilot at its remembered position after reopening", () => {
-    const address = "/studio?via=blank&panes=editor,copilot,browser#proof";
-    renderCopilotMemory(address);
+  test("reopens Copilot in the slot it was closed from", () => {
+    const address =
+      "/studio?cache-key-value=x&panes=editor,copilot,browser#proof";
+    renderCopilotVisit(address);
 
     fireEvent.click(screen.getByText("toggle-copilot"));
     fireEvent.click(screen.getByText("toggle-copilot"));
@@ -190,6 +234,27 @@ describe("useStudioPanes Copilot context memory", () => {
       "editor,copilot,browser",
     );
     expect(screen.getByTestId("address").textContent).toBe(address);
+  });
+
+  test("reopens a dragged pane where the drag left it, not at the end", () => {
+    renderCopilotVisit("/studio?panes=browser,copilot");
+
+    fireEvent.click(screen.getByText("drag-copilot-first"));
+    fireEvent.click(screen.getByText("close-copilot"));
+    expect(screen.getByTestId("panes").textContent).toBe("browser");
+    fireEvent.click(screen.getByText("open-copilot"));
+
+    expect(screen.getByTestId("panes").textContent).toBe("copilot,browser");
+  });
+
+  test("appends a pane that has not been open during this visit", () => {
+    renderCopilotVisit("/studio?panes=copilot,browser");
+
+    fireEvent.click(screen.getByText("toggle-editor"));
+
+    expect(screen.getByTestId("panes").textContent).toBe(
+      "copilot,browser,editor",
+    );
   });
 });
 
@@ -202,21 +267,23 @@ describe("useStudioPanes setOpenPanes", () => {
 });
 
 describe("useStudioPanes setPanesOrder", () => {
-  test("commits a reordered list to the URL", () => {
+  test("reorders runtime panes while preserving the URL", () => {
     renderWithPanes("?panes=copilot,editor,browser", [
       "editor",
       "browser",
       "copilot",
     ]);
 
+    const search = screen.getByTestId("search").textContent;
     fireEvent.click(screen.getByText("set-order"));
+    expect(screen.getByTestId("search").textContent).toBe(search);
 
     expect(screen.getByTestId("panes").textContent).toBe(
       "editor,browser,copilot",
     );
   });
 
-  test("keeps the open set from the URL: closed panes in the order are dropped, missing ones appended", () => {
+  test("keeps the current open set: closed panes in the order are dropped, missing ones appended", () => {
     // "overview" is not open, so it must not open; "browser" is open but
     // absent from the requested order, so it keeps a slot at the end.
     renderWithPanes("?panes=copilot,editor,browser", [
@@ -225,7 +292,9 @@ describe("useStudioPanes setPanesOrder", () => {
       "copilot",
     ]);
 
+    const search = screen.getByTestId("search").textContent;
     fireEvent.click(screen.getByText("set-order"));
+    expect(screen.getByTestId("search").textContent).toBe(search);
 
     expect(screen.getByTestId("panes").textContent).toBe(
       "editor,copilot,browser",
@@ -239,7 +308,9 @@ describe("useStudioPanes setPanesOrder", () => {
       "copilot",
     ]);
 
+    const search = screen.getByTestId("search").textContent;
     fireEvent.click(screen.getByText("set-order"));
+    expect(screen.getByTestId("search").textContent).toBe(search);
 
     expect(screen.getByTestId("panes").textContent).toBe("browser,copilot");
   });
@@ -254,7 +325,14 @@ function renderAtRunRoute(entry: string) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       <Routes>
-        <Route path="/runs/:runId/*" element={<RunRouteProbe />} />
+        <Route
+          path="/runs/:runId/*"
+          element={
+            <StudioPaneDefaultsProvider hasBlocks={true}>
+              <RunRouteProbe />
+            </StudioPaneDefaultsProvider>
+          }
+        />
       </Routes>
     </MemoryRouter>,
   );
@@ -263,7 +341,7 @@ function renderAtRunRoute(entry: string) {
 describe("useStudioPanes under the short run URL", () => {
   test("/runs/{wr} opens the run layout from the path, not the edit default", () => {
     renderAtRunRoute("/runs/wr_1");
-    expect(screen.getByTestId("panes").textContent).toBe("browser,overview");
+    expect(screen.getByTestId("panes").textContent).toBe("overview,browser");
   });
 
   test("an explicit ?panes= still wins under the short run URL", () => {
@@ -314,7 +392,9 @@ describe("useStudioPanes selectedBlockLabel", () => {
   test("openPane carries selectedBlockLabel in the same navigation", () => {
     render(
       <MemoryRouter initialEntries={["/studio?panes=editor"]}>
-        <OpenWithParamsProbe />
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <OpenWithParamsProbe />
+        </StudioPaneDefaultsProvider>
       </MemoryRouter>,
     );
     fireEvent.click(screen.getByText("open-with-params"));
@@ -326,15 +406,18 @@ describe("useStudioPanes selectedBlockLabel", () => {
     expect(screen.getByTestId("panes").textContent).toContain("copilot");
   });
 
-  test("a pane write that changes the URL pane list carries them too", () => {
+  test("opening Browser preserves the pane URL while setting the selected block", () => {
     render(
       <MemoryRouter initialEntries={["/studio?panes=editor"]}>
-        <OpenWithParamsProbe />
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <OpenWithParamsProbe />
+        </StudioPaneDefaultsProvider>
       </MemoryRouter>,
     );
     fireEvent.click(screen.getByText("open-browser-with-params"));
     const search = screen.getByTestId("search").textContent ?? "";
-    expect(search).toContain("panes=editor,browser");
+    expect(new URLSearchParams(search).get("panes")).toBe("editor");
+    expect(screen.getByTestId("panes").textContent).toBe("editor,browser");
     expect(search).toContain("selected-block=checkout");
   });
 
@@ -343,7 +426,9 @@ describe("useStudioPanes selectedBlockLabel", () => {
       <MemoryRouter
         initialEntries={["/studio?panes=editor&selected-block=stale"]}
       >
-        <OpenWithParamsProbe />
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <OpenWithParamsProbe />
+        </StudioPaneDefaultsProvider>
       </MemoryRouter>,
     );
     fireEvent.click(screen.getByText("open-clearing-params"));
@@ -355,7 +440,9 @@ describe("useStudioPanes selectedBlockLabel", () => {
   test("openPane carries selectedBlockLabel even when the pane is already open", () => {
     render(
       <MemoryRouter initialEntries={["/studio?panes=editor,copilot"]}>
-        <OpenWithParamsProbe />
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <OpenWithParamsProbe />
+        </StudioPaneDefaultsProvider>
       </MemoryRouter>,
     );
     fireEvent.click(screen.getByText("open-with-params"));

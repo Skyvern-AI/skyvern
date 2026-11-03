@@ -22,4 +22,8 @@ export interface SendEmailBlock {
     subject: string;
     body: string;
     file_attachments?: string[];
+    custom_smtp_host?: string;
+    custom_smtp_port?: number;
+    custom_smtp_username?: string;
+    custom_smtp_password?: string;
 }

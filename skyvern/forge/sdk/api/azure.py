@@ -82,7 +82,7 @@ class AsyncAzureVaultClient(Protocol):
             vault_name: The name of the Azure Key Vault
 
         Returns:
-            The name of the deleted secret
+            The name of the deleted secret; deleting a secret that does not exist succeeds
 
         Raises:
             Exception: If the operation fails

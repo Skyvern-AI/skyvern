@@ -1,6 +1,10 @@
 // @vitest-environment jsdom
 
-const { getSpy } = vi.hoisted(() => ({ getSpy: vi.fn() }));
+const { getSpy, runQuerySpy, mockedRun } = vi.hoisted(() => ({
+  getSpy: vi.fn(),
+  runQuerySpy: vi.fn(),
+  mockedRun: { current: null as unknown },
+}));
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: async () => ({ get: getSpy }),
@@ -9,7 +13,15 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
-  useWorkflowRunWithWorkflowQuery: () => ({ data: null }),
+  useWorkflowRunWithWorkflowQuery: (options?: { workflowRunId?: string }) => {
+    runQuerySpy(options);
+    return { data: mockedRun.current };
+  },
+}));
+vi.mock("@/routes/workflows/components/CodeEditor", () => ({
+  CodeEditor: ({ value }: { value: string }) => (
+    <pre data-testid="code-editor">{value}</pre>
+  ),
 }));
 vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
   useWorkflowRunTimelineQuery: () => ({ data: [], isLoading: false }),
@@ -26,9 +38,6 @@ vi.mock("../hooks/useRunHealEpisodesQuery", () => ({
     },
   }),
 }));
-vi.mock("./WorkflowRunHumanInteraction", () => ({
-  WorkflowRunHumanInteraction: () => null,
-}));
 
 import {
   cleanup,
@@ -39,13 +48,14 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ActionTypes,
   ArtifactType,
   Status,
   type ActionsApiResponse,
+  type WorkflowRunStatusApiResponseWithWorkflow,
 } from "@/api/types";
 import type {
   WorkflowRunBlock,
@@ -135,6 +145,7 @@ function renderActionDiagnosticsHref(
   render(
     <MemoryRouter>
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem={activeAction}
         timeline={[buildBlockItem(block)]}
       />
@@ -151,6 +162,8 @@ function renderActionDiagnosticsHref(
 afterEach(() => {
   cleanup();
   getSpy.mockReset();
+  runQuerySpy.mockReset();
+  mockedRun.current = null;
 });
 
 describe("WorkflowRunBlockDetail router", () => {
@@ -159,7 +172,13 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "extraction",
       data_extraction_goal: "Pull the price from the page",
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     // Header still labels the block type
     expect(screen.getByText("Extraction")).toBeDefined();
     // Goal field is intentionally hidden in the detail body (feedback #4/#6/#9)
@@ -172,7 +191,13 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "extraction",
       failure_reason: "Could not locate the price element",
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     // A failed block opens on Summary and shows the failure exactly once — no
     // longer duplicated between the Summary field and a persistent callout.
     expect(screen.getByText("Failure")).toBeDefined();
@@ -213,6 +238,7 @@ describe("WorkflowRunBlockDetail router", () => {
     render(
       <QueryClientProvider client={queryClient}>
         <WorkflowRunBlockDetail
+          workflowRunId={undefined}
           activeItem={block}
           timeline={[]}
           onViewScreenshot={onViewScreenshot}
@@ -241,6 +267,7 @@ describe("WorkflowRunBlockDetail router", () => {
     render(
       <QueryClientProvider client={queryClient}>
         <WorkflowRunBlockDetail
+          workflowRunId={undefined}
           activeItem={block}
           timeline={[]}
           onViewScreenshot={vi.fn()}
@@ -268,6 +295,7 @@ describe("WorkflowRunBlockDetail router", () => {
     render(
       <QueryClientProvider client={queryClient}>
         <WorkflowRunBlockDetail
+          workflowRunId={undefined}
           activeItem={block}
           timeline={[]}
           onViewScreenshot={vi.fn()}
@@ -296,7 +324,11 @@ describe("WorkflowRunBlockDetail router", () => {
     });
     render(
       <MemoryRouter>
-        <WorkflowRunBlockDetail activeItem={block} timeline={[]} />
+        <WorkflowRunBlockDetail
+          workflowRunId={undefined}
+          activeItem={block}
+          timeline={[]}
+        />
       </MemoryRouter>,
     );
     expect(screen.getAllByText(reason)).toHaveLength(1);
@@ -316,7 +348,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     expect(
       screen.getByRole("tab", { name: "Extracted Information" }),
@@ -336,7 +374,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     expect(
       screen.getByRole("tab", { name: "Extracted Information" }),
@@ -353,7 +397,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     const tab = screen.getByRole("tab", { name: "Extracted Information" });
     expect(tab.hasAttribute("disabled")).toBe(false);
@@ -376,7 +426,13 @@ describe("WorkflowRunBlockDetail router", () => {
       },
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     expect(screen.getByText("output")).toBeDefined();
     expect(screen.getAllByText("status_code").length).toBeGreaterThanOrEqual(1);
@@ -404,7 +460,11 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(
       <MemoryRouter>
-        <WorkflowRunBlockDetail activeItem={block} timeline={[]} />
+        <WorkflowRunBlockDetail
+          workflowRunId={undefined}
+          activeItem={block}
+          timeline={[]}
+        />
       </MemoryRouter>,
     );
 
@@ -584,7 +644,13 @@ describe("WorkflowRunBlockDetail router", () => {
       actions: [action],
     });
 
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
 
     // The bottom timeline already lists every action; the detail panel must
     // not re-list them under an "Actions (N)" section.
@@ -613,7 +679,13 @@ describe("WorkflowRunBlockDetail router", () => {
         ],
       },
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     // The branch evaluations section renders the expression as a code chunk
     expect(screen.getByText("{{ x == 1 }}")).toBeDefined();
   });
@@ -623,7 +695,13 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "for_loop",
       loop_values: [{ name: "alpha" }, { name: "beta" }],
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     expect(screen.queryByText(/iterable values/i)).toBeNull();
     expect(screen.queryByText(/Current iteration/)).toBeNull();
     // Radix tabs activate on mousedown.
@@ -637,12 +715,24 @@ describe("WorkflowRunBlockDetail router", () => {
       block_type: "http_request",
       url: "https://example.test/endpoint",
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     expect(screen.getByText("https://example.test/endpoint")).toBeDefined();
   });
 
   it("renders an empty state when there is no selection and no resolvable target", () => {
-    render(<WorkflowRunBlockDetail activeItem={null} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={null}
+        timeline={[]}
+      />,
+    );
     expect(screen.getByText(/no block selected/i)).toBeDefined();
   });
 
@@ -653,7 +743,13 @@ describe("WorkflowRunBlockDetail router", () => {
       subject: "SKY-10066 approval",
       recipients: ["celal@skyvern.com", "ops@skyvern.com"],
     });
-    render(<WorkflowRunBlockDetail activeItem={block} timeline={[]} />);
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId={undefined}
+        activeItem={block}
+        timeline={[]}
+      />,
+    );
     expect(
       screen.getByText("Please verify the order total before we ship."),
     ).toBeDefined();
@@ -672,6 +768,7 @@ describe("WorkflowRunBlockDetail router", () => {
     });
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem="stream"
         timeline={[buildBlockItem(running)]}
       />,
@@ -709,6 +806,7 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem={action}
         timeline={[buildBlockItem(block)]}
       />,
@@ -746,6 +844,7 @@ describe("WorkflowRunBlockDetail router", () => {
 
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem={action}
         timeline={[buildBlockItem(block)]}
       />,
@@ -776,6 +875,7 @@ describe("WorkflowRunBlockDetail router", () => {
     });
     render(
       <WorkflowRunBlockDetail
+        workflowRunId={undefined}
         activeItem="stream"
         activeIteration={2}
         timeline={[buildBlockItem(loop)]}
@@ -800,13 +900,11 @@ describe("WorkflowRunBlockDetail cold-start skeleton", () => {
         isLoading: false,
       }),
     }));
-    vi.doMock("./WorkflowRunHumanInteraction", () => ({
-      WorkflowRunHumanInteraction: () => null,
-    }));
     const { WorkflowRunBlockDetail: ReloadedBlockDetail } =
       await import("./WorkflowRunBlockDetail");
     const { container } = render(
       <ReloadedBlockDetail
+        workflowRunId={undefined}
         activeItem={null}
         timeline={[]}
         timelineReady={false}
@@ -821,5 +919,214 @@ describe("WorkflowRunBlockDetail cold-start skeleton", () => {
     const skeletons = container.querySelectorAll('[class*="animate-pulse"]');
     expect(skeletons.length).toBeGreaterThan(0);
     vi.doUnmock("../hooks/useWorkflowRunTimelineQuery");
+  });
+});
+
+describe("WorkflowRunBlockDetail run resolution", () => {
+  function renderWithRunId(workflowRunId: string | undefined) {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <WorkflowRunBlockDetail
+          workflowRunId={workflowRunId}
+          activeItem={buildBlock()}
+          timeline={[]}
+          showDownloadedFiles
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("states the caller's run to every run query", () => {
+    renderWithRunId("wr_stated");
+
+    expect(runQuerySpy).toHaveBeenCalled();
+    for (const [options] of runQuerySpy.mock.calls) {
+      expect(options).toEqual({ workflowRunId: "wr_stated" });
+    }
+  });
+
+  it("states no run rather than deferring to the route when the prop is undefined", () => {
+    renderWithRunId(undefined);
+
+    expect(runQuerySpy).toHaveBeenCalled();
+    for (const [options] of runQuerySpy.mock.calls) {
+      expect(options).toEqual({ workflowRunId: undefined });
+    }
+  });
+});
+
+describe("WorkflowRunBlockDetail code block", () => {
+  const capMarker = {
+    truncated: true,
+    reason: "exceeded_max_run_response_value_size",
+    original_size_bytes: 3_000_000,
+    limit_bytes: 2_097_152,
+  };
+
+  beforeEach(() => {
+    mockedRun.current = {
+      workflow_run_id: "wr_code",
+      status: Status.Completed,
+      parameters: { region: "west" },
+      workflow: {
+        workflow_definition: {
+          parameters: [
+            { parameter_type: "workflow", key: "region" },
+            { parameter_type: "output", key: "Fetch_Rows_output" },
+          ],
+          blocks: [
+            { block_type: "http_request", label: "Fetch_Rows" },
+            { block_type: "text_prompt", label: "Summarize" },
+            {
+              block_type: "code",
+              label: "Filter_Rows",
+              code: "rows = {{ Fetch_Rows_output }}\nsummary = {{ Summarize }}\nkeep = {{ Not_A_Block }}",
+              parameters: [{ parameter_type: "workflow", key: "region" }],
+              prompt: "Keep the rows due this week",
+              steps: [],
+            },
+          ],
+        },
+      },
+    } as unknown as WorkflowRunStatusApiResponseWithWorkflow;
+  });
+
+  function renderCodeBlock(
+    selected: WorkflowRunBlock,
+    others: Array<WorkflowRunBlock>,
+  ) {
+    render(
+      <WorkflowRunBlockDetail
+        workflowRunId="wr_code"
+        activeItem={selected}
+        timeline={[selected, ...others].map(buildBlockItem)}
+      />,
+    );
+  }
+
+  function codeRun(id: string, createdAt: string) {
+    return buildBlock({
+      workflow_run_block_id: id,
+      block_type: "code",
+      label: "Filter_Rows",
+      created_at: createdAt,
+    });
+  }
+
+  function upstreamValue(name: string) {
+    const list = screen.getByRole("list", {
+      name: "Upstream outputs before this execution",
+    });
+    const item = Array.from(list.children).find(
+      (child) => child.firstElementChild?.textContent === name,
+    );
+    return item?.textContent ?? "";
+  }
+
+  it("shows the run's code, its inputs with values, and what it uses", () => {
+    renderCodeBlock(codeRun("wrb_filter", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { rows: [{ id: 1 }] },
+      }),
+    ]);
+
+    expect(screen.getByTestId("code-editor").textContent).toContain(
+      "{{ Fetch_Rows_output }}",
+    );
+    expect(screen.getByText("Keep the rows due this week")).toBeDefined();
+    const uses = screen.getByRole("list", { name: "Names this code reads" });
+    expect(
+      Array.from(uses.children).map((item) => [
+        item.firstElementChild?.textContent,
+        item.getAttribute("data-kind"),
+      ]),
+    ).toEqual([
+      ["region", "input"],
+      ["Fetch_Rows_output", "block"],
+      ["Summarize", "block"],
+      ["Not_A_Block", "neither"],
+    ]);
+    expect(uses.children[0]!.textContent).toContain('"west"');
+    expect(upstreamValue("Fetch_Rows_output")).toContain('"id": 1');
+    expect(upstreamValue("Summarize")).toContain("not available for this run");
+  });
+
+  it("never shows the selected execution's own output or a later one", () => {
+    renderCodeBlock(codeRun("wrb_filter_1", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch_0",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { batch: "first" },
+      }),
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch_1",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:03Z",
+        output: { batch: "second" },
+      }),
+      buildBlock({
+        workflow_run_block_id: "wrb_summary_later",
+        label: "Summarize",
+        created_at: "2026-01-01T00:00:04Z",
+        output: { extracted_information: "later" },
+      }),
+    ]);
+
+    expect(upstreamValue("Fetch_Rows_output")).toContain('"first"');
+    expect(upstreamValue("Fetch_Rows_output")).not.toContain('"second"');
+    expect(upstreamValue("Summarize")).toContain("not available for this run");
+  });
+
+  it("adds output for a bare label read, as the run context does", () => {
+    renderCodeBlock(codeRun("wrb_filter", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_summary",
+        label: "Summarize",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { extracted_information: { total: 3 } },
+      }),
+    ]);
+
+    expect(upstreamValue("Summarize")).toMatch(
+      /"extracted_information"[\s\S]*"output": \{\s*"total": 3/,
+    );
+  });
+
+  it("labels an upstream output the run capped", () => {
+    renderCodeBlock(codeRun("wrb_filter", "2026-01-01T00:00:02Z"), [
+      buildBlock({
+        workflow_run_block_id: "wrb_fetch",
+        label: "Fetch_Rows",
+        created_at: "2026-01-01T00:00:01Z",
+        output: { rows: [{ id: 1 }, capMarker], count: 2 },
+      }),
+    ]);
+
+    expect(upstreamValue("Fetch_Rows_output")).toContain("Capped by the run");
+    expect(upstreamValue("Fetch_Rows_output")).toContain('"count": 2');
+  });
+
+  it("falls back to the generic detail when the run's definition has no such code block", () => {
+    renderCodeBlock(
+      buildBlock({
+        workflow_run_block_id: "wrb_renamed",
+        block_type: "code",
+        label: "Renamed_Block",
+      }),
+      [],
+    );
+
+    expect(screen.queryByTestId("code-editor")).toBeNull();
+    expect(
+      screen.queryByRole("list", { name: "Names this code reads" }),
+    ).toBeNull();
   });
 });

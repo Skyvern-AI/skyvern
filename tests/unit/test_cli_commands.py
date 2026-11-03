@@ -2,23 +2,37 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
+import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 import typer
+from playwright.async_api import Error as PlaywrightError
 from typer.testing import CliRunner
 
+from skyvern import _cli_bootstrap, config
+from skyvern.cli.commands import _output as cli_output
+from skyvern.cli.commands import browser as cli_browser
 from skyvern.cli.commands import cli_app
 from skyvern.cli.commands._state import CLIState, clear_state, load_state, save_state
+from skyvern.cli.core import client as cli_client
+from skyvern.cli.core.guards import STALE_FRAME_HINT
 from skyvern.cli.status import _status_data
+from skyvern.exceptions import StaleFrameSelectionError
+from skyvern.library.skyvern import Skyvern
+from tests.unit._mcp_browser_fakes import StaleScopePage
 
 # ---------------------------------------------------------------------------
 # _state.py
@@ -220,6 +234,50 @@ class TestBrowserCommandGuards:
 
         with pytest.raises(GuardError, match="Invalid state"):
             _validate_wait_state("bad-state")
+
+    @pytest.mark.parametrize("clear", [True, False], ids=["fill", "append"])
+    def test_type_with_intent_refuses_top_document_password_match(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, clear: bool
+    ) -> None:
+        top_match = MagicMock()
+        top_match.first = top_match
+        top_match.evaluate = AsyncMock(return_value=True)
+        top_match.type = AsyncMock()
+        raw_page = MagicMock()
+        raw_page.locator = MagicMock(return_value=top_match)
+        frame_match = MagicMock()
+        frame_match.first = frame_match
+        frame_match.evaluate = AsyncMock(return_value=False)
+        active_frame = MagicMock()
+        active_frame.locator = MagicMock(return_value=frame_match)
+        page = MagicMock()
+        page.page = raw_page
+        page.locator_scope = active_frame
+        page.locator = MagicMock(return_value=top_match)
+        browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+        monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+        monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+        monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+        with pytest.raises(SystemExit):
+            cli_browser.type_text(
+                text="opaque-value",
+                intent="the promo code box",
+                selector=".shared-field",
+                session=None,
+                cdp=None,
+                timeout=1000,
+                clear=clear,
+                delay=None,
+                json_output=True,
+            )
+
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["ok"] is False
+        assert "password" in parsed["error"]["message"].lower()
+        top_match.type.assert_not_awaited()
+        page.fill.assert_not_called()
 
 
 class TestBrowserCommands:
@@ -1069,7 +1127,7 @@ class TestSharedFactoryBaseUrlGuard:
         monkeypatch.setattr(client_module, "is_cli_runtime", lambda: True)
         monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: True)
         client_constructor = MagicMock(return_value=object())
-        monkeypatch.setattr(client_module, "Skyvern", client_constructor)
+        monkeypatch.setattr(client_module, "_LoopbackSkyvern", client_constructor)
 
         client_module._build_cloud_client("test-api-key")
 
@@ -1108,6 +1166,56 @@ class TestBrowserGroupBaseUrlGuard:
         assert "Set SKYVERN_BASE_URL" in parsed["error"]["message"]
 
 
+class TestCliUserAgent:
+    @pytest.mark.parametrize(
+        "args",
+        [
+            pytest.param(["workflow", "list", "--json"], id="mcp_parity_command"),
+            pytest.param(["browser", "session", "create", "--json"], id="browser_command"),
+        ],
+    )
+    def test_cli_command_labels_its_api_calls_as_the_cli(
+        self, args: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The CLI drives the MCP's own client and tools; only the header lets the server tell the two apart."""
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=[])
+
+        real_build_cloud_client = cli_client._build_cloud_client
+
+        def build_cloud_client_offline(api_key: str) -> Skyvern:
+            instance = real_build_cloud_client(api_key)
+            instance._client_wrapper.httpx_client.httpx_client._transport = httpx.MockTransport(handler)
+            return instance
+
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_COMMAND_RUNNING", False)
+        monkeypatch.setattr("skyvern.utils.env_paths.load_backend_env_files", lambda intent: tmp_path / ".env")
+        monkeypatch.setattr(_cli_bootstrap, "configure_cli_runtime_logging", lambda: None)
+        monkeypatch.setattr("skyvern.cli.core.session_manager.is_stateless_http_mode", lambda: False)
+        monkeypatch.setattr(
+            cli_client, "settings", config.Settings(_env_file=None, SKYVERN_BASE_URL="http://skyvern.test")
+        )
+        monkeypatch.setattr(cli_client, "_resolve_api_key", lambda: "test-api-key")
+        monkeypatch.setattr(cli_client, "_global_skyvern_instance", None)
+        monkeypatch.setattr(cli_client, "_build_cloud_client", build_cloud_client_offline)
+        monkeypatch.setattr(cli_output, "capture_cli_tool_call", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", lambda *_args, **_kwargs: None)
+
+        token = cli_client._skyvern_instance.set(None)
+        try:
+            CliRunner().invoke(cli_app, args)
+        finally:
+            cli_client._skyvern_instance.reset(token)
+
+        assert requests
+        assert {request.headers.get("x-user-agent") for request in requests} == {"skyvern-cli"}
+
+
 class TestCliRuntimeFlag:
     def test_prepare_cli_runtime_marks_cli_process(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from skyvern import _cli_bootstrap
@@ -1126,6 +1234,45 @@ class TestCliRuntimeFlag:
         code = "import sys; import skyvern.cli; raise SystemExit(1 if 'skyvern.config' in sys.modules else 0)"
         completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
         assert completed.returncode == 0, completed.stderr
+
+
+class TestCliRuntimeResetFixture:
+    def test_reset_cli_runtime_entry_restores_process_and_env_state(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The autouse conftest fixture must undo everything a CLI entry leaves in the process.
+
+        prepare_cli_runtime flips _CLI_RUNTIME_PREPARED, and load_backend_env_files writes
+        SKYVERN_ENV_INTENT unconditionally plus SKYVERN_API_KEY / SKYVERN_BASE_URL when a .env
+        supplies them. config._settings_env_intent reads SKYVERN_ENV_INTENT for env precedence,
+        so leaking it past teardown steers a later cloud-client test in the same shard.
+        """
+        from skyvern import _cli_bootstrap
+        from tests.unit.conftest import reset_cli_runtime_entry
+
+        run_reset = reset_cli_runtime_entry.__wrapped__
+
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_RUNTIME_PREPARED", False)
+        monkeypatch.setattr(_cli_bootstrap, "_CLI_COMMAND_RUNNING", False)
+        monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+        monkeypatch.delenv("SKYVERN_BASE_URL", raising=False)
+        monkeypatch.setenv("SKYVERN_ENV_INTENT", "auto")
+
+        teardown = run_reset()
+        next(teardown)
+
+        _cli_bootstrap._CLI_RUNTIME_PREPARED = True
+        _cli_bootstrap.mark_cli_command()
+        os.environ["SKYVERN_API_KEY"] = "leaked-key"
+        os.environ["SKYVERN_BASE_URL"] = "https://leaked.example"
+        os.environ["SKYVERN_ENV_INTENT"] = "cloud"
+
+        with pytest.raises(StopIteration):
+            next(teardown)
+
+        assert _cli_bootstrap._CLI_RUNTIME_PREPARED is False
+        assert _cli_bootstrap.is_cli_command() is False
+        assert "SKYVERN_API_KEY" not in os.environ
+        assert "SKYVERN_BASE_URL" not in os.environ
+        assert os.environ["SKYVERN_ENV_INTENT"] == "auto"
 
 
 class TestCredentialsCommands:
@@ -1380,3 +1527,222 @@ class TestStopCommands:
         assert parsed["ok"] is False
         assert parsed["action"] == "stop.all"
         assert parsed["error"]["message"] == "No Skyvern services found running on ports 8000, 8080, or 9090."
+
+
+def test_cli_evaluate_bounds_a_never_resolving_expression(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    released = asyncio.Event()
+    awaits = 0
+
+    async def hanging_evaluate(_expression: str) -> str:
+        nonlocal awaits
+        awaits += 1
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(released.wait(), timeout=2)
+        return "escaped the bound"
+
+    raw = MagicMock()
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=hanging_evaluate)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+    monkeypatch.setattr(cli_browser, "DEFAULT_ACTION_TIMEOUT_MS", 150)
+
+    with pytest.raises(SystemExit):
+        cli_browser.evaluate(expression="await new Promise(() => {})", session=None, cdp=None, json_output=True)
+
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "timed out" in error["message"]
+    assert awaits == 1
+
+
+def test_cli_evaluate_reports_a_deadline_transport_error_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setattr(cli_browser, "DEFAULT_ACTION_TIMEOUT_MS", 50)
+
+    async def torn_down(expression: str, arg: object | None = None) -> object:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise PlaywrightError("Target page, context or browser has been closed") from None
+
+    raw = MagicMock()
+    raw.evaluate = torn_down
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=torn_down)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+    with pytest.raises(SystemExit):
+        cli_browser.evaluate(expression="fetch('/slow')", session=None, cdp=None, json_output=True)
+
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "never settled" in error["hint"], error
+    assert "Check JavaScript syntax" not in error["hint"], error
+
+
+def test_cli_evaluate_keeps_caller_js_out_of_the_deadline_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: dict[str, object] = {}
+
+    async def record(**kwargs: object) -> object:
+        recorded.update(kwargs)
+        return "ok"
+
+    raw = MagicMock()
+    raw.evaluate = AsyncMock(return_value="ok")
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=raw.evaluate)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+    monkeypatch.setattr(cli_browser.SkyvernFrame, "_evaluate_expression", record)
+
+    cli_browser.evaluate(expression="fetch('/orders?token=tok-do-not-log')", session=None, cdp=None, json_output=True)
+
+    assert "tok-do-not-log" not in str(recorded["expression"])
+
+
+def test_cli_evaluate_dispatches_caller_js_once_when_the_context_dies(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    expressions: list[str] = []
+
+    async def failing_evaluate(expression: str, arg: object | None = None) -> object:
+        expressions.append(expression)
+        if expression == "postOrder()":
+            raise PlaywrightError("Execution context was destroyed, most likely because of a navigation")
+        return None
+
+    raw = MagicMock()
+    raw.evaluate = failing_evaluate
+    raw.wait_for_load_state = AsyncMock()
+    page = SimpleNamespace(page=raw, locator_scope=raw, evaluate=failing_evaluate)
+    browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+    monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+    monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+    monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+    with pytest.raises(SystemExit):
+        cli_browser.evaluate(expression="postOrder()", session=None, cdp=None, json_output=True)
+
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "Execution context was destroyed" in error["message"]
+    assert expressions == ["postOrder()"]
+    raw.wait_for_load_state.assert_not_awaited()
+
+
+class TestCLIStaleFrameSurface:
+    @staticmethod
+    def _patch_page(monkeypatch: pytest.MonkeyPatch, page: object) -> None:
+        browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+        monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+        monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+        monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+    @pytest.mark.parametrize(
+        "invoke",
+        [
+            lambda: cli_browser.evaluate(expression="1 + 1", session=None, cdp=None, json_output=True),
+            lambda: cli_browser.scroll(
+                direction="down", session=None, cdp=None, amount=None, intent=None, selector=None, json_output=True
+            ),
+            lambda: cli_browser.press_key(
+                key="Enter", session=None, cdp=None, intent=None, selector=None, json_output=True
+            ),
+            lambda: cli_browser.select(
+                value="Ground",
+                intent=None,
+                selector="#ship",
+                session=None,
+                cdp=None,
+                timeout=30000,
+                by_label=True,
+                json_output=True,
+            ),
+        ],
+        ids=["evaluate", "scroll", "press_key", "select_by_label"],
+    )
+    def test_page_space_commands_refuse_an_unowned_frame_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+        invoke: Callable[[], None],
+    ) -> None:
+        raw = MagicMock()
+        raw.evaluate = AsyncMock(return_value=2)
+        raw.keyboard = SimpleNamespace(press=AsyncMock())
+        self._patch_page(monkeypatch, StaleScopePage(raw))
+
+        with pytest.raises(SystemExit):
+            invoke()
+
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert "Stale frame selection" in error["message"]
+        assert error["hint"] == STALE_FRAME_HINT
+        raw.locator.assert_not_called()
+
+    def test_select_by_label_resolves_in_page_space_not_the_selected_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = MagicMock()
+        raw.locator = MagicMock(return_value=SimpleNamespace(select_option=AsyncMock()))
+        frame = MagicMock()
+        self._patch_page(monkeypatch, SimpleNamespace(page=raw, locator_scope=frame))
+
+        cli_browser.select(
+            value="Ground",
+            intent=None,
+            selector="#ship",
+            session=None,
+            cdp=None,
+            timeout=30000,
+            by_label=True,
+            json_output=True,
+        )
+
+        raw.locator.assert_called_once_with("#ship")
+        frame.locator.assert_not_called()
+
+    def test_wait_intent_envelope_keeps_the_stale_selection_hint(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        page = SimpleNamespace(
+            wait_for_timeout=AsyncMock(),
+            validate=AsyncMock(side_effect=StaleFrameSelectionError("pay", "https://pay.example.com/")),
+        )
+        browser = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+        monkeypatch.setattr(cli_browser, "_resolve_connection", MagicMock())
+        monkeypatch.setattr(cli_browser, "_connect_browser", AsyncMock(return_value=browser))
+        monkeypatch.setattr(cli_browser, "_apply_cli_frame_state", AsyncMock())
+        monkeypatch.setattr(cli_browser, "capture_cli_tool_call", MagicMock())
+
+        with pytest.raises(SystemExit):
+            cli_browser.wait(
+                session=None,
+                cdp=None,
+                time_ms=None,
+                intent="the card form is ready",
+                selector=None,
+                state="visible",
+                timeout=0,
+                poll_interval=0,
+                json_output=True,
+            )
+
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert "Stale frame selection" in error["message"]
+        assert error["hint"] == STALE_FRAME_HINT

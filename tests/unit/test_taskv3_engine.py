@@ -7,32 +7,81 @@ from the tools test, so the engine's wiring is exercised without a real LLM or b
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import random
+from collections.abc import Callable
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import aiohttp
+import litellm
 import pytest
 import yarl
+from structlog.testing import capture_logs
 
-from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.config import settings
+from skyvern.forge import app
+from skyvern.forge.sdk.api.llm import api_handler_factory
+from skyvern.forge.sdk.api.llm.api_handler_factory import (
+    LLM_RETRY_CHAIN_EXHAUSTED_MESSAGE,
+    LLMAPIHandlerFactory,
+    LLMCaller,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX
 from skyvern.forge.taskv3 import engine as engine_mod
+from skyvern.forge.taskv3 import loop as loop_mod
 from skyvern.forge.taskv3.engine import (
     DEFAULT_MAX_TOOL_CALLS,
     DEFAULT_MAX_TURNS,
     MAX_TOOL_CALLS_PER_ACTION_STEP,
     MAX_TURNS_PER_ACTION_STEP,
+    OPAQUE_URL_GUIDANCE,
+    PAGE_FREE_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
     coerce_v3_parameters,
+    model_input_token_limit,
     run_task_v3_agent_loop,
     taskv3_runaway_backstops,
 )
-from skyvern.forge.taskv3.loop import ToolResult, ToolSpec
-from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
-from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR
-from tests.unit.test_taskv3_loop import _ScriptedCaller
-from tests.unit.test_taskv3_tools import _FakePage, _fixed_page_provider
+from skyvern.forge.taskv3.goal_check import (
+    INSTRUCTIONS_MAX_CHARS,
+    TERMINATE_PREMISE_PROMPT_NAME,
+    UNLISTED_REASK_PROMPT_NAME,
+)
+from skyvern.forge.taskv3.goal_composition import CodeTypedValue
+from skyvern.forge.taskv3.handoff_redaction import caller_known_published_urls
+from skyvern.forge.taskv3.llm_call_params import carries_reasoning, reasoning_effort_with_summary
+from skyvern.forge.taskv3.loop import (
+    CODE_TOOL_NAME,
+    NAV_DEAD_END_GUARD,
+    PERCEPTION_RETAIN_CHARS_HIGH,
+    LoopOutcome,
+    SemanticCommitStats,
+    ToolResult,
+    ToolSpec,
+    _ProgressEvidence,
+)
+from skyvern.forge.taskv3.opaque_refs import OpaqueUrlRefs, mask_opaque_urls
+from skyvern.forge.taskv3.run_arms import ANSWER_AUDIT_LOG_ONLY_FLAG, APPLICATION_CONTEXT_FLAG, CARRY_REASONING_FLAG
+from skyvern.forge.taskv3.tools import PAGE_UNAVAILABLE_ERROR, DownloadFailureWatch
+from skyvern.forge.taskv3.turn_dom import TurnDomCapture
+from skyvern.schemas.llm import LLMConfig, LLMRouterConfig, LLMRouterModelConfig
+from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS
+from skyvern.utils.token_counter import count_tokens
+from tests.unit.helpers import fallback_receipts
+from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.test_taskv3_loop import _ReasoningCaller, _ScriptedCaller
+from tests.unit.test_taskv3_tools import (
+    _SURFACE_OFF_TOOL_NAMES,
+    _DownloadFakePage,
+    _FakePage,
+    _fixed_page_provider,
+)
 
 
 @pytest.mark.asyncio
@@ -156,6 +205,53 @@ async def test_engine_exposes_browser_and_finish_tools_no_task_ecosystem() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("llm_route_arm", ["treatment", "control", None])
+async def test_engine_finished_line_carries_the_llm_route_arm_the_caller_recorded(llm_route_arm: str | None) -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    caller.llm_key = "ANY_ROUTE"
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x", llm_route_arm=llm_route_arm
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["llm_key"], finished["llm_route_arm"]) == ("ANY_ROUTE", llm_route_arm)
+
+
+@pytest.mark.asyncio
+async def test_engine_joins_the_turn_page_read_after_each_model_call_and_logs_its_totals() -> None:
+    saved: list[bytes] = []
+
+    def store(_step: Any, html: bytes) -> str:
+        saved.append(html)
+        return f"a_{len(saved)}"
+
+    turn_dom = TurnDomCapture(AsyncMock(return_value="<p>page</p>"), store)
+
+    async def on_turn_start(turn: int) -> None:
+        turn_dom.start(SimpleNamespace(step_id=f"turn-{turn}"), turn)
+
+    caller = _ScriptedCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]])
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="x",
+            on_turn_start=on_turn_start,
+            turn_dom=turn_dom,
+        )
+
+    finished = next(entry for entry in logs if entry["event"] == "taskv3 engine loop finished")
+    assert (finished["dom_arm"], finished["dom_captures"], finished["dom_stored"], finished["dom_deduped"]) == (
+        True,
+        2,
+        1,
+        1,
+    )
+    assert saved == [b"<p>page</p>"]
+
+
+@pytest.mark.asyncio
 async def test_engine_records_billable_actions() -> None:
     # observe/finish are not billable; type + click are — so per-action billing counts 2.
     script = [
@@ -195,6 +291,166 @@ async def test_engine_wires_budget_and_retry_defaults(monkeypatch: pytest.Monkey
     assert captured["deadline_seconds"] == engine_mod.DEFAULT_DEADLINE_SECONDS
     assert captured["max_call_retries"] == engine_mod.DEFAULT_MAX_CALL_RETRIES
     assert captured["retryable_call_exceptions"] == (LLMProviderErrorRetryableTask,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marks", [False, True])
+async def test_engine_passes_claude_cache_marks_through_to_the_loop(
+    monkeypatch: pytest.MonkeyPatch, marks: bool
+) -> None:
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        anthropic_cache_markers=marks,
+    )
+
+    assert captured["anthropic_cache_markers"] is marks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_free", [False, True])
+async def test_engine_samples_a_single_actions_effect_with_the_action_effect_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, page_free: bool
+) -> None:
+    # The settle fingerprint drops a frame that will not answer, which would read as the action having an effect.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    async def unmasked() -> str:
+        return "unmasked"
+
+    async def masked() -> str:
+        return "masked"
+
+    async def action_effect() -> str:
+        return "action_effect"
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        page_free=page_free,
+        page_fingerprint=unmasked,
+        settle_fingerprint=masked,
+        action_effect_fingerprint=action_effect,
+    )
+
+    assert captured["action_effect_fingerprint"] is (None if page_free else action_effect)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("single_action_block", [True, False])
+async def test_engine_forwards_single_action_block_to_the_loop(
+    monkeypatch: pytest.MonkeyPatch, single_action_block: bool
+) -> None:
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    captured: dict[str, object] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        single_action_block=single_action_block,
+        block_completion_judge=_achieving_judge([]),
+    )
+
+    assert captured["single_action_block"] is single_action_block
+    assert (captured["block_completion_check"] is not None) is single_action_block
+
+
+def _achieving_judge(prompts: list[str]):
+    async def judge(prompt: str) -> dict[str, object]:
+        prompts.append(prompt)
+        return {"verdict": "achieved", "quote": "", "missing": ""}
+
+    return judge
+
+
+async def _run_then_judge_block(
+    monkeypatch: pytest.MonkeyPatch,
+    judge: Any,
+    *,
+    script: list[list[tuple[str, dict[str, Any]]]] | None = None,
+    **kwargs: Any,
+) -> tuple[Any, list[Any]]:
+    """Run the real loop on a single-action block, then ask its completion judge once, as the step cap would."""
+    real_loop = engine_mod.run_agent_tool_loop
+    verdicts: list[Any] = []
+
+    async def _loop_then_judge(**loop_kwargs: Any) -> Any:
+        outcome = await real_loop(**loop_kwargs)
+        if loop_kwargs["block_completion_check"] is not None:
+            verdicts.append(await loop_kwargs["block_completion_check"]())
+        return outcome
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _loop_then_judge)
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller(script or [[("finish", {"status": "completed", "reason": "done"})]]),
+        single_action_block=True,
+        block_completion_judge=judge,
+        **kwargs,
+    )
+    return outcome, verdicts
+
+
+@pytest.mark.asyncio
+async def test_engine_block_completion_judge_skips_after_a_secret_typed_in_this_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The secret's field can still be on screen and pixels cannot be redacted.
+    from skyvern.forge.taskv3 import engine as engine_mod
+    from skyvern.forge.taskv3.goal_check import TrailEntry
+    from skyvern.forge.taskv3.loop import LoopOutcome
+
+    prompts: list[str] = []
+    verdicts: list[Any] = []
+
+    async def _capture(**kwargs: Any) -> LoopOutcome:
+        kwargs["tool_trail"].record(
+            TrailEntry(
+                tool="type", status="ok", content="typed", perception=False, page_changing=True, secret_entered=True
+            )
+        )
+        verdicts.append(await kwargs["block_completion_check"]())
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([]),
+        goal="x",
+        single_action_block=True,
+        block_completion_judge=_achieving_judge(prompts),
+    )
+
+    [verdict] = verdicts
+    assert verdict.skipped_reason == "secret_entered" and not prompts
 
 
 def test_runaway_backstops_scale_with_action_step_budget() -> None:
@@ -336,11 +592,18 @@ async def test_engine_defers_completion_while_delayed_render_settles(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_page_free_mode_finishes_without_settle_probe() -> None:
-    # Page-free runs have no page to settle: finish(completed) is immediate and the provider is
-    # never consulted.
+async def test_page_free_mode_finishes_without_settle_probe_or_completion_gate() -> None:
+    # Page-free runs have no page to settle or to gate: finish(completed) is immediate and the
+    # provider is never consulted.
     async def no_page() -> Any:
         raise AssertionError("provider must not be consulted in page-free mode")
+
+    gate_calls = 0
+
+    async def refusing_gate() -> bool:
+        nonlocal gate_calls
+        gate_calls += 1
+        return False
 
     script = [[("finish", {"status": "completed", "reason": "criteria hold"})]]
     caller = _ScriptedCaller(script)
@@ -349,10 +612,12 @@ async def test_page_free_mode_finishes_without_settle_probe() -> None:
         llm_caller=caller,
         goal="assess",
         page_free=True,
+        completion_gate=refusing_gate,
         max_action_steps=2,
-        max_turns=4,
+        max_turns=8,
     )
-    assert outcome.status == "completed"
+    assert (outcome.status, outcome.reason, outcome.gate_passed) == ("completed", "criteria hold", False)
+    assert gate_calls == 0
 
 
 @pytest.mark.asyncio
@@ -379,7 +644,7 @@ async def test_bare_run_finishes_without_settle_probe() -> None:
 
 
 @pytest.mark.asyncio
-async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_engine_call_kwargs_carry_only_the_step_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.loop import LoopOutcome
 
@@ -390,13 +655,11 @@ async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPat
         return LoopOutcome(status="completed", reason="ok")
 
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    monkeypatch.setattr(engine_mod.settings, "TASK_V3_TOOL_CHOICE_REQUIRED", False)
 
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x"
     )
-    # None, not {} -- the loop splats **(call_kwargs or {}), so preserving None keeps the
-    # default (lever-off) path byte-identical to before this lever existed.
+    # None, not {} -- the loop splats **(call_kwargs or {}).
     assert captured["call_kwargs"] is None
 
     step = object()
@@ -404,41 +667,6 @@ async def test_engine_omits_tool_choice_by_default(monkeypatch: pytest.MonkeyPat
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", step=step
     )
-    assert captured["call_kwargs"] == {"step": step}
-
-
-@pytest.mark.asyncio
-async def test_engine_requests_tool_choice_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
-    captured: dict[str, object] = {}
-
-    async def _capture(**kwargs: object) -> LoopOutcome:
-        captured.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    monkeypatch.setattr(engine_mod.settings, "TASK_V3_TOOL_CHOICE_REQUIRED", True)
-
-    step = object()
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", step=step
-    )
-
-    assert captured["call_kwargs"] == {"step": step, "tool_choice": "required"}
-
-    # The engine asking the caller is what keeps tool_choice_in_effect honest rather than
-    # aspirational: a model that cannot take the parameter must not have it added at all.
-    class _UnsupportedCaller(_ScriptedCaller):
-        def supports_tool_choice(self) -> bool:
-            return False
-
-    captured.clear()
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_UnsupportedCaller([]), goal="x", step=step
-    )
-
     assert captured["call_kwargs"] == {"step": step}
 
 
@@ -587,35 +815,45 @@ async def test_engine_wires_failure_evidence_gate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_engine_forwards_the_page_probe_and_withholds_it_from_page_free_runs(
+async def test_engine_forwards_the_page_probe_and_document_identity_and_withholds_them_from_page_free_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Drop this kwarg anywhere on the way in and the loop classifies every unflagged error as
-    # non-poisoning -- the fail-open state -- with every loop-level test still green.
+    # Drop either kwarg on the way in and a guard fails open with every loop-level test still green: the
+    # loop classifies every unflagged error as non-poisoning, and the finish tool converts a re-ask
+    # without comparing the document before and after its judge.
     from skyvern.forge.taskv3 import engine as engine_mod
     from skyvern.forge.taskv3.loop import LoopOutcome
 
-    captured: list[object] = []
+    captured: list[tuple[object, object]] = []
+    finish_identities: list[object] = []
+    real_make = engine_mod.make_finish_tool
+
+    def _capture_finish(*args: Any, **kwargs: Any) -> Any:
+        finish_identities.append(kwargs.get("document_identity"))
+        return real_make(*args, **kwargs)
 
     async def _capture(**kwargs: object) -> LoopOutcome:
-        captured.append(kwargs.get("page_probe"))
+        captured.append((kwargs.get("page_probe"), finish_identities[-1]))
         return LoopOutcome(status="completed", reason="ok")
 
     async def probe() -> str | None:
         return "doc-1"
 
+    async def identity() -> str | None:
+        return "doc-1|frame-1"
+
+    monkeypatch.setattr(engine_mod, "make_finish_tool", _capture_finish)
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x", page_probe=probe
-    )
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="x",
-        page_probe=probe,
-        page_free=True,
-    )
-    assert captured == [probe, None]
+    for page_free in (False, True):
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([]),
+            goal="x",
+            page_probe=probe,
+            document_identity=identity,
+            page_free=page_free,
+        )
+    assert captured == [(probe, identity), (None, None)]
 
 
 @pytest.mark.asyncio
@@ -629,6 +867,12 @@ async def test_engine_forwards_the_page_fingerprint_and_withholds_it_from_page_f
     from skyvern.forge.taskv3.loop import LoopOutcome
 
     captured: list[object] = []
+    finish_samplers: list[object] = []
+    real_make = engine_mod.make_finish_tool
+
+    def _capture_finish(*args: Any, **kwargs: Any) -> Any:
+        finish_samplers.append(kwargs.get("page_fingerprint"))
+        return real_make(*args, **kwargs)
 
     async def _capture(**kwargs: object) -> LoopOutcome:
         captured.append(kwargs.get("page_fingerprint"))
@@ -637,21 +881,23 @@ async def test_engine_forwards_the_page_fingerprint_and_withholds_it_from_page_f
     async def fingerprint() -> str | None:
         return "markup-1"
 
+    async def settle() -> str | None:
+        return "markup-#"
+
+    monkeypatch.setattr(engine_mod, "make_finish_tool", _capture_finish)
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="x",
-        page_fingerprint=fingerprint,
-    )
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="x",
-        page_fingerprint=fingerprint,
-        page_free=True,
-    )
-    assert captured == [fingerprint, None]
+    for settle_sampler, page_free in ((None, False), (settle, False), (settle, True)):
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([]),
+            goal="x",
+            page_fingerprint=fingerprint,
+            settle_fingerprint=settle_sampler,
+            page_free=page_free,
+        )
+    assert captured == [fingerprint, fingerprint, None]
+    # The settle gate reads the tick-masked sampler when one is given; stall telemetry keeps the raw one.
+    assert finish_samplers == [fingerprint, settle, None]
 
 
 @pytest.mark.asyncio
@@ -663,7 +909,7 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
     # object, or arm them for a page-free run (which has no page to ask) and disarm them for an
     # ordinary one, and nothing else in the suite would notice.
     from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome, SubmitWatch
+    from skyvern.forge.taskv3.loop import SubmitWatch
 
     finish_args: list[tuple[Any, Any]] = []
     loop_watches: list[Any] = []
@@ -714,6 +960,67 @@ async def test_engine_wires_the_pending_gate_and_withholds_it_from_page_free_run
 
 
 @pytest.mark.asyncio
+async def test_engine_shares_one_semantic_commit_stats_between_the_browser_tools_and_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The counter needs BOTH halves on ONE record: the browser tools increment it, the loop's
+    # terminal record reads it. Wire either half to a different object and every production run
+    # reports 0 opportunities / 0 accepts forever, and nothing else in the suite would notice.
+    tool_stats: list[Any] = []
+    loop_stats: list[Any] = []
+    real_build = engine_mod.build_browser_tools
+    real_loop = engine_mod.run_agent_tool_loop
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        tool_stats.append(kwargs.get("semantic_commit_stats"))
+        return real_build(*args, **kwargs)
+
+    async def capturing_loop(**kwargs: Any) -> LoopOutcome:
+        loop_stats.append(kwargs.get("semantic_commit_stats"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", capturing_loop)
+
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="apply",
+        max_action_steps=2,
+        max_turns=4,
+    )
+    assert isinstance(tool_stats[0], SemanticCommitStats), tool_stats
+    assert loop_stats[0] is tool_stats[0], (loop_stats, tool_stats)
+
+
+@pytest.mark.asyncio
+async def test_engine_omits_semantic_commit_stats_when_the_verify_kill_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tier only ever increments under TASK_V3_SEMANTIC_COMMIT_VERIFY, so with the kill switch
+    # off a live object makes every page-ful run emit 0 opportunities for a tier that is turned
+    # off — the denominator drag omission exists to prevent. The switch and the omission contract
+    # have to agree, or flipping the switch silently corrupts the accept rate instead of ending it.
+    monkeypatch.setattr(settings, "TASK_V3_SEMANTIC_COMMIT_VERIFY", False)
+    loop_stats: list[Any] = []
+    real_loop = engine_mod.run_agent_tool_loop
+
+    async def capturing_loop(**kwargs: Any) -> LoopOutcome:
+        loop_stats.append(kwargs.get("semantic_commit_stats"))
+        return await real_loop(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", capturing_loop)
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+        goal="apply",
+        max_action_steps=2,
+        max_turns=4,
+    )
+    assert loop_stats == [None], loop_stats
+
+
+@pytest.mark.asyncio
 async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
     # A presigned file URL reaches the model only as its opaque_url_ token in the payload; the tools
     # resolve that token to the untouched bytes (navigate's goto, file_upload's download), and the
@@ -736,7 +1043,7 @@ async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pyt
 
     captured_source: dict[str, str] = {}
 
-    async def fake_download_file(source: str, output_dir: str | None = None, organization_id: str | None = None) -> str:
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
         captured_source["source"] = source
         request_info = aiohttp.RequestInfo(
             url=yarl.URL(signed_url), method="GET", headers={}, real_url=yarl.URL(signed_url)
@@ -789,6 +1096,133 @@ async def test_signed_payload_url_reaches_model_only_as_a_token(monkeypatch: pyt
     assert signed_url in outcome.reason  # nosemgrep: incomplete-url-substring-sanitization
     assert token not in outcome.reason
     assert outcome.extracted_output == {"uploaded": [signed_url], "note": f"used {signed_url}"}
+
+
+@pytest.mark.asyncio
+async def test_signed_url_rendered_into_model_facing_text_reaches_model_only_as_a_resolvable_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A workflow template renders a file parameter into the goal, the system guidance and the block URL,
+    # with no payload carrying it. Each must get the same treatment as the payload: token in, real URL out.
+    signature = "f1e2d3c4b5a697887766554433221100aabbccddeeff00112233445566778899"
+    cover_signature = "99887766554433221100ffeeddccbbaa00112233445566778899aabbccddeeff"
+    query = "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260824T000000Z&X-Amz-Expires=2700&X-Amz-SignedHeaders=host"
+    signed_url = f"https://files.example.test/uploads/0123456789abcdef/resume.pdf{query}&X-Amz-Signature={signature}"
+    cover_url = (
+        f"https://files.example.test/uploads/0123456789abcdef/cover.pdf{query}&X-Amz-Signature={cover_signature}"
+    )
+    start_signature = "00112233445566778899aabbccddeeff99887766554433221100ffeeddccbbaa"
+    start_url = f"https://files.example.test/uploads/O'Brien/posting.pdf{query}&X-Amz-Signature={start_signature}"
+    plain_url = "https://portfolio.example.test/jo"
+    goal = f"Fill out the application.\n\nresume: {signed_url}\nportfolio: {plain_url}.\n"
+    # Distinct URLs, so each token can only resolve through the refs minted from its own text.
+    token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(signed_url)
+    cover_token = OpaqueUrlRefs(masked=None, refs={}).mint_in_text(cover_url)
+    # The apostrophe is a legal path character that ends a prose URL match.
+    start_token = OpaqueUrlRefs(masked=None, refs={}).derive(start_url)
+    assert len({token, cover_token, start_token}) == 3 and cover_token.startswith("opaque_url_")
+
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    captured_sources: list[str] = []
+
+    async def fake_download_file(source: str, output_dir: str | None = None, **kwargs: object) -> str:
+        captured_sources.append(source)
+        request_info = aiohttp.RequestInfo(url=yarl.URL(source), method="GET", headers={}, real_url=yarl.URL(source))
+        raise aiohttp.ClientResponseError(request_info=request_info, history=(), status=400, message="Bad Request")
+
+    import skyvern.forge.sdk.api.files as files_module
+
+    monkeypatch.setattr(files_module, "download_file", fake_download_file)
+
+    caller = _ScriptedCaller(
+        [
+            [("file_upload", {"selector": "#cv", "file": token})],
+            [("file_upload", {"selector": "#cover", "file": cover_token})],
+            [("navigate", {"url": start_token})],
+            [("finish", {"status": "failed", "reason": "upload rejected"})],
+        ]
+    )
+    page = _FakePage()
+    skyvern_context.set(SkyvernContext(task_id="tsk_goal"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=caller,
+            goal=goal,
+            parameters=None,
+            starting_url=start_url,
+            extra_system_guidance=f"Always attach the cover letter at {cover_url}",
+        )
+    finally:
+        skyvern_context.reset()
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert f"resume: {token}\n" in user_prompt
+    assert f"You start on: {start_token}" in user_prompt
+    assert f"portfolio: {plain_url}." in user_prompt  # nosemgrep: incomplete-url-substring-sanitization
+    system_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "system")
+    assert f"Always attach the cover letter at {cover_token}" in system_prompt
+    assert OPAQUE_URL_GUIDANCE in system_prompt
+    transcript = json.dumps(outcome.messages)
+    assert all(sig not in transcript for sig in (signature, cover_signature, start_signature))
+    assert captured_sources == [signed_url, cover_url]
+    assert page.url == start_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("block_type", "navigates"), [("validation", False), ("extraction", True), ("action", True)])
+async def test_only_a_validation_block_is_refused_navigation(
+    monkeypatch: pytest.MonkeyPatch, block_type: str, navigates: bool
+) -> None:
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    start_url, other_url = "https://portal.example.test/case", "https://portal.example.test/other"
+    caller = _ScriptedCaller(
+        [[("navigate", {"url": other_url})], [("finish", {"status": "completed", "reason": "checked"})]]
+    )
+    page = _FakePage()
+    page.url = start_url
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=caller,
+        goal="Check the case.",
+        starting_url=start_url,
+        block_type=block_type,
+    )
+
+    assert page.url == (other_url if navigates else start_url)
+    navigate_result = next(m["content"] for m in outcome.messages if m.get("role") == "tool")
+    assert navigate_result.startswith("refused") is not navigates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_url", "masked"),
+    [
+        ("https://portal.example.test/case?ticket=q8ZtR2vXk9LmP4sWb7NcY1hJd6FgT3aE", True),
+        ("https://portal.example.test/case/42", False),
+    ],
+)
+async def test_a_start_url_the_browser_is_on_is_not_offered_as_a_destination(start_url: str, masked: bool) -> None:
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "checked"})]])
+    page = _FakePage()
+    page.url = start_url
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=caller,
+        goal="Check that the case is open.",
+        starting_url=start_url,
+        starting_url_is_current=True,
+    )
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert "You start on" not in user_prompt
+    shown = OpaqueUrlRefs(masked=None, refs={}).derive(start_url) if masked else start_url
+    assert shown in user_prompt
+    assert "ticket=" not in user_prompt
 
 
 @pytest.mark.asyncio
@@ -848,33 +1282,38 @@ async def test_hash_route_job_url_is_not_masked() -> None:
 
 @pytest.mark.asyncio
 async def test_page_free_mode_does_not_mask_signed_urls() -> None:
-    # Page-free mode has no tools to resolve an opaque_url_ token, so the payload stays verbatim.
+    # Page-free mode has no tools to resolve an opaque_url_ token, so every model-facing URL stays verbatim.
     signed_url = "https://files.example.test/uploads/x?token=eyJhbGciOiJIUzI1NiJ9c2lnbmVkQ29ycmVjdEhvcnNl"
     caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "criteria hold"})]])
     outcome = await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),  # never consulted: page_free has no tools
         llm_caller=caller,
-        goal="assess",
+        goal=f"assess {signed_url}",
+        starting_url=signed_url,
         page_free=True,
         parameters={"u": signed_url},
         max_turns=4,
     )
     user_message = next(m for m in outcome.messages if m.get("role") == "user")["content"]
-    assert (
-        signed_url in user_message and "opaque_url_" not in user_message
-    )  # nosemgrep: incomplete-url-substring-sanitization
+    assert f"assess {signed_url}" in user_message  # nosemgrep: incomplete-url-substring-sanitization
+    assert "opaque_url_" not in user_message
 
 
 @pytest.mark.asyncio
-async def test_engine_forwards_completion_hooks_and_gates_guidance_on_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    # completion_probe must reach the loop and completion_blocker must reach the finish tool, and
-    # the download-completion guidance is appended to the system prompt only when a probe is given.
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
+async def test_engine_forwards_download_hooks_without_a_download_order(monkeypatch: pytest.MonkeyPatch) -> None:
     loop_kwargs: dict[str, Any] = {}
     finish_kwargs: dict[str, Any] = {}
+    watches: list[DownloadFailureWatch] = []
+    closed: list[DownloadFailureWatch] = []
+
+    class RecordingWatch(DownloadFailureWatch):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            watches.append(self)
+
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
 
     async def fake_loop(**kwargs: Any) -> LoopOutcome:
         loop_kwargs.update(kwargs)
@@ -886,93 +1325,51 @@ async def test_engine_forwards_completion_hooks_and_gates_guidance_on_probe(monk
         finish_kwargs.update(kwargs)
         return real_make_finish_tool(*args, **kwargs)
 
+    tools_kwargs: dict[str, Any] = {}
+    real_build = engine_mod.build_browser_tools
+
+    def capturing_build(*args: Any, **kwargs: Any) -> Any:
+        tools_kwargs.update(kwargs)
+        return real_build(*args, **kwargs)
+
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
     monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
+    monkeypatch.setattr(engine_mod, "DownloadFailureWatch", RecordingWatch)
+    monkeypatch.setattr(engine_mod, "build_browser_tools", capturing_build)
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
+    async def probe() -> None:
         return None
 
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),
         llm_caller=_ScriptedCaller([]),
         goal="download the file",
-        completion_probe=probe,
-        completion_blocker=blocker,
+        download_wait=probe,
+        download_settle=_no_download_pending,
     )
-    assert loop_kwargs["completion_probe"] is probe
-    assert finish_kwargs["completion_blocker"] is blocker
-    assert DOWNLOAD_COMPLETION_GUIDANCE in loop_kwargs["system_prompt"]
+    assert tools_kwargs["download_wait"] is probe
+    assert finish_kwargs["download_settle"] is _no_download_pending
+    download_prompt = loop_kwargs["system_prompt"]
     # One staged_downloads set is shared between the loop and the finish tool -- a name staged via
-    # a billable tool call must be visible to the SAME finish-tool blocker, not a divergent copy.
+    # a billable tool call must be visible to the SAME finish-tool settle hook, not a divergent copy.
     assert loop_kwargs["staged_downloads"] is finish_kwargs["staged_downloads"]
     assert isinstance(loop_kwargs["staged_downloads"], set)
+    [watch] = watches
+    assert watch in closed
+    assert finish_kwargs["download_facts"] is watch.facts
 
-    loop_kwargs.clear()
-    finish_kwargs.clear()
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="download the file"
     )
-    assert loop_kwargs["completion_probe"] is None
-    assert finish_kwargs["completion_blocker"] is None
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
-
-
-@pytest.mark.asyncio
-async def test_engine_guidance_keyed_on_which_hooks_are_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    # blocker-only (extraction tasks: the probe would end the loop before the model returns
-    # extracted_output) gets the DOWNLOAD_REQUIRED variant naming finish(completed) as the model's
-    # own job; probe-only (download_timeout alone, wait-only) has no completion semantics at all,
-    # so it gets neither guidance string.
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE, DOWNLOAD_REQUIRED_GUIDANCE
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
-    loop_kwargs: dict[str, Any] = {}
-
-    async def fake_loop(**kwargs: Any) -> LoopOutcome:
-        loop_kwargs.update(kwargs)
-        return LoopOutcome(status="completed", reason="ok")
-
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
-
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return None
-
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="download the file",
-        completion_blocker=blocker,
+    assert len(watches) == 1
+    assert finish_kwargs["download_facts"] is None
+    assert (
+        download_prompt.split("\n\nToday's date is")[0] == loop_kwargs["system_prompt"].split("\n\nToday's date is")[0]
     )
-    assert DOWNLOAD_REQUIRED_GUIDANCE in loop_kwargs["system_prompt"]
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
-
-    loop_kwargs.clear()
-
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return None
-
-    await run_task_v3_agent_loop(
-        page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="download the file",
-        completion_probe=probe,
-    )
-    assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
 
 
 @pytest.mark.asyncio
 async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No browser tools exist to trigger a download, so a blocker would refuse finish(completed)
-    # forever; page-free runs get neither hook nor the download guidance.
-    from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.engine import DOWNLOAD_COMPLETION_GUIDANCE, DOWNLOAD_REQUIRED_GUIDANCE
-    from skyvern.forge.taskv3.loop import LoopOutcome
-
     loop_kwargs: dict[str, Any] = {}
     finish_kwargs: dict[str, Any] = {}
 
@@ -989,13 +1386,10 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
     monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
     monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
 
-    async def probe(_staged: frozenset[str]) -> str | None:
-        return "a file finished downloading"
+    async def probe() -> None:
+        return None
 
-    async def blocker(_staged: frozenset[str]) -> str | None:
-        return "no download yet"
-
-    async def verification_blocker() -> str | None:
+    async def verification_blocker(_status: str) -> str | None:
         return "no code arrived"
 
     await run_task_v3_agent_loop(
@@ -1003,15 +1397,12 @@ async def test_engine_drops_download_hooks_in_page_free_mode(monkeypatch: pytest
         llm_caller=_ScriptedCaller([]),
         goal="validate the record",
         page_free=True,
-        completion_probe=probe,
-        completion_blocker=blocker,
+        download_wait=probe,
+        download_settle=_no_download_pending,
         verification_blocker=verification_blocker,
     )
-    assert loop_kwargs["completion_probe"] is None
-    assert finish_kwargs["completion_blocker"] is None
+    assert finish_kwargs["download_settle"] is None
     assert finish_kwargs["verification_blocker"] is None
-    assert DOWNLOAD_COMPLETION_GUIDANCE not in loop_kwargs["system_prompt"]
-    assert DOWNLOAD_REQUIRED_GUIDANCE not in loop_kwargs["system_prompt"]
 
 
 @pytest.mark.asyncio
@@ -1149,7 +1540,122 @@ def test_engine_omits_summary_when_caller_denies_the_bridge() -> None:
         add_assistant_prefix=False,
         reasoning_effort="high",
     )
-    assert engine_mod._reasoning_effort_with_summary(caller) is None
+    assert reasoning_effort_with_summary(caller) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arm", "bridged", "primary_keys", "carries", "primary_model", "route"),
+    [
+        ("treatment", True, ("a",), True, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, ("a", "b"), False, "openai/responses/gpt-test", "main_group_differs"),
+        ("treatment", False, ("a",), False, "openai/responses/gpt-test", "not_responses_bridge"),
+        ("treatment", True, ("a",), False, "azure/responses/gpt-test", "azure"),
+        ("control", True, ("a",), False, "openai/responses/gpt-test", "carries"),
+        (None, True, ("a",), False, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, (), True, "openai/responses/gpt-test", "carries"),
+        ("treatment", True, (), False, "azure/responses/gpt-test", "azure"),
+    ],
+    ids=[
+        "treatment",
+        "primary_cannot_share",
+        "not_bridged",
+        "azure_primary",
+        "control",
+        "unresolved",
+        "direct",
+        "direct_azure",
+    ],
+)
+async def test_reasoning_is_carried_only_on_treatment_over_a_bridged_primary_group(
+    arm: str | None, bridged: bool, primary_keys: tuple[str, ...], carries: bool, primary_model: str, route: str
+) -> None:
+    # The other endpoint is a fallback group only, so it does not change whether the run carries; no primary keys means a
+    # direct config.
+    deployments = [
+        LLMRouterModelConfig(model_name="primary", litellm_params={"model": primary_model, "api_key": key})
+        for key in primary_keys
+    ]
+    deployments.append(
+        LLMRouterModelConfig(
+            model_name="other-endpoint",
+            litellm_params={"model": "azure/responses/gpt-test", "api_base": "https://other.example.test"},
+        )
+    )
+    caller = _ReasoningCaller([[("observe", {})], [("finish", {"status": "completed", "reason": "ok"})]])
+    caller.uses_openai_responses_bridge = lambda: bridged
+    caller.last_served_model_group = "primary" if primary_keys else None
+    caller.llm_config = (
+        LLMRouterConfig(
+            model_name="scope-router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=deployments,
+            main_model_group="primary",
+            fallback_model_group="other-endpoint",
+        )
+        if primary_keys
+        else LLMConfig(model_name=primary_model, required_env_vars=[], supports_vision=True, add_assistant_prefix=False)
+    )
+    context = SkyvernContext(run_arms={CARRY_REASONING_FLAG: ("wr_1", arm)} if arm else {})
+    skyvern_context.set(context)
+    try:
+        with capture_logs() as logs:
+            await run_task_v3_agent_loop(page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="x")
+    finally:
+        skyvern_context.reset()
+
+    finished = next(e for e in logs if e["event"] == "taskv3 engine loop finished")
+    assert finished["carry_reasoning_arm"] == (arm or "unrandomized")
+    assert finished["carry_reasoning_route"] == route
+    assert finished["carry_reasoning_stripped"] is False
+    assert finished["carried_reasoning_turns"] == (2 if carries else 0)
+    assert any(m.get("reasoning_items") for m in caller.sent[-1]) is carries
+
+
+def test_any_difference_between_main_group_deployments_stops_the_carry() -> None:
+    # Any parameter, including one no code names, can make two deployments different places; fallback groups never
+    # decide whether a run carries.
+    rng = random.Random(19364)
+    values: dict[str, list[Any]] = {
+        "model": ["openai/responses/gpt-a", "openai/gpt-a", "openai/responses/gpt-b", "azure/responses/gpt-a"],
+        "api_key": ["k1", "k2", None],
+        "api_base": [None, "https://a.example.test", "https://b.example.test"],
+        "api_version": [None, "2025-01-01"],
+        "service_tier": [None, "flex"],
+        "timeout": [60, 600],
+    }
+    for case in range(400):
+        base = {key: rng.choice(options) for key, options in values.items() if rng.random() < 0.8}
+        base.setdefault("model", rng.choice(values["model"]))
+        main = []
+        for _ in range(rng.randint(1, 3)):
+            params = dict(base)
+            if rng.random() < 0.4:
+                key = rng.choice([*values, f"unlisted_{case}"])
+                params[key] = rng.choice([*values.get(key, []), f"other_{case}"])
+            main.append(params)
+        deployments = [LLMRouterModelConfig(model_name="primary", litellm_params=params) for params in main]
+        deployments += [
+            LLMRouterModelConfig(model_name=f"fallback-{i}", litellm_params={"model": rng.choice(values["model"])})
+            for i in range(rng.randint(0, 2))
+        ]
+        caller = SimpleNamespace(
+            uses_openai_responses_bridge=lambda: True,
+            llm_config=LLMRouterConfig(
+                model_name="router",
+                required_env_vars=[],
+                supports_vision=True,
+                add_assistant_prefix=False,
+                model_list=deployments,
+                main_model_group="primary",
+                fallback_model_group=[d.model_name for d in deployments if d.model_name != "primary"] or None,
+            ),
+        )
+        identical = all(params == main[0] for params in main)
+        toward_azure = any(str(params["model"]).startswith("azure/") for params in main)
+        assert carries_reasoning(caller) is (identical and not toward_azure), (case, main)
 
 
 def test_bridge_check_mirrors_litellm_dispatched_name_only() -> None:
@@ -1268,11 +1774,490 @@ def test_caller_level_bridge_check_denies_openai_provider_with_custom_api_base()
 
 
 @pytest.mark.asyncio
+async def test_terminal_log_carries_the_guard_class_that_ended_the_run() -> None:
+    # The class a guard verdict used to prefix onto the customer-facing reason lives here now, one row
+    # per run (SKY-16271): a dashboard counting how often a policy ends a run reads this field, so it
+    # has to survive the trip out of the loop.
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "never runs"})]]),
+            goal="x",
+            initial_navigation_status=404,
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert outcome.status == "terminated"
+    assert terminal[0]["status"] == "terminated"
+    assert terminal[0]["guard"] == NAV_DEAD_END_GUARD
+    assert terminal[0]["llm_key"] == "SCRIPTED_TEST_KEY"
+
+    # A model-authored verdict carries no guard, so the field partitions cleanly.
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+            goal="x",
+        )
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert terminal[0]["guard"] is None
+
+
+async def _run_with_application_context_arm(
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+    script: list[list[tuple[str, dict[str, Any]]]],
+    *,
+    hook: Any = ("TIER ONE", "AGE TEXT", "SIX TEXT"),
+    page_free: bool = False,
+    payload_check: tuple[str | None, str] = ("SIX AND TIER ONE", "rendered"),
+) -> tuple[Any, _ScriptedCaller, dict[str, Any], list[Any]]:
+    """Today's hooks qualify the payload; the audit hook records that it ran, whatever the run declares."""
+    context_calls: list[Any] = []
+    audit_calls: list[Any] = []
+    payload_hook_calls: list[str] = []
+
+    async def audit(parameters: Any, *, goal: str, organization_id: Any, step: Any, declaring: Any = "absent") -> None:
+        audit_calls.append(declaring)
+
+    def texts(parameters: Any) -> Any:
+        context_calls.append(parameters)
+        return hook
+
+    def age_hook(parameters: Any) -> tuple[str | None, str]:
+        payload_hook_calls.append("age")
+        return ("AGE TEXT", "rendered")
+
+    def defaults_hook(parameters: Any) -> tuple[str | None, str]:
+        payload_hook_calls.append("defaults")
+        return payload_check
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", age_hook)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", defaults_hook)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", texts)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", audit)
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", arm)}
+    skyvern_context.set(ctx)
+    caller = _ScriptedCaller(script)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=caller,
+                goal="Apply.",
+                parameters={"resume": "text"},
+                page_free=page_free,
+            )
+    finally:
+        skyvern_context.reset()
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    declaring_run = arm == "treatment" and hook is not None and not page_free
+    assert audit_calls == ([] if page_free else [True if declaring_run else "absent"])
+    # A declaring run reads every log fact off its one context call.
+    assert payload_hook_calls == ([] if page_free or declaring_run else ["age", "defaults"])
+    return outcome, caller, terminal, context_calls
+
+
+def _user_texts(outcome: Any) -> list[str]:
+    return [m["content"] for m in outcome.messages if m["role"] == "user" and isinstance(m.get("content"), str)]
+
+
+def _sent_tool_names(caller: _ScriptedCaller) -> set[str]:
+    return {tool["function"]["name"] for tool in caller.sent_tools or []}
+
+
+_FINISH_ONLY = [[("finish", {"status": "completed", "reason": "ok"})]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", ["control", "unrandomized"])
+async def test_application_context_arm_off_leaves_the_run_as_today(monkeypatch: pytest.MonkeyPatch, arm: str) -> None:
+    outcome, caller, terminal, context_calls = await _run_with_application_context_arm(monkeypatch, arm, _FINISH_ONLY)
+    assert context_calls == []
+    assert "declare_application_context" not in _sent_tool_names(caller)
+    users = _user_texts(outcome)
+    assert users[0].endswith("\n\nAGE TEXT\n\nSIX AND TIER ONE")
+    assert not any("declare_application_context" in text for text in users)
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (True, True)
+    assert (terminal["application_context_arm"], terminal["application_context"]) == (arm, None)
+    assert terminal["application_defaults_delivered"] is None
+    assert (terminal["age_default_reason"], terminal["application_defaults_reason"]) == ("rendered", "rendered")
+    assert terminal["application_payload_qualified"] is True
+    assert terminal["answer_audit_trigger"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_declared_yes_delivers_the_defaults_once_after_the_first_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcome, caller, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch,
+        "treatment",
+        [
+            [("declare_application_context", {"is_job_application": True})],
+            [("declare_application_context", {"is_job_application": True})],
+            [("finish", {"status": "completed", "reason": "ok"})],
+        ],
+    )
+    assert "declare_application_context" in _sent_tool_names(caller)
+    users = _user_texts(outcome)
+    assert users[0].endswith("\n\nTIER ONE")
+    assert users.count("AGE TEXT\n\nSIX TEXT") == 1
+    assert terminal["application_context"] == "yes_declared"
+    assert terminal["application_defaults_delivered"] is True
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (True, True)
+    assert terminal["application_payload_qualified"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_turn,state",
+    [
+        ([("declare_application_context", {"is_job_application": False})], "no_declared"),
+        ([], "no_implicit"),
+    ],
+)
+async def test_a_payload_qualified_run_without_a_yes_keeps_tier_one_and_the_audit_and_loses_the_defaults(
+    monkeypatch: pytest.MonkeyPatch, first_turn: list[tuple[str, dict[str, Any]]], state: str
+) -> None:
+    script = [*([first_turn] if first_turn else []), *_FINISH_ONLY, *_FINISH_ONLY]
+    outcome, _, terminal, _ = await _run_with_application_context_arm(monkeypatch, "treatment", script)
+    joined = "\n".join(_user_texts(outcome))
+    assert _user_texts(outcome)[0].endswith("\n\nTIER ONE")
+    assert "AGE TEXT" not in joined and "SIX" not in joined
+    assert terminal["application_context"] == state
+    assert terminal["application_defaults_delivered"] is False
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (False, False)
+    assert terminal["application_payload_qualified"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_yes_on_a_run_the_payload_check_misses_logs_the_two_apart(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, _, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch,
+        "treatment",
+        [[("declare_application_context", {"is_job_application": True})], *_FINISH_ONLY],
+        hook=(None, "AGE TEXT", "SIX TEXT"),
+    )
+    assert "AGE TEXT\n\nSIX TEXT" in _user_texts(outcome)
+    assert terminal["application_payload_qualified"] is False
+    assert terminal["application_defaults_delivered"] is True
+    assert terminal["application_defaults_reason"] == "not_job_application"
+
+
+@pytest.mark.asyncio
+async def test_a_withheld_age_text_stays_out_of_a_yes(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, _, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch,
+        "treatment",
+        [[("declare_application_context", {"is_job_application": True})], *_FINISH_ONLY],
+        hook=("TIER ONE", None, "SIX TEXT"),
+    )
+    assert "SIX TEXT" in _user_texts(outcome)
+    assert (terminal["age_default_rendered"], terminal["application_defaults_rendered"]) == (False, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hook,age_reason,defaults_reason,qualified",
+    [
+        (("TIER ONE", "AGE TEXT", "SIX TEXT"), "rendered", "rendered", True),
+        (("TIER ONE", None, "SIX TEXT"), "age_field_present", "rendered", True),
+        ((None, "AGE TEXT", "SIX TEXT"), "not_job_application", "not_job_application", False),
+        ((None, None, "SIX TEXT"), "not_job_application", "not_job_application", False),
+    ],
+)
+async def test_a_declaring_run_logs_the_payload_check_values_from_its_one_context_call(
+    monkeypatch: pytest.MonkeyPatch, hook: Any, age_reason: str, defaults_reason: str, qualified: bool
+) -> None:
+    _, _, terminal, context_calls = await _run_with_application_context_arm(
+        monkeypatch, "treatment", _FINISH_ONLY, hook=hook
+    )
+    assert len(context_calls) == 1
+    assert (terminal["age_default_reason"], terminal["application_defaults_reason"]) == (age_reason, defaults_reason)
+    assert terminal["application_payload_qualified"] is qualified
+
+
+async def _run_declaring_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    script: list[list[tuple[str, dict[str, Any]]]],
+    *,
+    task_text: str | None,
+    audit_present: bool = True,
+    log_only_arm: str = "control",
+) -> tuple[dict[str, Any], dict[str, Any], list[bool]]:
+    """Runs a treatment run with `probe_armed` tool calls in the script, each reading the audit's armed state."""
+    applied: dict[str, Any] = {}
+    readings: list[bool] = []
+
+    async def audit_hook(parameters: Any, *, goal: str, organization_id: Any, step: Any, declaring: bool) -> Any:
+        assert declaring is True
+        return object() if audit_present else None
+
+    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
+        applied.update(kwargs, audit=answer_audit)
+
+    async def probe(args: dict[str, Any]) -> ToolResult:
+        readings.append(applied["armed"]())
+        return ToolResult.ok("read")
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", lambda p: (task_text, "AGE", "SIX"))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", audit_hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", "treatment"), ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", log_only_arm)}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller(script),
+                goal="Apply.",
+                parameters={"background": "text"},
+                extra_tools=[ToolSpec(name="probe_armed", description="", parameters={}, handler=probe)],
+            )
+    finally:
+        skyvern_context.reset()
+    return applied, next(e for e in logs if e.get("event") == "taskv3 engine loop finished"), readings
+
+
+_PROBE = [("probe_armed", {})]
+_DECLARE_YES = [("declare_application_context", {"is_job_application": True})]
+_DECLARE_NO = [("declare_application_context", {"is_job_application": False})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_text,script,readings,trigger,active",
+    [
+        (None, [_PROBE, _DECLARE_YES, _PROBE, *_FINISH_ONLY], [False, True], "declaration", False),
+        (None, [_PROBE, _DECLARE_NO, _PROBE, *_FINISH_ONLY], [False, False], None, False),
+        (None, [_PROBE, _PROBE, *_FINISH_ONLY], [False, False], None, False),
+        ("TIER ONE", [_PROBE, _DECLARE_NO, _PROBE, *_FINISH_ONLY], [True, True], "payload", True),
+    ],
+    ids=["key-miss-yes", "key-miss-no", "key-miss-silent", "key-hit-armed-from-turn-1"],
+)
+async def test_the_audit_arms_on_the_payload_check_or_a_declared_yes(
+    monkeypatch: pytest.MonkeyPatch,
+    task_text: str | None,
+    script: Any,
+    readings: list[bool],
+    trigger: str | None,
+    active: bool,
+) -> None:
+    _, terminal, seen = await _run_declaring_audit(monkeypatch, script, task_text=task_text)
+    assert seen == readings
+    assert (terminal["answer_audit_trigger"], terminal["answer_audit_active"]) == (trigger, active)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared_only_log_only", [True, False], ids=["4b", "4a"])
+@pytest.mark.parametrize(
+    "task_text,log_only_arm,expected_4b,expected_4a",
+    [
+        (None, "control", True, False),
+        (None, "treatment", True, True),
+        ("TIER ONE", "control", False, False),
+        ("TIER ONE", "treatment", True, True),
+    ],
+)
+async def test_only_a_run_armed_by_its_declaration_alone_changes_mode_with_the_one_constant(
+    monkeypatch: pytest.MonkeyPatch,
+    declared_only_log_only: bool,
+    task_text: str | None,
+    log_only_arm: str,
+    expected_4b: bool,
+    expected_4a: bool,
+) -> None:
+    monkeypatch.setattr(engine_mod, "DECLARED_ONLY_AUDIT_LOG_ONLY", declared_only_log_only)
+    applied, _, _ = await _run_declaring_audit(
+        monkeypatch, _FINISH_ONLY, task_text=task_text, log_only_arm=log_only_arm
+    )
+    assert applied["log_only"] is (expected_4b if declared_only_log_only else expected_4a)
+    # The hold lines of a declaration-only run are told apart from the log-only arm's whichever mode it runs in.
+    assert ("answer_audit_trigger" in applied["log_fields"]) is (task_text is None)
+
+
+def test_the_declared_only_audit_defaults_to_log_only() -> None:
+    assert engine_mod.DECLARED_ONLY_AUDIT_LOG_ONLY is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_text", [None, "TIER ONE"], ids=["key-miss", "key-hit"])
+async def test_the_kill_switch_leaves_a_declared_yes_without_an_audit(
+    monkeypatch: pytest.MonkeyPatch, task_text: str | None
+) -> None:
+    applied, terminal, _ = await _run_declaring_audit(
+        monkeypatch, [_DECLARE_YES, *_FINISH_ONLY], task_text=task_text, audit_present=False
+    )
+    assert applied["audit"] is None
+    assert (terminal["answer_audit_trigger"], terminal["answer_audit_active"]) == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_never_gets_a_turn_reads_not_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", lambda p: ("TIER", "AGE", "SIX"))
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", "treatment")}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller(_FINISH_ONLY),
+                goal="Apply.",
+                parameters={"resume": "text"},
+                initial_navigation_status=404,
+            )
+    finally:
+        skyvern_context.reset()
+    assert outcome.status == "terminated"
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    assert terminal["application_context"] == "not_asked"
+
+
+@pytest.mark.asyncio
+async def test_a_page_free_run_gets_no_application_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, caller, terminal, context_calls = await _run_with_application_context_arm(
+        monkeypatch, "treatment", _FINISH_ONLY, page_free=True
+    )
+    assert context_calls == []
+    assert "declare_application_context" not in _sent_tool_names(caller)
+    assert not any("declare_application_context" in text for text in _user_texts(outcome))
+    assert terminal["application_context"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_hook_texts_means_no_tool_and_no_notice_even_on_treatment(monkeypatch: pytest.MonkeyPatch) -> None:
+    outcome, caller, terminal, _ = await _run_with_application_context_arm(
+        monkeypatch, "treatment", _FINISH_ONLY, hook=None
+    )
+    assert "declare_application_context" not in _sent_tool_names(caller)
+    assert not any("declare_application_context" in text for text in _user_texts(outcome))
+    assert _user_texts(outcome)[0].endswith("\n\nAGE TEXT\n\nSIX AND TIER ONE")
+    assert terminal["application_context"] is None
+
+
+@pytest.mark.asyncio
+async def test_operator_defaults_ride_the_task_message_only_and_leave_the_system_prompt_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Hook = tuple[str | None, str] | None
+
+    async def run(age: Hook, application: Hook) -> tuple[str, str, dict[str, Any]]:
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_age_default", lambda parameters: age)
+        monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_defaults", lambda parameters: application)
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+                goal="Apply.",
+                parameters={"resume": "text"},
+            )
+        by_role = {m["role"]: m["content"] for m in outcome.messages if m.get("role") in ("system", "user")}
+        terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+        return by_role["system"], by_role["user"], terminal
+
+    base_system, base_user, base_log = await run(None, None)
+    withheld_system, withheld_user, withheld_log = await run((None, "age_field_present"), None)
+    age_system, age_user, age_log = await run(("AGE DEFAULT TEXT", "rendered"), None)
+    both_system, both_user, both_log = await run((None, "age_field_present"), ("APPLICATION DEFAULTS TEXT", "rendered"))
+    all_system, all_user, all_log = await run(
+        ("AGE DEFAULT TEXT", "rendered"), ("APPLICATION DEFAULTS TEXT", "rendered")
+    )
+
+    assert base_system.startswith(SYSTEM_PROMPT)
+    assert base_system == withheld_system == age_system == both_system == all_system
+    assert base_user == withheld_user and age_user == base_user + "\n\nAGE DEFAULT TEXT"
+    assert both_user == base_user + "\n\nAPPLICATION DEFAULTS TEXT"
+    assert all_user == base_user + "\n\nAGE DEFAULT TEXT\n\nAPPLICATION DEFAULTS TEXT"
+    assert (base_log["age_default_rendered"], base_log["age_default_reason"]) == (False, None)
+    assert (withheld_log["age_default_rendered"], withheld_log["age_default_reason"]) == (False, "age_field_present")
+    assert (age_log["age_default_rendered"], age_log["age_default_reason"]) == (True, "rendered")
+    # Each default keeps its own field, so one entry's outcome read never counts the other's renders.
+    assert (both_log["age_default_rendered"], both_log["application_defaults_rendered"]) == (False, True)
+    assert (age_log["application_defaults_rendered"], age_log["application_defaults_reason"]) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_the_answer_audit_wraps_the_run_tools_and_sees_the_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    hook_calls: list[dict[str, Any]] = []
+    applied: list[tuple[list[str], object]] = []
+    audit = object()
+
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object:
+        hook_calls.append({"parameters": parameters, "goal": goal})
+        return audit
+
+    def spy(tools: list[Any], answer_audit: Any, **_kwargs: Any) -> None:
+        applied.append(([t.name for t in tools], answer_audit))
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    signed = "https://files.example.test/uploads/deadbeef/resume.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    for page_free in (False, True):
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+            goal="Apply.",
+            goal_instructions="Answer citizenship from the resume.",
+            parameters={"resume": "text", "file": signed},
+            page_free=page_free,
+        )
+
+    # Only the run with a page is audited, and its judge reads the instructions beside the goal and the data with
+    # signed URLs masked: a raw one would hand its token to the judge's model.
+    assert len(hook_calls) == 1
+    assert hook_calls[0]["parameters"] == mask_opaque_urls({"resume": "text", "file": signed}).masked
+    assert "eyJhbGci" not in str(hook_calls[0]["parameters"]) and "text" in str(hook_calls[0]["parameters"])
+    assert "Apply." in hook_calls[0]["goal"] and "Answer citizenship from the resume." in hook_calls[0]["goal"]
+    assert "click" in applied[0][0] and applied[0][1] is audit
+    assert applied[1][1] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_installed", [True, False])
+@pytest.mark.parametrize("audit_arm", ["unrandomized", "control", "treatment"])
+async def test_the_log_only_arm_changes_the_run_only_on_treatment(
+    monkeypatch: pytest.MonkeyPatch, audit_arm: str, audit_installed: bool
+) -> None:
+    applied: list[dict[str, Any]] = []
+
+    async def hook(parameters: Any, *, goal: str, organization_id: Any, step: Any) -> object | None:
+        return object() if audit_installed else None
+
+    def spy(tools: list[Any], answer_audit: Any, **kwargs: Any) -> None:
+        applied.append(kwargs)
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_answer_basis_audit", hook)
+    monkeypatch.setattr(engine_mod, "apply_answer_basis_audit", spy)
+    ctx = SkyvernContext()
+    ctx.run_arms = {ANSWER_AUDIT_LOG_ONLY_FLAG: ("wr_1", audit_arm)} if audit_arm != "unrandomized" else {}
+    skyvern_context.set(ctx)
+    try:
+        with capture_logs() as logs:
+            outcome = await run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "ok"})]]),
+                goal="Apply.",
+                parameters={"resume": "text"},
+            )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert applied == [
+        {"log_only": audit_arm == "treatment", "log_fields": {"audit_mode_arm": audit_arm}, "armed": None}
+    ]
+    terminal = next(e for e in logs if e.get("event") == "taskv3 engine loop finished")
+    assert (terminal["audit_mode_arm"], terminal["answer_audit_active"]) == (audit_arm, audit_installed)
+    assert terminal["answer_audit_trigger"] == ("payload" if audit_installed else None)
+
+
+@pytest.mark.asyncio
 async def test_terminal_log_carries_duration_and_block_type() -> None:
     # The v1-vs-v3 wall-time dashboard reads this log line; it needs the loop's own wall-clock and
     # the block context to slice workflow-block runs (SKY-15499).
-    from structlog.testing import capture_logs
-
     script = [[("finish", {"status": "completed", "reason": "ok"})]]
     with capture_logs() as logs:
         await run_task_v3_agent_loop(
@@ -1284,6 +2269,7 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
     terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
     assert len(terminal) == 1
     assert terminal[0]["block_type"] == "navigation"
+    assert terminal[0]["llm_key"] == "SCRIPTED_TEST_KEY"
     assert isinstance(terminal[0]["duration_seconds"], float)
     assert terminal[0]["duration_seconds"] >= 0.0
 
@@ -1298,32 +2284,1536 @@ async def test_terminal_log_carries_duration_and_block_type() -> None:
 
 
 @pytest.mark.asyncio
-async def test_engine_forwards_the_error_code_mapping_to_the_finish_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The engine hop is the one link no other test covers: the agent-side wiring test mocks the loop,
-    # the loop tests call make_finish_tool directly, and the agent tests hand-build a LoopOutcome. Drop
-    # this pass-through and the codes silently stop reaching the model in production.
+@pytest.mark.parametrize(
+    ("block_type", "refused_count"), [("extraction", 1), ("task", 0), ("navigation", 0), (None, 0)]
+)
+async def test_entry_is_refused_only_in_an_extraction_block(block_type: str | None, refused_count: int) -> None:
+    script = [
+        [("type", {"selector": "#q", "text": "Jane Doe"})],
+        [("finish", {"status": "completed", "reason": "ok"})],
+    ]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+            block_type=block_type,
+        )
+    refused = [e for e in logs if e.get("event") == "taskv3 loop extraction entry refused"]
+    assert len(refused) == refused_count
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_carries_loop_telemetry_and_the_two_terminal_records_stay_dead() -> None:
+    # The only test that can catch the loop telemetry silently dropping off this line, or either
+    # per-run record it replaced coming back — everything else asserts the payload, not the join.
+    script = [[("finish", {"status": "completed", "reason": "ok"})]]
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller(script),
+            goal="x",
+        )
+
+    assert not [e for e in logs if e.get("event") == "taskv3 loop progress ledger final"]
+    assert not [e for e in logs if e.get("event") == "taskv3 canonical progress final"]
+
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1, terminal
+    record = terminal[0]
+    assert record["form_ever_armed"] is False
+    assert record["llm_key"] == "SCRIPTED_TEST_KEY"
+    for member in _ProgressEvidence:
+        assert f"clear_{member.value}" in record, record
+    assert record["status"] == "completed"
+    assert isinstance(record["turns"], int)
+    assert "outcome_status" not in record, record
+
+
+@pytest.mark.asyncio
+async def test_terminal_log_merges_a_fully_populated_telemetry_without_colliding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The sibling test above drives a bare run, so it merges an almost-empty payload — it would stay
+    # green if a ledger or semantic-commit key ever collided with one of this line's fixed kwargs,
+    # and that collision is a TypeError inside LOG.info that would take the whole run's record with
+    # it. This one hands the engine the maximal payload every optional branch can produce.
     from skyvern.forge.taskv3 import engine as engine_mod
-    from skyvern.forge.taskv3.loop import LoopOutcome
+    from skyvern.forge.taskv3.loop import LedgerTerminalFields, TerminalTelemetry
 
-    finish_kwargs: dict[str, Any] = {}
+    stats = SemanticCommitStats(opportunities=3, accepts=2)
+    telemetry = TerminalTelemetry(
+        form_ever_armed=True,
+        survival={
+            "peak_same_touches": 5,
+            "peak_same_errors": 2,
+            "looping_targets": 1,
+            **{f"clear_{member.value}": 1 for member in _ProgressEvidence},
+        },
+        ledger=LedgerTerminalFields(
+            peak_actions_since_progress=9,
+            actions_since_progress=4,
+            form_armed=False,
+            would_fire=True,
+        ),
+        peak_page_state_stall_rounds=6,
+        peak_probe_revisits=7,
+        semantic_commit=stats,
+    )
 
-    async def fake_loop(**kwargs: Any) -> LoopOutcome:
-        return LoopOutcome(status="completed", reason="ok")
+    async def _loaded(**kwargs: object) -> LoopOutcome:
+        outcome = LoopOutcome(status="completed", reason="ok")
+        outcome.telemetry = telemetry
+        return outcome
 
-    real_make_finish_tool = engine_mod.make_finish_tool
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _loaded)
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=_ScriptedCaller([]), goal="x"
+        )
 
-    def capturing_make_finish_tool(*args: Any, **kwargs: Any) -> Any:
-        finish_kwargs.update(kwargs)
-        return real_make_finish_tool(*args, **kwargs)
+    terminal = [e for e in logs if e.get("event") == "taskv3 engine loop finished"]
+    assert len(terminal) == 1, terminal
+    record = terminal[0]
+    # Every key the payload can carry survives the merge, and the line's own kwargs are untouched.
+    for key, value in telemetry.log_fields().items():
+        assert record[key] == value, (key, record)
+    assert record["status"] == "completed"
+    assert record["block_type"] is None
+    # form_armed and form_ever_armed now ride the same record and mean different things.
+    assert record["form_armed"] is False
+    assert record["form_ever_armed"] is True
 
-    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", fake_loop)
-    monkeypatch.setattr(engine_mod, "make_finish_tool", capturing_make_finish_tool)
 
-    mapping = {"COVERAGE_NOT_ACTIVE": "The member has no active plan today."}
+def _advertised(caller: _ScriptedCaller) -> set[str]:
+    """The tool names the MODEL was actually offered, read off the request the caller built."""
+    return {t["function"]["name"] for t in (caller.sent_tools or [])}
+
+
+def _stub_code_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok("{}")
+
+    return ToolSpec(CODE_TOOL_NAME, "run python", {"type": "object", "properties": {}}, handler)
+
+
+async def _run_to_finish(caller: _ScriptedCaller) -> None:
+    skyvern_context.set(SkyvernContext(task_id="tsk_surface"))
+    try:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Do the thing.",
+            starting_url="https://example.test/",
+        )
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.asyncio
+async def test_the_model_is_offered_the_users_error_codes_on_finish() -> None:
+    caller = _ScriptedCaller(
+        [[("finish", {"status": "failed", "reason": "password rejected", "error_code": "invalid_credentials"})]]
+    )
+    skyvern_context.set(SkyvernContext(task_id="tsk_codes"))
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Sign in.",
+            error_code_mapping={"invalid_credentials": "The site rejected the password."},
+        )
+    finally:
+        skyvern_context.reset()
+
+    (finish,) = (t for t in caller.sent_tools or [] if t["function"]["name"] == "finish")
+    assert "invalid_credentials" in finish["function"]["parameters"]["properties"]["error_code"]["enum"]
+    assert outcome.error_code == "invalid_credentials"
+
+
+@pytest.mark.asyncio
+async def test_code_tool_surface_off_never_asks_the_deployment_for_a_code_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+    caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+    await _run_to_finish(caller)
+
+    assert not asked
+    assert CODE_TOOL_NAME not in _advertised(caller)
+
+
+@pytest.mark.asyncio
+async def test_a_surface_offering_the_code_tool_has_it_withheld(monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3: the code tool and frame perception do not run together, and frame perception is always on.
+
+    Code driving the page directly never reaches the wrapper that writes the realm-attributed
+    ledger, so in-frame fills and submits would be invisible to the data-loss guard and the
+    completion gate. Asserted at the advertised-tool set, not at the gate, because what matters is
+    that the model is never offered the tool -- a gate that runs and then leaks is still a leak.
+    """
+    asked = False
+
+    async def _build(**kwargs: Any) -> ToolSpec | None:
+        nonlocal asked
+        asked = True
+        return _stub_code_tool()
+
+    monkeypatch.setattr(app.AGENT_FUNCTION, "build_task_v3_code_tool", _build)
+
+    for surface in ("add", "replace"):
+        monkeypatch.setattr(settings, "TASK_V3_CODE_TOOL_SURFACE", surface)
+        caller = _ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]])
+        with capture_logs() as logs:
+            await _run_to_finish(caller)
+
+        assert not asked, surface
+        # And `replace` did not strip the action tools on its way to offering nothing.
+        assert _advertised(caller) == _SURFACE_OFF_TOOL_NAMES | {"finish"}, surface
+        withheld = [e for e in logs if e["event"] == "taskv3 code tool withheld"]
+        assert [e["reason"] for e in withheld] == ["frame_perception"], surface
+
+
+# The combobox bullet, pinned verbatim. This bullet produced FIVE defects in one PR, every one of them
+# a claim that some `select_combobox` error class falsifies -- only 4 of its 18 classes are row-related,
+# so guidance quantifying over them is wrong for most. A phrase blacklist cannot fire on wording nobody
+# anticipated ("every refusal provides a recovery action" would pass and is false), so the enforcing
+# mechanism is a snapshot: it fires on ALL change, which is the point for this text and not a cost.
+_COMBOBOX_BULLET = (
+    "- Autocomplete / typeahead / combobox fields (location, school, employer lookups) render suggestions only "
+    "AFTER you type, and the raw text you type is NOT accepted until you pick a suggestion. Use the "
+    "`select_combobox` tool (selector + value) for these — it types, waits for the suggestions to render, selects "
+    "the best-matching one, and verifies the field committed. Do NOT `type` into them or press keys on your own "
+    "initiative. If `select_combobox` returns an error, the field is genuinely unfilled — never treat it as done. "
+    "Act on what that error tells you rather than substituting a value of your own: this field commits only the "
+    "suggestions the page itself offers, and those are often coarser than the value you hold."
+)
+
+
+def test_combobox_bullet_is_pinned_so_every_edit_is_re_derived_against_the_error_taxonomy() -> None:
+    """The property, which the snapshot enforces rather than expresses: the bullet may claim what the
+    MODEL should do, never what an ERROR CONTAINS, and any prohibition is scoped by PROVENANCE (a value
+    or keystroke the model originates) rather than by shape. Four wordings broke the first rule -- "try
+    a fuller value", "pass a listed row's text back" (identical_rows wants a click), "the error states a
+    step" (row-less commit failures state none), "do not retype a longer value" (ambiguous_rows' own
+    next_step IS longer) -- and the unconditional typing ban broke the second, contradicting
+    identical_rows' "type the value to reopen the list" (tools.py:666).
+
+    WHAT THIS IS: a change-detector, not a correctness test. It cannot tell a semantic defect from a
+    rewording -- editing this constant alongside a broken prompt restores green. All it does is force a
+    human to look, which is the most any test here can do.
+
+    WHY EXACT PROSE, given CLAUDE.md:129 ("do not assert exact prompt prose ... WHEN A BEHAVIOR/CONTRACT
+    ASSERTION EXISTS"): that precondition is not met, and the claim is checkable. Every browser e2e
+    substitutes `ScriptedLLMCaller` for the model -- test_taskv3_fixture_parity.py says so in its own
+    docstring -- so no test in this repo can assert prompt-driven behaviour. The structural fix (a
+    mechanical guidance-vs-next_step consistency check) is tracked as SKY-16299, not built here.
+
+    Updating this snapshot is not a formality: re-derive the new text against every error class in
+    tools.py first, and against the WHOLE bullet -- a new clause can falsify an older one, which is how
+    the pre-existing unconditional typing ban became a live contradiction."""
+    bullet = next(line for line in SYSTEM_PROMPT.splitlines() if "select_combobox` tool" in line)
+
+    assert bullet == _COMBOBOX_BULLET
+
+
+@pytest.mark.asyncio
+async def test_engine_restores_a_blank_working_page_before_the_block_hands_it_on(tmp_path: Path) -> None:
+    # `finish` is assembled outside `build_browser_tools` (engine: browser_tools + extras + finish)
+    # and is therefore never wrapped, so a block shaped `click(download) -> finish` reaches the end
+    # of the loop with the tab still on `about:blank`. The next url-less block inherits it and
+    # `resolve_inherited_workflow_task_page` raises InvalidWorkflowTaskURLState (SKY-16322). Only the
+    # post-loop backstop can repair this shape -- the per-call guard has no later call to run on.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    script = [
+        [("click", {"selector": "#dl"})],
+        [("finish", {"status": "completed", "reason": "downloaded the statement"})],
+    ]
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller(script),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+    )
+
+    assert outcome.status == "completed"
+    assert restored == [(page, before)]
+    assert page.url == before
+
+
+@pytest.mark.asyncio
+async def test_engine_repairs_a_blank_page_when_the_loop_ends_without_another_tool_call(
+    tmp_path: Path,
+) -> None:
+    # The per-call guard repairs BEFORE a tool runs, so it cannot help when the blanking click is the
+    # last thing that happens -- the turn budget runs out and the loop returns with the page still
+    # blank. Only the post-loop backstop covers that, and the next url-less block is what pays.
+    page = _DownloadFakePage(tmp_path)
+    page._click_blanks = True
+    before = page.url
+    restored: list[tuple[Any, str]] = []
+
+    async def _restore(target: Any, url: str) -> None:
+        restored.append((target, url))
+        target.url = url
+
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ScriptedCaller([[("click", {"selector": "#dl"})]]),
+        goal="Download the statement.",
+        restore_page_url=_restore,
+        max_turns=1,
+    )
+
+    assert outcome.status != "completed"  # ran out of turns rather than finishing
+    assert restored == [(page, before)]
+    assert page.url == before
+
+
+def test_caller_level_bridge_check_denies_a_router_config_with_a_non_azure_api_base() -> None:
+    # The single-config check reads api_base off the config; a router config carries it per
+    # deployment instead, so a router pointed at OpenRouter used to slip past and report that it
+    # bridges. It does not, and the dict reasoning_effort that verdict unlocks 400s there.
+    from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    def _router(
+        model: str,
+        api_base: str | None,
+        fallback_model: str | None = None,
+        fallback_api_base: str | None = None,
+    ) -> LLMRouterConfig:
+        return LLMRouterConfig(
+            model_name="group-flex-fallback-router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=[
+                LLMRouterModelConfig(
+                    model_name="group-flex",
+                    litellm_params={"model": model, "api_base": api_base, "service_tier": "flex"},
+                ),
+                LLMRouterModelConfig(
+                    model_name="group-fallback",
+                    litellm_params={
+                        "model": fallback_model if fallback_model is not None else model,
+                        "api_base": fallback_api_base if fallback_model is not None else api_base,
+                    },
+                ),
+            ],
+            main_model_group="group-flex",
+            fallback_model_group="group-fallback",
+        )
+
+    def _verdict(config: LLMRouterConfig) -> bool:
+        return LLMCaller.uses_openai_responses_bridge(
+            SimpleNamespace(openai_client=None, _custom_openrouter=False, llm_config=config, original_llm_key="K")
+        )
+
+    assert _verdict(_router("openrouter/openai/gpt-5.6-luna", "https://openrouter.ai/api/v1")) is False
+    # the two shapes that must keep bridging: real OpenAI needs no api_base, and Azure serves it
+    assert _verdict(_router("gpt-5.6-luna", None)) is True
+    assert _verdict(_router("azure/gpt-5.6-luna", "https://example.openai.azure.com")) is True
+
+    # A MIXED router: one deployment can serve the bridge and one cannot. This is what separates
+    # `any` from `all` — the router picks the deployment, the caller cannot, so one leg that
+    # would reject the dict form has to deny the whole config. Without this case, swapping the
+    # guard to `all` leaves the test green.
+    assert (
+        _verdict(
+            _router(
+                "gpt-5.6-luna",
+                None,
+                fallback_model="openrouter/openai/gpt-5.6-luna",
+                fallback_api_base="https://openrouter.ai/api/v1",
+            )
+        )
+        is False
+    )
+
+
+def test_dispatchable_deployments_covers_every_fallback_group_shape() -> None:
+    # The bridge guard judges a router by the deployments it can actually serve a call from.
+    # No config in the repo today has a deployment outside its groups, or a list-valued fallback,
+    # so these branches are only reachable from here — and a guard that silently widens or
+    # narrows its own input would still look correct on every existing config.
+    from skyvern.forge.sdk.api.llm.api_handler_factory import _dispatchable_deployments
+    from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
+
+    def _leg(name: str) -> LLMRouterModelConfig:
+        return LLMRouterModelConfig(model_name=name, litellm_params={"model": "m"})
+
+    def _config(fallback: str | list[str] | None, names: list[str]) -> LLMRouterConfig:
+        return LLMRouterConfig(
+            model_name="router",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            model_list=[_leg(name) for name in names],
+            main_model_group="main",
+            fallback_model_group=fallback,
+        )
+
+    def _names(fallback: str | list[str] | None, names: list[str]) -> set[str]:
+        return {d.model_name for d in _dispatchable_deployments(_config(fallback, names))}
+
+    # a deployment in neither group is unreachable and must be excluded
+    assert _names("fb", ["main", "fb", "retired"]) == {"main", "fb"}
+    # every fallback shape the type allows
+    assert _names(None, ["main", "fb"]) == {"main"}
+    assert _names([], ["main", "fb"]) == {"main"}
+    assert _names(["fb1", "fb2"], ["main", "fb1", "fb2", "other"]) == {"main", "fb1", "fb2"}
+    # the main group is never dropped
+    assert "main" in _names(["fb1"], ["main", "fb1"])
+
+
+async def _system_prompt_for_run() -> str:
+    """The system message an actual engine run sends."""
+    skyvern_context.set(SkyvernContext())
+    try:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=_ScriptedCaller([[("finish", {"status": "completed", "reason": "done"})]]),
+            goal="noop",
+        )
+    finally:
+        skyvern_context.reset()
+    return next(m for m in outcome.messages if m.get("role") == "system")["content"]
+
+
+_SYSTEM_PROMPT_SHA256 = "aa708d82a5277e0f6f554345aad8a3a2a5bc672473c4f4331e5547918ce75bc9"
+_PAGE_FREE_SYSTEM_PROMPT_SHA256 = "f2467a7f82ea2db5e08b6da7576a3e58371295af0569cfe143d59903d2580f37"
+
+
+def test_system_prompts_are_pinned() -> None:
+    message = (
+        "{} changed. Any change to the Task V3 system prompt needs a dated operator ruling cited in the PR "
+        "(cloud_docs/task-v3/CHARTER.md, Governance) and a deliberate update of this pin."
+    )
+    assert hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest() == _SYSTEM_PROMPT_SHA256, message.format("SYSTEM_PROMPT")
+    assert hashlib.sha256(PAGE_FREE_SYSTEM_PROMPT.encode()).hexdigest() == _PAGE_FREE_SYSTEM_PROMPT_SHA256, (
+        message.format("PAGE_FREE_SYSTEM_PROMPT")
+    )
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_adds_no_submit_pressure() -> None:
+    # The charter's non-negotiable: while the only thing standing between a model error and an
+    # unauthorized submit is a line of system prompt, no prose may compete with it.
+    # Asserted on the prompt the engine actually sends, not the constant.
+    system_prompt = await _system_prompt_for_run()
+    bullet = next(line for line in system_prompt.splitlines() if line.startswith("- Fill fields from the task's data"))
+
+    assert system_prompt.startswith(SYSTEM_PROMPT)
+    assert "submission" not in bullet and "accepted" not in bullet
+    assert "Leave optional fields blank" in bullet
+    contract = next(line for line in system_prompt.splitlines() if "status=completed" in line)
+    assert "every required field holds its intended value" in contract
+    no_submit = "Do not submit forms or take irreversible actions unless the goal explicitly instructs it."
+    assert no_submit in system_prompt
+    # Pinned as a literal so an edit weakening SYSTEM_PROMPT cannot pass by weakening the constant too.
+    do_not_invent = (
+        "Do not invent sensitive or identifying values (government IDs, financial details, or "
+        "legal/eligibility attestations); if one of those is required and not provided, stop and report it "
+        "rather than guessing."
+    )
+    assert do_not_invent in system_prompt
+    # Operator ruling 2026-09-30: the one date-of-birth default, and the contact values it never extends to.
+    birth_year_only = (
+        "If a required date-of-birth field needs a month and day and the task gives only the birth year, "
+        "enter 01/01/<year>. Never invent a street address or phone number."
+    )
+    assert birth_year_only in bullet
+
+
+def _provider_503() -> Exception:
+    return litellm.exceptions.InternalServerError(message="upstream 503", llm_provider="openai", model="gpt-4")
+
+
+def _finish_completion() -> litellm.ModelResponse:
+    finish_call = {
+        "id": "call_0",
+        "type": "function",
+        "function": {"name": "finish", "arguments": json.dumps({"status": "completed", "reason": "done"})},
+    }
+    return litellm.ModelResponse(
+        model="gpt-4",
+        choices=[
+            {"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "tool_calls": [finish_call]}}
+        ],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+
+
+async def _run_v3_against_provider(monkeypatch: pytest.MonkeyPatch, provider: AsyncMock) -> tuple[LoopOutcome, list]:
+    # A real LLMCaller with only the provider round-trip faked, so the engine's wiring, the loop's
+    # retry, and the handler seam all decide together whether a receipt is emitted.
+    llm_config = LLMConfig(model_name="gpt-4", required_env_vars=[], supports_vision=False, add_assistant_prefix=False)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: llm_config)
+    caller = LLMCaller("TEST_TASKV3_EXHAUSTION")
+    monkeypatch.setattr(caller, "_dispatch_llm_call", provider)
+    monkeypatch.setattr(loop_mod, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="noop"
+        )
+    receipts = [log for log in logs if log["event"] == LLM_RETRY_CHAIN_EXHAUSTED_MESSAGE]
+    return outcome, receipts
+
+
+@pytest.mark.asyncio
+async def test_llm_failure_the_loop_retry_recovers_is_not_counted_as_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = AsyncMock(side_effect=[_provider_503(), _provider_503(), _finish_completion()])
+
+    outcome, receipts = await _run_v3_against_provider(monkeypatch, provider)
+
+    assert outcome.status == "completed"
+    assert receipts == []
+
+
+@pytest.mark.asyncio
+async def test_llm_failure_past_every_retry_is_counted_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = AsyncMock(side_effect=[_provider_503() for _ in range(10)])
+
+    outcome, receipts = await _run_v3_against_provider(monkeypatch, provider)
+
+    assert outcome.status == "loop_error"
+    assert [(receipt["llm_key"], receipt["outcome"]) for receipt in receipts] == [
+        ("TEST_TASKV3_EXHAUSTION", "provider_error")
+    ]
+
+
+def _gemini_then_gpt_chain() -> LLMRouterConfig:
+    return LLMRouterConfig(
+        model_name="test-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(model_name="gemini-group", litellm_params={"model": "vertex_ai/gemini-x"}),
+            LLMRouterModelConfig(model_name="gpt-group", litellm_params={"model": "azure/gpt-x"}),
+        ],
+        main_model_group="gemini-group",
+        fallback_model_group="gpt-group",
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        disable_cooldowns=True,
+        temperature=None,
+    )
+
+
+# Each provider call, in order, answers (True) or 503s (False). The first two calls are one loop
+# attempt that exhausts the router's chain; the loop then re-issues the same request.
+V3_FALLBACK_CASES = [
+    pytest.param(
+        [False, False, False, True],
+        "completed",
+        [("recovered", "gemini-group", "gpt-group")],
+        id="retry_recovered_by_the_backup_model_counts_once",
+    ),
+    pytest.param(
+        [False, False, True],
+        "completed",
+        [("primary", "gemini-group", "gemini-group")],
+        id="retry_on_the_same_model_is_not_a_fallback",
+    ),
+    pytest.param([False] * 6, "loop_error", [("exhausted", "gemini-group", None)], id="exhausted_is_not_a_recovery"),
+]
+
+
+@pytest.mark.parametrize(("answers", "status", "expected"), V3_FALLBACK_CASES)
+@pytest.mark.asyncio
+async def test_llm_fallback_outcome_is_reported_once_per_call_intent(
+    monkeypatch: pytest.MonkeyPatch, answers: list[bool], status: str, expected: list[tuple[str, str, str | None]]
+) -> None:
+    # A real LLMCaller over a real litellm.Router, faking only each provider answer, so the router's
+    # fallback, the loop's retry, and both receipts decide together what the metric counts.
+    real_acompletion = litellm.acompletion
+    script = list(answers)
+
+    async def provider(**kwargs: Any) -> Any:
+        answer = _finish_completion() if script.pop(0) else "litellm.InternalServerError"
+        return await real_acompletion(**kwargs, mock_response=answer)
+
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: _gemini_then_gpt_chain())
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    monkeypatch.setattr(loop_mod, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()), llm_caller=LLMCaller("TEST_TASKV3_FALLBACK"), goal="noop"
+        )
+
+    assert outcome.status == status
+    assert fallback_receipts(logs) == expected
+
+
+async def _no_download_pending(_staged: frozenset[str]) -> str | None:
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "judged"),
+    [
+        ({}, 1),
+        ({"download_settle": _no_download_pending}, 0),
+        ({"extraction_requested": True}, 0),
+        ({"page_free": True}, 0),
+    ],
+    ids=["navigation", "download_gated", "extraction", "page_free"],
+)
+async def test_block_completion_judge_skips_blocks_that_verify_their_own_completion(
+    monkeypatch: pytest.MonkeyPatch, scope: dict[str, Any], judged: int
+) -> None:
+    prompts: list[str] = []
+    outcome, verdicts = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
+        script=[[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
+        goal="Open the settings page.",
+        **scope,
+    )
+
+    assert outcome.status == "completed"
+    assert len(prompts) == judged
+    assert len(verdicts) == judged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("deadline_seconds", "judged"), [(10.0, True), (1.0, False)])
+async def test_block_completion_judge_timeout_is_bounded_by_the_runs_deadline(
+    monkeypatch: pytest.MonkeyPatch, deadline_seconds: float, judged: bool
+) -> None:
+    timeouts: list[float] = []
+    real_run_goal_check = engine_mod.run_goal_check
+
+    async def recording_run_goal_check(**kwargs: Any) -> Any:
+        timeouts.append(kwargs["timeout_seconds"])
+        return await real_run_goal_check(**kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_goal_check", recording_run_goal_check)
+    prompts: list[str] = []
+    outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch, _achieving_judge(prompts), goal="Open the settings page.", deadline_seconds=deadline_seconds
+    )
+
+    assert outcome.status == "completed"
+    if judged:
+        (timeout,) = timeouts
+        assert 0 < timeout <= deadline_seconds - engine_mod.GOAL_CHECK_DEADLINE_MARGIN_SECONDS
+        assert len(prompts) == 1
+    else:
+        # One second left is inside the margin: the judge is never called, and the check says why.
+        assert timeouts == []
+        assert prompts == []
+        assert verdict.skipped_reason == "deadline"
+
+
+@pytest.mark.asyncio
+async def test_block_completion_judge_prompt_is_redacted_and_carries_the_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompts: list[str] = []
+    await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
+        goal="Enter the code Qz7Wk2Pm9Rt4.",
+        goal_instructions="If the form is already saved, finish completed.",
+        goal_check_redactor=lambda: lambda text: text.replace("Qz7Wk2Pm9Rt4", "[REDACTED_SECRET]"),
+    )
+
+    (prompt,) = prompts
+    assert "Enter the code [REDACTED_SECRET]." in prompt
+    assert "Qz7Wk2Pm9Rt4" not in prompt
+    assert "If the form is already saved, finish completed." in prompt
+
+
+def _code_delivering_tool() -> ToolSpec:
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        ctx = skyvern_context.current()
+        assert ctx is not None
+        ctx.register_secret_value("482913")
+        return ToolResult.ok("verification_code: 482913")
+
+    return ToolSpec(
+        name="fetch_code", description="fetch_code", parameters={"type": "object", "properties": {}}, handler=handler
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "judged"),
+    [
+        (("type", {"selector": "#first", "text": "John"}), True),
+        (("type", {"selector": "#first", "text": f"{RANDOM_SECRET_ID_PREFIX}password_1"}), False),
+        (("fetch_code", {}), False),
+        (("navigate", {"url": f"https://example.test/login?t={RANDOM_SECRET_ID_PREFIX}token_1"}), False),
+    ],
+    ids=["plain_type", "credential_placeholder", "verification_code", "navigate_placeholder"],
+)
+async def test_block_completion_judge_never_judges_a_block_that_entered_a_secret(
+    monkeypatch: pytest.MonkeyPatch, step: tuple[str, Any], judged: bool
+) -> None:
+    # The judge's screenshot could show the secret, and v3 tools apply no visual secret mask.
+    prompts: list[str] = []
+    skyvern_context.set(SkyvernContext())
+    try:
+        outcome, (verdict,) = await _run_then_judge_block(
+            monkeypatch,
+            _achieving_judge(prompts),
+            # An observe after the secret: the flag must outlive the entry that set it.
+            script=[[step], [("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
+            goal="Sign in.",
+            extra_tools=[_code_delivering_tool()],
+        )
+    finally:
+        skyvern_context.reset()
+
+    assert outcome.status == "completed"
+    assert len(prompts) == (1 if judged else 0)
+    assert verdict.skipped_reason == (None if judged else "secret_entered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("extra_chars", "judged"), [(0, True), (1, False)], ids=["at_cap", "over_cap"])
+async def test_block_completion_judge_never_judges_against_truncated_instructions(
+    monkeypatch: pytest.MonkeyPatch, extra_chars: int, judged: bool
+) -> None:
+    # A rule that decides "done" can sit past the cap; judging against a prefix could fail a correct completion.
+    prompts: list[str] = []
+    _outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
+        goal="Save the form.",
+        goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS + extra_chars),
+    )
+
+    assert len(prompts) == (1 if judged else 0)
+    assert verdict.skipped_reason == (None if judged else "instructions_too_long")
+
+
+@pytest.mark.asyncio
+async def test_block_completion_judge_measures_instructions_after_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Redaction can lengthen text (a short secret becomes a longer marker), and the judge sees the redacted text.
+    prompts: list[str] = []
+
+    def redactor() -> Callable[[str], str]:
+        return lambda text: text.replace("PIN", "[REDACTED_SECRET]")
+
+    _outcome, (verdict,) = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(prompts),
+        goal="Save the form.",
+        goal_instructions="r" * (INSTRUCTIONS_MAX_CHARS - 3) + "PIN",
+        goal_check_redactor=redactor,
+    )
+
+    assert prompts == []
+    assert verdict.skipped_reason == "instructions_too_long"
+
+
+class _ReaskAnsweringCaller(_ScriptedCaller):
+    """The run's own caller, answering the unlisted-outcome re-ask outside the scripted loop turns."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any]) -> None:
+        super().__init__(script)
+        self.answer = answer
+        self.reask_calls: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+        if kwargs.get("prompt_name") == UNLISTED_REASK_PROMPT_NAME:
+            self.reask_calls.append(kwargs)
+            return self.answer
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "asked"),
+    [({}, True), ({"extraction_requested": True}, False), ({"download_settle": _no_download_pending}, False)],
+    ids=["navigation", "extraction", "download_gated"],
+)
+async def test_a_terminated_finish_is_reasked_on_the_runs_own_model_without_a_goal_judge(
+    scope: dict[str, Any], asked: bool
+) -> None:
+    # No goal judge is configured, as on production traffic: the re-ask must still run, on the run's own caller.
+    caller = _ReaskAnsweringCaller(
+        [[("observe", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer={"verdict": "not_completed", "terminate_criterion_holds": False, "skipped_screen": "", "quote": ""},
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=caller,
+        goal="Create the account.",
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        **scope,
+    )
+
+    assert outcome.status == "terminated"
+    assert outcome.converted_from is None
+    if not asked:
+        assert caller.reask_calls == []
+        assert outcome.unlisted_reask is None
+        return
+    (reask,) = caller.reask_calls
+    assert reask["use_message_history"] is False
+    assert "a PIN screen is shown" in reask["prompt"]
+    assert "No PIN screen was shown." in reask["prompt"]
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["asked"] is True
+    assert outcome.unlisted_reask["verdict"] == "not_completed"
+    assert outcome.unlisted_reask["converted"] is False
+
+
+class _PremiseAnsweringCaller(_ScriptedCaller):
+    """The run's own caller, answering the terminate-premise check outside the scripted loop turns."""
+
+    def __init__(self, script: list[list[tuple[str, dict[str, Any]]]], answer: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(script, **kwargs)
+        self.answer = answer
+        self.premise_calls: list[dict[str, Any]] = []
+        self.reask_calls: list[dict[str, Any]] = []
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+        if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
+            self.premise_calls.append(kwargs)
+            return self.answer
+        if kwargs.get("prompt_name") == UNLISTED_REASK_PROMPT_NAME:
+            self.reask_calls.append(kwargs)
+            return {"verdict": "not_completed", "terminate_criterion_holds": True, "skipped_screen": "", "quote": ""}
+        return await super().call(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "scope", "checked"),
+    [
+        ("terminated", {}, True),
+        # The check reads a stop, so a block that asks for data or waits on a download is checked too.
+        ("terminated", {"extraction_requested": True}, True),
+        ("completed", {}, False),
+        ("failed", {}, False),
+        ("terminated", {"page_free": True}, False),
+    ],
+    ids=["terminated", "terminated_extraction", "completed", "failed", "page_free"],
+)
+async def test_a_terminate_on_a_block_without_a_completion_criterion_is_checked_and_logged_and_still_ends_the_run(
+    status: str, scope: dict[str, Any], checked: bool
+) -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("read_fixture", {})], [("finish", {"status": status, "reason": "There is no 'View all statements' link."})]],
+        answer={
+            "cited": "instruction",
+            "condition": "unmet",
+            "stop_kind": "none",
+            "unmet_kind": "equivalent",
+            "quote": "See bill history",
+            "why": "The statements are linked under another name.",
+        },
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Open the statements with 'View all statements'.",
+            extra_tools=[_fixed_read_tool("Account overview\nSee bill history\nPay now")],
+            unlisted_reask_criteria=("", "the statements link is not on the page"),
+            **scope,
+        )
+
+    # Shadow only: the verdict is logged and the model's own status stands.
+    assert outcome.status == status
+    # No completion criterion, so no re-ask; the premise check does not need one.
+    assert caller.reask_calls == []
+    premise_logs = [log for log in logs if log["event"] == "taskv3 terminate premise"]
+    if not checked:
+        assert caller.premise_calls == [] and premise_logs == []
+        return
+    (premise_call,) = caller.premise_calls
+    assert premise_call["use_message_history"] is False
+    assert "See bill history" in premise_call["prompt"]
+    (log,) = premise_logs
+    assert log["would_overturn"] is True
+    assert log["why"] == "unmet_on_page"
+    assert log["never_overturn"] is None
+    assert log["unmet_kind"] == "equivalent"
+    # Never page text: the quote, the judge's sentence and the agent's reason stay in the LLM artifacts.
+    assert all(text not in str(log) for text in ("See bill history", "another name", "View all statements"))
+
+
+@pytest.mark.asyncio
+async def test_a_terminate_on_a_customers_own_model_key_is_logged_as_never_overturned_without_a_call() -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": "There is no 'View all statements' link."})]], answer={}
+    )
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Open the statements with 'View all statements'.",
+            unlisted_reask_criteria=("", "the statements link is not on the page"),
+            terminate_premise_check=False,
+        )
+
+    assert caller.premise_calls == []
+    (log,) = (log for log in logs if log["event"] == "taskv3 terminate premise")
+    assert log["never_overturn"] == "customer_key" and log["would_overturn"] is False
+
+
+@pytest.mark.asyncio
+async def test_stop_criteria_for_a_block_without_a_completion_criterion_change_nothing_the_model_sees() -> None:
+    # The shadow check is their only new reader: every model-facing byte matches a run that never had them.
+    signed = "https://files.example.test/uploads/deadbeef/statement.pdf?token=eyJhbGciOiJIUzI1NiJ9.c2lnbmVk.QQ"
+    terminate = f"the statement at {signed} is not listed"
+    seen = []
+    for criteria in (("", ""), ("", terminate)):
+        caller = _PremiseAnsweringCaller(
+            [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "Not listed."})]],
+            answer={"cited": "none", "condition": "unclear", "stop_kind": "none", "quote": ""},
+        )
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal=f"Open the statements.\n\nIf this becomes true, stop and finish with status=terminated: {terminate}",
+            extra_tools=[_fixed_read_tool(f"Statements\n{signed}")],
+            unlisted_reask_criteria=criteria,
+        )
+        seen.append((json.dumps(caller.message_history, sort_keys=True), caller.sent_tools, outcome.status))
+
+    assert seen[0] == seen[1]
+
+
+@pytest.mark.asyncio
+async def test_a_terminate_with_a_completion_criterion_asks_both_judges_once_each() -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("read_fixture", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer={"cited": "goal", "condition": "met", "stop_kind": "none", "quote": ""},
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Create the account.",
+            extra_tools=[_fixed_read_tool("Create account\nEmail")],
+            unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        )
+
+    assert outcome.status == "terminated"
+    assert len(caller.reask_calls) == 1 and len(caller.premise_calls) == 1
+    assert [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"] == ["condition_met"]
+
+
+@pytest.mark.asyncio
+async def test_a_premise_check_that_fails_still_ends_the_run_as_the_model_said() -> None:
+    def broken_redactor() -> Any:
+        raise RuntimeError("redactor down")
+
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": "There is no 'View all statements' link."})]], answer={}
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()),
+        llm_caller=caller,
+        goal="Open the statements.",
+        unlisted_reask_criteria=("", "the statements link is not on the page"),
+        goal_check_redactor=broken_redactor,
+    )
+    assert outcome.status == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_a_slow_premise_check_logs_after_the_run_ends_under_the_runs_own_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    checked_under: list[str | None] = []
+
+    class _SlowCaller(_PremiseAnsweringCaller):
+        async def call(self, **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
+            kwargs.pop("step", None)
+            if kwargs.get("prompt_name") == TERMINATE_PREMISE_PROMPT_NAME:
+                await release.wait()
+                checked_under.append(skyvern_context.ensure_context().task_id)
+            return await super().call(**kwargs)
+
+    flushed: list[str] = []
+
+    async def flush_step_archive(step_id: str) -> None:
+        flushed.append(step_id)
+
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", SimpleNamespace(flush_step_archive=flush_step_archive))
+    slow = _SlowCaller([[("finish", {"status": "terminated", "reason": "Not listed."})]], answer={})
+
+    def premise_whys() -> list[str]:
+        return [log["why"] for log in logs if log["event"] == "taskv3 terminate premise"]
+
+    with skyvern_context.scoped(SkyvernContext(task_id="tsk_premise")) as run_context, capture_logs() as logs:
+        outcome = await asyncio.wait_for(
+            run_task_v3_agent_loop(
+                page_provider=_fixed_page_provider(_FakePage()),
+                llm_caller=slow,
+                goal="Open the statements.",
+                unlisted_reask_criteria=("", "the statements link is not on the page"),
+                step=SimpleNamespace(step_id="stp_premise"),
+            ),
+            timeout=1.0,
+        )
+        assert outcome.status == "terminated"
+        assert premise_whys() == []
+        # What the block does once it ends; the shared context then belongs to the next block.
+        run_context.task_id = None
+        release.set()
+        async with asyncio.timeout(5):
+            while not premise_whys():
+                await asyncio.sleep(0.01)
+
+    assert premise_whys() == ["skipped:unparseable"]
+    assert checked_under == ["tsk_premise"]
+    # The run's own archive flush has already happened, so the late check flushes what its call wrote.
+    assert flushed == ["stp_premise"]
+
+
+def _fixed_read_tool(content: str, *, page: _FakePage | None = None, lands_at: str | None = None) -> ToolSpec:
+    # `lands_at` moves the page as a single-page app does once a submit's request returns, after the click.
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        if page is not None and lands_at is not None:
+            page.url = lands_at
+        return ToolResult.ok(content)
+
+    return ToolSpec(
+        name="read_fixture",
+        description="read_fixture",
+        parameters={"type": "object", "properties": {}},
+        handler=handler,
+        compactable=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("quote", "skipped_reason"),
+    [
+        ("Email: applicant@example.com", "quote_carries_no_entered_value"),
+        ("City: Springfield Heights", None),
+        ("Code 482913 accepted", "quote_carries_no_entered_value"),
+        ("Step 1 of 4", "quote_carries_no_entered_value"),
+    ],
+    ids=["untyped_payload_value", "typed_value", "typed_payload_one_time_code", "step_header"],
+)
+async def test_a_reask_converts_only_on_a_quote_carrying_a_value_the_block_typed(
+    quote: str, skipped_reason: str | None
+) -> None:
+    content = "Step 1 of 4\nEmail: applicant@example.com\nCity: Springfield Heights\nCode 482913 accepted"
+    page = _FakePage()
+    caller = _ReaskAnsweringCaller(
+        [
+            [("type", {"selector": "#city", "text": "Springfield Heights"})],
+            [("type", {"selector": "#otp", "text": "482913"})],
+            [("click", {"selector": "#create"})],
+            [("read_fixture", {})],
+            [("observe", {})],
+            [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})],
+        ],
+        answer={
+            "verdict": "completed",
+            "terminate_criterion_holds": False,
+            "skipped_screen": "the PIN screen",
+            "quote": quote,
+            "evidence": "The next form carries the entered values.",
+        },
+    )
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=caller,
+            goal="Create the account.",
+            parameters={"email": "applicant@example.com", "otp_code": "482913"},
+            extra_tools=[_fixed_read_tool(content, page=page, lands_at="https://example.test/apply/section/1")],
+            unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        )
+
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["converts"] is (skipped_reason is None)
+    assert outcome.unlisted_reask["skipped_reason"] == skipped_reason
+    assert outcome.status == ("completed" if skipped_reason is None else "terminated")
+    assert outcome.converted_from == ("terminated" if skipped_reason is None else None)
+    assert outcome.converted_from_reason == ("No PIN screen was shown." if skipped_reason is None else "")
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    assert line["llm_key"] == caller.llm_key
+
+
+class _LandingOnClickPage(_FakePage):
+    """A submit whose navigation lands before the click returns, so the click result reports the destination."""
+
+    def __init__(self, lands_at: str) -> None:
+        super().__init__()
+        self.lands_at = lands_at
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        await super().click(selector, timeout=timeout)
+        self.url = self.lands_at
+
+
+@pytest.mark.asyncio
+async def test_a_reask_reads_a_submit_that_lands_before_its_click_returns_as_a_url_change() -> None:
+    # observe, type, click with no observe between: the click reports only where it landed, so the URL the
+    # submit started from must come from the click itself, not from the observe the type call invalidated.
+    page = _LandingOnClickPage("https://example.test/apply/section/1")
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ReaskAnsweringCaller(
+            [
+                [("observe", {})],
+                [("type", {"selector": "#email", "text": "applicant@example.com"})],
+                [("click", {"selector": "#create"})],
+                [("read_fixture", {})],
+                [("observe", {})],
+                [("finish", {"status": "terminated", "reason": "The PIN screen was never shown."})],
+            ],
+            answer={
+                "verdict": "completed",
+                "terminate_criterion_holds": False,
+                "skipped_screen": "the PIN screen",
+                "quote": "Email: applicant@example.com",
+                "evidence": "The next form carries the account's email.",
+            },
+        ),
+        goal="Create the account.",
+        parameters={"email": "applicant@example.com"},
+        extra_tools=[_fixed_read_tool("Application\nEmail: applicant@example.com")],
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+    )
+
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["skipped_reason"] is None
+    assert outcome.status == "completed" and outcome.converted_from == "terminated"
+
+
+class _EnterSubmitPage(_FakePage):
+    """A form that an Enter key press submits, landing at `lands_at` (or staying put when it is None)."""
+
+    def __init__(self, lands_at: str | None) -> None:
+        super().__init__()
+        self.lands_at = lands_at
+
+    async def press(self, selector: str, key: str) -> None:
+        await super().press(selector, key)
+        if key == "Enter" and self.lands_at is not None:
+            self.url = self.lands_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submit",
+    [
+        ("press_key", {"selector": "#email", "key": "Enter"}),
+        ("type", {"selector": "#name", "text": "Alex Applicant", "press_enter": True}),
+    ],
+    ids=["press_key", "type_press_enter"],
+)
+@pytest.mark.parametrize("navigates", [True, False], ids=["url_changed", "same_url"])
+async def test_a_reask_reads_an_enter_submission_after_a_field_entry_by_where_the_url_went(
+    submit: tuple[str, dict[str, Any]], navigates: bool
+) -> None:
+    # observe, type, Enter, observe: the type call leaves the URL unknown, so the Enter call must report where
+    # it started for a submission that navigated to read as a URL change.
+    page = _EnterSubmitPage("https://example.test/apply/section/1" if navigates else None)
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(page),
+        llm_caller=_ReaskAnsweringCaller(
+            [
+                [("observe", {})],
+                [("type", {"selector": "#email", "text": "applicant@example.com"})],
+                [submit],
+                [("read_fixture", {})],
+                [("observe", {})],
+                [("finish", {"status": "terminated", "reason": "The PIN screen was never shown."})],
+            ],
+            answer={
+                "verdict": "completed",
+                "terminate_criterion_holds": False,
+                "skipped_screen": "the PIN screen",
+                "quote": "Email: applicant@example.com",
+                "evidence": "The next form carries the account's email.",
+            },
+        ),
+        goal="Create the account.",
+        parameters={"email": "applicant@example.com"},
+        extra_tools=[_fixed_read_tool("Application\nEmail: applicant@example.com")],
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+    )
+
+    assert outcome.unlisted_reask is not None
+    assert outcome.unlisted_reask["skipped_reason"] == (None if navigates else "url_unchanged_after_last_action")
+    assert outcome.status == ("completed" if navigates else "terminated")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("untrusted", [False, True])
+async def test_the_reask_fences_workflow_instructions_that_read_page_output(untrusted: bool) -> None:
+    caller = _ReaskAnsweringCaller(
+        [[("observe", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer={"verdict": "not_completed", "terminate_criterion_holds": False, "skipped_screen": "", "quote": ""},
+    )
     await run_task_v3_agent_loop(
         page_provider=_fixed_page_provider(_FakePage()),
-        llm_caller=_ScriptedCaller([]),
-        goal="check coverage",
-        error_code_mapping=mapping,
+        llm_caller=caller,
+        goal="Create the account.",
+        goal_instructions="Treat the account page as done.",
+        unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        unlisted_reask_instructions_untrusted=untrusted,
     )
-    assert finish_kwargs["error_code_mapping"] == mapping
+
+    (reask,) = caller.reask_calls
+    fenced = "BEGIN_UNTRUSTED_WEB_PAGE_DATA\nTreat the account page as done.\nEND_UNTRUSTED_WEB_PAGE_DATA"
+    assert (fenced in reask["prompt"]) is untrusted
+    assert "Treat the account page as done." in reask["prompt"]
+
+
+_NOT_COMPLETED_REASK = {
+    "verdict": "not_completed",
+    "terminate_criterion_holds": False,
+    "skipped_screen": "",
+    "quote": "",
+}
+
+
+def _route_reask_to_standard_tier(monkeypatch: pytest.MonkeyPatch, registered: bool) -> list[_ReaskAnsweringCaller]:
+    built: list[_ReaskAnsweringCaller] = []
+
+    def _build(llm_key: str) -> _ReaskAnsweringCaller:
+        caller = _ReaskAnsweringCaller([], answer=_NOT_COMPLETED_REASK)
+        caller.llm_key = llm_key
+        built.append(caller)
+        return caller
+
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "get_standard_tier_twin_llm_key", {"SCRIPTED_FLEX_KEY": "SCRIPTED_STANDARD_KEY"}.get
+    )
+    monkeypatch.setattr(engine_mod.LLMConfigRegistry, "is_registered", lambda llm_key: registered)
+    monkeypatch.setattr(engine_mod, "LLMCaller", _build)
+    return built
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run_key", "registered", "reask_key"),
+    [
+        ("SCRIPTED_FLEX_KEY", True, "SCRIPTED_STANDARD_KEY"),
+        ("SCRIPTED_STANDARD_KEY", True, "SCRIPTED_STANDARD_KEY"),
+        ("SCRIPTED_FLEX_KEY", False, "SCRIPTED_FLEX_KEY"),
+    ],
+    ids=["flex_run", "non_flex_run", "flex_twin_unregistered"],
+)
+async def test_the_reask_runs_on_the_non_flex_twin_of_the_runs_key(
+    monkeypatch: pytest.MonkeyPatch, run_key: str, registered: bool, reask_key: str
+) -> None:
+    # Flex queueing outlasts the re-ask's 20s limit, so a flex run asks on its standard-tier twin.
+    built = _route_reask_to_standard_tier(monkeypatch, registered)
+    caller = _ReaskAnsweringCaller(
+        [[("observe", {})], [("finish", {"status": "terminated", "reason": "No PIN screen was shown."})]],
+        answer=_NOT_COMPLETED_REASK,
+    )
+    caller.llm_key = run_key
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Create the account.",
+            unlisted_reask_criteria=("a PIN screen is shown", "the create-account submission fails"),
+        )
+
+    asked = [c for c in [caller, *built] if c.reask_calls]
+    assert [c.llm_key for c in asked] == [reask_key]
+    assert (asked[0] is caller) is (reask_key == run_key)
+    (line,) = (log for log in logs if log["event"] == "taskv3 finish unlisted reask")
+    assert (line["llm_key"], line["reask_llm_key"]) == (run_key, reask_key)
+
+
+async def _captured_request(
+    monkeypatch: pytest.MonkeyPatch, caller: _ScriptedCaller, values: tuple[CodeTypedValue, ...]
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    async def _capture(**kwargs: object) -> LoopOutcome:
+        captured.update(kwargs)
+        return LoopOutcome(status="completed", reason="ok")
+
+    monkeypatch.setattr(engine_mod, "run_agent_tool_loop", _capture)
+    goal = "Fill the form\n\nCode outline (a record of this block's code in source order, not steps to perform):\n- x"
+    await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal=goal, code_typed_values=values
+    )
+    return captured
+
+
+def _router(*entries: tuple[dict[str, Any], dict[str, Any]]) -> LLMRouterConfig:
+    return LLMRouterConfig(
+        model_name="router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(model_name=f"m{n}", litellm_params=params, model_info=info)
+            for n, (params, info) in enumerate(entries)
+        ],
+        main_model_group="m0",
+    )
+
+
+def test_a_router_entry_is_limited_by_its_base_model() -> None:
+    expected = litellm.get_model_info(model="azure/gpt-4.1")["max_input_tokens"]
+
+    limit = model_input_token_limit(_router(({"model": "azure/opaque-deployment"}, {"base_model": "azure/gpt-4.1"})))
+
+    assert limit == expected
+
+
+def test_an_unknown_router_model_counts_as_the_one_request_ceiling_not_the_known_ones_limit() -> None:
+    limit = model_input_token_limit(
+        _router(
+            ({"model": "known"}, {"max_input_tokens": 1_000_000}),
+            ({"model": "not-a-model-litellm-knows"}, {}),
+        )
+    )
+
+    assert limit == PROMPT_HARD_CEILING_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_typed_values_reach_the_acting_model_but_never_the_goal_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge_prompts: list[str] = []
+    outcome, _verdicts = await _run_then_judge_block(
+        monkeypatch,
+        _achieving_judge(judge_prompts),
+        script=[[("observe", {})], [("finish", {"status": "completed", "reason": "done"})]],
+        goal="Fill the form\n\nCode outline (a record of this block's code in source order, not steps to perform):",
+        code_typed_values=(CodeTypedValue(line=2, target="#name", value="Zephyrine Quill"),),
+    )
+
+    user_prompt = next(m["content"] for m in outcome.messages if m.get("role") == "user")
+    assert '"Zephyrine Quill" into "#name"' in user_prompt
+    assert len(judge_prompts) == 1
+    assert "Zephyrine Quill" not in judge_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_a_typed_value_far_past_a_page_read_reaches_the_request_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    long_value = " ".join(f"word{n}" for n in range(6000))
+
+    request = await _captured_request(
+        monkeypatch, _ScriptedCaller([]), (CodeTypedValue(line=2, target="#notes", value=long_value),)
+    )
+
+    assert json.dumps(long_value) in request["user_prompt"]
+    assert "not listed" not in request["user_prompt"]
+
+
+def _small_fallback_caller(limit: int) -> _ScriptedCaller:
+    caller = _ScriptedCaller([])
+    caller.llm_config = LLMRouterConfig(
+        model_name="router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="primary", litellm_params={"model": "primary"}, model_info={"max_input_tokens": 400_000}
+            ),
+            LLMRouterModelConfig(
+                model_name="fallback", litellm_params={"model": "fallback"}, model_info={"max_input_tokens": limit}
+            ),
+        ],
+        main_model_group="primary",
+    )
+    return caller
+
+
+@pytest.mark.asyncio
+async def test_typed_values_are_withheld_only_past_the_smallest_model_input_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 60_000
+    caller = _small_fallback_caller(limit)
+    chunk = " ".join(f"word{n}" for n in range(4000))
+    values = tuple(CodeTypedValue(line=n, target=f"#f{n}", value=chunk) for n in range(1, 21))
+
+    request = await _captured_request(monkeypatch, caller, values)
+    user_prompt = request["user_prompt"]
+    rows = [line for line in user_prompt.split("\n") if line.startswith("- Line ")]
+    sent = (
+        count_tokens(request["system_prompt"])
+        + count_tokens(user_prompt)
+        + count_tokens(json.dumps([tool.to_openai_tool() for tool in request["tools"]]))
+        + PERCEPTION_RETAIN_CHARS_HIGH // 4
+    )
+
+    assert 0 < len(rows) < len(values)
+    assert all(row.endswith(f'into "#f{n}"') and json.dumps(chunk) in row for n, row in enumerate(rows, start=1))
+    assert f"- {len(values) - len(rows)} more typed values not listed" in user_prompt
+    assert sent <= limit
+
+
+@pytest.mark.asyncio
+async def test_the_typed_value_budget_leaves_room_for_the_later_application_context_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 60_000
+    defaults = " ".join(f"default{n}" for n in range(10_000))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "task_v3_application_context_texts", lambda p: (None, None, defaults))
+    chunk = " ".join(f"word{n}" for n in range(4000))
+    values = tuple(CodeTypedValue(line=n, target=f"#f{n}", value=chunk) for n in range(1, 21))
+    ctx = SkyvernContext()
+    ctx.run_arms = {APPLICATION_CONTEXT_FLAG: ("wr_1", "treatment")}
+    skyvern_context.set(ctx)
+    try:
+        request = await _captured_request(monkeypatch, _small_fallback_caller(limit), values)
+    finally:
+        skyvern_context.reset()
+    sent = (
+        count_tokens(request["system_prompt"])
+        + count_tokens(request["user_prompt"])
+        + count_tokens(defaults)
+        + count_tokens(json.dumps([tool.to_openai_tool() for tool in request["tools"]]))
+        + PERCEPTION_RETAIN_CHARS_HIGH // 4
+    )
+    assert sent <= limit
+
+
+@pytest.mark.parametrize("via_click", [False, True])
+@pytest.mark.asyncio
+async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
+    monkeypatch: pytest.MonkeyPatch, via_click: bool
+) -> None:
+    # The real navigate tool behind the engine: a task URL redirected to a missing page is the task's own
+    # target; a page a click reached earlier, navigated back to and found missing, is a revisit.
+    import skyvern.utils.url_validators as urlv
+
+    monkeypatch.setattr(urlv, "validate_fetch_url", lambda url: url)
+    task_url = "https://jobs.example.test/acme/42"
+    page = _FakePage()
+
+    async def _goto(url: str, timeout: int | None = None, wait_until: str | None = None) -> Any:
+        dead = url == task_url
+        page.url = "https://jobs.example.test/acme/expired" if dead and not via_click else url
+        return SimpleNamespace(status=404 if dead else 200, url=page.url)
+
+    async def _click(selector: str, timeout: int | None = None) -> None:
+        page.url = task_url
+
+    page.goto = _goto  # type: ignore[method-assign]
+    page.click = _click  # type: ignore[method-assign]
+    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
+    if via_click:
+        script[:0] = [[("click", {"selector": "#go"})], [("navigate", {"url": "https://example.test/other"})]]
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(page),
+            llm_caller=_ScriptedCaller(script),
+            goal="Apply.",
+            task_target_urls=frozenset() if via_click else caller_known_published_urls(task_url, keep_query=True),
+        )
+
+    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")
+
+
+_JUSTIFY_CRITERIA = ("", "the record is not listed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "held"),
+    [
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA}, True),
+        ({"unlisted_reask_criteria": None}, False),
+        ({"unlisted_reask_criteria": _JUSTIFY_CRITERIA, "page_free": True}, False),
+    ],
+    ids=["browser_loop", "validation", "page_free"],
+)
+async def test_validation_and_page_free_runs_are_never_held_for_a_source(scope: dict[str, Any], held: bool) -> None:
+    caller = _PremiseAnsweringCaller(
+        [[("finish", {"status": "terminated", "reason": f"r{i}"})] for i in (1, 2)], answer={}
+    )
+    outcome = await run_task_v3_agent_loop(
+        page_provider=_fixed_page_provider(_FakePage()), llm_caller=caller, goal="Look up the record.", **scope
+    )
+    assert (outcome.status, outcome.reason, outcome.turns) == ("terminated", *(("r2", 2) if held else ("r1", 1)))
+
+
+_TERMINATE = ("finish", {"status": "terminated", "reason": "r1"})
+_ACT = ("type", {"selector": "#first", "text": "John"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        ([[_TERMINATE], [_TERMINATE]], ("refinished_same", 1, 0, 0)),
+        ([[_TERMINATE], [("read_fixture", {})], [_TERMINATE]], ("looked_then_terminated", 2, 0, 1)),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "terminated", "reason": "r2"})]],
+            ("continued_terminated", 2, 1, 0),
+        ),
+        (
+            [[_TERMINATE], [_ACT], [("finish", {"status": "completed", "reason": "done"})]],
+            ("continued_completed", 2, 1, 0),
+        ),
+    ],
+    ids=["refinished_same", "looked_then_terminated", "continued_terminated", "continued_completed"],
+)
+async def test_engine_summary_line_carries_the_justification_outcome(
+    script: list[list[tuple[str, dict[str, Any]]]], expected: tuple[str, int, int, int]
+) -> None:
+    caller = _PremiseAnsweringCaller(script, answer={})
+    with capture_logs() as logs:
+        await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            parameters={"first_name": "John"},
+            extra_tools=[_fixed_read_tool("Results")],
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    finished = next(e for e in logs if e["event"] == "taskv3 engine loop finished")
+    assert (
+        finished["justify_outcome"],
+        finished["justify_turns_after"],
+        finished["justify_actions_after"],
+        finished["justify_perceptions_after"],
+    ) == expected
+    assert (finished["justify_held"], finished["justify_status"], finished["justify_turn"]) == (True, "terminated", 1)
+
+
+@pytest.mark.asyncio
+async def test_the_justification_hold_switch_turns_the_hold_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "DISABLE_TASK_V3_JUSTIFY_HOLD", True)
+    caller = _PremiseAnsweringCaller([[_TERMINATE]], answer={})
+    with capture_logs() as logs:
+        outcome = await run_task_v3_agent_loop(
+            page_provider=_fixed_page_provider(_FakePage()),
+            llm_caller=caller,
+            goal="Look up the record.",
+            unlisted_reask_criteria=_JUSTIFY_CRITERIA,
+        )
+    assert (outcome.status, outcome.turns) == ("terminated", 1)
+    assert "taskv3 finish justification held" not in [e["event"] for e in logs]

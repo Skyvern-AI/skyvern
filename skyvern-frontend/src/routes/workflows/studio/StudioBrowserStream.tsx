@@ -1,9 +1,9 @@
 import { useCallback, useEffect } from "react";
 
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 import { StreamPresenter } from "./StreamPresenter";
+import { type StudioPaneId } from "./panes";
 import { useBrowserPaneView } from "./useBrowserPaneView";
 import { useExecutingBlockRun } from "./useExecutingBlockRun";
 import { useStudioPanes } from "./useStudioPanes";
@@ -12,13 +12,19 @@ import { useStudioPanes } from "./useStudioPanes";
  * The studio's single live-browser stream, portaled into a host node re-parented
  * between the open panes so the socket persists instead of re-booting.
  */
-export function StudioBrowserStream() {
+export function StudioBrowserStream({
+  visiblePanes,
+}: {
+  visiblePanes?: readonly StudioPaneId[];
+}) {
   const { panes } = useStudioPanes();
-  const browserPaneOpen = panes.includes("browser");
-  const isRecording = useRecordingStore((s) => s.isRecording);
-  const resetRecording = useRecordingStore((s) => s.reset);
+  const renderedPanes = visiblePanes ?? panes;
+  const browserPaneOpen = renderedPanes.includes("browser");
   const reloadNonce = useStudioBrowserStore((s) => s.reloadNonce);
   const setStreamUrl = useStudioBrowserStore((s) => s.setStreamUrl);
+  const setDebugStreamState = useStudioBrowserStore(
+    (s) => s.setDebugStreamState,
+  );
   const markActivity = useStudioBrowserStore((s) => s.markActivity);
   const clearActivity = useStudioBrowserStore((s) => s.clearActivity);
   const reset = useStudioBrowserStore((s) => s.reset);
@@ -26,8 +32,8 @@ export function StudioBrowserStream() {
   const browserSessionId = debugBrowserSessionId;
   const executingBlockRun = useExecutingBlockRun();
   // Co-drive: take-control stays available while a block run executes; the pill
-  // just flags the shared browser. Recording is exempt — the recorder is driving.
-  const coDriving = executingBlockRun && !isRecording;
+  // just flags the shared browser.
+  const coDriving = executingBlockRun;
   // Only offer control while this stream is the pane's visible surface. A replay
   // view or a per-run stream parks this node; withdrawing the offer makes
   // BrowserStream release any held grab (it can't be exercised unseen).
@@ -38,13 +44,6 @@ export function StudioBrowserStream() {
     reset();
     return () => reset();
   }, [browserSessionId, reset]);
-
-  // Recording is session-scoped: clear it when the studio's browser session ends
-  // or changes. The stream component can remount while the session persists and
-  // doesn't reset recording state itself, so this owns that.
-  useEffect(() => {
-    return () => resetRecording();
-  }, [browserSessionId, resetRecording]);
 
   useEffect(() => {
     if (browserPaneOpen) {
@@ -82,13 +81,8 @@ export function StudioBrowserStream() {
         // panel there is no browser address bar to type into and a session
         // resting on about:blank has no way out (SKY-13705).
         enableUrlInput={true}
-        isRecording={isRecording}
-        // While recording, the Copilot pane hosts the live-drafts panel, whose
-        // header already shows the timer + step count — an on-stream REC pill
-        // would duplicate it. Closing that pane brings the pill back on either
-        // transport (VNC renders it in BrowserStream, CDP in StreamPresenter).
-        hideRecordingIndicator={panes.includes("copilot")}
         onUrlChange={handleUrlChange}
+        onStreamStateChange={setDebugStreamState}
         onActivity={handleActivity}
       />
       {coDriving && debugStreamShown ? (

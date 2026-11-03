@@ -1,11 +1,25 @@
+import asyncio
 import re
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from urllib.parse import SplitResult, parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import pyotp
 import structlog
+from onepassword.client import Client as OnePasswordClient
+from onepassword.errors import DesktopSessionExpiredException, RateLimitExceededException
+from onepassword.types import Item
 from pydantic import ValidationError
+
+from skyvern.exceptions import (
+    CredentialItemNotFoundError,
+    OnePasswordGetItemError,
+    OnePasswordRateLimitError,
+    OnePasswordServiceUnavailableError,
+    OnePasswordSessionExpiredError,
+    sanitize_credential_for_error,
+)
 
 LOG = structlog.get_logger()
 
@@ -52,6 +66,41 @@ def extract_onepassword_upstream_5xx_status(message: str) -> int | None:
 
 def is_onepassword_credential_error(message: str) -> bool:
     return bool(_ONEPASSWORD_CREDENTIAL_ERROR_PATTERN.search(message))
+
+
+def format_resolved_lookup_context(provider: str, **identifiers: str | None) -> str:
+    resolved_identifiers = ", ".join(
+        f"{key}={sanitize_credential_for_error(value) if value else '<not provided>'}"
+        for key, value in identifiers.items()
+    )
+    return f"Resolved {provider} credential identifiers: {resolved_identifiers}."
+
+
+async def fetch_onepassword_item(token: str, vault_id: str, item_id: str, lookup_context: str) -> Item:
+    try:
+        client = await OnePasswordClient.authenticate(
+            auth=token,
+            integration_name="Skyvern",
+            integration_version="v1.0.0",
+        )
+        item = await client.items.get(vault_id, item_id)
+    except RateLimitExceededException as e:
+        raise OnePasswordRateLimitError(f"{e!s} {lookup_context}") from e
+    except DesktopSessionExpiredException as e:
+        raise OnePasswordSessionExpiredError(f"{e!s} {lookup_context}") from e
+    except Exception as e:
+        upstream_status = extract_onepassword_upstream_5xx_status(f"{e!s}")
+        if upstream_status is not None:
+            raise OnePasswordServiceUnavailableError(
+                status_code=upstream_status,
+                lookup_context=lookup_context,
+            ) from e
+        raise OnePasswordGetItemError(f"{e} {lookup_context}") from e
+
+    if item is None:
+        LOG.error("No 1Password item found", vault_id=vault_id, item_id=item_id)
+        raise CredentialItemNotFoundError(f"1Password item not found. {lookup_context}")
+    return item
 
 
 class OnePasswordConstants(StrEnum):
@@ -116,6 +165,11 @@ def is_unresolved_totp_value(value: object) -> bool:
     return isinstance(value, str) and (
         is_unresolved_totp_placeholder(value) or any(marker in value for marker in _TOTP_MARKER_VALUES)
     )
+
+
+def is_totp_sentinel(value: object) -> bool:
+    """Return whether a value is exactly a vault's marker for "generate this credential's TOTP here"."""
+    return isinstance(value, str) and value in _TOTP_MARKER_VALUES
 
 
 def _validate_base32_secret(totp_secret: str) -> str:
@@ -210,10 +264,7 @@ def parse_totp_secret(totp_secret: str) -> str:
         if parsed_from_secret_param:
             return parsed_from_secret_param
 
-    LOG.error(
-        "Invalid TOTP secret, discarding",
-        totp_secret_preview=_compact_secret_value(stripped_totp_secret)[:4] + "...",
-    )
+    LOG.error("Invalid TOTP secret, discarding", totp_secret_length=len(_compact_secret_value(stripped_totp_secret)))
     return ""
 
 
@@ -250,6 +301,31 @@ def normalize_totp_config(totp_secret: str) -> str:
         return unquoted_totp_secret if parse_totp_config(unquoted_totp_secret) else ""
 
     return parse_totp_secret(totp_secret)
+
+
+def totp_window_wait_seconds(totp_secret: str, min_remaining_seconds: int, *, now: float) -> float:
+    """Seconds to wait before generating so the code keeps at least ``min_remaining_seconds`` of its step
+    (capped at one second short of the step, as the multi-field path caps it); 0 when it already would."""
+    if min_remaining_seconds <= 0:
+        return 0.0
+    totp = parse_totp_config(totp_secret)
+    if totp is None:
+        return 0.0
+    interval = totp.interval
+    threshold = max(0, min(min_remaining_seconds, interval - 1))
+    remaining = interval - (now % interval)
+    return remaining if remaining < threshold else 0.0
+
+
+async def wait_for_fresh_totp_window(totp_secret: str, *, min_remaining_seconds: int = 0) -> None:
+    # Re-measured after each sleep: a loop that wakes late can land in the next window's tail. Bounded,
+    # because a wait always ends at a window boundary, which a timely wake leaves fresh.
+    for _ in range(3):
+        wait_seconds = totp_window_wait_seconds(totp_secret, min_remaining_seconds, now=time.time())
+        if wait_seconds <= 0:
+            return
+        LOG.info("Waiting for a fresh TOTP window", wait_seconds=round(wait_seconds, 1))
+        await asyncio.sleep(wait_seconds)
 
 
 def generate_totp_code(totp_secret: str, for_time: int | None = None) -> str:

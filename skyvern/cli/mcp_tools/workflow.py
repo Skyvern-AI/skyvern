@@ -8,6 +8,7 @@ browser session.
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import inspect
 import json
@@ -21,6 +22,7 @@ from pydantic import Field
 
 from skyvern.client.errors import BadRequestError, NotFoundError
 from skyvern.forge.sdk.copilot.code_block_steps import derive_code_block_steps
+from skyvern.forge.sdk.workflow.block_notes import block_labels, carry_forward_block_notes
 from skyvern.forge.sdk.workflow.models.parameter import (
     ParameterType,
     WorkflowParameterType,
@@ -31,7 +33,7 @@ from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
-from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, Timer, make_error, make_result
+from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
 from ._validation import validate_folder_id, validate_run_id, validate_workflow_id, validate_workflow_run_id
 from ._workflow_http import (
@@ -45,11 +47,13 @@ from ._workflow_http import (
     update_workflow_folder_raw,
     update_workflow_raw,
 )
-from .response import MCP_MAX_RESPONSE_CHARS, _response_size
+from .response import MCP_MAX_RESPONSE_BYTES, MCP_MAX_RESPONSE_CHARS, _response_size, within_response_limits
 
 LOG = structlog.get_logger()
 _SUMMARY_TOP_LEVEL_KEY_LIMIT = 8
 _SUMMARY_SCALAR_PREVIEW_LIMIT = 3
+_SUMMARY_DOWNLOAD_DETAIL_LIMIT = 20
+_SUMMARY_DOWNLOAD_DETAIL_BUDGET_CHARS = 6_000
 _SUMMARY_ARTIFACT_PREVIEW_LIMIT = 4
 _SUMMARY_STRING_PREVIEW_LIMIT = 120
 _SUMMARY_RECURSION_LIMIT = 10
@@ -61,6 +65,25 @@ _SCREENSHOT_ARTIFACT_ID_KEYS = frozenset({"task_screenshot_artifact_ids", "workf
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _notes_kept_by_server(json_def: dict[str, Any] | None, yaml_def: str | None, saved: dict[str, Any]) -> list[str]:
+    """Labels whose saved notes or description the server kept because the submitted definition omitted them."""
+    try:
+        submitted = json_def if json_def is not None else safe_load_no_dates(yaml_def or "")
+    except yaml.YAMLError:
+        return []
+    submitted_blocks = (
+        (submitted.get("workflow_definition") or {}).get("blocks") if isinstance(submitted, dict) else None
+    )
+    saved_blocks = (saved.get("workflow_definition") or {}).get("blocks")
+    if not isinstance(submitted_blocks, list) or not isinstance(saved_blocks, list):
+        return []
+    return list(
+        carry_forward_block_notes(
+            copy.deepcopy(submitted_blocks), saved_blocks, same_step_labels=block_labels(submitted_blocks)
+        )
+    )
 
 
 def _serialize_workflow(wf: Any) -> dict[str, Any]:
@@ -231,10 +254,9 @@ def _note_artifact_ids(stats: dict[str, Any], values: list[Any]) -> None:
 
 
 def _scan_output_value(value: Any, stats: dict[str, Any], depth: int = 0) -> None:
+    # Callers pass a tree _jsonable already converted; converting per level would copy each subtree once per ancestor.
     if depth > _SUMMARY_RECURSION_LIMIT:
         return
-
-    value = _jsonable(value)
 
     if isinstance(value, dict):
         for key, nested_value in value.items():
@@ -304,17 +326,67 @@ def _summarize_output_value(output_value: Any) -> tuple[dict[str, Any], dict[str
     return summary, stats
 
 
-def _summarize_artifacts(run: Any, output_stats: dict[str, Any]) -> dict[str, Any]:
-    missing = object()
+# List rows carry no recording/screenshot/download/output fields at all, so a summary must
+# omit a fact whose source key is absent rather than report it as false/0.
+_MISSING = object()
+
+
+def _download_detail(file_info: Any) -> dict[str, Any]:
+    """Reduce a downloaded file to what makes it retrievable.
+
+    The signed URL is the only field a caller cannot rebuild from the rest of a
+    reduced payload, so a summary that drops it strands the file.
+    """
+    detail = {field: _jsonable(_get_value(file_info, field)) for field in ("url", "checksum", "filename")}
+    return {key: value for key, value in detail.items() if value}
+
+
+def _bounded_download_details(downloaded_files: list[Any]) -> list[dict[str, Any]]:
+    """Keep whole download entries within a fixed share of the response budget.
+
+    Signed URLs are long and a summary is also used per row in run lists, so the
+    list is capped by characters as well as by entry count. ``downloaded_file_count``
+    reports the true total when entries are left out.
+    """
+    details: list[dict[str, Any]] = []
+    spent = 0
+    for file_info in downloaded_files:
+        if len(details) >= _SUMMARY_DOWNLOAD_DETAIL_LIMIT:
+            break
+        detail = _download_detail(file_info)
+        if not detail:
+            continue
+        spent += _response_size(detail)
+        if spent > _SUMMARY_DOWNLOAD_DETAIL_BUDGET_CHARS:
+            break
+        details.append(detail)
+    return details
+
+
+def _summarize_artifacts(
+    run: Any,
+    output_stats: dict[str, Any] | None,
+    *,
+    include_download_details: bool = False,
+) -> dict[str, Any]:
+    """Summarize a run's artifacts.
+
+    ``include_download_details`` belongs to callers that drop ``downloaded_files``
+    from their payload; a caller that keeps the field verbatim would otherwise
+    carry every url and checksum twice.
+    """
+    missing = _MISSING
     downloaded_files_value = _get_value(run, "downloaded_files", missing)
     screenshot_urls_value = _get_value(run, "screenshot_urls", missing)
+    recording_url_value = _get_value(run, "recording_url", missing)
     downloaded_files = [] if downloaded_files_value is missing else (_jsonable(downloaded_files_value) or [])
     screenshot_urls = [] if screenshot_urls_value is missing else (_jsonable(screenshot_urls_value) or [])
 
-    summary: dict[str, Any] = {
-        "recording_available": bool(_get_value(run, "recording_url")),
-        "artifact_id_count": output_stats["artifact_id_count"],
-    }
+    summary: dict[str, Any] = {}
+    if recording_url_value is not missing:
+        summary["recording_available"] = bool(recording_url_value)
+    if output_stats is not None:
+        summary["artifact_id_count"] = output_stats["artifact_id_count"]
     if screenshot_urls_value is not missing:
         summary["workflow_screenshot_count"] = len(screenshot_urls)
     if downloaded_files_value is not missing:
@@ -328,10 +400,30 @@ def _summarize_artifacts(run: Any, output_stats: dict[str, Any]) -> dict[str, An
     if filenames:
         summary["downloaded_file_names"] = filenames[:_SUMMARY_SCALAR_PREVIEW_LIMIT]
 
-    if output_stats["artifact_ids_preview"]:
+    if include_download_details:
+        file_details = _bounded_download_details(downloaded_files)
+        if file_details:
+            summary["downloaded_files"] = file_details
+
+    if output_stats and output_stats["artifact_ids_preview"]:
         summary["artifact_ids_preview"] = output_stats["artifact_ids_preview"]
 
     return summary
+
+
+_DOWNLOAD_REFERENCE_FIELDS = ("downloaded_file_count", "downloaded_files")
+
+
+def _download_reference(artifact_summary: Any) -> dict[str, Any]:
+    if not isinstance(artifact_summary, dict):
+        return {}
+    return {field: artifact_summary[field] for field in _DOWNLOAD_REFERENCE_FIELDS if field in artifact_summary}
+
+
+_RUN_LIST_DETAILS_HINT = (
+    "Run rows do not include recording, screenshot, artifact or output details; an omitted field means "
+    "unknown, not none. Call skyvern_workflow_status(run_id, verbosity='full') for a run's details."
+)
 
 
 def _serialize_run_summary(run: Any) -> dict[str, Any]:
@@ -340,17 +432,24 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
     if run_type is None and _get_value(run, "workflow_run_id"):
         run_type = "workflow_run"
 
-    output_value = _get_value(run, "output")
-    if output_value is None and _get_value(run, "outputs") is not None:
-        output_value = _get_value(run, "outputs")
-
-    output_summary, output_stats = _summarize_output_value(output_value)
+    output_value = _get_value(run, "output", _MISSING)
+    outputs_value = _get_value(run, "outputs", _MISSING)
+    output_summary: dict[str, Any] | None = None
+    output_stats: dict[str, Any] | None = None
+    if output_value is not _MISSING or outputs_value is not _MISSING:
+        if output_value is _MISSING or output_value is None:
+            output_value = None if outputs_value is _MISSING else outputs_value
+        output_summary, output_stats = _summarize_output_value(output_value)
+    artifact_summary = _summarize_artifacts(run, output_stats, include_download_details=True)
 
     summary: dict[str, Any] = {
         "run_id": run_id,
         "status": str(_get_value(run, "status")) if _get_value(run, "status") is not None else None,
         "run_type": str(run_type) if run_type is not None else None,
-        "artifact_summary": _summarize_artifacts(run, output_stats),
+        "created_at": _jsonable(_get_value(run, "created_at")),
+        "trigger_type": _jsonable(_get_value(run, "trigger_type")),
+        "copilot_session_id": _get_value(run, "copilot_session_id"),
+        "artifact_summary": artifact_summary or None,
         "output_summary": output_summary,
     }
 
@@ -460,56 +559,6 @@ def _validate_definition_structure(json_def: dict[str, Any] | None, action: str)
     return None
 
 
-def _extract_workflow_blocks(definition: dict[str, Any]) -> list[Any]:
-    block_lists: list[list[Any]] = []
-    top_level_blocks = definition.get("blocks")
-    if isinstance(top_level_blocks, list):
-        block_lists.append(top_level_blocks)
-
-    workflow_definition = definition.get("workflow_definition")
-    if isinstance(workflow_definition, dict):
-        workflow_blocks = workflow_definition.get("blocks")
-        if isinstance(workflow_blocks, list) and workflow_blocks is not top_level_blocks:
-            block_lists.append(workflow_blocks)
-
-    return [block for blocks in block_lists for block in blocks]
-
-
-def _validate_code_only_workflow_blocks(definition: dict[str, Any], action: str) -> dict[str, Any] | None:
-    blocks = _extract_workflow_blocks(definition)
-    if not blocks:
-        return None
-
-    # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
-    from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
-        collect_code_only_banned_items,
-    )
-
-    banned_items = collect_code_only_banned_items(blocks)
-    if not banned_items:
-        return None
-
-    labels = ", ".join(sorted({label for label, _ in banned_items}))
-    types = ", ".join(sorted({block_type for _, block_type in banned_items}))
-    return make_result(
-        action,
-        ok=False,
-        error=make_error(
-            ErrorCode.INVALID_INPUT,
-            f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
-            "In code-only mode, use a `code` block for durable browser/page work instead of "
-            "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
-        ),
-    )
-
-
-def _validate_code_only_definition(definition: str, fmt: str, action: str) -> dict[str, Any] | None:
-    raw, _ = _load_definition_dict(definition, fmt)
-    if raw is None:
-        return None
-    return _validate_code_only_workflow_blocks(raw, action)
-
-
 _CODE_V2_DEFAULTS: dict[str, Any] = {
     "code_version": 2,
     "run_with": "agent",
@@ -526,6 +575,7 @@ _WORKFLOW_UPDATE_PRESERVED_TOP_LEVEL_FIELDS = (
     "pin_saved_session_ip",
     "browser_profile_id",
     "browser_profile_key",
+    "browser_type",
     "model",
     "is_saved_task",
     "max_screenshot_scrolls",
@@ -720,10 +770,9 @@ def _inject_code_block_prompt_defaults(definition: str, fmt: str, existing_code_
 
 
 def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
-    """Fill `steps` from `code` on code-first blocks (non-null prompt) that carry none, using the
-    copilot's own deterministic derivation. Legacy blocks (null/absent prompt) and explicit steps
-    (even an empty outline) are left untouched, so this composes with the prompt-default injection's
-    migration guarantees; `steps: null` is the workflow-get shape for "no steps yet" and derives."""
+    """Rebuild `steps` from `code` on code-first blocks (non-null prompt), discarding any submitted steps.
+    Legacy blocks (null/absent prompt) are left untouched, so this composes with the prompt-default
+    injection's migration guarantees."""
     raw, parsed_format = _load_definition_dict(definition, fmt)
     if raw is None or parsed_format is None:
         return definition
@@ -734,13 +783,13 @@ def _inject_code_block_derived_steps(definition: str, fmt: str) -> str:
 
     changed = False
     for block in _iter_blocks_flat(blocks):
-        if block.get("block_type") != "code" or block.get("prompt") is None or block.get("steps") is not None:
+        if block.get("block_type") != "code" or block.get("prompt") is None:
             continue
         code = block.get("code")
         if not isinstance(code, str):
             continue
-        derived = derive_code_block_steps(code, block.get("prompt"))
-        if derived:
+        derived = derive_code_block_steps(code)
+        if (derived or block.get("steps")) and block.get("steps") != derived:
             block["steps"] = derived
             changed = True
 
@@ -888,7 +937,7 @@ def _block_to_authoring_shape(block: Any) -> Any:
             for param in resolved
             if isinstance(param, dict) and param.get("key") and param.get("key") != output_key
         ]
-        if derived:
+        if derived or authoring.get("block_type") == "code":
             existing = [k for k in (authoring.get("parameter_keys") or []) if isinstance(k, str)]
             authoring["parameter_keys"] = existing + [k for k in derived if k not in existing]
 
@@ -1019,7 +1068,11 @@ def _iter_blocks_flat(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def _auto_wire_code_only_parameter_keys(raw_definition: dict[str, Any], excluded_keys: set[str]) -> bool:
+def _auto_wire_code_block_parameter_keys(
+    raw_definition: dict[str, Any],
+    excluded_keys: set[str],
+    skip_labels: frozenset[str] = frozenset(),
+) -> bool:
     wf_def = raw_definition.get("workflow_definition")
     if not isinstance(wf_def, dict):
         return False
@@ -1046,10 +1099,12 @@ def _auto_wire_code_only_parameter_keys(raw_definition: dict[str, Any], excluded
             eligible_by_key[key] = eligible_by_key[key] and eligible
 
     eligible_keys = [key for key in ordered_keys if eligible_by_key[key]]
+    if not eligible_keys:
+        return False
     blocks = wf_def.get("blocks")
     changed = False
     for block in _iter_blocks_flat(blocks if isinstance(blocks, list) else []):
-        if block.get("block_type") != BlockType.CODE:
+        if block.get("block_type") != BlockType.CODE or block.get("label") in skip_labels:
             continue
         # Explicit [] is a caller opt-out ("this block uses no workflow parameters");
         # only a missing/null parameter_keys triggers auto-wiring.
@@ -1059,11 +1114,21 @@ def _auto_wire_code_only_parameter_keys(raw_definition: dict[str, Any], excluded
     return changed
 
 
+def _convert_runtime_definition_shape(raw_definition: dict[str, Any]) -> bool:
+    wf_def = raw_definition.get("workflow_definition")
+    if not _has_runtime_definition_shape(wf_def):
+        return False
+    raw_definition["workflow_definition"] = _workflow_definition_to_authoring_shape(wf_def)
+    return True
+
+
 def _auto_wire_definition_string(definition: str, fmt: str, excluded_keys: set[str]) -> str:
     raw, parsed_format = _load_definition_dict(definition, fmt)
     if raw is None or parsed_format is None:
         return definition
-    if not _auto_wire_code_only_parameter_keys(raw, excluded_keys):
+    # Convert first: a runtime code block's empty ``parameters`` becomes the ``parameter_keys: []`` opt-out.
+    converted = _convert_runtime_definition_shape(raw)
+    if not (_auto_wire_code_block_parameter_keys(raw, excluded_keys) or converted):
         return definition
     return _dump_definition_dict(raw, parsed_format)
 
@@ -1181,6 +1246,7 @@ async def _inject_workflow_update_parameters(
     if raw is None or parsed_format is None:
         return definition, warnings
 
+    converted = _convert_runtime_definition_shape(raw)
     wf_def = raw.get("workflow_definition")
     if not isinstance(wf_def, dict):
         return definition, warnings
@@ -1194,8 +1260,6 @@ async def _inject_workflow_update_parameters(
 
     existing_params: list[dict[str, Any]] = existing_wf_def.get("parameters", [])
 
-    modified = False
-
     # --- Step 1: Always replace protected parameters with existing values ---
     # Credential/secret parameters — including workflow inputs of type credential_id —
     # should NEVER be modifiable via MCP. The existing workflow's values always win,
@@ -1206,6 +1270,14 @@ async def _inject_workflow_update_parameters(
     for param in existing_params:
         if _is_protected_update_parameter(param):
             protected_keys.add(param["key"])
+
+    # Only code blocks new to the workflow are auto-wired; an existing code block keeps its prior links via Step 3.
+    existing_labels = frozenset(
+        block["label"]
+        for block in _iter_blocks_flat(existing_wf_def.get("blocks", []))
+        if isinstance(block.get("label"), str) and block.get("block_type") == BlockType.CODE
+    )
+    modified = _auto_wire_code_block_parameter_keys(raw, protected_keys, existing_labels) or converted
 
     if protected_keys:
         # Remove any protected params the caller may have included (may have stale data)
@@ -1627,7 +1699,15 @@ async def skyvern_workflow_run_list(
     page: Annotated[int, Field(description="Page number (1-based)", ge=1)] = 1,
     page_size: Annotated[int, Field(description="Results per page", ge=1, le=100)] = 10,
     status: Annotated[list[str] | None, "Filter by one or more workflow run statuses"] = None,
-    search_key: Annotated[str | None, Field(description="Search workflow run IDs, parameters, and headers")] = None,
+    search_key: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Search workflow run IDs, parameters, headers and webhook callback URLs; a complete "
+                "browser profile, browser session or credential ID matches the runs that used it"
+            )
+        ),
+    ] = None,
     error_code: Annotated[str | None, Field(description="Filter by task error code")] = None,
     include_child_runs: Annotated[
         bool,
@@ -1648,16 +1728,20 @@ async def skyvern_workflow_run_list(
 
     with Timer() as timer:
         try:
-            requested_page_size = page_size
-            runs = await list_workflow_runs_raw(
+            list_runs = functools.partial(
+                list_workflow_runs_raw,
                 workflow_id,
-                page=page,
-                page_size=requested_page_size + 1,
                 status=status,
                 search_key=search_key,
                 error_code=error_code,
                 include_child_runs=include_child_runs,
             )
+            runs = await list_runs(page=page, page_size=page_size)
+            has_more = False
+            if len(runs) == page_size:
+                # The route offsets by (page - 1) * page_size, so this one-row page is the next page's first run.
+                next_run = await list_runs(page=page * page_size + 1, page_size=1)
+                has_more = bool(next_run)
             timer.mark("sdk")
         except NotFoundError:
             return make_result(
@@ -1678,9 +1762,6 @@ async def skyvern_workflow_run_list(
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check your API key and workflow run filters"),
             )
 
-    has_more = len(runs) > page_size
-    runs = runs[:page_size]
-
     return make_result(
         "skyvern_workflow_run_list",
         data={
@@ -1691,6 +1772,7 @@ async def skyvern_workflow_run_list(
             "count": len(runs),
             "has_more": has_more,
             "include_child_runs": include_child_runs,
+            "run_details_hint": _RUN_LIST_DETAILS_HINT,
             "sdk_equivalent": (
                 f"# No SDK argument yet — GET /v1/workflows/{workflow_id}/runs?include_child_runs=true"
                 if include_child_runs
@@ -1710,31 +1792,26 @@ async def skyvern_workflow_create(
         str, Field(description="Definition format: 'json', 'yaml', or 'auto' (tries JSON first, falls back to YAML)")
     ] = "auto",
     folder_id: Annotated[str | None, "Folder ID (fld_...) to organize the workflow in"] = None,
-    code_only: Annotated[
-        bool | None,
-        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
-    ] = None,
 ) -> dict[str, Any]:
     """Create a reusable, versioned workflow from a YAML or JSON definition. For multi-page automations,
     scheduling, and repeated runs — not one-off trials (use skyvern_run_task for those).
 
     The ENTIRE workflow — its title, blocks, and parameters — must be serialized INTO the `definition`
     string (YAML or JSON). Do NOT pass title, blocks, parameters, or other workflow fields as separate
-    top-level arguments; only definition/format/folder_id/code_only are accepted and any other top-level
+    top-level arguments; only definition/format/folder_id are accepted and any other top-level
     field is rejected. Minimal JSON definition:
     {"title": "My workflow", "workflow_definition": {"blocks": [...], "parameters": [...]}}.
     This creates from a definition — it does not list or search; to browse existing workflows use
     skyvern_workflow_list.
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
-    Omit `code_only` or pass null to use this server's default; organization policy may enforce code-only, making rejection intentional.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
     When omitted, run_with defaults to "agent" and code_version defaults to 2 for both JSON and YAML
     definitions.
     Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
     Give every code block a `prompt`: its plain-language goal, shown as the block's Goal in the
     editor. Code blocks that omit `prompt` are defaulted to prompt="" so they render the current
-    code block editor experience, and their `steps` outline is derived from the code when omitted.
+    code block editor experience. A code block's `steps` outline is always rebuilt from its code, so do not send one.
 
     Leave optional toggles and overrides unset unless the user explicitly asks for them. This
     applies to workflow-level fields (persist_browser_session, pin_saved_session_ip, extra_http_headers,
@@ -1774,17 +1851,10 @@ async def skyvern_workflow_create(
     if err := _validate_definition_structure(json_def, "skyvern_workflow_create"):
         return err
 
-    if code_only:
-        if json_def is not None:
-            if err := _validate_code_only_workflow_blocks(json_def, "skyvern_workflow_create"):
-                return err
-            # No exclusions on create: _auto_wire_code_only_parameter_keys already skips
-            # sensitive params, and there is no existing workflow to protect.
-            _auto_wire_code_only_parameter_keys(json_def, set())
-        elif err := _validate_code_only_definition(definition, format, "skyvern_workflow_create"):
-            return err
-        elif yaml_def is not None:
-            yaml_def = _auto_wire_definition_string(yaml_def, format, set())
+    if json_def is not None:
+        _auto_wire_code_block_parameter_keys(json_def, set())
+    elif yaml_def is not None:
+        yaml_def = _auto_wire_definition_string(yaml_def, format, set())
 
     with Timer() as timer:
         try:
@@ -1821,17 +1891,13 @@ async def skyvern_workflow_update(
     format: Annotated[  # noqa: A002
         str, Field(description="Definition format: 'json', 'yaml', or 'auto'")
     ] = "auto",
-    code_only: Annotated[
-        bool | None,
-        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
-    ] = None,
 ) -> dict[str, Any]:
     """Update an existing workflow's definition. Use when you need to modify a workflow's blocks,
     parameters, or configuration. Creates a new version of the workflow.
 
     The ENTIRE updated workflow — its title, blocks, and parameters — must be serialized INTO the
     `definition` string; do NOT pass title/blocks/parameters as separate top-level arguments (only
-    workflow_id/definition/format/code_only are accepted, any other top-level field is rejected).
+    workflow_id/definition/format are accepted, any other top-level field is rejected).
 
     For very large workflows, run
     `skyvern workflow get --id <wpid> --definition-file wf.json`, edit wf.json, then run
@@ -1858,10 +1924,6 @@ async def skyvern_workflow_update(
             ),
         )
 
-    if code_only:
-        if err := _validate_code_only_definition(definition, format, "skyvern_workflow_update"):
-            return err
-
     existing_workflow: dict[str, Any] | None = None
 
     async def fetch_existing() -> dict[str, Any]:
@@ -1876,18 +1938,6 @@ async def skyvern_workflow_update(
         definition = await _inject_workflow_update_top_level_settings(definition, format, fetch_existing)
         definition = await _inject_workflow_update_code_block_prompt_defaults(definition, format, fetch_existing)
         definition = _inject_code_block_derived_steps(definition, format)
-        if code_only:
-            existing = await fetch_existing()
-            existing_wf_def = existing.get("workflow_definition")
-            existing_params = existing_wf_def.get("parameters", []) if isinstance(existing_wf_def, dict) else []
-            # Only the existing workflow's protected keys need excluding here; sensitive
-            # keys in the submitted definition are already skipped inside the auto-wire.
-            protected_existing = {
-                parameter["key"]
-                for parameter in (existing_params if isinstance(existing_params, list) else [])
-                if _is_protected_update_parameter(parameter)
-            }
-            definition = _auto_wire_definition_string(definition, format, protected_existing)
         definition, param_warnings = await _inject_workflow_update_parameters(definition, format, fetch_existing)
     except NotFoundError:
         return make_result(
@@ -1950,6 +2000,12 @@ async def skyvern_workflow_update(
             )
 
     data = _serialize_workflow(workflow)
+    if notes_kept := _notes_kept_by_server(json_def, yaml_def, workflow):
+        data["notes_kept"] = notes_kept
+        data["notes_kept_message"] = (
+            "The definition omitted notes or descriptions on these blocks, so the saved ones were kept. "
+            "To delete one, send the field as null."
+        )
     fmt_label = "json_definition" if json_def is not None else "yaml_definition"
     data["sdk_equivalent"] = f"await skyvern.update_workflow({workflow_id!r}, {fmt_label}=<definition>)"
     if param_warnings:
@@ -2094,6 +2150,17 @@ async def skyvern_workflow_run(
             description="Execution mode override (e.g., 'code' for cached script execution). Null inherits from workflow setting."
         ),
     ] = None,
+    max_steps_override: Annotated[
+        int | None,
+        Field(description="Cap the number of AI steps per task block for this run, to bound AI cost.", ge=1),
+    ] = None,
+    ai_fallback: Annotated[
+        bool | None,
+        Field(
+            description="With run_with='code', whether a failed cached-script step falls back to AI. "
+            "Null inherits from the workflow setting."
+        ),
+    ] = None,
     verbosity: Annotated[
         Literal["summary", "full"],
         Field(description="Return compact run output or the full response, subject to the final size caps."),
@@ -2152,6 +2219,8 @@ async def skyvern_workflow_run(
                 wait_for_completion=wait,
                 timeout=timeout_seconds,
                 run_with=run_with,
+                max_steps_override=max_steps_override,
+                ai_fallback=ai_fallback,
             )
             timer.mark("sdk")
         except asyncio.TimeoutError:
@@ -2190,7 +2259,14 @@ async def skyvern_workflow_run(
     data.setdefault("workflow_id", workflow_id)
     params_str = f", parameters={parsed_params}" if parsed_params else ""
     wait_str = f", wait_for_completion=True, timeout={timeout_seconds}" if wait else ""
-    data["sdk_equivalent"] = f"await skyvern.run_workflow(workflow_id={workflow_id!r}{params_str}{wait_str})"
+    overrides_str = "".join(
+        f", {name}={value!r}"
+        for name, value in (("max_steps_override", max_steps_override), ("ai_fallback", ai_fallback))
+        if value is not None
+    )
+    data["sdk_equivalent"] = (
+        f"await skyvern.run_workflow(workflow_id={workflow_id!r}{params_str}{overrides_str}{wait_str})"
+    )
     return make_result("skyvern_workflow_run", data=data, timing_ms=timer.timing_ms)
 
 
@@ -2260,7 +2336,7 @@ async def skyvern_workflow_status(
         return payload
 
     result = make_result("skyvern_workflow_status", data=_payload_for(verbosity), timing_ms=timer.timing_ms)
-    if _response_size(result) <= MCP_MAX_RESPONSE_CHARS:
+    if within_response_limits(result):
         return result
 
     # The generic size cap preserves only top-level `ok`/`error`/`*_id`, and this result
@@ -2268,26 +2344,39 @@ async def skyvern_workflow_status(
     # caller nothing to act on. Degrade to the compact payload instead; the full output is
     # still retrievable over the HTTP API, which is not capped.
     oversized_warning = (
-        f"Full output exceeded the {MCP_MAX_RESPONSE_CHARS}-char MCP response limit; "
-        f"returning a reduced payload. Fetch the full run over the HTTP API at /v1/runs/{run_id}."
+        f"Full output exceeded the MCP response size limit ({MCP_MAX_RESPONSE_CHARS} chars / "
+        f"{MCP_MAX_RESPONSE_BYTES} bytes); returning a reduced payload. "
+        f"Fetch the full run over the HTTP API at /v1/runs/{run_id}."
     )
+    summary_data = _payload_for("summary")
     summary_result = make_result(
         "skyvern_workflow_status",
-        data=_payload_for("summary"),
+        data=summary_data,
         timing_ms=timer.timing_ms,
         warnings=[oversized_warning],
     )
-    if _response_size(summary_result) <= MCP_MAX_RESPONSE_CHARS:
+    if within_response_limits(summary_result):
         return summary_result
 
     # The summary is itself unbounded — it copies fields like failure_reason verbatim. Fall
-    # back to the identifiers a poller needs so it never lands in the stripped envelope.
-    summary_data = _payload_for("summary")
+    # back to the identifiers a poller needs so it never lands in the stripped envelope,
+    # plus the download references, which are otherwise unreachable over MCP.
     minimal: dict[str, Any] = {"run_id": run_id, "status": summary_data.get("status")}
     if run_id.startswith("wr_"):
         minimal["sdk_equivalent"] = f"await skyvern_workflow_status(run_id={run_id!r}, verbosity='summary')"
     else:
         minimal["sdk_equivalent"] = f"await skyvern.get_run({run_id!r})"
+
+    downloads = _download_reference(summary_data.get("artifact_summary"))
+    if downloads:
+        with_downloads = make_result(
+            "skyvern_workflow_status",
+            data={**minimal, "artifact_summary": downloads},
+            timing_ms=timer.timing_ms,
+            warnings=[oversized_warning],
+        )
+        if within_response_limits(with_downloads):
+            return with_downloads
     return make_result(
         "skyvern_workflow_status",
         data=minimal,

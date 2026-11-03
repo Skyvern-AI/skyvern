@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 
-from skyvern.config import settings
+from skyvern.config import CodeBlockMode, settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.config import (
-    BlockAuthoringPolicy,
+    AGENT_BLOCKS_ONLY,
+    ALL_BLOCK_FAMILIES,
+    CODE_BLOCKS_ONLY,
     CopilotConfig,
-    block_authoring_policy_for_request,
-    block_authoring_policy_from_code_only_mode,
-    download_scout_act_required_for_policy,
+    authoring_capability_for_request,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
     derive_copilot_code_mode_diagnostics,
@@ -24,16 +26,16 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON,
     _build_recoverable_route_agent_result,
     _capture_copilot_code_mode_opt_out,
-    _effective_copilot_composer_mode,
+    _effective_copilot_build_mode,
     _reason_category_for_copilot_code_mode_opt_out,
-    _resolve_copilot_code_available,
+    _resolve_copilot_request_config,
     _should_emit_copilot_code_mode_opt_out,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 
-def _request(mode: str | None, code_block: bool | None) -> WorkflowCopilotChatRequest:
+def _request(mode: Literal["build"] | None, code_block: bool | None) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
         workflow_id="wf-1",
@@ -64,58 +66,63 @@ def _outcome(
 
 
 @pytest.mark.parametrize(
-    ("mode", "code_block", "uses_v2", "code_mode_fallback", "expected"),
+    ("mode", "code_block", "code_mode_fallback", "expected"),
     [
-        ("ask", None, False, False, "ask"),
-        ("build", None, True, True, "build"),
-        ("build", False, True, True, "build"),
-        ("build", True, True, False, "code"),
-        (None, True, True, False, "code"),
-        (None, False, True, True, "build"),
-        (None, None, True, False, "build"),
-        (None, None, True, True, "code"),
-        (None, None, False, True, "ask"),
+        ("build", None, True, "code"),
+        ("build", False, True, "build"),
+        ("build", True, False, "code"),
+        (None, True, False, "code"),
+        (None, False, True, "build"),
+        (None, None, False, None),
+        (None, None, True, "code"),
     ],
 )
-def test_effective_copilot_composer_mode(
-    mode: str | None, code_block: bool | None, uses_v2: bool, code_mode_fallback: bool, expected: str
+def test_effective_copilot_build_mode(
+    mode: str | None, code_block: bool | None, code_mode_fallback: bool, expected: str
 ) -> None:
     assert (
-        _effective_copilot_composer_mode(
+        _effective_copilot_build_mode(
             _request(mode, code_block),
-            uses_v2=uses_v2,
             code_mode_fallback=code_mode_fallback,
         )
         == expected
     )
 
 
+def test_chat_request_rejects_removed_ask_mode() -> None:
+    with pytest.raises(ValidationError):
+        WorkflowCopilotChatRequest.model_validate(
+            {
+                "workflow_permanent_id": "wpid-1",
+                "workflow_id": "wf-1",
+                "workflow_copilot_chat_id": "chat-1",
+                "message": "message",
+                "workflow_yaml": "title: Example",
+                "mode": "ask",
+            }
+        )
+
+
 @pytest.mark.parametrize(
-    ("prior", "to_mode", "current_code_available", "expected"),
+    ("prior", "to_mode", "expected"),
     [
-        (_outcome(mode="code"), "build", True, True),
-        (_outcome(mode="code"), "ask", False, True),
-        (_outcome(mode="build", code_available=True), "ask", False, True),
-        (_outcome(mode="build", code_available=False), "ask", True, True),
-        (_outcome(mode="build", code_available=False), "ask", False, False),
-        (_outcome(mode="code"), "code", True, False),
-        (_outcome(mode="build", code_available=True), "build", True, False),
-        (_outcome(mode="ask", code_available=True), "build", True, False),
-        (None, "ask", True, False),
-        (_outcome(mode=None, code_available=True), "ask", True, False),
+        (_outcome(mode="code"), "build", True),
+        (_outcome(mode="code"), "code", False),
+        (_outcome(mode="build", code_available=True), "build", False),
+        (_outcome(mode="ask", code_available=True), "build", False),
+        (None, "build", False),
+        (_outcome(mode=None, code_available=True), "build", False),
     ],
 )
 def test_should_emit_copilot_code_mode_opt_out_transitions(
     prior: TurnOutcome | None,
     to_mode: str,
-    current_code_available: bool,
     expected: bool,
 ) -> None:
     assert (
         _should_emit_copilot_code_mode_opt_out(
             prior_turn_outcome=prior,
             to_mode=to_mode,
-            current_code_available=current_code_available,
         )
         is expected
     )
@@ -156,8 +163,7 @@ def test_capture_copilot_code_mode_opt_out_uses_chat_id_as_distinct_id(monkeypat
 
     _capture_copilot_code_mode_opt_out(
         prior_turn_outcome=prior,
-        to_mode="ask",
-        current_code_available=True,
+        to_mode="build",
         workflow_copilot_chat_id="chat-123",
         workflow_permanent_id="wpid-123",
         organization_id="org-123",
@@ -168,7 +174,7 @@ def test_capture_copilot_code_mode_opt_out_uses_chat_id_as_distinct_id(monkeypat
         "copilot_code_mode_opt_out",
         data={
             "from_mode": "code",
-            "to_mode": "ask",
+            "to_mode": "build",
             "reason_category": "failure",
             "last_code_build_failed": True,
             "pending_capability": "credential-typed code synthesis",
@@ -188,8 +194,7 @@ def test_capture_copilot_code_mode_opt_out_skips_non_transition(monkeypatch: pyt
 
     _capture_copilot_code_mode_opt_out(
         prior_turn_outcome=_outcome(mode="build", code_available=False),
-        to_mode="ask",
-        current_code_available=False,
+        to_mode="build",
         workflow_copilot_chat_id="chat-123",
         workflow_permanent_id="wpid-123",
         organization_id="org-123",
@@ -234,18 +239,16 @@ def test_build_recoverable_route_agent_result_sets_failure_turn_outcome() -> Non
 
 
 @pytest.mark.asyncio
-async def test_resolve_copilot_code_available_uses_access_and_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
-    agent_function = SimpleNamespace(has_code_block_access=AsyncMock(), get_copilot_config_for_request=AsyncMock())
+async def test_resolve_copilot_request_config_uses_single_resolved_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = CopilotConfig(code_block_available=True, effective_code_block_mode=True)
+    config.authoring_capability = CODE_BLOCKS_ONLY
+    agent_function = SimpleNamespace(get_copilot_config_for_request=AsyncMock(return_value=config))
     monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
 
-    agent_function.has_code_block_access.return_value = False
-    assert await _resolve_copilot_code_available("org-1", _request("build", False)) is False
-    agent_function.get_copilot_config_for_request.assert_not_awaited()
+    resolved = await _resolve_copilot_request_config("org-1", _request("build", None))
 
-    agent_function.has_code_block_access.return_value = True
-    agent_function.get_copilot_config_for_request.return_value = config
-    assert await _resolve_copilot_code_available("org-1", _request("ask", None)) is True
+    assert resolved is config
+    agent_function.get_copilot_config_for_request.assert_awaited_once_with("org-1", code_block_mode=None)
 
 
 def test_with_copilot_code_mode_metadata_preserves_turn_outcome_fields() -> None:
@@ -265,6 +268,7 @@ def test_with_copilot_code_mode_metadata_preserves_turn_outcome_fields() -> None
     assert updated.response_kind == ResponseKind.CLARIFY
     assert updated.reason_code == "request_policy_clarification"
     assert updated.terminal_reason == "terminal"
+    assert updated.copilot_runtime == "agent"
     assert updated.copilot_effective_mode == "build"
     assert updated.copilot_code_available is True
     assert updated.copilot_turn_id == "turn-123"
@@ -298,63 +302,94 @@ def test_derive_copilot_code_mode_diagnostics_on_a_clean_turn() -> None:
     }
 
 
-def test_copilot_config_defaults_to_standard_policy() -> None:
-    assert CopilotConfig().block_authoring_policy == BlockAuthoringPolicy.STANDARD
+def test_copilot_config_defaults_to_agent_blocks_only() -> None:
+    assert CopilotConfig().authoring_capability == AGENT_BLOCKS_ONLY
 
 
-def test_code_block_settings_helper_selects_policy() -> None:
-    assert block_authoring_policy_from_code_only_mode(True) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-    assert block_authoring_policy_from_code_only_mode(False) == BlockAuthoringPolicy.STANDARD
+@pytest.mark.parametrize(
+    ("code_block_mode", "has_code_block_access", "expected"),
+    [
+        (None, True, ALL_BLOCK_FAMILIES),
+        (True, True, CODE_BLOCKS_ONLY),
+        (False, True, AGENT_BLOCKS_ONLY),
+        (None, False, AGENT_BLOCKS_ONLY),
+        (True, False, AGENT_BLOCKS_ONLY),
+        (False, False, AGENT_BLOCKS_ONLY),
+    ],
+)
+def test_authoring_capability_for_request(
+    code_block_mode: bool | None,
+    has_code_block_access: bool,
+    expected: object,
+) -> None:
+    assert authoring_capability_for_request(code_block_mode, has_code_block_access) == expected
 
 
-@pytest.mark.parametrize("fallback_code_block_mode", [False, True])
-def test_build_with_unspecified_code_mode_selects_task_v3_pure(fallback_code_block_mode: bool) -> None:
-    assert (
-        block_authoring_policy_for_request(None, "build", fallback_code_block_mode=fallback_code_block_mode)
-        == BlockAuthoringPolicy.TASK_V3_PURE
-    )
-
-
-def test_download_scout_act_requirement_follows_code_only_policy() -> None:
-    assert download_scout_act_required_for_policy(BlockAuthoringPolicy.CODE_ONLY_BROWSER) is True
-    assert download_scout_act_required_for_policy("code_only_browser") is True
-    assert download_scout_act_required_for_policy(None) is False
-    assert download_scout_act_required_for_policy(BlockAuthoringPolicy.STANDARD) is False
-
-
-def test_base_agent_function_honors_code_block_mode_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_base_agent_function_default_config_authors_agent_blocks_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
 
     config = AgentFunction().get_copilot_config()
 
     assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
 
 
 @pytest.mark.asyncio
-async def test_base_agent_function_request_config_uses_env_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("code_block_mode", "has_code_block_access", "expected_capability", "expected_effective_code_mode"),
+    [
+        (None, True, ALL_BLOCK_FAMILIES, False),
+        (True, True, CODE_BLOCKS_ONLY, True),
+        (False, True, AGENT_BLOCKS_ONLY, False),
+        (None, False, AGENT_BLOCKS_ONLY, False),
+        (True, False, AGENT_BLOCKS_ONLY, False),
+    ],
+)
+async def test_request_config_resolver_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    code_block_mode: bool | None,
+    has_code_block_access: bool,
+    expected_capability: object,
+    expected_effective_code_mode: bool,
+) -> None:
+    # The rows read the request against an org's access, so the dial is held on; that it drops an
+    # unstated mode to agent blocks when off is the rollback, covered by the code-block flag suite.
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    agent_function = AgentFunction()
+    monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=has_code_block_access))
 
-    config = await AgentFunction().get_copilot_config_for_request("o_test")
+    config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=code_block_mode)
 
     assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    assert config.authoring_capability == expected_capability
+    assert config.code_block_available is has_code_block_access
+    assert config.effective_code_block_mode is expected_effective_code_mode
 
 
 @pytest.mark.asyncio
-async def test_base_agent_function_build_without_code_access_selects_task_v3_pure(
+async def test_request_config_authors_agent_blocks_only_when_access_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", False)
+    agent_function = AgentFunction()
+    monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(side_effect=RuntimeError("boom")))
 
-    config = await AgentFunction().get_copilot_config_for_request(
-        "o_test",
-        code_block_mode=None,
-        composer_mode="build",
-    )
+    config = await agent_function.get_copilot_config_for_request("o_test")
 
     assert config is not None
-    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
+
+
+@pytest.mark.asyncio
+async def test_base_agent_function_request_config_honors_code_block_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
+    monkeypatch.setattr(settings, "CODE_BLOCK_MODE", CodeBlockMode.disabled)
+
+    config = await AgentFunction().get_copilot_config_for_request("o_test", code_block_mode=True)
+
+    assert config is not None
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
 
 
 @pytest.mark.asyncio
@@ -363,12 +398,8 @@ async def test_base_request_config_preserves_get_copilot_config_override() -> No
     delegated_config = CopilotConfig()
     agent_function.get_copilot_config = MagicMock(return_value=delegated_config)  # type: ignore[method-assign]
 
-    config = await agent_function.get_copilot_config_for_request(
-        "o_test",
-        code_block_mode=False,
-        composer_mode="build",
-    )
+    config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=False)
 
     assert config is delegated_config
-    assert config.block_authoring_policy == BlockAuthoringPolicy.TASK_V3_PURE
+    assert config.authoring_capability == AGENT_BLOCKS_ONLY
     agent_function.get_copilot_config.assert_called_once_with(False)

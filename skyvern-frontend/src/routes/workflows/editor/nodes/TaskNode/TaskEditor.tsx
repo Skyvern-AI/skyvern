@@ -20,7 +20,11 @@ import { ModelSelector } from "@/components/ModelSelector";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 
 import { AI_IMPROVE_CONFIGS } from "../../constants";
-import { helpTooltips, placeholders } from "../../helpContent";
+import {
+  firstBrowserBlockUrlPlaceholder,
+  helpTooltips,
+  placeholders,
+} from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSession";
 import { type AppNode, isWorkflowBlockNode } from "..";
@@ -31,10 +35,16 @@ import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCred
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode, TaskNodeData } from "./types";
 import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
+import { cn } from "@/util/utils";
+import {
+  blockUrlErrorId,
+  useBlockUrlError,
+} from "../../hooks/useBlockUrlError";
 import { useUpdate } from "../../useUpdate";
 import {
   getAvailableOutputParameterKeys,
   getParentLoopSkipsOnFail,
+  isFirstBrowserTaskBlock,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 
@@ -51,6 +61,9 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
   ];
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
+  const urlPlaceholder = isFirstBrowserTaskBlock(nodes, edges, blockId)
+    ? firstBrowserBlockUrlPlaceholder
+    : placeholders["task"]["url"];
   // Subscribe to the node via the live useNodes() store rather than a
   // snapshot from reactFlowInstance.getNode - sidebar editors mount via
   // BlockConfigForm (not the RF node renderer), so a getNode snapshot
@@ -70,6 +83,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
     blockId,
   );
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
+  const urlError = useBlockUrlError(blockId);
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const hasInteracted = useHasInteractedThisSession();
@@ -106,12 +120,28 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   ) : null}
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="url"
                   nodeId={blockId}
                   onChange={(value) => update({ url: value })}
                   value={data.url}
-                  placeholder={placeholders["task"]["url"]}
-                  className="nopan text-xs"
+                  placeholder={urlPlaceholder}
+                  aria-invalid={urlError !== null}
+                  aria-describedby={
+                    urlError ? blockUrlErrorId(blockId) : undefined
+                  }
+                  className={cn(
+                    "nopan text-xs",
+                    urlError !== null && "border-destructive",
+                  )}
                 />
+                {urlError ? (
+                  <p
+                    id={blockUrlErrorId(blockId)}
+                    className="text-xs text-destructive"
+                  >
+                    {urlError}
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
@@ -123,6 +153,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="navigationGoal"
                   aiImprove={AI_IMPROVE_CONFIGS.task.navigationGoal}
                   nodeId={blockId}
                   onChange={(value) => update({ navigationGoal: value })}
@@ -157,6 +188,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="dataExtractionGoal"
                   aiImprove={{
                     useCase: AI_IMPROVE_CONFIGS.task.dataExtractionGoal.useCase,
                     context: {
@@ -176,6 +208,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                 />
               </div>
               <WorkflowDataSchemaInputGroup
+                deferKey={JSON.stringify([blockId, "dataSchema"])}
                 exampleValue={dataSchemaExampleValue}
                 onChange={(value) => update({ dataSchema: value })}
                 value={data.dataSchema}
@@ -197,6 +230,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   Complete if...
                 </Label>
                 <WorkflowBlockInputTextarea
+                  name="completeCriterion"
                   aiImprove={AI_IMPROVE_CONFIGS.task.completeCriterion}
                   nodeId={blockId}
                   onChange={(value) => update({ completeCriterion: value })}
@@ -276,6 +310,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                 </div>
                 {data.errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={data.label}
                     value={data.errorCodeMapping}
                     onChange={(value) => update({ errorCodeMapping: value })}
@@ -353,6 +388,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   <HelpTooltip content={helpTooltips["task"]["fileSuffix"]} />
                 </div>
                 <WorkflowBlockInput
+                  name="downloadSuffix"
                   nodeId={blockId}
                   type="text"
                   placeholder={placeholders["task"]["downloadSuffix"]}
@@ -372,6 +408,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier"
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
@@ -398,6 +435,7 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl"
                   nodeId={blockId}
                   onChange={(value) => update({ totpVerificationUrl: value })}
                   value={data.totpVerificationUrl ?? ""}

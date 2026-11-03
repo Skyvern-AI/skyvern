@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from enum import StrEnum
+
 from starlette import status
 
 from skyvern.exceptions import SkyvernException, SkyvernHTTPException
@@ -124,8 +127,8 @@ class CustomSMTPAuthenticationFailed(BaseWorkflowException):
 
 
 class NoValidEmailRecipient(BaseWorkflowException):
-    def __init__(self, recipients: list[str]) -> None:
-        super().__init__(f"No valid email recipient found. Recipients: {recipients}")
+    def __init__(self) -> None:
+        super().__init__("No email recipient found: the Recipients field resolved to no addresses.")
 
 
 class ContextParameterSourceNotDefined(BaseWorkflowHTTPException):
@@ -140,6 +143,14 @@ class InvalidFileType(BaseWorkflowHTTPException):
     def __init__(self, file_url: str, file_type: str, error: str) -> None:
         super().__init__(
             f"File URL {file_url} is not a valid {file_type} file. Error: {error}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
+class WorksheetNotFound(BaseWorkflowHTTPException):
+    def __init__(self, file_url: str, worksheet: str) -> None:
+        super().__init__(
+            f"Worksheet {worksheet!r} was not found in the workbook at file URL {file_url}.",
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
@@ -184,10 +195,30 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
 
 
-class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
-    def __init__(self, block_label: str, step_index: int, detail: str) -> None:
+class BlockEngineNotEnabledError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, engine: str) -> None:
         super().__init__(
-            f"Invalid step at index {step_index} in code block '{block_label}': {detail}",
+            f"Block '{block_label}' uses the {engine} engine, which is not enabled on this server",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class CodeBlockTemplateSyntaxError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, original: BaseException) -> None:
+        self.block_label = block_label
+        self.original = original
+        self.line = getattr(original, "lineno", None)
+        line_suffix = f" on line {self.line}" if self.line is not None else ""
+        super().__init__(
+            f"Invalid Jinja2 in code block '{block_label}'{line_suffix}: {original}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
+class CodeBlockInsecureCodeError(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, reason: str) -> None:
+        super().__init__(
+            f"Code block '{block_label}' can't run: {reason}",
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
@@ -201,10 +232,51 @@ class InvalidWaitBlockTime(WorkflowDefinitionValidationException):
         )
 
 
+class RenderFailureKind(StrEnum):
+    SYNTAX_ERROR = "Syntax error"
+    MISSING_REFERENCE = "Missing reference"
+    MISSING_KEY_OR_ATTRIBUTE = "Missing key or attribute"
+    WRONG_VALUE_TYPE = "Wrong value type"
+    UNSAFE_OPERATION = "Unsafe template operation"
+    INVALID_URL_MALFORMED = "Invalid URL: malformed"
+    INVALID_URL_UNSUPPORTED_SCHEME = "Invalid URL: unsupported scheme"
+    TRANSFORMED_PLACEHOLDER = "Placeholder used with a transformation"
+    JSON_FILTER_WITH_OTHER_TEXT = "`| json` combined with other text"
+    RENDER_ERROR = "Render error"
+
+
+@dataclass(frozen=True)
+class TemplateRenderCause:
+    """Why a template failed to render, built only from the exception class, the template source and field names."""
+
+    kind: RenderFailureKind
+    expressions: tuple[str, ...] = ()
+    line: int | None = None
+    field_name: str | None = None
+
+
+RENDER_FAILURE_OUTPUT_KEY = "render_failure"
+
+
+def has_render_failure_record(output: object) -> bool:
+    """Whether a failed block's output carries the record its template render failure wrote (ADR 0028 typed state)."""
+    return isinstance(output, dict) and isinstance(output.get(RENDER_FAILURE_OUTPUT_KEY), dict)
+
+
 class FailedToFormatJinjaStyleParameter(SkyvernException):
-    def __init__(self, template: str, msg: str, *, available_keys: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        template: str,
+        msg: str,
+        *,
+        available_keys: list[str] | None = None,
+        missing_references: list[str] | None = None,
+        render_cause: TemplateRenderCause | None = None,
+    ) -> None:
         self.template = template
         self.available_keys = available_keys or []
+        self.missing_references = missing_references or []
+        self.render_cause = render_cause
         super().__init__(
             f"Failed to format Jinja style parameter '{template}'. "
             f"Reason: {msg}. "
@@ -221,8 +293,9 @@ class PayloadTemplateRenderError(SkyvernException):
     string so the run's failure reason tells the author where to look.
     """
 
-    def __init__(self, path: str, template: str, original: BaseException) -> None:
+    def __init__(self, path: str, template: str, original: BaseException, segments: tuple[str | int, ...] = ()) -> None:
         self.path = path
+        self.segments = segments
         self.template = template
         self.original = original
         lineno = getattr(original, "lineno", None)
@@ -252,8 +325,17 @@ class PayloadTemplateSyntaxError(WorkflowDefinitionValidationException):
 
 
 class MissingJinjaVariables(SkyvernException):
-    def __init__(self, template: str, variables: set[str]) -> None:
+    def __init__(
+        self,
+        template: str,
+        variables: set[str],
+        *,
+        missing_references: list[str] | None = None,
+        render_cause: TemplateRenderCause | None = None,
+    ) -> None:
         self.variables = variables
+        self.missing_references = missing_references or []
+        self.render_cause = render_cause
 
         super().__init__(
             f"Missing variables for '{template}'. Missing: {variables}. "

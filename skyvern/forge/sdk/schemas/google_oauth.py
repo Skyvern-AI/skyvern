@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, computed_field, field_validator
 
 STATE_ACTIVE = "active"
+GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
 class GoogleOAuthClientConfig(BaseModel):
@@ -76,6 +77,7 @@ class GoogleOAuthCredentialBase(BaseModel):
     organization_id: str
     credential_name: str
     email_address: str | None = None
+    google_subject: str | None = Field(default=None, exclude=True)
     provider: str = "google"
     state: str
     scopes_requested: list[str] = Field(default_factory=list)
@@ -87,6 +89,16 @@ class GoogleOAuthCredentialBase(BaseModel):
     @property
     def valid(self) -> bool:
         return self.state == STATE_ACTIVE
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def gmail_send_ready(self) -> bool:
+        return (
+            self.state == STATE_ACTIVE
+            and {GOOGLE_GMAIL_SEND_SCOPE}.issubset(self.scopes_granted)
+            and bool(self.google_subject)
+            and bool(self.email_address)
+        )
 
 
 class GoogleOAuthCredentialResponse(BaseModel):
@@ -101,10 +113,13 @@ class GoogleOAuthCredentialListResponse(BaseModel):
 class CreateGoogleOAuthAuthorizeRequest(BaseModel):
     redirect_uri: str = Field(..., description="Redirect URI the consent flow will return to")
     credential_name: str = Field(default="Default", description="Human-readable name for this credential")
-    scope_profile: Literal["google_sheets", "gmail", "google_drive"] | None = Field(
+    scope_profile: Literal["google_sheets", "gmail", "google_drive", "gmail_send", "gmail_read_send"] | None = Field(
         default=None,
-        description="Allowed Google OAuth scope profile to request. Defaults to google_sheets.",
-        examples=["google_sheets", "gmail", "google_drive"],
+        description="Allowed Google OAuth scope profile to request. Defaults to google_sheets. "
+        "gmail_read_send connects one account for both reading and sending. "
+        "gmail_send or gmail_read_send with credential_id adds that permission to the connection and keeps "
+        "its existing grants.",
+        examples=["google_sheets", "gmail", "google_drive", "gmail_send", "gmail_read_send"],
     )
     app_origin: str | None = Field(
         default=None,

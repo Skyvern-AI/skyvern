@@ -1,8 +1,18 @@
-import { useMemo } from "react";
+import {
+  getRunAttempt,
+  runIsLogicallyActive,
+  runIsLogicallyFinal,
+  runIsExecuting,
+} from "@/routes/workflows/workflowRun/runRetryState";
+import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
-import { Status, WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import {
+  ActionTypes,
+  Status,
+  WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
+
 import {
   isAction,
   isObserverThought,
@@ -15,17 +25,24 @@ import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuer
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { getRecordingUrls } from "../workflowRun/recordingUrls";
 import {
+  filterTimelineToAttempt,
   findActiveItem,
   findTimelineBlock,
   resolveScreenshotBlockId,
 } from "../workflowRun/workflowTimelineUtils";
 import { type HeroSelection } from "./runview/HeroScreenshot";
-import { buildFilmstrip, runOutcomeFromStatus } from "./runProjections";
+import { useHeroScreenshot } from "./runview/useHeroScreenshot";
+import {
+  buildFilmstrip,
+  resolveLandingSelectionId,
+  runOutcomeFromStatus,
+} from "./runProjections";
 
 export type RunVisuals = {
   workflowRun: WorkflowRunStatusApiResponseWithWorkflow | undefined;
   timeline: WorkflowRunTimelineItem[] | undefined;
   running: boolean;
+  executing: boolean;
   failed: boolean;
   finalized: boolean;
   provisioning: boolean;
@@ -33,22 +50,21 @@ export type RunVisuals = {
   recordingUrls: string[];
   recordingArchived: boolean;
   hasScreenshots: boolean;
+  // Not yet known: the timeline or the selected block/thought's artifacts are loading.
+  screenshotsPending: boolean;
   // ?active= pins a specific step (anything but the live-edge "stream" pin).
   scrubbing: boolean;
   heroSelection: HeroSelection | null;
 };
 
-function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
-  if (!selection) {
-    return false;
-  }
-  if (selection.kind === "action") {
-    return Boolean(
+function hasActionScreenshot(selection: HeroSelection | null): boolean {
+  return (
+    selection?.kind === "action" &&
+    Boolean(
       selection.artifactId ||
       (selection.stepId && selection.actionOrder != null),
-    );
-  }
-  return true;
+    )
+  );
 }
 
 /**
@@ -58,21 +74,55 @@ function hasScreenshotCandidate(selection: HeroSelection | null): boolean {
  * block → leaf block, thought → LLM screenshot).
  */
 export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
-  const queryOptions = workflowRunId ? { workflowRunId } : undefined;
+  const queryOptions = { workflowRunId };
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(queryOptions);
-  const { data: timeline } = useWorkflowRunTimelineQuery(queryOptions);
+  const {
+    data: retainedTimeline,
+    isPlaceholderData: timelineIsPlaceholder,
+    isFetching: timelineFetching,
+  } = useWorkflowRunTimelineQuery(queryOptions);
+  // The timeline payload carries no run id of its own, so keepPreviousData serves
+  // the previous run's timeline on both a switch and a clear. It also bridges this
+  // run's own refetch on a status change (status is in the query key); those rows
+  // stay, or replay pills blink off mid-run.
+  const [loadedTimelineRunId, setLoadedTimelineRunId] = useState<string>();
+  if (
+    workflowRunId &&
+    !timelineIsPlaceholder &&
+    retainedTimeline !== undefined &&
+    loadedTimelineRunId !== workflowRunId
+  ) {
+    setLoadedTimelineRunId(workflowRunId);
+  }
+  const timeline =
+    !workflowRunId ||
+    (timelineIsPlaceholder && loadedTimelineRunId !== workflowRunId)
+      ? undefined
+      : retainedTimeline;
+  const currentTimeline = useMemo(
+    () =>
+      timeline
+        ? filterTimelineToAttempt(
+            timeline,
+            workflowRun?.attempts ?? [],
+            getRunAttempt(workflowRun ?? {}),
+          )
+        : undefined,
+    [timeline, workflowRun],
+  );
   const [searchParams] = useSearchParams();
   const activeParam = searchParams.get("active");
   // The Overview pane's loop-iteration selection isn't in the URL; read it from the
   // shared store so a selected iteration's screenshot resolves here too.
   const activeIteration = useRunViewStore((s) => s.activeIteration);
 
-  const outcome = runOutcomeFromStatus(workflowRun?.status);
-  const running = outcome === "running";
+  const outcome = runOutcomeFromStatus(workflowRun);
+  const running = Boolean(workflowRun && runIsLogicallyActive(workflowRun));
+  const executing = Boolean(workflowRun && runIsExecuting(workflowRun));
   // A user-canceled run isn't a failure — its replay defaults like a success.
   const canceled = workflowRun?.status === Status.Canceled;
   const failed = outcome === "failed" && !canceled;
-  const finalized = workflowRun ? statusIsFinalized(workflowRun) : false;
+  const finalized = workflowRun ? runIsLogicallyFinal(workflowRun) : false;
   const provisioning =
     workflowRun?.status === Status.Created ||
     workflowRun?.status === Status.Queued;
@@ -83,21 +133,27 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
     [workflowRun],
   );
 
-  const frames = useMemo(() => buildFilmstrip(timeline), [timeline]);
-  const lastFrame = frames.length > 0 ? frames[frames.length - 1] : null;
+  const frames = useMemo(
+    () => buildFilmstrip(currentTimeline),
+    [currentTimeline],
+  );
   const scrubbing = activeParam != null && activeParam !== "stream";
-  const selectedFrameId = scrubbing ? activeParam : (lastFrame?.id ?? null);
+  const landingSelectionId = useMemo(
+    () => resolveLandingSelectionId(frames, currentTimeline, finalized),
+    [frames, currentTimeline, finalized],
+  );
+  const selectedFrameId = scrubbing ? activeParam : landingSelectionId;
   const finallyBlockLabel =
     workflowRun?.workflow?.workflow_definition?.finally_block_label ?? null;
   const activeItem = useMemo(
     () =>
       findActiveItem(
-        timeline ?? [],
+        (selectedFrameId ? timeline : currentTimeline) ?? [],
         selectedFrameId,
         finalized,
         finallyBlockLabel,
       ),
-    [timeline, selectedFrameId, finalized, finallyBlockLabel],
+    [timeline, currentTimeline, selectedFrameId, finalized, finallyBlockLabel],
   );
 
   const heroSelection = useMemo<HeroSelection | null>(() => {
@@ -107,6 +163,13 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
         artifactId: activeItem.screenshot_artifact_id ?? null,
         stepId: activeItem.step_id ?? null,
         actionOrder: activeItem.action_order ?? null,
+        // The full timeline, not the current attempt's: a pinned action may belong to an earlier attempt.
+        workflowRunBlockId:
+          activeItem.action_type === ActionTypes.NullAction
+            ? (buildFilmstrip(timeline).find(
+                (frame) => frame.id === activeItem.action_id,
+              )?.blockId ?? null)
+            : null,
       };
     }
     if (isWorkflowRunBlock(activeItem)) {
@@ -140,13 +203,26 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
       ),
     [frames],
   );
+  // A selected block or thought offers Screenshots only once its artifacts resolve
+  // to one (the same lookup the hero renders); otherwise the pill opens nothing.
+  const { screenshot: selectionScreenshot, isLoading: selectionLoading } =
+    useHeroScreenshot(
+      heroSelection?.kind === "action" ? null : heroSelection,
+      executing,
+    );
   const hasScreenshots =
-    hasScreenshotFrame || hasScreenshotCandidate(heroSelection);
+    heroSelection?.kind === "block" || heroSelection?.kind === "thought"
+      ? Boolean(selectionScreenshot && !selectionScreenshot.archived)
+      : hasScreenshotFrame || hasActionScreenshot(heroSelection);
+  const screenshotsPending =
+    !hasScreenshots &&
+    (selectionLoading || (timelineFetching && timeline === undefined));
 
   return {
     workflowRun,
     timeline,
     running,
+    executing,
     failed,
     finalized,
     provisioning,
@@ -154,6 +230,7 @@ export function useRunVisuals(workflowRunId: string | undefined): RunVisuals {
     recordingUrls,
     recordingArchived: workflowRun?.recording_archived ?? false,
     hasScreenshots,
+    screenshotsPending,
     scrubbing,
     heroSelection,
   };

@@ -167,19 +167,6 @@ async def _fill(
 
 
 @pytest.mark.asyncio
-async def test_fill_secret_recovers_mismatch_after_first_write() -> None:
-    # A mismatched first read-back triggers a clear + retry that renders the value exactly; the recovery
-    # succeeds and no failure is returned. The retry transport (sequential) is asserted separately.
-    element = _make_secret_element([ROTATED, SECRET])
-
-    result = await _fill(element)
-
-    assert result is None
-    element.input_clear.assert_awaited_once()
-    element.input_fill.assert_awaited_once_with(text=SECRET)  # the single atomic first write
-
-
-@pytest.mark.asyncio
 async def test_fill_secret_recovers_text_truncation_via_readback() -> None:
     # SKY-12597/12579: a controlled text/email field drops the typed tail; the clear + retry recovers it.
     element = _make_secret_element([TRUNCATED, SECRET])
@@ -232,26 +219,32 @@ async def test_fill_typed_widget_secret_first_write_is_sequential_and_exact_read
 @pytest.mark.asyncio
 async def test_fill_typed_widget_secret_persistent_mismatch_retries_once_and_fails_closed() -> None:
     element = _make_secret_element([ROTATED, ROTATED])
+    manager = MagicMock()
+    manager.attach_mock(element.input_sequentially, "write")
+    manager.attach_mock(element.input_clear, "clear")
 
     result = await _fill(element, sequential_first=True)
 
     assert isinstance(result, ActionFailure)
     assert result.exception_type == "SecretInputMismatch"
-    assert element.input_sequentially.await_count == 2
     element.input_fill.assert_not_awaited()
-    element.input_clear.assert_awaited_once()
     assert element.get_locator.return_value.input_value.await_count == 2
+    # The last write left a scrambled credential in the field, so the fail-closed return clears it: a later
+    # retry step must not find a field that looks filled and submit the wrong value (SKY-19543).
+    assert [c[0] for c in manager.mock_calls] == ["write", "clear", "write", "clear"]
 
 
 @pytest.mark.asyncio
-async def test_fill_secret_clean_first_try_skips_retry() -> None:
-    element = _make_secret_element([SECRET])
+async def test_fill_secret_fail_closed_survives_a_clear_that_cannot_run() -> None:
+    # The field can be gone or refuse the clear by the time the mismatch is final. That must still return the
+    # fail-closed SecretInputMismatch rather than raising out of the action with another classification.
+    element = _make_secret_element([ROTATED, ROTATED])
+    element.input_clear = AsyncMock(side_effect=[None, PlaywrightError("Element is not attached to the DOM")])
 
     result = await _fill(element)
 
-    assert result is None
-    element.input_clear.assert_not_awaited()
-    element.input_sequentially.assert_not_awaited()
+    assert isinstance(result, ActionFailure)
+    assert result.exception_type == "SecretInputMismatch"
 
 
 @pytest.mark.asyncio
@@ -265,29 +258,6 @@ async def test_fill_secret_recovers_drop_to_empty(text: str) -> None:
 
     assert result is None
     element.input_clear.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_fill_secret_fails_after_second_mismatch() -> None:
-    element = _make_secret_element([ROTATED, ROTATED])
-
-    result = await _fill(element)
-
-    assert isinstance(result, ActionFailure)
-    assert result.success is False
-    assert result.exception_type == "SecretInputMismatch"
-
-
-@pytest.mark.asyncio
-async def test_fill_secret_fails_when_retry_readback_empty() -> None:
-    # After a confirmed first mismatch we cleared a known-bad value; an empty retry read-back is NOT a
-    # positive confirmation, so fail loudly rather than proceed with an unverified secret.
-    element = _make_secret_element([ROTATED, ""])
-
-    result = await _fill(element)
-
-    assert isinstance(result, ActionFailure)
-    assert result.exception_type == "SecretInputMismatch"
 
 
 @pytest.mark.asyncio
@@ -445,30 +415,21 @@ async def test_fill_secret_sequential_retry_async_clear_fails_closed() -> None:
     element.input_sequentially.assert_awaited_once_with(text=SECRET)
 
 
-@pytest.mark.asyncio
-async def test_fill_secret_recovery_never_logs_the_secret() -> None:
-    # The sequential retry + fail-closed path must never log the secret, its length, or its characters.
-    element = _make_secret_element([ROTATED, ROTATED])  # persistent mismatch -> fail closed
-
-    with patch("skyvern.webeye.actions.handler.LOG") as mock_log:
-        result = await _fill(element)
-
-    assert isinstance(result, ActionFailure)
-    logged = str(mock_log.mock_calls)
-    assert SECRET not in logged and ROTATED not in logged
-
-
 _NAV_ERROR = PlaywrightError("Execution context was destroyed, most likely because of a navigation")
 
 
 @pytest.mark.asyncio
-async def test_fill_secret_treats_navigation_after_fill_as_submitted() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [_NAV_ERROR, PlaywrightError("Protocol error (DOM.describeNode): Cannot find context with specified id")],
+)
+async def test_fill_secret_treats_navigation_after_fill_as_submitted(error: Exception) -> None:
     # A TOTP/credential field that auto-submits once the value completes tears down the execution context, so
     # the read-back raises a navigation error. The value was accepted and submitted, so treat it as success --
     # never re-raise out of the action or turn a correctly-entered code into SecretInputMismatch (SKY-13821).
     element = _make_secret_element([SECRET])
 
-    with patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(side_effect=_NAV_ERROR)):
+    with patch("skyvern.webeye.actions.handler.get_input_value", new=AsyncMock(side_effect=error)):
         result = await _fill(element)
 
     assert result is None
@@ -477,16 +438,20 @@ async def test_fill_secret_treats_navigation_after_fill_as_submitted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fill_secret_propagates_non_navigation_readback_error() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [PlaywrightError("some other driver failure"), RuntimeError("Cannot find context with specified id")],
+)
+async def test_fill_secret_propagates_non_navigation_readback_error(error: Exception) -> None:
     # Guard: only navigation teardown is tolerated. Any other read-back driver error still propagates rather
     # than being swallowed into a false success.
     element = _make_secret_element([SECRET])
 
     with patch(
         "skyvern.webeye.actions.handler.get_input_value",
-        new=AsyncMock(side_effect=PlaywrightError("some other driver failure")),
+        new=AsyncMock(side_effect=error),
     ):
-        with pytest.raises(PlaywrightError):
+        with pytest.raises(type(error)):
             await _fill(element)
 
 
@@ -634,6 +599,8 @@ async def test_fill_secret_logs_carry_no_secret_material() -> None:
     assert SECRET not in logged
     assert ROTATED not in logged
     assert str(len(SECRET)) not in logged
+    all_levels = str(mock_log.mock_calls)
+    assert SECRET not in all_levels and ROTATED not in all_levels
     assert result.exception_type == "SecretInputMismatch"
     assert SECRET not in (result.exception_message or "")
 

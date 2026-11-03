@@ -108,6 +108,11 @@ async def _load_context(
     else:
         assert workflow_run is not None
         tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run.workflow_run_id)
+        current_attempt = next(
+            (item.attempt_number or 1 for item in tasks if item.task_id == last_step.task_id),
+            max((item.attempt_number or 1 for item in tasks), default=1),
+        )
+        tasks = [item for item in tasks if (item.attempt_number or 1) == current_attempt]
         organization_id = workflow_run.organization_id
         workflow_run_id = workflow_run.workflow_run_id
         run_status = str(workflow_run.status)

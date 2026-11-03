@@ -4,6 +4,7 @@ import io
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,6 +24,8 @@ from pypdf.generic import (
 )
 
 from skyvern.forge import app
+from skyvern.forge.sdk.api import files
+from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError
 from skyvern.forge.sdk.utils.tesseract_languages import tesseract_language_arg, tesseract_ocr_packages
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import pdf_fill_block
@@ -381,6 +384,26 @@ def test_extract_field_labels_on_fillable_fixture(tmp_path: Path) -> None:
     assert isinstance(labels, dict)
 
 
+def test_fields_keep_their_names_when_the_word_lookup_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_pdf = tmp_path / "labelled.pdf"
+    _write_fillable_pdf(source_pdf)
+    lookups: list[object] = []
+
+    def refuse_the_lookup(*args: object, **kwargs: object) -> None:
+        lookups.append(args)
+        raise CappedSubprocessError("returned more than the 32 MiB a result may hold", kind="result_too_large")
+
+    monkeypatch.setattr(pdf_fill_block, "extract_upright_pdf_words", refuse_the_lookup)
+
+    inventory = _make_block()._extract_field_inventory(PdfReader(str(source_pdf)), str(source_pdf))
+
+    assert lookups
+    assert set(inventory) == set(PdfReader(str(source_pdf)).get_fields())
+    assert all(field.context_label == "" for field in inventory.values())
+
+
 def test_checkbox_without_known_state_is_skipped_not_silently_unchecked() -> None:
     block = _make_block()
     inventory = {
@@ -444,6 +467,25 @@ async def test_resolve_source_pdf_accepts_run_local_absolute_path_in_non_local_e
 
     assert resolved == str(source_pdf.resolve())
     assert is_temp is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_source_pdf_accepts_run_local_file_uri_without_temporary_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_id = "run_pdf_fill_file_uri"
+    _install_context(monkeypatch, run_id)
+    source_pdf = _run_local_pdf_path(monkeypatch, tmp_path, run_id, "source.pdf")
+    _write_fillable_pdf(source_pdf)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.pdf_fill_block.settings.ENV", "production")
+    monkeypatch.setattr(files.app, "STORAGE", SimpleNamespace(manages_local_file_uri=lambda *_: False))
+    block = _make_block(file_url=source_pdf.as_uri())
+
+    resolved, is_temp = await block._resolve_source_pdf(run_id, organization_id="org-1")
+
+    assert resolved == str(source_pdf.resolve())
+    assert is_temp is False
+    assert source_pdf.exists()
 
 
 @pytest.mark.asyncio

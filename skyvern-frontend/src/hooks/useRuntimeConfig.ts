@@ -1,14 +1,17 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { browserStreamingMode as buildTimeBrowserStreamingMode } from "@/util/env";
+import type { BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
 import { useQuery } from "@tanstack/react-query";
 
 export type BrowserStreamingMode = "cdp" | "vnc";
 
-type RuntimeConfigResponse = {
+export type RuntimeConfigResponse = {
   browser_streaming_mode?: string;
   browser_streaming_label?: string;
   environment?: string;
+  workflow_copilot_code_block_mode?: boolean;
+  code_block_access?: boolean;
   warnings?: string[];
 };
 
@@ -71,7 +74,7 @@ function resolveStreamTransport(
 function useStreamTransport(browserSessionId?: string | null) {
   const { browserStreamingMode } = useBrowserStreamingMode();
   const credentialGetter = useCredentialGetter();
-  const query = useQuery<{ stream_transport?: string | null }>({
+  const query = useQuery<Pick<BrowserSession, "stream_transport" | "source">>({
     // Deliberately the same key BrowserSession.tsx uses for its session query,
     // so react-query dedupes the fetch on pages that already load the session.
     queryKey: ["browserSession", browserSessionId],
@@ -93,6 +96,8 @@ function useStreamTransport(browserSessionId?: string | null) {
   const pending = Boolean(browserSessionId) && query.isPending;
 
   return {
+    // A registered external browser is never streamed; consumers show a fixed panel and open no socket.
+    isExternal: query.data?.source === "external",
     streamTransport: pending
       ? undefined
       : resolveStreamTransport(

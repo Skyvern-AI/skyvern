@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -38,6 +40,7 @@ class CredentialFoldersRepository(BaseRepository):
         page: int = 1,
         page_size: int = 10,
         search_query: str | None = None,
+        allowed_folder_ids: set[str] | None = None,
     ) -> list[CredentialFolderModel]:
         async with self.Session() as session:
             stmt = (
@@ -55,6 +58,9 @@ class CredentialFoldersRepository(BaseRepository):
                         CredentialFolderModel.description.ilike(search_pattern, escape="\\"),
                     )
                 )
+
+            if allowed_folder_ids is not None:
+                stmt = stmt.filter(CredentialFolderModel.folder_id.in_(allowed_folder_ids))
 
             stmt = stmt.order_by(CredentialFolderModel.modified_at.desc())
             stmt = stmt.offset((page - 1) * page_size).limit(page_size)
@@ -186,24 +192,34 @@ class CredentialFoldersRepository(BaseRepository):
         credential_id: str,
         organization_id: str,
         folder_id: str | None,
+        authorize_move: Callable[[AsyncSession], Awaitable[None]] | None = None,
     ) -> Credential | None:
         # Treat an empty folder_id as "remove from folder" (None) so it isn't
         # written as a non-existent "" id and trip the folder foreign key.
         folder_id = folder_id or None
         async with self.Session() as session:
-            credential = await session.get(CredentialModel, credential_id)
+            credential = await session.scalar(
+                select(CredentialModel).where(CredentialModel.credential_id == credential_id).with_for_update()
+            )
             if credential is None or credential.organization_id != organization_id or credential.deleted_at is not None:
                 return None
 
             # Validate the target folder in-org and bump its modified_at in a single fetch
             if folder_id:
-                folder_model = await session.get(CredentialFolderModel, folder_id)
+                folder_model = await session.scalar(
+                    select(CredentialFolderModel).where(CredentialFolderModel.folder_id == folder_id).with_for_update()
+                )
                 if (
                     folder_model is None
                     or folder_model.organization_id != organization_id
                     or folder_model.deleted_at is not None
                 ):
                     raise ValueError(f"Credential folder {folder_id} not found")
+
+            if authorize_move is not None:
+                await authorize_move(session)
+
+            if folder_id:
                 folder_model.modified_at = datetime.now(timezone.utc)
 
             credential.folder_id = folder_id

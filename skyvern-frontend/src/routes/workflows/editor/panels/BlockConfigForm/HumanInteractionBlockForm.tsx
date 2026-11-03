@@ -39,6 +39,7 @@ function HumanInteractionBlockFormBody({
     recipients,
     subject,
     body,
+    bodyFormat,
     negativeDescriptor,
     positiveDescriptor,
   } = node.data;
@@ -50,6 +51,7 @@ function HumanInteractionBlockFormBody({
       recipients,
       subject,
       body,
+      bodyFormat,
       negativeDescriptor,
       positiveDescriptor,
     }),
@@ -59,6 +61,7 @@ function HumanInteractionBlockFormBody({
       recipients,
       subject,
       body,
+      bodyFormat,
       negativeDescriptor,
       positiveDescriptor,
     ],

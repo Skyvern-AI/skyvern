@@ -3,7 +3,6 @@ import { useParams } from "react-router-dom";
 
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { cn } from "@/util/utils";
 
 import { useCollapseContext } from "../../collapse/CollapseContext";
@@ -18,12 +17,8 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
-  const recordingStore = useRecordingStore();
   const { open } = useCollapseContext();
-  const blockTitle = getCodeBlockTitle({
-    prompt: data.prompt,
-    steps: data.steps,
-  });
+  const blockTitle = getCodeBlockTitle({ prompt: data.prompt });
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
   const thisBlockIsTargetted =
@@ -32,11 +27,7 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
 
   return (
-    <div
-      className={cn({
-        "pointer-events-none opacity-50": recordingStore.isRecording,
-      })}
-    >
+    <div>
       <Handle
         type="source"
         position={Position.Bottom}
@@ -58,7 +49,6 @@ function CodeBlockNode({ id, data }: NodeProps<CodeBlockNode>) {
             "bg-background outline outline-2 outline-ring":
               thisBlockIsTargetted,
           },
-          data.comparisonColor,
         )}
       >
         <NodeHeader

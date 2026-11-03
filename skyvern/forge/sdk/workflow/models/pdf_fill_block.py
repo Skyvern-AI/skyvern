@@ -11,9 +11,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
+from urllib.parse import urlparse
 
 import aiofiles
-import pdfplumber
 import structlog
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -26,7 +26,8 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import (
     download_file,
     get_path_for_workflow_download_directory,
-    validate_local_file_path,
+    parse_uri_to_path,
+    resolve_local_or_download_file,
 )
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.api_handler_factory import (
@@ -38,7 +39,11 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.utils.pdf_parser import render_pdf_pages_as_images, validate_pdf_file
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_upright_pdf_words,
+    render_pdf_pages_as_images,
+    validate_pdf_file,
+)
 from skyvern.forge.sdk.utils.tesseract_languages import DEFAULT_FLAT_FILL_OCR_LANGUAGES
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
@@ -47,6 +52,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     Block,
     capture_block_download_baseline,
     extract_file_url_from_block_output,
+    render_failure_reason,
     sanitize_filename,
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
@@ -245,13 +251,15 @@ class PdfFillBlock(Block):
         # a user-supplied local path is never deleted.
         if settings.ENV == "local" and os.path.exists(self.file_url):
             return self.file_url, False
-        if self.file_url.startswith("/"):
+        parsed_url = urlparse(self.file_url)
+        if self.file_url.startswith("/") or parsed_url.scheme == "file":
             context = skyvern_context.current()
             run_id = context.run_id if context and context.run_id else workflow_run_id
-            resolved = validate_local_file_path(self.file_url, run_id)
-            if not os.path.isfile(resolved):
-                raise FileNotFoundError(f"Local file not found: {self.file_url}")
-            return resolved, False
+            resolved = await resolve_local_or_download_file(self.file_url, run_id, organization_id)
+            is_temp = parsed_url.scheme == "file" and os.path.realpath(resolved) != os.path.realpath(
+                parse_uri_to_path(self.file_url)
+            )
+            return resolved, is_temp
         return await download_file(self.file_url, organization_id=organization_id), True
 
     @staticmethod
@@ -303,6 +311,11 @@ class PdfFillBlock(Block):
             return "checkbox"
         return "text"
 
+    def _read_pdf_and_inventory(self, pdf_path: str) -> tuple[PdfReader, dict[str, PdfFieldInventory]]:
+        validate_pdf_file(pdf_path, file_identifier=self.file_url)
+        reader = PdfReader(pdf_path)
+        return reader, self._extract_field_inventory(reader, pdf_path)
+
     def _extract_field_inventory(self, reader: PdfReader, pdf_path: str | None = None) -> dict[str, PdfFieldInventory]:
         fields = reader.get_fields() or {}
         if not fields:
@@ -350,11 +363,7 @@ class PdfFillBlock(Block):
             if not leaf_rects:
                 return {}
 
-            with pdfplumber.open(pdf_path) as pdf:
-                words_by_page = {
-                    pi: [w for w in pg.extract_words(extra_attrs=["upright"]) if w.get("upright", True)]
-                    for pi, pg in enumerate(pdf.pages)
-                }
+            words_by_page = extract_upright_pdf_words(pdf_path, {rect[0] for rect in leaf_rects.values()})
 
             labels: dict[str, str] = {}
             for leaf, (page_index, fx0, ftop, fx1, fbot, is_button) in leaf_rects.items():
@@ -450,7 +459,7 @@ class PdfFillBlock(Block):
             LOG.warning(
                 "PdfFillBlock LLM response missing expected key",
                 expected_key=expected_key,
-                response_keys=list(parsed.keys()),
+                response_keys_count=len(parsed),
             )
         return parsed
 
@@ -559,7 +568,8 @@ class PdfFillBlock(Block):
         return shutil.which("tesseract") is not None
 
     async def _extract_flat_anchors(self, pdf_path: str) -> list[FlatPdfAnchor]:
-        page_images = render_pdf_pages_as_images(
+        page_images = await asyncio.to_thread(
+            render_pdf_pages_as_images,
             pdf_path,
             file_identifier=self.file_url,
             max_pages=FLAT_FILL_MAX_PAGES,
@@ -1043,7 +1053,9 @@ class PdfFillBlock(Block):
             return []
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                return await app.STORAGE.get_downloaded_files(organization_id=organization_id, run_id=workflow_run_id)
+                return await app.STORAGE.get_current_attempt_downloaded_files(
+                    organization_id=organization_id, run_id=workflow_run_id
+                )
         except Exception:
             return []
 
@@ -1065,7 +1077,9 @@ class PdfFillBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -1085,9 +1099,7 @@ class PdfFillBlock(Block):
 
         try:
             try:
-                validate_pdf_file(source_pdf_path, file_identifier=self.file_url)
-                reader = PdfReader(source_pdf_path)
-                inventory = self._extract_field_inventory(reader, source_pdf_path)
+                reader, inventory = await asyncio.to_thread(self._read_pdf_and_inventory, source_pdf_path)
             except PDFParsingError as e:
                 return await self._record_failure(
                     workflow_run_context,
@@ -1214,6 +1226,7 @@ class PdfFillBlock(Block):
             downloaded_files = filter_downloaded_files_for_current_iteration(
                 downloaded_files,
                 current_context.loop_internal_state if current_context else None,
+                aliases=app.STORAGE.get_downloaded_file_signature_aliases,
             )
             # The run-level download list can hold other blocks' files; narrow to this block's filled PDF so a
             # downstream block consuming `{{ this_output }}` resolves to the right file (extract_file_url reads [0]).

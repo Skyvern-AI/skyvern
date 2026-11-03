@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import time
+import timeit
 from typing import Any, Callable
 
 import pytest
@@ -38,12 +40,17 @@ CLOUDFRONT_SIGNED = (
 POLICY_NUMBER_URL = "https://ins.example.test/claim?policyNumber=POL2026AUG1234567X"
 MONKEYVAL_URL = "https://zoo.example.test/exhibit?monkeyval=abcdef0123456789xyz"
 
-# LIVENESS corpus: signed-URL shapes that must mask but previously slipped through unmasked.
-JWT_IN_PATH_URL = (
-    "https://files.example.test/download/"
-    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-    "/resume.pdf"
+# jwt.io's public sample token. Joined at import so no line holds a whole JWT for secret scanners to flag.
+SAMPLE_JWT = ".".join(
+    (
+        "eyJhbGciOiJIUzI1NiJ9",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    )
 )
+
+# LIVENESS corpus: signed-URL shapes that must mask but previously slipped through unmasked.
+JWT_IN_PATH_URL = f"https://files.example.test/download/{SAMPLE_JWT}/resume.pdf"
 HEX_BLOB_IN_PATH_URL = (
     "https://files.example.test/download/9f2c8a1b4d6e0f3a7c5b2d8e1f4a6c9b0d3e7f2a5c8b1d4e6f9a0c3e7b2d5f8a/resume.pdf"
 )
@@ -112,10 +119,7 @@ BLOB_AS_QUERY_KEY_WITH_TRIVIAL_VALUE_URL = (
 # A JWT can be embedded WITHIN a larger query value (e.g. an echoed "Bearer <jwt>" header) rather
 # than being the value's entire content - detection must match the same way it does in the path
 # (substring search), not require the JWT to be the whole decoded value.
-JWT_EMBEDDED_IN_QUERY_VALUE_URL = (
-    "https://files.example.test/download?t=Bearer%20"
-    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-)
+JWT_EMBEDDED_IN_QUERY_VALUE_URL = f"https://files.example.test/download?t=Bearer%20{SAMPLE_JWT}"
 # The blob can be fused directly into a KEY that also contains a signing word (e.g. "token-<blob>"),
 # bare or with a trivial value - the signing-key match must not short-circuit past checking whether
 # the key's own text still carries an unrelated, unmasked blob.
@@ -722,13 +726,20 @@ def test_mask_canonical_match_handles_thousands_of_quote_glued_copies_iterativel
     token = next(iter(refs.refs))
     echoed = "https://example.test/f?token=abcdefghijklmnop0123"
 
-    def timed(copies: int) -> float:
-        started = time.perf_counter()
+    def mask(copies: int) -> None:
         assert refs.mask("'".join([echoed] * copies)) == "'".join([token] * copies)
-        return time.perf_counter() - started
 
-    # Linear, not quadratic: four times the copies costs well under sixteen times the work.
-    assert timed(4000) < 6 * max(timed(1000), 0.005)
+    def timed(copies: int) -> float:
+        return timeit.timeit(lambda: mask(copies), number=1, timer=time.thread_time)
+
+    # Thread CPU time with the garbage collector paused, alternating sizes and keeping the best of each, so a busy
+    # runner slows both alike.
+    small_best = large_best = math.inf
+    for _ in range(5):
+        small_best = min(small_best, timed(500))
+        large_best = min(large_best, timed(4000))
+    # Linear, not quadratic: eight times the copies costs ~8x the work, where quadratic would cost ~64x.
+    assert large_best < 16 * small_best
 
 
 def test_mask_canonical_match_is_still_by_membership() -> None:
@@ -755,3 +766,72 @@ def test_mask_canonical_match_keeps_path_delimiter_escapes_distinct() -> None:
     refs = mask_opaque_urls({"file": "https://example.test/f?token=abcdefghijklmnop0123&next=a%2Fb"})
     prose = "at https://example.test/f?token=abcdefghijklmnop0123&next=a/b."
     assert refs.mask(prose) == prose
+
+
+_ECHOED_REF = "https://Files.example.test:443/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+_ECHOED_REF_BROWSER_FORM = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+
+
+@pytest.mark.parametrize("after", ["|Resume.pdf", ",next", ")x", "]x", "…", "\x00", "#top"])
+def test_mask_canonical_match_ends_at_the_ref_whatever_follows_it(after: str) -> None:
+    # observe prints a select option as `value|text`: the canonical echo runs straight into a character
+    # that is legal inside a URL, so no delimiter can say where the ref ends. Its own length can.
+    refs = mask_opaque_urls({"file": _ECHOED_REF})
+    token = next(iter(refs.refs))
+    assert refs.mask(f"{_ECHOED_REF_BROWSER_FORM}{after}") == f"{token}{after}"
+
+
+def test_mask_canonical_match_keeps_a_control_character_that_follows_the_ref() -> None:
+    # The URL parser strips a trailing control character, so a span that ends in one compares equal to the
+    # ref: the match must end before it, for a spelling of the ref as long as none of its forms too.
+    url = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+    refs = mask_opaque_urls({"file": url})
+    token = next(iter(refs.refs))
+    for echoed in (url, url.replace(".test/", ".test:443/")):
+        assert refs.mask(f"{echoed}\x01") == f"{token}\x01"
+
+
+def test_mask_canonical_match_ending_at_ref_length_is_still_by_membership() -> None:
+    refs = mask_opaque_urls({"file": _ECHOED_REF})
+    # Same host and path, a different credential run straight into a `|`: not ours, so not masked.
+    live = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "b" * 64 + "|Resume.pdf"
+    assert refs.mask(live) == live
+
+
+@pytest.mark.parametrize("glue", [" ", "|", ",", "https://live.example.test/page,"])
+def test_mask_of_cut_text_drops_the_head_of_a_ref_the_cut_left(glue: str) -> None:
+    # A head cannot say which object it was cut from, so it is dropped rather than masked to a token.
+    first = "https://files.example.test/a/doc.pdf?X-Amz-Signature=" + "a" * 64
+    second = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "b" * 64
+    refs = mask_opaque_urls({"first": first, "second": second})
+    token = next(token for token, url in refs.refs.items() if url == first)
+    for head in (second[:60], second[:60].upper(), "https://files.example.test/b/do", "https://files.example.test/"):
+        assert refs.mask(f"{first}{glue}{head}", cut=True) == f"{token}{glue}"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # Another host.
+        "https://other.example.test/b/doc.pdf?X-Amz-Sig",
+        # Same host, a path that leaves the ref's before the cut.
+        "https://files.example.test/c/doc.pdf?X-Amz-Sig",
+        # Too short to have left the ref's host: it names nothing on it.
+        "https://files.exa",
+        "https://files.example.test",
+    ],
+)
+def test_mask_of_cut_text_leaves_a_trailing_url_that_is_not_a_ref_head(tail: str) -> None:
+    refs = mask_opaque_urls({"file": "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64})
+    assert refs.mask(f"see {tail}", cut=True) == f"see {tail}"
+
+
+def test_mask_leaves_a_whole_live_url_that_shares_a_ref_prefix_alone() -> None:
+    # Only a cut can have made a partial of a ref, and only at the end of the text: uncut, or anywhere before
+    # the end of cut text, the same URL is a whole URL of the page's own.
+    url = "https://files.example.test/b/doc.pdf?X-Amz-Signature=" + "a" * 64
+    refs = mask_opaque_urls({"file": url})
+    live = "https://files.example.test/b/doc.pdf"
+    assert refs.mask(f"see {live}") == f"see {live}"
+    assert refs.mask(f"see {live} or the form", cut=True) == f"see {live} or the form"
+    assert refs.mask(f"see {live}|Resume", cut=True) == f"see {live}|Resume"

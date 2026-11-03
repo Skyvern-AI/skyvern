@@ -18,12 +18,17 @@ import structlog
 
 LOG = structlog.get_logger()
 
-# The only criterion kind graded today. Its evidence is the execution layer's own file registration,
-# which no generated code can fake or swallow.
+# Each kind is graded only from the execution layer's own registration of that kind of file, which
+# no generated code can fake or swallow: a site download, or a file the secure worker published.
 CRITERION_REGISTERED_DOWNLOAD = "registered_download"
+CRITERION_GENERATED_FILE = "generated_file"
 
 _CONTRACT_KEY = "completion_contract"
-_SUPPORTED_KINDS = frozenset({CRITERION_REGISTERED_DOWNLOAD})
+_SUPPORTED_KINDS = frozenset({CRITERION_REGISTERED_DOWNLOAD, CRITERION_GENERATED_FILE})
+_UNMET_REASONS = {
+    CRITERION_REGISTERED_DOWNLOAD: "The workflow did not produce the file it is declared to download.",
+    CRITERION_GENERATED_FILE: "The workflow did not produce the file it is declared to generate.",
+}
 # The field is public on the workflow schema, so a hand-written contract is bounded here.
 _MAX_CRITERIA = 16
 _MAX_ID_CHARS = 128
@@ -79,35 +84,29 @@ def grade_completion_contract(
     criteria: tuple[CompletionCriterion, ...],
     *,
     registered_download_count: int,
+    generated_file_count: int = 0,
 ) -> ContractVerdict:
     """Grade declared criteria against execution-layer evidence."""
-    unmet: list[str] = []
+    unmet: list[CompletionCriterion] = []
+    unclaimed_generated = generated_file_count
     for criterion in criteria:
-        if criterion.kind == CRITERION_REGISTERED_DOWNLOAD and registered_download_count < criterion.min_count:
-            unmet.append(criterion.id)
+        if criterion.kind == CRITERION_REGISTERED_DOWNLOAD:
+            if registered_download_count < criterion.min_count:
+                unmet.append(criterion)
+        elif criterion.kind == CRITERION_GENERATED_FILE:
+            # A published file is not tied to a criterion, so each promise claims its own in declaration
+            # order: the unmet ids say how many promises are short, not which files are missing.
+            if unclaimed_generated < criterion.min_count:
+                unmet.append(criterion)
+            else:
+                unclaimed_generated -= criterion.min_count
     if not unmet:
         return ContractVerdict(satisfied=True, unmet_criterion_ids=(), reason=None)
     return ContractVerdict(
         satisfied=False,
-        unmet_criterion_ids=tuple(unmet),
-        reason="The workflow did not produce the file it is declared to download.",
+        unmet_criterion_ids=tuple(criterion.id for criterion in unmet),
+        reason=_UNMET_REASONS[unmet[0].kind],
     )
-
-
-def contract_from_request_criteria(criteria: object) -> dict[str, object] | None:
-    """Project the request's own typed completion criteria into a workflow-carried contract.
-
-    The obligation comes from what the user asked for, never from the shape of the code the product
-    generated: a block that merely reports a download-shaped result promises nothing, and a request
-    that asked for a file promises one however the block is written."""
-    if not isinstance(criteria, (list, tuple)):
-        return None
-    if not any(_criterion_requests_a_download(criterion) for criterion in criteria):
-        return None
-    return {
-        "schema_version": 1,
-        "criteria": [{"id": "requested_download", "kind": CRITERION_REGISTERED_DOWNLOAD, "min_count": 1}],
-    }
 
 
 def contract_from_code_artifact_metadata(metadata: object) -> dict[str, object] | None:
@@ -119,7 +118,8 @@ def contract_from_code_artifact_metadata(metadata: object) -> dict[str, object] 
     """
     if not isinstance(metadata, Mapping):
         return None
-    seen_ids: set[str] = set()
+    # Ids are model-chosen per block, so two blocks can reuse one id for promises of different kinds.
+    seen: set[tuple[str, str]] = set()
     criteria: list[dict[str, object]] = []
     for artifact in metadata.values():
         if not isinstance(artifact, Mapping):
@@ -128,15 +128,14 @@ def contract_from_code_artifact_metadata(metadata: object) -> dict[str, object] 
         if not isinstance(raw_criteria, list):
             continue
         for item in raw_criteria:
-            if not isinstance(item, Mapping) or item.get("deliverable_kind") != CRITERION_REGISTERED_DOWNLOAD:
+            kind = item.get("deliverable_kind") if isinstance(item, Mapping) else None
+            if not isinstance(kind, str) or kind not in _SUPPORTED_KINDS:
                 continue
-            identifier = (
-                str(item.get("id") or CRITERION_REGISTERED_DOWNLOAD).strip() or CRITERION_REGISTERED_DOWNLOAD
-            )[:_MAX_ID_CHARS]
-            if identifier in seen_ids:
+            identifier = (str(item.get("id") or kind).strip() or kind)[:_MAX_ID_CHARS]
+            if (identifier, kind) in seen:
                 continue
-            seen_ids.add(identifier)
-            criteria.append({"id": identifier, "kind": CRITERION_REGISTERED_DOWNLOAD, "min_count": 1})
+            seen.add((identifier, kind))
+            criteria.append({"id": identifier, "kind": kind, "min_count": 1})
     if not criteria:
         return None
     return {"schema_version": 1, "criteria": criteria}
@@ -161,21 +160,3 @@ def with_contract(definition: dict, carried: dict[str, object] | None) -> dict:
         return definition
     definition[_CONTRACT_KEY] = carried
     return definition
-
-
-def _criterion_requests_a_download(criterion: object) -> bool:
-    """Whether a request criterion asks for a registered download.
-
-    The request classifier types this as ``deliverable_kind``/``output_path``; the synthetic id is
-    the copilot's own internal marker for the same obligation. Both are request-derived."""
-    from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS
-    from skyvern.forge.sdk.copilot.request_policy import REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID
-
-    for attr in ("deliverable_kind", "declared_deliverable_kind"):
-        if str(getattr(criterion, attr, "") or "").strip() == CRITERION_REGISTERED_DOWNLOAD:
-            return True
-    if str(getattr(criterion, "output_path", "") or "").strip() in REGISTERED_DOWNLOAD_REQUESTED_OUTPUT_PATHS:
-        return True
-    # The copilot's own synthetic marker for the same obligation, compared by id so this stays
-    # readable from an untyped criterion.
-    return str(getattr(criterion, "id", "") or "") == REGISTERED_DOWNLOAD_COMPLETION_CRITERION_ID

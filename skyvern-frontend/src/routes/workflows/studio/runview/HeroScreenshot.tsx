@@ -1,15 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ReloadIcon } from "@radix-ui/react-icons";
-import { useQuery } from "@tanstack/react-query";
 
-import { getClient } from "@/api/AxiosClient";
-import { ArtifactApiResponse, ArtifactType } from "@/api/types";
 import { useArtifactImageSrc } from "@/hooks/useArtifactImageSrc";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { apiPathPrefix } from "@/util/env";
+import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 
-import { selectBlockScreenshot } from "../../workflowRun/blockScreenshot";
 import { screenshotZoomClasses } from "./HeroScreenshot.utils";
+import { useHeroScreenshot } from "./useHeroScreenshot";
+
+const PRIMARY_RETRY_MS = 5000;
 
 export type HeroSelection =
   | {
@@ -17,6 +15,7 @@ export type HeroSelection =
       artifactId: string | null;
       stepId: string | null;
       actionOrder: number | null;
+      workflowRunBlockId: string | null;
     }
   | {
       kind: "block";
@@ -30,131 +29,62 @@ export type HeroSelection =
 
 /**
  * The selected element's screenshot, fit to the run-hero width and scrollable for
- * long captures. Mirrors the legacy run page: an action shows its own post-action
- * screenshot (by artifact id, falling back to the step's action screenshots), a
- * block shows its representative screenshot via `selectBlockScreenshot`.
+ * long captures.
  */
 export function HeroScreenshot({
   selection,
   running,
+  unavailableText = "Screenshot unavailable.",
 }: {
   selection: HeroSelection | null;
   running: boolean;
+  unavailableText?: string;
 }) {
-  const credentialGetter = useCredentialGetter();
   const [zoomed, setZoomed] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const {
+    screenshot: primary,
+    fallbackScreenshot,
+    isLoading,
+  } = useHeroScreenshot(selection, running);
+  const [failedPrimaryId, setFailedPrimaryId] = useState<string | null>(null);
+  const retriedPrimaryIds = useRef(new Set<string>());
+  const primaryId = primary?.artifact_id ?? null;
+  const canFallBack =
+    fallbackScreenshot !== undefined &&
+    fallbackScreenshot.artifact_id !== primary?.artifact_id;
+  const latched = canFallBack && failedPrimaryId === primaryId;
+  const loaded = latched ? fallbackScreenshot : primary;
+  const { src, onImageError, imageFailed } = useArtifactImageSrc(loaded);
+  // An at-failure capture can be listed before its upload finishes; show the prior action shot in the same render.
+  const primaryFailed = imageFailed && canFallBack && !latched;
+  const screenshot = primaryFailed ? fallbackScreenshot : loaded;
 
-  const action = selection?.kind === "action" ? selection : null;
-  const block = selection?.kind === "block" ? selection : null;
-  const thought = selection?.kind === "thought" ? selection : null;
+  useEffect(() => {
+    if (primaryFailed && primaryId) {
+      setFailedPrimaryId(primaryId);
+    }
+  }, [primaryFailed, primaryId]);
 
-  const { data: artifactById, isLoading: loadingArtifact } =
-    useQuery<ArtifactApiResponse>({
-      queryKey: ["artifact", action?.artifactId],
-      queryFn: async () => {
-        const client = await getClient(credentialGetter, "sans-api-v1");
-        return client
-          .get(`/artifacts/${action!.artifactId}`)
-          .then((response) => response.data);
-      },
-      enabled: Boolean(action?.artifactId),
-      refetchOnWindowFocus: false,
-      staleTime: Infinity,
-      retry: 1,
-    });
-
-  // Fallback path only when the action carries no explicit screenshot id: the
-  // step's action screenshots, indexed by action order (newest-first), like legacy.
-  const useStepFallback =
-    Boolean(action?.stepId) &&
-    action?.actionOrder != null &&
-    !action?.artifactId;
-  const { data: stepArtifacts, isLoading: loadingStep } = useQuery<
-    Array<ArtifactApiResponse>
-  >({
-    queryKey: ["step", action?.stepId, "artifacts"],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      return client
-        .get(`${apiPathPrefix}/step/${action!.stepId}/artifacts`)
-        .then((response) => response.data);
-    },
-    enabled: useStepFallback,
-    refetchInterval: running ? 5000 : false,
-    refetchOnWindowFocus: false,
-    staleTime: running ? 0 : Infinity,
-    retry: 1,
-  });
-
-  const { data: blockArtifacts, isLoading: loadingBlock } = useQuery<
-    Array<ArtifactApiResponse>
-  >({
-    queryKey: ["workflowRunBlock", block?.workflowRunBlockId, "artifacts"],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      return client
-        .get(
-          `${apiPathPrefix}/workflow_run_block/${block!.workflowRunBlockId}/artifacts`,
-        )
-        .then((response) => response.data);
-    },
-    enabled: Boolean(block?.workflowRunBlockId),
-    refetchInterval: running ? 5000 : false,
-    refetchOnWindowFocus: false,
-    // Artifacts are immutable once the run finishes; only keep polling while live.
-    staleTime: running ? 0 : Infinity,
-    retry: 1,
-  });
-
-  const { data: thoughtArtifacts, isLoading: loadingThought } = useQuery<
-    Array<ArtifactApiResponse>
-  >({
-    queryKey: ["observerThought", thought?.thoughtId, "artifacts"],
-    queryFn: async () => {
-      const client = await getClient(credentialGetter);
-      return client
-        .get(`${apiPathPrefix}/thought/${thought!.thoughtId}/artifacts`)
-        .then((response) => response.data);
-    },
-    enabled: Boolean(thought?.thoughtId),
-    refetchInterval: running ? 5000 : false,
-    refetchOnWindowFocus: false,
-    staleTime: running ? 0 : Infinity,
-    retry: 1,
-  });
-
-  let screenshot: ArtifactApiResponse | undefined;
-  if (action) {
-    const actionShots = stepArtifacts?.filter(
-      (artifact) => artifact.artifact_type === ArtifactType.ActionScreenshot,
-    );
-    const fromStep =
-      actionShots && action.actionOrder != null
-        ? actionShots[actionShots.length - action.actionOrder - 1]
-        : undefined;
-    screenshot = artifactById ?? fromStep;
-  } else if (block) {
-    screenshot = selectBlockScreenshot(
-      blockArtifacts,
-      block.blockType ?? undefined,
-    );
-  } else if (thought) {
-    const thoughtShots = thoughtArtifacts?.filter(
-      (artifact) => artifact.artifact_type === ArtifactType.LLMScreenshot,
-    );
-    // Thought LLM screenshots arrive newest-first; the last is the capture.
-    screenshot = thoughtShots?.[thoughtShots.length - 1];
-  }
-
-  const screenshotId = screenshot?.artifact_id ?? null;
-  const { src, onImageError, imageFailed } = useArtifactImageSrc(screenshot);
-  const isLoading =
-    loadingArtifact || loadingStep || loadingBlock || loadingThought;
+  // The upload may still finish, so give a latched primary one more chance.
+  useEffect(() => {
+    if (
+      !failedPrimaryId ||
+      failedPrimaryId !== primaryId ||
+      retriedPrimaryIds.current.has(failedPrimaryId)
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      retriedPrimaryIds.current.add(failedPrimaryId);
+      setFailedPrimaryId(null);
+    }, PRIMARY_RETRY_MS);
+    return () => clearTimeout(timer);
+  }, [failedPrimaryId, primaryId]);
 
   useEffect(() => {
     setZoomed(false);
-  }, [screenshotId]);
+  }, [primaryId]);
 
   // Start each view at the top; when zoomed, center horizontally too (margin-auto
   // resolves to 0 once the image overflows, so the scroll would default to left).
@@ -165,7 +95,7 @@ export function HeroScreenshot({
     }
     el.scrollTop = 0;
     el.scrollLeft = zoomed ? (el.scrollWidth - el.clientWidth) / 2 : 0;
-  }, [zoomed, screenshotId]);
+  }, [zoomed, primaryId]);
 
   if (!selection) {
     return (
@@ -182,10 +112,10 @@ export function HeroScreenshot({
       </div>
     );
   }
-  if (!screenshot || screenshot.archived || imageFailed) {
+  if (!screenshot || screenshot.archived || (imageFailed && !primaryFailed)) {
     return (
       <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
-        Screenshot unavailable.
+        {!screenshot ? unavailableText : "Screenshot unavailable."}
       </div>
     );
   }
@@ -208,7 +138,7 @@ export function HeroScreenshot({
       }}
     >
       <img
-        src={src}
+        src={primaryFailed ? getImageURL(screenshot) : src}
         alt="screenshot"
         className={zoom.image}
         onError={onImageError}

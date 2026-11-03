@@ -1,23 +1,47 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, or_, select, text
+from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.orm import defer
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.orm import defer, load_only
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.ask_user import (
+    QUESTION_CLIENT_GRACE,
+    AccountGroupDecision,
+    CredentialDeleteOutcome,
+    QuestionInteraction,
+    QuestionResponse,
+    claim_credential_deletion,
+    credential_deletion_lease_expired,
+    fail_unrecorded_credential_deletion,
+    finish_credential_deletion,
+    question_wait_is_live,
+    resolve_question_response,
+)
 from skyvern.forge.sdk.copilot.completion_criteria_store import criteria_from_json, criterion_authority_projection
-from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
-from skyvern.forge.sdk.copilot.terminal_envelope import chat_awaits_user_input
+from skyvern.forge.sdk.copilot.context import ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
+from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory, read_with_disconnect_recovery
 from skyvern.forge.sdk.db.base_repository import BaseRepository
-from skyvern.forge.sdk.db.exceptions import DuplicateCopilotTurnError, NotFoundError
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
+from skyvern.forge.sdk.db.exceptions import (
+    CopilotProposalConflictError,
+    DatabaseConnectionUnavailableError,
+    DuplicateCopilotTurnError,
+    NotFoundError,
+)
+from skyvern.forge.sdk.db.id import generate_credential_parameter_id
 from skyvern.forge.sdk.db.models import (
     ActionModel,
     AISuggestionModel,
@@ -31,13 +55,13 @@ from skyvern.forge.sdk.db.models import (
     OnePasswordCredentialParameterModel,
     OutputParameterModel,
     TaskGenerationModel,
-    TaskModel,
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
     WorkflowCopilotCompletionCriteriaSetModel,
     WorkflowModel,
     WorkflowParameterModel,
 )
+from skyvern.forge.sdk.db.repositories.workflow_runs import _folder_access_filter
 from skyvern.forge.sdk.db.utils import (
     convert_to_aws_secret_parameter,
     convert_to_output_parameter,
@@ -48,17 +72,29 @@ from skyvern.forge.sdk.db.utils import (
     summarize_copilot_chat_title,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
+    CopilotBrowserAllocation,
+    CopilotRequestBrowserAllocations,
+    TurnOutcome,
+)
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
-from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    COPILOT_PROPOSAL_METADATA_KEY,
+    MAX_STEER_MESSAGES_PER_TURN,
+    CopilotAttachedFile,
+    CopilotCandidateDisposition,
     CopilotPendingTurn,
+    CopilotProposalMetadata,
+    CopilotSteerMessage,
+    CopilotVideoEvidenceArtifact,
     NonAdoptableCriteriaSet,
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatSender,
     WorkflowCopilotChatSummary,
     WorkflowCopilotCompletionCriteriaSet,
+    WorkflowCopilotMessageFeedbackRating,
+    copilot_proposal_metadata,
 )
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -75,12 +111,25 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.utils.action_redaction import redact_action_for_log
+from skyvern.forge.sdk.workflow.models.workflow import COPILOT_TEST_WORKFLOW_CREATOR
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
 
 PENDING_TURN_RETENTION = timedelta(days=30)
+# ponytail: SQLite has no advisory locks and runs in one process, so an in-process set stands in.
+_SQLITE_FINALISING_TURNS: set[str] = set()
+
+
+def _turn_finalisation_lock_key(workflow_copilot_chat_id: str, turn_id: str) -> str:
+    return f"copilot_turn_finalisation:{workflow_copilot_chat_id}:{turn_id}"
+
+
+async def _turn_finalisation_held(session: AsyncSession, key: str) -> bool:
+    if session.bind is not None and session.bind.dialect.name == "sqlite":
+        return key in _SQLITE_FINALISING_TURNS
+    acquired = await session.scalar(text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"), {"key": key})
+    return not acquired
 
 
 def _pending_turn_id_for_idempotency_digest(
@@ -214,20 +263,57 @@ def _prune_pending_turns(pending_turns: object) -> dict[str, Any]:
     """Drop markers too old to still be worth reconciling, so the column cannot grow without bound."""
     if not isinstance(pending_turns, dict):
         return {}
-    cutoff = datetime.now(timezone.utc) - PENDING_TURN_RETENTION
+    now = datetime.now(timezone.utc)
+    cutoff = now - PENDING_TURN_RETENTION
     kept: dict[str, Any] = {}
     for turn_id, entry in pending_turns.items():
         if not isinstance(entry, dict):
             continue
         started_at = _parse_pending_turn_timestamp(entry.get("started_at"))
-        if started_at is not None and started_at < cutoff:
+        last_activity = started_at
+        live_question = False
+        for question in entry.get("question_interactions") or []:
+            if not isinstance(question, dict):
+                continue
+            review = question.get("credential_delete_review") or {}
+            for stamp in (question.get("resolved_at"), review.get("claimed_at")):
+                activity_at = _parse_pending_turn_timestamp(stamp)
+                if activity_at is not None:
+                    last_activity = max(last_activity, activity_at) if last_activity else activity_at
+            client_seen = _parse_pending_turn_timestamp(
+                entry.get("question_client_seen_at")
+            ) or _parse_pending_turn_timestamp(question.get("created_at"))
+            live_question = live_question or (
+                question.get("status") == "pending"
+                and question_wait_is_live(_parse_pending_turn_timestamp(entry.get("question_heartbeat_at")), now)
+                and client_seen is not None
+                and now - client_seen < QUESTION_CLIENT_GRACE
+            )
+        if last_activity is not None and last_activity < cutoff and not live_question:
             continue
         kept[turn_id] = entry
     return kept
 
 
+def _dump_attached_files(attached_files: list[CopilotAttachedFile] | None) -> list[dict[str, Any]] | None:
+    # ``available`` is resolved fresh on every read, so persisting it would age into a lie.
+    if not attached_files:
+        return None
+    return [attached.model_dump(mode="json", exclude={"available"}) for attached in attached_files]
+
+
 class WorkflowParametersRepository(BaseRepository):
     """Database operations for workflow parameters, copilot chat, task generation, actions, and runs."""
+
+    def __init__(
+        self,
+        session_factory: _SessionFactory,
+        debug_enabled: bool = False,
+        is_retryable_error_fn: Callable[[SQLAlchemyError], bool] | None = None,
+        db_engine: AsyncEngine | None = None,
+    ) -> None:
+        super().__init__(session_factory, debug_enabled, is_retryable_error_fn)
+        self._db_engine = db_engine
 
     @db_operation("create_workflow_parameter")
     async def create_workflow_parameter(
@@ -332,6 +418,7 @@ class WorkflowParametersRepository(BaseRepository):
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, BitwardenLoginCredentialParameter):
+            now = naive_utc_now()
             return BitwardenLoginCredentialParameterModel(
                 bitwarden_login_credential_parameter_id=parameter.bitwarden_login_credential_parameter_id,
                 workflow_id=parameter.workflow_id,
@@ -343,7 +430,10 @@ class WorkflowParametersRepository(BaseRepository):
                 bitwarden_collection_id=parameter.bitwarden_collection_id,
                 bitwarden_item_id=parameter.bitwarden_item_id,
                 url_parameter_key=parameter.url_parameter_key,
-                deleted_at=parameter.deleted_at,
+                totp_identifier=parameter.totp_identifier,
+                created_at=to_naive_utc(parameter.created_at) or now,
+                modified_at=to_naive_utc(parameter.modified_at) or now,
+                deleted_at=to_naive_utc(parameter.deleted_at),
             )
         elif isinstance(parameter, BitwardenSensitiveInformationParameter):
             return BitwardenSensitiveInformationParameterModel(
@@ -386,6 +476,7 @@ class WorkflowParametersRepository(BaseRepository):
                 deleted_at=parameter.deleted_at,
             )
         elif isinstance(parameter, OnePasswordCredentialParameter):
+            now = naive_utc_now()
             return OnePasswordCredentialParameterModel(
                 onepassword_credential_parameter_id=parameter.onepassword_credential_parameter_id,
                 workflow_id=parameter.workflow_id,
@@ -393,7 +484,10 @@ class WorkflowParametersRepository(BaseRepository):
                 description=parameter.description,
                 vault_id=parameter.vault_id,
                 item_id=parameter.item_id,
-                deleted_at=parameter.deleted_at,
+                totp_identifier=parameter.totp_identifier,
+                created_at=to_naive_utc(parameter.created_at) or now,
+                modified_at=to_naive_utc(parameter.modified_at) or now,
+                deleted_at=to_naive_utc(parameter.deleted_at),
             )
         elif isinstance(parameter, AzureVaultCredentialParameter):
             return AzureVaultCredentialParameterModel(
@@ -439,7 +533,8 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_id: str,
         parameters: list[PARAMETER_TYPE],
     ) -> None:
-        """Reconcile persisted WorkflowParameter + OutputParameter rows against ``parameters``.
+        """Reconcile persisted WorkflowParameter + OutputParameter rows, and each CredentialParameter row's
+        ``credential_id`` binding, against ``parameters``.
 
         Preserves primary keys on in-place updates (workflow-run FKs reference
         them) and mutates each matched incoming parameter so its ID equals the
@@ -529,6 +624,49 @@ class WorkflowParametersRepository(BaseRepository):
                 continue
             if row.deleted_at is None:
                 row.deleted_at = now
+
+        desired_credentials = {p.key: p for p in parameters if isinstance(p, CredentialParameter)}
+        live_credential_rows = (
+            await session.scalars(
+                select(CredentialParameterModel)
+                .filter_by(workflow_id=workflow_id)
+                .where(CredentialParameterModel.deleted_at.is_(None))
+            )
+        ).all()
+        for row in live_credential_rows:
+            desired = desired_credentials.pop(row.key, None)
+            if desired is None:
+                row.deleted_at = now
+            elif row.credential_id != desired.credential_id:
+                # Run search dates a binding by its row, so the replaced credential stays as a closed row.
+                session.add(
+                    CredentialParameterModel(
+                        workflow_id=workflow_id,
+                        key=row.key,
+                        credential_id=row.credential_id,
+                        created_at=row.created_at,
+                        deleted_at=now,
+                    )
+                )
+                row.credential_id = desired.credential_id
+                row.created_at = now
+        for parameter in desired_credentials.values():
+            parameter_id = parameter.credential_parameter_id
+            if await session.get(CredentialParameterModel, parameter_id) is not None:
+                parameter_id = generate_credential_parameter_id()
+            session.add(
+                CredentialParameterModel(
+                    credential_parameter_id=parameter_id,
+                    workflow_id=workflow_id,
+                    key=parameter.key,
+                    description=parameter.description,
+                    credential_id=parameter.credential_id,
+                    credential_ids=parameter.credential_ids,
+                    selection_strategy=parameter.selection_strategy,
+                    fallback_credential_ids=parameter.fallback_credential_ids,
+                    fallback_trigger=parameter.fallback_trigger,
+                )
+            )
 
     @db_operation("get_workflow_output_parameters")
     async def get_workflow_output_parameters(self, workflow_id: str) -> list[OutputParameter]:
@@ -672,6 +810,7 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_copilot_chat_id: str,
         proposed_workflow: dict | None | object = _UNSET,
         auto_accept: bool | None = None,
+        work_plan: list[str] | None | object = _UNSET,
     ) -> WorkflowCopilotChat | None:
         async with self.Session() as session:
             chat = (
@@ -679,19 +818,338 @@ class WorkflowParametersRepository(BaseRepository):
                     select(WorkflowCopilotChatModel)
                     .where(WorkflowCopilotChatModel.organization_id == organization_id)
                     .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
                 )
             ).first()
             if not chat:
                 return None
 
             if proposed_workflow is not _UNSET:
+                # Callers here read the chat before they write it. An owned candidate published in
+                # between owns the row, and only its own compare-and-set may replace it.
+                if copilot_proposal_metadata(chat.proposed_workflow) is not None and (
+                    copilot_proposal_metadata(proposed_workflow) is None
+                ):
+                    raise CopilotProposalConflictError(
+                        "Copilot proposal is owned by a newer candidate", reason="token_changed"
+                    )
                 chat.proposed_workflow = proposed_workflow
             if auto_accept is not None:
                 chat.auto_accept = auto_accept
+            if work_plan is not _UNSET:
+                chat.work_plan = work_plan
 
             await session.commit()
             await session.refresh(chat)
             return WorkflowCopilotChat.model_validate(chat)
+
+    async def _locked_copilot_chat(
+        self, session: AsyncSession, organization_id: str, workflow_copilot_chat_id: str
+    ) -> WorkflowCopilotChatModel:
+        chat = (
+            await session.scalars(
+                select(WorkflowCopilotChatModel)
+                .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .with_for_update()
+            )
+        ).first()
+        if chat is None:
+            raise NotFoundError(f"workflow copilot chat {workflow_copilot_chat_id}")
+        return chat
+
+    @staticmethod
+    def _require_candidate_token(
+        proposal: object, expected_owner_turn_id: str | None, expected_revision: int | None
+    ) -> CopilotProposalMetadata | None:
+        current = copilot_proposal_metadata(proposal)
+        if current is None:
+            if isinstance(proposal, Mapping) and COPILOT_PROPOSAL_METADATA_KEY in proposal:
+                raise CopilotProposalConflictError("Copilot proposal metadata is invalid", reason="metadata_invalid")
+            if expected_owner_turn_id is not None or expected_revision is not None:
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+            return None
+        if current.owner_turn_id != expected_owner_turn_id or current.revision != expected_revision:
+            raise CopilotProposalConflictError("Copilot proposal changed", reason="token_changed")
+        return current
+
+    @db_operation("publish_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def publish_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        proposal: dict[str, Any],
+        owner_turn_id: str,
+        canonical_fingerprint: str,
+        canonical_title: str | None,
+        disposition: ProposalDisposition,
+        expected_owner_turn_id: str | None,
+        expected_revision: int | None,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is not None and current.claim_is_live(datetime.now(timezone.utc)):
+                # The accept between its claim and its canonical write is committing bytes it has
+                # already read; replacing them underneath it would make it write a stale workflow.
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+            revision = current.revision + 1 if current is not None and current.owner_turn_id == owner_turn_id else 1
+            metadata = CopilotProposalMetadata(
+                owner_turn_id=owner_turn_id,
+                revision=revision,
+                canonical_fingerprint=canonical_fingerprint,
+                canonical_title=canonical_title,
+                disposition=disposition,
+            )
+            chat.proposed_workflow = {
+                **proposal,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("enrich_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def enrich_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        proposal: dict[str, Any],
+        expected_owner_turn_id: str,
+        expected_revision: int,
+        disposition: ProposalDisposition,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is None or not isinstance(chat.proposed_workflow, dict):
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+            if current.claim_is_live(datetime.now(timezone.utc)):
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+            if chat.proposed_workflow.get("_copilot_yaml") != proposal.get("_copilot_yaml"):
+                raise CopilotProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
+            current_workflow = {
+                key: value for key, value in chat.proposed_workflow.items() if not key.startswith("_copilot_")
+            }
+            proposed_workflow = {key: value for key, value in proposal.items() if not key.startswith("_copilot_")}
+            if current_workflow != proposed_workflow:
+                raise CopilotProposalConflictError("Copilot proposal content changed", reason="content_changed")
+            metadata = current.model_copy(update={"disposition": disposition})
+            chat.proposed_workflow = {
+                **proposal,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("bind_workflow_copilot_candidate_run", expected_errors=(CopilotProposalConflictError,))
+    async def bind_workflow_copilot_candidate_run(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str,
+        expected_revision: int,
+        expected_workflow_yaml: str,
+        workflow_run_id: str,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is None or not isinstance(chat.proposed_workflow, dict):
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+            if current.claim_is_live(datetime.now(timezone.utc)):
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+            if chat.proposed_workflow.get("_copilot_yaml") != expected_workflow_yaml:
+                raise CopilotProposalConflictError("Copilot proposal bytes changed", reason="bytes_changed")
+            # A new run is not yet proof. Turn end re-records the disposition from its result, but a turn
+            # that exits without one must not leave a stale Tested beside this run.
+            proven = current.disposition in ("review_tested", "auto_applicable")
+            metadata = current.model_copy(
+                update={
+                    "workflow_run_id": workflow_run_id,
+                    "disposition": "review_untested" if proven else current.disposition,
+                }
+            )
+            chat.proposed_workflow = {
+                **chat.proposed_workflow,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("claim_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def claim_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str,
+        expected_revision: int,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is None or not isinstance(chat.proposed_workflow, dict):
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="candidate_missing")
+            if current.claim_is_live(datetime.now(timezone.utc)):
+                raise CopilotProposalConflictError("Copilot proposal is being accepted", reason="being_accepted")
+            metadata = current.model_copy(update={"disposition": "accepting", "claimed_at": datetime.now(timezone.utc)})
+            chat.proposed_workflow = {
+                **chat.proposed_workflow,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("claim_untokened_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def claim_untokened_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_proposal: dict[str, Any],
+        owner_turn_id: str,
+    ) -> tuple[WorkflowCopilotChat, int | None]:
+        """Tokens a tokenless proposal, already claimed, and returns the saved version read in the claim's transaction."""
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            if chat.proposed_workflow != expected_proposal:
+                raise CopilotProposalConflictError("Copilot proposal changed", reason="content_changed")
+            # The proposal records no base, so this is the only version Accept can hold a later save against.
+            # Same filter as WorkflowsRepository.get_workflow_by_permanent_id, the read expected_version uses.
+            base_version = await session.scalar(
+                select(WorkflowModel.version)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id == chat.workflow_permanent_id)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(
+                    or_(WorkflowModel.created_by.is_(None), WorkflowModel.created_by != COPILOT_TEST_WORKFLOW_CREATOR)
+                )
+                .order_by(WorkflowModel.version.desc())
+                .limit(1)
+            )
+            # It was published against no recorded canonical, so the token records none. An empty fingerprint
+            # never matches, which keeps reads from showing it while claimed or after a write whose clear failed.
+            metadata = CopilotProposalMetadata(
+                owner_turn_id=owner_turn_id,
+                revision=1,
+                canonical_fingerprint="",
+                disposition="accepting",
+                claimed_at=datetime.now(timezone.utc),
+            )
+            chat.proposed_workflow = {
+                **expected_proposal,
+                COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+            }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat), base_version
+
+    @db_operation("release_workflow_copilot_candidate_claim", expected_errors=(CopilotProposalConflictError,))
+    async def release_workflow_copilot_candidate_claim(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str,
+        expected_revision: int,
+        expected_claimed_at: datetime | None,
+        disposition: ProposalDisposition,
+        restore_untokened: bool = False,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            # The token names the candidate and survives a takeover, so only the claim timestamp
+            # tells one holder's claim from its successor's.
+            if (
+                current is None
+                or not isinstance(chat.proposed_workflow, dict)
+                or current.disposition != "accepting"
+                or current.claimed_at != expected_claimed_at
+            ):
+                raise CopilotProposalConflictError("Copilot proposal claim changed", reason="claim_changed")
+            if restore_untokened:
+                chat.proposed_workflow = {
+                    key: value for key, value in chat.proposed_workflow.items() if key != COPILOT_PROPOSAL_METADATA_KEY
+                }
+            else:
+                metadata = current.model_copy(update={"disposition": disposition, "claimed_at": None})
+                chat.proposed_workflow = {
+                    **chat.proposed_workflow,
+                    COPILOT_PROPOSAL_METADATA_KEY: metadata.model_dump(mode="json"),
+                }
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("clear_workflow_copilot_candidate", expected_errors=(CopilotProposalConflictError,))
+    async def clear_workflow_copilot_candidate(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        *,
+        expected_owner_turn_id: str | None,
+        expected_revision: int | None,
+        expected_disposition: CopilotCandidateDisposition | None = None,
+        expected_claimed_at: datetime | None = None,
+        auto_accept: bool | None = None,
+        record_acceptance: bool = False,
+    ) -> WorkflowCopilotChat:
+        async with self.Session() as session:
+            chat = await self._locked_copilot_chat(session, organization_id, workflow_copilot_chat_id)
+            current = self._require_candidate_token(chat.proposed_workflow, expected_owner_turn_id, expected_revision)
+            if current is not None and (
+                (expected_disposition is None and current.claim_is_live(datetime.now(timezone.utc)))
+                or (expected_disposition is not None and current.disposition != expected_disposition)
+                # A claim the caller named must still be the one it took; see release above.
+                or (expected_claimed_at is not None and current.claimed_at != expected_claimed_at)
+            ):
+                raise CopilotProposalConflictError("Copilot proposal disposition changed", reason="disposition_changed")
+            if record_acceptance:
+                if current is None:
+                    raise CopilotProposalConflictError(
+                        "Copilot proposal has no owner to record", reason="candidate_missing"
+                    )
+                accepted_turn_ids = list(chat.accepted_turn_ids or [])
+                if current.owner_turn_id not in accepted_turn_ids:
+                    accepted_turn_ids.append(current.owner_turn_id)
+                chat.accepted_turn_ids = accepted_turn_ids
+            chat.proposed_workflow = None
+            if auto_accept is not None:
+                chat.auto_accept = auto_accept
+            await session.commit()
+            await session.refresh(chat)
+            return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("get_workflow_copilot_claim_expires_in")
+    async def get_workflow_copilot_claim_expires_in(
+        self, organization_id: str, workflow_permanent_id: str
+    ) -> float | None:
+        """Seconds left on the longest live Accept claim held by any chat on the workflow."""
+        proposal = WorkflowCopilotChatModel.proposed_workflow
+        async with self.Session() as session:
+            claims = (
+                await session.scalars(
+                    select(proposal[COPILOT_PROPOSAL_METADATA_KEY])
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+                    .where(proposal[(COPILOT_PROPOSAL_METADATA_KEY, "disposition")].as_string() == "accepting")
+                )
+            ).all()
+        now = datetime.now(timezone.utc)
+        remaining = [
+            metadata.claim_expires_in(now)
+            for claim in claims
+            if (metadata := copilot_proposal_metadata({COPILOT_PROPOSAL_METADATA_KEY: claim})) is not None
+        ]
+        return max((seconds for seconds in remaining if seconds is not None), default=None)
 
     @db_operation("create_workflow_copilot_chat_message")
     async def create_workflow_copilot_chat_message(
@@ -701,6 +1159,7 @@ class WorkflowParametersRepository(BaseRepository):
         sender: WorkflowCopilotChatSender,
         content: str,
         audio_artifact_id: str | None = None,
+        attached_files: list[CopilotAttachedFile] | None = None,
         global_llm_context: str | None = None,
         turn_outcome: TurnOutcome | None = None,
         narrative_payload: TurnNarrativePayload | dict[str, Any] | None = None,
@@ -712,6 +1171,7 @@ class WorkflowParametersRepository(BaseRepository):
                 sender=sender,
                 content=content,
                 audio_artifact_id=audio_artifact_id,
+                attached_files=_dump_attached_files(attached_files),
                 global_llm_context=global_llm_context,
                 turn_outcome=turn_outcome.model_dump(mode="json") if turn_outcome is not None else None,
                 narrative_payload=narrative_payload,
@@ -721,6 +1181,42 @@ class WorkflowParametersRepository(BaseRepository):
             await session.refresh(new_message)
             return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
 
+    @db_operation("set_workflow_copilot_chat_message_feedback")
+    async def set_workflow_copilot_chat_message_feedback(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_copilot_chat_message_id: str,
+        rating: WorkflowCopilotMessageFeedbackRating | None,
+        reason: str | None,
+    ) -> WorkflowCopilotChatMessage | None:
+        async with self.Session() as session:
+            message = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .filter(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .filter(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id
+                        == workflow_copilot_chat_message_id
+                    )
+                    .filter(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                )
+            ).first()
+            if message is None:
+                return None
+            if rating is None:
+                message.feedback_rating = None
+                message.feedback_reason = None
+                message.feedback_at = None
+            else:
+                message.feedback_rating = rating
+                message.feedback_reason = reason or None
+                message.feedback_at = naive_utc_now()
+            await session.commit()
+            await session.refresh(message)
+            return convert_to_workflow_copilot_chat_message(message, self.debug_enabled)
+
     @db_operation("start_copilot_turn")
     async def start_copilot_turn(
         self,
@@ -729,8 +1225,10 @@ class WorkflowParametersRepository(BaseRepository):
         pending_turn: CopilotPendingTurn,
         user_message: str,
         audio_artifact_id: str | None = None,
+        attached_files: list[CopilotAttachedFile] | None = None,
+        sender: WorkflowCopilotChatSender = WorkflowCopilotChatSender.USER,
     ) -> WorkflowCopilotChatMessage:
-        """Write the turn's user row and its pending marker in one transaction.
+        """Write the turn's opening row and its pending marker in one transaction.
 
         Two separate commits would leave a crash window in which the user
         message exists with no marker to reconcile it.
@@ -772,9 +1270,10 @@ class WorkflowParametersRepository(BaseRepository):
             new_message = WorkflowCopilotChatMessageModel(
                 workflow_copilot_chat_id=workflow_copilot_chat_id,
                 organization_id=organization_id,
-                sender=WorkflowCopilotChatSender.USER,
+                sender=sender,
                 content=user_message,
                 audio_artifact_id=audio_artifact_id,
+                attached_files=_dump_attached_files(attached_files),
             )
             session.add(new_message)
             await session.flush()
@@ -785,6 +1284,444 @@ class WorkflowParametersRepository(BaseRepository):
             await session.commit()
             await session.refresh(new_message)
             return convert_to_workflow_copilot_chat_message(new_message, self.debug_enabled)
+
+    async def _locked_question_chat(
+        self, session: AsyncSession, organization_id: str, chat_id: str
+    ) -> WorkflowCopilotChatModel:
+        chat = (
+            await session.scalars(
+                select(WorkflowCopilotChatModel)
+                .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                .with_for_update()
+            )
+        ).first()
+        if chat is None:
+            raise NotFoundError("Unknown Copilot chat")
+        return chat
+
+    @staticmethod
+    def _question_in_pending(
+        chat: WorkflowCopilotChatModel, interaction_id: str
+    ) -> tuple[CopilotPendingTurn, QuestionInteraction]:
+        for raw in (chat.pending_turns or {}).values():
+            entry = CopilotPendingTurn.model_validate(raw)
+            for item in entry.question_interactions:
+                if item.interaction_id == interaction_id:
+                    return entry, item
+        raise NotFoundError("Unknown pending Copilot question")
+
+    @staticmethod
+    def _store_question_turn(chat: WorkflowCopilotChatModel, entry: CopilotPendingTurn) -> None:
+        chat.pending_turns = {**(chat.pending_turns or {}), entry.turn_id: entry.model_dump(mode="json")}
+
+    @staticmethod
+    def _expire_credential_deletion_leases(entry: CopilotPendingTurn, now: datetime) -> bool:
+        expired = [
+            item.interaction_id for item in entry.question_interactions if credential_deletion_lease_expired(item, now)
+        ]
+        if expired:
+            LOG.warning("copilot_credential_deletion_lease_expired", interaction_ids=expired)
+            entry.question_interactions = [
+                fail_unrecorded_credential_deletion(item) if item.interaction_id in expired else item
+                for item in entry.question_interactions
+            ]
+        return bool(expired)
+
+    @staticmethod
+    def _question_in_entry(entry: CopilotPendingTurn, interaction_id: str) -> QuestionInteraction:
+        return next(item for item in entry.question_interactions if item.interaction_id == interaction_id)
+
+    @classmethod
+    def _expire_absent_question_client(cls, entry: CopilotPendingTurn, now: datetime) -> bool:
+        expired = cls._expire_credential_deletion_leases(entry, now)
+        for item in entry.question_interactions:
+            if (
+                item.awaiting_answer
+                and now - (entry.question_client_seen_at or item.created_at) >= QUESTION_CLIENT_GRACE
+            ):
+                item.status = "interrupted"
+                expired = True
+        return expired
+
+    @db_operation("refresh_copilot_question_client")
+    async def refresh_copilot_question_client(
+        self, organization_id: str, chat_id: str
+    ) -> dict[str, CopilotPendingTurn]:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            now = datetime.now(timezone.utc)
+            entries = {key: CopilotPendingTurn.model_validate(raw) for key, raw in (chat.pending_turns or {}).items()}
+            for entry in entries.values():
+                expired = self._expire_absent_question_client(entry, now)
+                pending = any(item.status == "pending" for item in entry.question_interactions)
+                if pending:
+                    entry.question_client_seen_at = now
+                if expired or pending:
+                    self._store_question_turn(chat, entry)
+            await session.commit()
+            return entries
+
+    @db_operation("start_copilot_question")
+    async def start_copilot_question(
+        self, organization_id: str, chat_id: str, interaction: QuestionInteraction
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            raw = (chat.pending_turns or {}).get(interaction.turn_id)
+            if raw is None:
+                raise ValueError("The Copilot execution has ended")
+            entry = CopilotPendingTurn.model_validate(raw)
+            if any(item.tool_call_id == interaction.tool_call_id for item in entry.question_interactions):
+                raise ValueError("This tool call already has a question")
+            entry.question_interactions.append(interaction)
+            entry.question_heartbeat_at = datetime.now(timezone.utc)
+            entry.question_client_seen_at = entry.question_heartbeat_at
+            self._store_question_turn(chat, entry)
+            await session.commit()
+
+    @db_operation("poll_copilot_question")
+    async def poll_copilot_question(
+        self, organization_id: str, chat_id: str, interaction_id: str
+    ) -> QuestionInteraction:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            now = datetime.now(timezone.utc)
+            if self._expire_absent_question_client(entry, now):
+                self._store_question_turn(chat, entry)
+                await session.commit()
+                return self._question_in_entry(entry, interaction_id)
+            if item.status == "pending" and (
+                entry.question_heartbeat_at is None or now - entry.question_heartbeat_at >= timedelta(seconds=5)
+            ):
+                entry.question_heartbeat_at = now
+                self._store_question_turn(chat, entry)
+                await session.commit()
+            return item
+
+    @db_operation("resolve_copilot_question")
+    async def resolve_copilot_question(
+        self,
+        organization_id: str,
+        chat_id: str,
+        interaction_id: str,
+        response: QuestionResponse,
+        *,
+        account_group_decision: AccountGroupDecision | None = None,
+        preflight_only: bool = False,
+    ) -> QuestionInteraction:
+        """Validate before external screening, then recheck and commit the screened reply."""
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            try:
+                entry, item = self._question_in_pending(chat, interaction_id)
+            except NotFoundError:
+                payloads = await session.scalars(
+                    select(WorkflowCopilotChatMessageModel.narrative_payload)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+                )
+                for payload in payloads:
+                    for raw in (payload or {}).get("questionInteractions", []):
+                        recorded = QuestionInteraction.model_validate(raw)
+                        if recorded.interaction_id == interaction_id:
+                            if recorded.status != "resolved":
+                                raise ValueError("The question is no longer active")
+                            return recorded
+                raise
+            if item.status == "resolved":
+                return item
+            now = datetime.now(timezone.utc)
+            expired = self._expire_absent_question_client(entry, now)
+            if item.awaiting_answer and not question_wait_is_live(entry.question_heartbeat_at, now):
+                item.status = "interrupted"
+                self._store_question_turn(chat, entry)
+                await session.commit()
+                raise ValueError("The question's execution was interrupted")
+            try:
+                if not item.awaiting_answer:
+                    raise ValueError("The question is no longer active")
+                resolved = resolve_question_response(item, response, account_group_decision)
+            except ValueError:
+                if expired:
+                    self._store_question_turn(chat, entry)
+                    await session.commit()
+                raise
+            if preflight_only:
+                entry.question_client_seen_at = datetime.now(timezone.utc)
+                self._store_question_turn(chat, entry)
+                await session.commit()
+                return item
+            entry.question_interactions = [
+                resolved if prior.interaction_id == interaction_id else prior for prior in entry.question_interactions
+            ]
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return resolved
+
+    @db_operation("record_copilot_account_group_submission")
+    async def record_copilot_account_group_submission(
+        self, organization_id: str, chat_id: str, interaction_id: str, workflow_run_group_id: str
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            if item.account_group_review is None:
+                raise ValueError("This question has no account review")
+            item.account_group_review.workflow_run_group_id = workflow_run_group_id
+            self._store_question_turn(chat, entry)
+            await session.commit()
+
+    @db_operation("claim_copilot_credential_deletion")
+    async def claim_copilot_credential_deletion(
+        self,
+        organization_id: str,
+        chat_id: str,
+        interaction_id: str,
+        approved_ids: list[str],
+        confirmed_by: str | None,
+    ) -> QuestionInteraction:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry, item = self._question_in_pending(chat, interaction_id)
+            now = datetime.now(timezone.utc)
+            expired = self._expire_absent_question_client(entry, now)
+            if item.awaiting_answer and not question_wait_is_live(entry.question_heartbeat_at, now):
+                item.status = "interrupted"
+                self._store_question_turn(chat, entry)
+                await session.commit()
+                raise ValueError("The question's execution was interrupted")
+            try:
+                claimed = claim_credential_deletion(item, approved_ids, confirmed_by)
+            except ValueError:
+                if expired:
+                    self._store_question_turn(chat, entry)
+                    await session.commit()
+                raise
+            entry.question_interactions = [
+                claimed if prior.interaction_id == interaction_id else prior for prior in entry.question_interactions
+            ]
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return claimed
+
+    @db_operation("record_copilot_credential_deletion")
+    async def record_copilot_credential_deletion(
+        self, organization_id: str, chat_id: str, interaction_id: str, outcomes: list[CredentialDeleteOutcome]
+    ) -> QuestionInteraction:
+        """Resolve a claimed deletion with its outcomes, in the pending turn or, once that turn ended, its row."""
+        return await self._settle_credential_deletion(
+            organization_id, chat_id, interaction_id, lambda item: finish_credential_deletion(item, outcomes)
+        )
+
+    @db_operation("fail_copilot_credential_deletion")
+    async def fail_copilot_credential_deletion(
+        self, organization_id: str, chat_id: str, interaction_id: str
+    ) -> QuestionInteraction:
+        return await self._settle_credential_deletion(
+            organization_id, chat_id, interaction_id, fail_unrecorded_credential_deletion
+        )
+
+    @db_operation("expire_copilot_credential_deletion_leases")
+    async def expire_copilot_credential_deletion_leases(
+        self, organization_id: str, chat_id: str, interactions: list[QuestionInteraction]
+    ) -> list[QuestionInteraction]:
+        now = datetime.now(timezone.utc)
+        expired = [item.interaction_id for item in interactions if credential_deletion_lease_expired(item, now)]
+        if not expired:
+            return interactions
+        LOG.warning("copilot_credential_deletion_lease_expired", interaction_ids=expired)
+        settled = {
+            interaction_id: await self._settle_credential_deletion(
+                organization_id, chat_id, interaction_id, fail_unrecorded_credential_deletion
+            )
+            for interaction_id in expired
+        }
+        return [settled.get(item.interaction_id, item) for item in interactions]
+
+    async def _settle_credential_deletion(
+        self,
+        organization_id: str,
+        chat_id: str,
+        interaction_id: str,
+        settle: Callable[[QuestionInteraction], QuestionInteraction],
+    ) -> QuestionInteraction:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            try:
+                entry, item = self._question_in_pending(chat, interaction_id)
+            except NotFoundError:
+                entry = None
+                stored = await self._narrative_question(session, organization_id, chat_id, interaction_id)
+                if stored is None:
+                    raise
+                item = stored
+            if item.status != "pending":
+                LOG.warning("copilot_credential_deletion_settled_after_resolution", interaction_id=interaction_id)
+                return item
+            resolved = settle(item)
+            if entry is not None:
+                entry.question_interactions = [
+                    resolved if prior.interaction_id == interaction_id else prior
+                    for prior in entry.question_interactions
+                ]
+                self._store_question_turn(chat, entry)
+            await self._patch_narrative_questions(session, organization_id, chat_id, [resolved])
+            await session.commit()
+            return resolved
+
+    @staticmethod
+    async def _narrative_question(
+        session: AsyncSession, organization_id: str, chat_id: str, interaction_id: str
+    ) -> QuestionInteraction | None:
+        payloads = await session.scalars(
+            select(WorkflowCopilotChatMessageModel.narrative_payload)
+            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+        )
+        for payload in payloads:
+            for raw in (payload or {}).get("questionInteractions", []):
+                if raw.get("interaction_id") == interaction_id:
+                    return QuestionInteraction.model_validate(raw)
+        return None
+
+    @staticmethod
+    async def _patch_narrative_questions(
+        session: AsyncSession, organization_id: str, chat_id: str, interactions: list[QuestionInteraction]
+    ) -> None:
+        by_id = {item.interaction_id: item.model_dump(mode="json") for item in interactions}
+        messages = await session.scalars(
+            select(WorkflowCopilotChatMessageModel)
+            .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+            .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == chat_id)
+            .where(WorkflowCopilotChatMessageModel.narrative_payload.is_not(None))
+            .options(
+                load_only(
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id,
+                    WorkflowCopilotChatMessageModel.narrative_payload,
+                )
+            )
+        )
+        for message in messages:
+            payload: dict[str, Any] = dict(message.narrative_payload or {})
+            questions: list[dict[str, Any]] = payload.get("questionInteractions", [])
+            if any(raw.get("interaction_id") in by_id for raw in questions):
+                payload["questionInteractions"] = [by_id.get(raw["interaction_id"], raw) for raw in questions]
+                message.narrative_payload = payload
+
+    @db_operation("interrupt_copilot_question")
+    async def interrupt_copilot_question(
+        self, organization_id: str, chat_id: str, interaction_id: str, *, stale_only: bool = False
+    ) -> QuestionInteraction | None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            try:
+                entry, item = self._question_in_pending(chat, interaction_id)
+            except NotFoundError:
+                return None
+            now = datetime.now(timezone.utc)
+            changed = self._expire_credential_deletion_leases(entry, now)
+            item = self._question_in_entry(entry, interaction_id)
+            if item.awaiting_answer and not (stale_only and question_wait_is_live(entry.question_heartbeat_at, now)):
+                item.status = "interrupted"
+                changed = True
+            if changed:
+                self._store_question_turn(chat, entry)
+                await session.commit()
+            return item
+
+    @db_operation("cancel_copilot_questions")
+    async def cancel_copilot_questions(self, organization_id: str, chat_id: str, cancel_token: str) -> bool:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            changed = False
+            for raw in list((chat.pending_turns or {}).values()):
+                entry = CopilotPendingTurn.model_validate(raw)
+                if entry.cancel_token != cancel_token:
+                    continue
+                self._expire_credential_deletion_leases(entry, datetime.now(timezone.utc))
+                for item in entry.question_interactions:
+                    if item.awaiting_answer:
+                        item.status = "cancelled"
+                        changed = True
+                self._store_question_turn(chat, entry)
+            await session.commit()
+            return changed
+
+    @db_operation("record_copilot_steer_message", expected_errors=(ValueError,))
+    async def record_copilot_steer_message(
+        self,
+        organization_id: str,
+        chat_id: str,
+        cancel_token: str,
+        steer_id: str,
+        steer: CopilotSteerMessage | None = None,
+    ) -> CopilotSteerMessage | None:
+        """Validate the running turn before external screening (``steer`` None), then recheck and record.
+
+        An already-recorded ``steer_id`` returns the stored message, so a retry never records twice.
+        """
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            entry = next(
+                (
+                    candidate
+                    for candidate in map(CopilotPendingTurn.model_validate, (chat.pending_turns or {}).values())
+                    if candidate.cancel_token == cancel_token and candidate.recovering_at is None
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError("The Copilot turn has ended")
+            existing = next((item for item in entry.steer_messages if item.steer_id == steer_id), None)
+            if existing is not None:
+                return existing
+            if len(entry.steer_messages) >= MAX_STEER_MESSAGES_PER_TURN:
+                raise ValueError("This Copilot turn cannot take more messages")
+            if steer is None:
+                return None
+            entry.steer_messages.append(steer)
+            entry.steer_messages.sort(key=lambda item: item.created_at)
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return steer
+
+    @db_operation("undelivered_copilot_steer_ids")
+    async def undelivered_copilot_steer_ids(self, organization_id: str, chat_id: str, turn_id: str) -> set[str]:
+        async with self.Session() as session:
+            pending_turns = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel.pending_turns)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                )
+            ).first()
+        raw = (pending_turns or {}).get(turn_id)
+        if raw is None:
+            return set()
+        entry = CopilotPendingTurn.model_validate(raw)
+        return {item.steer_id for item in entry.steer_messages if item.delivered_at is None}
+
+    @db_operation("take_copilot_steer_messages")
+    async def take_copilot_steer_messages(
+        self, organization_id: str, chat_id: str, turn_id: str
+    ) -> list[CopilotSteerMessage]:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, chat_id)
+            raw = (chat.pending_turns or {}).get(turn_id)
+            if raw is None:
+                return []
+            entry = CopilotPendingTurn.model_validate(raw)
+            undelivered = [item for item in entry.steer_messages if item.delivered_at is None]
+            if not undelivered:
+                return []
+            delivered_at = datetime.now(timezone.utc)
+            for item in undelivered:
+                item.delivered_at = delivered_at
+            self._store_question_turn(chat, entry)
+            await session.commit()
+            return undelivered
 
     @db_operation("claim_pending_copilot_turn")
     async def claim_pending_copilot_turn(
@@ -814,13 +1751,98 @@ class WorkflowParametersRepository(BaseRepository):
             entry = pending.get(turn_id)
             if not isinstance(entry, dict):
                 return False
+            question_turn = CopilotPendingTurn.model_validate(entry)
+            if any(item.status == "pending" for item in question_turn.question_interactions) and question_wait_is_live(
+                question_turn.question_heartbeat_at, datetime.now(timezone.utc)
+            ):
+                return False
+            if any(
+                item.last_activity_at is not None and item.last_activity_at > claim_before
+                for item in question_turn.question_interactions
+            ):
+                return False
             recovering_at = _parse_pending_turn_timestamp(entry.get("recovering_at"))
             if recovering_at is not None and recovering_at > claim_before:
+                return False
+            if await _turn_finalisation_held(session, _turn_finalisation_lock_key(workflow_copilot_chat_id, turn_id)):
+                return False
+            credential_resumed_at = _parse_pending_turn_timestamp(entry.get("credential_resumed_at"))
+            if credential_resumed_at is not None and credential_resumed_at > claim_before:
                 return False
             pending[turn_id] = {**entry, "recovering_at": datetime.now(timezone.utc).isoformat()}
             chat.pending_turns = pending
             await session.commit()
             return True
+
+    @db_operation("record_pending_copilot_turn_credential_resume")
+    async def record_pending_copilot_turn_credential_resume(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+    ) -> None:
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return
+            pending = dict(chat.pending_turns or {})
+            entry = pending.get(turn_id)
+            if not isinstance(entry, dict):
+                return
+            pending[turn_id] = {**entry, "credential_resumed_at": datetime.now(timezone.utc).isoformat()}
+            chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("claim_pending_copilot_turn_for_finalisation")
+    async def claim_pending_copilot_turn_for_finalisation(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+    ) -> Literal["claimed", "reconciling", "no_marker"]:
+        """ "claimed" means the live handler owns the turn and "reconciling" that reconcile does. Call it inside
+        ``hold_copilot_turn_finalisation``: reconcile cannot claim a turn while that lock is held."""
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return "no_marker"
+            entry = (chat.pending_turns or {}).get(turn_id)
+            if not isinstance(entry, dict):
+                return "no_marker"
+            return "reconciling" if entry.get("recovering_at") is not None else "claimed"
+
+    @asynccontextmanager
+    async def hold_copilot_turn_finalisation(self, workflow_copilot_chat_id: str, turn_id: str) -> AsyncIterator[None]:
+        """Keep reconcile off this turn while the live handler writes its outcome. The lock lives on this
+        transaction's connection, so a dead process releases it and a stalled live one keeps it."""
+        if self._db_engine is None:
+            raise RuntimeError("Copilot turn finalisation locking requires a database engine")
+        key = _turn_finalisation_lock_key(workflow_copilot_chat_id, turn_id)
+        if self._db_engine.dialect.name == "sqlite":
+            _SQLITE_FINALISING_TURNS.add(key)
+            try:
+                yield
+            finally:
+                _SQLITE_FINALISING_TURNS.discard(key)
+            return
+        # A raw connection, never the ambient session: the handler's own writes commit on their own.
+        async with self._db_engine.connect() as connection, connection.begin():
+            await connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
+            yield
 
     @db_operation("clear_pending_copilot_turn")
     async def clear_pending_copilot_turn(
@@ -841,10 +1863,197 @@ class WorkflowParametersRepository(BaseRepository):
             if chat is None:
                 return
             pending = dict(chat.pending_turns or {})
-            if pending.pop(turn_id, None) is None:
+            popped = pending.pop(turn_id, None)
+            if popped is None:
                 return
             chat.pending_turns = pending
+            entry = CopilotPendingTurn.model_validate(popped)
+            if entry.request_browser_allocations is not None:
+                terminal = (
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if terminal is None or not isinstance(terminal.turn_outcome, dict):
+                    raise ValueError("Copilot allocation receipt has no terminal row")
+                terminal.turn_outcome = {
+                    **terminal.turn_outcome,
+                    "request_browser_allocations": entry.request_browser_allocations.model_dump(mode="json"),
+                }
+            # The turn's row was written from an earlier read, so a deletion claimed then may have resolved since.
+            claimed = [
+                item
+                for item in entry.question_interactions
+                if item.credential_delete_review is not None and item.credential_delete_review.claimed_at is not None
+            ]
+            if claimed:
+                await self._patch_narrative_questions(session, organization_id, workflow_copilot_chat_id, claimed)
             await session.commit()
+
+    @db_operation("record_copilot_browser_allocation")
+    async def record_copilot_browser_allocation(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_permanent_id: str,
+        turn_id: str,
+        request_cancel_token: str | None,
+        allocation_id: str,
+        browser_session_id: str | None,
+    ) -> None:
+        async with self.Session() as session:
+            chat = await self._locked_question_chat(session, organization_id, workflow_copilot_chat_id)
+            if chat.workflow_permanent_id != workflow_permanent_id:
+                raise ValueError("Copilot allocation workflow does not match")
+            pending = dict(chat.pending_turns or {})
+            raw_entry = pending.get(turn_id)
+            message = None
+            if isinstance(raw_entry, dict):
+                entry = CopilotPendingTurn.model_validate(raw_entry)
+                if entry.cancel_token != request_cancel_token:
+                    raise ValueError("Copilot allocation request does not match")
+                receipt = entry.request_browser_allocations
+            else:
+                if browser_session_id is None:
+                    raise ValueError("The Copilot execution has ended")
+                message = (
+                    await session.scalars(
+                        select(WorkflowCopilotChatMessageModel)
+                        .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                        .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                        .where(WorkflowCopilotChatMessageModel.sender == WorkflowCopilotChatSender.AI)
+                        .where(WorkflowCopilotChatMessageModel.turn_outcome["copilot_turn_id"].as_string() == turn_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if message is None or not isinstance(message.turn_outcome, dict):
+                    raise ValueError("Copilot allocation request is unavailable")
+                outcome = TurnOutcome.model_validate(message.turn_outcome)
+                if outcome.request_cancel_token != request_cancel_token:
+                    raise ValueError("Copilot allocation request does not match")
+                receipt = outcome.request_browser_allocations
+            if receipt is None:
+                if browser_session_id is not None:
+                    raise ValueError("Copilot allocation has no recorded intent")
+                receipt = CopilotRequestBrowserAllocations(
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_copilot_chat_id=workflow_copilot_chat_id,
+                    turn_id=turn_id,
+                    request_cancel_token=request_cancel_token,
+                )
+            if (
+                receipt.organization_id != organization_id
+                or receipt.workflow_permanent_id != workflow_permanent_id
+                or receipt.workflow_copilot_chat_id != workflow_copilot_chat_id
+                or receipt.turn_id != turn_id
+                or receipt.request_cancel_token != request_cancel_token
+            ):
+                raise ValueError("Copilot allocation receipt does not match")
+            allocations = list(receipt.allocations)
+            previous = next((row for row in allocations if row.allocation_id == allocation_id), None)
+            truncated = receipt.truncated
+            if browser_session_id is None:
+                if previous is None:
+                    if len(allocations) >= 64:
+                        truncated = True
+                    else:
+                        allocations.append(CopilotBrowserAllocation(allocation_id=allocation_id))
+            elif previous is None:
+                if not truncated:
+                    raise ValueError("Copilot allocation has no recorded intent")
+            elif previous.browser_session_id not in {None, browser_session_id}:
+                raise ValueError("Copilot allocation identity changed")
+            else:
+                allocations[allocations.index(previous)] = previous.model_copy(
+                    update={"browser_session_id": browser_session_id, "created_this_request": True}
+                )
+            receipt = receipt.model_copy(
+                update={
+                    "allocations": allocations,
+                    "truncated": truncated,
+                    "recording_incomplete": truncated or any(row.browser_session_id is None for row in allocations),
+                }
+            )
+            if message is not None:
+                message.turn_outcome = {
+                    **message.turn_outcome,
+                    "request_browser_allocations": receipt.model_dump(mode="json"),
+                }
+            else:
+                if not isinstance(raw_entry, dict):
+                    raise ValueError("Copilot allocation request is unavailable")
+                pending[turn_id] = {**raw_entry, "request_browser_allocations": receipt.model_dump(mode="json")}
+                chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("record_superseded_build_test_run")
+    async def record_superseded_build_test_run(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+        workflow_run_id: str,
+    ) -> None:
+        """Record that this turn ended an older build-test run to take the chat's browser.
+
+        Copilot-owned, so the superseded run's own finalizer cannot overwrite it the way it can
+        overwrite the reason on the run row.
+        """
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return
+            pending = dict(chat.pending_turns or {})
+            entry = pending.get(turn_id)
+            if not isinstance(entry, dict):
+                return
+            recorded = entry.get("superseded_build_test_run_ids")
+            recorded = list(recorded) if isinstance(recorded, list) else []
+            if workflow_run_id in recorded:
+                return
+            recorded.append(workflow_run_id)
+            pending[turn_id] = {**entry, "superseded_build_test_run_ids": recorded}
+            chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("build_test_run_was_superseded")
+    async def build_test_run_was_superseded(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        workflow_run_id: str,
+    ) -> bool:
+        """Whether any turn of this chat recorded ending that build-test run."""
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                )
+            ).first()
+            if chat is None:
+                return False
+            for entry in (chat.pending_turns or {}).values():
+                if not isinstance(entry, dict):
+                    continue
+                recorded = entry.get("superseded_build_test_run_ids")
+                if isinstance(recorded, list) and workflow_run_id in recorded:
+                    return True
+            return False
 
     @db_operation("record_pending_copilot_turn_canonical_write")
     async def record_pending_copilot_turn_canonical_write(
@@ -905,19 +2114,155 @@ class WorkflowParametersRepository(BaseRepository):
             await session.refresh(message)
             return WorkflowCopilotChatMessage.model_validate(message)
 
-    @db_operation("get_workflow_copilot_chat_messages")
+    @db_operation("mark_workflow_copilot_video_attachments_unsafe")
+    async def mark_workflow_copilot_video_attachments_unsafe(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        file_ids: frozenset[str],
+    ) -> None:
+        if not file_ids:
+            return
+        async with self.Session() as session:
+            messages = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).all()
+            found_file_ids: set[str] = set()
+            for message in messages:
+                raw_attachments = message.attached_files
+                if not isinstance(raw_attachments, list):
+                    continue
+                updated_attachments: list[Any] = []
+                changed = False
+                for attachment in raw_attachments:
+                    file_id = attachment.get("file_id") if isinstance(attachment, dict) else None
+                    if isinstance(file_id, str) and file_id in file_ids:
+                        found_file_ids.add(file_id)
+                        if attachment.get("video_safety_status") != "unsafe":
+                            attachment = {**attachment, "video_safety_status": "unsafe"}
+                            changed = True
+                    updated_attachments.append(attachment)
+                if changed:
+                    message.attached_files = updated_attachments
+            if found_file_ids != set(file_ids):
+                raise NotFoundError("Could not persist every unsafe Copilot video attachment")
+            await session.commit()
+
+    @db_operation("mark_workflow_copilot_video_attachments_too_long")
+    async def mark_workflow_copilot_video_attachments_too_long(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        file_ids: frozenset[str],
+    ) -> None:
+        if not file_ids:
+            return
+        async with self.Session() as session:
+            messages = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).all()
+            found_file_ids: set[str] = set()
+            for message in messages:
+                raw_attachments = message.attached_files
+                if not isinstance(raw_attachments, list):
+                    continue
+                updated_attachments: list[Any] = []
+                changed = False
+                for attachment in raw_attachments:
+                    file_id = attachment.get("file_id") if isinstance(attachment, dict) else None
+                    if isinstance(file_id, str) and file_id in file_ids:
+                        found_file_ids.add(file_id)
+                        if attachment.get("video_processing_status") != "too_long":
+                            attachment = {**attachment, "video_processing_status": "too_long"}
+                            changed = True
+                    updated_attachments.append(attachment)
+                if changed:
+                    message.attached_files = updated_attachments
+            if found_file_ids != set(file_ids):
+                LOG.warning(
+                    "Could not persist every overlength Copilot video attachment",
+                    missing_file_ids=sorted(set(file_ids) - found_file_ids),
+                )
+            await session.commit()
+
+    @db_operation("persist_workflow_copilot_video_evidence_artifacts")
+    async def persist_workflow_copilot_video_evidence_artifacts(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        artifacts: dict[str, CopilotVideoEvidenceArtifact],
+    ) -> None:
+        if not artifacts:
+            return
+        async with self.Session() as session:
+            messages = (
+                await session.scalars(
+                    select(WorkflowCopilotChatMessageModel)
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).all()
+            found_file_ids: set[str] = set()
+            for message in messages:
+                raw_attachments = message.attached_files
+                if not isinstance(raw_attachments, list):
+                    continue
+                updated_attachments: list[Any] = []
+                changed = False
+                for attachment in raw_attachments:
+                    file_id = attachment.get("file_id") if isinstance(attachment, dict) else None
+                    if isinstance(file_id, str) and file_id in artifacts:
+                        artifact = artifacts[file_id]
+                        found_file_ids.add(file_id)
+                        serialized = artifact.model_dump(mode="json")
+                        if attachment.get("video_evidence") != serialized:
+                            attachment = {**attachment, "video_evidence": serialized}
+                            changed = True
+                    updated_attachments.append(attachment)
+                if changed:
+                    message.attached_files = updated_attachments
+            if found_file_ids != set(artifacts):
+                LOG.warning(
+                    "Could not persist every Copilot video evidence artifact",
+                    missing_file_ids=sorted(set(artifacts) - found_file_ids),
+                )
+            await session.commit()
+
+    @db_operation("get_workflow_copilot_chat_messages", expected_errors=(DatabaseConnectionUnavailableError,))
     async def get_workflow_copilot_chat_messages(
         self,
         workflow_copilot_chat_id: str,
     ) -> list[WorkflowCopilotChatMessage]:
-        async with self.Session() as session:
+        async def read(session: AsyncSession) -> list[WorkflowCopilotChatMessage]:
             query = (
                 select(WorkflowCopilotChatMessageModel)
                 .filter(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
-                .order_by(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc())
+                # Within one second, ids follow the worker hash and a wrapping 10-bit sequence, not write order.
+                .order_by(
+                    WorkflowCopilotChatMessageModel.created_at.asc(),
+                    WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.asc(),
+                )
             )
             messages = (await session.scalars(query)).all()
             return [convert_to_workflow_copilot_chat_message(message, self.debug_enabled) for message in messages]
+
+        return await read_with_disconnect_recovery(
+            self.Session,
+            read,
+            operation="get_workflow_copilot_chat_messages",
+            workflow_copilot_chat_id=workflow_copilot_chat_id,
+        )
 
     @db_operation("get_workflow_copilot_chat_by_id")
     async def get_workflow_copilot_chat_by_id(
@@ -943,15 +2288,35 @@ class WorkflowParametersRepository(BaseRepository):
         self,
         organization_id: str,
         workflow_permanent_id: str,
+        request_cancel_token: str | None = None,
     ) -> WorkflowCopilotChat | None:
         async with self.Session() as session:
             query = (
                 select(WorkflowCopilotChatModel)
                 .filter(WorkflowCopilotChatModel.organization_id == organization_id)
                 .filter(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
-                .order_by(WorkflowCopilotChatModel.created_at.desc())
-                .limit(1)
             )
+            if request_cancel_token is not None:
+                completed_turn = (
+                    select(WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id)
+                    .where(
+                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id
+                        == WorkflowCopilotChatModel.workflow_copilot_chat_id
+                    )
+                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
+                    .where(
+                        WorkflowCopilotChatMessageModel.turn_outcome["request_cancel_token"].as_string()
+                        == request_cancel_token
+                    )
+                    .exists()
+                )
+                pending_turn = func.jsonb_path_exists(
+                    cast(WorkflowCopilotChatModel.pending_turns, JSONB),
+                    cast("$.* ? (@.cancel_token == $token)", JSONPATH),
+                    func.jsonb_build_object("token", request_cancel_token),
+                )
+                query = query.filter(or_(pending_turn, completed_turn))
+            query = query.order_by(WorkflowCopilotChatModel.created_at.desc()).limit(1)
             chat = (await session.scalars(query)).first()
             if not chat:
                 return None
@@ -968,6 +2333,7 @@ class WorkflowParametersRepository(BaseRepository):
     ) -> list[WorkflowCopilotChatSummary]:
         page = max(page, 1)
         page_size = max(min(page_size, 100), 1)
+        folder_filter = await _folder_access_filter(organization_id, WorkflowCopilotChatModel.workflow_permanent_id)
         async with self.Session() as session:
             # Each chat's first message (earliest created_at) is its title source and proves the
             # chat is non-empty; DISTINCT ON keeps one opening row per chat.
@@ -986,13 +2352,22 @@ class WorkflowParametersRepository(BaseRepository):
                 .subquery()
             )
             query = (
-                select(WorkflowCopilotChatModel, first_message.c.title)
+                select(
+                    WorkflowCopilotChatModel,
+                    first_message.c.title,
+                    func.jsonb_path_query_array(
+                        cast(WorkflowCopilotChatModel.pending_turns, JSONB),
+                        cast('$.* ? (@.question_interactions[*].status == "pending").question_heartbeat_at', JSONPATH),
+                    ).label("question_heartbeats"),
+                )
                 .options(defer(WorkflowCopilotChatModel.pending_turns))
                 .join(first_message, first_message.c.chat_id == WorkflowCopilotChatModel.workflow_copilot_chat_id)
                 .where(WorkflowCopilotChatModel.organization_id == organization_id)
             )
             if workflow_permanent_id is not None:
                 query = query.where(WorkflowCopilotChatModel.workflow_permanent_id == workflow_permanent_id)
+            if folder_filter is not None:
+                query = query.where(folder_filter)
             if search and search.strip():
                 # Unindexed substring match over each chat's opening message (one row per chat);
                 # add a pg_trgm index on content if per-org chat counts grow large.
@@ -1005,32 +2380,8 @@ class WorkflowParametersRepository(BaseRepository):
             )
             rows = (await session.execute(query)).all()
 
-            # The chats-list indexes are (organization_id, workflow_copilot_chat_id) with no
-            # created_at, so the tail lookup is scoped to this page's chats rather than joined
-            # as a DISTINCT ON over the org's whole message history.
-            chat_ids = [chat.workflow_copilot_chat_id for chat, _ in rows]
-            awaiting: dict[str, bool] = {}
-            if chat_ids:
-                latest_message = (
-                    select(
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
-                        WorkflowCopilotChatMessageModel.sender,
-                        WorkflowCopilotChatMessageModel.narrative_payload,
-                    )
-                    .where(WorkflowCopilotChatMessageModel.organization_id == organization_id)
-                    .where(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id.in_(chat_ids))
-                    .distinct(WorkflowCopilotChatMessageModel.workflow_copilot_chat_id)
-                    .order_by(
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_id,
-                        WorkflowCopilotChatMessageModel.created_at.desc(),
-                        WorkflowCopilotChatMessageModel.workflow_copilot_chat_message_id.desc(),
-                    )
-                )
-                for chat_id, sender, narrative_payload in (await session.execute(latest_message)).all():
-                    awaiting[chat_id] = chat_awaits_user_input(sender=sender, narrative_payload=narrative_payload)
-
             workflow_titles: dict[str, str] = {}
-            permanent_ids = {chat.workflow_permanent_id for chat, _ in rows}
+            permanent_ids = {chat.workflow_permanent_id for chat, _, _ in rows}
             if permanent_ids:
                 title_rows = (
                     await session.execute(
@@ -1052,9 +2403,12 @@ class WorkflowParametersRepository(BaseRepository):
                     title=summarize_copilot_chat_title(content),
                     created_at=chat.created_at,
                     modified_at=chat.modified_at,
-                    awaiting_user_input=awaiting.get(chat.workflow_copilot_chat_id, False),
+                    awaiting_user_input=any(
+                        question_wait_is_live(_parse_pending_turn_timestamp(heartbeat), datetime.now(timezone.utc))
+                        for heartbeat in (question_heartbeats or [])
+                    ),
                 )
-                for chat, content in rows
+                for chat, content, question_heartbeats in rows
             ]
 
     @db_operation("get_latest_workflow_copilot_completion_criteria_set")
@@ -1195,7 +2549,6 @@ class WorkflowParametersRepository(BaseRepository):
     async def create_action(self, action: Action) -> Action:
         async with self.Session() as session:
             raw_action_payload = action.model_dump()
-            action_log_payload = redact_action_for_log(action)
             new_action = ActionModel(
                 action_type=action.action_type,
                 source_action_id=action.source_action_id,
@@ -1208,7 +2561,7 @@ class WorkflowParametersRepository(BaseRepository):
                 status=action.status,
                 reasoning=action.reasoning,
                 intention=action.intention,
-                response=action_log_payload.get("response"),
+                response=action.response,
                 element_id=action.element_id,
                 skyvern_element_hash=action.skyvern_element_hash,
                 skyvern_element_data=action.skyvern_element_data,
@@ -1231,7 +2584,6 @@ class WorkflowParametersRepository(BaseRepository):
         # uploaded) and its end-of-block batch converge on the same row, so the batch backfills the
         # screenshot instead of inserting a duplicate. Isolated from create_action to leave the agent
         # write path untouched.
-        action_log_payload = redact_action_for_log(action)
         values = {
             "action_id": action.action_id,
             "action_type": action.action_type,
@@ -1245,7 +2597,7 @@ class WorkflowParametersRepository(BaseRepository):
             "status": action.status,
             "reasoning": action.reasoning,
             "intention": action.intention,
-            "response": action_log_payload.get("response"),
+            "response": action.response,
             "element_id": action.element_id,
             "skyvern_element_hash": action.skyvern_element_hash,
             "skyvern_element_data": action.skyvern_element_data,
@@ -1280,6 +2632,8 @@ class WorkflowParametersRepository(BaseRepository):
         action_id: str,
         reasoning: str,
     ) -> Action:
+        # Column-only: hydrate_action lets a non-null action_json value win, so this is visible to a
+        # hydrated read only because the rows it targets are recorded without a reasoning.
         async with self.Session() as session:
             action = (
                 await session.scalars(
@@ -1292,28 +2646,3 @@ class WorkflowParametersRepository(BaseRepository):
                 await session.refresh(action)
                 return Action.model_validate(action)
             raise NotFoundError(f"Action {action_id}")
-
-    @db_operation("retrieve_action_plan")
-    async def retrieve_action_plan(self, task: Task) -> list[Action]:
-        async with self.Session() as session:
-            subquery = (
-                select(TaskModel.task_id)
-                .filter(TaskModel.url == task.url)
-                .filter(TaskModel.navigation_goal == task.navigation_goal)
-                .filter(TaskModel.status == TaskStatus.completed)
-                .order_by(TaskModel.created_at.desc())
-                .limit(1)
-                .subquery()
-            )
-
-            query = (
-                select(ActionModel)
-                .filter(ActionModel.task_id == subquery.c.task_id)
-                .order_by(ActionModel.step_order, ActionModel.action_order, ActionModel.created_at)
-            )
-
-            actions = (await session.scalars(query)).all()
-            # hydrate_action, not Action.model_validate: the base model has no action_json merge, so
-            # validating the row directly drops every subclass field a cached action was recorded
-            # with. Matches every other retrieval site.
-            return [hydrate_action(action) for action in actions]

@@ -1,5 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
 import { Cross2Icon, FileIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation } from "@tanstack/react-query";
@@ -8,6 +9,7 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { toast } from "./ui/use-toast";
+import { isBrowserFetchableUrl } from "./fileUploadLink";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 
 export type FileInputValue =
@@ -24,14 +26,14 @@ type Props = {
   required?: boolean;
 };
 
-const FILE_SIZE_LIMIT_IN_BYTES = 10 * 1024 * 1024; // 10 MB
+const FILE_SIZE_LIMIT_IN_BYTES = 30 * 1024 * 1024; // 30 MB
 
 function showFileSizeError() {
   toast({
     variant: "destructive",
     title: "File size limit exceeded",
     description:
-      "The file you are trying to upload exceeds the 10MB limit, please try again with a different file",
+      "The file you are trying to upload exceeds the 30MB limit, please try again with a different file",
   });
 }
 
@@ -70,7 +72,7 @@ function FileUpload({ value, onChange, required }: Props) {
       toast({
         variant: "destructive",
         title: "Failed to upload file",
-        description: `An error occurred while uploading the file: ${error.message}`,
+        description: `An error occurred while uploading the file: ${getErrorDetail(error)}`,
       });
     },
   });
@@ -115,12 +117,19 @@ function FileUpload({ value, onChange, required }: Props) {
       <TabsContent value="upload">
         {isManualUpload && ( // redundant check for ts compiler
           <div className="flex h-full items-center gap-4 p-4">
-            <a href={value.presignedUrl} className="underline">
+            {isBrowserFetchableUrl(value.presignedUrl) ? (
+              <a href={value.presignedUrl} className="underline">
+                <div className="flex gap-2">
+                  <FileIcon className="size-6" />
+                  <span>{file.name}</span>
+                </div>
+              </a>
+            ) : (
               <div className="flex gap-2">
                 <FileIcon className="size-6" />
                 <span>{file.name}</span>
               </div>
-            </a>
+            )}
             <Button onClick={() => reset()} size="icon" variant="secondary">
               <Cross2Icon />
             </Button>
@@ -167,7 +176,7 @@ function FileUpload({ value, onChange, required }: Props) {
               <span>
                 {file
                   ? file.name
-                  : "Drag and drop file here or click to select (Max 10MB)"}
+                  : "Drag and drop file here or click to select (Max 30MB)"}
               </span>
             </div>
           </Label>

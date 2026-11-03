@@ -10,23 +10,27 @@ import asyncio
 import json
 import os
 import re
+import string
 import time
 from contextlib import suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator, Literal
+from typing import Any, Awaitable, Callable, Iterator, Literal, Sequence
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils.page import JS_FUNCTION_DEFS, SkyvernFrame
 
 from .guards import CREDENTIAL_HINT, GuardError, validate_wait_until
+from .js_dispatch import under_action_deadline
+from .page_change import is_page_change_error
 from .perception_telemetry import track_perception_probe
 
 LOG = structlog.get_logger(__name__)
@@ -34,6 +38,28 @@ LOG = structlog.get_logger(__name__)
 TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
 COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
 OBSERVE_V2_ENV = "SKYVERN_MCP_OBSERVE_V2"
+
+_SELECTOR_IS_PASSWORD_JS = (
+    "el => el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'password'"
+)
+
+
+async def selector_targets_password(scopes: Sequence[Any], selector: str, *, timeout: float) -> bool:
+    """Report whether ``selector`` reaches a password input in any document the paired write may
+    resolve it in; pass every such scope, since a probe narrower than the write fails open.
+
+    ``timeout`` must be the paired write's own timeout. A probe that gives up sooner answers "not a
+    password" for a field the write then waits for and types into, which is the one failure this
+    guard exists to prevent.
+    """
+    for scope in scopes:
+        try:
+            if await scope.locator(selector).first.evaluate(_SELECTOR_IS_PASSWORD_JS, timeout=timeout):
+                return True
+        except Exception:
+            LOG.debug("password probe failed", selector=selector, exc_info=True)
+    return False
+
 
 # Per-request rollout decision (set by the cloud MCP middleware from the org-keyed
 # PostHog flag). None means "no decision here" - fall back to the process env var,
@@ -108,7 +134,9 @@ LOCALHOST_RECOVERY_HINT = (
 # when a later state never arrives, so navigation degrades down this ladder rather than
 # reporting a failure for a page that is already loaded and usable.
 _LOAD_STATE_LADDER = ("commit", "domcontentloaded", "load", "networkidle")
-_WEAKER_LOAD_STATE_TIMEOUT_MS = 1000
+_NAVIGATE_TITLE_TIMEOUT_SECONDS = 5.0
+_VIEWPORT_PROBE_TIMEOUT_SECONDS = 2.0
+_UNBOUNDED_LEG_TIMEOUT_MS = 1000
 
 
 @dataclass
@@ -122,6 +150,7 @@ class NavigateResult:
 class ScreenshotResult:
     data: bytes
     full_page: bool = False
+    viewport_css_px: tuple[int, int] | None = None
 
 
 @dataclass
@@ -148,19 +177,25 @@ def parse_extract_schema(schema: str | dict[str, Any] | None) -> dict[str, Any] 
         raise GuardError(f"Invalid JSON schema: {e}", "Provide schema as a valid JSON string")
 
 
-async def _reached_load_state(page: Any, requested: str, budget_ms: int) -> str:
+def remaining_budget_ms(started_at: float, budget_ms: int) -> int:
+    """What is left of one action's budget, floored at 1ms because a driver reads ``timeout=0`` as
+    "wait forever"; legs of a multi-step action read this instead of restarting ``budget_ms``. A budget
+    of zero is itself "wait forever", so its later legs get one second each rather than one millisecond."""
+    if budget_ms <= 0:
+        return _UNBOUNDED_LEG_TIMEOUT_MS
+    return max(budget_ms - int((time.monotonic() - started_at) * 1000), 1)
+
+
+async def _reached_load_state(page: Any, started_at: float, requested: str, budget_ms: int) -> str:
     """Return the strongest lifecycle state the committed document actually reached.
 
-    Anything below ``requested`` is probed briefly: those states have already fired in
-    every healthy navigation, so the short budget only bounds a document that stalled.
+    Every rung reads what is left of the navigation's one budget rather than restarting it; a state
+    that already fired returns without consulting its timeout, so a spent budget still reports it.
     """
     weaker_states = _LOAD_STATE_LADDER[1 : _LOAD_STATE_LADDER.index(requested) + 1]
-    for index, state in enumerate(reversed(weaker_states)):
+    for state in reversed(weaker_states):
         try:
-            await page.wait_for_load_state(
-                state,
-                timeout=budget_ms if index == 0 else _WEAKER_LOAD_STATE_TIMEOUT_MS,
-            )
+            await page.wait_for_load_state(state, timeout=remaining_budget_ms(started_at, budget_ms))
         except PlaywrightTimeoutError:
             continue
         return state
@@ -191,14 +226,45 @@ async def do_navigate(
     # the requested lifecycle state separately: a page whose `load` never fires is navigated,
     # not failed, and reporting the weaker state beats a false failure on a usable page.
     started = time.monotonic()
-    await page.goto(validated_url, timeout=timeout, wait_until="commit")
-    requested = wait_until or "load"
-    load_state = "commit"
-    if requested != "commit":
-        # Floor the leftover budget: Playwright reads timeout=0 as "wait forever".
-        remaining_ms = max(timeout - int((time.monotonic() - started) * 1000), _WEAKER_LOAD_STATE_TIMEOUT_MS)
-        load_state = await _reached_load_state(page, requested, remaining_ms)
-    return NavigateResult(url=page.url, title=await page.title(), load_state=load_state)
+    async with under_action_deadline(budget_ms=timeout if timeout > 0 else None):
+        await page.goto(validated_url, timeout=timeout, wait_until="commit")
+        requested = wait_until or "load"
+        load_state = "commit"
+        if requested != "commit":
+            load_state = await _reached_load_state(page, started, requested, timeout)
+        try:
+            title_timeout = min(remaining_budget_ms(started, timeout) / 1000, _NAVIGATE_TITLE_TIMEOUT_SECONDS)
+            if timeout <= 0:
+                title_timeout = _NAVIGATE_TITLE_TIMEOUT_SECONDS
+            title = await asyncio.wait_for(page.title(), timeout=title_timeout)
+        except Exception:  # noqa: BLE001
+            title = ""
+    return NavigateResult(url=page.url, title=title, load_state=load_state)
+
+
+_CURSOR_RESTORES: set[asyncio.Task[None]] = set()
+_CURSOR_RESTORE_TIMEOUT_SECONDS = 5.0
+_CURSOR_RESTORE_CANCEL_GRACE_SECONDS = 1.0
+
+
+async def _restore_cursor_overlay(page: Any) -> None:
+    restore = asyncio.ensure_future(SkyvernFrame.show_cursor_overlay(page))
+    try:
+        done, _ = await asyncio.wait({restore}, timeout=_CURSOR_RESTORE_TIMEOUT_SECONDS)
+        if not done:
+            restore.cancel()
+            done, _ = await asyncio.wait({restore}, timeout=_CURSOR_RESTORE_CANCEL_GRACE_SECONDS)
+            if not done:
+                # Nothing in-process can end a driver call that ignores cancellation; its transport holds
+                # it until that transport closes. Nothing here references it any longer.
+                LOG.warning("Cursor restore ignored cancellation; leaving it to the browser transport")
+                return
+    except asyncio.CancelledError:
+        # asyncio.wait leaves the futures it waits on running when the waiter itself is cancelled.
+        restore.cancel()
+        raise
+    if not restore.cancelled():
+        restore.exception()
 
 
 async def do_screenshot(
@@ -206,24 +272,46 @@ async def do_screenshot(
     full_page: bool = False,
     selector: str | None = None,
 ) -> ScreenshotResult:
-    if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
-        try:
-            await SkyvernFrame.hide_cursor_overlay(page)
-        except Exception:
-            pass
+    cancelled = False
     try:
+        if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
+            try:
+                await SkyvernFrame.hide_cursor_overlay(page)
+            except Exception:
+                pass
         if selector:
             element = page.locator(selector)
             data = await element.screenshot()
         else:
             data = await page.screenshot(full_page=full_page)
+        # Reported only when the image shows exactly the viewport, so image size over it is a valid scale.
+        viewport_css_px = None if selector or full_page else await _viewport_css_px(page)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
         if SettingsManager.get_settings().BROWSER_CURSOR_VISUALIZATION:
-            try:
-                await SkyvernFrame.show_cursor_overlay(page)
-            except Exception:
-                pass
-    return ScreenshotResult(data=data, full_page=full_page)
+            # Detached only for a cancelled screenshot, so a driver that stopped answering cannot hold
+            # the call past its deadline; every other exit waits for the cursor to come back.
+            restore = asyncio.create_task(_restore_cursor_overlay(page))
+            _CURSOR_RESTORES.add(restore)
+            restore.add_done_callback(_CURSOR_RESTORES.discard)
+            if not cancelled:
+                await restore
+    return ScreenshotResult(data=data, full_page=full_page, viewport_css_px=viewport_css_px)
+
+
+async def _viewport_css_px(page: Any) -> tuple[int, int] | None:
+    # Screenshots are taken at device scale, so the image's pixel size is not the CSS viewport on a HiDPI display.
+    try:
+        size = await asyncio.wait_for(
+            page.evaluate("() => [window.innerWidth, window.innerHeight]"), timeout=_VIEWPORT_PROBE_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return None
+    if isinstance(size, list) and len(size) == 2 and all(type(value) is int and value > 0 for value in size):
+        return size[0], size[1]
+    return None
 
 
 async def do_act(
@@ -737,6 +825,12 @@ _ROLE_TO_TAG: dict[str, str] = {
     "treeitem": "li",
 }
 
+# Roles `roleFor` in _OBSERVE_INTERACTABLES_JS can assign by heuristic rather than read from markup;
+# merge keys keep the host tag for these so a pointer-cursor wrapper sharing a label cannot claim an
+# a11y entry. Every other role is declared by markup, where _ROLE_TO_TAG names just one of the tags
+# that can carry it (a combobox is a <select>, or an input/div with role=combobox).
+_INFERRED_DOM_ROLES = frozenset({"button", "option"})
+
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
 
@@ -972,7 +1066,7 @@ class NativeOptionSelection:
 
 
 async def select_native_option_if_targeted(
-    page: Any,
+    page: SkyvernPage,
     selector: str,
     *,
     timeout: int = 30000,
@@ -983,17 +1077,17 @@ async def select_native_option_if_targeted(
     Playwright. This keeps selector/ref driven click flows deterministic by
     translating that specific target shape into a select_option call.
     """
-    raw_page = getattr(page, "page", page)
-    locator_factory = getattr(raw_page, "locator", None)
-    if locator_factory is None:
-        return None
+    # Page-space input ignores the frame selection; read the scope so an unowned one refuses.
+    _ = page.locator_scope
+    locator_factory = page.page.locator
 
     locator = locator_factory(selector)
-    first_locator = getattr(locator, "first", locator)
+    first_locator = locator.first
     # Bounded classification probe: only decides whether the target is a native <option>.
     # If the element is not readily present, defer to the caller's click (preserving
     # direct-mode fast-fail and resilient-mode waiting) instead of blocking the full
     # action timeout here.
+    started_at = time.monotonic()
     probe_timeout = min(timeout, _NATIVE_OPTION_PROBE_TIMEOUT_MS)
     try:
         option_info = await first_locator.evaluate(_NATIVE_OPTION_TARGET_JS, timeout=probe_timeout)
@@ -1016,7 +1110,7 @@ async def select_native_option_if_targeted(
     # values cannot resolve to the wrong option; fall back to value, then label.
     if isinstance(index, int) and index >= 0:
         try:
-            await select_locator.select_option(index=index, timeout=timeout)
+            await select_locator.select_option(index=index, timeout=remaining_budget_ms(started_at, timeout))
             return NativeOptionSelection(
                 select_selector=select_selector,
                 value=str(value) if value is not None else None,
@@ -1029,7 +1123,7 @@ async def select_native_option_if_targeted(
 
     if value is not None:
         try:
-            await select_locator.select_option(value=str(value), timeout=timeout)
+            await select_locator.select_option(value=str(value), timeout=remaining_budget_ms(started_at, timeout))
             return NativeOptionSelection(
                 select_selector=select_selector,
                 value=str(value),
@@ -1041,7 +1135,7 @@ async def select_native_option_if_targeted(
             last_error = exc
 
     if label:
-        await select_locator.select_option(label=str(label), timeout=timeout)
+        await select_locator.select_option(label=str(label), timeout=remaining_budget_ms(started_at, timeout))
         return NativeOptionSelection(
             select_selector=select_selector,
             value=str(value) if value is not None else None,
@@ -1092,6 +1186,117 @@ class ObserveResult:
     document_id: str | None = None
 
 
+_ARIA_KEY = re.compile(r'([A-Za-z]+)(?: "((?:[^"\\]|\\.)*)")?(?: \[[^\]]*\])*')
+_ARIA_SIMPLE_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
+
+
+def _aria_unescape(text: str) -> str:
+    """Playwright's aria-snapshot string escapes (incl. \\xHH); an unknown or malformed escape keeps the literal."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char != "\\" or i + 1 >= len(text):
+            out.append(char)
+            i += 1
+            continue
+        nxt = text[i + 1]
+        width = {"x": 2, "u": 4}.get(nxt)
+        digits = text[i + 2 : i + 2 + width] if width else ""
+        if nxt in _ARIA_SIMPLE_ESCAPES:
+            out.append(_ARIA_SIMPLE_ESCAPES[nxt])
+            i += 2
+        elif width and len(digits) == width and all(d in string.hexdigits for d in digits):
+            out.append(chr(int(digits, 16)))
+            i += 2 + width
+        else:
+            out.append(nxt)
+            i += 2
+    return "".join(out)
+
+
+def _aria_scalar(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return _aria_unescape(value[1:-1])
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    return value
+
+
+def _parse_aria_line(line: str) -> tuple[int, str, str, str | None] | None:
+    stripped = line.lstrip(" ")
+    if not stripped.startswith("- "):
+        return None
+    body = stripped[2:]
+    if body.startswith("'"):
+        # YAML single-quotes the whole node when its text contains ": "; '' is an escaped quote.
+        end = 1
+        while end < len(body) and not (body[end] == "'" and body[end + 1 : end + 2] != "'"):
+            end += 2 if body[end] == "'" else 1
+        if end >= len(body):
+            return None
+        key, rest = body[1:end].replace("''", "'"), body[end + 1 :]
+    else:
+        cut, in_quotes, escaped = len(body), False, False
+        for index, char in enumerate(body):
+            if escaped:
+                escaped = False
+            elif char == "\\" and in_quotes:
+                escaped = True
+            elif char == '"':
+                in_quotes = not in_quotes
+            elif char == ":" and not in_quotes:
+                cut = index
+                break
+        key, rest = body[:cut], body[cut:]
+    match = _ARIA_KEY.fullmatch(key)
+    if match is None or (rest and not rest.startswith(":")):
+        return None
+    inline = _aria_scalar(rest[1:].strip()) if rest[1:].strip() else None
+    return len(line) - len(stripped), match[1], _aria_unescape(match[2]) if match[2] is not None else "", inline
+
+
+# Inline aria-snapshot content is a form control's current value for every other role, so it is never kept.
+_ARIA_TEXT_CONTENT_ROLES = frozenset(
+    {"text", "paragraph", "heading", "listitem", "cell", "gridcell", "columnheader", "rowheader", "caption",
+     "blockquote", "term", "definition", "note", "status", "alert", "tooltip", "code", "strong", "emphasis"}
+)  # fmt: skip
+
+
+def _aria_snapshot_to_tree(snapshot_yaml: str) -> dict[str, Any]:
+    root: dict[str, Any] = {"role": "WebArea", "name": "", "children": []}
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
+    for line in snapshot_yaml.splitlines():
+        try:
+            parsed = _parse_aria_line(line)
+        except Exception:
+            LOG.debug("observe aria snapshot line skipped", exc_info=True)
+            parsed = None
+        if parsed is None:
+            continue
+        indent, role, name, inline = parsed
+        while stack[-1][0] >= indent:
+            stack.pop()
+        node: dict[str, Any] = {"role": role, "name": name}
+        if inline and role in _ARIA_TEXT_CONTENT_ROLES:
+            if role == "text":
+                node["name"] = inline
+            else:
+                node["children"] = [{"role": "text", "name": inline}]
+        stack[-1][1].setdefault("children", []).append(node)
+        stack.append((indent, node))
+    return root
+
+
+async def _aria_snapshot_tree(page: Any, selector: str | None) -> dict[str, Any] | None:
+    try:
+        snapshot_yaml = await page.locator(selector or "body").first.aria_snapshot()
+    except Exception:
+        LOG.debug("observe aria snapshot unavailable", exc_info=True)
+        return None
+    return _aria_snapshot_to_tree(snapshot_yaml)
+
+
 def _flatten_a11y_tree(node: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Recursively flatten an accessibility tree into a flat element list."""
     if node is None:
@@ -1123,6 +1328,7 @@ async def _get_dom_observe_elements(
     *,
     frame_name: str | None = None,
     frame_url: str | None = None,
+    propagate_page_change: bool = False,
 ) -> list[dict[str, Any]]:
     evaluate = getattr(page, "evaluate", None)
     if evaluate is None:
@@ -1141,6 +1347,8 @@ async def _get_dom_observe_elements(
     except Exception as exc:
         if frame_name is not None:
             raise ObserveFrameError(frame_name, frame_url or "", exc) from exc
+        if propagate_page_change and is_page_change_error(exc):
+            raise
         return []
     if not isinstance(result, list):
         return []
@@ -1154,19 +1362,19 @@ def _merge_dom_observe_elements(
     merged = list(a11y_elements)
     selector_seen = {element.get("selector") for element in merged if element.get("selector")}
 
-    # Only upgrade an a11y element with a DOM selector when the (role, name, tag) key is
-    # unambiguous on both sides. A duplicate label would otherwise risk attaching the
-    # selector to the wrong element — a confidently wrong deterministic action. Ambiguous
-    # DOM elements still fall through to the append path with their own distinct selector.
+    # Only upgrade an a11y element with a DOM selector when the merge key is unambiguous on
+    # both sides. A duplicate label would otherwise risk attaching the selector to the wrong
+    # element — a confidently wrong deterministic action. Ambiguous DOM elements still fall
+    # through to the append path with their own distinct selector.
     def _key(role: str, name: str, tag: str) -> tuple[str, str, str]:
-        return role, name, tag
+        return role, name, tag if role in _INFERRED_DOM_ROLES else ""
 
-    a11y_key_counts: dict[tuple[str, str, str], int] = {}
+    a11y_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for element in merged:
         if not element.get("selector"):
             role = element.get("role", "")
             key = _key(role, element.get("name", ""), _ROLE_TO_TAG.get(role, ""))
-            a11y_key_counts[key] = a11y_key_counts.get(key, 0) + 1
+            a11y_by_key.setdefault(key, []).append(element)
     dom_key_counts: dict[tuple[str, str, str], int] = {}
     for dom_element in dom_elements:
         key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
@@ -1177,43 +1385,36 @@ def _merge_dom_observe_elements(
         if dom_selector and dom_selector in selector_seen:
             continue
         dom_key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
-        unambiguous = a11y_key_counts.get(dom_key, 0) == 1 and dom_key_counts.get(dom_key, 0) == 1
-        matched_existing = False
-        if unambiguous:
-            for existing in merged:
-                if (
-                    not existing.get("selector")
-                    and existing.get("role", "") == dom_element.get("role", "")
-                    and existing.get("name", "") == dom_element.get("name", "")
-                    and _ROLE_TO_TAG.get(existing.get("role", ""), "") == dom_element.get("tag", "")
-                ):
-                    existing["selector"] = dom_selector
-                    if dom_element.get("value") is not None:
-                        existing["value"] = dom_element["value"]
-                    if dom_element.get("options") and not existing.get("children"):
-                        existing["options"] = dom_element.get("options")
-                    if dom_element.get("aria_controls"):
-                        existing["aria_controls"] = dom_element["aria_controls"]
-                    if dom_element.get("aria_owns"):
-                        existing["aria_owns"] = dom_element["aria_owns"]
-                    matched_existing = True
-                    if dom_selector:
-                        selector_seen.add(dom_selector)
-                    break
-        if not matched_existing:
+        candidates = a11y_by_key.get(dom_key, [])
+        if len(candidates) == 1 and dom_key_counts.get(dom_key, 0) == 1:
+            existing = candidates[0]
+            existing["selector"] = dom_selector
+            # The a11y entry carries no tag of its own; without this it keeps reporting
+            # _ROLE_TO_TAG's guess instead of the tag it merged with.
+            if dom_element.get("tag"):
+                existing["tag"] = dom_element["tag"]
+            if dom_element.get("value") is not None:
+                existing["value"] = dom_element["value"]
+            if dom_element.get("options") and not existing.get("children"):
+                existing["options"] = dom_element.get("options")
+            if dom_element.get("aria_controls"):
+                existing["aria_controls"] = dom_element["aria_controls"]
+            if dom_element.get("aria_owns"):
+                existing["aria_owns"] = dom_element["aria_owns"]
+        else:
             merged.append(dom_element)
-            if dom_selector:
-                selector_seen.add(dom_selector)
+        if dom_selector:
+            selector_seen.add(dom_selector)
 
     return merged
 
 
 async def get_observe_document_id(page: Any) -> str | None:
     """Read the current document revision marker without taking an observe snapshot."""
-    working_frame = getattr(page, "_working_frame", None)
-    target = working_frame if working_frame is not None else page
+    scope = page.locator_scope if isinstance(page, SkyvernPage) else None
+    target = scope if scope is not None else page
     raw_page = getattr(page, "page", page)
-    session_target = working_frame if working_frame is not None else raw_page
+    session_target: Any = scope if scope is not None else raw_page
     cdp = getattr(session_target, "_skyvern_observe_cdp_session", None)
 
     # The session is cached on the page so the marker costs no attach per call; a cached one can be
@@ -1258,6 +1459,8 @@ async def do_observe(
     interactive_only: bool = True,
     max_elements: int = 50,
     include_values: bool = False,
+    *,
+    propagate_page_change: bool = False,
 ) -> ObserveResult:
     """Capture interactive elements with stable refs for batch operations."""
     # Execute-step params arrive as untyped JSON; a string like "false" must not
@@ -1296,13 +1499,14 @@ async def do_observe(
         snapshot = None
     else:
         accessibility = getattr(page, "accessibility", None)
-        if selector and accessibility is not None:
+        if accessibility is None:
+            # Playwright 1.58+ removed Page.accessibility; the public aria snapshot carries the same role/name tree.
+            snapshot = await _aria_snapshot_tree(page, selector)
+        elif selector:
             element_handle = await page.locator(selector).first.element_handle()
             snapshot = await accessibility.snapshot(root=element_handle)
-        elif accessibility is not None:
-            snapshot = await accessibility.snapshot()
         else:
-            snapshot = None
+            snapshot = await accessibility.snapshot()
 
     all_elements = _flatten_a11y_tree(snapshot)
     dom_elements = await _get_dom_observe_elements(
@@ -1311,6 +1515,7 @@ async def do_observe(
         include_values,
         frame_name=working_frame.name if working_frame is not None else None,
         frame_url=working_frame.url if working_frame is not None else None,
+        propagate_page_change=propagate_page_change,
     )
 
     page_text: str | None = None
@@ -1847,6 +2052,7 @@ async def do_select_option(
     """Deterministic custom-select pipeline: classify the control, open (click) or
     filter (fill) it, scope scan-observed options to it, click the unique match, then
     verify a committed-state transition. Returns None to defer to the native path."""
+    started_at = time.monotonic()
     probe_timeout = min(timeout, _NATIVE_OPTION_PROBE_TIMEOUT_MS)
     try:
         control = page.locator(selector).first
@@ -1893,7 +2099,6 @@ async def do_select_option(
         if not target.get("selectlike") and not scan_observed_shape and not bare_typeahead:
             return None
 
-    started_at = time.monotonic()
     deadline = started_at + timeout / 1000
     # Deliberately overrides larger caller timeouts: dom-fallback ticks re-scan the page,
     # and a control this ambiguous should fail fast to the native path, not poll for minutes.
@@ -1913,9 +2118,9 @@ async def do_select_option(
         await _assert_live_target_not_password(page, selector)
     try:
         if target.get("editable"):
-            await control.fill(value, timeout=timeout)
+            await control.fill(value, timeout=remaining_budget_ms(started_at, timeout))
         else:
-            await control.click(timeout=timeout)
+            await control.click(timeout=remaining_budget_ms(started_at, timeout))
     except Exception as e:
         if target.get("editable") and restore_value_on_failure:
             await _restore_custom_select_value(control, original_value, probe_timeout)
@@ -1992,8 +2197,8 @@ async def do_select_option(
                 }
             await _assert_live_target_not_password(page, selector)
             try:
-                await control.fill("", timeout=timeout)
-                await control.press_sequentially(value, timeout=timeout)
+                await control.fill("", timeout=remaining_budget_ms(started_at, timeout))
+                await control.press_sequentially(value, timeout=remaining_budget_ms(started_at, timeout))
             except Exception as e:
                 if restore_value_on_failure:
                     await _restore_custom_select_value(control, original_value, probe_timeout)

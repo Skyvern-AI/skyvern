@@ -1,5 +1,6 @@
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from freezegun import freeze_time
@@ -125,6 +126,25 @@ async def test_delete_browser_profile_hard_delete_raises_on_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("read_only", "stored_after"), [(False, "session=rotated"), (True, "session=original")])
+async def test_only_a_read_only_browser_leaves_the_stored_profile_unchanged(
+    local_storage: LocalStorage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_only: bool, stored_after: str
+) -> None:
+    monkeypatch.setattr(settings, "BROWSER_SESSION_BASE_PATH", str(tmp_path / "sessions"))
+    monkeypatch.setattr(settings, "TEMP_PATH", str(tmp_path / "temp"))
+    stored = tmp_path / "sessions" / TEST_ORGANIZATION_ID / "profiles" / "bp_1"
+    (stored / "Default").mkdir(parents=True)
+    (stored / "Default" / "Cookies").write_text("session=original")
+    retrieve = local_storage.retrieve_browser_profile_copy if read_only else local_storage.retrieve_browser_profile
+
+    browser_dir = await retrieve(TEST_ORGANIZATION_ID, "bp_1")
+    assert browser_dir is not None
+    (Path(browser_dir) / "Default" / "Cookies").write_text("session=rotated")
+
+    assert (stored / "Default" / "Cookies").read_text() == stored_after
+
+
+@pytest.mark.asyncio
 async def test_delete_legacy_file_deletes_managed_artifact(tmp_path: Path) -> None:
     storage = LocalStorage(artifact_path=str(tmp_path))
     artifact_paths = [
@@ -151,3 +171,35 @@ async def test_delete_legacy_file_rejects_other_organization_path(tmp_path: Path
         await storage.delete_legacy_file(organization_id=TEST_ORGANIZATION_ID, uri=f"file://{artifact_path}")
 
     assert artifact_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_get_downloaded_files_carries_local_artifact_attribution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = TEST_WORKFLOW_RUN_ID
+    download_path = tmp_path / run_id / "report.pdf"
+    download_path.parent.mkdir(parents=True)
+    download_path.write_bytes(b"report")
+    uri = f"file://{download_path}"
+    artifact = SimpleNamespace(
+        artifact_id="artifact_download_1",
+        uri=uri,
+        modified_at=None,
+    )
+    list_artifacts = AsyncMock(return_value=[artifact])
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+
+    with patch("skyvern.forge.sdk.artifact.storage.local.app") as mock_app:
+        mock_app.DATABASE.artifacts.list_artifacts_for_run_by_type = list_artifacts
+        files = await LocalStorage().get_downloaded_files(TEST_ORGANIZATION_ID, run_id)
+
+    assert len(files) == 1
+    assert files[0].artifact_id == "artifact_download_1"
+    assert files[0].modified_at is not None
+    list_artifacts.assert_awaited_once_with(
+        run_id=run_id,
+        organization_id=TEST_ORGANIZATION_ID,
+        artifact_type=ArtifactType.DOWNLOAD,
+    )

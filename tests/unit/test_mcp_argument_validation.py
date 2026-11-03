@@ -20,6 +20,7 @@ from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.cli.mcp_tools import workflow as mcp_workflow
 from skyvern.cli.mcp_tools.argument_validation import _repair_argument_types, _split_comma_separated_list
 from tests.unit._mcp_browser_fakes import make_mock_page, make_skyvern_page
+from tests.unit._mcp_test_helpers import patch_skyvern_client
 
 
 def _structured(result: object) -> dict:
@@ -59,8 +60,8 @@ def _mock_navigation(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         ("skyvern_script_get_code", {"workflow_id": "wpid_1"}, ["workflow_id"], ["script_id"]),
         (
             "skyvern_workflow_run",
-            {"workflow_id": "wpid_1", "ai_fallback": True, "timeout": 2700},
-            ["ai_fallback", "timeout"],
+            {"workflow_id": "wpid_1", "max_steps": 5, "timeout": 2700},
+            ["max_steps", "timeout"],
             [],
         ),
     ],
@@ -129,6 +130,45 @@ async def test_workflow_run_list_comma_separated_status_is_split_for_list_parame
 
 
 @pytest.mark.asyncio
+async def test_workflow_run_list_bare_status_string_is_wrapped_into_list_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    list_runs = AsyncMock(return_value=[])
+    monkeypatch.setattr(mcp_workflow, "list_workflow_runs_raw", list_runs)
+
+    payload = await _call("skyvern_workflow_run_list", {"workflow_id": "wpid_test", "status": "completed"})
+
+    assert payload["ok"] is True
+    assert _awaited_kwargs(list_runs)["status"] == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_object_parameters_are_json_encoded_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_client = SimpleNamespace(
+        run_workflow=AsyncMock(return_value=SimpleNamespace(run_id="wr_test", status="queued"))
+    )
+    patch_skyvern_client(monkeypatch, fake_client)
+    workflow_parameters = {"account_id": "acct_1", "reference": "REF-0001"}
+
+    payload = await _call("skyvern_workflow_run", {"workflow_id": "wpid_test", "parameters": workflow_parameters})
+
+    assert payload["ok"] is True
+    assert _awaited_kwargs(fake_client.run_workflow)["parameters"] == workflow_parameters
+
+
+@pytest.mark.asyncio
+async def test_object_value_is_not_json_encoded_for_unapproved_string_parameter() -> None:
+    tool = await mcp.get_tool("skyvern_workflow_create")
+    arguments = {"title": "Example", "definition": {"workflow_definition": {"blocks": []}}}
+
+    _repair_argument_types("skyvern_workflow_create", tool, arguments)
+
+    assert arguments["definition"] == {"workflow_definition": {"blocks": []}}
+
+
+@pytest.mark.asyncio
 async def test_comma_separated_string_is_not_split_for_non_list_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
     list_runs = AsyncMock(return_value=[])
     monkeypatch.setattr(mcp_workflow, "list_workflow_runs_raw", list_runs)
@@ -154,7 +194,7 @@ async def test_comma_separated_string_is_not_split_for_unapproved_list_parameter
 
 @pytest.mark.parametrize(
     "value",
-    ['["terminated","failed"]', "terminated,,failed", "terminated"],
+    ['["terminated","failed"]', "terminated,,failed", ""],
 )
 def test_csv_list_repair_leaves_structured_or_ambiguous_strings_for_other_validation(value: str) -> None:
     assert _split_comma_separated_list(value) == value
@@ -167,6 +207,7 @@ def test_csv_list_repair_leaves_excessive_item_count_for_other_validation() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_navigate_sub_1000_timeout_is_treated_as_seconds_and_converted_to_milliseconds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -179,7 +220,7 @@ async def test_navigate_sub_1000_timeout_is_treated_as_seconds_and_converted_to_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("timeout_seconds", "timeout_ms"), [(1.5, 1500), (0.5, 500)])
+@pytest.mark.parametrize(("timeout_seconds", "timeout_ms"), [(1.5, 1500)])
 async def test_navigate_fractional_seconds_with_whole_milliseconds_are_converted_to_int(
     timeout_seconds: float,
     timeout_ms: int,
@@ -194,6 +235,17 @@ async def test_navigate_fractional_seconds_with_whole_milliseconds_are_converted
 
 
 @pytest.mark.asyncio
+async def test_navigate_fractional_seconds_stay_unchanged_when_rescaling_is_still_below_minimum() -> None:
+    tool = await mcp.get_tool("skyvern_navigate")
+    arguments = {"timeout": 0.5}
+
+    _repair_argument_types("skyvern_navigate", tool, arguments)
+
+    assert arguments["timeout"] == 0.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("public_dns")
 async def test_navigate_timeout_at_millisecond_threshold_is_not_scaled(monkeypatch: pytest.MonkeyPatch) -> None:
     navigate = _mock_navigation(monkeypatch)
 
@@ -201,6 +253,87 @@ async def test_navigate_timeout_at_millisecond_threshold_is_not_scaled(monkeypat
 
     assert payload["ok"] is True
     assert _awaited_kwargs(navigate)["timeout"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_composite_navigate_sub_1000_timeout_reaches_the_navigate_step_as_milliseconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paired_capture = AsyncMock(return_value={"ok": True, "action": "navigate_extract_and_screenshot"})
+    monkeypatch.setattr(mcp_browser, "_run_paired_capture", paired_capture)
+
+    payload = await _call(
+        "skyvern_navigate_extract_and_screenshot",
+        {"url": "https://example.com", "prompt": "read the page", "timeout": 45},
+    )
+
+    assert payload["ok"] is True
+    operations = dict(paired_capture.await_args.args[1])
+    assert operations["navigate"]["timeout"] == 45000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("timeout", "expected_timeout", "expected_error"),
+    [
+        (60, 60000, None),
+        (90, None, "timeout is in milliseconds (1000-60000); got 90 - for seconds, use 1-60"),
+        (100, None, "timeout is in milliseconds (1000-60000); got 100 - for seconds, use 1-60"),
+        (500, None, "timeout is in milliseconds (1000-60000); got 500 - for seconds, use 1-60"),
+    ],
+)
+async def test_click_timeout_repairs_valid_seconds_and_rejects_ambiguous_values_at_mcp_dispatch(
+    monkeypatch: pytest.MonkeyPatch, timeout: int, expected_timeout: int | None, expected_error: str | None
+) -> None:
+    click = AsyncMock(return_value="#submit")
+    page = make_skyvern_page(make_mock_page())
+    page.click = click
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+    payload = await _call("skyvern_click", {"selector": "#submit", "selector_mode": "direct", "timeout": timeout})
+
+    if expected_error is not None:
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "INVALID_INPUT"
+        assert payload["error"]["message"] == expected_error
+        assert payload["error"]["hint"] == "For seconds, pass 1-60; otherwise provide milliseconds from 1000-60000."
+        click.assert_not_awaited()
+    else:
+        assert payload["ok"] is True
+        assert _awaited_kwargs(click)["timeout"] == expected_timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "argument", "sent", "expected"),
+    [
+        # Sub-floor values on millisecond-named parameters are interpreted as seconds.
+        ("skyvern_navigate_extract_and_screenshot", "timeout", 45, 45000),
+        ("skyvern_navigate_and_screenshot", "timeout", 30, 30000),
+        ("skyvern_click", "timeout", 10, 10000),
+        ("skyvern_wait", "poll_interval_ms", 5, 5000),
+        ("skyvern_tab_wait_for_new", "timeout_ms", 20, 20000),
+        ("skyvern_open_tabs", "per_tab_timeout_ms", 15, 15000),
+        # Second- and minute-denominated parameters mean what they say and must survive untouched.
+        ("skyvern_browser_session_create", "timeout", 5, 5),
+        ("skyvern_run_task", "timeout_seconds", 45, 45),
+        ("skyvern_workflow_run", "timeout_seconds", 30, 30),
+        ("skyvern_login", "timeout_seconds", 60, 60),
+        # Seconds are converted only when the result fits the schema's millisecond range.
+        ("skyvern_click", "timeout", 45, 45000),
+        ("skyvern_click", "timeout", 60, 60000),
+    ],
+)
+async def test_timeout_repair_rescales_millisecond_parameters_only(
+    tool_name: str, argument: str, sent: int, expected: int
+) -> None:
+    tool = await mcp.get_tool(tool_name)
+    arguments = {argument: sent}
+
+    _repair_argument_types(tool_name, tool, arguments)
+
+    assert arguments[argument] == expected
 
 
 @pytest.mark.asyncio
@@ -215,31 +348,17 @@ async def test_type_repair_preserves_structured_missing_key_rejection() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("arguments", "expected_field"),
-    [
-        # SKY-15319: page below the tool's documented 1-based minimum.
-        ({"workflow_id": "wpid_test", "page": 0}, "page"),
-        # SKY-14997: a single status value sent as a bare string instead of a list. Not
-        # comma-separated, so the narrow CSV repair correctly leaves it for validation.
-        ({"workflow_id": "wpid_test", "status": "completed"}, "status"),
-    ],
-)
-async def test_out_of_schema_value_gets_structured_error_instead_of_raising(
-    monkeypatch: pytest.MonkeyPatch,
-    arguments: dict,
-    expected_field: str,
-) -> None:
+async def test_out_of_schema_value_gets_structured_error_instead_of_raising(monkeypatch: pytest.MonkeyPatch) -> None:
     list_runs = AsyncMock(return_value=[])
     monkeypatch.setattr(mcp_workflow, "list_workflow_runs_raw", list_runs)
 
-    # Regression proof: before the fix, FastMCP's own pydantic validation raised
-    # fastmcp.exceptions.ValidationError out of call_next, uncaught by this middleware.
-    payload = await _call("skyvern_workflow_run_list", arguments)
+    # SKY-15319: page below the tool's documented 1-based minimum. Before the fix, FastMCP's own
+    # pydantic validation raised fastmcp.exceptions.ValidationError out of call_next, uncaught here.
+    payload = await _call("skyvern_workflow_run_list", {"workflow_id": "wpid_test", "page": 0})
 
     assert payload["ok"] is False
     error = payload["error"]
     assert error["code"] == "INVALID_INPUT"
-    assert expected_field in error["message"]
+    assert "page" in error["message"]
     assert "skyvern_workflow_run_list" in error["hint"]
     list_runs.assert_not_awaited()

@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/accordion";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { EmailBodyFormatSelect } from "../components/EmailBodyFormatSelect";
 import { Separator } from "@/components/ui/separator";
 
 import { AI_IMPROVE_CONFIGS } from "../../constants";
@@ -54,6 +55,7 @@ function HumanInteractionEditorBody({
     recipients,
     subject,
     body,
+    bodyFormat,
     negativeDescriptor,
     positiveDescriptor,
   } = data;
@@ -74,6 +76,7 @@ function HumanInteractionEditorBody({
           </div>
         </div>
         <WorkflowBlockInput
+          name="instructions"
           nodeId={blockId}
           onChange={(next) => update({ instructions: next })}
           value={instructions}
@@ -113,6 +116,7 @@ function HumanInteractionEditorBody({
         <div className="space-y-2">
           <Label className="text-xs text-tertiary-foreground">Recipients</Label>
           <WorkflowBlockInput
+            name="recipients"
             nodeId={blockId}
             onChange={(next) => update({ recipients: next })}
             value={recipients}
@@ -123,6 +127,7 @@ function HumanInteractionEditorBody({
         <div className="space-y-2">
           <Label className="text-xs text-tertiary-foreground">Subject</Label>
           <WorkflowBlockInput
+            name="subject"
             nodeId={blockId}
             onChange={(next) => update({ subject: next })}
             value={subject}
@@ -131,8 +136,16 @@ function HumanInteractionEditorBody({
           />
         </div>
         <div className="space-y-2">
-          <Label className="text-xs text-tertiary-foreground">Body</Label>
+          <div className="flex items-center justify-between">
+            <Label className="text-xs text-tertiary-foreground">Body</Label>
+            <EmailBodyFormatSelect
+              value={bodyFormat}
+              onChange={(next) => update({ bodyFormat: next })}
+              disabled={!editable}
+            />
+          </div>
           <WorkflowBlockInputTextarea
+            name="body"
             aiImprove={AI_IMPROVE_CONFIGS.humanInteraction.body}
             nodeId={blockId}
             onChange={(next) => update({ body: next })}
@@ -159,6 +172,7 @@ function HumanInteractionEditorBody({
                     <HelpTooltip content={negativeDescriptorTooltip} />
                   </div>
                   <WorkflowBlockInput
+                    name="negativeDescriptor"
                     nodeId={blockId}
                     onChange={(next) => update({ negativeDescriptor: next })}
                     value={negativeDescriptor}
@@ -174,6 +188,7 @@ function HumanInteractionEditorBody({
                     <HelpTooltip content={positiveDescriptorTooltip} />
                   </div>
                   <WorkflowBlockInput
+                    name="positiveDescriptor"
                     nodeId={blockId}
                     onChange={(next) => update({ positiveDescriptor: next })}
                     value={positiveDescriptor}

@@ -21,6 +21,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.blocker_signal import (
     assert_clean_user_facing_text,
 )
+from skyvern.utils.strings import join_phrases
 
 SCHEMA_INCOMPATIBILITY_BLOCKED_TOOL = "update_and_run_blocks"
 
@@ -86,19 +87,10 @@ def merge_schema_incompatibilities(items: list[SchemaIncompatibility]) -> Schema
     )
 
 
-def _field_list_phrase(paths: tuple[str, ...]) -> str:
-    quoted = [f"`{path}`" for path in paths]
-    if len(quoted) == 1:
-        return quoted[0]
-    if len(quoted) == 2:
-        return f"{quoted[0]} and {quoted[1]}"
-    return ", ".join(quoted[:-1]) + f", and {quoted[-1]}"
-
-
 def render_schema_incompatibility_user_reason(incompat: SchemaIncompatibility) -> str:
     """Product-language reply rendered from the structured incompatibility. Falls back
     to a field-free message if an exotic field name trips the user-facing safety gate."""
-    fields = _field_list_phrase(incompat.incompatible_paths)
+    fields = join_phrases([f"`{path}`" for path in incompat.incompatible_paths], "and")
     single = len(incompat.incompatible_paths) == 1
     verb = "doesn't" if single else "don't"
     subject = "it will" if single else "they will"

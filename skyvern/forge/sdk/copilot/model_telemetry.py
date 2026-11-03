@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
+import json
+import math
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import Any, Literal, cast, overload
+from typing import Any, Literal, TypeVar, cast, overload
 from urllib.parse import urlparse
 
 import litellm
@@ -22,33 +25,83 @@ from agents.models.chatcmpl_converter import Converter
 from agents.models.fake_id import FAKE_RESPONSES_ID
 from agents.models.interface import ModelTracing
 from agents.models.openai_responses import Converter as OpenAIResponsesConverter
-from agents.tool import Tool
+from agents.tool import FunctionTool, Tool
 from agents.tracing.span_data import GenerationSpanData
 from agents.tracing.spans import Span
 from litellm.completion_extras import responses_api_bridge
+from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import ModelResponse as LiteLLMModelResponse
 from litellm.types.utils import Usage as LiteLLMUsage
+from litellm.utils import CustomStreamWrapper
 from openai import AsyncStream, omit
 from openai.types.chat import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
-from openai.types.responses import Response
+from openai.types.responses import Response, ResponseCompletedEvent, ResponseReasoningItem
+from openai.types.responses.response_function_call_output_item_list_param import (
+    ResponseFunctionCallOutputItemListParam,
+)
 
 from skyvern.forge.sdk.api.llm.copilot_model_usage import (
     CopilotModelUsageEvent,
-    emit_copilot_model_usage,
+    _emit_copilot_model_usage,
+    _observe_copilot_model_usage,
     normalize_gen_ai_provider,
 )
+from skyvern.forge.sdk.api.llm.litellm_pricing import long_prompt_cost_multiplier
+from skyvern.forge.sdk.api.llm.utils import is_anthropic_model
 from skyvern.forge.sdk.copilot.cache_envelope import (
     CacheableSystemInstructions,
     ExplicitCacheEnvelope,
+    anthropic_cached_system_blocks,
     build_explicit_cache_envelope,
+    model_chain,
+    responses_route_model,
 )
+from skyvern.forge.sdk.copilot.enforcement import stable_prefix_anchors
 from skyvern.forge.sdk.copilot.model_input_capture import attach_tool_surface_to_pending_capture
 from skyvern.forge.sdk.copilot.pending_operation import pending_operation
 
 LOG = structlog.get_logger()
 _DATED_MODEL_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+# Anthropic sends each tool argument in one piece after a silence as long as its generation, so this must stay
+# above the time to write the largest argument (~29k tokens at the slowest observed Sonnet rate).
+_STREAM_PROGRESS_TIMEOUT_SECONDS = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class CopilotModelStopMetadata:
+    model_call_index: int | None
+    finish_reason: str | None = None
+    incomplete_details: dict[str, str] | None = None
+    refusal: bool | None = None
+    content_filter: bool | None = None
+    usage_missing: bool = True
+
+    @classmethod
+    def unknown(cls) -> CopilotModelStopMetadata:
+        return cls(model_call_index=None)
+
+    def log_fields(self) -> dict[str, int | str | bool | dict[str, str] | None]:
+        return {
+            "model_call_index": self.model_call_index,
+            "finish_reason": self.finish_reason,
+            "incomplete_details": self.incomplete_details,
+            "refusal": self.refusal,
+            "content_filter": self.content_filter,
+            "usage_missing": self.usage_missing,
+        }
+
+
+@dataclass(slots=True)
+class CopilotModelAttemptTelemetry:
+    latest_stop_metadata: CopilotModelStopMetadata = field(default_factory=CopilotModelStopMetadata.unknown)
+
+    def record(self, metadata: CopilotModelStopMetadata) -> None:
+        current_index = self.latest_stop_metadata.model_call_index
+        next_index = metadata.model_call_index
+        if next_index is not None and (current_index is None or next_index >= current_index):
+            self.latest_stop_metadata = metadata
 
 
 def _usage_field(value: Any, *keys: str) -> Any:
@@ -67,17 +120,31 @@ def _usage_field(value: Any, *keys: str) -> Any:
 class CopilotModelCallTelemetry:
     model_call_index: int
     response_model: str | None = None
+    served_provider: str | None = None
+    served_model: str | None = None
     cache_mode: Literal["implicit", "explicit"] = "implicit"
     cache_breakpoint_count: int = 0
     cache_stable_prefix_chars: int | None = None
+    ref_tool_outputs_escaped: int = 0
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    reported_cost: float | None = None
+    service_tier: str | None = None
+    finish_reason: str | None = None
+    incomplete_details: dict[str, str] | None = None
+    refusal: bool | None = None
+    content_filter: bool | None = None
+    # The provider's encrypted reasoning for this call, which the SDK's chat conversion drops from its output.
+    returned_reasoning: list[ResponseReasoningItem] = field(default_factory=list)
 
     def capture(self, usage: Any | None) -> None:
         if usage is None:
             return
+        cost = _usage_field(usage, "cost")
+        if type(cost) in {int, float} and math.isfinite(cost) and cost >= 0:
+            self.reported_cost = float(cost)
         input_tokens = _usage_field(usage, "prompt_tokens", "input_tokens")
         output_tokens = _usage_field(usage, "completion_tokens", "output_tokens")
         if isinstance(input_tokens, int) and not isinstance(input_tokens, bool):
@@ -93,12 +160,28 @@ class CopilotModelCallTelemetry:
             cache_write = _usage_field(details, "cache_write_tokens")
             if cache_write is None:
                 cache_write = (getattr(details, "model_extra", None) or {}).get("cache_write_tokens")
+            if cache_write is None:
+                cache_write = _usage_field(details, "cache_creation_tokens")
             if isinstance(cache_write, int) and not isinstance(cache_write, bool):
                 self.cache_write_tokens = cache_write
+
+    def stop_metadata(self) -> CopilotModelStopMetadata:
+        return CopilotModelStopMetadata(
+            model_call_index=self.model_call_index,
+            finish_reason=self.finish_reason,
+            incomplete_details=self.incomplete_details,
+            refusal=self.refusal,
+            content_filter=self.content_filter,
+            usage_missing=self.input_tokens is None and self.output_tokens is None,
+        )
 
 
 _current_model_call_telemetry: contextvars.ContextVar[CopilotModelCallTelemetry | None] = contextvars.ContextVar(
     "_current_model_call_telemetry",
+    default=None,
+)
+_current_model_attempt_telemetry: contextvars.ContextVar[CopilotModelAttemptTelemetry | None] = contextvars.ContextVar(
+    "_current_model_attempt_telemetry",
     default=None,
 )
 
@@ -107,10 +190,49 @@ def current_model_call_telemetry() -> CopilotModelCallTelemetry | None:
     return _current_model_call_telemetry.get()
 
 
+def current_model_attempt_telemetry() -> CopilotModelAttemptTelemetry | None:
+    return _current_model_attempt_telemetry.get()
+
+
+@contextlib.contextmanager
+def model_attempt_telemetry_scope() -> Iterator[CopilotModelAttemptTelemetry]:
+    telemetry = CopilotModelAttemptTelemetry()
+    token = _current_model_attempt_telemetry.set(telemetry)
+    try:
+        yield telemetry
+    finally:
+        _current_model_attempt_telemetry.reset(token)
+
+
 def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float | None:
+    if telemetry.reported_cost is not None:
+        return telemetry.reported_cost
     if telemetry.input_tokens is None or telemetry.output_tokens is None:
         return None
     pricing_model = _DATED_MODEL_SUFFIX.sub("", model)
+    provider = normalize_gen_ai_provider(telemetry.served_provider, pricing_model)
+    pricing_provider: dict[str, Any] = {}
+    if provider == "aws.bedrock":
+        # Bedrock's response can strip the regional inference profile. Price the actual served hop,
+        # or leave it unknown rather than selecting a bare Claude name's direct Anthropic rate.
+        if pricing_model.startswith("claude-"):
+            pricing_model = _DATED_MODEL_SUFFIX.sub("", telemetry.served_model or pricing_model)
+        if pricing_model.startswith("claude-"):
+            return None
+        pricing_provider["custom_llm_provider"] = "bedrock"
+    tier = telemetry.service_tier
+    if provider in {"openai", "azure.ai.openai", "gcp.vertex_ai", "gcp.gemini"} and tier not in {
+        "default",
+        "standard",
+        "flex",
+        "priority",
+    }:
+        return None
+    # The shared handler also treats these as pricing-library gaps; absent billed cost stays unknown here.
+    if tier == "flex" and (
+        provider in {"gcp.vertex_ai", "gcp.gemini"} or (provider == "openai" and telemetry.input_tokens > 272_000)
+    ):
+        return None
     try:
         input_cost, output_cost = litellm.cost_per_token(
             model=pricing_model,
@@ -119,10 +241,12 @@ def _model_call_cost(telemetry: CopilotModelCallTelemetry, model: str) -> float 
             cache_read_input_tokens=telemetry.cache_read_tokens,
             cache_creation_input_tokens=telemetry.cache_write_tokens,
             call_type="aresponses",
+            service_tier=tier,
+            **pricing_provider,
         )
     except Exception:
         return None
-    return float(input_cost + output_cost)
+    return float(input_cost + output_cost) * long_prompt_cost_multiplier(pricing_model, telemetry.input_tokens)
 
 
 def _is_azure_openai_host(base_url: str) -> bool:
@@ -150,31 +274,40 @@ def _log_model_call_usage(
 ) -> None:
     """Emit one Datadog-searchable usage event after provider usage arrives."""
 
-    if telemetry.input_tokens is None and telemetry.output_tokens is None:
+    if telemetry.input_tokens is None and telemetry.output_tokens is None and telemetry.reported_cost is None:
+        _observe_copilot_model_usage(CopilotModelUsageEvent(request_model=model))
         return
 
     billing_model = telemetry.response_model or model
-    emit_copilot_model_usage(
+    # An in-call fallback can be served by another provider than the one base_url points at.
+    provider_name = (
+        normalize_gen_ai_provider(telemetry.served_provider, billing_model)
+        if telemetry.served_provider
+        else _otel_provider_name(billing_model, base_url)
+    )
+    _emit_copilot_model_usage(
         CopilotModelUsageEvent(
             request_model=model,
             response_model=telemetry.response_model,
-            provider_name=_otel_provider_name(billing_model, base_url),
+            provider_name=provider_name,
             input_tokens=telemetry.input_tokens,
             output_tokens=telemetry.output_tokens,
             cache_read_tokens=telemetry.cache_read_tokens,
             cache_creation_tokens=telemetry.cache_write_tokens,
             cost=_model_call_cost(telemetry, billing_model),
+            cost_source="provider_reported" if telemetry.reported_cost is not None else "litellm_estimate",
             model_call_index=telemetry.model_call_index,
             cache_mode=telemetry.cache_mode,
             cache_breakpoint_count=telemetry.cache_breakpoint_count,
             cache_stable_prefix_chars=telemetry.cache_stable_prefix_chars,
+            ref_tool_outputs_escaped=telemetry.ref_tool_outputs_escaped or None,
         ),
         logger=LOG,
     )
 
 
 @contextlib.contextmanager
-def model_call_telemetry_scope(
+def _model_call_telemetry_scope(
     model_call_index: int,
     *,
     model: str | None = None,
@@ -192,13 +325,147 @@ def model_call_telemetry_scope(
         except Exception:
             pass
         finally:
+            attempt_telemetry = current_model_attempt_telemetry()
+            if attempt_telemetry is not None:
+                attempt_telemetry.record(telemetry.stop_metadata())
             _current_model_call_telemetry.reset(token)
+
+
+def _capture_served_provider(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+    hidden_params = getattr(response, "_hidden_params", None)
+    provider = hidden_params.get("custom_llm_provider") if isinstance(hidden_params, dict) else None
+    if isinstance(provider, str) and provider:
+        telemetry.served_provider = provider
+    served_model = hidden_params.get("litellm_model_name") if isinstance(hidden_params, dict) else None
+    if isinstance(served_model, str) and served_model:
+        telemetry.served_model = served_model
+    tier = getattr(response, "service_tier", None)
+    if not isinstance(tier, str) and isinstance(hidden_params, dict):
+        tier = hidden_params.get("skyvern_served_service_tier")
+    if isinstance(tier, str):
+        telemetry.service_tier = tier
+
+
+def _capture_chat_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+    """Capture only typed transport exit facts; no model text reaches logs."""
+
+    choices = _usage_field(response, "choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        finish_reason = _usage_field(choice, "finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            telemetry.finish_reason = finish_reason
+            telemetry.content_filter = finish_reason == "content_filter"
+        message = _usage_field(choice, "message", "delta")
+        if message is None:
+            continue
+        refusal = _usage_field(message, "refusal")
+        provider_fields = _usage_field(message, "provider_specific_fields")
+        if refusal is None and provider_fields is not None:
+            refusal = _usage_field(provider_fields, "refusal")
+        if isinstance(refusal, str):
+            telemetry.refusal = bool(refusal)
+        elif telemetry.refusal is None and finish_reason is not None:
+            telemetry.refusal = False
+
+
+def _capture_responses_stop_metadata(telemetry: CopilotModelCallTelemetry, response: object) -> None:
+    status = _usage_field(response, "status")
+    incomplete = _usage_field(response, "incomplete_details")
+    reason = _usage_field(incomplete, "reason") if incomplete is not None else None
+    if isinstance(reason, str) and reason:
+        telemetry.incomplete_details = {"reason": reason}
+        telemetry.content_filter = reason == "content_filter"
+
+    output = _usage_field(response, "output")
+    if isinstance(output, list):
+        refused = False
+        for item in output:
+            content = _usage_field(item, "content")
+            if not isinstance(content, list):
+                continue
+            if any(_usage_field(part, "type") == "refusal" for part in content):
+                refused = True
+        telemetry.refusal = refused
+    if (
+        isinstance(status, str)
+        and status in {"completed", "failed", "incomplete", "cancelled"}
+        and telemetry.content_filter is None
+    ):
+        telemetry.content_filter = False
+
+
+def _is_stream_progress(chunk: ChatCompletionChunk) -> bool:
+    for choice in chunk.choices:
+        delta = choice.delta
+        if choice.finish_reason or delta.content or delta.tool_calls:
+            return True
+        # Keep-alives arrive as empty deltas, and an empty thinking delta is not output. LiteLLM deletes unset
+        # reasoning fields from its Delta, so they are read with getattr.
+        if getattr(delta, "reasoning_content", None):
+            return True
+        for block in getattr(delta, "thinking_blocks", None) or ():
+            if block.get("thinking") or block.get("signature") or block.get("data"):
+                return True
+    return False
+
+
+class _ProgressGuardedStream:
+    def __init__(
+        self,
+        stream: AsyncStream[ChatCompletionChunk],
+        model: str,
+        telemetry: CopilotModelCallTelemetry | None,
+    ) -> None:
+        self._stream = stream
+        self._iterator = stream.__aiter__()
+        self._model = model
+        self._telemetry = telemetry
+        self._last_progress = asyncio.get_running_loop().time()
+        self._made_progress = False
+        self._chunks_seen = 0
+
+    def __aiter__(self) -> _ProgressGuardedStream:
+        return self
+
+    async def aclose(self) -> None:
+        await LitellmModel._maybe_aclose(self._stream)
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        timeout = asyncio.timeout_at(self._last_progress + _STREAM_PROGRESS_TIMEOUT_SECONDS)
+        try:
+            async with timeout:
+                chunk = await self._iterator.__anext__()
+        except TimeoutError:
+            if not timeout.expired():
+                raise
+            served_provider = self._telemetry.served_provider if self._telemetry is not None else None
+            if served_provider is None and isinstance(self._stream, CustomStreamWrapper):
+                served_provider = self._stream.custom_llm_provider
+            LOG.warning(
+                "Copilot model stream made no progress",
+                model=self._model,
+                served_provider=served_provider,
+                made_progress=self._made_progress,
+                chunks_seen=self._chunks_seen,
+            )
+            raise litellm.Timeout(
+                f"Copilot model stream made no progress for {_STREAM_PROGRESS_TIMEOUT_SECONDS:g} s",
+                model=self._model,
+                llm_provider=served_provider or "",
+            ) from None
+        self._chunks_seen += 1
+        if _is_stream_progress(chunk):
+            self._made_progress = True
+            self._last_progress = asyncio.get_running_loop().time()
+        return chunk
 
 
 class _UsageCapturingStream:
     def __init__(
         self,
-        stream: AsyncStream[ChatCompletionChunk],
+        stream: AsyncIterator[ChatCompletionChunk],
         telemetry: CopilotModelCallTelemetry,
     ) -> None:
         self._stream = stream
@@ -208,24 +475,49 @@ class _UsageCapturingStream:
     def __aiter__(self) -> _UsageCapturingStream:
         return self
 
+    async def aclose(self) -> None:
+        await LitellmModel._maybe_aclose(self._stream)
+
     async def __anext__(self) -> ChatCompletionChunk:
         chunk = await self._iterator.__anext__()
         if isinstance(chunk.model, str):
             self._telemetry.response_model = chunk.model
+        _capture_served_provider(self._telemetry, chunk)
         # LiteLLM returns ModelResponseStream at runtime even though its public
         # annotation is ChatCompletionChunk. Content chunks omit ``usage``.
         usage = getattr(chunk, "usage", None)
         if isinstance(usage, (LiteLLMUsage, CompletionUsage)):
             _capture_usage(self._telemetry, usage)
+        _capture_chat_stop_metadata(self._telemetry, chunk)
         return chunk
 
 
-class _ResponsesUsageCapturingStream:
-    """Capture raw Responses usage before LiteLLM drops cache-write tokens."""
+def _encrypted_reasoning(output: list[Any] | None, model: str) -> list[ResponseReasoningItem]:
+    return [
+        ResponseReasoningItem.model_validate(
+            {**(item if isinstance(item, dict) else item.model_dump()), "provider_data": {"model": model}}
+        )
+        for item in output or []
+        if _usage_field(item, "type") == "reasoning" and _usage_field(item, "encrypted_content")
+    ]
 
-    def __init__(self, stream: AsyncIterator[Any], telemetry: CopilotModelCallTelemetry) -> None:
+
+def _with_returned_reasoning(output: list[Any], reasoning: list[ResponseReasoningItem]) -> list[Any]:
+    # The SDK's own reasoning item carries only summary text, so the provider's item takes its place.
+    if not reasoning:
+        return output
+    return [*reasoning, *(item for item in output if not isinstance(item, ResponseReasoningItem))]
+
+
+class _ResponsesUsageCapturingStream:
+    """Capture raw Responses usage before LiteLLM drops cache-write tokens, and the encrypted reasoning it drops."""
+
+    def __init__(
+        self, stream: AsyncIterator[Any], telemetry: CopilotModelCallTelemetry, reasoning_model: str | None = None
+    ) -> None:
         self._iterator = stream.__aiter__()
         self._telemetry = telemetry
+        self._reasoning_model = reasoning_model
 
     def __aiter__(self) -> _ResponsesUsageCapturingStream:
         return self
@@ -239,7 +531,27 @@ class _ResponsesUsageCapturingStream:
         usage = getattr(response, "usage", None)
         if usage is not None:
             _capture_usage(self._telemetry, usage)
+        if response is not None:
+            _capture_served_provider(self._telemetry, response)
+            _capture_responses_stop_metadata(self._telemetry, response)
+            if self._reasoning_model and _usage_field(event, "type") == "response.completed":
+                self._telemetry.returned_reasoning = _encrypted_reasoning(
+                    _usage_field(response, "output"), self._reasoning_model
+                )
+        if _usage_field(event, "type") in {"response.refusal.delta", "response.refusal.done"}:
+            self._telemetry.refusal = True
         return event
+
+
+async def _typed_stream_errors(stream: AsyncIterator[Any], model: str, provider: str) -> AsyncIterator[Any]:
+    # LiteLLM's Responses stream raises mid-stream errors raw, which the retry check does not recognise.
+    # Its chat stream wrapper maps them with exception_type, so do the same here.
+    try:
+        async for event in stream:
+            yield event
+    except Exception as exc:
+        litellm.exception_type(model=model, original_exception=exc, custom_llm_provider=provider)
+        raise
 
 
 def _capture_usage(
@@ -252,7 +564,124 @@ def _capture_usage(
         LOG.warning("Failed to capture Copilot model usage", error=repr(exc))
 
 
+_GEMINI_PROVIDERS = frozenset({"vertex_ai", "vertex_ai_beta", "gemini"})
+
+
+def _is_gemini_model(model: str) -> bool:
+    try:
+        return litellm.get_llm_provider(model)[1] in _GEMINI_PROVIDERS
+    except litellm.exceptions.BadRequestError:
+        return False
+
+
+def _gemini_on_model_chain(model: str, model_settings: ModelSettings) -> bool:
+    return any(_is_gemini_model(candidate) for candidate in model_chain(model, model_settings))
+
+
+def _has_ref_key(value: object) -> bool:
+    if isinstance(value, dict):
+        return "$ref" in value or any(_has_ref_key(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_has_ref_key(child) for child in value)
+    return False
+
+
+def _escape_ref_text(text: str) -> str | None:
+    # LiteLLM's Gemini converter sends a tool result that parses to a JSON object as the literal
+    # function_response.response, where Vertex reads a $ref key as a media reference; its plain-text shape is safe.
+    if not text.strip().startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+        has_ref = isinstance(parsed, dict) and _has_ref_key(parsed)
+    except ValueError:
+        return None
+    except RecursionError:
+        # Too deep to walk; wrapping is lossless, and the converter then parses only the shallow envelope.
+        has_ref = True
+    return json.dumps({"content": text}, ensure_ascii=False) if has_ref else None
+
+
+def _escape_ref_output(
+    output: str | ResponseFunctionCallOutputItemListParam,
+) -> str | ResponseFunctionCallOutputItemListParam | None:
+    if isinstance(output, str):
+        return _escape_ref_text(output)
+    texts = [part["text"] for part in output if part["type"] == "input_text"]
+    if len(texts) != len(output):
+        return None
+    escaped = _escape_ref_text("".join(texts))
+    return None if escaped is None else [{"type": "input_text", "text": escaped}]
+
+
+def _escape_ref_tool_outputs_for_gemini(
+    input: str | list[TResponseInputItem],
+    model: str,
+    model_settings: ModelSettings,
+) -> str | list[TResponseInputItem]:
+    if isinstance(input, str) or not _gemini_on_model_chain(model, model_settings):
+        return input
+    rewritten: list[TResponseInputItem] | None = None
+    escaped_count = 0
+    for index, item in enumerate(input):
+        tool_output = Converter.maybe_function_tool_call_output(item)
+        if tool_output is None:
+            continue
+        escaped = _escape_ref_output(tool_output["output"])
+        if escaped is None:
+            continue
+        if rewritten is None:
+            rewritten = list(input)
+        escaped_item = tool_output.copy()
+        escaped_item["output"] = escaped
+        rewritten[index] = escaped_item
+        escaped_count += 1
+    if rewritten is None:
+        return input
+    telemetry = current_model_call_telemetry()
+    if telemetry is not None:
+        telemetry.ref_tool_outputs_escaped = escaped_count
+    return rewritten
+
+
+_SCHEMA_LITERALS = frozenset({"default", "const", "enum", "examples"})
+
+
+def _drop_schema_titles(node: Any) -> Any:
+    if isinstance(node, list):
+        return [_drop_schema_titles(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    return {
+        key: value if key in _SCHEMA_LITERALS else _drop_schema_titles(value)
+        for key, value in node.items()
+        if not (key == "title" and isinstance(value, str))
+    }
+
+
+_ToolT = TypeVar("_ToolT", bound=Tool)
+
+
+def drop_tool_schema_titles(tools: list[_ToolT], model: str, model_settings: ModelSettings) -> list[_ToolT]:
+    # Pydantic's generated titles carry nothing the property names don't. Offline replay showed no behavior change
+    # without them on Claude and terra; gpt-6.1-sol replied less often after a passing test run, so other models keep them.
+    if not all(
+        is_anthropic_model(candidate) or "gpt-5.6-terra" in candidate
+        for candidate in model_chain(model, model_settings)
+    ):
+        return tools
+    return [
+        replace(tool, params_json_schema=_drop_schema_titles(tool.params_json_schema))
+        if isinstance(tool, FunctionTool)
+        else tool
+        for tool in tools
+    ]
+
+
 class CopilotLitellmModel(LitellmModel):
+    # True for a caller without Copilot's call_model_input_filter: nothing rewrites its recent tool outputs.
+    history_append_only = False
+
     def __init__(
         self,
         model: str,
@@ -277,13 +706,12 @@ class CopilotLitellmModel(LitellmModel):
         conversation_id: str | None = None,
         prompt: Any | None = None,
     ) -> ModelResponse:
-        attach_tool_surface_to_pending_capture(tools)
-        with model_call_telemetry_scope(
+        with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
-        ):
-            return await super().get_response(
+        ) as telemetry:
+            response = await super().get_response(
                 system_instructions,
                 input,
                 model_settings,
@@ -295,6 +723,8 @@ class CopilotLitellmModel(LitellmModel):
                 conversation_id,
                 prompt,
             )
+            response.output = _with_returned_reasoning(response.output, telemetry.returned_reasoning)
+            return response
 
     async def stream_response(
         self,
@@ -309,25 +739,32 @@ class CopilotLitellmModel(LitellmModel):
         conversation_id: str | None = None,
         prompt: Any | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        attach_tool_surface_to_pending_capture(tools)
-        with model_call_telemetry_scope(
+        with _model_call_telemetry_scope(
             self.next_model_call_index(),
             model=self.model,
             base_url=self.base_url,
-        ):
-            async for event in super().stream_response(
-                system_instructions,
-                input,
-                model_settings,
-                tools,
-                output_schema,
-                handoffs,
-                tracing,
-                previous_response_id,
-                conversation_id,
-                prompt,
-            ):
-                yield event
+        ) as telemetry:
+            async with contextlib.aclosing(
+                super().stream_response(
+                    system_instructions,
+                    input,
+                    model_settings,
+                    tools,
+                    output_schema,
+                    handoffs,
+                    tracing,
+                    previous_response_id,
+                    conversation_id,
+                    prompt,
+                )
+            ) as events:
+                async for event in events:
+                    # The runner builds the turn's items from this event's output.
+                    if isinstance(event, ResponseCompletedEvent):
+                        event.response.output = _with_returned_reasoning(
+                            event.response.output, telemetry.returned_reasoning
+                        )
+                    yield event
 
     @overload
     async def _fetch_response(
@@ -372,6 +809,11 @@ class CopilotLitellmModel(LitellmModel):
         stream: bool = False,
         prompt: Any | None = None,
     ) -> LiteLLMModelResponse | tuple[Response, AsyncStream[ChatCompletionChunk]]:
+        input = _escape_ref_tool_outputs_for_gemini(input, self.model, model_settings)
+        tools = drop_tool_schema_titles(tools, self.model, model_settings)
+        attach_tool_surface_to_pending_capture(tools)
+        anchors = stable_prefix_anchors(input, append_only=self.history_append_only) if isinstance(input, list) else []
+        anchor = anchors[-1] if anchors else None
         explicit_cache_envelope = build_explicit_cache_envelope(
             model=self.model,
             base_url=self.base_url,
@@ -380,13 +822,16 @@ class CopilotLitellmModel(LitellmModel):
             model_settings=model_settings,
             tools=tools,
             handoffs=handoffs,
+            reasoning_effort=self._get_reasoning_effort(model_settings),
+            anchors=anchors,
             should_replay_reasoning_content=self.should_replay_reasoning_content,
+            api_key=self.api_key,
         )
         if explicit_cache_envelope is not None:
             telemetry = current_model_call_telemetry()
             if telemetry is not None:
                 telemetry.cache_mode = "explicit"
-                telemetry.cache_breakpoint_count = 1
+                telemetry.cache_breakpoint_count = explicit_cache_envelope.breakpoint_count
                 if isinstance(system_instructions, CacheableSystemInstructions):
                     telemetry.cache_stable_prefix_chars = len(system_instructions.stable_prefix)
             result = await self._fetch_explicit_responses(
@@ -400,8 +845,44 @@ class CopilotLitellmModel(LitellmModel):
                 stream,
             )
         else:
+            sent_instructions = str(system_instructions) if system_instructions is not None else None
+            anthropic_system_blocks = anthropic_cached_system_blocks(
+                model=self.model,
+                model_settings=model_settings,
+                system_instructions=system_instructions,
+            )
+            if anthropic_system_blocks is not None:
+                breakpoint_count = 1
+                if anchor is not None and isinstance(input, list):
+                    anchor_messages = Converter.items_to_messages(
+                        input[: anchor + 1],
+                        base_url=self.base_url,
+                        preserve_thinking_blocks=model_settings.reasoning is not None
+                        and model_settings.reasoning.effort is not None,
+                        preserve_tool_output_all_content=True,
+                        model=self.model,
+                        should_replay_reasoning_content=self.should_replay_reasoning_content,
+                    )
+                    # The marker sits on the newest anchor, before any content a later call rewrites; the count mirrors
+                    # the SDK's tool-call split, with system at 0.
+                    rolling_index = len(self._fix_tool_message_ordering(anchor_messages))
+                    model_settings = replace(
+                        model_settings,
+                        extra_args={
+                            **(model_settings.extra_args or {}),
+                            "cache_control_injection_points": [{"location": "message", "index": rolling_index}],
+                        },
+                    )
+                    breakpoint_count += 1
+                # The SDK inserts system content verbatim, so a block list reaches LiteLLM as list-form system content.
+                sent_instructions = cast(str, anthropic_system_blocks)
+                telemetry = current_model_call_telemetry()
+                if telemetry is not None:
+                    telemetry.cache_mode = "explicit"
+                    telemetry.cache_breakpoint_count = breakpoint_count
+                    telemetry.cache_stable_prefix_chars = len(anthropic_system_blocks[0]["text"])
             result = await super()._fetch_response(
-                system_instructions,
+                sent_instructions,
                 input,
                 model_settings,
                 tools,
@@ -417,15 +898,21 @@ class CopilotLitellmModel(LitellmModel):
             if telemetry is not None:
                 if isinstance(result.model, str):
                     telemetry.response_model = result.model
+                _capture_served_provider(telemetry, result)
                 usage = result.get("usage")
                 if isinstance(usage, LiteLLMUsage):
                     _capture_usage(telemetry, usage)
+                _capture_chat_stop_metadata(telemetry, result)
             return result
 
         response, response_stream = result
+        if telemetry is not None and isinstance(response_stream, CustomStreamWrapper):
+            telemetry.served_provider = response_stream.custom_llm_provider
+            telemetry.served_model = response_stream.model
+        guarded_stream = _ProgressGuardedStream(response_stream, self.model, telemetry)
         if telemetry is None:
-            return result
-        capturing_stream = _UsageCapturingStream(response_stream, telemetry)
+            return response, cast(AsyncStream[ChatCompletionChunk], guarded_stream)
+        capturing_stream = _UsageCapturingStream(guarded_stream, telemetry)
         return response, cast(AsyncStream[ChatCompletionChunk], capturing_stream)
 
     async def _fetch_explicit_responses(
@@ -509,14 +996,56 @@ class CopilotLitellmModel(LitellmModel):
         request_kwargs["prompt_cache_key"] = envelope.prompt_cache_key
         request_kwargs["extra_body"] = envelope.extra_body
         request_kwargs.pop("reasoning_effort", None)
+        fallbacks: list[str | dict[str, Any]] = request_kwargs.pop("fallbacks", None) or []
 
-        raw_response = await litellm.aresponses(**request_kwargs)
+        # LiteLLM runs fallbacks only inside acompletion, so the Responses call walks the chain the same way.
+        hops: list[str | dict[str, Any]] = [{}, *fallbacks]
+        for hop_index, hop in enumerate(hops):
+            hop_override = {"model": hop} if isinstance(hop, str) else dict(hop)
+            # safe_deep_copy returns its argument in LiteLLM's safe_memory_mode, so each hop builds a new dict.
+            hop_kwargs = (
+                {**safe_deep_copy(request_kwargs), **safe_deep_copy(hop_override)}
+                if fallbacks
+                else {**request_kwargs, **hop_override}
+            )
+            # aresponses reads only api_base; a base_url kwarg is silently ignored and the call goes to the default host.
+            hop_base_url = hop_kwargs.pop("base_url", None)
+            if hop_base_url and not hop_kwargs.get("api_base"):
+                hop_kwargs["api_base"] = hop_base_url
+            hop_kwargs["model"] = responses_route_model(hop_kwargs["model"])
+            try:
+                raw_response = await litellm.aresponses(**hop_kwargs)
+                break
+            except Exception as exc:
+                LOG.warning(
+                    "Copilot Responses hop failed",
+                    hop_index=hop_index,
+                    model=hop_kwargs["model"],
+                    error_type=type(exc).__name__,
+                    status_code=getattr(exc, "status_code", None),
+                    error=str(exc)[:300],
+                )
+                if not fallbacks:
+                    raise
+                if hop_index == len(hops) - 1:
+                    # Matches LiteLLM's fallback error: an untyped Exception with no __cause__, so not retriable.
+                    raise Exception(
+                        f"{exc}. All fallback attempts failed. "
+                        "Enable verbose logging with `litellm.set_verbose=True` for details."
+                    )
+        served_model = hop_kwargs["model"]
+        served_provider = litellm.get_llm_provider(served_model)[1]
         telemetry = current_model_call_telemetry()
+        if telemetry is not None:
+            telemetry.served_provider = served_provider
+            telemetry.served_model = served_model
 
         if stream:
-            raw_stream = cast(AsyncIterator[Any], raw_response)
+            raw_stream = _typed_stream_errors(cast(AsyncIterator[Any], raw_response), served_model, served_provider)
             if telemetry is not None:
-                raw_stream = _ResponsesUsageCapturingStream(raw_stream, telemetry)
+                raw_stream = _ResponsesUsageCapturingStream(
+                    raw_stream, telemetry, self.model if envelope.replays_reasoning else None
+                )
             response_stream = responses_api_bridge.transformation_handler.get_model_response_iterator(
                 raw_stream,
                 sync_stream=False,
@@ -525,7 +1054,7 @@ class CopilotLitellmModel(LitellmModel):
             response = Response(
                 id=FAKE_RESPONSES_ID,
                 created_at=time.time(),
-                model=self.model,
+                model=served_model,
                 object="response",
                 output=[],
                 tool_choice=response_tool_choice,  # type: ignore[arg-type]
@@ -542,9 +1071,13 @@ class CopilotLitellmModel(LitellmModel):
         if telemetry is not None:
             if isinstance(raw_response.model, str):
                 telemetry.response_model = raw_response.model
+            _capture_served_provider(telemetry, raw_response)
             _capture_usage(telemetry, raw_response.usage)
+            _capture_responses_stop_metadata(telemetry, raw_response)
+            if envelope.replays_reasoning:
+                telemetry.returned_reasoning = _encrypted_reasoning(raw_response.output, self.model)
         model_response = responses_api_bridge.transformation_handler.transform_response(
-            model=self.model,
+            model=served_model,
             raw_response=raw_response,
             model_response=LiteLLMModelResponse(),
             logging_obj=SimpleNamespace(),  # type: ignore[arg-type]

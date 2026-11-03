@@ -6,7 +6,9 @@ user-defined errors array. The filter drops anything not in the user's
 error_code_mapping so only declared codes leak through to the user.
 """
 
-from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes
+import pytest
+
+from skyvern.errors.errors import UserDefinedError, filter_to_user_defined_codes, resolve_error_code_mapping_key
 
 
 def _make_error(code: str) -> UserDefinedError:
@@ -58,12 +60,27 @@ def test_filter_handles_empty_errors_input() -> None:
     assert dropped == []
 
 
-def test_filter_is_case_sensitive() -> None:
-    """Codes must match exactly — mapping is case-sensitive by design."""
-    errors = [_make_error("data_unavailable")]
-    mapping = {"DATA_UNAVAILABLE": "x"}
+def test_filter_returns_the_mapping_key_for_a_case_variant_and_drops_an_ambiguous_one() -> None:
+    errors = [_make_error("data_unavailable"), _make_error("Website_Down")]
+    mapping = {"DATA_UNAVAILABLE": "x", "website_down": "y", "WEBSITE_DOWN": "z"}
 
     kept, dropped = filter_to_user_defined_codes(errors, mapping)
 
-    assert kept == []
-    assert dropped == ["data_unavailable"]
+    assert [error.error_code for error in kept] == ["DATA_UNAVAILABLE"]
+    assert dropped == ["Website_Down"]
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("website_down", "website_down"),
+        ("WEBSITE_DOWN", "WEBSITE_DOWN"),
+        ("Login_Failed", "login_failed"),
+        # Two keys differ only by case: guessing between them could emit the wrong customer code.
+        ("Website_Down", None),
+    ],
+)
+def test_resolve_mapping_key_prefers_exact_and_declines_ambiguous_case(code: str, expected: str | None) -> None:
+    mapping = {"website_down": "x", "WEBSITE_DOWN": "y", "login_failed": "z"}
+
+    assert resolve_error_code_mapping_key(code, mapping) == expected

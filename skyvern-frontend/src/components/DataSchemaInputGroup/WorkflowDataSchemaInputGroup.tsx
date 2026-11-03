@@ -21,7 +21,14 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { getClient } from "@/api/AxiosClient";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
 import { helpTooltips } from "@/routes/workflows/editor/helpContent";
-import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
+import {
+  useWorkflowScopeId,
+  useWorkflowScopeReadOnly,
+} from "@/routes/workflows/editor/WorkflowScopeContext";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { useCallback, useMemo, useState } from "react";
 import { AutoResizingTextarea } from "../AutoResizingTextarea/AutoResizingTextarea";
 import { Button } from "../ui/button";
@@ -31,25 +38,37 @@ import { TSON } from "@/util/tson";
 import { cn } from "@/util/utils";
 
 type Props = {
+  deferKey?: string;
   value: string;
   onChange: (value: string) => void;
   suggestionContext: Record<string, unknown>;
   exampleValue: Record<string, unknown>;
   helpTooltip?: string;
+  hideEnableToggle?: boolean;
 };
 
 function WorkflowDataSchemaInputGroup({
+  deferKey,
   value,
   onChange,
   suggestionContext,
   exampleValue,
   helpTooltip,
+  hideEnableToggle = false,
 }: Props) {
   const credentialGetter = useCredentialGetter();
+  const workflowId = useWorkflowScopeId();
   const scopeReadOnly = useWorkflowScopeReadOnly();
+  const locked = useWorkflowYamlEditorStore(
+    (state) =>
+      scopeReadOnly ||
+      (workflowId !== null && selectEditorMutationLocked(state)),
+  );
   const [generateWithAIActive, setGenerateWithAIActive] = useState(false);
   const [generateWithAIPrompt, setGenerateWithAIPrompt] = useState("");
   const [pendingSchema, setPendingSchema] = useState<string | null>(null);
+  // Without the toggle nothing can bring the editor back, so a typed "null" must not hide it.
+  const schemaEnabled = hideEnableToggle || value !== "null";
 
   const resetAIState = useCallback(() => {
     setPendingSchema(null);
@@ -74,7 +93,7 @@ function WorkflowDataSchemaInputGroup({
       );
     },
     onSuccess: (response) => {
-      if (value === "null") {
+      if (!schemaEnabled) {
         return;
       }
       setPendingSchema(JSON.stringify(response.data.output, null, 2));
@@ -99,20 +118,22 @@ function WorkflowDataSchemaInputGroup({
               content={helpTooltip ?? helpTooltips["task"]["dataSchema"]}
             />
           </div>
-          <Checkbox
-            checked={value !== "null"}
-            disabled={scopeReadOnly}
-            onCheckedChange={(checked) => {
-              if (!checked) {
-                resetAIState();
-              }
-              onChange(
-                checked ? JSON.stringify(exampleValue, null, 2) : "null",
-              );
-            }}
-          />
+          {!hideEnableToggle && (
+            <Checkbox
+              checked={value !== "null"}
+              disabled={locked}
+              onCheckedChange={(checked) => {
+                if (!checked) {
+                  resetAIState();
+                }
+                onChange(
+                  checked ? JSON.stringify(exampleValue, null, 2) : "null",
+                );
+              }}
+            />
+          )}
         </div>
-        {value !== "null" && !generateWithAIActive && !scopeReadOnly && (
+        {schemaEnabled && !generateWithAIActive && !locked && (
           <Button
             variant="tertiary"
             className="h-7 text-xs"
@@ -126,7 +147,7 @@ function WorkflowDataSchemaInputGroup({
         )}
       </div>
 
-      {value !== "null" && (
+      {schemaEnabled && (
         <div className="space-y-2">
           {generateWithAIActive ? (
             <div className="flex w-full items-center rounded-xl border px-4">
@@ -139,6 +160,7 @@ function WorkflowDataSchemaInputGroup({
               />
               <AutoResizingTextarea
                 className="min-h-0 resize-none rounded-md border-transparent px-4 py-2 text-xs hover:border-transparent focus-visible:ring-0"
+                disabled={locked}
                 value={generateWithAIPrompt}
                 onChange={(event) => {
                   setGenerateWithAIPrompt(event.target.value);
@@ -151,12 +173,15 @@ function WorkflowDataSchemaInputGroup({
                 <PaperPlaneIcon
                   className={cn(
                     "size-4",
-                    pendingSchema !== null || !generateWithAIPrompt.trim()
+                    locked ||
+                      pendingSchema !== null ||
+                      !generateWithAIPrompt.trim()
                       ? "cursor-not-allowed opacity-50"
                       : "cursor-pointer",
                   )}
                   onClick={() => {
                     if (
+                      locked ||
                       pendingSchema !== null ||
                       !generateWithAIPrompt.trim()
                     ) {
@@ -177,6 +202,7 @@ function WorkflowDataSchemaInputGroup({
             )}
           >
             <CodeEditor
+              deferKey={deferKey}
               language="json"
               value={value}
               onChange={onChange}
@@ -190,7 +216,7 @@ function WorkflowDataSchemaInputGroup({
           )}
         </div>
       )}
-      {value !== "null" && (
+      {schemaEnabled && (
         <Dialog
           open={pendingSchema !== null}
           onOpenChange={(open) => {
@@ -241,6 +267,7 @@ function WorkflowDataSchemaInputGroup({
                 <Button variant="secondary">Cancel</Button>
               </DialogClose>
               <Button
+                disabled={locked}
                 onClick={() => {
                   if (pendingSchema !== null) {
                     onChange(pendingSchema);

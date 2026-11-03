@@ -4,8 +4,8 @@ from skyvern.config import settings
 from skyvern.forge import app
 
 LOG = structlog.get_logger()
-# Tracks TASK_V2_CONVERGE_PCT in infra/k8s/temporal-worker/values-benchmark-hetzner.yaml; the flag
-# carries no value of its own, so re-tuning the fleet means re-tuning this too.
+# The converge percentage the planner-levers flag applies when TASK_V2_CONVERGE_PCT is unset; the flag
+# carries no value of its own.
 DEFAULT_CONVERGE_PCT = 20
 
 

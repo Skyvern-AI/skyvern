@@ -18,21 +18,28 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta, tzinfo
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyvern.exceptions import WorkflowNotFound, WorkflowRunNotFound
+from skyvern.exceptions import BrowserSessionClosed, BrowserSessionStartupTimeout, WorkflowNotFound, WorkflowRunNotFound
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow import service as service_module
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.forge.sdk.workflow.retry_policy import TERMINAL_RELEASE_RETRY_MAX_ATTEMPTS
+from skyvern.forge.sdk.workflow.service import (
+    WorkflowBrowserCleanupResult,
+    WorkflowService,
+    _browser_lease_failure_category,
+)
+from skyvern.services import run_service
 
 
 @pytest.mark.asyncio
 async def test_mark_canceled_if_not_final_returns_conditional_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     updated_row = MagicMock()
     updated_row.status = WorkflowRunStatus.canceled
 
@@ -46,7 +53,18 @@ async def test_mark_canceled_if_not_final_returns_conditional_result(
     delegate.assert_awaited_once_with(
         workflow_run_id="wr_1",
         status=WorkflowRunStatus.canceled,
+        failure_reason=None,
     )
+
+
+def _patch_service_log(monkeypatch: pytest.MonkeyPatch, **methods: object) -> None:
+    """Replace the service module's LOG rather than a method on it. Undoing a patched method on
+    structlog's lazy proxy leaves a bound logger stuck to the proxy, and later tests in the same
+    process then miss that module's lines in structlog.testing.capture_logs."""
+    log = MagicMock(wraps=service_module.LOG)
+    for name, method in methods.items():
+        setattr(log, name, method)
+    monkeypatch.setattr(service_module, "LOG", log)
 
 
 def _make_updated_row(now: datetime | None = None) -> MagicMock:
@@ -54,6 +72,7 @@ def _make_updated_row(now: datetime | None = None) -> MagicMock:
     row = MagicMock()
     row.status = WorkflowRunStatus.canceled
     row.created_at = now - timedelta(seconds=30)
+    row.queued_at = None
     row.started_at = now - timedelta(seconds=20)
     row.workflow_id = "wf_abc"
     row.organization_id = "org_abc"
@@ -74,8 +93,6 @@ async def test_completion_tags_write_final_status_execution_mode_and_primary_fai
     monkeypatch: pytest.MonkeyPatch,
     final_status: WorkflowRunStatus,
 ) -> None:
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     workflow_run = _make_updated_row()
     workflow_run.workflow_run_id = f"wr_{final_status.value}"
     workflow_run.status = final_status
@@ -95,6 +112,7 @@ async def test_completion_tags_write_final_status_execution_mode_and_primary_fai
             "skyvern.failure_category": "PARAMETER_BINDING_ERROR",
         },
         caller_id="system:completion-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -102,8 +120,6 @@ async def test_completion_tags_write_final_status_execution_mode_and_primary_fai
 async def test_completion_tags_write_status_and_execution_mode_for_completed_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     workflow_run = _make_updated_row()
     workflow_run.workflow_run_id = "wr_completed"
     workflow_run.status = "completed"
@@ -118,6 +134,7 @@ async def test_completion_tags_write_status_and_execution_mode_for_completed_run
         organization_id="org_abc",
         sets={"skyvern.status": "completed", "skyvern.execution_mode": "agent"},
         caller_id="system:completion-tagging",
+        known_run=workflow_run,
     )
 
 
@@ -125,8 +142,6 @@ async def test_completion_tags_write_status_and_execution_mode_for_completed_run
 async def test_completion_tag_write_failure_does_not_interrupt_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     workflow_run = _make_updated_row()
     workflow_run.workflow_run_id = "wr_completion"
     monkeypatch.setattr(
@@ -142,8 +157,6 @@ async def test_completion_tag_write_failure_does_not_interrupt_finalization(
 async def test_conditional_cancel_writes_completion_tags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     updated_row = _make_updated_row()
     updated_row.workflow_run_id = "wr_canceled"
     monkeypatch.setattr(
@@ -170,11 +183,9 @@ async def test_mark_canceled_if_not_final_logs_duration_metrics(
     statuses. ``recorded_seconds`` must equal the sample handed to
     ``record_run_duration`` so a log query keyed on it reconciles with the metric.
     """
-    from skyvern.forge.sdk.workflow import service as service_module
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
     updated_row = _make_updated_row(fixed_now)
+    updated_row.workflow_run_id = "wr_live"
     updated_row.parent_workflow_run_id = None
 
     class FrozenDateTime(datetime):
@@ -203,7 +214,7 @@ async def test_mark_canceled_if_not_final_logs_duration_metrics(
     def fake_info(event: str, **kwargs: object) -> None:
         info_calls.append((event, dict(kwargs)))
 
-    monkeypatch.setattr(service_module.LOG, "info", fake_info)
+    _patch_service_log(monkeypatch, info=fake_info)
 
     svc = WorkflowService()
     result = await svc.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_live")
@@ -230,9 +241,8 @@ async def test_mark_canceled_if_not_final_syncs_task_runs(
     the ``_sync_task_run_from_workflow_run`` write-through so downstream
     consumers reading ``task_runs`` see the cancel event.
     """
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     updated_row = _make_updated_row()
+    updated_row.workflow_run_id = "wr_sync"
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
         "update_workflow_run_if_not_final",
@@ -265,9 +275,6 @@ async def test_mark_canceled_if_not_final_skips_side_effects_on_terminal_row(
     terminal status's own ``_update_workflow_run_status`` call already emitted
     them.
     """
-    from skyvern.forge.sdk.workflow import service as service_module
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
         "update_workflow_run_if_not_final",
@@ -281,7 +288,7 @@ async def test_mark_canceled_if_not_final_skips_side_effects_on_terminal_row(
     def fake_info(event: str, **kwargs: object) -> None:
         info_calls.append(event)
 
-    monkeypatch.setattr(service_module.LOG, "info", fake_info)
+    _patch_service_log(monkeypatch, info=fake_info)
 
     svc = WorkflowService()
     result = await svc.mark_workflow_run_as_canceled_if_not_final(workflow_run_id="wr_already_done")
@@ -297,8 +304,6 @@ async def test_mark_canceled_if_not_final_is_noop_on_terminal_row(
 ) -> None:
     """DB returns None when the row is already terminal — helper must propagate
     that as None instead of raising or writing a conflicting row."""
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     delegate = AsyncMock(return_value=None)
     monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", delegate)
 
@@ -329,8 +334,6 @@ async def test_mark_canceled_rejects_transition_on_terminal_row(
     terminal rows; the service helper must propagate the existing row back to
     callers without writing ``canceled``.
     """
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     existing_row = MagicMock()
     existing_row.status = terminal_status
 
@@ -351,6 +354,7 @@ async def test_mark_canceled_rejects_transition_on_terminal_row(
     conditional_update.assert_awaited_once_with(
         workflow_run_id="wr_final",
         status=WorkflowRunStatus.canceled,
+        failure_reason=None,
     )
     unconditional_update.assert_not_called()
 
@@ -362,8 +366,6 @@ async def test_mark_canceled_writes_when_row_is_non_terminal(
     """SKY-9188: a non-terminal run still transitions to ``canceled`` through
     the conditional update path.
     """
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     canceled_row = MagicMock()
     canceled_row.status = WorkflowRunStatus.canceled
 
@@ -379,6 +381,7 @@ async def test_mark_canceled_writes_when_row_is_non_terminal(
     conditional_update.assert_awaited_once_with(
         workflow_run_id="wr_running",
         status=WorkflowRunStatus.canceled,
+        failure_reason=None,
     )
     get_workflow_run.assert_not_called()
 
@@ -392,8 +395,6 @@ async def test_mark_canceled_raises_when_row_missing(
     ``WorkflowRunNotFound`` rather than silently pretending the cancel
     succeeded.
     """
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     conditional_update = AsyncMock(return_value=None)
     monkeypatch.setattr(app.DATABASE.workflow_runs, "update_workflow_run_if_not_final", conditional_update)
     get_workflow_run = AsyncMock(return_value=None)
@@ -407,9 +408,6 @@ async def test_mark_canceled_raises_when_row_missing(
 
 @pytest.mark.asyncio
 async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.workflow import service as service_module
-    from skyvern.forge.sdk.workflow.service import WorkflowBrowserCleanupResult, WorkflowService
-
     running_run = _make_updated_row()
     running_run.workflow_run_id = "wr_canceled_during_cleanup"
     running_run.status = WorkflowRunStatus.running
@@ -424,7 +422,7 @@ async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatc
 
     webhook_statuses: list[WorkflowRunStatus] = []
 
-    async def record_webhook(workflow_run: MagicMock, _api_key: str | None = None) -> None:
+    async def record_webhook(workflow_run: MagicMock, _api_key: str | None = None, **_claim: object) -> None:
         webhook_statuses.append(workflow_run.status)
 
     monkeypatch.setattr(svc, "execute_workflow_webhook", record_webhook)
@@ -442,7 +440,7 @@ async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatc
         pre_finally_failure_reason=None,
     )
     await svc.clean_up_workflow(
-        workflow=MagicMock(),
+        workflow=SimpleNamespace(workflow_definition=SimpleNamespace(retry_policy=None)),
         workflow_run=finalized_run,
         browser_cleanup_result=WorkflowBrowserCleanupResult(
             browser_state=None,
@@ -457,9 +455,151 @@ async def test_cleanup_after_cancellation_emits_only_canceled_webhook(monkeypatc
     conditional_finalize.assert_awaited_once_with(
         workflow_run_id=running_run.workflow_run_id,
         status=WorkflowRunStatus.completed,
+        _on_terminal_write=None,
     )
     assert finalized_run is canceled_run
     assert webhook_statuses == [WorkflowRunStatus.canceled]
+
+
+@pytest.mark.asyncio
+async def test_cancel_policy_run_leaves_attachment_deletion_to_terminal_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_run = _make_updated_row()
+    workflow_run.workflow_run_id = "wr_policy_cancel"
+    workflow_run.status = WorkflowRunStatus.running
+    canceled_run = _make_updated_row()
+    canceled_run.workflow_run_id = workflow_run.workflow_run_id
+    attempts = [MagicMock(attempt_number=1)]
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(return_value=workflow_run),
+    )
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_runs,
+        "get_workflow_runs_by_parent_workflow_run_id",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=attempts)
+    )
+    monkeypatch.setattr(
+        run_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_canceled", AsyncMock(return_value=canceled_run)
+    )
+    decision = run_service.RetryDecision(False, 1, 0, True, "cancel")
+    monkeypatch.setattr(run_service, "get_recorded_decision", AsyncMock(return_value=decision))
+    terminal_effects = AsyncMock()
+    monkeypatch.setattr(run_service.app.WORKFLOW_SERVICE, "_run_terminal_side_effects_with_retries", terminal_effects)
+    delete = AsyncMock()
+    monkeypatch.setattr(run_service.uploaded_file_service, "delete_files_attached_to_run", delete)
+    webhook = AsyncMock()
+    monkeypatch.setattr(run_service.app.WORKFLOW_SERVICE, "execute_workflow_webhook", webhook)
+
+    await run_service.cancel_workflow_run(workflow_run.workflow_run_id, organization_id="org_abc")
+
+    delete.assert_not_awaited()
+    terminal_effects.assert_awaited_once_with(canceled_run, decision, api_key=None)
+    webhook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_policy_run_retries_failed_terminal_release_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_run = _make_updated_row()
+    workflow_run.workflow_run_id = "wr_policy_cancel_effect_failed"
+    workflow_run.status = WorkflowRunStatus.running
+    canceled_run = _make_updated_row()
+    canceled_run.workflow_run_id = workflow_run.workflow_run_id
+    attempt = SimpleNamespace(
+        attempt_number=1,
+        retry_decision="final",
+        decision_reason="cancel",
+        side_effects_released_at=None,
+        webhook_sent_at=None,
+        interim_webhook_sent_at=None,
+    )
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(return_value=workflow_run),
+    )
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_runs,
+        "get_workflow_runs_by_parent_workflow_run_id",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_run_attempts,
+        "get_attempts",
+        AsyncMock(return_value=[attempt]),
+    )
+    svc = WorkflowService()
+    monkeypatch.setattr(svc, "mark_workflow_run_as_canceled", AsyncMock(return_value=canceled_run))
+    monkeypatch.setattr(run_service.app, "WORKFLOW_SERVICE", svc)
+    decision = run_service.RetryDecision(False, 1, 0, True, "cancel")
+    monkeypatch.setattr(run_service, "get_recorded_decision", AsyncMock(return_value=decision))
+
+    release_calls = 0
+
+    async def fail_release(*_args: object, **_kwargs: object) -> str:
+        nonlocal release_calls
+        release_calls += 1
+        return "effect_failed"
+
+    monkeypatch.setattr(svc, "run_terminal_side_effects", fail_release)
+    warning = MagicMock()
+    _patch_service_log(monkeypatch, warning=warning)
+
+    # The cancel operation itself succeeded; a failed best-effort release is retried and left
+    # for the durable recovery owner instead of being raised through the API path.
+    await run_service.cancel_workflow_run(workflow_run.workflow_run_id, organization_id="org_abc")
+
+    assert release_calls == TERMINAL_RELEASE_RETRY_MAX_ATTEMPTS
+    assert any(
+        call.args
+        and "exhausted" in str(call.args[0])
+        and call.kwargs.get("workflow_run_id") == workflow_run.workflow_run_id
+        and call.kwargs.get("attempt_number") == 1
+        and call.kwargs.get("outcome") == "effect_failed"
+        for call in warning.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_no_policy_run_deletes_attachments_before_webhook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow_run = _make_updated_row()
+    workflow_run.workflow_run_id = "wr_no_policy_cancel"
+    workflow_run.status = WorkflowRunStatus.queued
+    canceled_run = _make_updated_row()
+    canceled_run.workflow_run_id = workflow_run.workflow_run_id
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_runs,
+        "get_workflow_run",
+        AsyncMock(return_value=workflow_run),
+    )
+    monkeypatch.setattr(
+        run_service.app.DATABASE.workflow_runs,
+        "get_workflow_runs_by_parent_workflow_run_id",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(run_service.app.DATABASE.workflow_run_attempts, "get_attempts", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        run_service.app.WORKFLOW_SERVICE, "mark_workflow_run_as_canceled", AsyncMock(return_value=canceled_run)
+    )
+    order: list[str] = []
+    delete = AsyncMock(side_effect=lambda **_kwargs: order.append("delete"))
+    webhook = AsyncMock(side_effect=lambda *args, **kwargs: order.append("webhook"))
+    monkeypatch.setattr(run_service.uploaded_file_service, "delete_files_attached_to_run", delete)
+    monkeypatch.setattr(run_service.app.WORKFLOW_SERVICE, "execute_workflow_webhook", webhook)
+
+    await run_service.cancel_workflow_run(workflow_run.workflow_run_id, organization_id="org_abc")
+
+    assert order == ["delete", "webhook"]
+    delete.assert_awaited_once_with(run_id=workflow_run.workflow_run_id)
 
 
 @pytest.mark.asyncio
@@ -469,8 +609,6 @@ async def test_execute_workflow_webhook_tolerates_soft_deleted_workflow(
     """If the workflow row has been soft-deleted by the time cleanup runs,
     ``execute_workflow_webhook`` should log a warning and return — not raise.
     """
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     svc = WorkflowService()
 
     async def raise_not_found(*args: object, **kwargs: object) -> None:
@@ -491,8 +629,6 @@ async def test_build_status_response_uses_filter_deleted_false_when_allowed(
     """``allow_deleted=True`` goes through the run-joined repository lookup with
     ``filter_deleted=False`` so soft-deleted workflows still resolve.
     """
-    from skyvern.forge.sdk.workflow.service import WorkflowService
-
     svc = WorkflowService()
 
     by_run = AsyncMock(return_value=MagicMock())
@@ -605,13 +741,14 @@ async def test_shielded_finalize_skipped_when_pre_finally_status_unset() -> None
 
 
 def test_lease_failure_category_persists_only_typed_browser_loss() -> None:
-    from skyvern.exceptions import BrowserSessionClosed, BrowserSessionStartupTimeout
-    from skyvern.forge.sdk.workflow.service import _browser_lease_failure_category
-
-    closed = _browser_lease_failure_category(BrowserSessionClosed("pbs_x"))
-    timeout = _browser_lease_failure_category(BrowserSessionStartupTimeout("pbs_x"))
+    workflow_run = SimpleNamespace(created_at=datetime.now(UTC))
+    closed = _browser_lease_failure_category(BrowserSessionClosed("pbs_x"), workflow_run)
+    timeout = _browser_lease_failure_category(BrowserSessionStartupTimeout("pbs_x"), workflow_run)
 
     assert closed is not None and closed[0]["category"] == "BROWSER_ERROR"
     assert closed[0]["reason_code"] == "browser_session_closed"
     assert timeout is not None and timeout[0]["reason_code"] == "browser_session_startup_timeout"
-    assert _browser_lease_failure_category(RuntimeError("a required workflow parameter was not provided")) is None
+    assert (
+        _browser_lease_failure_category(RuntimeError("a required workflow parameter was not provided"), workflow_run)
+        is None
+    )

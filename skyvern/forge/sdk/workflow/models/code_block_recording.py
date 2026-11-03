@@ -11,6 +11,7 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.executor.run_liveness import run_lease_final_write_blocked, run_write_authority
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
@@ -22,8 +23,10 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.webeye.actions.actions import Action
+from skyvern.webeye.action_deadline import cancellation_pending
+from skyvern.webeye.actions.actions import Action, ActionStatus, ActionType
 from skyvern.webeye.browser_diagnostics import schedule_control_endpoint_diagnostics
+from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame, screenshot_failure_outcome
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
     from skyvern.forge.sdk.workflow.models.block import CodeBlock
+    from skyvern.webeye.browser_engine import BrowserEngineSelection
 
 LOG = structlog.get_logger()
 
@@ -48,6 +52,7 @@ _RECORDER_OWNED_ACTION_FIELDS = (
     "action_type",
     "status",
     "action_order",
+    "workflow_run_id",
     "screenshot_artifact_id",
     "started_at",
     "finished_at",
@@ -112,9 +117,11 @@ class CodeBlockActionRecording:
         credential_release_guard: CredentialReleaseGuard | None = None,
         strategy_aware_typing: bool = False,
         playwright_input_defaults: PlaywrightInputDefaults | None = None,
+        engine_selection: BrowserEngineSelection | None = None,
     ) -> None:
         self._code_block = code_block
         self._page = page
+        self._engine_selection = engine_selection
         self._workflow_run_id = workflow_run_id
         self._workflow_run_block_id = workflow_run_block_id
         self._organization_id = organization_id
@@ -242,7 +249,12 @@ class CodeBlockActionRecording:
         if not self._recording_enabled:
             return
         metadata = self._remember_action_metadata(action)
-        # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
+        if cancellation_pending():
+            # The shared capture refuses to start once the block is being cancelled, and the bare CancelledError
+            # it raises would replace the in-flight one that names the failing tab.
+            await self._persist_action(action, metadata)
+            return
+        # The capture shares the CDP channel with the user's page calls, so it must run synchronously
         # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
         # only the page-free S3 upload is deferred off the critical path.
         capture_started = False
@@ -253,12 +265,24 @@ class CodeBlockActionRecording:
                 )
             run_block = self._workflow_run_block
             capture_started = True
-            screenshot = await self._page.screenshot(timeout=settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS)
-        except Exception:
+            # animations="allow": disabling them fast-forwards finite transitions and fires their end events
+            # on the user's page between two of its statements.
+            screenshot = await SkyvernFrame.take_scrolling_screenshot(
+                page=self._page,
+                timeout=settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS,
+                mode=ScreenshotMode.LITE,
+                scrolling_number=0,
+                engine_selection=self._engine_selection,
+                animations="allow",
+                record_health=False,
+            )
+        except Exception as e:
+            # A fixed label, never the exception's class name: user code can raise a class named after a parameter.
             LOG.warning(
                 "Code block screenshot capture failed",
                 workflow_run_block_id=self._workflow_run_block_id,
                 page_closed=_page_closed(self._page),
+                outcome=screenshot_failure_outcome(e, self._engine_selection),
             )
             # Only a failed capture says anything about the browser; a database error above
             # would otherwise emit probe fields describing a browser that is perfectly fine.
@@ -302,6 +326,14 @@ class CodeBlockActionRecording:
             response = masked.get("response")
             if isinstance(response, str):
                 masked["response"] = response[:RECORDED_FAILURE_RESPONSE_MAX_CHARS]
+            if (
+                payload.get("action_type") == ActionType.SOLVE_CAPTCHA.value
+                and payload.get("status") == ActionStatus.completed.value
+                and payload.get("response") in ("true", "false")
+            ):
+                # The recorder writes the solver builtin's own boolean here, not user data, and a boolean
+                # parameter's "false" variant would otherwise redact the verdict the copilot reads.
+                masked["response"] = payload["response"]
             # IDs, timestamps, and implicit model defaults come from a snapshot taken before user
             # code can mutate the action. Explicit page/action fields remain masked.
             masked.update(metadata)
@@ -333,16 +365,20 @@ class CodeBlockActionRecording:
 
     async def finalize(self, success: bool) -> None:
         # Finalize both task and step on every exit path (incl. CancelledError via a finally); idempotent.
+        self.recording_page._detach_document_observers()
         if self._task is None or self._finalized:
             return
         self._finalized = True
         try:
-            await app.DATABASE.tasks.update_task(
+            status = TaskStatus.completed if success else TaskStatus.failed
+            final_write_blocked = await run_lease_final_write_blocked(self._workflow_run_id)
+            task = await app.DATABASE.tasks.update_task(
                 task_id=self._task.task_id,
                 organization_id=self._organization_id,
-                status=TaskStatus.completed if success else TaskStatus.failed,
+                status=status,
+                keep_final_status=final_write_blocked,
             )
-            if self._step is not None:
+            if self._step is not None and (not final_write_blocked or task.status == status):
                 await app.DATABASE.tasks.update_step(
                     task_id=self._task.task_id,
                     step_id=self._step.step_id,
@@ -350,6 +386,7 @@ class CodeBlockActionRecording:
                     output=AgentStepOutput(action_results=[]) if success else None,
                     is_last=True,
                     organization_id=self._organization_id,
+                    write_authority_for_run=run_write_authority,
                 )
         except Exception:
             LOG.warning(

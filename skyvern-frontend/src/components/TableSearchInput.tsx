@@ -7,6 +7,7 @@ type TableSearchInputProps = {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  title?: string;
   className?: string;
   inputClassName?: string;
   disabled?: boolean;
@@ -17,6 +18,7 @@ function TableSearchInput({
   value,
   onChange,
   placeholder = "Search…",
+  title,
   className,
   inputClassName,
   disabled,
@@ -35,6 +37,7 @@ function TableSearchInput({
         value={value}
         onChange={handleChange}
         placeholder={placeholder}
+        title={title}
         disabled={disabled}
         maxLength={maxLength}
         className={cn("pl-9", inputClassName)}

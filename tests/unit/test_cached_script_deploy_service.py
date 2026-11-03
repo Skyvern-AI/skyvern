@@ -799,6 +799,9 @@ async def run(parameters):
         ("subprocess", "import subprocess\nsubprocess.Popen(['true'])\n"),
         ("ctypes", "import ctypes\n"),
         ("socket", "import socket\n"),
+        ("types", "import types\nvalue = types.CodeType\n"),
+        ("types", "import types as runtime\nvalue = runtime.FunctionType\n"),
+        ("types", "from types import CodeType, FunctionType\n"),
         ("operator", "import operator\noperator.attrgetter('__class__')\n"),
         ("multiprocessing", "import multiprocessing\n"),
         ("importlib", "import importlib\n"),
@@ -828,6 +831,42 @@ def test_uploaded_python_rejects_module_execution_imports(module_name: str, sour
 
     assert exc.value.status_code == 400
     assert module_name in str(exc.value.detail)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import types\n"
+        "code = types.CodeType(0, 0, 0, 0, 0, 0, b'', (), (), (), '', '', '', 0, b'', b'', (), ())\n"
+        "types.FunctionType(code, {})()\n",
+        "from types import CodeType, FunctionType\nFunctionType(CodeType, {})()\n",
+        "import types as runtime\nrebuilt = runtime.FunctionType\n",
+        # Attribute access must be rejected independently of import checks.
+        "import asyncio\nrebuilt = asyncio.coroutines.types.FunctionType\n",
+        "import asyncio\ncode = asyncio.coroutines.types.CodeType\n",
+        "import asyncio\nrebuilt = asyncio.coroutines.types.LambdaType\n",
+    ],
+)
+def test_uploaded_python_rejects_bytecode_reconstruction(source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import sys\nsys.path.insert(0, '../old_revision')\nimport helper\n",
+        "import asyncio\nasyncio.sys.path.insert(0, '../old_revision')\nimport helper\n",
+    ],
+)
+def test_uploaded_python_rejects_sys_module_access(source: str) -> None:
+    with pytest.raises(HTTPException) as exc:
+        _validate_uploaded_source(source)
+
+    assert exc.value.status_code == 400
+    assert "sys" in str(exc.value.detail)
 
 
 @pytest.mark.parametrize("module_name", ["os", "shutil", "nt", "posix"])
@@ -917,7 +956,6 @@ def test_uploaded_python_rejects_locals_and_builtins_module_escapes(blocked_name
         "value = page.request\n",
         "from __future__ import annotations\n",
         "import os.path\n",
-        "import sys\n",
         "value = '{}-{}'.format(a, b)\n",
         "template = '{}/{}'\nvalue = template.format(a, b)\n",
         "class C:\n    def __init__(self):\n        self._value = 1\n\n    def get(self):\n        return self._value\n",

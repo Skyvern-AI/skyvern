@@ -12,11 +12,16 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import ParseResult, parse_qsl, urlencode, urlparse
 
+import structlog
+
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
+from skyvern.forge.sdk.services.request_principal import get_request_principal
+
+LOG = structlog.get_logger()
 
 CredentialUrlTier = Literal["url_exact", "url_path", "url_host"]
-CredentialResolutionTier = Literal["url_exact", "url_path", "url_host", "urlless_sole"]
+CredentialResolutionTier = Literal["url_exact", "url_path", "url_host", "urlless_sole", "vault_site"]
 CredentialResolutionVerdict = Literal["resolved", "ambiguous", "unresolved"]
 
 _URL_TIERS: tuple[CredentialResolutionTier, ...] = ("url_exact", "url_path", "url_host")
@@ -32,15 +37,54 @@ class CredentialResolution:
         return any(candidate.credential_id == credential_id for candidate in self.candidates)
 
 
-async def load_credentials(organization_id: str) -> list[Credential]:
+async def credential_folder_ids_for_current_request() -> set[str] | None:
+    principal = get_request_principal()
+    return await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) if principal is not None else None
+
+
+async def load_credentials(
+    organization_id: str,
+    *,
+    credential_ids: Sequence[str] | None = None,
+    page: int | None = None,
+    page_size: int = 50,
+    include_deleted: bool = False,
+) -> list[Credential]:
+    allowed_folder_ids = await credential_folder_ids_for_current_request()
+    if credential_ids is not None:
+        return await app.DATABASE.credentials.get_credentials_by_ids(
+            list(credential_ids),
+            organization_id=organization_id,
+            allowed_folder_ids=allowed_folder_ids,
+            include_deleted=include_deleted,
+        )
+    if page is not None:
+        return await app.DATABASE.credentials.get_credentials(
+            organization_id=organization_id,
+            page=page,
+            page_size=page_size,
+            allowed_folder_ids=allowed_folder_ids,
+        )
+
     page = 1
     credentials: list[Credential] = []
     while True:
-        items = await app.DATABASE.credentials.get_credentials(organization_id=organization_id, page=page, page_size=50)
+        items = await app.DATABASE.credentials.get_credentials(
+            organization_id=organization_id,
+            page=page,
+            page_size=50,
+            allowed_folder_ids=allowed_folder_ids,
+        )
         credentials.extend(items)
         if len(items) < 50:
             return sorted(credentials, key=lambda c: getattr(c, "created_at", None) or "", reverse=True)
         page += 1
+
+
+async def count_visible_credentials(organization_id: str) -> int:
+    return await app.DATABASE.credentials.count_credentials(
+        organization_id, allowed_folder_ids=await credential_folder_ids_for_current_request()
+    )
 
 
 def _parse_url(url: str) -> ParseResult | None:
@@ -71,6 +115,26 @@ def url_parts(url: str) -> tuple[str, str, str] | None:
     # actually matches; the host tier alone would let any page on the host claim the credential.
     without_query = f"{origin}{path}"
     return (f"{without_query}?{query}" if query else without_query), without_query, origin
+
+
+def safe_admitted_url(url: str) -> str:
+    """The part of an admitted login URL that the origin check reads, with nothing else.
+
+    A live sign-in URL carries `?state=`/`?code=`/reset tokens and can carry `user:pass@`. This value
+    is persisted into the chat context and enters the next model prompt, so it keeps only the scheme,
+    host, port and path the exact and path tiers match on.
+    """
+    parsed = _parse_url(url if "://" in url else f"https://{url}")
+    if parsed is None or not parsed.hostname:
+        return ""
+    try:
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        port = ""
+    # urlparse strips the brackets an IPv6 literal needs; without them the port reads as part of
+    # the address and the next turn's origin check cannot canonicalize it.
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme.lower()}://{host}{port}{parsed.path.rstrip('/')}"
 
 
 def loggable_origin(url: str) -> str:
@@ -166,13 +230,6 @@ def grounded_references(message: str, candidates: Iterable[str]) -> set[str]:
             for _other, other_start, other_end in occurrences
         )
     }
-
-
-def grounded_credential_references(message: str, credentials: list[Credential]) -> set[str]:
-    """Find complete saved names/IDs in a turn, preferring the longest overlap."""
-    return grounded_references(
-        message, (value for credential in credentials for value in (credential.name, credential.credential_id))
-    )
 
 
 def _match_by_url_tiered(

@@ -17,11 +17,11 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _MAX_MODAL_OVERLAYS,
     _MAX_NAVIGATION_TARGETS,
     _MAX_PAGE_OBSTRUCTIONS,
-    _MAX_RESULT_CONTAINERS,
     _MAX_RESULT_SAMPLE_ROWS,
     _MAX_REVEAL_KEY_VALUE_RELATIONS,
     _MAX_SELECT_OPTIONS,
     _MAX_SELECTOR_CHARS,
+    _MAX_SUBMIT_CONTROLS_PER_FORM,
     _MAX_TABLE_HEADERS,
     _MAX_VISIBLE_CONTROLS,
     _MAX_VISIBLE_TEXT_EXCERPT_CHARS,
@@ -31,17 +31,20 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     _RENDERED_STYLE_SNAPSHOT_ATTR,
     _RESULT_CONTAINER_HINTS,
     COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
+    MAX_RESULT_CONTAINERS,
     OBSERVED_CHECKED_FIELD_TYPES,
     OBSERVED_VALUE_FIELD_TYPES,
 )
+from skyvern.webeye.utils.page import OTP_INPUT_PRIVACY_JS
 
 # Keep stripped-body evaluate results under the shared MCP response cap while
 # preserving as much below-fold page structure as possible.
 COMPOSITION_STRIPPED_HTML_MAX_CHARS = 135000
 COMPOSITION_STRIPPED_HTML_EXPRESSION = (
-    "(() => {"
-    "  const b = document.body; if (!b) return '';"
-    "  const c = b.cloneNode(true);"
+    "(() => {" + OTP_INPUT_PRIVACY_JS + "  const b = document.body; if (!b) return '';"
+    "  const inert = document.implementation.createHTMLDocument('');"
+    "  const c = inert.importNode(b, true);"
+    "  const aligned = otpMaskHtmlCopy(b, c);"
     "  const sourceNodes = [b, ...b.querySelectorAll('*')];"
     "  const cloneNodes = [c, ...c.querySelectorAll('*')];"
     "  const cloneBySource = new Map(sourceNodes.map((source, index) => [source, cloneNodes[index]]));"
@@ -119,7 +122,7 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
     "    }"
     "  };"
     "  const computedVisibility = new Map();"
-    "  for (let i = 0; i < sourceNodes.length; i++) {"
+    "  for (let i = 0; aligned && i < sourceNodes.length; i++) {"
     "    const source = sourceNodes[i]; const clone = cloneNodes[i];"
     "    let style; try { style = window.getComputedStyle(source); } catch (e) { continue; }"
     "    const parentVisibility = computedVisibility.get(source.parentElement) || '';"
@@ -189,32 +192,66 @@ _JS_NAME_FROM_CONTENT_ROLES = (
     "]);"
 )
 
+# Matches Playwright only for the shapes the tap test pins: hidden descendants skipped, non-inline word breaks,
+# aria-label/aria-labelledby before content, hidden references read whole, and no element read twice per name.
+_JS_CONTENT_TEXT_HELPER = (
+    "const hiddenForName = (el, style = getComputedStyle(el)) => "
+    "  el.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility !== 'visible';"
+    "const contentText = (root, inRef, seen) => {"
+    "  const parts = [];"
+    "  const walk = (node) => {"
+    "    for (const child of node.childNodes) {"
+    "      if (child.nodeType === 3) { parts.push(child.nodeValue); continue; }"
+    "      if (child.nodeType !== 1 || seen.has(child)) continue;"
+    "      seen.add(child);"
+    "      const style = getComputedStyle(child);"
+    "      const boundary = child.tagName === 'BR' || style.display !== 'inline';"
+    "      if (boundary) parts.push(' ');"
+    "      if (!hiddenForName(child, style)) {"
+    "        const refs = inRef ? '' : refsText(child, seen);"
+    "        const label = refs || text(child.getAttribute('aria-label'));"
+    "        if (label) parts.push(label); else walk(child);"
+    "      }"
+    "      if (boundary) parts.push(' ');"
+    "    }"
+    "  };"
+    "  walk(root);"
+    "  return text(parts.join(''));"
+    "};"
+    "const refText = (el, seen) => {"
+    "  seen.add(el);"
+    "  const aria = text(el.getAttribute('aria-label'));"
+    "  if (aria) return aria;"
+    "  for (let n = el; n; n = n.parentElement) { if (hiddenForName(n)) return text(el.textContent); }"
+    "  return contentText(el, true, seen);"
+    "};"
+    "const refsText = (el, seen) => text((el.getAttribute('aria-labelledby') || '').split(/\\s+/).map((id) => {"
+    "  const ref = id && document.getElementById(id);"
+    "  return ref && !seen.has(ref) ? refText(ref, seen) : '';"
+    "}).filter(Boolean).join(' '));"
+)
+
 _JS_ACCESSIBLE_NAME_HELPER = (
-    "const accessibleName = (node, role) => {"
+    _JS_CONTENT_TEXT_HELPER + "const accessibleName = (node, role) => {"
     "  const aria = text(node.getAttribute('aria-label'));"
     "  if (aria) return aria;"
-    "  const labelledby = node.getAttribute('aria-labelledby');"
-    "  if (labelledby) {"
-    "    const parts = labelledby.split(/\\s+/).map((id) => {"
-    "      const ref = document.getElementById(id);"
-    "      return ref ? text(ref.textContent) : '';"
-    "    }).filter(Boolean);"
-    "    if (parts.length) return text(parts.join(' '));"
-    "  }"
+    "  const seen = new Set([node]);"
+    "  const labelled = refsText(node, seen);"
+    "  if (labelled) return labelled;"
     "  const id = node.getAttribute('id');"
     "  if (id) {"
     "    let lab = null;"
     "    try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
-    "    if (lab) { const t = text(lab.textContent); if (t) return t; }"
+    "    if (lab) { const t = refText(lab, seen); if (t) return t; }"
     "  }"
     "  const parentLabel = node.closest ? node.closest('label') : null;"
-    "  if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
+    "  if (parentLabel) { const t = refText(parentLabel, seen); if (t) return t; }"
     "  const title = text(node.getAttribute('title'));"
     "  if (title) return title;"
     "  const placeholder = text(node.getAttribute('placeholder'));"
     "  if (placeholder) return placeholder;"
     "  if (role && nameFromContentRoles.has(role) && !isEditable(node)) {"
-    "    const content = text(node.textContent);"
+    "    const content = contentText(node, false, seen);"
     "    if (content) return content;"
     "  }"
     "  return '';"
@@ -238,34 +275,6 @@ def scout_accessible_role_name_expression(css_selector: str) -> str:
         f"  {_JS_ACCESSIBLE_NAME_HELPER}"
         "  const role = text(el.getAttribute('role')) || implicitRole(el);"
         "  return { role: role, accessible_name: accessibleName(el, role) };"
-        "})()"
-    )
-
-
-# Count elements whose computed ARIA role and accessible name exactly match, so a scout-ambiguous
-# selector's get_by_role(role, name, exact=True) re-anchor is only trusted when it resolves uniquely.
-def role_name_match_count_expression(role: str, name: str) -> str:
-    target_role = json.dumps(role)
-    target_name = json.dumps(name)
-    return (
-        "(() => {"
-        "  try {"
-        f"    {_JS_TEXT_HELPER}"
-        f"    {_JS_IS_EDITABLE_HELPER}"
-        f"    {_JS_IMPLICIT_ROLE_HELPER}"
-        f"    {_JS_NAME_FROM_CONTENT_ROLES}"
-        f"    {_JS_ACCESSIBLE_NAME_HELPER}"
-        f"    const targetRole = {target_role};"
-        f"    const targetName = {target_name};"
-        "    let count = 0;"
-        "    const nodes = document.querySelectorAll('*');"
-        "    for (const el of nodes) {"
-        "      const role = text(el.getAttribute('role')) || implicitRole(el);"
-        "      if (role !== targetRole) continue;"
-        "      if (accessibleName(el, role) === targetName) count++;"
-        "    }"
-        "    return count;"
-        "  } catch (e) { return -1; }"
         "})()"
     )
 
@@ -300,6 +309,53 @@ _JS_SELECTOR_CANDIDATES_HELPER = (
     "  return candidates;"
     "};"
 )
+
+_JS_SCOUT_PRE_ACTION_PACKET = (
+    "function scoutPreActionPacket(el, requested, parsedRole, parsedName, maxScanElements) {"
+    "  let roleName = parsedRole || parsedName ? { role: parsedRole, accessible_name: parsedName } : null;"
+    "  if (!roleName && el) {"
+    "    try {"
+    "      const r = text(el.getAttribute('role')) || implicitRole(el);"
+    "      const n = accessibleName(el, r);"
+    "      if (r || n) roleName = { role: r, accessible_name: n };"
+    "    } catch (e) { roleName = null; }"
+    "  }"
+    "  const targetRole = roleName ? roleName.role : '';"
+    "  const targetName = roleName ? roleName.accessible_name : '';"
+    "  let roleNameMatchCount = -1;"
+    "  if (targetRole && targetName &&"
+    "      (maxScanElements == null || document.getElementsByTagName('*').length <= maxScanElements)) {"
+    "    try {"
+    "      let count = 0;"
+    "      for (const node of document.querySelectorAll('*')) {"
+    "        const r = text(node.getAttribute('role')) || implicitRole(node);"
+    "        if (r !== targetRole) continue;"
+    "        if (accessibleName(node, r) === targetName) count++;"
+    "      }"
+    "      roleNameMatchCount = count;"
+    "    } catch (e) { roleNameMatchCount = -1; }"
+    "  }"
+    "  let selectorMatchCount = -1;"
+    "  try { selectorMatchCount = document.querySelectorAll(requested).length; }"
+    "  catch (e) { selectorMatchCount = -1; }"
+    "  let candidates = [];"
+    "  try { candidates = el ? collectCandidates(el, requested) : []; } catch (e) { candidates = []; }"
+    "  return { role_name: roleName, role_name_match_count: roleNameMatchCount,"
+    "    selector_match_count: selectorMatchCount, selector_candidates: candidates };"
+    "}"
+)
+
+
+def scout_pre_action_packet_js() -> str:
+    return (
+        _JS_TEXT_HELPER
+        + _JS_IS_EDITABLE_HELPER
+        + _JS_IMPLICIT_ROLE_HELPER
+        + _JS_NAME_FROM_CONTENT_ROLES
+        + _JS_ACCESSIBLE_NAME_HELPER
+        + _JS_SELECTOR_CANDIDATES_HELPER
+        + _JS_SCOUT_PRE_ACTION_PACKET
+    )
 
 
 def selector_candidates_expression(css_selector: str) -> str:
@@ -340,50 +396,13 @@ def scout_pre_action_expression(css_selector: str, role: str | None = None, name
     parsed_name = json.dumps(name or "")
     return (
         "(() => {"
-        f"  {_JS_TEXT_HELPER}"
-        f"  {_JS_IS_EDITABLE_HELPER}"
-        f"  {_JS_IMPLICIT_ROLE_HELPER}"
-        f"  {_JS_NAME_FROM_CONTENT_ROLES}"
-        f"  {_JS_ACCESSIBLE_NAME_HELPER}"
-        f"  {_JS_SELECTOR_CANDIDATES_HELPER}"
+        f"  {scout_pre_action_packet_js()}"
         f"  const requested = {sel};"
         f"  const parsedRole = {parsed_role};"
         f"  const parsedName = {parsed_name};"
         "  let el = null;"
         "  try { el = document.querySelector(requested); } catch (e) { el = null; }"
-        "  let roleName = null;"
-        "  if (parsedRole || parsedName) roleName = { role: parsedRole, accessible_name: parsedName };"
-        "  else if (el) {"
-        "    try {"
-        "      const r = text(el.getAttribute('role')) || implicitRole(el);"
-        "      const n = accessibleName(el, r);"
-        "      if (r || n) roleName = { role: r, accessible_name: n };"
-        "    } catch (e) { roleName = null; }"
-        "  }"
-        "  const targetRole = roleName ? roleName.role : '';"
-        "  const targetName = roleName ? roleName.accessible_name : '';"
-        "  let roleNameMatchCount = -1;"
-        "  if (targetRole && targetName) {"
-        "    try {"
-        "      let count = 0;"
-        "      for (const node of document.querySelectorAll('*')) {"
-        "        const r = text(node.getAttribute('role')) || implicitRole(node);"
-        "        if (r !== targetRole) continue;"
-        "        if (accessibleName(node, r) === targetName) count++;"
-        "      }"
-        "      roleNameMatchCount = count;"
-        "    } catch (e) { roleNameMatchCount = -1; }"
-        "  }"
-        "  let selectorMatchCount = -1;"
-        "  try { selectorMatchCount = document.querySelectorAll(requested).length; } catch (e) { selectorMatchCount = -1; }"
-        "  let candidates = [];"
-        "  try { candidates = el ? collectCandidates(el, requested) : []; } catch (e) { candidates = []; }"
-        "  return {"
-        "    role_name: roleName,"
-        "    role_name_match_count: roleNameMatchCount,"
-        "    selector_match_count: selectorMatchCount,"
-        "    selector_candidates: candidates,"
-        "  };"
+        "  return scoutPreActionPacket(el, requested, parsedRole, parsedName);"
         "})()"
     )
 
@@ -499,8 +518,9 @@ _STRUCTURED_CONST_HEADER = (
     f"const OBSERVED_CHECKED_TYPES=new Set({json.dumps(sorted(OBSERVED_CHECKED_FIELD_TYPES))});"
     f"const MAX_FORMS={int(_MAX_FORMS)};"
     f"const MAX_FIELDS_PER_FORM={int(_MAX_FIELDS_PER_FORM)};"
+    f"const MAX_SUBMIT_CONTROLS_PER_FORM={int(_MAX_SUBMIT_CONTROLS_PER_FORM)};"
     f"const MAX_NAVIGATION_TARGETS={int(_MAX_NAVIGATION_TARGETS)};"
-    f"const MAX_RESULT_CONTAINERS={int(_MAX_RESULT_CONTAINERS)};"
+    f"const MAX_RESULT_CONTAINERS={int(MAX_RESULT_CONTAINERS)};"
     f"const MAX_KEY_VALUE_RELATIONS={int(_MAX_KEY_VALUE_RELATIONS)};"
     f"const MAX_SELECTOR_CHARS={int(_MAX_SELECTOR_CHARS)};"
     f"const MAX_REVEAL_KEY_VALUE_RELATIONS={int(_MAX_REVEAL_KEY_VALUE_RELATIONS)};"
@@ -526,7 +546,14 @@ const lower = (v) => String(v == null ? '' : v).toLowerCase();
 // Cap fields in-page so a giant element can't bloat the JSON past the size bound; Python re-bounds.
 const FIELD_CAP = 2048;
 const cap = (s) => (s.length > FIELD_CAP ? s.slice(0, FIELD_CAP) : s);
-const attr = (el, k) => { const v = el && el.getAttribute ? el.getAttribute(k) : null; return typeof v === 'string' ? cap(v.trim()) : ''; };
+const attr = (el, k) => {
+  const value = el && el.getAttribute ? el.getAttribute(k) : null;
+  if (typeof value !== 'string') return '';
+  const safe = (k === 'value' || k === 'placeholder') && isOtpInputValueSecret(el)
+    ? otpSafeInputAttribute(el, k, value)
+    : value;
+  return cap(safe.trim());
+};
 const nodeText = (el) => { if (!el) return ''; return cap(String(el.textContent || '').replace(/\s+/g, ' ').trim()); };
   const readsAsOneLeaf = (el) => {
     if (!el || !el.children || !el.children.length) return true;
@@ -552,6 +579,18 @@ const cssMatchesFor = (selector) => {
   try { matches = Array.from(document.querySelectorAll(selector)); } catch (e) { matches = null; }
   cssSelectorMatchCache.set(selector, matches);
   return matches;
+};
+// A selector's matches are counted once and each element's visibility is read once: a selector shared by N
+// controls would otherwise rescan its N matches for every one of them.
+const elementVisibilityCache = new WeakMap();
+const visibleMatchCountCache = new WeakMap();
+const matchVisible = (el) => {
+  if (!elementVisibilityCache.has(el)) elementVisibilityCache.set(el, controlVisible(el));
+  return elementVisibilityCache.get(el);
+};
+const visibleMatchCount = (matches) => {
+  if (!visibleMatchCountCache.has(matches)) visibleMatchCountCache.set(matches, matches.filter(matchVisible).length);
+  return visibleMatchCountCache.get(matches);
 };
 const resolvesUniquely = (sel, el) => {
   if (!sel) return false;
@@ -596,7 +635,12 @@ const renderedText = (el) => {
   const own = String(el.textContent || '');
   let scripts; try { scripts = Array.from(el.querySelectorAll('script,style')); } catch (e) { scripts = []; }
   let text = own;
-  for (const dead of scripts) text = text.split(String(dead.textContent || '')).join(' ');
+  // An empty separator splits per character, so join(' ') would double the text once per empty script or
+  // style until the renderer itself crashes, which no try/catch here can catch.
+  for (const dead of scripts) {
+    const deadText = String(dead.textContent || '');
+    if (deadText) text = text.split(deadText).join(' ');
+  }
   return (text + parts).split(/\s+/).join(' ').trim();
 };
 const untruncatedText = renderedText;
@@ -642,7 +686,7 @@ const textAnchorCandidateFor = (base, label, anchor, inner, el) => {
     let within; try { within = Array.from(anchor.querySelectorAll(inner)); } catch (e) { return null; }
     if (within.length !== 1 || within[0] !== el) return null;
   }
-  return { selector: selector, source: 'text_anchor', match_count: 1 };
+  return { selector: selector, source: 'text_anchor', match_count: 1, visible_match_count: visibleMatchCount([el]) };
 };
 const textAnchorCandidatesFor = (el) => {
   const out = [];
@@ -785,7 +829,12 @@ const selectorCandidatesFor = (
   const offer = (selector, source) => {
     if (!selector || selector.length > MAX_SELECTOR_CHARS) return;
     const matches = cssMatchesFor(selector);
-    candidates.push({ selector: selector, source: source, match_count: matches === null ? null : matches.length });
+    const candidate = { selector: selector, source: source, match_count: matches === null ? null : matches.length };
+    if (matches !== null) candidate.visible_match_count = visibleMatchCount(matches);
+    if (matches !== null && candidate.visible_match_count < matches.length) {
+      candidate.first_match_visible = matchVisible(matches[0]);
+    }
+    candidates.push(candidate);
   };
   const id = attr(el, 'id');
   if (id) offer(simpleIdent(id) ? '#' + id : tag + '[id="' + cssAttr(id) + '"]', 'id');
@@ -824,13 +873,68 @@ const selectorCandidatesFor = (
   cachedByOptions.set(cacheKey, offered);
   return offered;
 };
+// Playwright's :text-is() compares each run of an element's own text nodes, whitespace-normalized and
+// case-sensitive, so CSS text-transform and descendant text never make a competitor match.
+const ownTextRuns = (el) => {
+  const runs = [];
+  let run = '';
+  for (let child = el.firstChild; child; child = child.nextSibling) {
+    if (child.nodeType === 3) { run += child.nodeValue || ''; continue; }
+    if (run) runs.push(run);
+    run = '';
+  }
+  if (run) runs.push(run);
+  return runs.map((text) => text.split('​').join('').trim().split(/\s+/).join(' '));
+};
+const composedParent = (node) => node.parentElement || (node.parentNode && node.parentNode.host) || null;
+// When the label's text also appears in a same-shape sibling (a table header repeating a card's label),
+// the anchor names the label element itself, at the nearest ancestor holding both label and carrier.
+const labelAnchorCandidateFor = (carrier, labelEl, label) => {
+  if (!labelEl || labelEl === carrier || valueLike(label) || !ownTextRuns(labelEl).includes(label)) return null;
+  let anchor = carrier;
+  for (let hops = 0; !anchor.contains(labelEl); hops++) {
+    if (hops >= TEXT_ANCHOR_MAX_HOPS || !anchor.parentElement || anchor.parentElement.tagName === 'BODY') return null;
+    anchor = anchor.parentElement;
+  }
+  const base = shapeSelector(anchor);
+  const inner = anchor === carrier ? '' : shapeSelector(carrier);
+  // A label's classes are styling that can differ between the scouted frame and a run, so they are named only
+  // where the bare tag would not leave this carrier as the single match.
+  for (const labelShape of new Set([(labelEl.tagName || '*').toLowerCase(), shapeSelector(labelEl)])) {
+    const selector = base + ':has(' + labelShape + ':text-is("' + cssAttr(label) + '"))' + (inner ? ' ' + inner : '');
+    if (selector.length > MAX_SELECTOR_CHARS) continue;
+    const anchors = new Set();
+    for (const root of openRoots()) {
+      let nodes; try { nodes = Array.from(root.querySelectorAll(labelShape)); } catch (e) { return null; }
+      for (const node of nodes) {
+        if (!ownTextRuns(node).includes(label)) continue;
+        for (let up = composedParent(node); up; up = composedParent(up)) if (up.matches && up.matches(base)) anchors.add(up);
+      }
+    }
+    let matched = Array.from(anchors);
+    if (inner) {
+      matched = [];
+      for (const root of openRoots()) {
+        let nodes; try { nodes = Array.from(root.querySelectorAll(inner)); } catch (e) { return null; }
+        for (const node of nodes) {
+          for (let up = composedParent(node); up; up = composedParent(up)) if (anchors.has(up)) { matched.push(node); break; }
+        }
+      }
+    }
+    if (matched.length === 1 && matched[0] === carrier) {
+      return { selector: selector, source: 'text_anchor', match_count: 1, visible_match_count: visibleMatchCount([carrier]) };
+    }
+  }
+  return null;
+};
 // A relation's key can provide one additional factual representation. It is appended after the
 // generic capture so its presence does not reorder or privilege another source.
-const relationCandidatesFor = (carrier, keyText) => {
+const relationCandidatesFor = (carrier, keyText, labelEl) => {
   const label = String(keyText || '').trim();
   const base = shapeSelector(carrier);
-  const keyed = label && labelLike(label) && label.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && base
-    ? textAnchorCandidateFor(base, label, carrier, '', carrier)
+  const eligible = label && labelLike(label) && label.length <= TEXT_ANCHOR_MAX_LABEL_CHARS && base;
+  const keyed = eligible
+    ? textAnchorCandidateFor(base, label, carrier, '', carrier) || labelAnchorCandidateFor(carrier, labelEl, label)
     : null;
   const captured = selectorCandidatesFor(carrier);
   return keyed && !captured.some((candidate) => candidate.selector === keyed.selector)
@@ -876,7 +980,9 @@ const isFilled = (el) => {
 // Live DOM property state, which diverges from the markup attribute once the agent interacts.
 const observedValue = (el) => {
   try {
-    return typeof el.value === 'string' ? cap(el.value.trim()) : '';
+    if (typeof el.value !== 'string') return '';
+    const value = isOtpInputValueSecret(el) ? otpSafeInputAttribute(el, 'value', el.value) : el.value;
+    return cap(value.trim());
   } catch (e) {
     return '';
   }
@@ -979,6 +1085,39 @@ const controlVisible = (node) => {
   const rect = node.getBoundingClientRect();
   // Match Playwright for form-control readiness: opacity alone does not make a control hidden.
   return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+};
+// What a pointer aimed at the control's centre lands on, read without scrolling. A centre that is
+// outside the viewport or clipped by an ancestor cannot be hit-tested, so it reports not_measured.
+const pointerAtCenterFacts = (node) => {
+  const rect = node.getBoundingClientRect();
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  if (x < 0 || y < 0 || x >= viewportWidth || y >= viewportHeight) return { pointer_at_center: 'not_measured' };
+  let stack; try { stack = document.elementsFromPoint(x, y); } catch (e) { return { pointer_at_center: 'not_measured' }; }
+  if (!stack.length) return { pointer_at_center: 'not_measured' };
+  if (stack[0] === node || node.contains(stack[0])) return { pointer_at_center: 'reaches_control' };
+  // Cut to the parser's bound here, so a long label on a layer over many controls cannot fill the capture.
+  const elementAtCenter = identityFor(stack[0]);
+  elementAtCenter.label_context = elementAtCenter.label_context.slice(0, 120);
+  const reachesOtherElement = { pointer_at_center: 'reaches_other_element', element_at_center: elementAtCenter };
+  if (stack.includes(node)) return reachesOtherElement;
+  // A control that ignores pointer events is never in the stack: the pointer lands on whatever is under it.
+  let pointerEvents = ''; try { pointerEvents = window.getComputedStyle(node).pointerEvents; } catch (e) { pointerEvents = ''; }
+  if (pointerEvents === 'none') return reachesOtherElement;
+  // So does one hit-testing skips (a 1px control under `clip`, an inert subtree), unless an ancestor clips it at its
+  // padding box. The walk follows the flat tree into shadow trees and stops below body, whose clip is the viewport.
+  const flatParent = (el) => el.assignedSlot || el.parentElement || (el.parentNode && el.parentNode.host) || null;
+  for (let cur = flatParent(node); cur && cur !== document.body && cur !== document.documentElement; cur = flatParent(cur)) {
+    let style; try { style = window.getComputedStyle(cur); } catch (e) { return { pointer_at_center: 'not_measured' }; }
+    if (style.overflowX === 'visible' && style.overflowY === 'visible') continue;
+    const box = cur.getBoundingClientRect();
+    const left = box.left + cur.clientLeft;
+    const top = box.top + cur.clientTop;
+    if (x < left || x >= left + cur.clientWidth || y < top || y >= top + cur.clientHeight) return { pointer_at_center: 'not_measured' };
+  }
+  return reachesOtherElement;
 };
 const layerControlActionable = (control) => {
   const tag = (control.tagName || '').toLowerCase();
@@ -1101,17 +1240,19 @@ for (const form of document.querySelectorAll('form')) {
       : (declaredType || tag || 'text');
     if (tag === 'input' && (fieldType === 'hidden' || fieldType === 'reset')) continue;
     if (tag === 'button' || fieldType === 'submit' || fieldType === 'button') {
-      submitControls.push(Object.assign({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) }, disclosureFacts(node)));
+      // The parser keeps only a form's first MAX_SUBMIT_CONTROLS_PER_FORM submit controls, so later ones are not hit-tested.
+      submitControls.push(Object.assign({ text: controlLabel(node), name: attr(node, 'name'), id: attr(node, 'id'), value: attr(node, 'value'), class: classesFor(node), type: fieldType, disabled: controlDisabled(node), visible: controlVisible(node), selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) }, disclosureFacts(node), submitControls.length < MAX_SUBMIT_CONTROLS_PER_FORM ? pointerAtCenterFacts(node) : {}));
       continue;
     }
     if (fields.length >= MAX_FIELDS_PER_FORM) continue;
     const options = tag === 'select' ? selectOptions(node) : [];
     const field = { name: attr(node, 'name'), id: attr(node, 'id'), label: fieldLabel(node), type: fieldType, value: attr(node, 'value'), filled: isFilled(node), class: classesFor(node), placeholder: attr(node, 'placeholder'), required: !!(node.hasAttribute('required') || lower(attr(node, 'aria-required')) === 'true'), disabled: controlDisabled(node), readonly: controlReadonly(node), visible: controlVisible(node), checked: node.hasAttribute('checked'), options: options, selector: selectorFor(node), selector_candidates: selectorCandidatesFor(node), identity: identityFor(node) };
-    // Observed state needs both a real <input> tag here and the reported attribute type at the
+    Object.assign(field, pointerAtCenterFacts(node));
+    // Unmasked observed state needs both a real <input> tag here and the reported attribute type at the
     // Python and replay re-gates; the pair is deliberately an AND so a page that declares
     // type="date" on a textarea mirroring a password acquires no observed value.
     const observedType = tag === 'input' ? lower(node.type) : '';
-    if (OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
+    if (isOtpInputValueSecret(node) || OBSERVED_VALUE_TYPES.has(observedType)) field.observed_value = observedValue(node);
     if (OBSERVED_CHECKED_TYPES.has(observedType)) field.observed_checked = observedChecked(node);
     if (tag === 'select') {
       field.option_count = node.querySelectorAll('option').length;
@@ -1198,12 +1339,12 @@ for (const f of forms) for (const sc of (f.submit_controls || [])) if (sc.select
 for (const n of navTargets) if (n.selector) usedClickableSelectors.add(n.selector);
 const clickableControls = [];
 const seenClickableText = new Set();
-for (const el of document.querySelectorAll('button,[role="button" i],[data-action]')) {
-  if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
+const seenTextlessSelectors = new Set();
+const collectClickable = (el) => {
   const tag = (el.tagName || '').toLowerCase();
-  if (SKIP_TAGS.has(tag)) continue;
-  if (!elementVisible(el)) continue;
-  if (el.closest && el.closest('form')) continue;
+  if (SKIP_TAGS.has(tag)) return;
+  if (!elementVisible(el)) return;
+  if (el.closest && el.closest('form')) return;
   const text = clickableText(el);
   const selector = clickableSelector(el);
   let unique = false;
@@ -1212,13 +1353,30 @@ for (const el of document.querySelectorAll('button,[role="button" i],[data-actio
     clickableControls.push(Object.assign({ text: text, selector: selector, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), tag: tag, disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
     usedClickableSelectors.add(selector);
     if (text) seenClickableText.add(text);
-    continue;
+    return;
   }
-  if (!text || seenClickableText.has(text)) continue;
+  if (!text) {
+    // Copies of a repeated textless control share one selector, so it is listed once and addressed by its candidates.
+    if (!selector || seenTextlessSelectors.has(selector)) return;
+    clickableControls.push(Object.assign({ text: '', tag: tag, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
+    seenTextlessSelectors.add(selector);
+    return;
+  }
+  if (seenClickableText.has(text)) return;
   // No CSS selector singles this control out, which is the case the text rung exists for: reporting
   // the control with its text alone leaves the model nothing to address it by.
   clickableControls.push(Object.assign({ text: text, tag: tag, selector_candidates: selectorCandidatesFor(el), identity: identityFor(el), disabled: controlDisabled(el), visible: true }, disclosureFacts(el)));
   seenClickableText.add(text);
+};
+const CLICKABLE_ROLE_QUERY = 'button,[role="button" i],[data-action]';
+for (const el of document.querySelectorAll(CLICKABLE_ROLE_QUERY)) {
+  if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
+  collectClickable(el);
+}
+for (const el of document.querySelectorAll('[tabindex]:not([tabindex^="-"])')) {
+  if (clickableControls.length >= MAX_CLICKABLE_CONTROLS) break;
+  if (el.matches(CLICKABLE_ROLE_QUERY) || clickableText(el)) continue;
+  collectClickable(el);
 }
 
 const resultContainers = [];
@@ -1323,7 +1481,7 @@ const valueBesideLabel = (labelEl) => {
       let pos = -1;
       try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
       if (pos < 0) return null;
-      return { owner: ancestor, relation: { key_text: labelText, selector_candidates: relationCandidatesFor(carrier, labelText), identity: identityFor(carrier), label_selector: labelSelector, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+      return { owner: ancestor, relation: { key_text: labelText, selector_candidates: relationCandidatesFor(carrier, labelText, labelEl), identity: identityFor(carrier), label_selector: labelSelector, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
     }
     branch = ancestor;
     ancestor = ancestor.parentElement;
@@ -1349,19 +1507,19 @@ for (const target of REQUESTED_TARGETS) {
 // across hidden siblings, while exactly one visible leaf carries that magnitude.
 const witnessedLabelNear = (valueLeaf) => {
   const wanted = new Set(REQUESTED_TARGETS.map((t) => String(t || '').trim().toLowerCase()).filter(Boolean));
-  if (!wanted.size) return { text: '', owner: null };
+  if (!wanted.size) return { text: '', owner: null, el: null };
   let branch = valueLeaf;
   let ancestor = valueLeaf.parentElement;
   while (ancestor && ancestor.tagName !== 'BODY' && ancestor.tagName !== 'HTML') {
     for (const leaf of Array.from(ancestor.querySelectorAll('*'))) {
       if (!isLeafEl(leaf) || withinEl(leaf, branch) || !elementVisible(leaf) || insidePageChrome(leaf)) continue;
       const text = nodeText(leaf);
-      if (wanted.has(text.trim().toLowerCase())) return { text: text, owner: ancestor };
+      if (wanted.has(text.trim().toLowerCase())) return { text: text, owner: ancestor, el: leaf };
     }
     branch = ancestor;
     ancestor = ancestor.parentElement;
   }
-  return { text: '', owner: null };
+  return { text: '', owner: null, el: null };
 };
 const witnessedValueRelation = (valueLeaf) => {
   const carrier = valueLeaf.parentElement;
@@ -1377,7 +1535,7 @@ const witnessedValueRelation = (valueLeaf) => {
   try { pos = Array.from(document.querySelectorAll(sel)).indexOf(carrier); } catch (e) { pos = -1; }
   if (pos < 0) return null;
   const near = witnessedLabelNear(valueLeaf);
-  return { owner: carrier, relation: { key_text: near.text, selector_candidates: relationCandidatesFor(carrier, near.text), identity: identityFor(carrier), label_selector: '', label_child_index: -1, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
+  return { owner: carrier, relation: { key_text: near.text, selector_candidates: relationCandidatesFor(carrier, near.text, near.el), identity: identityFor(carrier), label_selector: '', label_child_index: -1, value_text: nodeText(valueLeaf), container_selector: sel, container_match_count: matches, container_position: pos, value_child_index: childIndex, direct_child_count: kids.length, visible: true, value_visible: true } };
 };
 const witnessedWanted = new Set(WITNESSED_VALUES);
 if (witnessedWanted.size) {
@@ -1414,9 +1572,9 @@ for (const node of all) {
   for (let index = 0; index < children.length; index++) {
     const child = children[index];
     const grand = Array.from(child.children || []);
-    if (!grand.length) { const text = nodeText(child); if (text) leaves.push({ index: index, text: text, carrier: null, carrierIndex: 0, carrierCount: 0 }); continue; }
+    if (!grand.length) { const text = nodeText(child); if (text) leaves.push({ index: index, text: text, el: child, carrier: null, carrierIndex: 0, carrierCount: 0 }); continue; }
     if (grand.some((g) => !readsAsOneLeaf(g))) { nestedOk = false; break; }
-    for (let gi = 0; gi < grand.length; gi++) { const text = nodeText(grand[gi]); if (text) leaves.push({ index: index, text: text, carrier: child, carrierIndex: gi, carrierCount: grand.length }); }
+    for (let gi = 0; gi < grand.length; gi++) { const text = nodeText(grand[gi]); if (text) leaves.push({ index: index, text: text, el: grand[gi], carrier: child, carrierIndex: gi, carrierCount: grand.length }); }
   }
   if (!nestedOk || !leaves.length || leaves.length > 8) continue;
   const magnitudeLeaves2 = leaves.filter((leaf) => bareMagnitude.test(leaf.text));
@@ -1448,7 +1606,7 @@ for (const node of all) {
   countFoldedKey(headingLeaves[0].text);
   countWalkedValue(cardValueText);
   if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS) { keyValueRelationsTruncated = true; continue; }
-  keyValueRelations.push({ key_text: headingLeaves[0].text, selector_candidates: relationCandidatesFor(cardCarrier, headingLeaves[0].text), identity: identityFor(cardCarrier), value_text: cardValueText, container_selector: cardSelector, container_match_count: cardMatches, container_position: cardPosition, value_child_index: cardChildIndex, label_child_index: (cardCarrier === node ? headingChildIndex : -1), direct_child_count: cardChildCount, visible: true, value_visible: true });
+  keyValueRelations.push({ key_text: headingLeaves[0].text, selector_candidates: relationCandidatesFor(cardCarrier, headingLeaves[0].text, headingLeaves[0].el), identity: identityFor(cardCarrier), value_text: cardValueText, container_selector: cardSelector, container_match_count: cardMatches, container_position: cardPosition, value_child_index: cardChildIndex, label_child_index: (cardCarrier === node ? headingChildIndex : -1), direct_child_count: cardChildCount, visible: true, value_visible: true });
   metricCardNodes.add(node);
 }
 for (const node of all) {
@@ -1470,7 +1628,7 @@ for (const node of all) {
   let position = -1;
   try { position = Array.from(document.querySelectorAll(selector)).indexOf(node); } catch (e) { position = -1; }
   if (position < 0) continue;
-  keyValueRelations.push({ key_text: keyText, selector_candidates: relationCandidatesFor(node, keyText), identity: identityFor(node), value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
+  keyValueRelations.push({ key_text: keyText, selector_candidates: relationCandidatesFor(node, keyText, children[0]), identity: identityFor(node), value_text: valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: 1, direct_child_count: children.length, visible: true, value_visible: elementVisible(children[1]) });
 }
 
 const revealHintTokens = (node) => (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -1510,7 +1668,7 @@ for (const node of all) {
   // relation does not itself claim reads as though it identified this leaf's value.
   for (const leaf of valueLeaves) {
     if (keyValueRelations.length >= MAX_KEY_VALUE_RELATIONS || revealRelationCount >= MAX_REVEAL_KEY_VALUE_RELATIONS) { revealRelationsTruncated = true; capped = true; break; }
-    keyValueRelations.push({ key_text: leaf.index === designatedIndex ? keyText : '', selector_candidates: relationCandidatesFor(node, leaf.index === designatedIndex ? keyText : ''), identity: identityFor(node), value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
+    keyValueRelations.push({ key_text: leaf.index === designatedIndex ? keyText : '', selector_candidates: relationCandidatesFor(node, leaf.index === designatedIndex ? keyText : '', heading), identity: identityFor(node), value_text: leaf.valueText, container_selector: selector, container_match_count: matches, container_position: position, value_child_index: leaf.index, direct_child_count: children.length, visible: true, value_visible: true });
     revealRelationCount++;
   }
   if (capped) break;
@@ -1636,6 +1794,20 @@ const boundedStructuredEvidence = (payload) => {
   let serialized = JSON.stringify(payload);
   let serializedCharCount = pythonCharCount(serialized);
   if (serializedCharCount <= STRUCTURED_EVIDENCE_MAX_CHARS) return serialized;
+  // Over the bound, pointer facts and visible counts all go first and uncounted, so what follows sees the packet
+  // as it would be without them.
+  const dropAuthoringFacts = (value) => {
+    if (!value || typeof value !== 'object') return;
+    delete value.pointer_at_center;
+    delete value.element_at_center;
+    delete value.visible_match_count;
+    delete value.first_match_visible;
+    Object.values(value).forEach(dropAuthoringFacts);
+  };
+  dropAuthoringFacts(payload);
+  serialized = JSON.stringify(payload);
+  serializedCharCount = pythonCharCount(serialized);
+  if (serializedCharCount <= STRUCTURED_EVIDENCE_MAX_CHARS) return serialized;
 
   const originalCharCount = serializedCharCount;
   const omissions = [];
@@ -1749,7 +1921,7 @@ def composition_structured_evidence_expression(
         f"const REQUESTED_TARGETS={json.dumps(targets[:_MAX_KEY_VALUE_RELATIONS])};"
         f"const WITNESSED_VALUES={json.dumps(values[:_MAX_KEY_VALUE_RELATIONS])};"
     )
-    return "(() => {" + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
+    return "(() => {" + OTP_INPUT_PRIVACY_JS + header + _STRUCTURED_CONST_HEADER + _STRUCTURED_EVIDENCE_BODY + "})()"
 
 
 COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION = composition_structured_evidence_expression()
@@ -1773,3 +1945,21 @@ def value_witness_read_expression(container_selector: str, match_count: int, pos
         + "]; if (!leaf) return null; "
         + "return String(leaf.textContent || '').replace(/\\s+/g, ' ').trim(); })()"
     )
+
+
+DECLARED_IFRAME_SRC_EXPRESSION = (
+    "(() => {"
+    "  try {"
+    "    return Array.from(document.querySelectorAll('iframe'))"
+    "      .map((el) => {"
+    "        const src = el.getAttribute('src') || '';"
+    "        if (!src) return '';"
+    "        try { return new URL(src, document.baseURI).href; } catch (e) { return ''; }"
+    "      })"
+    "      .filter(Boolean);"
+    "  } catch (e) { return []; }"
+    "})()"
+)
+"""Every ``iframe@src`` the document declares, resolved against the page's own base URL, because a
+challenge frame whose request never committed reports an empty ``frame.url`` while its element still
+names the vendor."""

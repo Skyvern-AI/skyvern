@@ -6,14 +6,18 @@ from fastapi import Depends, HTTPException, status
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     MissingBrowserStatePage,
+    MissingElement,
     ScrapingFailed,
+    ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
     SkyvernActionFailed,
     SkyvernHTTPException,
+    TaskTerminationError,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import validate_download_url
+from skyvern.forge.sdk.api.files import uploaded_file_id_for_local_uri, validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType, WorkflowRunTriggerType
@@ -36,6 +40,14 @@ LOG = structlog.get_logger()
 # never removed, leaving a permanent liveness ghost that would veto a real run's terminal browser
 # close. No await separates an inc from its matching dec, so a plain dict is race-free.
 _sdk_action_context_refcounts: dict[str, int] = {}
+
+
+async def _resolve_sdk_action_attempt_number(workflow_run_id: str) -> int:
+    """A run live in this process knows its attempt; one owned elsewhere needs the durable rows."""
+    if app.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context(workflow_run_id):
+        return app.WORKFLOW_CONTEXT_MANAGER.get_attempt_number(workflow_run_id)
+    attempts = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
+    return max((row.attempt_number for row in attempts), default=1)
 
 
 def _acquire_sdk_action_context(workflow_run_id: str) -> None:
@@ -67,17 +79,24 @@ def _release_sdk_action_context(workflow_run_id: str) -> bool:
 async def run_sdk_action(
     action_request: RunSdkActionRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> RunSdkActionResponse:
     """Execute a single SDK action with the specified parameters."""
     # The whole action runs on this process's event loop, so the cap is taken before any database
     # write or page work: an organization over its cap costs a rejected request, not a started one.
     async with app.RATE_LIMITER.limit_sdk_action_concurrency(organization.organization_id):
-        return await _run_sdk_action(action_request, organization)
+        # Not the API permission checker: on older billing plans it demands a whole run's worth of credits.
+        try:
+            await app.AGENT_FUNCTION.validate_task_execution(organization_id=organization.organization_id)
+        except TaskTerminationError:
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Not enough credit balance.")
+        return await _run_sdk_action(action_request, organization, created_by=user_id)
 
 
 async def _run_sdk_action(
     action_request: RunSdkActionRequest,
     organization: Organization,
+    created_by: str | None = None,
 ) -> RunSdkActionResponse:
     LOG.info(
         "Running SDK action",
@@ -89,6 +108,14 @@ async def _run_sdk_action(
     browser_session_id = action_request.browser_session_id
     browser_address = action_request.browser_address
     action = action_request.action
+
+    # The touch is intentionally unscoped, so validate this client-supplied id before any task is
+    # persisted; a failed lookup cannot leave a non-terminal task behind.
+    renewable_session_id = browser_session_id
+    if renewable_session_id and not await app.DATABASE.browser_sessions.get_persistent_browser_session(
+        renewable_session_id, organization_id
+    ):
+        renewable_session_id = None
 
     # Use existing workflow_run_id if provided, otherwise create a new one
     created_workflow_run = not action_request.workflow_run_id
@@ -128,9 +155,11 @@ async def _run_sdk_action(
             organization=organization,
             version=None,
             trigger_type=WorkflowRunTriggerType.api,
+            created_by=created_by,
         )
         task_type = TaskType.synthetic_sdk_action
 
+    attempt_number = await _resolve_sdk_action_attempt_number(workflow_run.workflow_run_id)
     task = await app.DATABASE.tasks.create_task(
         organization_id=organization_id,
         url=action_request.url,
@@ -142,6 +171,7 @@ async def _run_sdk_action(
         browser_session_id=browser_session_id,
         browser_address=browser_address,
         task_type=task_type,
+        attempt_number=attempt_number,
     )
 
     if created_workflow_run:
@@ -161,6 +191,7 @@ async def _run_sdk_action(
         organization_id=organization_id,
         block_type=BlockType.ACTION,
         task_id=task.task_id,
+        attempt_number=attempt_number,
     )
 
     _acquire_sdk_action_context(workflow_run.workflow_run_id)
@@ -170,6 +201,20 @@ async def _run_sdk_action(
     # refcount and leave a permanent liveness ghost that vetoes a real run's terminal browser
     # close.
     try:
+        if renewable_session_id is not None:
+            try:
+                # The synthetic run owns no session lease. Await its first stamp before context setup or
+                # browser work; the initial write is also part of the task's handled failure span.
+                await app.BROWSER_MANAGER.begin_session_activity_renewal(renewable_session_id)
+            except Exception as e:
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.failed,
+                    failure_reason=str(e),
+                )
+                raise
+
         await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
             organization,
             workflow_run.workflow_run_id,
@@ -183,6 +228,7 @@ async def _run_sdk_action(
             None,
             workflow,
             mask_secrets=getattr(workflow, "mask_secrets", False),
+            attempt_number=attempt_number,
         )
 
         context = skyvern_context.ensure_context()
@@ -190,6 +236,9 @@ async def _run_sdk_action(
             SkyvernContext(
                 request_id=context.request_id,
                 organization_id=task.organization_id,
+                org_age=context.org_age
+                if context.org_age is not None
+                else skyvern_context.compute_org_age(organization.created_at),
                 task_id=task.task_id,
                 step_id=step.step_id,
                 browser_session_id=browser_session_id,
@@ -232,7 +281,12 @@ async def _run_sdk_action(
                     timeout=action.timeout,
                 )
             elif action.type == "ai_upload_file":
-                if action.file_url and not validate_download_url(action.file_url, organization_id=organization_id):
+                # The id only clears this gate; the original URI travels on because the upload handler
+                # matches it against the task payload, and download_file maps it to the id again.
+                gate_url = action.file_url
+                if gate_url:
+                    gate_url = await uploaded_file_id_for_local_uri(gate_url, organization_id) or gate_url
+                if gate_url and not validate_download_url(gate_url, organization_id=organization_id):
                     raise HTTPException(status_code=400, detail="Unsupported file url")
                 result = await page_ai.ai_upload_file(
                     selector=action.selector,
@@ -321,6 +375,25 @@ async def _run_sdk_action(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="The browser page, context or browser was closed before the action could complete.",
             )
+        # Deliberately narrower than FailedToTakeScreenshot, which also wraps renderer crashes and
+        # protocol errors — those are ours to fix, so they keep reaching the catch-all as 5xx.
+        except ScreenshotPageHasNoDrawnArea as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the page had no drawn area to capture",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The page had no drawn area to capture for the action. Its viewport may have collapsed to zero.",
+            )
         except MissingBrowserStatePage as e:
             await app.DATABASE.tasks.update_task(
                 task_id=task.task_id,
@@ -337,6 +410,40 @@ async def _run_sdk_action(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="The browser had no page left to act on before the action could complete.",
+            )
+        except MissingElement as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the target element was not on the page",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The element the action targeted was not found on the page. An earlier action may have removed it.",
+            )
+        except ActionDeadlineExceeded as e:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(e),
+            )
+            LOG.warning(
+                "SDK action failed because the browser did not answer before its deadline",
+                action_type=action.type,
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The browser did not answer before the action's deadline.",
             )
         except SkyvernHTTPException as e:
             await app.DATABASE.tasks.update_task(
@@ -382,6 +489,8 @@ async def _run_sdk_action(
             result=result,
         )
     finally:
+        if renewable_session_id is not None:
+            app.BROWSER_MANAGER.end_session_activity_renewal(renewable_session_id)
         # Remove the run-context only once the last concurrent run_action for this run finishes.
         # A client-provided workflow_run_id is shared across sibling calls, so an unconditional
         # removal would yank the context out from under an in-flight sibling; never removing it

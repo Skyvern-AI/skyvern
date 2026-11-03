@@ -10,7 +10,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
-from skyvern.forge.sdk.workflow.loop_download_filter import filter_downloaded_files_for_current_iteration
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import TaskV2Block
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
@@ -30,51 +29,6 @@ def _output_parameter(key: str) -> OutputParameter:
         created_at=now,
         modified_at=now,
     )
-
-
-def test_taskv2_context_loop_state_available_after_nested_task_execution() -> None:
-    """Verify loop_internal_state survives nested task execution and remains available for filtering."""
-    loop_state = {
-        "downloaded_file_signatures_before_iteration": [
-            ["a.pdf", "abc", "https://files/a.pdf"],
-        ],
-    }
-
-    parent_context = SkyvernContext(
-        organization_id="org_1",
-        workflow_run_id="wr_1",
-        run_id="wr_1",
-        loop_internal_state=loop_state,
-    )
-    skyvern_context.set(parent_context)
-
-    with skyvern_context.scoped(
-        SkyvernContext(
-            organization_id="org_1",
-            workflow_run_id="wr_child",
-            workflow_permanent_id="wfp_child",
-            task_v2_id="tsk_v2_child",
-            run_id="wr_1",
-        )
-    ):
-        pass
-
-    current_context = skyvern_context.current()
-    assert current_context is not None
-    assert current_context is parent_context
-    assert current_context.loop_internal_state == loop_state
-
-    all_files = [
-        _file("https://files/a.pdf?sig=old", "a.pdf", "abc"),
-        _file("https://files/b.pdf?sig=new", "b.pdf", "def"),
-    ]
-    filtered = filter_downloaded_files_for_current_iteration(
-        all_files,
-        current_context.loop_internal_state,
-    )
-    assert [f.filename for f in filtered] == ["b.pdf"]
-
-    skyvern_context.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -123,6 +77,7 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
             workflow_runs=SimpleNamespace(
                 get_workflow_run=AsyncMock(side_effect=[outer_workflow_run, child_workflow_run]),
                 update_workflow_run=AsyncMock(),
+                update_workflow_run_if_not_final=AsyncMock(),
             ),
             observer=SimpleNamespace(
                 update_task_v2=AsyncMock(),
@@ -135,7 +90,11 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
         ),
         # First read is the block's own baseline capture (only a.zip exists yet); the
         # second is the post-run read (a.zip from before + b.zip downloaded this block).
-        STORAGE=SimpleNamespace(get_downloaded_files=AsyncMock(side_effect=[[a_zip], [a_zip, b_zip]])),
+        STORAGE=SimpleNamespace(
+            get_current_attempt_downloaded_files=AsyncMock(side_effect=[[a_zip], [a_zip, b_zip]]),
+            get_downloaded_file_signature_aliases=lambda _: [],
+        ),
+        WORKFLOW_CONTEXT_MANAGER=SimpleNamespace(has_workflow_run_context=lambda _run_id: False),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
 
@@ -165,6 +124,7 @@ async def test_taskv2_block_uses_pre_run_loop_state_for_download_filtering(
         return completed_task_v2
 
     monkeypatch.setattr(task_v2_service, "run_task_v2", fake_run_task_v2)
+    monkeypatch.setattr(task_v2_service, "settle_child_of_ended_parent", AsyncMock(return_value=None))
 
     recorded_outputs: list[dict[str, object]] = []
     block = TaskV2Block(

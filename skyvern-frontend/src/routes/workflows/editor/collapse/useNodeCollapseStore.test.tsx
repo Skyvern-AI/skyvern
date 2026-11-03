@@ -1,6 +1,23 @@
 import { act, cleanup, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import type { NodeProps } from "@xyflow/react";
+import {
+  beginSaveTransaction,
+  createYamlCommitOwner,
+  finishSaveTransaction,
+  registerEditorOwner,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { WorkflowPermanentIdContext } from "../../WorkflowPermanentIdContext";
+import { focusBlockTarget } from "../../studio/blockSearch";
+import { useWorkflowGraphState } from "../workflowEditorUtils";
+import type { AppNode } from "../nodes";
+import { LoopNode } from "../nodes/LoopNode/LoopNode";
+import { loopNodeDefaultData } from "../nodes/LoopNode/types";
+import { ConditionalNode } from "../nodes/ConditionalNode/ConditionalNode";
+import { conditionalNodeDefaultData } from "../nodes/ConditionalNode/types";
+import { codeBlockNodeDefaultData } from "../nodes/CodeBlockNode/types";
 import { WorkflowScopeContext } from "../WorkflowScopeContext";
 
 import {
@@ -8,6 +25,61 @@ import {
   useIsBlockCollapsed,
   useNodeCollapseStore,
 } from "./useNodeCollapseStore";
+
+let graph: ReturnType<typeof useWorkflowGraphState>;
+const updateNodeData = vi.fn();
+
+vi.mock("@xyflow/react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@xyflow/react")>()),
+  Handle: () => null,
+  useNodes: () => graph.nodes,
+  useReactFlow: () => ({ setNodes: graph.setNodes, updateNodeData }),
+}));
+vi.mock("../nodes/components/NodeHeader", () => ({ NodeHeader: () => null }));
+vi.mock("../nodes/LoopNode/LoopEditor", () => ({ LoopEditor: () => null }));
+vi.mock("../nodes/ConditionalNode/BranchesEditor", () => ({
+  BranchesEditor: () => null,
+}));
+vi.mock("../nodes/BuildModeOnly", () => ({ BuildModeOnly: () => null }));
+vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQuery: () => ({ data: undefined }),
+}));
+
+function ContainerGraph({ initialNodes }: { initialNodes: AppNode[] }) {
+  graph = useWorkflowGraphState(initialNodes, []);
+  const container = graph.nodes[0]!;
+  const props = {
+    ...container,
+    selected: false,
+    dragging: false,
+    draggable: false,
+    selectable: true,
+    deletable: false,
+    isConnectable: false,
+    zIndex: 0,
+    positionAbsoluteX: 0,
+    positionAbsoluteY: 0,
+  };
+  return (
+    <WorkflowPermanentIdContext.Provider value={WF}>
+      <WorkflowScopeContext.Provider
+        value={{ workflowId: WF, readOnly: false }}
+      >
+        {container.type === "loop" ? (
+          <LoopNode
+            {...(props as NodeProps<Extract<AppNode, { type?: "loop" }>>)}
+          />
+        ) : (
+          <ConditionalNode
+            {...(props as NodeProps<
+              Extract<AppNode, { type?: "conditional" }>
+            >)}
+          />
+        )}
+      </WorkflowScopeContext.Provider>
+    </WorkflowPermanentIdContext.Provider>
+  );
+}
 
 function resetStore() {
   useNodeCollapseStore.setState({ collapsed: {} });
@@ -20,6 +92,10 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+  );
+  vi.unstubAllGlobals();
   localStorage.clear();
 });
 
@@ -301,3 +377,73 @@ describe("renameBlock", () => {
     ).toBeUndefined();
   });
 });
+
+test.each(["loop", "conditional"] as const)(
+  "%s reveals descendants after search expands it during a save",
+  async (type) => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const container: AppNode =
+      type === "loop"
+        ? {
+            id: "container",
+            type,
+            position: { x: 0, y: 0 },
+            data: { ...loopNodeDefaultData, label: "container" },
+          }
+        : {
+            id: "container",
+            type,
+            position: { x: 0, y: 0 },
+            data: { ...conditionalNodeDefaultData, label: "container" },
+          };
+    const child: AppNode = {
+      id: "child",
+      type: "codeBlock",
+      parentId: container.id,
+      position: { x: 0, y: 0 },
+      data: { ...codeBlockNodeDefaultData, label: "child" },
+    };
+    useNodeCollapseStore.getState().collapseAll(WF, ["container"]);
+    render(<ContainerGraph initialNodes={[container, child]} />);
+    expect(graph.nodes.find((node) => node.id === "child")?.hidden).toBe(true);
+    const owner = createYamlCommitOwner(WF);
+    act(() => {
+      registerEditorOwner(owner);
+      expect(beginSaveTransaction(owner)).toBe(true);
+    });
+    await act(async () => {
+      await focusBlockTarget("child", {
+        getNodes: () => graph.nodes,
+        getInternalNode: () => undefined,
+        getPaneWidth: () => 1000,
+        viewportZoom: 1,
+        duration: 0,
+        setViewport: vi.fn(),
+        selectBlock: vi.fn(),
+        expandBlock: (label) =>
+          useNodeCollapseStore.getState().expandBlock(WF, label),
+        switchBranch: vi.fn(),
+        waitForSettle: async () => {},
+      });
+    });
+    expect(
+      useNodeCollapseStore.getState().collapsed[
+        makeCollapseKey(WF, "container")
+      ],
+    ).toBeUndefined();
+    expect(graph.nodes.find((node) => node.id === "child")?.hidden).toBe(true);
+    act(() => finishSaveTransaction(owner));
+    expect(graph.nodes.find((node) => node.id === "child")?.hidden).toBe(false);
+    expect(
+      useNodeCollapseStore.getState().collapsed[
+        makeCollapseKey(WF, "container")
+      ],
+    ).toBeUndefined();
+  },
+);

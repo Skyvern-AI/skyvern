@@ -60,6 +60,7 @@ class TestMCPFrameTools:
         assert result["error"]["code"] == mcp_browser.ErrorCode.NO_ACTIVE_BROWSER
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_working_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """skyvern_navigate must clear _working_frame to prevent stale frame references."""
         from skyvern.cli.core.session_manager import SessionState
@@ -85,6 +86,7 @@ class TestMCPFrameTools:
         assert state._working_frame is None
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_clears_frame_on_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Frame state must be cleared even when navigation fails (partial load may destroy iframes)."""
         from skyvern.cli.core.session_manager import SessionState
@@ -115,7 +117,6 @@ class TestMCPFrameTools:
         fake_page.is_closed = MagicMock(return_value=False)
         fake_ctx = MagicMock()
         fake_ctx.mode = "local"
-        monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(fake_page, fake_ctx)))
 
         target_page = MagicMock()
         target_page.is_closed = MagicMock(return_value=False)
@@ -128,6 +129,7 @@ class TestMCPFrameTools:
         state.browser._browser_context.pages = [fake_page, target_page]
         state._working_frame = MagicMock()  # stale frame from previous tab
         monkeypatch.setattr(mcp_tabs, "get_current_session", lambda: state)
+        monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(state.browser, fake_ctx)))
 
         result = await mcp_tabs.skyvern_tab_switch(index=1)
         assert result["ok"] is True
@@ -142,7 +144,6 @@ class TestMCPFrameTools:
         fake_page = MagicMock()
         fake_ctx = MagicMock()
         fake_ctx.mode = "local"
-        monkeypatch.setattr(mcp_tabs, "get_page", AsyncMock(return_value=(fake_page, fake_ctx)))
 
         new_page = MagicMock()
         new_page.url = "about:blank"
@@ -154,6 +155,7 @@ class TestMCPFrameTools:
         state.browser._browser_context.pages = [fake_page, new_page]
         state._working_frame = MagicMock()  # stale frame
         monkeypatch.setattr(mcp_tabs, "get_current_session", lambda: state)
+        monkeypatch.setattr(mcp_tabs, "resolve_browser", AsyncMock(return_value=(state.browser, fake_ctx)))
 
         result = await mcp_tabs.skyvern_tab_new()
         assert result["ok"] is True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +61,7 @@ def test_file_upload_block_applies_workflow_system_prompt() -> None:
     block = _file_upload_block("Upload invoices.")
     workflow_run_context = MagicMock()
     workflow_run_context.resolve_effective_workflow_system_prompt.return_value = "Follow accounting policy."
+    workflow_run_context.resolve_block_notes_section.return_value = None
 
     with patch.object(
         FileUploadBlock,
@@ -126,6 +128,7 @@ async def _execute_file_upload(
         ) as handler_factory,
     ):
         mock_app.STORAGE.get_downloaded_files = AsyncMock(return_value=[])
+        mock_app.STORAGE.get_current_attempt_downloaded_files = mock_app.STORAGE.get_downloaded_files
         mock_app.AGENT_FUNCTION.upload_file_to_customer_storage = upload
         mock_app.DATABASE.observer.get_workflow_run_block = AsyncMock(return_value=workflow_run_block)
         mock_app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts = persist_artifacts
@@ -408,11 +411,13 @@ async def test_prompt_selecting_zero_files_completes_and_records_empty_output(
         "workflow_run_block_id": "workflow-run-block-id",
         "candidate_count": 3,
         "selected_count": 0,
-        "reasoning": "No candidates match.",
+        "reasoning_type": "str",
+        "reasoning_length": len("No candidates match."),
     }
     warning_event = zero_selection_warnings[0]
     for field, value in expected_fields.items():
         assert warning_event[field] == value
+    assert "No candidates match." not in repr(warning_event)
 
 
 @pytest.mark.asyncio
@@ -613,3 +618,29 @@ def test_file_upload_selection_prompt_renders_filenames_as_contained_json_data()
     assert r"\u2460invoice.pdf" in rendered
     assert '"1invoice.pdf"' not in rendered
     assert '"files_to_upload"' in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [2, 1, None, "lookup_failure"])
+async def test_upload_ignores_files_from_previous_attempts(tmp_path: Path, attempt: int | str | None) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_candidates(download_dir, names=("report.pdf", "report (1).pdf"))
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    os.utime(download_dir / "report.pdf", (started_at.timestamp() - 10,) * 2)
+    os.utime(download_dir / "report (1).pdf", (started_at.timestamp(),) * 2)
+    resolver = AsyncMock(
+        side_effect=RuntimeError("attempt lookup unavailable") if attempt == "lookup_failure" else None,
+        return_value=("wr_upload", attempt or 1, started_at if attempt is not None else None),
+    )
+    with (
+        patch("skyvern.forge.sdk.artifact.storage.base.resolve_download_attempt", resolver),
+        structlog.testing.capture_logs() as logs,
+    ):
+        execution = await _execute_file_upload(_file_upload_block(None), download_dir)
+
+    assert execution.result.success is True
+    uploaded_names = {Path(call.kwargs["file_path"]).name for call in execution.upload.await_args_list}
+    assert uploaded_names == ({"report (1).pdf"} if attempt == 2 else {"report.pdf", "report (1).pdf"})
+    assert (download_dir / "report.pdf").exists()
+    if attempt == "lookup_failure":
+        assert any(row["log_level"] == "warning" and "attempt" in row["event"] for row in logs)

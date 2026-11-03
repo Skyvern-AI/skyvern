@@ -5,21 +5,36 @@ from pathlib import Path
 SKYVERN_ID_ATTR: str = "unique_id"
 
 # Values sent in the x-user-agent header by first-party Skyvern clients. Used to distinguish
-# UI- and MCP-triggered runs from API/SDK callers (e.g. for trigger_type classification and routing strategy).
+# UI-, MCP- and CLI-triggered runs from API/SDK callers (e.g. for trigger_type classification and routing strategy).
 SKYVERN_UI_USER_AGENT: str = "skyvern-ui"
 SKYVERN_MCP_USER_AGENT: str = "skyvern-mcp"
+SKYVERN_CLI_USER_AGENT: str = "skyvern-cli"
+# The CLI drives the same tools as the MCP server, so it gets the MCP's run treatment; only attribution tells them apart.
+SKYVERN_AGENT_USER_AGENTS: frozenset[str] = frozenset({SKYVERN_MCP_USER_AGENT, SKYVERN_CLI_USER_AGENT})
 
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent
 
+# Bounds the reasoning that user-defined errors carry to the customer webhook, and the
+# descriptions in an error_code_mapping. Lives here so the leaf error models and the workflow
+# schema can share one number without the models depending on the schema package.
+ERROR_CODE_REASONING_MAX_LENGTH = 2000
+
 INPUT_TEXT_TIMEOUT = 120000  # 2 minutes
 PAGE_CONTENT_TIMEOUT = 300  # 5 mins
 BROWSER_PAGE_CLOSE_TIMEOUT = 5  # 5 seconds
+# Bounded attempts to close a crashed tab. Anything that waits on that close derives its budget from
+# this and BROWSER_PAGE_CLOSE_TIMEOUT rather than restating the count.
+CRASHED_PAGE_CLOSE_ATTEMPTS = 2
 BROWSER_CLOSE_TIMEOUT = 180  # 3 minute
 # Independent budget for disabling the download interceptor during close(). Kept well below
 # BROWSER_CLOSE_TIMEOUT so a stuck/cancellation-resistant download drain is reclaimed quickly
 # and can never consume the budget the paid-provider cleanup phase needs.
 BROWSER_INTERCEPTOR_DISABLE_TIMEOUT = 30  # 30 seconds
+# Budget for the whole browser-context teardown phase: on-close callbacks, cookie persistence, then context
+# close. Healthy closes finish in seconds (prod p99.9 ~4.5s); one still running at this point is wedged, and
+# holding it to BROWSER_CLOSE_TIMEOUT only delays the run's result. Keep on-close callbacks cheap.
+BROWSER_CONTEXT_CLOSE_TIMEOUT = 30  # 30 seconds
 BROWSER_DOWNLOAD_MAX_WAIT_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME = 120  # 2 minute
 BROWSER_DOWNLOAD_TIMEOUT = 600  # 10 minute
@@ -30,12 +45,25 @@ SPECULATIVE_COST_PERSIST_DRAIN_TIMEOUT = 30
 GET_DOWNLOADED_FILES_TIMEOUT = 30
 NAVIGATION_MAX_RETRY_TIME = 5
 PERMANENT_NAV_ERRORS = ("net::ERR_INVALID_URL",)
-PROXY_SENSITIVE_NAV_ERRORS = (
-    "net::ERR_NAME_NOT_RESOLVED",
-    "net::ERR_NAME_RESOLUTION_FAILED",
+# The proxy hop itself failing (HTTP CONNECT or SOCKS handshake) before the site is contacted. Only a
+# proxied browser can report these, and they are the only codes here that rule out the target -- except
+# for a target with no DNS address record, which the proxy also reports as a tunnel failure.
+PROXY_TRANSPORT_NAV_ERRORS = (
     "net::ERR_TUNNEL_CONNECTION_FAILED",
     "net::ERR_SOCKS_CONNECTION_FAILED",
     "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+)
+# Browser-context draws allowed for one navigation. A generic net::ERR keeps the single historical
+# recovery. A refusal by the proxy hop gets more because that refusal is a property of the draw rather
+# than of the route or the target -- a run minutes or seconds away reaches the same target fine -- so
+# independent draws are the only thing that clears it. Each draw relaunches the browser, which already
+# spaces them by seconds, and only a run that would otherwise have failed outright pays for them.
+NAV_ERROR_MAX_BROWSER_DRAWS = 2
+PROXY_TRANSPORT_NAV_MAX_BROWSER_DRAWS = 4
+PROXY_SENSITIVE_NAV_ERRORS = (
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_NAME_RESOLUTION_FAILED",
+    *PROXY_TRANSPORT_NAV_ERRORS,
     "net::ERR_CERT_",
     "net::ERR_SSL_",
 )
@@ -50,9 +78,7 @@ SKIP_INNER_NAV_RETRY_ERRORS = PERMANENT_NAV_ERRORS + PROXY_SENSITIVE_NAV_ERRORS
 # ERR_CERT_AUTHORITY_INVALID is the one cert code that means an untrusted issuer, i.e. something
 # terminating TLS in front of us.
 EGRESS_ATTRIBUTABLE_NAV_ERRORS = (
-    "net::ERR_TUNNEL_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_FAILED",
-    "net::ERR_SOCKS_CONNECTION_HOST_UNREACHABLE",
+    *PROXY_TRANSPORT_NAV_ERRORS,
     "net::ERR_NAME_NOT_RESOLVED",
     "net::ERR_NAME_RESOLUTION_FAILED",
     "net::ERR_CERT_AUTHORITY_INVALID",
@@ -111,7 +137,7 @@ DEFAULT_LOGIN_COMPLETE_CRITERION = (
 )
 
 # Template for wrapping a block-level mini-goal with the user's original prompt as context.
-# Used by both TaskV2 planning and the workflow-copilot-v2 tool handler so that every block's
+# Used by both TaskV2 planning and the Workflow Copilot tool handler so that every block's
 # navigation_goal carries the user's overarching intent — the verifier (complete_verify) can
 # then reason about completion against the user's goal rather than the block's narrow action
 # decomposition.
@@ -145,7 +171,14 @@ PDF_OCR_PAGE_CONCURRENCY = 5
 # alone cannot bound it; this keeps a pathological document to one failed block instead of
 # letting it consume the run's whole activity budget.
 FILE_PARSE_STEP_TIMEOUT_SECONDS = 300
-MAX_IMAGE_MESSAGES = 10
+# Wall-clock ceiling for one file-parser LLM call (page OCR or structured extraction); the slowest legitimate call seen
+# is a ~245 s large-output extraction. The LLM client's timeout only bounds the gap between received bytes, which a
+# gateway's keep-alive bytes keep resetting on a stalled call.
+FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS = 250
+# Wall-clock ceiling for OCR'ing every page of one scanned PDF: MAX_PDF_OCR_PAGES in rounds of PDF_OCR_PAGE_CONCURRENCY,
+# one retry per page, at the ~30 s a slow OCR call takes. It, not the per-call ceiling, bounds a scan whose pages stall.
+PDF_OCR_TOTAL_TIMEOUT_SECONDS = 600
+MAX_IMAGE_BLOCKS = 20
 SCROLL_AMOUNT_MULTIPLIER = 100
 EXTRACT_ACTION_SCROLL_AMOUNT = 500  # pixels per scroll action from extract-action prompt
 
@@ -164,3 +197,6 @@ SKYVERN_PAGE_MAX_SCRAPING_RETRIES = 2
 # Placeholder titles a workflow carries before anything names it. Two strings because
 # the frontend and backend defaults drifted apart.
 DEFAULT_WORKFLOW_TITLES = ("New Workflow", "New Agent")
+
+# What the data-retention scrubber writes over a stored value it removed.
+SCRUBBED_VALUE = "[removed]"

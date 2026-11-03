@@ -1,0 +1,780 @@
+---
+title: "Schedules"
+description: "Run agents on a cron schedule."
+slug: sdk-reference/schedules
+keywords:
+  - "schedule"
+  - "cron"
+---
+
+{/* Generated from the Skyvern SDK source (signatures and docstrings). Do not edit by hand; change the SDK docstrings. */}
+
+Schedule methods live on the `schedules` sub-client: `skyvern.schedules.<method>`.
+
+Every method here also accepts `request_options` (Python) or a final `requestOptions` argument (TypeScript) to override the timeout, retries or headers for one call; see [request options](/sdk-reference/overview#request-options).
+
+---
+
+## schedules.list_all
+
+List all schedules for the organization
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.list_all(
+    *,
+    page: int | None = None,
+    page_size: int | None = None,
+    status: SchedulesListAllRequestStatus | None = None,
+    search: str | None = None,
+) -> OrganizationScheduleListResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.listAll(request?: SchedulesListAllRequest): Promise<OrganizationScheduleListResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"page"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"page_size"} type={"int | None"}>
+Default: `None`
+</ParamField>
+
+<ParamField path={"status"} type={"SchedulesListAllRequestStatus | None"}>
+Filter by status: 'active' or 'paused'
+
+Default: `None`
+</ParamField>
+
+<ParamField path={"search"} type={"str | None"}>
+Search by workflow title or schedule name
+
+Default: `None`
+</ParamField>
+
+**Returns** `OrganizationScheduleListResponse` · TypeScript `Promise<OrganizationScheduleListResponse>`
+
+<Accordion title="OrganizationScheduleListResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedules` | `list[OrganizationScheduleItem]` |  |
+| `total_count` | `int` |  |
+| `page` | `int` |  |
+| `page_size` | `int` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.list_all()
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.listAll();
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.list
+
+List schedules for an agent
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.list(workflow_permanent_id: str) -> WorkflowScheduleListResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.list(workflowPermanentId: string): Promise<WorkflowScheduleListResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+**Returns** `WorkflowScheduleListResponse` · TypeScript `Promise<WorkflowScheduleListResponse>`
+
+<Accordion title="WorkflowScheduleListResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedules` | `list[WorkflowSchedule]` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.list(workflow_permanent_id="wpid_123")
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.list("wpid_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.create
+
+Create a cron, fixed-interval or one-time schedule that runs the given agent automatically with a fixed set of parameters. An interval schedule first runs at first_fire_at, or one interval after creation. A one-time schedule runs once at run_at. Returns the stored schedule and its next upcoming run times.
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.create(
+    workflow_permanent_id: str,
+    *,
+    timezone: str,
+    cron_expression: str | None = ...,
+    interval_seconds: int | None = ...,
+    first_fire_at: datetime | None = ...,
+    run_at: datetime | None = ...,
+    enabled: bool | None = ...,
+    parameters: dict[str, Any | None] | None = ...,
+    name: str | None = ...,
+    description: str | None = ...,
+) -> WorkflowScheduleResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.create(workflowPermanentId: string, request: WorkflowScheduleUpsertRequest): Promise<WorkflowScheduleResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"timezone"} type={"str"} required>
+</ParamField>
+
+<ParamField path={"cron_expression"} type={"str | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"interval_seconds"} type={"int | None"}>
+Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"first_fire_at"} type={"datetime | None"}>
+First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"run_at"} type={"datetime | None"}>
+Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"enabled"} type={"bool | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"parameters"} type={"dict[str, Any | None] | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"name"} type={"str | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"description"} type={"str | None"}>
+Sent only when you pass it
+</ParamField>
+
+**Returns** `WorkflowScheduleResponse` · TypeScript `Promise<WorkflowScheduleResponse>`
+
+<Accordion title="WorkflowScheduleResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedule` | `WorkflowSchedule` |  |
+| `next_runs` | `list[datetime] \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.create(
+        workflow_permanent_id="wpid_123",
+        timezone="America/New_York",
+        cron_expression="0 9 * * 1-5",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.create("wpid_123", {
+    cron_expression: "0 9 * * 1-5",
+    timezone: "America/New_York",
+});
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.get
+
+Fetch one schedule belonging to an agent. Returns the schedule's cron expression or interval, timezone, parameters, enabled state, and next upcoming run times.
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.get(
+    workflow_permanent_id: str,
+    workflow_schedule_id: str,
+) -> WorkflowScheduleResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.get(workflowPermanentId: string, workflowScheduleId: string): Promise<WorkflowScheduleResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"workflow_schedule_id"} type={"str"} required>
+ID of the schedule.
+
+TypeScript: `workflowScheduleId`
+</ParamField>
+
+**Returns** `WorkflowScheduleResponse` · TypeScript `Promise<WorkflowScheduleResponse>`
+
+<Accordion title="WorkflowScheduleResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedule` | `WorkflowSchedule` |  |
+| `next_runs` | `list[datetime] \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.get(
+        workflow_permanent_id="wpid_123",
+        workflow_schedule_id="wfs_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.get("wpid_123", "wfs_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.update
+
+Replace a schedule's cron expression, interval or one-time run_at, timezone, run parameters, and enabled state. A one-time schedule stays one-time and can change only until it fires; afterwards this returns 409. Returns the updated schedule and its next upcoming run times.
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.update(
+    workflow_permanent_id: str,
+    workflow_schedule_id: str,
+    *,
+    timezone: str,
+    cron_expression: str | None = ...,
+    interval_seconds: int | None = ...,
+    first_fire_at: datetime | None = ...,
+    run_at: datetime | None = ...,
+    enabled: bool | None = ...,
+    parameters: dict[str, Any | None] | None = ...,
+    name: str | None = ...,
+    description: str | None = ...,
+) -> WorkflowScheduleResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.update(workflowPermanentId: string, workflowScheduleId: string, request: WorkflowScheduleUpsertRequest): Promise<WorkflowScheduleResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"workflow_schedule_id"} type={"str"} required>
+ID of the schedule.
+
+TypeScript: `workflowScheduleId`
+</ParamField>
+
+<ParamField path={"timezone"} type={"str"} required>
+</ParamField>
+
+<ParamField path={"cron_expression"} type={"str | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"interval_seconds"} type={"int | None"}>
+Fixed elapsed interval between runs, in seconds. Mutually exclusive with cron_expression.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"first_fire_at"} type={"datetime | None"}>
+First run of an interval schedule; later runs follow every interval_seconds from it. Must be in the future when changed. Defaults to one interval after creation.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"run_at"} type={"datetime | None"}>
+Run the agent once at this instant, ISO 8601 with a UTC offset, at least 60 seconds in the future. Mutually exclusive with cron_expression and interval_seconds; the schedule can be edited or canceled only until it fires.
+
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"enabled"} type={"bool | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"parameters"} type={"dict[str, Any | None] | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"name"} type={"str | None"}>
+Sent only when you pass it
+</ParamField>
+
+<ParamField path={"description"} type={"str | None"}>
+Sent only when you pass it
+</ParamField>
+
+**Returns** `WorkflowScheduleResponse` · TypeScript `Promise<WorkflowScheduleResponse>`
+
+<Accordion title="WorkflowScheduleResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedule` | `WorkflowSchedule` |  |
+| `next_runs` | `list[datetime] \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.update(
+        workflow_permanent_id="wpid_123",
+        workflow_schedule_id="wfs_123",
+        timezone="America/New_York",
+        cron_expression="0 9 * * 1-5",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.update("wpid_123", "wfs_123", {
+    cron_expression: "0 9 * * 1-5",
+    timezone: "America/New_York",
+});
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.enable
+
+Enable an agent schedule
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.enable(
+    workflow_permanent_id: str,
+    workflow_schedule_id: str,
+) -> WorkflowScheduleResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.enable(workflowPermanentId: string, workflowScheduleId: string): Promise<WorkflowScheduleResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"workflow_schedule_id"} type={"str"} required>
+ID of the schedule.
+
+TypeScript: `workflowScheduleId`
+</ParamField>
+
+**Returns** `WorkflowScheduleResponse` · TypeScript `Promise<WorkflowScheduleResponse>`
+
+<Accordion title="WorkflowScheduleResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedule` | `WorkflowSchedule` |  |
+| `next_runs` | `list[datetime] \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.enable(
+        workflow_permanent_id="wpid_123",
+        workflow_schedule_id="wfs_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.enable("wpid_123", "wfs_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.disable
+
+Disable an agent schedule
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.disable(
+    workflow_permanent_id: str,
+    workflow_schedule_id: str,
+) -> WorkflowScheduleResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.disable(workflowPermanentId: string, workflowScheduleId: string): Promise<WorkflowScheduleResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"workflow_schedule_id"} type={"str"} required>
+ID of the schedule.
+
+TypeScript: `workflowScheduleId`
+</ParamField>
+
+**Returns** `WorkflowScheduleResponse` · TypeScript `Promise<WorkflowScheduleResponse>`
+
+<Accordion title="WorkflowScheduleResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedule` | `WorkflowSchedule` |  |
+| `next_runs` | `list[datetime] \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.disable(
+        workflow_permanent_id="wpid_123",
+        workflow_schedule_id="wfs_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.disable("wpid_123", "wfs_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.cancel
+
+Cancel a one-time schedule that has not fired yet. The schedule stays readable with dispatch_status canceled. Returns 409 once it has fired or was already canceled, and 422 for a recurring schedule.
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.cancel(
+    workflow_permanent_id: str,
+    workflow_schedule_id: str,
+) -> WorkflowScheduleResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.cancel(workflowPermanentId: string, workflowScheduleId: string): Promise<WorkflowScheduleResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"workflow_schedule_id"} type={"str"} required>
+ID of the schedule.
+
+TypeScript: `workflowScheduleId`
+</ParamField>
+
+**Returns** `WorkflowScheduleResponse` · TypeScript `Promise<WorkflowScheduleResponse>`
+
+<Accordion title="WorkflowScheduleResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `schedule` | `WorkflowSchedule` |  |
+| `next_runs` | `list[datetime] \| None` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.cancel(
+        workflow_permanent_id="wpid_123",
+        workflow_schedule_id="wfs_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.cancel("wpid_123", "wfs_123");
+console.log(result);
+```
+</CodeGroup>
+
+---
+
+## schedules.delete
+
+Delete an agent schedule
+
+<CodeGroup>
+```python Python
+await skyvern.schedules.delete(
+    workflow_permanent_id: str,
+    workflow_schedule_id: str,
+) -> DeleteScheduleResponse
+```
+
+```typescript TypeScript
+skyvern.schedules.delete(workflowPermanentId: string, workflowScheduleId: string): Promise<DeleteScheduleResponse>
+```
+</CodeGroup>
+
+**Parameters**
+
+<ParamField path={"workflow_permanent_id"} type={"str"} required>
+ID of the agent (`wpid_…`).
+
+TypeScript: `workflowPermanentId`
+</ParamField>
+
+<ParamField path={"workflow_schedule_id"} type={"str"} required>
+ID of the schedule.
+
+TypeScript: `workflowScheduleId`
+</ParamField>
+
+**Returns** `DeleteScheduleResponse` · TypeScript `Promise<DeleteScheduleResponse>`
+
+<Accordion title="DeleteScheduleResponse fields">
+
+| Field | Type | Description |
+|---|---|---|
+| `ok` | `bool` |  |
+
+</Accordion>
+
+**Example**
+
+<CodeGroup>
+```python Python
+import asyncio
+
+from skyvern import Skyvern
+
+
+async def main() -> None:
+    skyvern = Skyvern(api_key="YOUR_API_KEY")
+    result = await skyvern.schedules.delete(
+        workflow_permanent_id="wpid_123",
+        workflow_schedule_id="wfs_123",
+    )
+    print(result)
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: "YOUR_API_KEY" });
+const result = await skyvern.schedules.delete("wpid_123", "wfs_123");
+console.log(result);
+```
+</CodeGroup>

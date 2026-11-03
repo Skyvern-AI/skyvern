@@ -45,6 +45,9 @@ class FakeOrganizationsRepository:
         self.updated_encrypted_methods: list[EncryptMethod | None] = []
         self.update_organization = AsyncMock()
 
+    async def get_organization(self, organization_id: str) -> Organization | None:
+        return None
+
     async def get_valid_org_auth_tokens(
         self,
         organization_id: str,
@@ -148,11 +151,14 @@ def fake_organizations(monkeypatch: pytest.MonkeyPatch) -> FakeOrganizationsRepo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("created_at", [datetime.now(timezone.utc), None], ids=["with-timestamp", "none-timestamp"])
 async def test_prepare_org_llm_runtime_creates_context_and_stamps_defaults(
     monkeypatch: pytest.MonkeyPatch,
+    created_at: datetime | None,
 ) -> None:
     organization = _org("o_runtime").model_copy(
         update={
+            "created_at": created_at,
             "default_llm_key": "CUSTOM_LLM_oat_smart",
             "default_secondary_llm_key": "CUSTOM_LLM_oat_fast",
         }
@@ -173,6 +179,7 @@ async def test_prepare_org_llm_runtime_creates_context_and_stamps_defaults(
     assert context.organization_id == organization.organization_id
     assert context.org_default_llm_key == "CUSTOM_LLM_oat_smart"
     assert context.org_default_secondary_llm_key == "CUSTOM_LLM_oat_fast"
+    assert context.org_age == (None if created_at is None else 0)
     get_organization.assert_awaited_once_with(organization.organization_id)
     load_configs.assert_awaited_once_with(database, organization.organization_id)
 
@@ -291,7 +298,7 @@ async def test_custom_llm_masks_and_preserves_secret_extra_headers(
             config=CustomLLMConfig(
                 display_name="Gemini Flex",
                 provider="gemini",
-                model_name="gemini-2.5-flash",
+                model_name="gemini-3-flash-preview",
                 api_key="test-key",
                 extra_parameters={"service_tier": "flex", "extra_headers": dict(secret_headers)},
             )
@@ -320,7 +327,7 @@ async def test_custom_llm_masks_and_preserves_secret_extra_headers(
                 config=CustomLLMConfig(
                     display_name="Gemini Flex",
                     provider="gemini",
-                    model_name="gemini-2.5-flash",
+                    model_name="gemini-3-flash-preview",
                     api_key=CUSTOM_LLM_API_KEY_MASK,
                     extra_parameters={"service_tier": "flex", "extra_headers": dict(masked_headers)},
                 )
@@ -934,7 +941,7 @@ def test_task_v2_selected_non_custom_model_override_is_intentional(monkeypatch: 
         workflow_permanent_id="wpid_non_custom",
         prompt="Use the selected non-custom model",
         url=None,
-        model={"model_name": "gemini-2.5-flash"},
+        model={"model_name": "gemini-3.0-flash"},
         created_at=now,
         modified_at=now,
     )
@@ -965,7 +972,7 @@ def test_custom_llm_extra_parameters_flow_into_litellm_params() -> None:
         CustomLLMConfig(
             display_name="Gemini Flex",
             provider="gemini",
-            model_name="gemini-2.5-flash",
+            model_name="gemini-3-flash-preview",
             api_key="test-key",
             extra_parameters={
                 "service_tier": "flex",
@@ -980,7 +987,7 @@ def test_custom_llm_extra_parameters_flow_into_litellm_params() -> None:
     finally:
         deregister_custom_llm_config(custom_llm_id)
 
-    assert llm_config.model_name == "gemini/gemini-2.5-flash"
+    assert llm_config.model_name == "gemini/gemini-3-flash-preview"
     assert llm_config.litellm_params
     assert llm_config.litellm_params["service_tier"] == "flex"
     assert llm_config.litellm_params["thinking"] == {"type": "enabled", "budget_tokens": 1024}
@@ -994,7 +1001,7 @@ def test_gemini_provider_requires_api_key() -> None:
         CustomLLMConfig(
             display_name="Gemini",
             provider="gemini",
-            model_name="gemini-2.5-flash",
+            model_name="gemini-3-flash-preview",
         )
 
 
@@ -1007,7 +1014,7 @@ def test_custom_llm_extra_parameters_reject_reserved_keys(reserved_key: str) -> 
         CustomLLMConfig(
             display_name="Reserved",
             provider="gemini",
-            model_name="gemini-2.5-flash",
+            model_name="gemini-3-flash-preview",
             api_key="test-key",
             extra_parameters={reserved_key: "value"},
         )
@@ -1018,7 +1025,7 @@ def test_custom_llm_extra_parameters_reject_too_many() -> None:
         CustomLLMConfig(
             display_name="Too Many",
             provider="gemini",
-            model_name="gemini-2.5-flash",
+            model_name="gemini-3-flash-preview",
             api_key="test-key",
             extra_parameters={f"param_{index}": index for index in range(31)},
         )
@@ -1029,7 +1036,7 @@ def test_custom_llm_extra_parameters_reject_oversized() -> None:
         CustomLLMConfig(
             display_name="Too Big",
             provider="gemini",
-            model_name="gemini-2.5-flash",
+            model_name="gemini-3-flash-preview",
             api_key="test-key",
             extra_parameters={"blob": "x" * 11_000},
         )
@@ -1058,7 +1065,7 @@ def test_custom_gemini_thinking_budget_is_owned_and_not_overwritten() -> None:
         CustomLLMConfig(
             display_name="Gemini Thinking",
             provider="gemini",
-            model_name="gemini-2.5-flash",
+            model_name="gemini-3-flash-preview",
             api_key="test-key",
             extra_parameters={"thinking": {"type": "enabled", "budget_tokens": 4096}},
         ),
@@ -1089,7 +1096,7 @@ def test_custom_gemini_thinking_budget_is_owned_and_not_overwritten() -> None:
 
 def test_non_custom_key_never_owns_thinking() -> None:
     assert (
-        LLMAPIHandlerFactory._custom_llm_owns_thinking("GEMINI_2_5_FLASH", {"thinking": {"budget_tokens": 1}}) is False
+        LLMAPIHandlerFactory._custom_llm_owns_thinking("GEMINI_3_0_FLASH", {"thinking": {"budget_tokens": 1}}) is False
     )
 
 

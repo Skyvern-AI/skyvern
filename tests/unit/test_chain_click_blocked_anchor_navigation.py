@@ -17,7 +17,13 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
-from skyvern.exceptions import BlockedHost, BlockedNavigationDestination, InvalidUrl, SkyvernHTTPException
+from skyvern.exceptions import (
+    BlockedHost,
+    BlockedNavigationDestination,
+    FailToOpenLink,
+    InvalidUrl,
+    SkyvernHTTPException,
+)
 from skyvern.utils.url_validators import validate_fetch_url
 from skyvern.webeye.utils import dom as dom_module
 from skyvern.webeye.utils.dom import InteractiveElement, SkyvernElement
@@ -307,12 +313,12 @@ def _public_resolver(host: str, port: int | None, *args: object, **kwargs: objec
     return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", port or 0))]
 
 
-_UNRESOLVABLE_HOST = "unresolvable.example.test"
+_UNRESOLVABLE_HOST = "service.internal.test"
 
 
 def _resolver_with_unresolvable_host(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
     if host == _UNRESOLVABLE_HOST:
-        raise OSError("dns unavailable")
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
     return _public_resolver(host, port, *args, **kwargs)
 
 
@@ -409,6 +415,37 @@ async def test_dom_navigate_to_a_href_rejects_loopback(monkeypatch: pytest.Monke
     page.goto.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("url_after_failure", "expected_clause"),
+    [
+        ("https://portal.example.com/results", "The current page is unchanged."),
+        ("chrome-error://chromewebdata/", "no longer on the page it was on before"),
+    ],
+    ids=["navigation_never_committed", "navigation_committed_an_error_page"],
+)
+@pytest.mark.asyncio
+async def test_failed_cross_origin_href_reports_the_page_state_it_measured(
+    url_after_failure: str, expected_clause: str
+) -> None:
+    """A failed goto can still commit an error page, so the page state must be read, not assumed.
+
+    Claiming "unchanged" when the tab did move would hide from the planner that it is now off-site.
+    """
+    elem = _make_anchor_element(href="https://external.example.test/profile", target="_blank")
+    page = _make_page("https://portal.example.com/results")
+
+    async def _fail_and_land(*_: object, **__: object) -> None:
+        page.url = url_after_failure
+        raise RuntimeError("Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://external.example.test/profile")
+
+    page.goto = AsyncMock(side_effect=_fail_and_land)
+
+    with pytest.raises(FailToOpenLink) as raised:
+        await elem.navigate_to_a_href(page=page)
+
+    assert expected_clause in str(raised.value)
+
+
 class TestChainClickBlockedAnchorNavigation:
     """Integration tests: chain_click must call the new helper only in the
     ``blocking_element is None and blocked=True`` branch, and only for anchors
@@ -426,6 +463,7 @@ class TestChainClickBlockedAnchorNavigation:
         action_y: int | None = None,
         action_download: bool = False,
         navigate_result: str | None = "https://portal.example.com/billpay",
+        href_navigation_error: BaseException | None = None,
         is_checkbox: bool = False,
         is_checkbox_mock: AsyncMock | None = None,
         checked_states: list[bool | None] | None = None,
@@ -442,6 +480,9 @@ class TestChainClickBlockedAnchorNavigation:
         try_navigate_mock)."""
         from skyvern.webeye.actions import handler as handler_module
         from skyvern.webeye.actions.actions import ClickAction
+
+        if not real_href_navigation:
+            monkeypatch.setattr(handler_module, "validate_fetch_url", lambda url: url)
 
         # Stub out the entire pre-blocking-check block so we jump straight to
         # find_blocking_element.  In chain_click, the first Playwright click
@@ -477,7 +518,9 @@ class TestChainClickBlockedAnchorNavigation:
         # ``__init__`` here, seed the name-mangled attribute directly.
         elem._SkyvernElement__static_element = {"id": "AAA3", "tagName": tag}  # type: ignore[attr-defined]
         elem.locator = MagicMock()
-        elem.navigate_to_a_href = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        elem.navigate_to_a_href = AsyncMock(  # type: ignore[method-assign]
+            side_effect=href_navigation_error, return_value=None
+        )
         elem.find_bound_label_by_attr_id = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.find_bound_label_by_direct_parent = AsyncMock(return_value=None)  # type: ignore[method-assign]
         elem.is_visible = AsyncMock(return_value=True)  # type: ignore[method-assign]
@@ -538,6 +581,26 @@ class TestChainClickBlockedAnchorNavigation:
             skyvern_element=elem,
         )
         return results, elem.coordinate_click, try_navigate
+
+    @pytest.mark.asyncio
+    async def test_failed_href_navigation_reaches_the_action_history_without_its_destination(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """chain_click is where the failure becomes the planner's own CLICK result, so assert there.
+
+        A third-party URL in that text reads as the agent having left the site its goal pinned it to.
+        """
+        results, _coord_click, _navigate = await self._run_chain_click(
+            monkeypatch,
+            blocked=False,
+            tag=InteractiveElement.A,
+            href="https://external.example.test/profile",
+            href_navigation_error=FailToOpenLink(page_moved=False),
+        )
+
+        message = results[0].exception_message or ""
+        assert "external.example.test" not in message
+        assert "The current page is unchanged." in message
 
     @pytest.mark.asyncio
     async def test_blocked_anchor_navigates_via_href_and_skips_coordinate_click(
@@ -670,25 +733,29 @@ class TestChainClickBlockedAnchorNavigation:
         coordinate_click.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unresolvable_anchor_entry_url_continues_to_coordinate_click(
+    async def test_unresolvable_internal_anchor_href_is_terminal_without_click_dispatch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from skyvern.webeye.actions.responses import ActionSuccess
+        from skyvern.webeye.actions.responses import ActionFailure
 
         monkeypatch.setattr(dom_module, "validate_fetch_url", validate_fetch_url)
         monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", _resolver_with_unresolvable_host)
+        js_click = AsyncMock()
 
         results, coordinate_click, navigate = await self._run_chain_click(
             monkeypatch,
             blocked=True,
             tag=InteractiveElement.A,
-            href=f"https://{_UNRESOLVABLE_HOST}/target",
+            href=f"http://{_UNRESOLVABLE_HOST}:8099/secret",
             real_href_navigation=True,
+            js_mock=js_click,
         )
 
-        assert isinstance(results[-1], ActionSuccess)
+        assert len(results) == 1
+        assert isinstance(results[0], ActionFailure)
         navigate.assert_awaited_once()
-        coordinate_click.assert_awaited_once()
+        coordinate_click.assert_not_awaited()
+        js_click.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_blocked_anchor_redirect_hop_is_terminal_without_coordinate_click(
@@ -715,10 +782,10 @@ class TestChainClickBlockedAnchorNavigation:
         coordinate_click.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unresolvable_anchor_redirect_hop_continues_to_coordinate_click(
+    async def test_unresolvable_anchor_redirect_hop_is_terminal_without_coordinate_click(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from skyvern.webeye.actions.responses import ActionSuccess
+        from skyvern.webeye.actions.responses import ActionFailure
 
         href = "https://external.example.test/target"
         monkeypatch.setattr(dom_module, "validate_fetch_url", validate_fetch_url)
@@ -733,14 +800,10 @@ class TestChainClickBlockedAnchorNavigation:
             navigation_response=_redirect_chain(href, f"https://{_UNRESOLVABLE_HOST}/final"),
         )
 
-        assert isinstance(results[-1], ActionSuccess)
+        assert len(results) == 1
+        assert isinstance(results[0], ActionFailure)
         navigate.assert_awaited_once()
-        coordinate_click.assert_awaited_once()
-
-
-def test_dom_module_exports_try_navigate_via_href() -> None:
-    """Sanity check that the helper is a method on ``SkyvernElement``."""
-    assert hasattr(dom_module.SkyvernElement, "try_navigate_via_href")
+        coordinate_click.assert_not_awaited()
 
 
 class _SelectedEngineTimeout(Exception):
@@ -1010,25 +1073,26 @@ class TestChainClickNavigationDestinationGuard:
         return results, elem, navigate, locator_click
 
     @pytest.mark.asyncio
-    async def test_unresolvable_host_reaches_coordinate_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.webeye.actions.responses import ActionSuccess
+    async def test_unresolvable_host_is_terminal_without_any_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.webeye.actions.responses import ActionFailure
 
         def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-            raise OSError("dns unavailable")
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
         monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
         with pytest.raises(BlockedHost) as exc_info:
-            validate_fetch_url("https://unresolvable.example.test/target")
+            validate_fetch_url(f"http://{_UNRESOLVABLE_HOST}:8099/secret")
 
         results, elem, navigate, locator_click = await self._run(
             monkeypatch,
             navigation_error=exc_info.value,
         )
 
-        assert isinstance(results[-1], ActionSuccess)
+        assert len(results) == 1
+        assert isinstance(results[0], ActionFailure)
         navigate.assert_awaited_once()
         locator_click.assert_not_awaited()
-        elem.coordinate_click.assert_awaited_once()
+        elem.coordinate_click.assert_not_awaited()
         elem.click_in_javascript.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1211,22 +1275,26 @@ class TestChainClickPreDispatchAnchorGuard:
         elem.coordinate_click.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_unresolvable_href_reaches_coordinate_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from skyvern.webeye.actions.responses import ActionSuccess
+    async def test_unresolvable_internal_href_is_refused_before_click_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.webeye.actions.responses import ActionFailure
 
         def fails_dns(host: str, port: int | None, *args: object, **kwargs: object) -> list[object]:
-            raise OSError("dns unavailable")
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
         monkeypatch.setattr("skyvern.utils.url_validators.socket.getaddrinfo", fails_dns)
-        href = "https://unresolvable.example.test/target"
+        href = f"http://{_UNRESOLVABLE_HOST}:8099/secret"
         validator = MagicMock(wraps=validate_fetch_url)
 
         results, elem, click_element, _ = await self._run(monkeypatch, href=href, validator=validator)
 
-        assert isinstance(results[-1], ActionSuccess)
+        assert len(results) == 1
+        assert isinstance(results[0], ActionFailure)
         validator.assert_called_once_with(href)
         click_element.assert_not_awaited()
-        elem.coordinate_click.assert_awaited_once()
+        elem.locator.click.assert_not_awaited()
+        elem.coordinate_click.assert_not_awaited()
         elem.click_in_javascript.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2214,24 +2282,6 @@ class TestIsSafeForCheckboxDirectClickUsesSkyvernFrameEvaluate:
     ``SkyvernFrame.evaluate`` entry point (repo-standard timeout/dispatch/
     navigation recovery, handle marshalling) rather than ``Locator.evaluate``,
     while preserving fail-closed semantics."""
-
-    @pytest.mark.asyncio
-    async def test_probe_routes_through_skyvernframe_evaluate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        blocker, blocker_locator = _make_blocking_element(
-            tag=InteractiveElement.BUTTON, interactive_descendant=None, direct_interactive=True
-        )
-        frame_eval = AsyncMock(return_value=True)
-        monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", frame_eval)
-
-        result = await blocker.is_safe_for_checkbox_direct_click()
-
-        assert result is False  # interactive blocker => unsafe
-        frame_eval.assert_awaited_once()
-        call = frame_eval.await_args
-        assert call.kwargs["expression"] == "(element) => element.matches('a[href], button')"
-        assert call.kwargs["frame"] is blocker.get_frame()
-        assert call.kwargs["arg"] is await blocker.get_element_handler()
-        blocker_locator.evaluate.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_probe_exception_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:

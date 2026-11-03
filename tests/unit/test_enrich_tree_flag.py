@@ -8,6 +8,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     _llm_screenshots_enabled_metric,
     _llm_screenshots_for_call,
 )
+from skyvern.forge.sdk.copilot.video_attachment import VIDEO_PERCEPTION_PROMPT_NAME, VIDEO_SECRET_SAFETY_PROMPT_NAME
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext, parse_enrich_tree_mode
 from skyvern.schemas.llm import LLMConfig
 
@@ -68,6 +69,33 @@ def test_vision_fallback_prompt_keeps_screenshots_in_no_image_modes(mode: Enrich
 
     assert _llm_screenshots_for_call([b"png"], _config(), ctx, "extract-text-from-image") == [b"png"]
     assert _llm_screenshots_enabled_metric(_config(), ctx, "extract-text-from-image") is True
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        EnrichTreeMode.ENRICHED_TREE_NO_IMAGES,
+        EnrichTreeMode.ENRICHED_TREE_NO_IMAGES_FALLBACK,
+    ],
+)
+@pytest.mark.parametrize("prompt_name", [VIDEO_SECRET_SAFETY_PROMPT_NAME, VIDEO_PERCEPTION_PROMPT_NAME])
+def test_video_prompts_always_receive_frames(mode: EnrichTreeMode, prompt_name: str) -> None:
+    ctx = SkyvernContext(enrich_tree_mode=mode)
+
+    assert _llm_screenshots_for_call([b"frame"], _config(), ctx, prompt_name) == [b"frame"]
+
+
+@pytest.mark.parametrize("prompt_name", [VIDEO_SECRET_SAFETY_PROMPT_NAME, VIDEO_PERCEPTION_PROMPT_NAME])
+def test_video_prompts_fail_closed_for_non_vision_model(prompt_name: str) -> None:
+    ctx = SkyvernContext(enrich_tree_mode=EnrichTreeMode.CONTROL)
+
+    with pytest.raises(ValueError, match="requires a vision-capable model"):
+        _llm_screenshots_for_call(
+            [b"frame"],
+            _config(supports_vision=False),
+            ctx,
+            prompt_name,
+        )
 
 
 def test_step_argument_controls_fallback_for_speculative_next_step() -> None:

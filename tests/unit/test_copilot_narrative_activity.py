@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+from agents.stream_events import RunItemStreamEvent
 
 from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
+from skyvern.forge.sdk.copilot.blocker_signal import clear_active_run_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.code_write_diff import (
     PER_PATCH_CHAR_CAP,
     TURN_PATCH_CHAR_BUDGET,
     build_code_write_diffs,
 )
-from skyvern.forge.sdk.copilot.context import BlockRunIdentity, CopilotContext
+from skyvern.forge.sdk.copilot.context import (
+    MAX_NARRATIVE_BLOCK_ATTEMPTS,
+    CopilotContext,
+    NarrativeBlockAttempt,
+    upsert_narrative_block_attempt,
+)
 from skyvern.forge.sdk.copilot.narration import (
     MAX_BLOCK_ACTIVITY_ENTRIES,
     MAX_DESIGN_ACTIVITY_ENTRIES,
@@ -19,8 +32,27 @@ from skyvern.forge.sdk.copilot.narration import (
     build_tool_result_activity,
     tool_activity_display_label,
 )
-from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user
+from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+from skyvern.forge.sdk.copilot.streaming_adapter import stream_to_sse
+from skyvern.forge.sdk.copilot.tools.run_execution import (
+    _reconcile_narrative_block_attempts,
+    _run_blocks_and_collect_debug,
+    _stash_recorded_run_outcome,
+)
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.services import workflow_service as workflow_service_module
+from tests.unit.copilot_test_helpers import (
+    FakeCopilotStream,
+    install_run_blocks_harness,
+    make_copilot_ctx,
+    origin_run_input,
+    terminal_extraction_block,
+    tool_called_event,
+    tool_output_event,
+)
 
 _SURGICAL_EDIT_TOOLS = ("edit_block", "delete_block")
 
@@ -129,30 +161,33 @@ def test_record_activity_routes_to_design_when_no_block_running() -> None:
     assert state.block_activity == {}
 
 
-def test_record_activity_routes_to_running_block() -> None:
+def test_unknown_tool_result_stays_in_design_with_a_block_running() -> None:
     state = NarratorState()
     state.running_block_label = "step_1"
+    state.running_block_id = "wrb_step_1"
     state.record_activity(
         build_tool_result_activity("run_blocks_and_collect_debug", "ran", True, 1, "c2", timestamp=_TS)
     )
-    assert [e["id"] for e in state.block_activity["step_1"]] == ["tr-c2"]
-    assert state.design_activity == []
+    assert state.block_activity == {}
+    assert [e["id"] for e in state.design_activity] == ["tr-c2"]
 
 
 def test_record_activity_drops_denylisted_entries() -> None:
     state = NarratorState()
     state.running_block_label = "step_1"
+    state.running_block_id = "wrb_step_1"
     state.record_activity(build_tool_call_activity("get_run_results", 0, "c1", timestamp=_TS))
     state.record_activity(build_tool_call_activity("update_workflow", 1, "c2", timestamp=_TS))
-    assert [e["id"] for e in state.block_activity["step_1"]] == ["tc-c2"]
+    assert [e["id"] for e in state.block_activity["wrb_step_1"]] == ["tc-c2"]
 
 
 def test_record_activity_caps_keep_most_recent() -> None:
     state = NarratorState()
     state.running_block_label = "b"
+    state.running_block_id = "wrb_b"
     for i in range(MAX_BLOCK_ACTIVITY_ENTRIES + 10):
         state.record_activity(build_tool_call_activity("t", i, f"c{i}", timestamp=_TS))
-    bucket = state.block_activity["b"]
+    bucket = state.block_activity["wrb_b"]
     assert len(bucket) == MAX_BLOCK_ACTIVITY_ENTRIES
     assert bucket[0]["iteration"] == 10
     assert bucket[-1]["iteration"] == MAX_BLOCK_ACTIVITY_ENTRIES + 9
@@ -165,14 +200,12 @@ def test_record_activity_caps_keep_most_recent() -> None:
 
 
 def test_record_activity_pins_run_tool_result_to_its_call_bucket() -> None:
-    # A run tool's call is recorded before the run it triggers flips
-    # running_block_label; its result must rejoin the call's bucket so the FE
-    # folds the pair instead of stranding the call row "calling…".
     state = NarratorState()
     state.record_activity(build_tool_call_activity("update_and_run_blocks", 0, "c1", timestamp=_TS))
     assert [e["id"] for e in state.design_activity] == ["tc-c1"]
 
     state.running_block_label = "step_1"
+    state.running_block_id = "wrb_step_1"
     state.record_activity(
         build_tool_result_activity("update_and_run_blocks", "Workflow updated", True, 1, "c1", timestamp=_TS)
     )
@@ -181,17 +214,17 @@ def test_record_activity_pins_run_tool_result_to_its_call_bucket() -> None:
     assert state.block_activity == {}
 
 
-def test_record_activity_non_run_tool_result_routes_live_not_pinned() -> None:
-    # The pin is scoped to run tools; other tools keep live running_block_label routing.
+def test_record_activity_non_run_tool_result_keeps_the_original_call_bucket() -> None:
     state = NarratorState()
     state.record_activity(build_tool_call_activity("evaluate", 0, "c9", timestamp=_TS))
     assert [e["id"] for e in state.design_activity] == ["tc-c9"]
 
     state.running_block_label = "step_2"
+    state.running_block_id = "wrb_step_2"
     state.record_activity(build_tool_result_activity("evaluate", "Inspecting page", True, 1, "c9", timestamp=_TS))
 
-    assert [e["id"] for e in state.block_activity["step_2"]] == ["tr-c9"]
-    assert [e["id"] for e in state.design_activity] == ["tc-c9"]
+    assert state.block_activity == {}
+    assert [e["id"] for e in state.design_activity] == ["tc-c9", "tr-c9"]
 
 
 def test_tool_activity_display_label_covers_discovery_tools() -> None:
@@ -204,9 +237,24 @@ def test_tool_activity_display_label_covers_discovery_tools() -> None:
 
 def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     ctx = _ctx()
+    ctx.demonstration_items = ["Navigate to example.com", "Click Submit"]
     ctx.staged_workflow = _staged("step_1", "step_2")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
-    ctx.block_state_map = {"step_1": "completed", "step_2": "running"}
+    for workflow_run_block_id, label, status in (
+        ("wrb_1", "step_1", "completed"),
+        ("wrb_2", "step_2", "running"),
+    ):
+        upsert_narrative_block_attempt(
+            ctx.narrative_block_attempts,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_id="wr_1",
+            label=label,
+            block_type="task",
+            status=status,
+            iteration=1,
+            started_at=_TS.isoformat(),
+            ended_at=_TS.isoformat() if status == "completed" else None,
+        )
     ctx.turn_id = "turn-1"
     ctx.turn_index = 2
 
@@ -215,13 +263,17 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
         build_narration_activity("Planning the build", 0, datetime(2026, 1, 1, tzinfo=timezone.utc))
     ]
     state.block_activity = {
-        "step_1": [
+        "wrb_1": [
             build_tool_result_activity("run_blocks_and_collect_debug", "ran step_1", True, 1, "c1", timestamp=_TS)
         ]
     }
+    state.work_plan = {"toolCallId": "p1", "items": ["Open the admin page"]}
     ctx.narrator_state = state
 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="summary")
+
+    assert payload["workPlan"] == {"toolCallId": "p1", "items": ["Open the admin page"]}
+    assert payload["demonstrationItems"] == ["Navigate to example.com", "Click Submit"]
 
     assert payload["designActivity"] == [
         {
@@ -248,20 +300,54 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
     assert blocks_by_label["step_2"]["activity"] == []
 
 
-def test_build_narrative_payload_persists_block_run_identity() -> None:
+def test_build_narrative_payload_marks_only_the_left_runs_blocks_unfinished() -> None:
+    ctx = _ctx()
+    for workflow_run_block_id, workflow_run_id in (("wrb_left", "wr_left"), ("wrb_cancelled", "wr_cancelled")):
+        upsert_narrative_block_attempt(
+            ctx.narrative_block_attempts,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_id=workflow_run_id,
+            label=workflow_run_block_id,
+            block_type="task",
+            status="running",
+            iteration=1,
+            started_at=_TS.isoformat(),
+            ended_at=None,
+        )
+    ctx.budget_expiry_state.source = "deadline"
+    ctx.budget_expiry_state.hard_backstop_reached = True
+    ctx.budget_expiry_state.leavable_run_ids.append("wr_left")
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="done")
+
+    assert {block["label"]: block["state"] for block in payload["blocks"]} == {
+        "wrb_left": "unfinished",
+        "wrb_cancelled": "running",
+    }
+    assert payload["budgetExpiry"]["leftRunIds"] == ["wr_left"]
+
+
+def test_build_narrative_payload_serializes_only_observed_attempts() -> None:
     ctx = _ctx()
     ctx.staged_workflow = _staged("step_1", "drafted_only")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
-    ctx.block_state_map = {"step_1": "completed"}
-    ctx.block_run_identity_map = {"step_1": BlockRunIdentity(workflow_run_block_id="wrb_1", iteration=6)}
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_1",
+        workflow_run_id="wr_1",
+        label="step_1",
+        block_type="task",
+        status="completed",
+        iteration=6,
+        started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:00:05+00:00",
+    )
 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message=None, narrative_summary=None)
 
-    blocks_by_label = {b["label"]: b for b in payload["blocks"]}
-    assert blocks_by_label["step_1"]["workflowRunBlockId"] == "wrb_1"
-    assert blocks_by_label["step_1"]["lastSeenIteration"] == 6
-    assert "workflowRunBlockId" not in blocks_by_label["drafted_only"]
-    assert blocks_by_label["drafted_only"]["lastSeenIteration"] == 0
+    assert [block["label"] for block in payload["blocks"]] == ["step_1"]
+    assert payload["blocks"][0]["workflowRunBlockId"] == "wrb_1"
+    assert payload["blocks"][0]["lastSeenIteration"] == 6
 
 
 def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
@@ -273,7 +359,198 @@ def test_build_narrative_payload_empty_when_no_narrator_state() -> None:
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
 
     assert payload["designActivity"] == []
+    assert payload["blocks"] == []
+
+
+def test_build_narrative_payload_preserves_retry_order_and_binds_each_outcome() -> None:
+    ctx = _ctx()
+    ctx.staged_workflow = _staged("step_1")  # type: ignore[assignment]
+    ctx.has_staged_proposal = True
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_first",
+        workflow_run_id="wr_first",
+        label="step_1",
+        block_type="task",
+        status="failed",
+        iteration=1,
+        started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:00:05+00:00",
+    )
+    ctx.last_run_blocks_workflow_run_id = "wr_first"
+    ctx.last_run_outcome_block_ids = ["wrb_first"]
+    ctx.last_run_blocks_block_labels = ["step_1"]
+    _stash_recorded_run_outcome(
+        ctx,
+        RecordedRunOutcome(
+            verdict="not_demonstrated",
+            display_reason="The first attempt failed.",
+            workflow_run_id="wr_first",
+            run_completed=False,
+        ),
+    )
+    clear_active_run_evidence_on_workflow_edit(ctx)
+
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_retry",
+        workflow_run_id="wr_retry",
+        label="step_1",
+        block_type="task",
+        status="completed",
+        iteration=4,
+        started_at="2026-01-01T00:00:06+00:00",
+        ended_at="2026-01-01T00:00:09+00:00",
+    )
+    ctx.last_run_blocks_workflow_run_id = "wr_retry"
+    ctx.last_run_outcome_block_ids = ["wrb_retry"]
+    ctx.last_run_blocks_block_labels = ["step_1"]
+    _stash_recorded_run_outcome(
+        ctx,
+        RecordedRunOutcome(
+            verdict="not_evaluated",
+            workflow_run_id="wr_retry",
+            run_completed=True,
+        ),
+    )
+
+    state = NarratorState()
+    state.block_activity = {
+        "wrb_retry": [build_tool_result_activity("edit_block", "Edited", True, 3, "edit", timestamp=_TS)]
+    }
+    ctx.narrator_state = state
+
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
+
+    assert [block["workflowRunBlockId"] for block in payload["blocks"]] == ["wrb_first", "wrb_retry"]
+    assert [block.get("workflowRunId") for block in payload["blocks"]] == ["wr_first", "wr_retry"]
+    assert [block.get("outcome") for block in payload["blocks"]] == ["not_demonstrated", "not_evaluated"]
     assert payload["blocks"][0]["activity"] == []
+    assert [entry["id"] for entry in payload["blocks"][1]["activity"]] == ["tr-edit"]
+
+
+def test_run_row_reconciliation_records_terminal_attempts_in_chronological_order() -> None:
+    ctx = _ctx()
+    rows = [
+        WorkflowRunBlock(
+            workflow_run_block_id=f"wrb_{label}",
+            workflow_run_id="wr_full",
+            organization_id="org",
+            block_type="task",
+            label=label,
+            status=status,
+            created_at=_TS,
+            modified_at=_TS,
+        )
+        for label, status in (("block_2", "completed"), ("block_1", "failed"))
+    ]
+
+    _reconcile_narrative_block_attempts(ctx, rows)
+
+    assert list(ctx.narrative_block_attempts) == ["wrb_block_2", "wrb_block_1"]
+    assert [attempt["rawStatus"] for attempt in ctx.narrative_block_attempts.values()] == [
+        "completed",
+        "failed",
+    ]
+
+
+def test_attempt_archive_keeps_only_the_most_recent_attempts() -> None:
+    archive: dict[str, NarrativeBlockAttempt] = {}
+    for i in range(MAX_NARRATIVE_BLOCK_ATTEMPTS + 1):
+        upsert_narrative_block_attempt(
+            archive,
+            workflow_run_block_id=f"wrb_iter_{i}",
+            workflow_run_id="wr_loop",
+            label="loop_body",
+            block_type="task",
+            status="completed",
+            iteration=i,
+            started_at=None,
+            ended_at=None,
+        )
+
+    assert len(archive) == MAX_NARRATIVE_BLOCK_ATTEMPTS
+    assert "wrb_iter_0" not in archive
+    assert next(iter(archive)) == "wrb_iter_1"
+
+
+def test_run_row_reconciliation_puts_both_ends_of_elapsed_on_the_database_clock() -> None:
+    ctx = _ctx()
+    poll_started_at = "2025-12-31T23:59:57+00:00"
+    upsert_narrative_block_attempt(
+        ctx.narrative_block_attempts,
+        workflow_run_block_id="wrb_block_1",
+        workflow_run_id="wr_full",
+        label="block_1",
+        block_type="task",
+        status="running",
+        iteration=1,
+        started_at=poll_started_at,
+        ended_at=None,
+    )
+    db_ended_at = _TS.replace(second=30)
+
+    _reconcile_narrative_block_attempts(
+        ctx,
+        [
+            WorkflowRunBlock(
+                workflow_run_block_id="wrb_block_1",
+                workflow_run_id="wr_full",
+                organization_id="org",
+                block_type="task",
+                label="block_1",
+                status="completed",
+                created_at=_TS,
+                modified_at=_TS.replace(second=45),
+                duration=30.0,
+            )
+        ],
+    )
+
+    attempt = ctx.narrative_block_attempts["wrb_block_1"]
+    assert attempt["startedAt"] == _TS.isoformat()
+    assert attempt["endedAt"] == db_ended_at.isoformat()
+
+
+def test_run_row_reconciliation_ignores_row_writes_that_land_after_the_block_finished() -> None:
+    ctx = _ctx()
+    watched_start, watched_end = "2026-01-01T00:00:01+00:00", "2026-01-01T00:00:06+00:00"
+    for status, started_at, ended_at in (("running", watched_start, None), ("completed", None, watched_end)):
+        upsert_narrative_block_attempt(
+            ctx.narrative_block_attempts,
+            workflow_run_block_id="wrb_watched",
+            workflow_run_id="wr_full",
+            label="watched",
+            block_type="task",
+            status=status,
+            iteration=1,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+    description_written_at = _TS.replace(second=40)
+    rows = [
+        WorkflowRunBlock(
+            workflow_run_block_id=f"wrb_{label}",
+            workflow_run_id="wr_full",
+            organization_id="org",
+            block_type="task",
+            label=label,
+            status="completed",
+            created_at=_TS,
+            modified_at=description_written_at,
+            duration=duration,
+        )
+        for label, duration in (("watched", None), ("fast", 2.0), ("untimed", None))
+    ]
+
+    _reconcile_narrative_block_attempts(ctx, rows)
+
+    watched = ctx.narrative_block_attempts["wrb_watched"]
+    assert (watched["startedAt"], watched["endedAt"]) == (watched_start, watched_end)
+    fast = ctx.narrative_block_attempts["wrb_fast"]
+    assert (fast["startedAt"], fast["endedAt"]) == (_TS.isoformat(), _TS.replace(second=2).isoformat())
+    untimed = ctx.narrative_block_attempts["wrb_untimed"]
+    assert (untimed["startedAt"], untimed["endedAt"]) == (_TS.isoformat(), None)
 
 
 def test_build_narrative_payload_persists_review_projection() -> None:
@@ -284,7 +561,7 @@ workflow_definition:
   blocks:
     - block_type: task
       label: existing
-      prompt: before
+      navigation_goal: before
 """
     ctx.staged_workflow_yaml = """
 workflow_definition:
@@ -292,10 +569,10 @@ workflow_definition:
   blocks:
     - block_type: task
       label: existing
-      prompt: after
+      navigation_goal: after
     - block_type: task
       label: added
-      prompt: new
+      navigation_goal: new
 """
     ctx.staged_workflow = _staged("existing", "added")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
@@ -322,6 +599,7 @@ workflow_definition:
             },
         ],
         "duplicateWrites": [],
+        "inputs": [],
     }
     assert payload["testedBlockFingerprints"] == {"existing": sorted(ctx.executed_block_fingerprints["existing"])}
 
@@ -365,6 +643,7 @@ workflow_definition:
             },
         ],
         "duplicateWrites": [],
+        "inputs": [],
     }
 
 
@@ -673,3 +952,83 @@ def test_a_tool_result_without_diffs_carries_no_code_diffs_key() -> None:
     )
     assert with_diffs is not None
     assert with_diffs["codeDiffs"] == [{"label": "step", "added": 2, "removed": 1}]
+
+
+_MODEL_SENTINEL = "model-value-sentinel-7f3a"
+_DEFAULT_SENTINEL = "default-value-sentinel-91c2"
+_ORIGIN_SENTINEL = "s3://origin-sentinel-bucket/earlier-run-sentinel-4d8e.pdf"
+_SENTINEL_INPUTS_WORKFLOW_YAML = f"""
+title: inputs with sentinel values
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: search_term
+    - parameter_type: workflow
+      workflow_parameter_type: string
+      key: region
+      default_value: {_DEFAULT_SENTINEL}
+    - parameter_type: workflow
+      workflow_parameter_type: file_url
+      key: resume
+  blocks:
+    - block_type: extraction
+      label: extract_heading
+      url: https://example.com
+      data_extraction_goal: Extract the page heading.
+      parameter_keys:
+        - search_term
+        - region
+        - resume
+"""
+
+
+async def _one_tool_round(call_id: str, tool_name: str, output: dict[str, Any]) -> AsyncIterator[RunItemStreamEvent]:
+    yield tool_called_event(call_id, tool_name)
+    yield tool_output_event(call_id, output)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_input_values_never_reach_the_run_row_or_its_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = await install_run_blocks_harness(
+        monkeypatch,
+        workflow_yaml=_SENTINEL_INPUTS_WORKFLOW_YAML,
+        polled_status="failed",
+        terminal_blocks=[terminal_extraction_block("failed")],
+    )
+    stream = FakeCopilotStream()
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat", stream=stream)
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+    ctx.repair_origin_input_values = (origin_run_input("resume", _ORIGIN_SENTINEL),)
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["extract_heading"], "parameters": {"search_term": _MODEL_SENTINEL}}, ctx
+    )
+    dispatched = workflow_service_module.prepare_workflow.call_args.kwargs["workflow_request"].data
+    assert (dispatched["search_term"], dispatched["region"], dispatched["resume"]) == (
+        _MODEL_SENTINEL,
+        _DEFAULT_SENTINEL,
+        _ORIGIN_SENTINEL,
+    )
+    model_facing = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    assert "test_inputs" not in json.dumps(model_facing)
+
+    run_stream = MagicMock()
+    run_stream.stream_events = lambda: _one_tool_round("run_1", "run_blocks_and_collect_debug", model_facing)
+    await stream_to_sse(run_stream, stream, ctx)
+
+    frame = next(f for f in stream.sent if getattr(f, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT)
+    payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary="done")
+    row = next(entry for entry in payload["designActivity"] if entry["id"] == "tr-run_1")
+    expected = [
+        {"key": "search_term", "source": "copilot"},
+        {"key": "region", "source": "default"},
+        {"key": "resume", "source": "earlier_run", "sourceRunId": "wr_origin"},
+    ]
+    assert (frame.workflow_run_id, frame.test_inputs) == ("wr_paused", expected)
+    assert (row["workflowRunId"], row["testInputs"]) == ("wr_paused", expected)
+    for serialized in (frame.model_dump_json(), json.dumps(row)):
+        for sentinel in (_MODEL_SENTINEL, _DEFAULT_SENTINEL, _ORIGIN_SENTINEL):
+            assert sentinel not in serialized
+    assert ctx.pending_test_inputs == {}

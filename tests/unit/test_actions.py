@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -47,7 +47,13 @@ from skyvern.webeye.actions.actions import (
     WebAction,
 )
 from skyvern.webeye.actions.models import DetailedAgentStepOutput
-from skyvern.webeye.actions.parse_actions import parse_action, parse_actions
+from skyvern.webeye.actions.parse_actions import (
+    parse_action,
+    parse_actions,
+    parse_anthropic_actions,
+    parse_cua_actions,
+    parse_ui_tars_actions,
+)
 
 
 def _mock_scraped_page() -> MagicMock:
@@ -55,6 +61,115 @@ def _mock_scraped_page() -> MagicMock:
     page.id_to_element_hash = {}
     page.id_to_element_dict = {}
     return page
+
+
+@pytest.mark.asyncio
+async def test_parse_anthropic_actions_does_not_log_model_response_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-anthropic-response-sentinel"
+    task = MagicMock(task_id="tsk_private", organization_id="org_private", workflow_run_id=None)
+    step = MagicMock(step_id="stp_private", order=0)
+    assistant_content = [
+        {"type": "thinking", "thinking": sentinel},
+        {"type": "thinking", "thinking": sentinel},
+        {
+            "type": "tool_use",
+            "name": "computer",
+            "id": "tool_private",
+            "input": {"action": "mouse_move", "private": sentinel},
+        },
+    ]
+    fallback = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.generate_cua_fallback_actions", fallback)
+
+    with capture_logs() as events:
+        actions = await parse_anthropic_actions(task, step, assistant_content, None, None)
+
+    assert actions == []
+    assert sentinel not in repr(events)
+    assert fallback.await_count == 1
+
+
+def test_parse_actions_does_not_log_malformed_response_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-malformed-action-sentinel"
+    context = MagicMock(totp_codes={})
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.skyvern_context.ensure_context", lambda: context)
+    task = MagicMock(
+        task_id="tsk_private",
+        organization_id="org_private",
+        workflow_run_id=None,
+        data_extraction_goal=None,
+        extracted_information_schema=None,
+    )
+
+    with capture_logs() as events:
+        actions = parse_actions(
+            task,
+            "stp_private",
+            0,
+            _mock_scraped_page(),
+            [
+                {"action_type": "INPUT_TEXT", "id": "e1", "reasoning": sentinel},
+                {"action_type": "SWITCH_TAB", "tab_index": sentinel},
+                sentinel,
+            ],
+        )
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], NullAction)
+    assert sentinel not in repr(events)
+    assert not any("exc_info" in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_parse_cua_actions_does_not_log_malformed_response_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = "private-cua-action-sentinel"
+    task = MagicMock(task_id="tsk_private", organization_id="org_private", workflow_run_id=None)
+    step = MagicMock(step_id="stp_private", order=0)
+    response = MagicMock()
+    response.output = [MagicMock(type="computer_call", action=MagicMock(type=sentinel))]
+    response.model_dump.return_value = {"output": [{"type": "computer_call", "action": {"type": sentinel}}]}
+    fallback = AsyncMock(return_value=[])
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.generate_cua_fallback_actions", fallback)
+
+    with capture_logs() as events:
+        actions = await parse_cua_actions(task, step, response)
+
+    assert actions == []
+    assert sentinel not in repr(events)
+    assert not any("exc_info" in event for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_content", "sentinel", "expected_event"),
+    [
+        ("Action: private_ui_tars_sentinel((", "private_ui_tars_sentinel", "Failed to parse action string"),
+        ("Action: private_ui_tars_sentinel()", "private_ui_tars_sentinel", "Unsupported UI-TARS action type"),
+        (
+            "Action: click(start_box='private-ui-tars-sentinel')",
+            "private-ui-tars-sentinel",
+            "Failed to parse UI-TARS coordinates",
+        ),
+    ],
+    ids=["malformed-action", "unsupported-action-type", "malformed-coordinates"],
+)
+async def test_parse_ui_tars_actions_does_not_log_malformed_response_content(
+    response_content: str,
+    sentinel: str,
+    expected_event: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = MagicMock(task_id="tsk_private", organization_id="org_private", workflow_run_id=None)
+    step = MagicMock(step_id="stp_private", order=0)
+    logger = MagicMock()
+    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.LOG", logger)
+
+    actions = await parse_ui_tars_actions(task, step, response_content, {"width": 1280, "height": 720})
+
+    assert actions == []
+    assert expected_event in repr(logger.mock_calls)
+    assert sentinel not in repr(logger.mock_calls)
+    assert "exc_info" not in repr(logger.mock_calls)
 
 
 def test_sdk_input_text_action_type_constant_matches_sdk_enum() -> None:
@@ -213,6 +328,31 @@ def test_web_input_text_action_repr_redacts_otp_text_marked_by_identifier() -> N
     assert REDACTED_OTP_VALUE in rendered_str
 
 
+def test_web_input_text_action_redacts_multi_field_reasoning_and_value() -> None:
+    action = InputTextAction(
+        action_type=ActionType.INPUT_TEXT,
+        element_id="box-0",
+        text="7",
+        reasoning="use the six digit value now",
+        intention="enter the code",
+        response="7",
+        totp_timing_info={
+            "is_totp_sequence": True,
+            "action_index": 0,
+            "box_element_ids": ["box-0", "box-1"],
+            "code_source": "external",
+        },
+    )
+
+    payload = redact_action_for_log(action)
+
+    assert payload["text"] == REDACTED_OTP_VALUE
+    assert payload["reasoning"] == "Entered a one-time code digit."
+    assert payload["intention"] == "*"
+    assert payload["response"] == "*"
+    assert "six digit" not in str(payload)
+
+
 def test_step_output_serialization_redacts_otp_input_action() -> None:
     secret_value = "OTP_SECRET_VALUE_SHOULD_NOT_APPEAR"
     action = InputTextAction(
@@ -280,7 +420,7 @@ def test_action_log_payload_redacts_otp_text_response_and_timing_secret() -> Non
     payload = redact_action_for_log(action)
 
     assert payload["text"] == REDACTED_OTP_VALUE
-    assert payload["response"] == REDACTED_OTP_VALUE
+    assert payload["response"] == "*"
     assert payload["totp_timing_info"]["totp_secret"] == REDACTED_OTP_SECRET
     assert secret_value not in str(payload)
     assert timing_secret not in str(payload)
@@ -306,8 +446,8 @@ def test_action_log_payload_keeps_non_otp_input_debuggable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_action_redacts_response_but_preserves_action_json_for_hydration() -> None:
-    secret_value = "OTP_SECRET_VALUE_SHOULD_NOT_APPEAR"
+async def test_create_action_persists_the_typed_otp_code_on_the_response_column() -> None:
+    otp_code = "OTP_CODE_THE_CUSTOMER_MUST_SEE"
     started_at = datetime(2026, 7, 30, 12, 0, 0)
     finished_at = datetime(2026, 7, 30, 12, 0, 1)
     captured_models = []
@@ -338,9 +478,9 @@ async def test_create_action_redacts_response_but_preserves_action_json_for_hydr
         step_order=0,
         action_order=0,
         element_id="otp-field",
-        text=secret_value,
+        text=otp_code,
         intention="Enter verification code",
-        response=secret_value,
+        response=otp_code,
         totp_code_required=True,
         started_at=started_at,
         finished_at=finished_at,
@@ -349,16 +489,16 @@ async def test_create_action_redacts_response_but_preserves_action_json_for_hydr
     await repo.create_action(action)
 
     persisted_model = captured_models[0]
-    assert persisted_model.response == REDACTED_OTP_VALUE
-    assert persisted_model.action_json["text"] == secret_value
-    assert persisted_model.action_json["response"] == secret_value
+    assert persisted_model.response == otp_code
+    assert persisted_model.action_json["text"] == otp_code
+    assert persisted_model.action_json["response"] == otp_code
     assert persisted_model.started_at == started_at
     assert persisted_model.finished_at == finished_at
 
     hydrated_action = hydrate_action(persisted_model)
     assert isinstance(hydrated_action, InputTextAction)
-    assert hydrated_action.text == secret_value
-    assert hydrated_action.response == secret_value
+    assert hydrated_action.text == otp_code
+    assert hydrated_action.response == otp_code
     assert hydrated_action.model_dump(mode="json")["started_at"] == "2026-07-30T12:00:00"
     assert hydrated_action.model_dump(mode="json")["finished_at"] == "2026-07-30T12:00:01"
 

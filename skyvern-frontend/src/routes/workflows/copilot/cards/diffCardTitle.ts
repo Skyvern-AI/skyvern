@@ -22,20 +22,28 @@ export function getDiffCardTitle(
   if (accepted) {
     return "Applied changes";
   }
-
-  // "Applied changes" requires the backend's explicit auto-applied signal.
-  // Everything else - pending review, a rejected auto-applicable draft, or a
-  // null/unknown disposition from a forward-compatible backend - defaults to
-  // "Proposed changes" rather than assuming the change landed.
-  if (
-    rejected ||
-    pendingProposal ||
-    turn.cancelled ||
-    turn.terminal === "error" ||
-    turn.proposalDisposition !== "auto_applicable"
-  ) {
+  if (pendingProposal || !draftLanded(turn, { rejected })) {
     return "Proposed changes";
   }
-
   return "Applied changes";
+}
+
+// "Applied" requires the backend's explicit auto-applied signal. A rejected, cancelled or errored
+// draft, or a null/unknown disposition from a forward-compatible backend, never landed.
+export function draftLanded(
+  turn: TurnNarrativeState,
+  {
+    rejected = false,
+    accepted = false,
+  }: Pick<DiffCardTitleOptions, "rejected" | "accepted"> = {},
+): boolean {
+  if (accepted) {
+    return true;
+  }
+  return (
+    !rejected &&
+    !turn.cancelled &&
+    turn.terminal !== "error" &&
+    turn.proposalDisposition === "auto_applicable"
+  );
 }

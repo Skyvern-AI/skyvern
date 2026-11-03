@@ -1,5 +1,5 @@
 import { getClient } from "@/api/AxiosClient";
-import { ArtifactApiResponse, Status } from "@/api/types";
+import { ArtifactApiResponse } from "@/api/types";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useArtifactImageSrc } from "@/hooks/useArtifactImageSrc";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -8,20 +8,19 @@ import {
   SCREENSHOT_PANEL_CLASS,
   StreamStatusPanel,
 } from "@/routes/streaming/StreamDiagnostics";
-import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { apiPathPrefix } from "@/util/env";
 import { isBlockScreenshot, selectBlockScreenshot } from "./blockScreenshot";
 
 type Props = {
   workflowRunBlockId: string;
   blockType?: string;
-  runStatus?: Status;
+  running?: boolean;
 };
 
 function WorkflowRunBlockScreenshot({
   workflowRunBlockId,
   blockType,
-  runStatus,
+  running,
 }: Props) {
   const credentialGetter = useCredentialGetter();
 
@@ -40,8 +39,8 @@ function WorkflowRunBlockScreenshot({
       // action screenshots land after its pre-execution LLM screenshot). Once finalized, stop:
       // no further screenshots are captured, including for promptless code blocks that never
       // produce one. Status unknown -> poll until any screenshot appears.
-      if (runStatus !== undefined) {
-        return statusIsNotFinalized({ status: runStatus }) ? 5000 : false;
+      if (running !== undefined) {
+        return running ? 5000 : false;
       }
       return query.state.data?.some(isBlockScreenshot) ? false : 5000;
     },
@@ -63,10 +62,7 @@ function WorkflowRunBlockScreenshot({
     );
   }
 
-  const runIsActive =
-    runStatus !== undefined && statusIsNotFinalized({ status: runStatus });
-
-  if (!screenshot && runIsActive) {
+  if (!screenshot && running) {
     return (
       <StreamStatusPanel
         className={SCREENSHOT_PANEL_CLASS}

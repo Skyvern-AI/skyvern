@@ -3,7 +3,7 @@
 # The server-extra guard must run before FastAPI/Starlette imports.
 # ruff: noqa: E402
 
-import os
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -24,8 +24,8 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import OperationalError
-from starlette.datastructures import MutableHeaders
+from sqlalchemy.exc import DataError, OperationalError
+from starlette.datastructures import MutableHeaders, QueryParams
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette_context.middleware import RawContextMiddleware
@@ -40,27 +40,37 @@ from skyvern.forge.request_logging import RequestLoggingMiddleware, log_raw_requ
 from skyvern.forge.sdk.api.llm.custom_llm_registry import load_custom_llm_configs_from_database
 from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.security import assert_signing_key_usable
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.db.exceptions import NotFoundError, is_connection_failure
+from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.exceptions import DatabaseConnectionUnavailableError, NotFoundError, is_connection_failure
 from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.executor.background_task_executor import BackgroundTaskExecutor
+from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.executor.run_liveness import start_run_lease_tasks, stop_run_lease_tasks
 from skyvern.forge.sdk.routes import internal_auth, internal_llms
 from skyvern.forge.sdk.routes.google_oauth import google_oauth_router
 from skyvern.forge.sdk.routes.google_sheets import google_sheets_router
 from skyvern.forge.sdk.routes.microsoft_oauth import microsoft_oauth_router
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.forge.sdk.routes.sms_inbound import sms_inbound_router
+from skyvern.forge.sdk.routes.twilio_integration import twilio_integration_router
 from skyvern.forge.sdk.services.local_org_auth_token_service import (
     ensure_local_api_key,
     ensure_local_org,
     fingerprint_token,
     regenerate_local_api_key,
 )
-from skyvern.services.browser_recording.session_registry import interpretation_registry
+from skyvern.forge.sdk.services.route_authorization import ROUTE_AUTHORIZATION_DEPENDENCY
 from skyvern.services.cleanup_service import (
     start_cleanup_scheduler,
     start_temp_artifact_sweep,
     stop_cleanup_scheduler,
     stop_temp_artifact_sweep,
 )
+from skyvern.services.hosted_driver_sweep import start_hosted_driver_sweep, stop_hosted_driver_sweep
+from skyvern.services.orphaned_run_reaper import reap_orphaned_runs_once
+from skyvern.services.workflow_run_group_service import run_workflow_run_group_recovery_loop
 from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
     stop_workflow_schedule_scheduler,
@@ -72,10 +82,22 @@ LOG = structlog.get_logger()
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
-async def db_unavailable_handler(request: Request, exc: OperationalError) -> JSONResponse:
-    if not is_connection_failure(exc.orig):
-        raise exc
-    LOG.warning("Database unavailable", error_type=type(exc.orig).__name__, sqlstate=exc.orig.sqlstate)
+async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
+    content: dict[str, str | None] = {"detail": exc.message}
+    if exc.error_code is not None:
+        content["error_code"] = exc.error_code
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
+
+
+async def db_unavailable_handler(
+    request: Request, exc: OperationalError | DatabaseConnectionUnavailableError
+) -> JSONResponse:
+    if isinstance(exc, OperationalError):
+        if not is_connection_failure(exc.orig):
+            raise exc
+        LOG.warning("Database unavailable", error_type=type(exc.orig).__name__, sqlstate=exc.orig.sqlstate)
+    else:
+        LOG.warning("Database unavailable", error_type=type(exc).__name__, operation=exc.operation)
     # A connection that drops while a commit is in flight may already have committed, so only a
     # safe method is told to retry; a write gets the 503 without the hint.
     headers = {"Retry-After": "1"} if request.method in SAFE_METHODS else None
@@ -86,11 +108,43 @@ async def db_unavailable_handler(request: Request, exc: OperationalError) -> JSO
     )
 
 
+def register_db_unavailable_handlers(fastapi_app: FastAPI) -> None:
+    """Both types mean the same outage: a read that exhausted its own reconnection attempts
+    must answer like the raw driver error it replaced, not fall through to a 500."""
+    for exc_type in (OperationalError, DatabaseConnectionUnavailableError):
+        fastapi_app.add_exception_handler(exc_type, db_unavailable_handler)
+
+
+async def invalid_data_handler(request: Request, exc: Exception) -> JSONResponse:
+    """DataError means a value could not be represented in its target type (out-of-range
+    integer, NUL byte in text), which is malformed input rather than a server fault.
+
+    A backstop for request-body fields, which the param bounds and the query-string check
+    cannot reach. `@db_operation` has already logged the traceback, so the failure stays
+    visible; `str(exc)` is withheld because it carries the raw SQL.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"detail": "A value in the request cannot be stored: out of range, or containing a NUL byte."},
+    )
+
+
+def register_invalid_data_handler(fastapi_app: FastAPI) -> None:
+    fastapi_app.add_exception_handler(DataError, invalid_data_handler)
+
+
 SECURITY_HEADERS = {
     # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
 }
+
+
+def security_headers() -> dict[str, str]:
+    if settings.STRICT_TRANSPORT_SECURITY:
+        return {**SECURITY_HEADERS, "Strict-Transport-Security": settings.STRICT_TRANSPORT_SECURITY}
+    return SECURITY_HEADERS
 
 
 class SecurityHeadersMiddleware:
@@ -107,17 +161,65 @@ class SecurityHeadersMiddleware:
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                for key, value in SECURITY_HEADERS.items():
-                    headers[key] = value
+                for key, value in security_headers().items():
+                    # A route-set header (e.g. a stricter per-response CSP) must win over the default.
+                    headers.setdefault(key, value)
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
 
 
+class RejectNulByteQueryMiddleware:
+    """Postgres cannot store a NUL byte in text, so a `?search=%00` reaching a query raises
+    a driver error instead of being rejected. No query param has a legitimate use for one,
+    so refuse it here rather than validating every free-text param separately.
+
+    Pure ASGI (not BaseHTTPMiddleware) so streaming responses pass through unwrapped.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        raw_query: bytes = scope.get("query_string", b"")
+        # Cheap pre-check: a NUL can only arrive percent-encoded or, from a non-conforming
+        # client, raw. Skip decoding the query string for the overwhelming majority.
+        if b"%00" in raw_query.lower() or b"\x00" in raw_query:
+            offending = next(
+                (key for key, value in QueryParams(raw_query).multi_items() if "\x00" in key or "\x00" in value),
+                None,
+            )
+            if offending is not None:
+                response = JSONResponse(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    content={
+                        "detail": [
+                            {
+                                "type": "string_contains_nul",
+                                "loc": ["query", offending],
+                                "msg": "Input should not contain a NUL byte",
+                            }
+                        ]
+                    },
+                )
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
 def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
     fastapi_app.add_middleware(
         CORSMiddleware,
-        **cors_middleware_kwargs(settings.ALLOWED_ORIGINS, settings.ALLOWED_ORIGIN_REGEX),
+        **cors_middleware_kwargs(
+            settings.ALLOWED_ORIGINS,
+            settings.ALLOWED_ORIGIN_REGEX,
+            expose_headers=["X-Next-Cursor", "Retry-After", "X-Has-More"],
+        ),
     )
 
 
@@ -160,6 +262,19 @@ class ExecutionDatePlugin(Plugin):
         return datetime.now()
 
 
+def strip_internal_schema_properties(openapi_schema: dict) -> None:
+    """Drop component properties marked ``x-internal`` so they stay out of the public docs and the SDK."""
+    for schema in openapi_schema.get("components", {}).get("schemas", {}).values():
+        properties = schema.get("properties")
+        if not properties:
+            continue
+        internal = [name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")]
+        for name in internal:
+            del properties[name]
+        if internal and "required" in schema:
+            schema["required"] = [name for name in schema["required"] if name not in internal]
+
+
 def custom_openapi(app: FastAPI) -> dict:
     if app.openapi_schema:
         return app.openapi_schema
@@ -174,6 +289,7 @@ def custom_openapi(app: FastAPI) -> dict:
         {"url": "https://api-staging.skyvern.com", "x-fern-server-name": "Staging"},
         {"url": "http://localhost:8000", "x-fern-server-name": "Local"},
     ]
+    strip_internal_schema_properties(openapi_schema)
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
@@ -243,16 +359,37 @@ def register_agent_route_aliases(fastapi_app: FastAPI) -> None:
         route.include_in_schema = False
 
 
-def _upgrade_sqlite_organization_slug(connection: Connection) -> None:
-    """Add the organization slug column and index to an existing local SQLite database."""
+# Columns that migrations added to tables an older local SQLite database already has. create_all only
+# creates missing tables, so an upgraded install needs each of these added here.
+_SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("organizations", "slug", "VARCHAR"),
+    ("tasks", "attempt_number", "INTEGER"),
+    ("workflow_run_blocks", "attempt_number", "INTEGER"),
+    ("google_oauth_credentials", "google_subject", "VARCHAR"),
+    ("tasks", "task_queue", "VARCHAR"),
+)
+
+
+def upgrade_sqlite_schema(connection: Connection) -> None:
+    """Add the columns and indexes that create_all leaves out of an existing local SQLite database."""
     inspector = inspect(connection)
-    if "organizations" not in inspector.get_table_names():
-        return
-    if "slug" not in {column["name"] for column in inspector.get_columns("organizations")}:
-        connection.execute(text("ALTER TABLE organizations ADD COLUMN slug VARCHAR"))
-    connection.execute(
-        text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL")
-    )
+    tables = set(inspector.get_table_names())
+    for table, column, column_type in _SQLITE_ADDED_COLUMNS:
+        if table in tables and column not in {existing["name"] for existing in inspector.get_columns(table)}:
+            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"))
+    if "organizations" in tables:
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_organizations_slug ON organizations (slug) WHERE slug IS NOT NULL"
+            )
+        )
+
+
+async def ensure_sqlite_schema(db: AgentDB) -> None:
+    """Create missing tables and add missing columns to a local SQLite database."""
+    async with db.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(upgrade_sqlite_schema)
 
 
 async def _bootstrap_sqlite() -> None:
@@ -265,9 +402,7 @@ async def _bootstrap_sqlite() -> None:
     _ensure_sqlite_dir(settings.DATABASE_STRING)
 
     db = forge_app.DATABASE
-    async with db.engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.run_sync(_upgrade_sqlite_organization_slug)
+    await ensure_sqlite_schema(db)
 
     # Preserve an existing API key if it's a real value (not the skeleton default).
     # settings.SKYVERN_API_KEY already incorporates env vars and .env via pydantic-settings.
@@ -301,6 +436,14 @@ async def _bootstrap_sqlite() -> None:
         api_key_fingerprint=fingerprint_token(api_key),
         env_file_written=backend_env,
     )
+
+
+async def _recover_pending_retries() -> None:
+    try:
+        await AsyncExecutorFactory.get_executor().recover_pending_retries()
+        LOG.info("Pending workflow retry recovery completed")
+    except Exception:
+        LOG.exception("Failed to recover pending workflow retries")
 
 
 @asynccontextmanager
@@ -354,6 +497,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         LOG.info("Cleanup scheduler started")
 
     start_temp_artifact_sweep()
+    start_hosted_driver_sweep()
 
     workflow_schedule_task = start_workflow_schedule_scheduler()
     if workflow_schedule_task:
@@ -364,19 +508,42 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     # lifespan here. This initializes the streamable-http session manager's
     # task group which is required for handling MCP requests.
     mcp_app = getattr(fastapi_app.state, "mcp_starlette_app", None)
-    if mcp_app:
-        async with mcp_app.lifespan(mcp_app):
-            LOG.info("MCP remote server lifespan started")
+    retry_recovery_task = asyncio.create_task(_recover_pending_retries(), name="workflow-retry-recovery")
+    # Cloud runs this sweep from its own periodic task loop.
+    group_recovery_task = (
+        asyncio.create_task(run_workflow_run_group_recovery_loop(), name="workflow-run-group-recovery")
+        if isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
+        else None
+    )
+    if (
+        isinstance(AsyncExecutorFactory.get_executor(), BackgroundTaskExecutor)
+        and settings.RUN_HEARTBEAT_TIMEOUT_MINUTES > 0
+    ):
+        start_run_lease_tasks(reap_orphaned_runs_once)
+    try:
+        if mcp_app:
+            async with mcp_app.lifespan(mcp_app):
+                LOG.info("MCP remote server lifespan started")
+                yield
+            LOG.info("MCP remote server lifespan stopped")
+        else:
             yield
-        LOG.info("MCP remote server lifespan stopped")
-    else:
-        yield
+    finally:
+        retry_recovery_task.cancel()
+        if group_recovery_task is not None:
+            group_recovery_task.cancel()
+        await asyncio.gather(
+            retry_recovery_task, *([group_recovery_task] if group_recovery_task else []), return_exceptions=True
+        )
+        await stop_run_lease_tasks()
+        # The initial pass starts the periodic sweep even when cancelled; stop it so the loop can drain.
+        await AsyncExecutorFactory.get_executor().stop_retry_recovery()
 
     # Stop cleanup scheduler
     await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
     await stop_temp_artifact_sweep()
-    await interpretation_registry.stop_all()
+    await stop_hosted_driver_sweep()
 
     if forge_app.api_app_shutdown_event:
         LOG.info("Calling api app shutdown event")
@@ -413,27 +580,9 @@ def create_api_app() -> FastAPI:
         except Exception as e:
             LOG.warning("Failed to initialize OTEL tracer provider early", error=str(e))
 
-    forge_app_instance = start_forge_app()
+    forge_app_instance = start_forge_app(load_api_modules=True)
 
-    # Initialize Laminar tracing after ForgeApp so auto-instrumentation works.
-    lmnr_api_key = os.environ.get("LMNR_PROJECT_API_KEY")
-    if lmnr_api_key:
-        try:
-            from lmnr import Laminar  # noqa: PLC0415
-
-            lmnr_base_url = os.environ.get("LMNR_BASE_URL", "http://localhost")
-            lmnr_grpc_port = int(os.environ.get("LMNR_GRPC_PORT", "8001"))
-            lmnr_http_port = int(os.environ.get("LMNR_HTTP_PORT", "8000"))
-            Laminar.initialize(
-                project_api_key=lmnr_api_key,
-                base_url=lmnr_base_url,
-                grpc_port=lmnr_grpc_port,
-                http_port=lmnr_http_port,
-            )
-            LOG.info("Laminar tracing initialized", base_url=lmnr_base_url, grpc_port=lmnr_grpc_port)
-        except Exception as e:
-            LOG.warning("Failed to initialize Laminar tracing", error=str(e))
-
+    assert_signing_key_usable()
     fastapi_app = FastAPI(lifespan=lifespan)
 
     add_credentialed_cors_middleware(fastapi_app)
@@ -447,21 +596,75 @@ def create_api_app() -> FastAPI:
     # remove either as a "duplicate". ``include_in_schema=False`` keeps the OAuth
     # endpoints out of the public OpenAPI/Swagger surface — they're consumed by
     # the frontend, not by SDK users.
-    fastapi_app.include_router(google_oauth_router, prefix="/v1/google", include_in_schema=False)
-    fastapi_app.include_router(google_oauth_router, prefix="/api/v1/google", include_in_schema=False)
-    fastapi_app.include_router(microsoft_oauth_router, prefix="/v1/microsoft", include_in_schema=False)
-    fastapi_app.include_router(microsoft_oauth_router, prefix="/api/v1/microsoft", include_in_schema=False)
-    fastapi_app.include_router(google_sheets_router, prefix="/v1/google/sheets", include_in_schema=False)
-    fastapi_app.include_router(google_sheets_router, prefix="/api/v1/google/sheets", include_in_schema=False)
+    fastapi_app.include_router(
+        google_oauth_router, prefix="/v1/google", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        google_oauth_router,
+        prefix="/api/v1/google",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        microsoft_oauth_router,
+        prefix="/v1/microsoft",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        microsoft_oauth_router,
+        prefix="/api/v1/microsoft",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        google_sheets_router,
+        prefix="/v1/google/sheets",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        google_sheets_router,
+        prefix="/api/v1/google/sheets",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    # Inbound SMS uses secret-URL and signature authentication. Only the canonical
+    # organization-scoped integration routes appear in the public schema.
+    fastapi_app.include_router(
+        sms_inbound_router, prefix="/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        sms_inbound_router, prefix="/api/v1/sms", include_in_schema=False, dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+    )
+    fastapi_app.include_router(
+        twilio_integration_router,
+        prefix="/v1/integrations/twilio",
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
+    fastapi_app.include_router(
+        twilio_integration_router,
+        prefix="/api/v1/integrations/twilio",
+        include_in_schema=False,
+        dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY],
+    )
 
     # local dev endpoints
     if settings.ENV == "local":
-        fastapi_app.include_router(internal_auth.router, prefix="/v1")
-        fastapi_app.include_router(internal_auth.router, prefix="/api/v1")
-        fastapi_app.include_router(internal_auth.router, prefix="/api/v2")
-        fastapi_app.include_router(internal_llms.router, prefix="/v1")
-        fastapi_app.include_router(internal_llms.router, prefix="/api/v1")
-        fastapi_app.include_router(internal_llms.router, prefix="/api/v2")
+        fastapi_app.include_router(internal_auth.router, prefix="/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY])
+        fastapi_app.include_router(
+            internal_auth.router, prefix="/api/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(
+            internal_auth.router, prefix="/api/v2", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(internal_llms.router, prefix="/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY])
+        fastapi_app.include_router(
+            internal_llms.router, prefix="/api/v1", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
+        fastapi_app.include_router(
+            internal_llms.router, prefix="/api/v2", dependencies=[ROUTE_AUTHORIZATION_DEPENDENCY]
+        )
 
     # Mirror the public /workflows surface to /agents (and hide the /workflows form from the schema).
     register_agent_route_aliases(fastapi_app)
@@ -482,11 +685,11 @@ def create_api_app() -> FastAPI:
     async def handle_not_found_error(request: Request, exc: NotFoundError) -> Response:
         return Response(status_code=status.HTTP_404_NOT_FOUND)
 
-    @fastapi_app.exception_handler(SkyvernHTTPException)
-    async def handle_skyvern_http_exception(request: Request, exc: SkyvernHTTPException) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    fastapi_app.add_exception_handler(SkyvernHTTPException, handle_skyvern_http_exception)
 
-    fastapi_app.add_exception_handler(OperationalError, db_unavailable_handler)
+    register_db_unavailable_handlers(fastapi_app)
+
+    register_invalid_data_handler(fastapi_app)
 
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
@@ -498,11 +701,14 @@ def create_api_app() -> FastAPI:
 
     @fastapi_app.exception_handler(RequestValidationError)
     async def handle_request_validation_error(request: Request, exc: RequestValidationError) -> Response:
-        # Only credential routes carry passkey/secret material worth stripping from 422 detail; every
-        # other route keeps FastAPI's default input/ctx to preserve debuggable validation errors.
         path = request.url.path.rstrip("/")
-        credential_prefixes = ("/v1/credentials", "/api/v1/credentials")
-        if not any(path == prefix or path.startswith(f"{prefix}/") for prefix in credential_prefixes):
+        if path == "/api/v1/users/me/onboarding":
+            # Both validation messages and unknown field names can contain reported contact details.
+            return JSONResponse(status_code=422, content={"detail": "invalid_onboarding_data"})
+        sensitive_prefixes = ("/v1/credentials", "/api/v1/credentials", "/v1/browser_sessions/external")
+        if path != "/v1/agent_feedback" and not any(
+            path == prefix or path.startswith(f"{prefix}/") for prefix in sensitive_prefixes
+        ):
             return await request_validation_exception_handler(request, exc)
 
         return JSONResponse(
@@ -526,7 +732,7 @@ def create_api_app() -> FastAPI:
         response = JSONResponse(
             status_code=500,
             content={"error": f"Unexpected error: {type(exc).__name__}"},
-            headers=SECURITY_HEADERS,
+            headers=security_headers(),
         )
         log_raw_request_exception(response.status_code)
         return response
@@ -547,6 +753,10 @@ def create_api_app() -> FastAPI:
 
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
+
+    # Inside RequestLoggingMiddleware (added next, so outside this one) to keep the
+    # rejections it short-circuits visible in request logs.
+    fastapi_app.add_middleware(RejectNulByteQueryMiddleware)
 
     # Register after extensions so it stays outside cloud BaseHTTPMiddleware
     # layers, whose child tasks do not propagate request ContextVars upstream.

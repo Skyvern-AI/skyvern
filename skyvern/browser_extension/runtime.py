@@ -6,24 +6,45 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from weakref import WeakKeyDictionary, WeakSet
 
 import structlog
 
 from skyvern.browser_extension.auth import load_or_create_pairing_token
 from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.cdp_adapter import TabReconnectEvent
 from skyvern.browser_extension.errors import BrowserExtensionError
+from skyvern.browser_extension.event_order import EventHold
 from skyvern.browser_extension.relay import ExtensionRelayServer
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
+from skyvern.utils.contained_effects import contained_effect
 
 LOG = structlog.get_logger(__name__)
+
+if TYPE_CHECKING:
+    from playwright.async_api import BrowserContext, Page
 
 _PORT_ENV = "SKYVERN_BROWSER_EXTENSION_PORT"
 _BROKER_ENV = "SKYVERN_BROWSER_EXTENSION_BROKER"
 _DEFAULT_PORT = 19777
 _PAIRING_BUSY_WAIT_SECONDS = 30.0
+_PAGE_TARGET_ACQUISITION_TIMEOUT_SECONDS = 2.0
+_RECONNECT_RECORD_TTL_SECONDS = 60.0
+_MAX_RECONNECT_RECORDS = 64
+
+
+@dataclass
+class TabReconnectRecord:
+    state: Literal["pending", "done", "failed"]
+    new_target_id: str | None = None
+    outcome: asyncio.Event = field(default_factory=asyncio.Event)
+    timestamp: float = field(default_factory=time.monotonic)
 
 
 class _Adapter(Protocol):
@@ -37,6 +58,12 @@ class _Adapter(Protocol):
     async def handle_extension_event(self, event: str, params: dict) -> None: ...
 
     async def on_extension_disconnect(self) -> None: ...
+
+    def target_attachment_snapshot(self, target_id: str) -> bool: ...
+
+    def scoped_tab_id_for_target(self, target_id: str) -> int | None: ...
+
+    def set_tab_reconnect_listener(self, listener: Callable[[TabReconnectEvent], None] | None) -> None: ...
 
 
 class _Relay(Protocol):
@@ -52,7 +79,7 @@ class _Relay(Protocol):
 
     async def wait_connected(self, timeout: float) -> bool: ...
 
-    async def request(self, op: str, args: dict, timeout: float = 30.0) -> dict: ...
+    async def request(self, op: str, args: dict, timeout: float = 30.0, *, hold: EventHold | None = None) -> dict: ...
 
     async def ensure_root_lease(self) -> dict | None: ...
     async def list_scoped_tabs(self) -> list[dict]: ...
@@ -60,10 +87,7 @@ class _Relay(Protocol):
     async def release_tab(self, tab_id: int) -> None: ...
 
 
-_relay_factory: Callable[
-    [str, int, Callable[[str, dict], Awaitable[None]], Callable[[], Awaitable[None]] | None],
-    ExtensionRelayServer,
-] = ExtensionRelayServer
+_relay_factory: type[ExtensionRelayServer] = ExtensionRelayServer
 _adapter_factory: Callable[[VirtualTargetRegistry, _Relay], _Adapter] | None = None
 
 
@@ -90,6 +114,13 @@ class BrowserExtensionRuntime:
         self._relay = relay
         self._adapter = adapter
         self._stopped = False
+        self._page_target_ids: WeakKeyDictionary[Any, str] = WeakKeyDictionary()
+        self._last_page_target_ids: WeakKeyDictionary[Page, str] = WeakKeyDictionary()
+        self._tab_reconnects: dict[str, TabReconnectRecord] = {}
+        self._reconnect_replacement_pages: WeakSet[Page] = WeakSet()
+        self._page_target_binding_tasks: WeakKeyDictionary[Any, asyncio.Task[str | None]] = WeakKeyDictionary()
+        self._page_close_hooks: WeakSet[Any] = WeakSet()
+        adapter.set_tab_reconnect_listener(self._on_tab_reconnect)
 
     @classmethod
     async def get_or_start(cls, port: int | None = None) -> BrowserExtensionRuntime:
@@ -117,6 +148,7 @@ class BrowserExtensionRuntime:
                 broker = BrokerClient(resolved_port, handle_broker_event, on_broker_disconnect)
                 broker_adapter = _create_adapter(registry, broker)
                 broker_adapter_holder.append(broker_adapter)
+                runtime = cls(broker, broker_adapter)
                 try:
                     await broker_adapter.start()
                     await broker.start()
@@ -124,7 +156,6 @@ class BrowserExtensionRuntime:
                     await _cleanup_failed_start(broker, broker_adapter)
                     raise
 
-                runtime = cls(broker, broker_adapter)
                 cls._instance = runtime
                 return runtime
 
@@ -138,9 +169,10 @@ class BrowserExtensionRuntime:
             async def on_disconnect() -> None:
                 await adapter_holder[0].on_extension_disconnect()
 
-            relay = _relay_factory(token, resolved_port, handle_event, on_disconnect)
+            relay = _relay_factory(token, resolved_port, handle_event, on_disconnect, order_debugger_events=True)
             adapter = _create_adapter(registry, relay)
             adapter_holder.append(adapter)
+            runtime = cls(relay, adapter)
 
             try:
                 await adapter.start()
@@ -158,7 +190,6 @@ class BrowserExtensionRuntime:
                 await _cleanup_failed_start(relay, adapter)
                 raise
 
-            runtime = cls(relay, adapter)
             cls._instance = runtime
             return runtime
 
@@ -177,6 +208,215 @@ class BrowserExtensionRuntime:
     async def wait_for_extension(self, timeout: float = 10.0) -> bool:
         return await self._relay.wait_connected(timeout)
 
+    def _prune_tab_reconnects(self) -> None:
+        cutoff = time.monotonic() - _RECONNECT_RECORD_TTL_SECONDS
+        for target_id, record in list(self._tab_reconnects.items()):
+            if record.timestamp < cutoff or len(self._tab_reconnects) > _MAX_RECONNECT_RECORDS:
+                self._tab_reconnects.pop(target_id)
+                record.state = "failed"
+                record.outcome.set()
+
+    def _on_tab_reconnect(self, event: TabReconnectEvent) -> None:
+        record = self._tab_reconnects.get(event.target_id)
+        if event.state == "pending" or record is None:
+            if record is not None:
+                record.state = "failed"
+                record.outcome.set()
+            self._tab_reconnects.pop(event.target_id, None)
+            record = TabReconnectRecord(state=event.state)
+            self._tab_reconnects[event.target_id] = record
+        record.state = event.state
+        record.new_target_id = event.new_target_id
+        record.timestamp = time.monotonic()
+        if event.state != "pending":
+            record.outcome.set()
+        self._prune_tab_reconnects()
+
+    async def page_target_id(self, page: Page) -> str | None:
+        try:
+            return await self._target_id_for_page(page)
+        except Exception as exc:  # noqa: BLE001 - Identity lookup must not fail an otherwise usable tool.
+            LOG.debug("browser_extension_page_identity_failed", error_type=type(exc).__name__)
+            return None
+
+    def last_page_target_id(self, page: Page) -> str | None:
+        return self._last_page_target_ids.get(page)
+
+    def tab_reconnect(self, target_id: str) -> TabReconnectRecord | None:
+        self._prune_tab_reconnects()
+        return self._tab_reconnects.get(target_id)
+
+    async def wait_for_tab_reconnect(self, record: TabReconnectRecord, timeout: float) -> None:
+        await asyncio.wait_for(record.outcome.wait(), timeout=timeout)
+
+    async def find_page_for_target(self, context: BrowserContext, target_id: str) -> Page | None:
+        pages = [page for page in context.pages if not page.is_closed()]
+        for page in pages:
+            if self._page_target_ids.get(page) == target_id:
+                return page
+        target_ids = await asyncio.gather(*(self.page_target_id(page) for page in pages))
+        return next(
+            (page for page, identity in zip(pages, target_ids) if identity == target_id and not page.is_closed()),
+            None,
+        )
+
+    async def is_reconnect_replacement(self, page: Page) -> bool:
+        if page in self._reconnect_replacement_pages:
+            return True
+        self._prune_tab_reconnects()
+        if not self._tab_reconnects:
+            return False
+        target_id = await self.page_target_id(page)
+        replacement = target_id is not None and any(
+            record.state in {"pending", "done"} and target_id in {old_target_id, record.new_target_id}
+            for old_target_id, record in self._tab_reconnects.items()
+        )
+        if replacement:
+            self._reconnect_replacement_pages.add(page)
+        return replacement
+
+    async def page_debugger_attached(self, page: Any) -> bool:
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            self._invalidate_page_binding(page)
+            return False
+        try:
+            target_id = await self._target_id_for_page(page)
+            if target_id is None or not self._runtime_is_connected() or self._page_is_closed(page):
+                return False
+            return self._adapter.target_attachment_snapshot(target_id)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_attachment_snapshot_failed", error_type=type(exc).__name__)
+            return False
+
+    async def _target_id_for_page(self, page: Any) -> str | None:
+        try:
+            target_id = self._page_target_ids.get(page)
+        except TypeError:
+            return None
+        if target_id is not None:
+            return target_id
+
+        self._install_page_close_hook(page)
+        try:
+            binding_task = self._page_target_binding_tasks.get(page)
+        except TypeError:
+            return None
+        if binding_task is None:
+            binding_task = asyncio.create_task(self._bind_page_target(page))
+            self._page_target_binding_tasks[page] = binding_task
+
+            def remove_binding_task(finished_task: asyncio.Future[str | None]) -> None:
+                try:
+                    if self._page_target_binding_tasks.get(page) is finished_task:
+                        self._page_target_binding_tasks.pop(page, None)
+                except TypeError:
+                    return
+
+            binding_task.add_done_callback(remove_binding_task)
+        try:
+            target_id = await asyncio.shield(binding_task)
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if binding_task.cancelled() and (current_task is None or current_task.cancelling() == 0):
+                return None
+            raise
+        if target_id is not None and not self._page_is_closed(page) and self._runtime_is_connected():
+            self._page_target_ids[page] = target_id
+            self._last_page_target_ids[page] = target_id
+        return target_id
+
+    async def _bind_page_target(self, page: Any) -> str | None:
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            return None
+        acquisition_task = asyncio.create_task(page.context.new_cdp_session(page))
+        cdp_session: Any = None
+        try:
+            done, _ = await asyncio.wait(
+                {acquisition_task},
+                timeout=_PAGE_TARGET_ACQUISITION_TIMEOUT_SECONDS,
+            )
+            if not done:
+                acquisition_task.add_done_callback(self._schedule_late_page_target_alias_detach)
+                return None
+            cdp_session = acquisition_task.result()
+            result = await asyncio.wait_for(cdp_session.send("Target.getTargetInfo"), timeout=2.0)
+            target_info = result.get("targetInfo") if isinstance(result, dict) else None
+            target_id = target_info.get("targetId") if isinstance(target_info, dict) else None
+            return target_id if isinstance(target_id, str) and target_id else None
+        except asyncio.CancelledError:
+            if not acquisition_task.done():
+                acquisition_task.add_done_callback(self._schedule_late_page_target_alias_detach)
+            elif cdp_session is None:
+                self._schedule_late_page_target_alias_detach(acquisition_task)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_target_binding_failed", error_type=type(exc).__name__)
+            return None
+        finally:
+            if cdp_session is not None:
+                await self._detach_page_target_alias(cdp_session)
+
+    def _schedule_late_page_target_alias_detach(self, acquisition_task: asyncio.Task[Any]) -> None:
+        if acquisition_task.cancelled():
+            return
+        try:
+            cdp_session = acquisition_task.result()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_late_page_target_acquisition_failed", error_type=type(exc).__name__)
+            return
+        if cdp_session is not None:
+            asyncio.create_task(self._detach_page_target_alias(cdp_session))
+
+    @staticmethod
+    async def _detach_page_target_alias(cdp_session: Any) -> None:
+        try:
+            await asyncio.wait_for(cdp_session.detach(), timeout=2.0)
+        except Exception as exc:  # noqa: BLE001
+            with contained_effect(
+                "browser_extension_page_target_alias_detach_failed",
+                error_type=type(exc).__name__,
+            ):
+                LOG.debug("browser_extension_page_target_alias_detach_failed", error_type=type(exc).__name__)
+
+    def _install_page_close_hook(self, page: Any) -> None:
+        try:
+            if page in self._page_close_hooks:
+                return
+            page.once("close", lambda *_: self._invalidate_page_binding(page))
+            self._page_close_hooks.add(page)
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_close_hook_failed", error_type=type(exc).__name__)
+
+    def _invalidate_page_binding(self, page: Any) -> None:
+        with suppress(TypeError):
+            self._page_target_ids.pop(page, None)
+            binding_task = self._page_target_binding_tasks.pop(page, None)
+            self._page_close_hooks.discard(page)
+            if binding_task is not None:
+                binding_task.cancel()
+
+    def _clear_page_bindings(self) -> None:
+        for binding_task in list(self._page_target_binding_tasks.values()):
+            binding_task.cancel()
+        self._page_target_ids.clear()
+        self._page_target_binding_tasks.clear()
+        self._page_close_hooks.clear()
+
+    @staticmethod
+    def _page_is_closed(page: Any) -> bool:
+        try:
+            return page.is_closed()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_page_closed_check_failed", error_type=type(exc).__name__)
+            return True
+
+    def _runtime_is_connected(self) -> bool:
+        try:
+            return self.extension_connected
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("browser_extension_connection_check_failed", error_type=type(exc).__name__)
+            return False
+
     async def broker_build_status(self) -> dict[str, Any] | None:
         """Broker-reported extension_build status, or None outside broker mode."""
         if not isinstance(self._relay, BrokerClient):
@@ -187,22 +427,22 @@ class BrowserExtensionRuntime:
     def describe_reported_build_hash(status: dict[str, Any]) -> str:
         return status.get("extensionReportedBuildHash") or "no hash reported (pre-dates this check)"
 
-    async def evaluate(self, expression: str) -> Any:
-        await self._relay.ensure_root_lease()
-        tabs = await self._relay.list_scoped_tabs()
-        candidates = [tab for tab in tabs if type(tab.get("tabId")) is int]
-        active = [tab for tab in candidates if tab.get("active") is True]
-        if len(active) == 1:
-            tab = active[0]
-        elif len(candidates) == 1:
-            tab = candidates[0]
-        else:
-            raise BrowserExtensionError("Select one Skyvern Controlled tab before evaluating JavaScript")
-        result = await self._relay.request(
-            "dom.evaluate",
-            {"tabId": tab["tabId"], "expression": expression},
+    async def fill_input(self, page: Any, selector: str, text: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Send fixed input data to the selected page; never evaluate caller source."""
+        deadline = int(time.time() * 1000 + min(timeout, 30.0) * 1000)
+        if self._page_is_closed(page) or not self._runtime_is_connected():
+            raise BrowserExtensionError("The selected page is no longer available")
+        target_id = await self._target_id_for_page(page)
+        tab_id = self._adapter.scoped_tab_id_for_target(target_id) if target_id is not None else None
+        if tab_id is None or self._page_is_closed(page):
+            raise BrowserExtensionError("The selected page is no longer in the controlled scope")
+        if time.time() * 1000 >= deadline:
+            raise TimeoutError("The fixed fill expired before it could be sent")
+        return await self._relay.request(
+            "dom.fill",
+            {"tabId": tab_id, "selector": selector, "text": text, "deadline": deadline},
+            timeout=min(timeout, 30.0),
         )
-        return result.get("result")
 
     @staticmethod
     def open_extension_url(url: str) -> bool:
@@ -302,6 +542,7 @@ class BrowserExtensionRuntime:
             if self._stopped:
                 return
             self._stopped = True
+            self._clear_page_bindings()
             try:
                 await self._relay.stop()
             finally:

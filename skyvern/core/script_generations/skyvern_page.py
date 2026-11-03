@@ -13,13 +13,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 import structlog
-from playwright.async_api import Frame, Locator, Page
+from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.config import settings
 from skyvern.core.script_generations.fuzzy_matcher import match_option as _match_option
 from skyvern.core.script_generations.skyvern_page_ai import SkyvernPageAi
-from skyvern.exceptions import NoTOTPSecretFound, ScriptTerminationException, SkyvernActionFailed
+from skyvern.exceptions import (
+    NoTOTPSecretFound,
+    ScriptTerminationException,
+    SkyvernActionFailed,
+    StaleFrameSelectionError,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import download_file as download_file_from_url
@@ -34,11 +39,14 @@ from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import read_locator_selected_state
+from skyvern.webeye.navigation import redact_url_secrets
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
+from skyvern.webeye.utils.page import mask_otp_values_in_html
 
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
     from skyvern.webeye.actions.responses import ActionResult
+    from skyvern.webeye.browser_engine import EngineFrame
 
 LOG = structlog.get_logger()
 
@@ -90,6 +98,7 @@ class SkyvernPage(Page):
     """
 
     engine_selection: BrowserEngineSelection | None = None
+    _working_frame: EngineFrame | None = None
 
     def __init__(
         self,
@@ -102,7 +111,6 @@ class SkyvernPage(Page):
         self.engine_selection = engine_selection
         self.current_label: str | None = None
         self._ai = ai
-        self._working_frame: Frame | None = None
 
     def __getattribute__(self, name: str) -> Any:
         page = object.__getattribute__(self, "page")
@@ -116,25 +124,42 @@ class SkyvernPage(Page):
 
         return object.__getattribute__(self, name)
 
+    def _owned_working_frame(self) -> EngineFrame | None:
+        """Return the working iframe, refusing one that names a different owning page."""
+        frame = object.__getattribute__(self, "_working_frame")
+        if frame is None:
+            return None
+        if frame.page is not object.__getattribute__(self, "page"):
+            raise StaleFrameSelectionError(frame.name, redact_url_secrets(frame.url))
+        return frame
+
     @property
-    def _locator_scope(self) -> Page | Frame:
+    def _locator_scope(self) -> Page | EngineFrame:
         """Return the current locator scope: the working iframe if set, otherwise the page.
 
         Use for element interaction (locator, click, fill). Keep self.page for
         page-level operations (goto, keyboard, url, title, reload, content).
         """
-        frame = object.__getattribute__(self, "_working_frame")
+        frame = self._owned_working_frame()
         if frame is not None:
             return frame
         return object.__getattribute__(self, "page")
 
     @property
-    def locator_scope(self) -> Page | Frame:
+    def _frame_scoped_ai(self) -> SkyvernPageAi:
+        """AI surface for actions that retarget a failed frame-scoped selector: their broad fallback
+        handlers swallow the scope refusal and would reissue the action against the focused page.
+        """
+        self._owned_working_frame()
+        return object.__getattribute__(self, "_ai")
+
+    @property
+    def locator_scope(self) -> Page | EngineFrame:
         """Public read-only view of the current locator scope for callers outside this class."""
         return self._locator_scope
 
     @property
-    def working_frame(self) -> Frame | None:
+    def working_frame(self) -> EngineFrame | None:
         """Public read-only view of the working iframe (None means the main frame)."""
         return object.__getattribute__(self, "_working_frame")
 
@@ -261,6 +286,10 @@ class SkyvernPage(Page):
             return ResolvedSensitiveValue(totp_code[digit_index])
         return ""
 
+    def _raise_if_browser_connection_lost(self) -> None:
+        # Only a run-bound page knows its run's browser; a standalone library page has no loss to observe.
+        return None
+
     @staticmethod
     def _track_ai_call() -> None:
         """Increment the script LLM call counter for cost-cap tracking."""
@@ -321,6 +350,7 @@ class SkyvernPage(Page):
                         retry_interval=retry_interval,
                     )
                     await asyncio.sleep(retry_interval)
+                    self._raise_if_browser_connection_lost()
                     # Re-acquire locator in case the DOM was replaced entirely
                     locator = self._locator_scope.locator(selector).first
                 else:
@@ -483,7 +513,10 @@ class SkyvernPage(Page):
                         return selector
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
+                except StaleFrameSelectionError:
+                    raise
                 except Exception as e:
+                    self._raise_if_browser_connection_lost()
                     if is_post_dispatch_click_timeout(e, self.engine_selection):
                         LOG.info(
                             "CSS selector click dispatched; navigation-wait timed out — skipping fallback",
@@ -506,6 +539,7 @@ class SkyvernPage(Page):
                         try:
                             await self.page.keyboard.press("Escape")
                             await asyncio.sleep(0.3)
+                            self._raise_if_browser_connection_lost()
                             locator = self._locator_scope.locator(selector).first
                             # The primary click may have dispatched and reached the desired state
                             # before raising, in which case retrying would toggle it back off.
@@ -518,6 +552,7 @@ class SkyvernPage(Page):
                             )
                             return selector
                         except Exception as retry_error:
+                            self._raise_if_browser_connection_lost()
                             if is_post_dispatch_click_timeout(retry_error, self.engine_selection):
                                 LOG.info(
                                     "CSS selector click dispatched after dismissing overlay; "
@@ -537,7 +572,7 @@ class SkyvernPage(Page):
 
             # if the original selector doesn't work, try to click the element with the ai generated selector
             if prompt:
-                return await self._ai.ai_click(
+                return await self._frame_scoped_ai.ai_click(
                     selector=selector,
                     intention=prompt,
                     data=data,
@@ -552,7 +587,7 @@ class SkyvernPage(Page):
                 return selector
         elif ai == "proactive":
             if prompt:
-                return await self._ai.ai_click(
+                return await self._frame_scoped_ai.ai_click(
                     selector=selector,
                     intention=prompt,
                     data=data,
@@ -578,7 +613,17 @@ class SkyvernPage(Page):
         intention: str | None = None,
         **kwargs: Any,
     ) -> str:
-        """Move the mouse over the element identified by `selector`."""
+        """Move the mouse over the element identified by `selector`.
+
+        Args:
+            selector: CSS selector for the element.
+            timeout: Maximum time to wait for the element, in milliseconds.
+            hold_seconds: How long to keep the mouse over the element, in seconds.
+            intention: Description of why you are hovering, recorded with the action.
+
+        Returns:
+            The selector that was hovered.
+        """
         if not selector:
             raise ValueError("Hover requires a selector.")
 
@@ -769,6 +814,23 @@ class SkyvernPage(Page):
         _skip_element_prep: bool = False,
         **kwargs: Any,
     ) -> str:
+        """Enter text into an input using a selector, AI, or both. Behaves the same as `fill`.
+
+        With a selector, the value is set in one step (Playwright's `fill`), not typed key by key. For inputs
+        that need real key events, use `fill_autocomplete`, `keypress`, or `press_sequentially` on a Playwright locator.
+
+        Args:
+            selector: CSS selector for the input.
+            value: The text to enter.
+            ai: AI behavior mode. Defaults to "fallback", which tries the selector first, then AI.
+            prompt: Natural language description of which input to type into.
+            totp_identifier: Identifier of the 2FA code to type, when `value` is a TOTP placeholder.
+            totp_url: URL Skyvern calls to fetch the 2FA code, when `value` is a TOTP placeholder.
+            **kwargs: Playwright options such as `timeout`.
+
+        Returns:
+            The value that was entered.
+        """
         # Backward compatibility
         intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
@@ -899,7 +961,7 @@ class SkyvernPage(Page):
         # For proactive mode, delegate entirely to the AI — it knows how to handle
         # autocomplete via the agent's full action handler.
         if ai == "proactive" and prompt:
-            return await self._ai.ai_input_text(
+            return await self._frame_scoped_ai.ai_input_text(
                 selector=selector,
                 value=value or "",
                 intention=prompt,
@@ -912,7 +974,7 @@ class SkyvernPage(Page):
         if not selector:
             # No selector, fall through to AI fallback below
             if prompt:
-                return await self._ai.ai_input_text(
+                return await self._frame_scoped_ai.ai_input_text(
                     selector=None,
                     value=value or "",
                     intention=prompt,
@@ -947,6 +1009,8 @@ class SkyvernPage(Page):
                 timeout=timeout,
             )
             return result
+        except StaleFrameSelectionError:
+            raise
         except Exception as e:
             redaction_value = actual_value if value_is_sensitive else None
             LOG.info(
@@ -955,7 +1019,7 @@ class SkyvernPage(Page):
                 error=redact_sensitive_value(str(e), redaction_value),
             )
             if prompt:
-                return await self._ai.ai_input_text(
+                return await self._frame_scoped_ai.ai_input_text(
                     selector=None,
                     value=value if resolved_totp_value is not None else actual_value,
                     intention=prompt,
@@ -1071,6 +1135,8 @@ class SkyvernPage(Page):
                 count = await locator.count()
                 if count > 0:
                     return [locator.nth(i) for i in range(min(count, 10))]  # cap at 10
+            except StaleFrameSelectionError:
+                raise
             except Exception:
                 continue
 
@@ -1188,6 +1254,8 @@ class SkyvernPage(Page):
                     return original_value
                 except NoTOTPSecretFound:
                     raise
+                except StaleFrameSelectionError:
+                    raise
                 except Exception as e:
                     redaction_value = value if value_is_sensitive else None
                     redacted_error = redact_sensitive_value(str(e), redaction_value)
@@ -1200,7 +1268,7 @@ class SkyvernPage(Page):
                     selector = None
 
             if intention:
-                return await self._ai.ai_input_text(
+                return await self._frame_scoped_ai.ai_input_text(
                     selector=selector,
                     value=original_value if resolved_totp_value is not None else value,
                     intention=intention,
@@ -1218,7 +1286,7 @@ class SkyvernPage(Page):
             else:
                 return original_value
         elif ai == "proactive" and intention:
-            return await self._ai.ai_input_text(
+            return await self._frame_scoped_ai.ai_input_text(
                 selector=selector,
                 value=value,
                 intention=intention,
@@ -1275,6 +1343,19 @@ class SkyvernPage(Page):
         ai: str | None = "fallback",
         **kwargs: Any,
     ) -> str:
+        """Upload a file to a file input, using a selector, AI, or both.
+
+        Args:
+            selector: CSS selector for the file input.
+            files: URL of the file to upload. One file per call.
+            prompt: Natural language description of which file input to use.
+            ai: AI behavior mode. With the default "fallback", a selector-only call uploads through the
+                selector. When a prompt is passed, the selector is tried first and AI then always runs the
+                upload, using the selector only if it worked.
+
+        Returns:
+            The file URL that was uploaded.
+        """
         # Backward compatibility
         intention = kwargs.pop("intention", None)
         if intention is not None and prompt is None:
@@ -1298,16 +1379,18 @@ class SkyvernPage(Page):
                 try:
                     file_path = await download_file_from_url(
                         files,
-                        organization_id=context.organization_id if context else None,
+                        organization_id=await self._get_file_organization_id(files),
                     )
                     locator = self._locator_scope.locator(selector)
                     await locator.set_input_files(file_path, **kwargs)
+                except StaleFrameSelectionError:
+                    raise
                 except Exception as e:
                     error_to_raise = e
                     selector = None
 
             if prompt:
-                return await self._ai.ai_upload_file(
+                return await self._frame_scoped_ai.ai_upload_file(
                     selector=selector,
                     files=files,
                     intention=prompt,
@@ -1321,7 +1404,7 @@ class SkyvernPage(Page):
             else:
                 return files
         elif ai == "proactive" and prompt:
-            return await self._ai.ai_upload_file(
+            return await self._frame_scoped_ai.ai_upload_file(
                 selector=selector,
                 files=files,
                 intention=prompt,
@@ -1334,7 +1417,7 @@ class SkyvernPage(Page):
         if not files:
             raise ValueError("Parameter 'files' is required but was not provided")
 
-        file_path = await download_file_from_url(files, organization_id=context.organization_id if context else None)
+        file_path = await download_file_from_url(files, organization_id=await self._get_file_organization_id(files))
         locator = self._locator_scope.locator(selector)
         await locator.set_input_files(file_path, timeout=timeout, **kwargs)
         return files
@@ -1426,12 +1509,14 @@ class SkyvernPage(Page):
                     locator = self._locator_scope.locator(selector)
                     await locator.select_option(value, timeout=timeout, **kwargs)
                     return value
+                except StaleFrameSelectionError:
+                    raise
                 except Exception as e:
                     error_to_raise = e
                     selector = None
 
             if prompt:
-                return await self._ai.ai_select_option(
+                return await self._frame_scoped_ai.ai_select_option(
                     selector=selector,
                     value=value,
                     intention=prompt,
@@ -1443,7 +1528,7 @@ class SkyvernPage(Page):
             else:
                 return value
         elif ai == "proactive" and prompt:
-            return await self._ai.ai_select_option(
+            return await self._frame_scoped_ai.ai_select_option(
                 selector=selector,
                 value=value,
                 intention=prompt,
@@ -1461,6 +1546,11 @@ class SkyvernPage(Page):
         seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
+        """Pause the script for a fixed time, recorded as a wait action.
+
+        Args:
+            seconds: How long to wait, in seconds.
+        """
         timeout_ms = kwargs.pop("timeout_ms", None)
         if seconds is not None:
             await asyncio.sleep(seconds)
@@ -1496,6 +1586,10 @@ class SkyvernPage(Page):
         """
         return
 
+    async def _get_file_organization_id(self, file_url: str) -> str | None:
+        context = skyvern_context.current()
+        return context.organization_id if context else None
+
     @action_wrap(ActionType.DOWNLOAD_FILE)
     async def download_file(
         self,
@@ -1518,16 +1612,16 @@ class SkyvernPage(Page):
         # Use uuid as fallback for empty file_name, matching handler.py behavior
         file_name = file_name or str(uuid.uuid4())
 
-        context = skyvern_context.current()
         file_path = await download_file_from_url(
             download_url,
             filename=file_name,
-            organization_id=context.organization_id if context else None,
+            organization_id=await self._get_file_organization_id(download_url),
         )
         return file_path
 
     @action_wrap(ActionType.RELOAD_PAGE)
     async def reload_page(self, **kwargs: Any) -> None:
+        """Reload the current page, recorded as an action."""
         await self.page.reload(**kwargs)
         return
 
@@ -1593,7 +1687,7 @@ class SkyvernPage(Page):
         Args:
             prompt: Validation criteria or condition to check
             model: Optional model configuration. Can be either:
-                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
+                   - A dict with model configuration (e.g., {"model_name": "gemini-3.0-flash", "max_tokens": 2048})
                    - A string with just the model name (e.g., "gpt-4")
 
         Returns:
@@ -1607,13 +1701,13 @@ class SkyvernPage(Page):
             # Validation with specific model (as string)
             is_valid = await page.validate(
                 "Check if the order was placed",
-                model="gemini-2.5-flash-lite"
+                model="gemini-3.0-flash"
             )
 
             # Validation with model config (as dict)
             is_valid = await page.validate(
                 "Check if the payment completed",
-                model={"model_name": "gemini-2.5-flash-lite", "max_tokens": 1024}
+                model={"model_name": "gemini-3.0-flash", "max_tokens": 1024}
             )
             ```
         """
@@ -1831,6 +1925,7 @@ class SkyvernPage(Page):
             return True
 
         for idx, value in sorted(mapping.items()):
+            self._raise_if_browser_connection_lost()
             if idx >= len(form_fields) or value is None:
                 continue
             totp_placeholder = value if isinstance(value, str) and is_unresolved_totp_value(value) else None
@@ -1893,6 +1988,8 @@ class SkyvernPage(Page):
                                 self._track_ai_call()
                                 prompt = f"For the question '{label}', select the option closest to '{value}'"
                                 await self.click(selector=selector, ai="fallback", prompt=prompt)
+                            except StaleFrameSelectionError:
+                                raise
                             except Exception:
                                 LOG.warning(
                                     "fill_from_mapping: AI fallback for radio/checkbox group failed, skipping",
@@ -1918,6 +2015,8 @@ class SkyvernPage(Page):
                                     self._track_ai_call()
                                     prompt = f"Select '{value}' from the '{label}' dropdown"
                                     await self.select_option(selector=selector, ai="fallback", prompt=prompt)
+                                except StaleFrameSelectionError:
+                                    raise
                                 except Exception:
                                     LOG.warning(
                                         "fill_from_mapping: select AI fallback failed, skipping", field_label=label
@@ -1993,6 +2092,8 @@ class SkyvernPage(Page):
 
             except NoTOTPSecretFound:
                 raise
+            except StaleFrameSelectionError:
+                raise
             except Exception:
                 LOG.warning(
                     "fill_from_mapping: field fill failed, trying AI fallback",
@@ -2022,6 +2123,8 @@ class SkyvernPage(Page):
                         prompt = f"Fill the '{label}' field with: {value}"
                         await self.fill(selector=selector, ai="fallback", prompt=prompt)
                 except NoTOTPSecretFound:
+                    raise
+                except StaleFrameSelectionError:
                     raise
                 except Exception:
                     LOG.warning("fill_from_mapping: AI fallback also failed", field_label=label, exc_info=True)
@@ -2096,6 +2199,8 @@ class SkyvernPage(Page):
                                     prompt=f"Upload resume file to the '{field_label or 'file upload'}' field",
                                 )
                                 uploaded = True
+                            except StaleFrameSelectionError:
+                                raise
                             except Exception:
                                 LOG.warning(
                                     "fill_from_mapping: file upload failed",
@@ -2106,6 +2211,7 @@ class SkyvernPage(Page):
                             break
                     if uploaded:
                         break
+        self._raise_if_browser_connection_lost()
 
     async def validate_mapping(
         self,
@@ -2256,7 +2362,7 @@ class SkyvernPage(Page):
             ts = datetime.datetime.now().strftime("%H%M%S_%f")[:-3]
             filename = f"{ts}_{label}.html"
             filepath = os.path.join(debug_dir, filename)
-            html = await self.page.content()
+            html = mask_otp_values_in_html(await self.page.content())
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(html)
             LOG.info("_dump_html: saved", path=filepath, size=len(html))
@@ -2309,6 +2415,7 @@ class SkyvernPage(Page):
             if page_num > 0:
                 await asyncio.sleep(1)
 
+            self._raise_if_browser_connection_lost()
             form_fields = await self.extract_form_fields()
 
             # Filter to fillable fields — includes standard inputs AND custom widgets
@@ -2433,6 +2540,8 @@ class SkyvernPage(Page):
                     ai="fallback",
                     prompt="Click the button to save and continue to the next page of the application",
                 )
+            except StaleFrameSelectionError:
+                raise
             except Exception:
                 LOG.info(
                     "fill_multipage_form: next button not found, stopping",
@@ -2504,6 +2613,7 @@ class SkyvernPage(Page):
             except Exception:
                 pass
 
+        self._raise_if_browser_connection_lost()
         elapsed = time.monotonic() - start_time
         LOG.info(
             "fill_multipage_form: completed",
@@ -2912,6 +3022,8 @@ class SkyvernPage(Page):
                 else:
                     self._track_ai_call()
                     await self.fill(selector=selector, value=value, ai="fallback", prompt=prompt)
+        except StaleFrameSelectionError:
+            raise
         except Exception:
             LOG.warning(
                 "fill_form: failed to fill matched field, trying AI fallback",
@@ -2960,6 +3072,8 @@ class SkyvernPage(Page):
             else:
                 self._track_ai_call()
                 await self.fill(selector=selector, ai="proactive", prompt=prompt)
+        except StaleFrameSelectionError:
+            raise
         except Exception:
             LOG.warning(
                 "fill_form: failed to fill unknown field",
@@ -3187,6 +3301,8 @@ class SkyvernPage(Page):
                 await self.fill_autocomplete(selector=selector, value=str(planned_value), ai=None)
             else:
                 await self.fill(selector=selector, value=str(planned_value), ai=None)
+        except StaleFrameSelectionError:
+            raise
         except Exception as primary_err:
             # Try alternate selector before falling back to AI (zero LLM cost)
             alt_selector = self._build_alt_selector(field)
@@ -3213,6 +3329,8 @@ class SkyvernPage(Page):
                     else:
                         raise primary_err  # no alternate strategy for click_group etc.
                     return  # alternate selector worked — skip AI
+                except StaleFrameSelectionError:
+                    raise
                 except Exception:
                     LOG.info("fill_with_planned_value: alternate selector also failed", alternate=alt_selector)
 
@@ -3235,6 +3353,8 @@ class SkyvernPage(Page):
                 else:
                     self._track_ai_call()
                     await self.fill(selector=selector, ai="proactive", prompt=prompt)
+            except StaleFrameSelectionError:
+                raise
             except Exception:
                 LOG.warning("fill_with_planned_value AI fallback also failed", label=label, exc_info=True)
             return
@@ -3256,6 +3376,8 @@ class SkyvernPage(Page):
                         ai="proactive",
                         prompt=f"Fill the '{label}' field with a SHORT value (not an essay). Field type: {hint}",
                     )
+            except StaleFrameSelectionError:
+                raise
             except Exception:
                 pass  # validation is best-effort, don't block on failure
 
@@ -3345,6 +3467,8 @@ class SkyvernPage(Page):
             LOG.info("structural_validate: all checks passed, skipping LLM validation")
             return True
 
+        except StaleFrameSelectionError:
+            raise
         except Exception:
             LOG.warning("structural_validate: check failed, falling back to LLM", exc_info=True)
             return False
@@ -3550,7 +3674,7 @@ class SkyvernPage(Page):
                 )
             ```
         """
-        return await self._ai.ai_element_fallback(
+        return await self._frame_scoped_ai.ai_element_fallback(
             navigation_goal=navigation_goal,
             max_steps=max_steps,
             validate_first=validate_first,
@@ -3572,8 +3696,8 @@ class SkyvernPage(Page):
             schema: Optional JSON schema to structure the response. If provided, the LLM response
                    will be validated against this schema.
             model: Optional model configuration. Can be either:
-                   - A dict with model configuration (e.g., {"model_name": "gemini-2.5-flash-lite", "max_tokens": 2048})
-                   - A string with just the model name (e.g., "gemini-2.5-flash-lite")
+                   - A dict with model configuration (e.g., {"model_name": "gemini-3.0-flash", "max_tokens": 2048})
+                   - A string with just the model name (e.g., "gemini-3.0-flash")
 
         Returns:
             LLM response structured according to the schema if provided, or unstructured response otherwise.
@@ -3684,7 +3808,7 @@ class SkyvernPage(Page):
                 # Try selector first, then AI
                 return AILocator(
                     self.page,
-                    self._ai,
+                    self._frame_scoped_ai,
                     prompt,
                     selector=selector,
                     selector_kwargs=kwargs,
@@ -3697,7 +3821,7 @@ class SkyvernPage(Page):
             if prompt:
                 return AILocator(
                     self.page,
-                    self._ai,
+                    self._frame_scoped_ai,
                     prompt,
                     selector=None,
                     selector_kwargs=kwargs,
@@ -3708,7 +3832,7 @@ class SkyvernPage(Page):
                 # Try AI first, then selector
                 return AILocator(
                     self.page,
-                    self._ai,
+                    self._frame_scoped_ai,
                     prompt,
                     selector=selector,
                     selector_kwargs=kwargs,
@@ -3731,6 +3855,12 @@ class SkyvernPage(Page):
         scroll_y: int,
         **kwargs: Any,
     ) -> None:
+        """Scroll the page by a number of pixels.
+
+        Args:
+            scroll_x: Pixels to scroll horizontally (negative scrolls left).
+            scroll_y: Pixels to scroll vertically (negative scrolls up).
+        """
         await self.page.evaluate(f"window.scrollBy({scroll_x}, {scroll_y})")
 
     @action_wrap(ActionType.KEYPRESS)
@@ -3741,6 +3871,13 @@ class SkyvernPage(Page):
         duration: float = 0,
         **kwargs: Any,
     ) -> None:
+        """Press one or more keys, such as `["Enter"]` or `["Control", "a"]`.
+
+        Args:
+            keys: Keys to press, using Playwright key names.
+            hold: Hold the keys down for `duration` seconds instead of tapping them.
+            duration: How long to hold the keys, in seconds, when `hold` is true.
+        """
         await handler_utils.keypress(self.page, keys, hold=hold, duration=duration)
 
     @action_wrap(ActionType.MOVE)
@@ -3750,6 +3887,12 @@ class SkyvernPage(Page):
         y: int,
         **kwargs: Any,
     ) -> None:
+        """Move the mouse cursor to a point on the page.
+
+        Args:
+            x: Horizontal position in pixels from the left of the viewport.
+            y: Vertical position in pixels from the top of the viewport.
+        """
         await EventStrategyFactory.move_cursor(self.page, x, y)
 
     @action_wrap(ActionType.DRAG)
@@ -3760,6 +3903,13 @@ class SkyvernPage(Page):
         path: list[tuple[int, int]],
         **kwargs: Any,
     ) -> None:
+        """Drag with the mouse from a start point along a path of points.
+
+        Args:
+            start_x: Horizontal start position in pixels.
+            start_y: Vertical start position in pixels.
+            path: Points `(x, y)` to drag through, ending where the mouse is released.
+        """
         await handler_utils.drag(self.page, start_x, start_y, path)
 
     @action_wrap(ActionType.LEFT_MOUSE)

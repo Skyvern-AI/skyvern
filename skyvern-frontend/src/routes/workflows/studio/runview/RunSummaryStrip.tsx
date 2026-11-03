@@ -1,14 +1,17 @@
 import { type ReactNode } from "react";
+import { Link } from "react-router-dom";
 
 import { type WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
 import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
 import { StatusBadge } from "@/components/StatusBadge";
+import { useBrowserProfileQuery } from "@/routes/browserProfiles/hooks/useBrowserProfileQuery";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { statusIsFinalized } from "@/routes/tasks/types";
+import { runIsLogicallyFinal } from "@/routes/workflows/workflowRun/runRetryState";
+import { WorkflowRunAttemptChip } from "@/components/WorkflowRunAttemptChip";
 import { type WorkflowRunTimelineItem } from "@/routes/workflows/types/workflowRunTypes";
 import { TimelineRunCounts } from "@/routes/workflows/workflowRun/WorkflowRunTimeline";
 import { compactLocalDateTime } from "@/util/timeFormat";
@@ -27,7 +30,7 @@ type RunSummaryStripProps = {
 };
 
 /**
- * The Timeline view's one header: status, duration, counts, and the search
+ * The Timeline view's one header: status, run timing, counts, and the search
  * control on a single line. Run-level facts wrap under width pressure; the
  * trailing controls never move. The run id lives in the top bar's "View Run"
  * tab and the browser session/profile ids in the Inputs view.
@@ -39,7 +42,7 @@ export function RunSummaryStrip({
   statusUnavailable = false,
   trailing,
 }: RunSummaryStripProps) {
-  const finalized = statusIsFinalized(workflowRun);
+  const finalized = runIsLogicallyFinal(workflowRun);
   const ranFor =
     finalized && workflowRun.started_at && workflowRun.finished_at
       ? formatElapsed(workflowRun.started_at, workflowRun.finished_at)
@@ -55,6 +58,29 @@ export function RunSummaryStrip({
           ? `Finished ${compactLocalDateTime(workflowRun.finished_at)}`
           : null,
       ].filter((chip): chip is string => Boolean(chip));
+  // failure_category is untyped JSON on the backend, so guard each entry at runtime.
+  const failureEntries = Array.isArray(workflowRun.failure_category)
+    ? workflowRun.failure_category
+    : [];
+  const signedOutProfileId = failureEntries.some(
+    (entry) => entry?.reason_code === "saved_profile_signed_out",
+  )
+    ? workflowRun.browser_profile_id
+    : null;
+  // Reasons lack session source, so use a general session-list link, not a create CTA.
+  const browserSessionEnded = failureEntries.some(
+    (entry) =>
+      entry?.reason_code === "browser_session_expired_before_run" ||
+      entry?.reason_code === "browser_session_closed" ||
+      entry?.reason_code === "browser_session_startup_timeout",
+  );
+  // A run keeps its profile id after the profile is deleted, and the Refresh
+  // dialog cannot open for a deleted profile. Cached data stays successful
+  // until a refetch fails, so only a settled lookup from this visit counts.
+  const signedOutProfile = useBrowserProfileQuery(
+    signedOutProfileId ?? undefined,
+    { retry: false, staleTime: 0 },
+  );
 
   return (
     <div className="flex shrink-0 items-start gap-2 [container-name:status] [container-type:inline-size]">
@@ -62,10 +88,42 @@ export function RunSummaryStrip({
         {!statusUnavailable ? (
           <StatusBadge status={workflowRun.status} collapsible />
         ) : null}
+        {!statusUnavailable ? (
+          <WorkflowRunAttemptChip
+            attempt={workflowRun.attempt}
+            retryPending={workflowRun.retry_pending}
+            nextAttemptAt={workflowRun.next_attempt_at}
+          />
+        ) : null}
         {!statusUnavailable && workflowRun.failure_category?.length ? (
           <FailureCategoryBadge
             failureCategory={workflowRun.failure_category}
           />
+        ) : null}
+        {!statusUnavailable && browserSessionEnded ? (
+          <Link
+            to="/browser-sessions"
+            className="whitespace-nowrap text-blue-700 hover:underline dark:text-blue-400 dark:hover:text-blue-300"
+          >
+            Review browser sessions
+          </Link>
+        ) : null}
+        {!statusUnavailable &&
+        signedOutProfileId &&
+        signedOutProfile.isSuccess &&
+        signedOutProfile.isFetchedAfterMount &&
+        !signedOutProfile.isFetching ? (
+          <Link
+            to={`/browser-profiles/${signedOutProfileId}?refresh=1`}
+            className="whitespace-nowrap text-blue-700 hover:underline dark:text-blue-400 dark:hover:text-blue-300"
+          >
+            Sign in again to refresh
+          </Link>
+        ) : null}
+        {workflowRun.created_at ? (
+          <span className="whitespace-nowrap text-muted-foreground">
+            Created {compactLocalDateTime(workflowRun.created_at)}
+          </span>
         ) : null}
         {duration ? (
           <Tooltip>

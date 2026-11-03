@@ -122,16 +122,7 @@ function BlockDetailHeader({
         data-slot="block-detail-header-primary"
         className="flex items-center gap-2 px-3 py-2"
       >
-        {/* Same glyph, same slot as the timeline row one pane up: status leads,
-            duration trails. The row's glyph is unlabeled because the row text
-            follows it; here it is the only status the header carries. */}
-        <span
-          role="img"
-          aria-label={block.status?.replace("_", " ") ?? "not started"}
-          className="flex shrink-0"
-        >
-          <StatusDot status={block.status} isFinalized={runFinalized} />
-        </span>
+        <StatusDot status={block.status} isFinalized={runFinalized} />
         <WorkflowBlockIcon
           workflowBlockType={block.block_type}
           className="size-4 shrink-0 text-tertiary-foreground"

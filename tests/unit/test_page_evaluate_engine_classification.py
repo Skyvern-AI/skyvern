@@ -234,6 +234,7 @@ async def test_instance_evaluate_forwards_engine_selection(monkeypatch: pytest.M
         evaluate_expression: object,
         timeout_ms: float,
         engine_selection: object = None,
+        bootstrap_expression: object = None,
     ) -> str:
         captured["engine_selection"] = engine_selection
         return "ok"
@@ -257,6 +258,7 @@ async def test_instance_evaluate_expression_forwards_engine_selection(monkeypatc
         evaluate_expression: object,
         timeout_ms: float,
         engine_selection: object = None,
+        bootstrap_expression: object = None,
     ) -> bool:
         captured["engine_selection"] = engine_selection
         return True

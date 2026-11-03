@@ -4,7 +4,7 @@ import {
   PlayIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { type FieldErrors, useForm } from "react-hook-form";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -50,13 +50,15 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { workflowEditorPath } from "./studioNavigation";
 import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
-import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { usePostHog } from "posthog-js/react";
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { usePostHogFeatureFlagVariantKey as useFeatureFlagVariantKey } from "@/hooks/usePostHogFeatureFlag";
 import { CREDENTIAL_FALLBACK_RETRY_FLAG } from "@/util/featureFlags";
 import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
 import { isActivationRun } from "@/util/onboarding/rolloutGating";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { runsApiBaseUrl } from "@/util/env";
 import { parseHeaderJson } from "@/util/secretHeaders";
 import {
   getRecoveryGuidanceRetryContext,
@@ -72,7 +74,6 @@ import {
   CredentialFallbackTrigger,
   CredentialParameter,
   WorkflowApiResponse,
-  WorkflowBlock,
   WorkflowParameter,
   WorkflowParameterTypes,
 } from "./types/workflowTypes";
@@ -87,9 +88,13 @@ import {
 } from "@/components/ui/tooltip";
 import { RotatingCredentialField } from "./components/RotatingCredentialField";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
-import * as env from "@/util/env";
 import {
+  browserTypeSelectionDisabled,
+  extractBrowserTypeSetting,
   parseJsonWorkflowParameterValue,
+  hasBrowserTypeOptions,
+  RESERVED_BROWSER_TYPE_FIELD,
+  useBrowserTypeOptionsQuery,
   validateJsonWorkflowParameterValue,
 } from "./utils";
 import {
@@ -98,28 +103,7 @@ import {
   isAtWillCredentialParameter,
 } from "./runWorkflowCredentials";
 import { useCredentialsQuery } from "./hooks/useCredentialsQuery";
-import { visitWorkflowBlocks } from "./workflowBlockUtils";
-
-/**
- * Recursively finds all login blocks that don't have any credential parameters selected.
- * Checks nested blocks inside for_loop blocks as well.
- */
-function getLoginBlocksWithoutCredentials(
-  blocks: Array<WorkflowBlock>,
-): Array<{ label: string }> {
-  const result: Array<{ label: string }> = [];
-
-  visitWorkflowBlocks(blocks, (block) => {
-    if (block.block_type === "login") {
-      // Login block requires at least one parameter (credential) to be selected
-      if (!block.parameters || block.parameters.length === 0) {
-        result.push({ label: block.label });
-      }
-    }
-  });
-
-  return result;
-}
+import { getLoginBlocksWithoutCredentials } from "./runValidation";
 
 /**
  * Validates the workflow for issues that would prevent it from running.
@@ -133,6 +117,27 @@ function validateWorkflowForRun(
   }
 
   return getLoginBlocksWithoutCredentials(workflow.workflow_definition.blocks);
+}
+
+/**
+ * Compares the raw form values, not the parsed ones: parsing a json parameter
+ * mints a fresh object every call, so comparing after the parse would report
+ * "changed" on every keystroke for any workflow that has one.
+ */
+function isSameRunParameters(
+  previous: Record<string, unknown> | null,
+  next: Record<string, unknown>,
+): boolean {
+  if (previous === null) {
+    return false;
+  }
+  const previousKeys = Object.keys(previous);
+  return (
+    previousKeys.length === Object.keys(next).length &&
+    previousKeys.every(
+      (key) => key in next && Object.is(previous[key], next[key]),
+    )
+  );
 }
 
 // Utility function to omit specified keys from an object
@@ -158,6 +163,7 @@ type Props = {
     browserProfileId: string | null;
     cdpConnectHeaders: Record<string, string> | null;
     runWith: string | null;
+    browserType?: string | null;
   };
 };
 
@@ -236,6 +242,7 @@ type RunWorkflowRequestBody = {
   cdp_connect_headers?: Record<string, string> | null;
   browser_address?: string | null;
   run_with?: "agent" | "code";
+  browser_type?: string | null;
   ai_fallback?: boolean;
 };
 
@@ -274,8 +281,13 @@ export function getRunWorkflowRequestBody(
     cdpConnectHeaders,
     runWith,
     aiFallback,
-    ...parameters
+    ...rest
   } = values;
+
+  // The internal browser-type setting lives under a reserved field name so it never collides with
+  // a workflow input parameter literally named `browserType`; that user parameter stays in `rest`
+  // and reaches the request `data` unchanged.
+  const { browserType, rest: parameters } = extractBrowserTypeSetting(rest);
 
   const parsedParameters = parseValuesForWorkflowRun(
     parameters,
@@ -285,6 +297,9 @@ export function getRunWorkflowRequestBody(
 
   const bsi = browserSessionId?.trim() === "" ? null : browserSessionId;
   const bpi = browserProfileId?.trim() === "" ? null : browserProfileId;
+  // A cleared address is an empty string, which is not an attachment; normalize it to
+  // null so the backend does not read "" as an attachment and 422 against browser_type.
+  const cda = cdpAddress?.trim() === "" ? null : cdpAddress;
   // A live session is the browser for the run and the backend rejects fresh +
   // session together, so an attached session wins and suppresses the fresh flag.
   const startFresh = Boolean(startFreshBrowser) && !bsi;
@@ -302,7 +317,7 @@ export function getRunWorkflowRequestBody(
     // Backend ranks an explicit profile override above start_fresh_browser, so a
     // fresh run must drop the (possibly settings-derived) override to take effect.
     browser_profile_id: startFresh || perInputAgent ? null : bpi,
-    browser_address: cdpAddress,
+    browser_address: cda,
     run_with: runWith,
     ai_fallback: aiFallback ?? true,
   };
@@ -319,6 +334,19 @@ export function getRunWorkflowRequestBody(
 
   if (webhookCallbackUrl) {
     body.webhook_callback_url = webhookCallbackUrl;
+  }
+
+  // Only send an explicit engine; omitting it inherits the workflow / system default and keeps
+  // the legacy wire shape byte-identical for runs that don't set one. An attached browser (session
+  // or remote address) owns its engine, so browser_type is suppressed even if the field held one.
+  if (
+    browserType &&
+    !browserTypeSelectionDisabled({
+      browserSessionId: bsi,
+      browserAddress: cda,
+    })
+  ) {
+    body.browser_type = browserType as string;
   }
 
   if (extraHttpHeaders) {
@@ -519,11 +547,13 @@ function RunWorkflowForm({
   const location = useLocation();
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
+  const postHog = usePostHog();
   const apiCredential = useApiCredential();
   const recoveryGuidanceRetryContext = getRecoveryGuidanceRetryContext(
     location.state,
   );
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
+  const { data: browserTypeOptions } = useBrowserTypeOptionsQuery();
   const loginCredentialInputs = useMemo(
     () => getLoginCredentialInputs({ workflow, workflowParameters }),
     [workflow, workflowParameters],
@@ -559,6 +589,8 @@ function RunWorkflowForm({
     [workflow],
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
+  // Mirrors the backend, which fails a run whose top-level block list is empty.
+  const hasNoBlocks = workflow?.workflow_definition.blocks.length === 0;
   const onboarding = useOnboardingStateOptional();
   const credentialFallbackRetryEnabled =
     useFeatureFlag(CREDENTIAL_FALLBACK_RETRY_FLAG) ?? false;
@@ -599,6 +631,7 @@ function RunWorkflowForm({
         ? JSON.stringify(initialSettings.cdpConnectHeaders)
         : null,
       runWith: deriveRunWith(workflow, initialSettings.runWith),
+      [RESERVED_BROWSER_TYPE_FIELD]: initialSettings.browserType ?? null,
       aiFallback: workflow?.ai_fallback ?? true,
     },
   });
@@ -614,6 +647,10 @@ function RunWorkflowForm({
   const explicitBrowserSessionPicked = Boolean(
     form.watch("browserSessionId")?.trim(),
   );
+  const browserTypeDisabled = browserTypeSelectionDisabled({
+    browserSessionId: form.watch("browserSessionId"),
+    browserAddress: form.watch("cdpAddress"),
+  });
   const hasBlockingParameterError = workflowParameters.some(
     (param) =>
       blockingParameterTypes.has(param.workflow_parameter_type) &&
@@ -621,6 +658,7 @@ function RunWorkflowForm({
   );
 
   const runWorkflowMutation = useMutation({
+    mutationKey: ["runWorkflow"],
     mutationFn: async (values: RunWorkflowFormType) => {
       const client = await getClient(credentialGetter);
       const body = getRunWorkflowRequestBody(
@@ -635,6 +673,10 @@ function RunWorkflowForm({
       >(`/workflows/${workflowPermanentId}/run`, body);
     },
     onSuccess: (response) => {
+      postHog.capture("workflow.run.started", {
+        org_id: workflow?.organization_id,
+        workflow_permanent_id: workflowPermanentId,
+      });
       handleRunWorkflowSuccess(
         response.data?.workflow_run_id,
         recoveryGuidanceRetryContext,
@@ -653,11 +695,7 @@ function RunWorkflowForm({
             });
           },
           onNavigate: (workflowRunId, recoveryGuidanceRetry) => {
-            const runPath = studioEnabled
-              ? `/runs/${workflowRunId}`
-              : env.useNewRunsUrl
-                ? `/runs/${workflowRunId}`
-                : `/agents/${workflowPermanentId}/${workflowRunId}/overview`;
+            const runPath = `/runs/${workflowRunId}`;
             if (recoveryGuidanceRetry) {
               navigate(runPath, {
                 state: { recoveryGuidanceRetry },
@@ -683,6 +721,7 @@ function RunWorkflowForm({
     string,
     unknown
   > | null>(null);
+  const rawRunParametersRef = useRef<Record<string, unknown> | null>(null);
   const [cacheKeyValue, setCacheKeyValue] = useState<string>("");
   const [isFormReset, setIsFormReset] = useState(false);
   const cacheKey = workflow?.cache_key ?? "default";
@@ -745,6 +784,7 @@ function RunWorkflowForm({
         ? JSON.stringify(initialSettings.cdpConnectHeaders)
         : null,
       runWith: deriveRunWith(workflow, initialSettings.runWith),
+      [RESERVED_BROWSER_TYPE_FIELD]: initialSettings.browserType ?? null,
       aiFallback: workflow?.ai_fallback ?? true,
     });
     setIsFormReset(true);
@@ -782,8 +822,12 @@ function RunWorkflowForm({
       cdpAddress,
       runWith,
       aiFallback,
-      ...parameters
+      ...rest
     } = values;
+
+    // Keep the reserved browser-type setting separate from `parameters` so the request builder can
+    // extract it; a workflow param literally named `browserType` stays in `parameters`.
+    const { browserType, rest: parameters } = extractBrowserTypeSetting(rest);
 
     const parsedParameters = parseValuesForWorkflowRun(
       parameters,
@@ -802,6 +846,7 @@ function RunWorkflowForm({
       cdpConnectHeaders,
       cdpAddress,
       runWith,
+      [RESERVED_BROWSER_TYPE_FIELD]: browserType,
       aiFallback,
     });
   }
@@ -819,14 +864,19 @@ function RunWorkflowForm({
       "cdpConnectHeaders",
       "cdpAddress",
       "runWith",
+      "aiFallback",
+      RESERVED_BROWSER_TYPE_FIELD,
     ]);
 
-    const parsedParameters = parseValuesForWorkflowRun(
-      parameters,
-      workflowParameters,
-    );
+    // A settings-only edit still fires this subscription, and a fresh object
+    // would re-render the whole form (every CodeMirror editor in it included)
+    // for a parameter set that did not move.
+    if (isSameRunParameters(rawRunParametersRef.current, parameters)) {
+      return;
+    }
+    rawRunParametersRef.current = parameters;
 
-    setRunParameters(parsedParameters);
+    setRunParameters(parseValuesForWorkflowRun(parameters, workflowParameters));
   }
 
   const handleInvalid = (errors: FieldErrors<RunWorkflowFormType>) => {
@@ -884,7 +934,7 @@ function RunWorkflowForm({
 
                 return {
                   method: "POST",
-                  url: `${env.runsApiBaseUrl}/run/workflows`,
+                  url: `${runsApiBaseUrl}/run/workflows`,
                   body: transformedBody,
                   headers,
                 } satisfies ApiCommandOptions;
@@ -895,7 +945,8 @@ function RunWorkflowForm({
               disabled={
                 runWorkflowMutation.isPending ||
                 hasLoginBlockValidationError ||
-                hasBlockingParameterError
+                hasBlockingParameterError ||
+                hasNoBlocks
               }
             >
               {runWorkflowMutation.isPending && (
@@ -908,6 +959,22 @@ function RunWorkflowForm({
             </Button>
           </div>
         </header>
+
+        {hasNoBlocks && (
+          <Alert>
+            <ExclamationTriangleIcon className="h-4 w-4" />
+            <AlertTitle>This agent has no blocks yet</AlertTitle>
+            <AlertDescription>
+              <Link
+                to={workflowEditorPath(workflowPermanentId, studioEnabled)}
+                className="underline hover:no-underline"
+              >
+                Add a block
+              </Link>{" "}
+              or ask Copilot to build the agent, then run it.
+            </AlertDescription>
+          </Alert>
+        )}
 
         {hasLoginBlockValidationError && isActivation && (
           <CredentialSetupPrompt
@@ -1459,6 +1526,76 @@ function RunWorkflowForm({
               </AccordionTrigger>
               <AccordionContent className="pl-6 pr-1 pt-1">
                 <div className="space-y-8 pt-5">
+                  {hasBrowserTypeOptions(browserTypeOptions) ? (
+                    <FormField
+                      key={RESERVED_BROWSER_TYPE_FIELD}
+                      control={form.control}
+                      name={RESERVED_BROWSER_TYPE_FIELD}
+                      render={({ field }) => {
+                        const current =
+                          field.value === null || field.value === undefined
+                            ? "default"
+                            : (field.value as string);
+                        return (
+                          <FormItem>
+                            <div className="flex gap-16">
+                              <FormLabel>
+                                <div className="w-72">
+                                  <div className="flex items-center gap-2 text-lg">
+                                    Browser Type
+                                  </div>
+                                  <h2 className="text-sm text-muted-foreground">
+                                    Browser engine for this run, overriding the
+                                    agent's setting. Default keeps the agent's
+                                    setting. Google Chrome does not support the
+                                    captcha-solver extension.
+                                  </h2>
+                                </div>
+                              </FormLabel>
+                              <div className="w-full space-y-2">
+                                <FormControl>
+                                  <Select
+                                    value={current}
+                                    onValueChange={(v) =>
+                                      field.onChange(v === "default" ? null : v)
+                                    }
+                                    disabled={browserTypeDisabled}
+                                  >
+                                    <SelectTrigger className="w-48">
+                                      <SelectValue placeholder="Browser Type" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="default">
+                                        Default
+                                      </SelectItem>
+                                      {(browserTypeOptions ?? []).map(
+                                        (option) => (
+                                          <SelectItem
+                                            key={option.value}
+                                            value={option.value}
+                                          >
+                                            {option.label}
+                                          </SelectItem>
+                                        ),
+                                      )}
+                                    </SelectContent>
+                                  </Select>
+                                </FormControl>
+                                {browserTypeDisabled ? (
+                                  <p className="text-sm text-muted-foreground">
+                                    An attached browser session or remote
+                                    address provides its own engine, so the
+                                    browser type can&apos;t be set for this run.
+                                  </p>
+                                ) : null}
+                                <FormMessage />
+                              </div>
+                            </div>
+                          </FormItem>
+                        );
+                      }}
+                    />
+                  ) : null}
                   <FormField
                     key="browserSessionId"
                     control={form.control}

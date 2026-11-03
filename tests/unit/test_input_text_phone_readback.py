@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,20 +10,35 @@ from skyvern.exceptions import (
     InvalidElementForTextInput,
     PhoneNumberInputBrowserInteractionFailed,
     PhoneNumberInputBrowserValidityMismatch,
+    PhoneNumberInputCountryCodeMismatch,
     PhoneNumberInputMismatch,
 )
-from skyvern.webeye.actions.actions import TelInputOutcome, TelInputStrategy
+from skyvern.forge.sdk.models import StepStatus
+from skyvern.webeye.actions.actions import InputTextAction, TelInputOutcome, TelInputStrategy
 from skyvern.webeye.actions.handler import (
     _fill_nanp_tel_with_readback,
     _input_target_log_fields,
-    _log_tel_fallback_fill_digit_counts,
+    _read_back_tel_fallback_fill,
+    _recommendation_drops_dial_code,
+    _tel_fill_recovers_with_source_number,
+    check_phone_number_format,
     verify_phone_input_digits,
 )
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+from tests.unit.helpers import make_organization, make_step, make_task
 
 NANP_DIGITS = "2245550199"
 NANP_E164 = f"+1{NANP_DIGITS}"
 _NOT_INPUTELEMENT_ERROR = "Node is not an HTMLInputElement, HTMLTextAreaElement or HTMLSelectElement"
+_NOW = datetime.now(UTC)
+_ORG = make_organization(_NOW)
+_TASK = make_task(
+    _NOW,
+    _ORG,
+    navigation_payload={"phone": NANP_E164},
+    navigation_goal="Fill out the job application form",
+)
+_STEP = make_step(_NOW, _TASK, step_id="stp-1", status=StepStatus.created, order=0, output=None)
 
 
 class _EngineError(Exception):
@@ -104,7 +120,7 @@ async def test_tel_fallback_readback_sanitizes_exception() -> None:
     locator.input_value = AsyncMock(side_effect=RuntimeError(NANP_DIGITS))
 
     with patch("skyvern.webeye.actions.handler.LOG.warning") as warning_log:
-        counts = await _log_tel_fallback_fill_digit_counts(
+        readback = await _read_back_tel_fallback_fill(
             skyvern_element=_make_element(locator),
             tag_name="input",
             expected_value=NANP_DIGITS,
@@ -112,7 +128,7 @@ async def test_tel_fallback_readback_sanitizes_exception() -> None:
             step_id="stp_1",
         )
 
-    assert counts == (10, None)
+    assert readback == (10, None, None, False)
     assert warning_log.call_args.kwargs == {
         "task_id": "tsk_1",
         "step_id": "stp_1",
@@ -270,7 +286,7 @@ async def test_tel_fill_and_fallback_log_thread_engine_selection() -> None:
             )
             is None
         )
-        await _log_tel_fallback_fill_digit_counts(
+        await _read_back_tel_fallback_fill(
             skyvern_element=element,
             tag_name="input",
             expected_value=NANP_DIGITS,
@@ -402,7 +418,7 @@ async def test_tel_fallback_digit_count_log_never_raises_on_mismatch() -> None:
     locator = MagicMock()
     locator.input_value = AsyncMock(return_value="(224) 555-019")
 
-    await _log_tel_fallback_fill_digit_counts(
+    readback = await _read_back_tel_fallback_fill(
         skyvern_element=_make_element(locator),
         tag_name="input",
         expected_value="(224) 555-0199",
@@ -410,16 +426,209 @@ async def test_tel_fallback_digit_count_log_never_raises_on_mismatch() -> None:
         step_id="stp_1",
     )
 
+    assert readback.country_code_mismatch is None
+
 
 @pytest.mark.asyncio
 async def test_tel_fallback_digit_count_log_swallows_read_errors() -> None:
     locator = MagicMock()
     locator.input_value = AsyncMock(side_effect=RuntimeError("element detached"))
 
-    await _log_tel_fallback_fill_digit_counts(
+    await _read_back_tel_fallback_fill(
         skyvern_element=_make_element(locator),
         tag_name="input",
         expected_value="2245550199",
         task_id="tsk_1",
         step_id="stp_1",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expected_value", "readback", "country_code_mismatch"),
+    [
+        # SKY-18890: the dial code came off the front, leaving the national digits behind the "+".
+        (f"+1 {NANP_DIGITS}", f"+{NANP_DIGITS}", True),
+        # The widget treated a UK national trunk prefix as the calling code.
+        ("+44 7911 123456", "+07911 123456", True),
+        # A "+" in front of the digits given, with nothing saying they are national: a number given
+        # as an international one without its "+" reads exactly the same way.
+        (NANP_DIGITS, f"+{NANP_DIGITS}", False),
+        ("447911123456", "+447911123456", False),
+        # The widget moved the dial code into its picker and kept the national digits.
+        ("+1 (224) 555-0199", "(224) 555-0199", False),
+        # The field regrouped the whole international number it was given.
+        ("+1 (224) 555-0199", "+1 224-555-0199", False),
+        # The field resolved the national digits to an international number of its own.
+        (NANP_DIGITS, NANP_E164, False),
+        # Shortenings that keep the number: a normalized trunk zero and a trimmed extension.
+        ("+44 (0) 7911 123456", "+447911123456", False),
+        (f"{NANP_E164} x12", NANP_E164, False),
+        # Too few digits to be read as a country calling code plus a number.
+        ("5550199", "+5550199", False),
+        # An empty field is not a country the number landed under.
+        (NANP_E164, "+", False),
+    ],
+)
+async def test_tel_fallback_readback_reports_a_wrong_international_reading(
+    expected_value: str, readback: str, country_code_mismatch: bool
+) -> None:
+    locator = MagicMock()
+    locator.input_value = AsyncMock(return_value=readback)
+    element = _make_element(locator)
+    element.get_attr = AsyncMock(return_value=None)
+
+    result = await _read_back_tel_fallback_fill(
+        skyvern_element=element,
+        tag_name="input",
+        expected_value=expected_value,
+        task_id="tsk_1",
+        step_id="stp_1",
+    )
+
+    assert isinstance(result.country_code_mismatch, PhoneNumberInputCountryCodeMismatch) is country_code_mismatch
+
+
+@pytest.mark.asyncio
+async def test_nanp_fill_recovers_plus_prefixed_national_digits_with_e164() -> None:
+    # The ladder types national digits, which an international field reads as a country calling code
+    # plus a number. The digits match, so only the withheld "+1" says the country is wrong; the E.164
+    # attempt puts it back.
+    element = _make_fill_element([f"+{NANP_DIGITS}", f"+{NANP_DIGITS}", NANP_E164])
+
+    mismatch = await _fill_nanp_tel_with_readback(
+        skyvern_element=element,
+        tag_name="input",
+        national_digits=NANP_DIGITS,
+        e164_fallback=NANP_E164,
+    )
+
+    assert mismatch is None
+    assert [call.kwargs["text"] for call in element.input_fill.await_args_list] == [NANP_DIGITS, NANP_E164]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_value", "retry_readback", "recovered"),
+    [
+        (NANP_E164, NANP_E164, True),
+        # The field keeps reading its own leading digits as the calling code, so nothing recovered it.
+        (NANP_E164, f"+{NANP_DIGITS}", False),
+        # A truncated or substituted retry is not a successful recovery.
+        (NANP_E164, f"+1{NANP_DIGITS[:-1]}", False),
+        (NANP_E164, f"+1{NANP_DIGITS[:-1]}8", False),
+        # Explicitly marked optional trunk zero and a constraint-valid NANP +1 rewrite are allowed.
+        ("+44 (0) 7911 123456", "+447911123456", True),
+        (NANP_DIGITS, NANP_E164, True),
+    ],
+)
+async def test_tel_fill_recovery_re_enters_the_number_as_given(
+    source_value: str, retry_readback: str, recovered: bool
+) -> None:
+    element = _make_fill_element([retry_readback])
+    element.get_attr = AsyncMock(return_value=None)
+
+    assert (
+        await _tel_fill_recovers_with_source_number(
+            skyvern_element=element,
+            tag_name="input",
+            source_value=source_value,
+            task_id="tsk_1",
+            step_id="stp_1",
+        )
+        is recovered
+    )
+    element.input_clear.assert_awaited_once()
+    element.input_fill.assert_awaited_once_with(text=source_value)
+
+
+@pytest.mark.asyncio
+async def test_tel_fill_recovery_fails_when_source_readback_is_unavailable() -> None:
+    element = _make_fill_element([])
+
+    assert not await _tel_fill_recovers_with_source_number(
+        skyvern_element=element,
+        tag_name="input",
+        source_value=NANP_E164,
+        task_id="tsk_1",
+        step_id="stp_1",
+    )
+
+
+def test_recommendation_drops_dial_code_with_national_trunk_prefix() -> None:
+    assert _recommendation_drops_dial_code("+44 7911 123456", "07911 123456")
+
+
+@pytest.mark.asyncio
+async def test_phone_readback_keeps_plus_prefixed_digits_without_withheld_evidence() -> None:
+    # Same read-back, no withheld country calling code: the digits given may themselves be an
+    # international number, so the entry is not called wrong.
+    locator = MagicMock()
+    locator.input_value = AsyncMock(return_value=f"+{NANP_DIGITS}")
+
+    await verify_phone_input_digits(tag_name="input", locator=locator, expected_value=NANP_DIGITS)
+
+
+def _format_check_element(placeholder: str | None, autocomplete: str | None) -> MagicMock:
+    element = _make_element(MagicMock())
+    element.get_attr = AsyncMock(
+        side_effect=lambda name, **_: {"placeholder": placeholder, "autocomplete": autocomplete}[name]
+    )
+    return element
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_current_value", "placeholder", "autocomplete", "expected_text"),
+    [
+        # SKY-18890: an international field whose own box holds the dial code keeps it, whether the box
+        # shows the picker's dial code or an earlier attempt at the number.
+        ("+48", None, None, NANP_E164),
+        ("+48 605 550 199", None, None, NANP_E164),
+        ("", "+1 (201) 555-0123", None, NANP_E164),
+        ("", None, "tel", NANP_E164),
+        # A national-number box next to a country-code element still drops the dial code.
+        ("", "(201) 555-0123", None, NANP_DIGITS),
+        ("(201) 555-0123", None, None, NANP_DIGITS),
+        ("+48", None, "tel-national", NANP_DIGITS),
+        # A placeholder whose "+" is prose, not a dial code.
+        ("", "+ Add phone", None, NANP_DIGITS),
+    ],
+)
+async def test_phone_format_check_keeps_the_dial_code_of_an_international_field(
+    field_current_value: str, placeholder: str | None, autocomplete: str | None, expected_text: str
+) -> None:
+    element = _format_check_element(placeholder, autocomplete)
+    llm_response = {
+        "page_info": "a phone field with a country picker",
+        "is_phone_number_input": True,
+        "thought": "a country picker exists, so the country code is handled elsewhere",
+        "phone_number_format": "national digits only",
+        "is_current_format_correct": False,
+        "recommended_phone_number": NANP_DIGITS,
+    }
+
+    with (
+        patch("skyvern.webeye.actions.handler.prompt_engine") as mock_prompt,
+        patch("skyvern.webeye.actions.handler.skyvern_context") as mock_ctx,
+        patch(
+            "skyvern.webeye.actions.handler.get_org_aware_secondary_llm_api_handler",
+            new=MagicMock(return_value=AsyncMock(return_value=llm_response)),
+        ),
+    ):
+        mock_prompt.load_prompt.return_value = "mocked prompt"
+        mock_ctx.ensure_context.return_value = MagicMock(tz_info=UTC)
+        scraped_page = MagicMock()
+        scraped_page.generate_scraped_page_without_screenshots = AsyncMock(return_value=MagicMock())
+
+        text = await check_phone_number_format(
+            value=NANP_E164,
+            action=InputTextAction(element_id="elem-phone", text=NANP_E164),
+            skyvern_element=element,
+            scraped_page=scraped_page,
+            task=_TASK,
+            step=_STEP,
+            field_current_value=field_current_value,
+        )
+
+    assert text == expected_text

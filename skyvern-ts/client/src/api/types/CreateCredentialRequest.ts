@@ -20,6 +20,8 @@ export interface CreateCredentialRequest {
     proxy_session_id?: string;
     /** Rotate the Skyvern-managed proxy sticky-session id when updating this credential. */
     rotate_proxy_session_id?: boolean;
+    /** Login page URL used during the credential test */
+    tested_url?: string;
 }
 
 export namespace CreateCredentialRequest {

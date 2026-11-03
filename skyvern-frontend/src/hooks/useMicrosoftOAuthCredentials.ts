@@ -11,6 +11,7 @@ import {
   MicrosoftOAuthCredentialResponse,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useHasCapability } from "@/store/PageSlots";
 export { MICROSOFT_MAIL_REQUIRED_SCOPES } from "@/util/microsoftScopes";
 
 const BROADCAST_CHANNEL_NAME = "skyvern:microsoft-oauth-credentials";
@@ -132,6 +133,10 @@ export function useMicrosoftOAuthCredentials({
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const canAuthorize = useHasCapability("microsoft_oauth.authorize");
+  const canCallback = useHasCapability("microsoft_oauth.callback");
+  const canUpdate = useHasCapability("microsoft_oauth.update");
+  const canDelete = useHasCapability("microsoft_oauth.delete");
 
   useEffect(() => {
     if (!credentialBroadcastChannel) return;
@@ -172,6 +177,11 @@ export function useMicrosoftOAuthCredentials({
 
   const authorizeMutation = useMutation({
     mutationFn: async (data: CreateMicrosoftOAuthAuthorizeRequest) => {
+      if (!canAuthorize) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client
         .post("/microsoft/oauth/authorize", data)
@@ -191,6 +201,11 @@ export function useMicrosoftOAuthCredentials({
 
   const oauthCallbackMutation = useMutation({
     mutationFn: async (data: CreateMicrosoftOAuthCallbackRequest) => {
+      if (!canCallback) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client
         .post("/microsoft/oauth/callback", data)
@@ -223,6 +238,11 @@ export function useMicrosoftOAuthCredentials({
       credentialId: string;
       credentialName: string;
     }) => {
+      if (!canUpdate) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client
         .patch(`/microsoft/oauth/credentials/${input.credentialId}`, {
@@ -254,6 +274,11 @@ export function useMicrosoftOAuthCredentials({
 
   const deleteCredentialMutation = useMutation({
     mutationFn: async (credentialId: string) => {
+      if (!canDelete) {
+        throw new Error(
+          "Organization admin access is required for this action.",
+        );
+      }
       const client = await getClient(credentialGetter);
       return await client.delete(
         `/microsoft/oauth/credentials/${credentialId}`,

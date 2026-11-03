@@ -9,7 +9,6 @@ hold on an image shipping only stock Playwright.
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -20,8 +19,10 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.config import settings
 from skyvern.exceptions import NoElementFound, ScrapingFailed, ScrapingFailedBlankPage, SkyvernPageAnalysisTimeout
 from skyvern.webeye.browser_engine import BrowserEngineMetadata, BrowserEngineSelection
+from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 _TIMEOUT_REASON_MARKER = "page-analysis timeout"
 
@@ -50,7 +51,11 @@ def _selection(name: str, error_type: type[BaseException], timeout_type: type[Ba
 
 
 def _browser_state(selection: BrowserEngineSelection | None) -> SimpleNamespace:
-    return SimpleNamespace(engine_selection=selection, get_working_page=AsyncMock(return_value=None))
+    return SimpleNamespace(
+        engine_selection=selection,
+        get_working_page=AsyncMock(return_value=None),
+        runtime_event_context=BrowserRuntimeLogContext(),
+    )
 
 
 async def _run_scrape_and_capture(browser_state: SimpleNamespace, error: BaseException) -> ScrapingFailed:
@@ -63,20 +68,6 @@ async def _run_scrape_and_capture(browser_state: SimpleNamespace, error: BaseExc
                 max_retries=0,
             )
     return exc_info.value
-
-
-class _ScraperAsyncio:
-    """Stands in for ``scraper``'s own ``asyncio`` binding so only its sleeps are recorded.
-
-    ``setattr(scraper.asyncio, "sleep", ...)`` mutates the one process-global asyncio module,
-    so any coroutine sleeping on another thread lands in the same recorder.
-    """
-
-    def __init__(self, sleep: AsyncMock) -> None:
-        self.sleep = sleep
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(asyncio, name)
 
 
 def _scraped_page() -> ScrapedPage:
@@ -103,6 +94,7 @@ class TestScrapeWebsiteEmptyTreeRecovery:
             engine_selection=None,
             get_working_page=AsyncMock(return_value=None),
             must_get_working_page=AsyncMock(return_value=page),
+            runtime_event_context=BrowserRuntimeLogContext(browser_runtime="vendor", browser_vendor="vendor-a"),
         )
         cleanup_element_tree = AsyncMock()
         scrape_exclude = AsyncMock()
@@ -110,7 +102,7 @@ class TestScrapeWebsiteEmptyTreeRecovery:
         sleep = AsyncMock()
         log = MagicMock()
         monkeypatch.setattr(scraper, "scrape_web_unsafe", scrape_web_unsafe)
-        monkeypatch.setattr(scraper, "asyncio", _ScraperAsyncio(sleep))
+        monkeypatch.setattr(scraper, "asyncio", ScopedAsyncio(sleep=sleep))
         monkeypatch.setattr(scraper, "LOG", log)
 
         unsafe_kwargs = {
@@ -126,6 +118,7 @@ class TestScrapeWebsiteEmptyTreeRecovery:
             "wait_seconds": 1.25,
             "must_included_tags": ["button"],
             "allow_transient_ui_suppression": True,
+            "navigation_deadline": 123.5,
         }
         return SimpleNamespace(
             browser_state=browser_state,
@@ -182,6 +175,9 @@ class TestScrapeWebsiteEmptyTreeRecovery:
         assert rig.scrape_web_unsafe.await_args_list == [call(**rig.unsafe_kwargs)] * 3
         rig.page.goto.assert_awaited_once_with("https://example.test/path", timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
         assert rig.sleep.await_args_list == [call(3), call(3)]
+        # The terminal line is a rendering-failure numerator; it must split by the browser's runtime.
+        terminal = rig.log.warning.call_args.kwargs
+        assert (terminal["browser_runtime"], terminal["browser_vendor"]) == ("vendor", "vendor-a")
 
     @pytest.mark.asyncio
     async def test_blank_page_failure_bypasses_recovery(self, monkeypatch: pytest.MonkeyPatch) -> None:

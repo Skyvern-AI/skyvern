@@ -1,9 +1,16 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { EditableNodeTitle } from "./EditableNodeTitle";
+import { flushBufferedEditorEdits } from "@/hooks/useDeferredLockedEdit";
 
 afterEach(() => {
   cleanup();
@@ -60,6 +67,38 @@ describe("EditableNodeTitle edit-mode input sizing", () => {
 });
 
 describe("EditableNodeTitle renderIdle seam", () => {
+  test.each(["Enter", "Escape"])(
+    "preserves %s behavior when a transaction flush follows the keypress",
+    (key) => {
+      const onChange = vi.fn();
+      render(
+        <EditableNodeTitle value="Original" editable onChange={onChange} />,
+      );
+      fireEvent.click(screen.getByRole("heading", { name: "Original" }));
+      const input = screen.getByDisplayValue("Original");
+      fireEvent.change(input, { target: { value: "Typed title" } });
+      fireEvent.keyDown(input, { key });
+      act(() => flushBufferedEditorEdits());
+      if (key === "Enter")
+        expect(onChange).toHaveBeenCalledExactlyOnceWith("Typed title");
+      else expect(onChange).not.toHaveBeenCalled();
+    },
+  );
+
+  test("unregisters the live title flusher on unmount", () => {
+    const onChange = vi.fn();
+    const view = render(
+      <EditableNodeTitle value="Original" editable onChange={onChange} />,
+    );
+    fireEvent.click(screen.getByRole("heading", { name: "Original" }));
+    fireEvent.change(screen.getByDisplayValue("Original"), {
+      target: { value: "Typed title" },
+    });
+    view.unmount();
+    act(() => flushBufferedEditorEdits());
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
   test("without renderIdle, idle still renders the default click-to-edit heading (other consumers unchanged)", () => {
     render(<EditableNodeTitle value="Foo" editable onChange={() => {}} />);
 

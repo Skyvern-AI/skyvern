@@ -8,6 +8,7 @@ from fastapi import status
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from typing_extensions import Self
 
+from skyvern.errors.errors import drop_unsolicited_download_errors
 from skyvern.exceptions import (
     InvalidTaskStatusTransition,
     SkyvernHTTPException,
@@ -178,7 +179,7 @@ class TaskRequest(TaskBase):
         url_validation_result = validate_url(url)
 
         if url_validation_result is None:
-            raise SkyvernHTTPException(message=f"Invalid URL: {url}", status_code=status.HTTP_400_BAD_REQUEST)
+            raise SkyvernHTTPException(message="Invalid url: missing host.", status_code=status.HTTP_400_BAD_REQUEST)
 
         self.url = url_validation_result
         return self
@@ -207,7 +208,7 @@ class TaskRequest(TaskBase):
         if not url:
             return url
 
-        return validate_url(url)
+        return validate_url(url, field_name="totp_verification_url")
 
 
 class PromptedTaskRequest(TaskRequest):
@@ -333,6 +334,7 @@ class Task(TaskBase):
     )
     organization_id: str
     workflow_run_id: str | None = None
+    attempt_number: int | None = None
     workflow_permanent_id: str | None = None
     browser_session_id: str | None = None
     order: int | None = None
@@ -418,7 +420,7 @@ class Task(TaskBase):
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             downloaded_file_urls=[file.url for file in downloaded_files] if downloaded_files else None,
-            errors=self.errors,
+            errors=drop_unsolicited_download_errors(self.errors, downloaded_files=downloaded_files),
             max_steps_per_run=self.max_steps_per_run,
             workflow_run_id=self.workflow_run_id,
             max_screenshot_scrolls=self.max_screenshot_scrolls,
@@ -493,7 +495,7 @@ class TaskOutput(BaseModel):
             status=task.status,
             extracted_information=task.extracted_information,
             failure_reason=task.failure_reason,
-            errors=task.errors,
+            errors=drop_unsolicited_download_errors(task.errors, downloaded_files=downloaded_files),
             failure_category=task.failure_category,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,

@@ -25,7 +25,16 @@ class LLMAPIHandler(Protocol):
         window_dimension: Resolution | None = None,
         force_dict: bool = True,
         system_prompt: str | None = None,
+        recording_attempt_id: str | None = None,
+        interpretation_session_id: str | None = None,
     ) -> Awaitable[dict[str, Any] | Any]: ...
+
+
+def handler_llm_key(handler: LLMAPIHandler) -> str | None:
+    # Handlers are plain callables: the factory attaches .llm_key dynamically, and bound LLMCaller
+    # methods carry it on __self__ (mirrors LLMAPIHandlerFactory._maybe_get_flex_handler).
+    key = getattr(handler, "llm_key", None) or getattr(getattr(handler, "__self__", None), "llm_key", None)
+    return key if isinstance(key, str) else None
 
 
 async def dummy_llm_api_handler(
@@ -45,5 +54,7 @@ async def dummy_llm_api_handler(
     window_dimension: Resolution | None = None,
     force_dict: bool = True,
     system_prompt: str | None = None,
+    recording_attempt_id: str | None = None,
+    interpretation_session_id: str | None = None,
 ) -> dict[str, Any] | Any:
     raise NotImplementedError("Your LLM provider is not configured. Please configure it in the .env file.")

@@ -5,6 +5,7 @@ export const TotpType = {
     Authenticator: "authenticator",
     Email: "email",
     Text: "text",
+    Passkey: "passkey",
     None: "none",
 } as const;
 export type TotpType = (typeof TotpType)[keyof typeof TotpType];

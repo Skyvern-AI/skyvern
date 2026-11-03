@@ -12,6 +12,7 @@ capture, or a secret value all leave a bare success with no evidence.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -38,6 +39,12 @@ _COMMITTED_VALUE = "Backend Engineer (Remote)"
 # probe left "California" in the control, so the click produces a real transition.
 _COMPOSITE_LABEL = "CA - California"
 _TYPED_PRE = "California"
+
+# Incident-shaped padded row: the account digits fall after ~90 chars of inter-span whitespace, so the raw
+# label overflows the 120-char field cap with the digits last. Synthetic values only.
+_PADDED_NAME = "SYNTHETIC WELLNESS GROUP EAP"
+_PADDED_DIGITS = "1234567890123"
+_PADDED_LABEL = _PADDED_NAME + "\n" + " " * 40 + "\n" + " " * 40 + "\n" + " " * 8 + "Account: " + _PADDED_DIGITS
 
 
 def _control(tag: str = "input") -> MagicMock:
@@ -157,6 +164,17 @@ class TestCommitEvidenceGate:
         # Each is a nonempty, differing pre->post that the old gate accepted; requiring both to be
         # boundary-delimited fragments of the clicked option label rejects them.
         assert handler._autocomplete_commit_evidence(pre, post, label) is None
+
+    def test_committed_option_collapses_whitespace_so_late_digits_survive_truncation(self) -> None:
+        # SKY-6657 F1: a padded row whose account digits fall after ~90 whitespace chars overflows the 120-char
+        # cap; the receipt must collapse whitespace before truncation so the full identity survives.
+        evidence = handler._autocomplete_commit_evidence(_PADDED_DIGITS, _PADDED_NAME, _PADDED_LABEL)
+        assert evidence is not None
+        committed_option, committed_value = evidence
+        assert committed_option == f"{_PADDED_NAME} Account: {_PADDED_DIGITS}"
+        assert _PADDED_DIGITS in committed_option
+        assert len(committed_option) <= handler.SELECT_SHADOW_MATCH_FIELD_MAX_CHARS
+        assert committed_value == _PADDED_NAME
 
     def test_no_evidence_when_post_equals_pre(self) -> None:
         assert handler._autocomplete_commit_evidence(_TYPED_PRE, _TYPED_PRE, _COMPOSITE_LABEL) is None
@@ -707,3 +725,39 @@ class TestCommitEvidenceSerialization:
         assert "committed_value" not in history[0]["result"]
         assert history[1]["result"]["committed_option"] == _OPTION_TEXT
         assert history[1]["result"]["committed_value"] == _COMMITTED_VALUE
+
+
+class TestPaddedReceiptReachesVerifierPrompt:
+    """Chromium-less complement for the autocomplete-click producer: the collapsed receipt survives real
+    action-history serialization and the real completion-verifier prompt so the account identity stays readable."""
+
+    @pytest.mark.asyncio
+    async def test_padded_receipt_identity_survives_history_and_verifier_prompt(self) -> None:
+        # The name+digits identity comes only from the receipt (the action's typed text is digits-only and the
+        # history projection omits text), so its presence in the rendered prompt proves the receipt survived.
+        result = await _run_producer(
+            pre_values=[_PADDED_DIGITS, _PADDED_NAME, _PADDED_NAME], option_label=_PADDED_LABEL
+        )
+        assert isinstance(result, ActionSuccess)
+        identity = f"{_PADDED_NAME} Account: {_PADDED_DIGITS}"
+        assert result.committed_option == identity
+
+        action = InputTextAction(element_id="AADC", text=_PADDED_DIGITS, reasoning="type the account number")
+        history = await _history_for([(action, [result])])
+        assert history[0]["result"]["committed_option"] == identity
+
+        from skyvern.forge.prompts import prompt_engine
+
+        rendered = prompt_engine.load_prompt(
+            "check-user-goal-with-termination",
+            action_history=json.dumps(history),
+            navigation_goal="Select the requested account in the dropdown",
+            navigation_payload="{}",
+            complete_criterion="",
+            terminate_criterion="",
+            elements="",
+            local_datetime="",
+            big_goal_context="",
+            new_elements_ids="",
+        )
+        assert identity in rendered  # the verifier reads the full identity from the Action History receipt

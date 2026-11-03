@@ -13,13 +13,16 @@ from skyvern.utils.secret_redaction import REDACTED_SECRET_PLACEHOLDER, redact_s
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret
 
 
-def _context_with_secret(workflow_run_id: str, token: str, value: str) -> WorkflowRunContext:
+def _context_with_secret(
+    workflow_run_id: str, token: str, value: str, *, mask_secrets: bool = False
+) -> WorkflowRunContext:
     context = WorkflowRunContext(
         workflow_title="t",
         workflow_id="w",
         workflow_permanent_id="wp",
         workflow_run_id=workflow_run_id,
         aws_client=MagicMock(),
+        mask_secrets=mask_secrets,
     )
     context.secrets[token] = value
     return context
@@ -29,9 +32,38 @@ def test_redact_prompt_text_removes_real_secret_and_keeps_placeholder(monkeypatc
     redacted = api_handler_factory._redact_prompt_text(
         "password real-password id placeholder_ab12_password",
         {"real-password"},
+        {"placeholder_ab12_password"},
     )
 
     assert redacted == f"password {REDACTED_SECRET_PLACEHOLDER} id placeholder_ab12_password"
+
+
+def test_prompt_exempts_the_runs_own_token_but_not_a_lookalike(monkeypatch) -> None:
+    """SKY-17864: the exemption is by registered id, not by the ``placeholder_`` shape. A credential
+    whose value is literally "password" must keep the field name in the token the model types back,
+    and the same text behind an unregistered prefix must still be scrubbed.
+    """
+    workflow_run_id = "wr_suffix"
+    token = "placeholder_cd34_password"
+    monkeypatch.setattr(api_handler_factory.settings, "ENABLE_SECRET_ARTIFACT_REDACTION", True)
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts[workflow_run_id] = _context_with_secret(
+        workflow_run_id, token, "password", mask_secrets=True
+    )
+    monkeypatch.setattr(forge_app, "WORKFLOW_CONTEXT_MANAGER", manager)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=workflow_run_id)):
+        secret_values = api_handler_factory._current_secret_values_for_redaction()
+        placeholder_ids = api_handler_factory._current_placeholder_ids_for_redaction()
+        redacted = api_handler_factory._redact_prompt_text(
+            f"type {token}, never placeholder_password", secret_values, placeholder_ids
+        )
+
+    assert secret_values == {"password"}
+    assert placeholder_ids == frozenset({token})
+    assert redacted == f"type {token}, never placeholder_{REDACTED_SECRET_PLACEHOLDER}"
+    # The surviving token is still the resolvable one, which is the whole point of exempting it.
+    assert get_actual_value_of_parameter_if_secret(workflow_run_id, token) == "password"
 
 
 def test_current_secret_values_for_redaction_respects_workflow_opt_out(
@@ -48,6 +80,21 @@ def test_current_secret_values_for_redaction_respects_workflow_opt_out(
 
     with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_redact")):
         assert api_handler_factory._current_secret_values_for_redaction() == set()
+
+
+def test_secret_values_for_drop_check_ignores_the_numeric_floor_and_the_opt_out(
+    workflow_context_manager_factory: Callable[..., WorkflowContextManager],
+) -> None:
+    manager = workflow_context_manager_factory(
+        workflow_run_id="wr_drop",
+        mask_secrets=False,
+        secrets={"cvv": "123", "pin": "4821", "password": "real-password", "tiny": "ab"},
+    )
+    # The redaction set honors the opt-out (and floors short numbers); the drop-check set does neither,
+    # but still skips values too short to match anything meaningfully.
+    assert manager.get_secret_values_for_run("wr_drop") == set()
+    assert manager.secret_values_for_drop_check("wr_drop") == {"123", "4821", "real-password"}
+    assert manager.secret_values_for_drop_check("wr_unknown") == set()
 
 
 def test_current_secret_values_for_redaction_returns_values_when_workflow_opted_in(
@@ -147,6 +194,10 @@ def test_build_navigation_payload_represents_credential_equal_value_as_placehold
     monkeypatch.setattr(forge_app, "WORKFLOW_CONTEXT_MANAGER", manager)
 
     task = SimpleNamespace(
+        navigation_goal=None,
+        data_extraction_goal=None,
+        complete_criterion=None,
+        terminate_criterion=None,
         task_id="tsk_collision",
         workflow_run_id=workflow_run_id,
         navigation_payload={
@@ -292,27 +343,58 @@ def test_find_secret_placeholder_excludes_totp_sentinel() -> None:
 
 
 def test_synthetic_totp_hint_is_never_tokenized(monkeypatch) -> None:
-    """The synthetic '123456' TOTP format hint injected for the LLM must never become a resolvable
-    credential token, even when a run credential's value is exactly '123456'. The representation pass
-    runs before the hint is injected, so the throwaway hint stays an inert literal.
-    """
+    """The injected decoy stays literal even when it equals a stored credential value."""
     workflow_run_id = "wr_totp_order"
-    context = _context_with_secret(workflow_run_id, "placeholder_pw01_password", "123456")
-    monkeypatch.setattr(context, "totp_secret_value_key", lambda placeholder: "totp_key")
-    monkeypatch.setattr(context, "get_original_secret_value_or_none", lambda key: "totp-seed")
+    decoy = "907182"
+    token = "placeholder_pw01_password"
+    context = _context_with_secret(workflow_run_id, token, decoy)
+    context.secrets[context.totp_secret_value_key("placeholder_tt99_totp")] = "JBSWY3DPEHPK3PXP"
+    monkeypatch.setattr("skyvern.forge.agent._generate_multi_field_totp_hint", lambda digits: decoy)
+    assert context.find_secret_placeholder_for_value(decoy) == token
     manager = WorkflowContextManager()
     manager.workflow_run_contexts[workflow_run_id] = context
     monkeypatch.setattr(forge_app, "WORKFLOW_CONTEXT_MANAGER", manager)
-    monkeypatch.setattr(ForgeAgent, "_should_process_totp", lambda self, scraped_page: True, raising=False)
 
     task = SimpleNamespace(
+        navigation_goal=None,
+        data_extraction_goal=None,
+        complete_criterion=None,
+        terminate_criterion=None,
         task_id="tsk_totp_order",
         workflow_run_id=workflow_run_id,
         navigation_payload={"login": {"totp": "placeholder_tt99_totp"}},
     )
+    box_elements = [
+        {
+            "id": f"box-{index}",
+            "tagName": "input",
+            "attributes": {"type": "text", "maxlength": "1"},
+            "frame": "main.frame",
+            "children": [],
+        }
+        for index in range(6)
+    ]
+    scraped_page = SimpleNamespace(
+        elements=box_elements,
+        element_tree=[
+            {
+                "id": "box-container",
+                "tagName": "div",
+                "attributes": {},
+                "frame": "main.frame",
+                "children": box_elements,
+            }
+        ],
+    )
     agent = object.__new__(ForgeAgent)
-    with skyvern_context.scoped(SkyvernContext(workflow_run_id=workflow_run_id)):
-        result = agent._build_navigation_payload(task, step=SimpleNamespace())  # type: ignore[arg-type]
+    task_context = SkyvernContext(workflow_run_id=workflow_run_id)
+    with skyvern_context.scoped(task_context):
+        result = agent._build_navigation_payload(task, step=SimpleNamespace(), scraped_page=scraped_page)  # type: ignore[arg-type]
 
     assert isinstance(result, dict)
-    assert result["login"]["totp"] == "123456"
+    attempt = task_context.multi_field_totp[task.task_id]
+    hint = result["login"]["totp"]
+    assert hint == attempt.hint_code == decoy
+    assert isinstance(hint, str) and hint.isdigit() and len(hint) == attempt.expected_digits
+    assert hint != "123456"
+    assert context.get_original_secret_value_or_none(hint) is None

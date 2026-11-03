@@ -22,6 +22,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     Block,
     ForLoopBlock,
     JinjaBranchCriteria,
+    LoopBlockExecutedResult,
     PromptBranchCriteria,
     TaskBlock,
     WhileLoopBlock,
@@ -229,6 +230,43 @@ class TestWhileLoopNestedLabelValidation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop_type", [ForLoopBlock, WhileLoopBlock])
+async def test_a_loop_stopped_by_a_child_on_a_sign_in_form_carries_that_fact(loop_type: type[Block]) -> None:
+    inner = TaskBlock(label="inner_task", output_parameter=_make_output_param("inner_task"))
+    failed_child = BlockResult(
+        success=False, output_parameter=inner.output_parameter, status=BlockStatus.failed, sign_in_form_visible=True
+    )
+    executed = LoopBlockExecutedResult(outputs_with_loop_values=[[]], block_outputs=[failed_child], last_block=inner)
+    if loop_type is ForLoopBlock:
+        loop: Block = ForLoopBlock(label="my_for", output_parameter=_make_output_param("my_for"), loop_blocks=[inner])
+        run_loop_body = patch.object(ForLoopBlock, "execute_loop_helper", AsyncMock(return_value=executed))
+    else:
+        loop = _make_while_loop()
+        run_loop_body = patch.object(WhileLoopBlock, "_execute_while_loop_helper", AsyncMock(return_value=executed))
+
+    async def build_block_result(
+        self: Block, *, success: bool, failure_reason: str | None, status: BlockStatus, **kwargs: object
+    ) -> BlockResult:
+        return BlockResult(
+            success=success, failure_reason=failure_reason, output_parameter=self.output_parameter, status=status
+        )
+
+    with (
+        run_loop_body,
+        patch.object(Block, "build_block_result", build_block_result),
+        patch.object(Block, "record_output_parameter_value", AsyncMock()),
+        patch.object(Block, "get_workflow_run_context", return_value=FakeWorkflowRunContext(values={})),
+        patch.object(ForLoopBlock, "get_loop_over_parameter_values", AsyncMock(return_value=[1])),
+        patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app,
+    ):
+        mock_app.DATABASE.observer.update_workflow_run_block = AsyncMock()
+        result = await loop.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_loop")
+
+    assert result.success is False
+    assert result.sign_in_form_visible is True
+
+
 class TestExecuteTopOfLoopSemantics:
     """Condition is evaluated before each iteration."""
 
@@ -236,6 +274,7 @@ class TestExecuteTopOfLoopSemantics:
     async def test_condition_false_on_first_check_skips_body(self) -> None:
         loop_block = _make_while_loop()
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
 
         with (
             patch.object(WhileLoopBlock, "_evaluate_condition", new_callable=AsyncMock, return_value=False),
@@ -265,6 +304,7 @@ class TestExecuteTopOfLoopSemantics:
         inner_result = _make_block_result(inner_block.output_parameter)
 
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
         mock_context.has_value.return_value = False
         mock_context.update_block_metadata = MagicMock()
         mock_context.set_value = MagicMock()
@@ -316,6 +356,7 @@ class TestExecuteTopOfLoopSemantics:
         inner_result = _make_block_result(inner_block.output_parameter)
 
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
         mock_context.has_value.return_value = False
         mock_context.update_block_metadata = MagicMock()
         mock_context.set_value = MagicMock()
@@ -365,6 +406,7 @@ class TestExecuteMaxIterationsCap:
         inner_result = _make_block_result(inner_block.output_parameter)
 
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
         mock_context.has_value.return_value = False
         mock_context.update_block_metadata = MagicMock()
         mock_context.set_value = MagicMock()
@@ -408,6 +450,7 @@ class TestExecuteMaxIterationsCap:
         inner_result = _make_block_result(inner_block.output_parameter)
 
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
         mock_context.has_value.return_value = False
         mock_context.update_block_metadata = MagicMock()
         mock_context.set_value = MagicMock()
@@ -462,6 +505,7 @@ class TestCurrentIndexWrittenBeforeCondition:
         evaluator and asserting the expected write happened first."""
         loop_block = _make_while_loop()
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
         mock_context.update_block_metadata = MagicMock()
         prior_calls_at_first_eval: list[Any] = []
 
@@ -594,6 +638,7 @@ class TestExecuteConditionRenderingErrors:
     async def test_failed_jinja_format_returns_failure_result(self) -> None:
         loop_block = _make_while_loop()
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
 
         async def raise_format_error(_self: Any, _ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             raise FailedToFormatJinjaStyleParameter("{{ ??? }}", "syntax error")
@@ -622,6 +667,7 @@ class TestExecuteConditionRenderingErrors:
     async def test_missing_jinja_variables_returns_failure_result(self) -> None:
         loop_block = _make_while_loop()
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
 
         async def raise_missing(_self: Any, _ctx: Any, **_kw: Any) -> bool:  # type: ignore[override]
             raise MissingJinjaVariables("{{ undefined_var }}", {"undefined_var"})
@@ -659,6 +705,7 @@ class TestExecuteCancellationPropagation:
         canceled_result = _make_block_result(inner_block.output_parameter, status=BlockStatus.canceled)
 
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
         mock_context.has_value.return_value = False
         mock_context.update_block_metadata = MagicMock()
         mock_context.set_value = MagicMock()
@@ -701,6 +748,8 @@ class TestPromptCriteriaEvaluation:
             condition=PromptBranchCriteria(expression="dates on the page are still recent"),
         )
         mock_context = MagicMock()
+        mock_context.cancel_failure_evidence_capture = AsyncMock()
+        mock_context.resolve_block_notes_section.return_value = "Notes for this step:\nCheck recent dates."
 
         with patch(
             "skyvern.forge.sdk.workflow.models.block._evaluate_prompt_branch_conditions_batch",
@@ -717,6 +766,7 @@ class TestPromptCriteriaEvaluation:
 
             assert result is True
             mock_batch.assert_called_once()
+            assert mock_batch.await_args.kwargs["notes_section"] == ("Notes for this step:\nCheck recent dates.")
 
 
 # ---------------------------------------------------------------------------

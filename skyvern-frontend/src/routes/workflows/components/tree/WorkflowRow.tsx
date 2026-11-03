@@ -1,3 +1,4 @@
+import { WorkflowFindingsButton } from "@/components/WorkflowFindingsSlot";
 import React from "react";
 import {
   BookmarkFilledIcon,
@@ -18,16 +19,19 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
-import { WorkflowApiResponse } from "../../types/workflowTypes";
+import {
+  WorkflowApiResponse,
+  workflowCreatedAt,
+} from "../../types/workflowTypes";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
-import { WORKFLOW_TAGGING_FLAG } from "@/util/featureFlags";
+import { useWorkflowTaggingEnabled } from "@/hooks/useWorkflowTaggingEnabled";
 import { workflowEditorPath } from "../../studioNavigation";
 import { HighlightText } from "../HighlightText";
 import { ParameterDisplayInline } from "../ParameterDisplayInline";
 import { TagChipList } from "../tagging/TagChipList";
-import { WorkflowReliabilityBadge } from "../../WorkflowReliabilityBadge";
 import { WorkflowRowActions } from "../WorkflowRowActions";
+import { WorkflowCreatorLabel } from "../WorkflowCreatorLabel";
+import { useCreatorColumnEnabled } from "@/store/WorkflowCreatorContext";
 import { useWorkflowsListContext } from "./WorkflowsListContext";
 import { useNavigate } from "react-router-dom";
 
@@ -75,10 +79,10 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
     handleIconClick,
     onRowDeleted,
   } = useWorkflowsListContext();
+  const showCreator = useCreatorColumnEnabled();
   const studioEnabled = useWorkflowStudioEnabled();
   const navigate = useNavigate();
-  // undefined (OSS / pre-load) shows tagging; only an explicit cloud `false` hides it.
-  const taggingEnabled = useFeatureFlag(WORKFLOW_TAGGING_FLAG) !== false;
+  const taggingEnabled = useWorkflowTaggingEnabled();
 
   const parameterItems = (workflow.workflow_definition?.parameters ?? [])
     .filter((p) => p.parameter_type !== "output")
@@ -113,12 +117,17 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
         <TableCell>
           <span className="text-muted-foreground">-</span>
         </TableCell>
+        {showCreator && (
+          <TableCell>
+            <WorkflowCreatorLabel createdBy={workflow.original_created_by} />
+          </TableCell>
+        )}
         <TableCell className="text-muted-foreground">
-          {compactLocalDateTime(workflow.created_at)}
+          {compactLocalDateTime(workflowCreatedAt(workflow))}
         </TableCell>
         <TableCell>
           <div className="flex justify-end gap-0.5">
-            <Button size="icon" variant="default" disabled>
+            <Button size="icon" variant="secondary" disabled>
               <Pencil2Icon className="h-4 w-4" />
             </Button>
             <Button size="icon" variant="ghost" disabled>
@@ -208,10 +217,13 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                       </Tooltip>
                     </TooltipProvider>
                   )}
-                  <WorkflowReliabilityBadge
+                  <WorkflowFindingsButton
                     reliability={
                       workflowReliabilityMap[workflow.workflow_permanent_id]
                     }
+                    workflowPermanentId={workflow.workflow_permanent_id}
+                    title={workflow.title}
+                    surface="list"
                   />
                 </div>
                 {taggingEnabled && workflowTags && workflowTags.length > 0 ? (
@@ -251,14 +263,25 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                 <span className="text-muted-foreground">-</span>
               )}
             </TableCell>
+            {showCreator && (
+              <TableCell
+                onClick={(event) => {
+                  handleRowClick(event, workflow.workflow_permanent_id);
+                }}
+              >
+                <WorkflowCreatorLabel
+                  createdBy={workflow.original_created_by}
+                />
+              </TableCell>
+            )}
             <TableCell
               onClick={(event) => {
                 handleRowClick(event, workflow.workflow_permanent_id);
               }}
               className="text-muted-foreground"
-              title={basicTimeFormat(workflow.created_at)}
+              title={basicTimeFormat(workflowCreatedAt(workflow))}
             >
-              {compactLocalDateTime(workflow.created_at)}
+              {compactLocalDateTime(workflowCreatedAt(workflow))}
             </TableCell>
             <TableCell>
               <div className="flex justify-end gap-0.5">
@@ -267,7 +290,7 @@ function WorkflowRow({ workflow, depth = 0 }: WorkflowRowProps) {
                     <TooltipTrigger asChild>
                       <Button
                         size="icon"
-                        variant="default"
+                        variant="secondary"
                         onClick={(event) => {
                           handleIconClick(
                             event,

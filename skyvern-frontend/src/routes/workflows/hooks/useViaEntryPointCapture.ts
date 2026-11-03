@@ -2,6 +2,7 @@ import { usePostHog } from "posthog-js/react";
 import { useSearchParams } from "react-router-dom";
 
 import { useMountEffect } from "@/hooks/useMountEffect";
+import { TEMPLATE_VIA } from "../templateGuidance";
 
 // Fires once on mount when a `?via=` entry point is present. Lives in a hook so
 // every editor surface a handoff can land on reports it — the studio
@@ -11,7 +12,7 @@ export function useViaEntryPointCapture(): void {
   const posthog = usePostHog();
   useMountEffect(() => {
     const via = searchParams.get("via");
-    if (via) {
+    if (via && via !== TEMPLATE_VIA) {
       posthog?.capture("copilot.discover.started", { entry_point: via });
     }
   });

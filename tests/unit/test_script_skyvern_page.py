@@ -10,30 +10,63 @@ and wait() (accepts both seconds= and timeout_ms= parameter styles).
 import asyncio
 import contextlib
 import inspect
+import os
 import re
 import time
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+import skyvern.forge.api_app as api_app_module
+import skyvern.forge.sdk.artifact.manager as artifact_manager_module
+import skyvern.forge.sdk.artifact.storage.base as storage_base_module
+import skyvern.forge.sdk.artifact.storage.local as local_storage_module
+import skyvern.forge.sdk.workflow.service as workflow_service_module
+import skyvern.library.embedded_server_factory as embedded_server_module
 from skyvern.config import settings
+from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
+from skyvern.core.script_generations import skyvern_page as skyvern_page_module
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.core.script_generations.skyvern_page import ResolvedSensitiveValue, SkyvernPage
+from skyvern.errors.errors import UserDefinedError
 from skyvern.exceptions import (
+    FailedToNavigateToUrl,
     IllegitCompleteScriptTermination,
+    MissingBrowserState,
     NoTOTPSecretFound,
     ScriptTerminationException,
     SkyvernActionFailed,
     SkyvernHTTPException,
+    StaleFrameSelectionError,
 )
+from skyvern.forge.sdk.api import files as files_module
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
+from skyvern.forge.sdk.artifact.models import Artifact
+from skyvern.forge.sdk.artifact.storage.local import LocalStorage
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.library.skyvern import Skyvern
+from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.services import script_service
+from skyvern.webeye import navigation as navigation_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.handler import ActionHandler
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionSuccess
+from skyvern.webeye.skycdp.facade.page import Frame as CdpFrame
+from skyvern.webeye.utils.page import SkyvernFrame
+from tests.unit._task_block_fakes import run_bound_browser_state
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 class _KeyboardStub:
@@ -79,7 +112,7 @@ def _selected_engine():
 
 class _ScrapedPageStub:
     def __init__(self) -> None:
-        self._browser_state = SimpleNamespace()
+        self._browser_state = SimpleNamespace(begin_navigation=MagicMock(), record_navigation_result=AsyncMock())
 
 
 @pytest.fixture(autouse=True)
@@ -132,6 +165,69 @@ async def test_page_navigation_accepts_public_destination(page_type, mock_scrape
     await page.goto("https://93.184.216.34/path")
 
     raw_page.goto.assert_awaited_once()
+    if page_type is ScriptSkyvernPage:
+        mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(
+            None,
+            url="https://93.184.216.34/path",
+        )
+
+
+@pytest.mark.asyncio
+async def test_script_page_reports_deferred_navigation_failure(mock_scraped_page, mock_ai):
+    page, raw_page = _build_navigation_page(ScriptSkyvernPage, mock_scraped_page, mock_ai)
+    error = RuntimeError("net::ERR_INVALID_AUTH_CREDENTIALS")
+    raw_page.goto = AsyncMock(side_effect=error)
+
+    with pytest.raises(RuntimeError, match="ERR_INVALID_AUTH_CREDENTIALS"):
+        await page.goto("https://93.184.216.34/path", max_retries=1)
+
+    mock_scraped_page._browser_state.begin_navigation.assert_called_once_with()
+    mock_scraped_page._browser_state.record_navigation_result.assert_awaited_once_with(error)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seam", "dispatches", "backoffs"),
+    [
+        ("native_close_during_goto", 1, 0),
+        ("ordinary_navigation_error", 5, 4),
+        ("native_close_during_backoff", 1, 1),
+        ("lost_before_first_dispatch", 0, 0),
+    ],
+)
+async def test_script_page_stops_retrying_navigation_after_native_browser_loss(
+    seam: str, dispatches: int, backoffs: int, mock_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from skyvern.core.script_generations import script_skyvern_page as module
+
+    browser_state, context = run_bound_browser_state("wr_script")
+    context._skyvern_cdp_download_interceptor = None
+    scraped_page = SimpleNamespace(_browser_state=browser_state)
+    page, raw_page = _build_navigation_page(ScriptSkyvernPage, scraped_page, mock_ai)
+
+    async def goto(url: str, **_: object) -> None:
+        if seam == "native_close_during_goto":
+            browser_state._on_browser_context_closed(context)
+            raise PlaywrightError("Target page, context or browser has been closed")
+        raise PlaywrightError("Timeout 30000ms exceeded.")
+
+    async def lose_browser_while_waiting(_: float) -> None:
+        if seam == "native_close_during_backoff":
+            browser_state._on_browser_context_closed(context)
+
+    raw_page.goto = AsyncMock(side_effect=goto)
+    backoff = AsyncMock(side_effect=lose_browser_while_waiting)
+    monkeypatch.setattr(module, "asyncio", ScopedAsyncio(sleep=backoff))
+    if seam == "lost_before_first_dispatch":
+        browser_state._on_browser_context_closed(context)
+
+    with pytest.raises(MissingBrowserState if seam == "lost_before_first_dispatch" else PlaywrightError) as error:
+        await page.goto("https://93.184.216.34/path", max_retries=5)
+
+    assert raw_page.goto.await_count == dispatches
+    assert backoff.await_count == backoffs
+    if seam == "native_close_during_backoff":
+        assert "Timeout 30000ms exceeded." in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -584,6 +680,29 @@ async def test_terminate_raises_script_termination_exception_without_context(moc
 
 
 @pytest.mark.asyncio
+async def test_solve_captcha_context_free_fallback_arms_lifecycle_scope(mock_scraped_page, mock_ai, monkeypatch):
+    """The context-free solve_captcha fallback (no org/task/step) must arm the vendor solver lifecycle
+    around auto_solve_captchas — enter, solve, exit — or a factory-created (solver-off) session never arms."""
+    from skyvern.forge import app
+    from tests.unit.conftest import ScopeRecordingAgentFunction
+
+    agent_function = ScopeRecordingAgentFunction(auto_solve=True)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+    script_page = _make_script_page(mock_scraped_page, mock_ai)
+
+    with (
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.skyvern_context.current",
+            return_value=None,
+        ),
+        patch.object(script_page, "_wait_for_page_ready_before_action", new=AsyncMock()),
+    ):
+        await script_page.solve_captcha()
+
+    assert agent_function.events == ["enter", "solve", "exit"]
+
+
+@pytest.mark.asyncio
 async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
     """
     When context, task, and step are available, terminate() should call
@@ -609,6 +728,15 @@ async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
         mock_context.action_order = 0
 
         mock_task = MagicMock()
+        mock_task.error_code_mapping = {"unavailable": "The requested item is unavailable"}
+        mapped_error = UserDefinedError(
+            error_code="unavailable", reasoning="The requested item is unavailable", confidence_float=1.0
+        )
+
+        async def classify(action, *_args):
+            action.errors = [mapped_error]
+            return [MagicMock(success=True)]
+
         mock_step = MagicMock()
         mock_step.order = 0
 
@@ -630,11 +758,13 @@ async def test_terminate_calls_handler_and_raises(mock_scraped_page, mock_ai):
             patch(
                 "skyvern.core.script_generations.script_skyvern_page.handle_terminate_action",
                 new_callable=AsyncMock,
-                return_value=[MagicMock(success=True)],
+                side_effect=classify,
             ) as mock_handler,
         ):
-            with pytest.raises(ScriptTerminationException, match="Terminate called: error1; error2"):
+            with pytest.raises(ScriptTerminationException, match="Terminate called: error1; error2") as raised:
                 await script_page.terminate(errors=["error1", "error2"])
+
+            assert raised.value.user_defined_errors == [mapped_error]
 
             # Verify handler was called with correct arguments
             mock_handler.assert_called_once()
@@ -1567,6 +1697,7 @@ async def test_input_text_rejects_raw_totp_markers_in_direct_mode(mock_scraped_p
 @pytest.mark.asyncio
 async def test_real_page_ai_rejects_raw_totp_placeholder_before_fallback() -> None:
     page_ai = RealSkyvernPageAi.__new__(RealSkyvernPageAi)
+    page_ai.scraped_page = SimpleNamespace(_browser_state=None)
     page_ai._maybe_run_v3_midrun = AsyncMock(return_value=(None, False))
 
     with (
@@ -1757,6 +1888,55 @@ class TestActionSubclassPersistence:
                 action_type=action_type,
                 kwargs=kwargs,
             )
+
+    @pytest.mark.asyncio
+    async def test_native_download_records_the_url_fetch_even_with_ignored_byte_kwargs(
+        self, mock_scraped_page, mock_ai
+    ):
+        script_page = self._build_script_page(mock_scraped_page, mock_ai)
+        script_page._wait_for_page_ready_before_action = AsyncMock()
+        script_page._create_screenshot_after_execution = AsyncMock()
+        script_page._create_html_action_after_execution = AsyncMock()
+        context = self._build_context()
+        captured = []
+
+        async def save_action(action):
+            captured.append(action)
+            return action
+
+        with (
+            patch("skyvern.core.script_generations.script_skyvern_page.skyvern_context.current", return_value=context),
+            patch(
+                "skyvern.core.script_generations.skyvern_page.download_file_from_url",
+                new=AsyncMock(return_value="/synthetic/report.pdf"),
+            ) as fetch,
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.create_action",
+                new=AsyncMock(side_effect=save_action),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.app.DATABASE.workflow_params.update_action_reasoning",
+                new=AsyncMock(),
+            ),
+            patch(
+                "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager.get_run_context",
+                return_value=None,
+            ),
+            patch.object(settings, "CACHED_ACTION_DELAY_SECONDS", 0),
+        ):
+            path = await script_page.download_file(
+                file_name="report.pdf", download_url="https://example.com/report.pdf", byte=b"ignored bytes"
+            )
+
+        assert path == "/synthetic/report.pdf"
+        fetch.assert_awaited_once_with(
+            "https://example.com/report.pdf", filename="report.pdf", organization_id="o_test"
+        )
+        action = captured[0]
+        assert action.status == "completed" and action.created_by == "script"
+        assert action.download is True
+        assert action.file_name == "report.pdf" and action.download_url == "https://example.com/report.pdf"
+        assert action.download_triggered is None and action.downloaded_files is None
 
     @pytest.mark.asyncio
     async def test_move_persists_x_and_y(self, mock_scraped_page, mock_ai):
@@ -2514,24 +2694,28 @@ class _RecordingLocator:
 
 
 class _RecordingLocatorScope:
-    def __init__(self, locator: _RecordingLocator) -> None:
+    def __init__(self, locator: _RecordingLocator, page: object) -> None:
         self._locator = locator
+        self.page = page
+        self.name = "checkout"
+        self.url = "https://pay.example.com/checkout"
 
     def locator(self, _selector: str, **_kwargs: object) -> _RecordingLocator:
         return self._locator
 
 
 def _direct_fill_page(mock_scraped_page, mock_ai, locator: _RecordingLocator) -> ScriptSkyvernPage:
+    raw_page = create_mock_page()
     with patch(
         "skyvern.core.script_generations.skyvern_page.Page.__init__",
         return_value=None,
     ):
         script_page = ScriptSkyvernPage(
             scraped_page=mock_scraped_page,
-            page=create_mock_page(),
+            page=raw_page,
             ai=mock_ai,
         )
-    script_page._working_frame = _RecordingLocatorScope(locator)
+    script_page._working_frame = _RecordingLocatorScope(locator, raw_page)
     return script_page
 
 
@@ -2550,7 +2734,7 @@ def _skyvern_page_with_locator(
             ai=mock_ai,
             engine_selection=engine_selection,
         )
-    skyvern_page._working_frame = _RecordingLocatorScope(locator)
+    skyvern_page._working_frame = _RecordingLocatorScope(locator, raw_page)
     return skyvern_page
 
 
@@ -2895,6 +3079,183 @@ async def test_post_dispatch_timeout_after_escape_skips_ai_fallback(mock_ai, eng
     mock_ai.ai_click.assert_not_awaited()
 
 
+_TARGET_CLOSED = "Target page, context or browser has been closed"
+
+
+def _run_bound_script_page(ai: object, locators: dict[str, object]) -> tuple[ScriptSkyvernPage, object, MagicMock]:
+    """A cached-script page whose scraped page carries a real run-bound browser state."""
+    browser_state, browser_context = run_bound_browser_state("wr_script")
+    raw_page = create_mock_page()
+    raw_page.keyboard = MagicMock(press=AsyncMock())
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(
+            scraped_page=SimpleNamespace(_browser_state=browser_state), page=raw_page, ai=ai
+        )
+    script_page._working_frame = MagicMock(page=raw_page, locator=MagicMock(side_effect=lambda s, **_: locators[s]))
+    return script_page, browser_state, browser_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    # expected: page-ready waits, selector waits, clicks, Escape presses, AI fallbacks
+    ("seam", "expected"),
+    [
+        ("lost_before_the_action", [0, 0, 0, 0, 0]),
+        ("lost_during_the_page_ready_wait", [1, 0, 0, 0, 0]),
+        ("lost_during_the_selector_backoff", [1, 1, 0, 0, 0]),
+        ("lost_with_the_click_failure", [1, 1, 1, 0, 0]),
+        ("lost_with_a_post_dispatch_click_timeout", [1, 1, 1, 0, 0]),
+        ("lost_during_the_escape_pause", [1, 1, 1, 1, 0]),
+        ("lost_during_the_reclick", [1, 1, 2, 1, 0]),
+        ("ordinary_selector_timeout", [1, 3, 1, 1, 1]),
+        ("ordinary_post_dispatch_click_timeout", [1, 1, 1, 0, 0]),
+    ],
+)
+async def test_cached_click_dispatches_nothing_after_native_browser_loss(
+    monkeypatch: pytest.MonkeyPatch, seam: str, expected: list[int]
+) -> None:
+    ai = _AiStub()
+    ai.ai_click = AsyncMock(return_value="xpath=//button")
+    locator = MagicMock()
+    locator.first = locator
+    page, browser_state, browser_context = _run_bound_script_page(ai, {"#submit": locator})
+    calls: list[str] = []
+    dispatched = PlaywrightTimeoutError("click action done; waiting for scheduled navigations to finish")
+    intercepted = PlaywrightTimeoutError("<div class='overlay'></div> intercepts pointer events")
+    timed_out = PlaywrightTimeoutError("Timeout 5000ms exceeded.")
+    # Per click: (whether the native loss latches during it, what it raises).
+    click_outcomes = {
+        "lost_with_the_click_failure": [(True, PlaywrightError(_TARGET_CLOSED))],
+        "lost_with_a_post_dispatch_click_timeout": [(True, dispatched)],
+        "lost_during_the_escape_pause": [(False, intercepted)],
+        "lost_during_the_reclick": [(False, intercepted), (True, PlaywrightError(_TARGET_CLOSED))],
+        "ordinary_selector_timeout": [(False, timed_out)],
+        "ordinary_post_dispatch_click_timeout": [(False, dispatched)],
+    }
+
+    def lose_browser() -> None:
+        browser_state._on_browser_context_closed(browser_context)
+
+    async def wait_for(*, state: str, **_: object) -> None:
+        if state == "attached":
+            calls.append("attached")
+            if browser_state.get_browser_connection_loss() is not None:
+                raise PlaywrightError(_TARGET_CLOSED)
+            if seam in ("lost_during_the_selector_backoff", "ordinary_selector_timeout"):
+                raise timed_out
+
+    async def click(**_: object) -> None:
+        calls.append("click")
+        if browser_state.get_browser_connection_loss() is not None:
+            raise PlaywrightError(_TARGET_CLOSED)
+        latches, error = click_outcomes[seam][calls.count("click") - 1]
+        if latches:
+            lose_browser()
+        raise error
+
+    async def pause(seconds: float) -> None:
+        if (seam, seconds) in (("lost_during_the_selector_backoff", 1.0), ("lost_during_the_escape_pause", 0.3)):
+            lose_browser()
+
+    async def wait_for_page_ready() -> None:
+        calls.append("page_ready")
+        if seam == "lost_during_the_page_ready_wait":
+            lose_browser()
+
+    locator.wait_for = AsyncMock(side_effect=wait_for)
+    locator.scroll_into_view_if_needed = AsyncMock()
+    locator.click = AsyncMock(side_effect=click)
+    monkeypatch.setattr(page, "_wait_for_page_ready_before_action", wait_for_page_ready)
+    monkeypatch.setattr(skyvern_page_module, "asyncio", ScopedAsyncio(sleep=pause))
+    if seam == "lost_before_the_action":
+        lose_browser()
+
+    with skyvern_context.scoped(SkyvernContext(code_version=2)):
+        if seam.startswith("lost"):
+            with pytest.raises(MissingBrowserState):
+                await page.click("#submit", prompt="Click submit")
+        else:
+            result = await page.click("#submit", prompt="Click submit")
+            assert result == ("xpath=//button" if seam == "ordinary_selector_timeout" else "#submit")
+
+    escapes, ai_clicks = page.page.keyboard.press.await_count, ai.ai_click.await_count
+    assert [*(calls.count(call) for call in ("page_ready", "attached", "click")), escapes, ai_clicks] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("browser_lost", "mapping"),
+    [(True, {0: "Noor", 1: "Blue"}), (True, {0: "Noor"}), (False, {0: "Noor", 1: "Blue"})],
+    ids=["lost_before_the_next_field", "lost_on_the_last_field", "ordinary_field_failure"],
+)
+async def test_fill_from_mapping_stops_at_the_field_after_native_browser_loss(
+    browser_lost: bool, mapping: dict[int, str]
+) -> None:
+    ai = _AiStub()
+    ai.ai_input_text = AsyncMock(return_value="Noor")
+    name, color = MagicMock(), MagicMock(select_option=AsyncMock())
+    name.first = name
+    page, browser_state, browser_context = _run_bound_script_page(ai, {"#name": name, "#color": color})
+
+    async def fill(_value: str, **_: object) -> None:
+        if browser_lost:
+            browser_state._on_browser_context_closed(browser_context)
+            raise PlaywrightError(_TARGET_CLOSED)
+        raise RuntimeError("element is not attached to the DOM")
+
+    name.fill = AsyncMock(side_effect=fill)
+    page._wait_for_page_ready_before_action = AsyncMock()  # type: ignore[method-assign]
+    form_fields = [
+        {"selector": "#name", "type": "text", "tag": "input", "label": "Name"},
+        {"selector": "#color", "type": "select-one", "tag": "select", "label": "Color"},
+    ]
+
+    with pytest.raises(MissingBrowserState) if browser_lost else contextlib.nullcontext():
+        await page.fill_from_mapping(form_fields, mapping)
+
+    assert color.select_option.await_count == ai.ai_input_text.await_count == (0 if browser_lost else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seam", ["lost_during_the_next_click", "lost_during_the_page_transition", "ordinary_last_page"]
+)
+async def test_fill_multipage_form_reports_no_pages_after_native_browser_loss(
+    monkeypatch: pytest.MonkeyPatch, seam: str
+) -> None:
+    page, browser_state, browser_context = _run_bound_script_page(_AiStub(), {})
+    pages = [[{"selector": f"#{name}", "type": "text", "tag": "input", "label": name}] for name in ("name", "email")]
+    extract_form_fields = AsyncMock(side_effect=[pages[0], pages[0], pages[1], pages[1]])
+
+    async def click_next(**_: object) -> None:
+        if seam == "lost_during_the_next_click":
+            browser_state._on_browser_context_closed(browser_context)
+        if seam != "lost_during_the_page_transition":
+            raise RuntimeError("no next button")
+
+    async def pause(seconds: float) -> None:
+        if seam == "lost_during_the_page_transition" and seconds == 1:
+            browser_state._on_browser_context_closed(browser_context)
+
+    monkeypatch.setattr(page, "extract_form_fields", extract_form_fields)
+    monkeypatch.setattr(page, "dynamic_field_map", AsyncMock(return_value={0: "Noor"}))
+    monkeypatch.setattr(page, "fill_from_mapping", AsyncMock())
+    monkeypatch.setattr(page, "click", AsyncMock(side_effect=click_next))
+    monkeypatch.setattr(page.page, "evaluate", AsyncMock(return_value=[]), raising=False)
+    ready_frame = SimpleNamespace(wait_for_page_ready=AsyncMock())
+    monkeypatch.setattr(SkyvernFrame, "create_instance", AsyncMock(return_value=ready_frame))
+    monkeypatch.setattr(skyvern_page_module, "asyncio", ScopedAsyncio(sleep=pause))
+
+    if seam == "ordinary_last_page":
+        assert await page.fill_multipage_form({"name": "Noor"}, max_pages=2) == 1
+    else:
+        with pytest.raises(MissingBrowserState):
+            await page.fill_multipage_form({"name": "Noor"}, max_pages=2)
+
+    assert extract_form_fields.await_count == 2
+    assert page.dynamic_field_map.await_count == 1
+
+
 @pytest.mark.asyncio
 async def test_get_or_create_browser_state_forwards_script_id_to_manager(monkeypatch):
     # MUST_FIX 1: the production script caller must forward the active run's script_id so the
@@ -3069,18 +3430,28 @@ class TestScriptSkyvernPageMagicLink:
 
         monkeypatch.setattr(module, "poll_otp_value", fake_poll)
         monkeypatch.setattr(module, "render_template", fake_render)
+        monkeypatch.setattr(module, "default_navigation_settle", AsyncMock())
         monkeypatch.setattr(module.settings, "ALLOWED_HOSTS", ["portal.example.com"])
+        get_task = AsyncMock(return_value=SimpleNamespace(url="https://portal.example.com/login"))
+        monkeypatch.setattr(module.app, "DATABASE", SimpleNamespace(tasks=SimpleNamespace(get_task=get_task)))
 
-        page = SimpleNamespace(goto=fake_goto, fill=fake_fill)
+        page = SimpleNamespace(url="https://customer.auth0.com/callback", goto=fake_goto, fill=fake_fill)
         script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
         script_page.page = page
+        module._set_scraped_page(script_page, SimpleNamespace(_browser_state=None))
         return script_page, state
 
     @staticmethod
     def _with_context():
         from skyvern.forge.sdk.core import skyvern_context
 
-        skyvern_context.set(skyvern_context.SkyvernContext(organization_id="org_1", workflow_run_id="wr_1"))
+        skyvern_context.set(
+            skyvern_context.SkyvernContext(
+                organization_id="org_1",
+                workflow_run_id="wr_1",
+                task_id="task_1",
+            )
+        )
         return skyvern_context
 
     @pytest.mark.asyncio
@@ -3098,6 +3469,8 @@ class TestScriptSkyvernPageMagicLink:
             ctx.reset()
 
         assert state["polled_with"]["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert state["polled_with"]["task_url"] == "https://portal.example.com/login"
+        assert script_page.page.url == "https://customer.auth0.com/callback"
         assert state["navigations"] == [link]
         assert state["fills"] == []
         # The anchor sits one grace interval behind now (naive UTC), so an email that landed
@@ -3110,6 +3483,39 @@ class TestScriptSkyvernPageMagicLink:
         assert anchor.tzinfo is None
         expected_anchor = datetime.now(timezone.utc).replace(tzinfo=None) - MAGIC_LINK_ANCHOR_GRACE
         assert abs((anchor - expected_anchor).total_seconds()) < 30
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "native_close", [True, False], ids=["native_close_during_goto", "ordinary_navigation_error"]
+    )
+    async def test_link_navigation_stops_retrying_after_native_browser_loss(self, monkeypatch, native_close) -> None:
+        from skyvern.core.script_generations import script_skyvern_page as module
+        from skyvern.forge.sdk.schemas.totp_codes import OTPType
+        from skyvern.services.otp_service import OTPValue
+
+        link = "https://portal.example.com/verify?token=x"
+        script_page, state = self._install(monkeypatch, OTPValue(value=link, type=OTPType.MAGIC_LINK))
+        browser_state, context = run_bound_browser_state("wr_1")
+        module._set_scraped_page(script_page, SimpleNamespace(_browser_state=browser_state))
+        monkeypatch.setattr(navigation_module, "asyncio", ScopedAsyncio(sleep=AsyncMock()))
+
+        async def goto(url, **kwargs):
+            state["navigations"].append(url)
+            if native_close:
+                browser_state._on_browser_context_closed(context)
+                raise PlaywrightError("Target page, context or browser has been closed")
+            raise PlaywrightError("Timeout 30000ms exceeded.")
+
+        script_page.page.goto = goto
+
+        ctx = self._with_context()
+        try:
+            with pytest.raises(FailedToNavigateToUrl):
+                await script_page.magic_link(totp_identifier="inbox@example.com")
+        finally:
+            ctx.reset()
+
+        assert state["navigations"] == [link] * (1 if native_close else NAVIGATION_MAX_RETRY_TIME)
 
     @pytest.mark.asyncio
     async def test_a_returned_one_time_code_is_reported_not_navigated_to(self, monkeypatch) -> None:
@@ -3366,8 +3772,9 @@ class TestAiClickRunsRegisteredClickSetup:
         delete_spy.assert_not_awaited()
         assert page_ai._record_element_fallback_episode.await_args.kwargs["v3_parent_episode_id"] == "ep_1"
 
+    @pytest.mark.parametrize("handle_result", [[ActionAbort()], [ActionAbort(desired_state_reached=True)]])
     @pytest.mark.asyncio
-    async def test_handle_click_action_desired_state_noop_discards_the_v3_parent_episode(self):
+    async def test_handle_click_action_desired_state_noop_discards_the_v3_parent_episode(self, handle_result):
         # SKY-14052: handle_click_action's own ClickContext.desired_state guard can suppress the
         # click with an ActionAbort the same way a registered per-site setup does, but it arrives
         # via `handle_result`, not `setup_result` (no per-site setup is registered here). It must
@@ -3375,7 +3782,7 @@ class TestAiClickRunsRegisteredClickSetup:
         page_ai, _locator = self._build_page_ai()
         page_ai._maybe_run_v3_midrun = AsyncMock(return_value=("ep_1", False))
         delete_spy = AsyncMock()
-        with self._patched(setup_result=None, handle_result=[ActionAbort()]) as spies:
+        with self._patched(setup_result=None, handle_result=handle_result) as spies:
             with patch(f"{self._MODULE}.app.DATABASE.scripts.delete_fallback_episode", new=delete_spy):
                 result = await page_ai.ai_click(selector="#btn", intention="toggle owner")
 
@@ -3706,3 +4113,373 @@ class TestCachedClickDesiredState:
         assert self._clicks(locator) == [("click", None)]
         assert ("evaluate", None) not in locator.calls
         assert locator.click_kwargs == [{"timeout": settings.BROWSER_ACTION_TIMEOUT_MS}]
+
+
+def test_locator_scope_refuses_a_skycdp_frame_owned_by_another_page(mock_ai):
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    skyvern_page._working_frame = CdpFrame(MagicMock(), "frame-1", url="https://pay.example.com/checkout")
+
+    with pytest.raises(StaleFrameSelectionError):
+        skyvern_page.locator_scope.locator("#card")
+
+
+def test_locator_scope_accepts_a_skycdp_frame_owned_by_this_page(mock_ai):
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    frame = CdpFrame(skyvern_page.page, "frame-1", url="https://pay.example.com/checkout")
+    skyvern_page._working_frame = frame
+
+    assert skyvern_page.locator_scope is frame
+
+
+class _UnownedFrame:
+    def __init__(self) -> None:
+        self.page = MagicMock()
+        self.name = "checkout"
+        self.url = "https://pay.example.com/checkout"
+
+
+def _page_with_unowned_frame(mock_ai) -> SkyvernPage:
+    skyvern_page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    skyvern_page._working_frame = _UnownedFrame()
+    return skyvern_page
+
+
+_TEXT_FIELD = {"selector": "#name", "type": "text", "tag": "input", "label": "Name"}
+_RADIO_GROUP_FIELD = {
+    "selector": "#q",
+    "type": "radio_group",
+    "tag": "input",
+    "label": "Q",
+    "options": [{"label": "Yes", "selector": "#yes"}],
+}
+_FILE_FIELD = {"selector": "#cv", "type": "file", "tag": "input", "name": "resume"}
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda page: page.fill_autocomplete(selector="#city", value="Paris"),
+        lambda page: page.fill(selector="#name", value="Ada"),
+        lambda page: page.upload_file(selector="#cv", files="https://example.com/cv.pdf"),
+        lambda page: page.select_option(selector="#country", value="FR"),
+        lambda page: page.fill_from_mapping([_TEXT_FIELD], {0: "Ada"}),
+        lambda page: page._fill_with_planned_value(_TEXT_FIELD, "Ada", None),
+        lambda page: page.fill_from_mapping([_RADIO_GROUP_FIELD], {0: "Maybe"}),
+        lambda page: page.fill_from_mapping([_FILE_FIELD], {}, {"resume": "https://example.com/cv.pdf"}),
+        lambda page: page._fill_matched_field(_TEXT_FIELD, {"action": "fill"}, None),
+        lambda page: page._fill_unknown_field(_TEXT_FIELD, "Fill out the form"),
+        lambda page: page._find_autocomplete_options(),
+    ],
+    ids=[
+        "fill_autocomplete",
+        "fill",
+        "upload_file",
+        "select_option",
+        "fill_from_mapping_text",
+        "fill_with_planned_value",
+        "fill_from_mapping_group_ai_fallback",
+        "fill_from_mapping_file_pass",
+        "fill_matched_field",
+        "fill_unknown_field",
+        "find_autocomplete_options",
+    ],
+)
+@pytest.mark.asyncio
+async def test_frame_scoped_write_propagates_the_stale_frame_refusal(mock_ai, action):
+    page = _page_with_unowned_frame(mock_ai)
+
+    with patch(
+        "skyvern.core.script_generations.skyvern_page.download_file_from_url",
+        AsyncMock(return_value="/tmp/cv.pdf"),
+    ):
+        with pytest.raises(StaleFrameSelectionError):
+            await action(page)
+
+
+@pytest.mark.asyncio
+async def test_structural_validate_propagates_the_stale_frame_refusal(mock_ai):
+    page = _page_with_unowned_frame(mock_ai)
+    page.page.evaluate = AsyncMock(return_value=[])
+
+    with pytest.raises(StaleFrameSelectionError):
+        await page.structural_validate()
+
+
+class _StealFocusOnSelectLocator(_RecordingLocator):
+    def __init__(self, scope: _RecordingLocatorScope) -> None:
+        super().__init__()
+        self._scope = scope
+
+    async def select_option(self, *_args: object, **_kwargs: object) -> None:
+        self._scope.page = MagicMock()
+        raise RuntimeError("no option matched")
+
+
+@pytest.mark.asyncio
+async def test_post_fill_validation_propagates_a_mid_action_stale_frame_refusal(mock_ai):
+    page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    field = {
+        "selector": "#name",
+        "type": "text",
+        "tag": "input",
+        "label": "Name",
+        "_format_hint": "short text",
+    }
+
+    async def _steal_focus_after_filling(*_args: object, **_kwargs: object) -> None:
+        page.working_frame.page = MagicMock()
+
+    with patch.object(SkyvernPage, "fill", AsyncMock(side_effect=_steal_focus_after_filling)):
+        with pytest.raises(StaleFrameSelectionError):
+            await page._fill_with_planned_value(field, "Ada", None)
+
+
+@pytest.mark.asyncio
+async def test_select_ai_fallback_propagates_a_mid_action_stale_frame_refusal(mock_ai):
+    page = _skyvern_page_with_locator(mock_ai, _RecordingLocator())
+    scope = page.working_frame
+    scope._locator = _StealFocusOnSelectLocator(scope)
+    field = {"selector": "#country", "type": "select-one", "tag": "select", "label": "Country"}
+
+    with pytest.raises(StaleFrameSelectionError):
+        await page.fill_from_mapping([field], {0: "France"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("organization_source", ["api_key", "embedded", "none"])
+async def test_library_page_reads_response_snapshot_with_trusted_organization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, organization_source: str
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(skyvern_context, "_context", ContextVar("test_context", default=None))
+    download_dir = tmp_path / "live_downloads"
+    download_dir.mkdir()
+    live_file = download_dir / "report.pdf"
+    live_file.write_bytes(b"attempt one")
+    storage = LocalStorage(str(tmp_path / "artifacts"))
+    rows: list[Artifact] = []
+
+    async def find_artifact(*, uri: str, **kwargs):
+        return next((row for row in rows if row.uri == uri), None)
+
+    async def create_artifact(**kwargs):
+        row = Artifact(**kwargs, created_at=datetime.now(UTC), modified_at=datetime.now(UTC))
+        rows.append(row)
+        return row
+
+    fake_app = SimpleNamespace(
+        STORAGE=storage,
+        ARTIFACT_MANAGER=ArtifactManager(),
+        DATABASE=SimpleNamespace(
+            workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=None)),
+            workflow_run_attempts=SimpleNamespace(get_attempts=AsyncMock(return_value=[])),
+            artifacts=SimpleNamespace(
+                list_artifacts_for_run_by_type=AsyncMock(side_effect=lambda **kwargs: list(rows)),
+                find_download_artifact=find_artifact,
+                create_artifact=create_artifact,
+            ),
+        ),
+    )
+    for module in (artifact_manager_module, storage_base_module, local_storage_module, workflow_service_module):
+        monkeypatch.setattr(module, "app", fake_app)
+    monkeypatch.setattr(local_storage_module, "get_download_dir", lambda **kwargs: str(download_dir))
+    await storage.save_downloaded_files(organization_id="o_1", run_id="wr_1", attempt_number=1)
+    _, urls = await WorkflowService()._fetch_downloaded_files(
+        SimpleNamespace(workflow_run_id="wr_1", organization_id="o_1"), task_v2=None
+    )
+    assert urls == [rows[0].uri]
+    snapshot_url = urls[0]
+    live_file.write_bytes(b"attempt two")
+
+    def authenticate(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/organizations/me"
+        if request.headers.get("x-api-key") != "test-api-key":
+            return httpx.Response(401)
+        return httpx.Response(200, json={"organization_id": "o_1"})
+
+    transport: httpx.AsyncBaseTransport = httpx.MockTransport(authenticate)
+    if organization_source == "embedded":
+        monkeypatch.setattr(settings, "OTEL_ENABLED", False)
+        monkeypatch.setattr(api_app_module, "start_forge_app", lambda **_kwargs: SimpleNamespace(setup_api_app=None))
+        api = api_app_module.create_api_app()
+
+        async def authenticated_org() -> Organization:
+            organization = Organization(
+                organization_id="o_1",
+                organization_name="Test organization",
+                created_at=datetime.now(UTC),
+                modified_at=datetime.now(UTC),
+            )
+            org_auth_service.apply_request_org_context(organization)
+            return organization
+
+        api.dependency_overrides[org_auth_service.get_current_org] = authenticated_org
+        transport = httpx.ASGITransport(app=api)
+
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        if organization_source == "embedded":
+            http_client.headers["x-api-key"] = "test-api-key"
+            monkeypatch.setattr(embedded_server_module, "create_embedded_server", lambda **kwargs: http_client)
+            sdk = Skyvern.local(use_in_memory_db=True)
+        else:
+            sdk = Skyvern(
+                api_key="test-api-key" if organization_source == "api_key" else "",
+                base_url="https://api.example.test",
+                httpx_client=http_client,
+            )
+        uploaded_bytes: list[bytes] = []
+
+        async def set_input_files(path: str, **kwargs) -> None:
+            uploaded_bytes.append(Path(path).read_bytes())
+
+        raw_page = create_mock_page()
+        raw_page.locator = MagicMock(return_value=SimpleNamespace(set_input_files=set_input_files))
+        with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+            page = SkyvernBrowserPage(SimpleNamespace(skyvern=sdk), raw_page)
+
+        if organization_source == "none":
+            with pytest.raises(PermissionError):
+                await page.download_file(download_url=snapshot_url)
+            with pytest.raises(PermissionError):
+                await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+            assert uploaded_bytes == []
+            return
+
+        context = SkyvernContext()
+        skyvern_context.set(context)
+        downloaded_path = await page.download_file(download_url=snapshot_url)
+        assert Path(downloaded_path).read_bytes() == b"attempt one"
+        await page.upload_file(selector="#file", files=snapshot_url)
+        await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+        assert uploaded_bytes == [b"attempt one", b"attempt one"]
+        assert skyvern_context.current() is context
+        assert context.organization_id is None
+        assert context.request_id is None
+
+        context = SkyvernContext()
+        skyvern_context.set(context)
+        downloaded_path = await page.download_file(download_url=snapshot_url)
+        assert Path(downloaded_path).read_bytes() == b"attempt one"
+        await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+        assert uploaded_bytes[-1] == b"attempt one"
+        assert skyvern_context.current() is context
+
+        context = SkyvernContext(organization_id="o_other")
+        skyvern_context.set(context)
+        with pytest.raises(PermissionError):
+            await page.download_file(download_url=snapshot_url)
+        with pytest.raises(PermissionError):
+            await page.upload_file(selector="#file", files=snapshot_url, ai=None)
+        assert skyvern_context.current() is context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_failure", ["offline", "unauthorized"])
+async def test_library_page_unscoped_files_skip_organization_lookup(
+    monkeypatch: pytest.MonkeyPatch, legacy_download_uris: dict[str, str], lookup_failure: str
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "local")
+    monkeypatch.setattr(skyvern_context, "_context", ContextVar("test_context", default=None))
+    requests: list[httpx.Request] = []
+
+    def unavailable_api(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if lookup_failure == "offline":
+            raise httpx.ConnectError("API unavailable", request=request)
+        return httpx.Response(401)
+
+    uploaded_bytes: list[bytes] = []
+
+    async def set_input_files(path: str, **kwargs) -> None:
+        uploaded_bytes.append(Path(path).read_bytes())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable_api)) as http_client:
+        sdk = Skyvern(api_key="test-api-key", base_url="https://api.example.test", httpx_client=http_client)
+        raw_page = create_mock_page()
+        raw_page.locator = MagicMock(return_value=SimpleNamespace(set_input_files=set_input_files))
+        with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+            page = SkyvernBrowserPage(SimpleNamespace(skyvern=sdk), raw_page)
+        url = legacy_download_uris["canonical"]
+        local_path = await page.download_file(download_url=url)
+        assert Path(local_path).read_text() == "STORMBREAKER-safe-body"
+        for ai in ("fallback", None):
+            await page.upload_file(selector="#file", files=url, ai=ai)
+        assert uploaded_bytes == [b"STORMBREAKER-safe-body"] * 2
+        assert await page._get_file_organization_id(files_module.parse_uri_to_path(url)) is None
+
+        with patch(
+            "skyvern.core.script_generations.skyvern_page.download_file_from_url",
+            AsyncMock(return_value=local_path),
+        ):
+            for scheme in ("http", "https"):
+                public_url = f"{scheme}://example.test/report.pdf"
+                assert await page.download_file(download_url=public_url) == local_path
+                for ai in ("fallback", None):
+                    await page.upload_file(selector="#file", files=public_url, ai=ai)
+        assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [2, 1, None, "lookup_error"])
+async def test_click_progress_ignores_retained_partial_rename(tmp_path, mock_scraped_page, mock_ai, attempt) -> None:
+    page = _make_script_page(mock_scraped_page, mock_ai)
+    cutoff = datetime.fromtimestamp(200, tz=UTC)
+    stale = tmp_path / "previous.pdf.crdownload"
+    stale.write_bytes(b"old bytes")
+    os.utime(stale, (100, 100))
+    context = SkyvernContext(organization_id="o_test", workflow_run_id="wr_retry")
+
+    async def click(_page):
+        stale.rename(tmp_path / "previous.pdf")
+
+    with (
+        patch.object(
+            storage_base_module,
+            "resolve_download_attempt",
+            new=AsyncMock(
+                return_value=("wr_retry", attempt or 1, cutoff if attempt else None),
+                side_effect=RuntimeError("lookup unavailable") if attempt == "lookup_error" else None,
+            ),
+        ),
+        patch("skyvern.core.script_generations.script_skyvern_page.skyvern_context.current", return_value=context),
+        patch(
+            "skyvern.core.script_generations.script_skyvern_page.get_path_for_workflow_download_directory",
+            return_value=tmp_path,
+        ),
+        patch.object(settings, "CACHED_ACTION_DELAY_SECONDS", 0),
+        patch.object(page, "_wait_for_page_ready_before_action", new=AsyncMock()),
+        patch.object(page, "_create_action_and_result_after_execution", new=AsyncMock()) as record,
+        patch.object(page, "_create_screenshot_after_execution", new=AsyncMock()),
+        patch.object(page, "_create_html_action_after_execution", new=AsyncMock()),
+    ):
+        await page._decorate_call(click, ActionType.CLICK)
+    assert record.await_args.kwargs["download_triggered"] is (attempt != 2)
+    assert record.await_args.kwargs["downloaded_files"] == (None if attempt == 2 else ["previous.pdf"])
+    assert (tmp_path / "previous.pdf").stat().st_mtime == 100
+
+
+@pytest.mark.asyncio
+async def test_polled_script_code_is_registered_so_its_saved_row_is_marked(monkeypatch: pytest.MonkeyPatch) -> None:
+    import skyvern.core.script_generations.script_skyvern_page as module
+    from skyvern.forge import app
+    from skyvern.forge.sdk.schemas.totp_codes import OTPType
+    from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+    from skyvern.services.otp_service import OTPValue
+    from skyvern.webeye.actions.actions import InputTextAction
+
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts["wr_1"] = WorkflowRunContext("title", "workflow-id", "permanent-id", "wr_1", None)
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager, raising=False)
+    monkeypatch.setattr(module, "get_actual_value_of_parameter_if_secret", lambda _workflow_run_id, value: value)
+    monkeypatch.setattr(module, "render_template", lambda value: value)
+    monkeypatch.setattr(module, "poll_otp_value", AsyncMock(return_value=OTPValue(value="482913", type=OTPType.TOTP)))
+    script_page = ScriptSkyvernPage.__new__(ScriptSkyvernPage)
+    script_page.page = SimpleNamespace()
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="org_1", workflow_run_id="wr_1", task_id="tsk_1")):
+        value = await script_page.get_actual_value("", totp_identifier="inbox@example.com")
+        codes = manager.get_one_time_codes_for_run("wr_1")
+
+    typed = InputTextAction(element_id="otp", text=value, workflow_run_id="wr_1")
+    assert value == "482913"
+    assert skyvern_context.action_for_multi_field_totp_persistence(typed, codes).totp_code_required

@@ -9,7 +9,7 @@ export type SendAction =
   | "send"
   | "queue_working"
   | "queue_live_browser"
-  | "replace_queued"
+  | "append_queued"
   | "noop";
 
 type ResolveSendInput = {
@@ -39,11 +39,11 @@ export function resolveSendAction({
   if (!candidate.trim()) {
     return "noop";
   }
-  // One queued prompt at a time still holds — a second send rewrites the one
+  // One queued prompt at a time still holds — a second send adds to the one
   // that's parked rather than being swallowed, so the composer is never a
   // dead box while a turn is parked waiting on the user.
   if (hasQueuedPrompt && !isDrain) {
-    return "replace_queued";
+    return "append_queued";
   }
   if (inFlight) {
     return "queue_working";
@@ -59,6 +59,11 @@ export function resolveSendAction({
     return "queue_live_browser";
   }
   return "send";
+}
+
+// Queued text and anything added to it stay one message, in the order typed.
+export function appendQueuedText(queued: string, addition: string): string {
+  return addition.trim() ? `${queued}\n${addition}` : queued;
 }
 
 export type DrainAction =

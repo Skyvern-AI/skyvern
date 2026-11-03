@@ -300,6 +300,48 @@ describe("useSpeechToText", () => {
     );
   });
 
+  it("drops a transcript that arrives after cancel", async () => {
+    const onTranscript = vi.fn();
+    const { result } = renderHook(() =>
+      useSpeechToText({
+        getBaseText: () => "before dictation",
+        onTranscript,
+      }),
+    );
+
+    await startSpeech(() => result.current.start());
+    const recognition = MockSpeechRecognition.lastInstance;
+    act(() => result.current.cancel());
+    act(() => {
+      recognition?.emitResult("late words");
+    });
+
+    expect(result.current.isListening).toBe(false);
+    expect(onTranscript).not.toHaveBeenCalled();
+  });
+
+  it("does not start dictation when cancelled during the permission prompt", async () => {
+    let grantPermission: (stream: unknown) => void = () => {};
+    mockGetUserMedia.mockReturnValueOnce(
+      new Promise((resolve) => {
+        grantPermission = resolve;
+      }),
+    );
+    const { result } = renderHook(() =>
+      useSpeechToText({ onTranscript: vi.fn() }),
+    );
+
+    act(() => result.current.start());
+    act(() => result.current.cancel());
+    await act(async () => {
+      grantPermission({ getTracks: () => [{ stop: trackStop }] });
+      await Promise.resolve();
+    });
+
+    expect(MockSpeechRecognition.lastInstance).toBeNull();
+    expect(result.current.isListening).toBe(false);
+  });
+
   it("starts from an empty base text", async () => {
     const onTranscript = vi.fn();
     const { result } = renderHook(() =>

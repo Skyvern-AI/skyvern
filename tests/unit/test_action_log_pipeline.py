@@ -2,28 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NoReturn, cast
+from typing import Any, NoReturn, cast
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import httpx
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import action_log
+from skyvern.cli.core import client as client_mod
+from skyvern.cli.core import session_manager
 from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import browser as mcp_browser
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
-from skyvern.forge.sdk.routes import browser_sessions, routers  # noqa: F401  # register action-log routes
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.library.skyvern import Skyvern
 from skyvern.schemas.action_log import (
@@ -34,6 +38,7 @@ from skyvern.schemas.action_log import (
     ActionLogOutcome,
     project_action_event,
 )
+from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "org_test"
 SESSION_ID = "pbs_test"
@@ -102,15 +107,14 @@ def _artifact(number: int, *, created_at: datetime) -> Artifact:
 def _route_client(monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, AsyncMock, AsyncMock]:
     get_session = AsyncMock(return_value=SimpleNamespace(browser_session_id=SESSION_ID, organization_id=ORG_ID))
     create_artifact = AsyncMock(return_value="a_test")
-    monkeypatch.setattr(forge_app.PERSISTENT_SESSIONS_MANAGER, "get_session", get_session)
+    monkeypatch.setattr(forge_app.DATABASE.browser_sessions, "get_persistent_browser_session", get_session)
     monkeypatch.setattr(
         forge_app.ARTIFACT_MANAGER,
         "create_browser_session_action_log_artifact",
         create_artifact,
     )
 
-    app = FastAPI()
-    app.include_router(routers.base_router, prefix="/v1")
+    app = shared_route_app(monkeypatch)
     app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(organization_id=ORG_ID)
     return TestClient(app), get_session, create_artifact
 
@@ -635,6 +639,59 @@ async def test_action_log_worker_timeout_is_passive_and_shutdown_is_clean() -> N
     assert worker.drop_count == 1
     assert worker._task is None
     assert worker._queue.empty()
+
+
+@pytest.fixture
+def slow_self_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]:
+    """The hosted MCP's own API on 127.0.0.1:PORT, answering each action-log POST after 3 s."""
+    received: list[dict[str, Any]] = []
+
+    class SlowAck(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            received.append(json.loads(self.rfile.read(int(self.headers["content-length"]))))
+            time.sleep(3)
+            self.send_response(202)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowAck)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+    monkeypatch.setattr(client_mod.settings, "PORT", server.server_address[1])
+    try:
+        yield received
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.asyncio
+async def test_hosted_action_log_batch_the_api_answers_slowly_is_delivered_not_dropped(
+    monkeypatch: pytest.MonkeyPatch, slow_self_api: list[dict[str, Any]]
+) -> None:
+    """A batch the API writes in 3 s (a third of server POSTs take over 2 s) is delivered by the session-close drain."""
+    worker = action_log.ActionLogWorker()
+    monkeypatch.setattr(action_log, "action_log_worker", worker)
+    session_manager.set_stateless_http_mode(True)
+    token = set_api_key_override("sk_slow_self_api")
+    try:
+        action_log.enqueue_action_event(
+            BrowserContext(mode="cloud_session", session_id=SESSION_ID),
+            tool="skyvern_click",
+            selector="#field",
+            timing_ms={"total": 1},
+            ok=True,
+        )
+        await action_log.drain_action_log_events()
+    finally:
+        reset_api_key_override(token)
+        await worker.shutdown()
+        await client_mod.close_skyvern()
+
+    assert [len(batch["events"]) for batch in slow_self_api] == [1]
+    assert worker.drop_count == 0
 
 
 @pytest.mark.asyncio

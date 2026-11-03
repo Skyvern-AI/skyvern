@@ -16,6 +16,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
 import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 
@@ -101,6 +102,11 @@ function FileParserEditorBody({
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
 
+  const resolvedFileType =
+    data.fileType && data.fileType !== "auto_detect"
+      ? data.fileType
+      : detectFileTypeFromUrl(data.fileUrl ?? "");
+
   const handleFileUrlChange = (value: string) => {
     const detected = detectFileTypeFromUrl(value);
     const currentType = data.fileType;
@@ -124,6 +130,7 @@ function FileParserEditorBody({
           <HelpTooltip content={helpTooltips["fileParser"]["fileUrl"]} />
         </div>
         <WorkflowBlockInput
+          name="fileUrl"
           nodeId={blockId}
           value={data.fileUrl}
           onChange={handleFileUrlChange}
@@ -159,7 +166,36 @@ function FileParserEditorBody({
         </Select>
       </div>
       <div className="space-y-2">
+        <div className="flex gap-2">
+          <Label
+            htmlFor={`${blockId}-worksheet`}
+            className="text-xs text-tertiary-foreground"
+          >
+            Worksheet
+          </Label>
+          <HelpTooltip content={helpTooltips["fileParser"]["worksheet"]} />
+        </div>
+        <WorkflowBlockInput
+          id={`${blockId}-worksheet`}
+          nodeId={blockId}
+          data-testid="worksheet-input"
+          value={data.worksheet ?? ""}
+          placeholder="First worksheet"
+          onChange={(value) => update({ worksheet: value })}
+          className="nopan text-xs"
+        />
+        {data.worksheet &&
+          resolvedFileType !== null &&
+          resolvedFileType !== "excel" && (
+            <p className="text-xs text-muted-foreground dark:text-slate-500">
+              Worksheet is ignored for non-Excel files. This block reads the
+              whole file.
+            </p>
+          )}
+      </div>
+      <div className="space-y-2">
         <WorkflowDataSchemaInputGroup
+          deferKey={JSON.stringify([blockId, "jsonSchema"])}
           exampleValue={dataSchemaExampleForFileExtraction}
           value={data.jsonSchema}
           onChange={(value) => update({ jsonSchema: value })}
@@ -200,6 +236,26 @@ function FileParserEditorBody({
                 update({ nextLoopOnFailure })
               }
             />
+            <div className="flex items-center justify-between gap-2 pt-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <Label className="truncate text-xs font-normal text-tertiary-foreground">
+                  Force OCR
+                </Label>
+                <HelpTooltip content={helpTooltips["fileParser"]["forceOcr"]} />
+              </div>
+              <div className="w-52 shrink-0">
+                <Switch
+                  checked={data.forceOcr ?? false}
+                  data-testid="force-ocr-switch"
+                  onCheckedChange={(checked) => {
+                    if (!editable) {
+                      return;
+                    }
+                    update({ forceOcr: checked });
+                  }}
+                />
+              </div>
+            </div>
             <IgnoreWorkflowSystemPrompt
               ignoreWorkflowSystemPrompt={
                 data.ignoreWorkflowSystemPrompt ?? false

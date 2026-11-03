@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated, Any
 
 import structlog
+from playwright.async_api import Page
 from pydantic import Field, TypeAdapter, ValidationError
 
 from skyvern.schemas.workflows import (
@@ -38,23 +40,45 @@ from skyvern.schemas.workflows import (
     NavigationBlockYAML,
     PdfFillBlockYAML,
     PDFParserBlockYAML,
+    PowerBIQueryBlockYAML,
     PrintPageBlockYAML,
     SendEmailBlockYAML,
     SplitPdfBlockYAML,
     TaskBlockYAML,
     TaskV2BlockYAML,
+    TerminateBlockYAML,
     TextPromptBlockYAML,
     UploadToS3BlockYAML,
     UrlBlockYAML,
     ValidationBlockYAML,
     WaitBlockYAML,
+    WebSearchBlockYAML,
     WhileLoopBlockYAML,
     WorkflowTriggerBlockYAML,
 )
 
-from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, make_error, make_result
+from ._common import ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
+
+
+def _powerbi_queries_available() -> bool:
+    from skyvern.forge.sdk.integrations.catalog import integration_is_live  # noqa: PLC0415
+
+    return integration_is_live("powerbi")
+
+
+def _contains_powerbi_query(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_contains_powerbi_query(block) for block in value if isinstance(block, dict))
+    if not isinstance(value, dict):
+        return False
+    if value.get("block_type") == BlockType.POWERBI_QUERY.value:
+        return True
+    if value.get("block_type") not in {BlockType.FOR_LOOP.value, BlockType.WHILE_LOOP.value}:
+        return False
+    return _contains_powerbi_query(value.get("loop_blocks", []))
+
 
 # ---------------------------------------------------------------------------
 # Block type → YAML class mapping
@@ -75,12 +99,14 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.WAIT.value: WaitBlockYAML,
     BlockType.VALIDATION.value: ValidationBlockYAML,
     BlockType.HTTP_REQUEST.value: HttpRequestBlockYAML,
+    BlockType.WEB_SEARCH.value: WebSearchBlockYAML,
     BlockType.SEND_EMAIL.value: SendEmailBlockYAML,
     BlockType.FILE_DOWNLOAD.value: FileDownloadBlockYAML,
     BlockType.FILE_UPLOAD.value: FileUploadBlockYAML,
     BlockType.GOTO_URL.value: UrlBlockYAML,
     BlockType.DOWNLOAD_TO_S3.value: DownloadToS3BlockYAML,
     BlockType.DATA_EXPORT.value: DataExportBlockYAML,
+    BlockType.TERMINATE.value: TerminateBlockYAML,
     BlockType.UPLOAD_TO_S3.value: UploadToS3BlockYAML,
     BlockType.FILE_URL_PARSER.value: FileParserBlockYAML,
     BlockType.PDF_PARSER.value: PDFParserBlockYAML,
@@ -92,6 +118,7 @@ BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
     BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
     BlockType.EMAIL_INBOX.value: EmailInboxBlockYAML,
     BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
+    BlockType.POWERBI_QUERY.value: PowerBIQueryBlockYAML,
 }
 
 # ---------------------------------------------------------------------------
@@ -109,9 +136,11 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "action": "Perform a single focused action on the current page",
     "login": "Handle authentication flows including username/password and TOTP/2FA",
     "wait": "Pause workflow execution for a specified duration",
+    "terminate": "End the workflow run as terminated with a reason and an optional error code, e.g. as a conditional branch target",
     "validation": "Validate page state with complete/terminate criteria",
     "http_request": "Call an external HTTP API",
-    "send_email": "Send an email notification via SMTP",
+    "web_search": "Search Google or Exa and optionally process the results with a prompt",
+    "send_email": "Send an email via SMTP or from a connected Gmail account",
     "file_download": "Download a file from a page",
     "file_upload": "Upload a file from S3/Azure to a page element",
     "goto_url": "Navigate directly to a URL without additional instructions",
@@ -128,6 +157,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "google_sheets_read": "Read rows from a Google Sheet as structured data (list of dicts)",
     "email_inbox": "Read matching messages from a Gmail or Outlook inbox",
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
+    "powerbi_query": "Run one read-only DAX query against a user's authorized Power BI dataset",
 }
 
 # ---------------------------------------------------------------------------
@@ -251,6 +281,12 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "label": "wait_for_processing",
         "wait_sec": 30,
     },
+    "terminate": {
+        "block_type": "terminate",
+        "label": "stop_account_not_found",
+        "reason": "No account matches {{ account_number }}",
+        "error_code": "ACCOUNT_NOT_FOUND",
+    },
     "text_prompt": {
         "block_type": "text_prompt",
         "label": "summarize_results",
@@ -336,7 +372,7 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "range": "A1",
         "credential_id": "{{ google_credential_id }}",
         "write_mode": "append",
-        "values": "{{ output_data | tojson }}",
+        "values": "[[{{ extract_metric.output.metric | tojson }}]]",
     },
 }
 
@@ -372,11 +408,15 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
     "file_parser_block": "** FILE PARSER BLOCK (file_url_parser) **",
     "send_email_block": "** SEND EMAIL BLOCK (send_email) **",
     "human_interaction_block": "** HUMAN INTERACTION BLOCK (human_interaction) **",
+    "captcha_solver": "** CAPTCHA SOLVER (captcha_solver) **",
+    "proxy_location": "** PROXY LOCATION AND BROWSER PROFILE (proxy_location) **",
     "text_prompt_block": "** TEXT PROMPT BLOCK (text_prompt) **",
     "http_request_block": "** HTTP REQUEST BLOCK (http_request) **",
+    "google_sheets_write_block": "** GOOGLE SHEETS WRITE BLOCK (google_sheets_write) **",
     "parameter_templating": "** PARAMETER TEMPLATING **",
     "error_handling_and_retries": "** ERROR HANDLING AND RETRIES **",
     "workflow_execution_flow": "** WORKFLOW EXECUTION FLOW **",
+    "notes_between_blocks": "** NOTES BETWEEN BLOCKS **",
     "best_practices": "** BEST PRACTICES **",
     "common_patterns": "** COMMON PATTERNS **",
     "validation_rules": "** VALIDATION RULES **",
@@ -385,6 +425,61 @@ WORKFLOW_KNOWLEDGE_TOPIC_HEADERS: dict[str, str] = {
 
 _kb_cache: dict[str, dict[str, Any]] | None = None
 _knowledge_topic_cache: dict[str, dict[str, str]] | None = None
+
+CODE_BLOCK_RUNTIME_TOPIC = "code_block_runtime"
+NOTES_KNOWLEDGE_TOPIC = "notes_between_blocks"
+
+
+def _code_block_runtime_topic() -> dict[str, str]:
+    """Render the names a CodeBlock may use from the executor's own namespace declaration."""
+    # Keep workflow model imports deferred for the lightweight-install import contract.
+    from skyvern.forge.sdk.workflow.models.block import CodeBlock  # noqa: PLC0415
+    from skyvern.forge.sdk.workflow.models.code_block_recorder import (  # noqa: PLC0415
+        _LOCATOR_ACTION_MAP,
+        _LOCATOR_FACTORY_METHODS,
+        _PAGE_ACTION_MAP,
+    )
+
+    def on_page(name: str) -> bool:
+        # The secure runner refuses page.set_input_files; only the locator form is supported.
+        return hasattr(Page, name) and name != "set_input_files"
+
+    factories = sorted({"locator", *_LOCATOR_FACTORY_METHODS})
+    locator_actions = sorted(_LOCATOR_ACTION_MAP)
+    safe_vars = CodeBlock.build_safe_vars()
+    builtin_names = sorted(name for name in safe_vars["__builtins__"] if not name.startswith("__"))
+    shims = {name: sorted(vars(value)) for name, value in safe_vars.items() if isinstance(value, SimpleNamespace)}
+    helpers = sorted(name for name in safe_vars if not name.startswith("__") and name not in shims)
+    lines = [
+        "Names a code block's Python may use. The runtime binds everything listed here. The only importable "
+        "modules are the shims below; `import re` binds the shim, and any other import is rejected.",
+        "",
+        "Builtins: " + ", ".join(builtin_names),
+        "",
+        "Module shims (only the listed attributes exist, e.g. datetime.datetime.now(), not datetime.now()):",
+        *(f"- {name}: {', '.join(attrs)}" for name, attrs in sorted(shims.items())),
+        "",
+        "Helpers: page, " + ", ".join(helpers),
+        "",
+        "Page: `page` is a Playwright async Page.",
+        "Locator factories build a selector and make no browser call. On page or a locator: "
+        + ", ".join(name for name in factories if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in factories if not on_page(name)),
+        "`await page.evaluate(js, arg=None)` runs JavaScript in the page and returns a JSON-serializable result; "
+        "one call can read many elements.",
+        "Recorded as timeline actions, each with a screenshot: "
+        + ", ".join([*(f"page.{name}" for name in sorted(_PAGE_ACTION_MAP)), "page.keyboard.press"])
+        + "; on page or a locator: "
+        + ", ".join(name for name in locator_actions if on_page(name))
+        + "; on a locator only: "
+        + ", ".join(name for name in locator_actions if not on_page(name)),
+        "Read methods such as inner_text, get_attribute, count, is_visible and wait_for run without a recorded action.",
+        "",
+        "For a date in a template field use {{current_date}}; inside code use datetime.date.today() "
+        "or datetime.datetime.now(datetime.UTC).",
+    ]
+    return {"topic": CODE_BLOCK_RUNTIME_TOPIC, "title": "CODE BLOCK RUNTIME", "content": "\n".join(lines)}
 
 
 def _parse_knowledge_topics() -> dict[str, dict[str, str]]:
@@ -525,7 +620,9 @@ async def skyvern_workflow_knowledge(
             description=(
                 "Knowledge topic IDs to retrieve. Omit to list every topic. Common IDs include "
                 "workflow_parameters, parameter_templating, workflow_execution_flow, choosing_a_block, "
-                "common_patterns, and best_practices."
+                "common_patterns, best_practices, captcha_solver, proxy_location, and code_block_runtime "
+                "(the builtins, module shims, helpers, and page object a code block's Python may use, "
+                "including which page calls are recorded as actions)."
             )
         ),
     ] = None,
@@ -538,9 +635,10 @@ async def skyvern_workflow_knowledge(
     """
 
     action = "skyvern_workflow_knowledge"
-    knowledge = _parse_knowledge_topics()
-    catalog = list(knowledge)
-    if not catalog:
+    knowledge = {
+        topic: section for topic, section in _parse_knowledge_topics().items() if topic != NOTES_KNOWLEDGE_TOPIC
+    }
+    if not knowledge:
         return make_result(
             action,
             ok=False,
@@ -550,6 +648,8 @@ async def skyvern_workflow_knowledge(
                 "Use get_block_schema for exact block fields and retry workflow knowledge later.",
             ),
         )
+    knowledge = {**knowledge, CODE_BLOCK_RUNTIME_TOPIC: _code_block_runtime_topic()}
+    catalog = list(knowledge)
 
     if topics is None:
         return make_result(action, data={"topics": catalog, "count": len(catalog)})
@@ -601,11 +701,14 @@ async def skyvern_block_schema(
     action = "skyvern_block_schema"
 
     if block_type is None:
+        block_types = dict(BLOCK_SUMMARIES)
+        if not _powerbi_queries_available():
+            block_types.pop(BlockType.POWERBI_QUERY.value, None)
         return make_result(
             action,
             data={
-                "block_types": BLOCK_SUMMARIES,
-                "count": len(BLOCK_SUMMARIES),
+                "block_types": block_types,
+                "count": len(block_types),
                 "hint": "Call skyvern_block_schema(block_type='navigation') for the full schema of a specific type",
             },
         )
@@ -615,6 +718,19 @@ async def skyvern_block_schema(
     task_redirect = normalized in ("task", "task_v2")
     if task_redirect:
         normalized = "navigation"
+
+    if normalized == BlockType.POWERBI_QUERY.value and not _powerbi_queries_available():
+        available_types = dict(BLOCK_SUMMARIES)
+        available_types.pop(BlockType.POWERBI_QUERY.value, None)
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Power BI queries are not currently available.",
+                f"Available types: {', '.join(sorted(available_types))}.",
+            ),
+        )
 
     cls = BLOCK_TYPE_MAP.get(normalized)
     if cls is None:
@@ -646,11 +762,33 @@ async def skyvern_block_schema(
             "summary": BLOCK_SUMMARIES.get(normalized, ""),
             "description": kb_entry.get("description"),
             "use_cases": kb_entry.get("use_cases"),
-            "schema": cls.model_json_schema(),
+            "schema": _without_internal_properties(cls.model_json_schema()),
             "example": BLOCK_EXAMPLES.get(normalized),
         },
         warnings=warnings,
     )
+
+
+def _without_internal_properties(value: Any) -> Any:
+    """Drop ``x-internal`` properties anywhere in a JSON schema, as the public OpenAPI doc does."""
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        internal = (
+            {name for name, prop in properties.items() if isinstance(prop, dict) and prop.get("x-internal")}
+            if isinstance(properties, dict)
+            else set()
+        )
+        cleaned = {key: _without_internal_properties(child) for key, child in value.items() if key != "properties"}
+        if isinstance(properties, dict):
+            cleaned["properties"] = {
+                name: _without_internal_properties(prop) for name, prop in properties.items() if name not in internal
+            }
+        if internal and isinstance(cleaned.get("required"), list):
+            cleaned["required"] = [name for name in cleaned["required"] if name not in internal]
+        return cleaned
+    if isinstance(value, list):
+        return [_without_internal_properties(child) for child in value]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -678,10 +816,6 @@ async def skyvern_block_validate(
         str,
         Field(description="JSON string of a single block definition to validate"),
     ],
-    code_only: Annotated[
-        bool | None,
-        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
-    ] = None,
 ) -> dict[str, Any]:
     """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
     it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
@@ -712,26 +846,16 @@ async def skyvern_block_validate(
             ),
         )
 
-    if code_only:
-        # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
-        from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
-            collect_code_only_banned_items,
+    if not _powerbi_queries_available() and _contains_powerbi_query(raw):
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "Power BI queries are not currently available.",
+                "Use a currently available block type from skyvern_block_schema.",
+            ),
         )
-
-        banned_items = collect_code_only_banned_items([raw])
-        if banned_items:
-            labels = ", ".join(sorted({label for label, _ in banned_items}))
-            types = ", ".join(sorted({block_type for _, block_type in banned_items}))
-            return make_result(
-                action,
-                ok=False,
-                error=make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
-                    "In code-only mode, use a `code` block for durable browser/page work instead of "
-                    "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
-                ),
-            )
 
     adapter = _get_block_adapter()
     try:

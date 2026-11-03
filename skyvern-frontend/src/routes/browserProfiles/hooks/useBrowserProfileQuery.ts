@@ -23,9 +23,9 @@ function useBrowserProfileQuery(
         .get<BrowserProfileApiResponse>(`/browser_profiles/${profileId}`)
         .then((response) => response.data);
     },
-    enabled: Boolean(profileId),
     staleTime: 5 * 60 * 1000,
     ...options,
+    enabled: Boolean(profileId) && (options.enabled ?? true),
   });
 }
 

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from functools import partial
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 from aiohttp import WSMsgType, web
@@ -15,11 +17,34 @@ from skyvern.browser_extension.errors import (
     BrowserExtensionError,
     ExtensionRequestError,
 )
-from skyvern.browser_extension.protocol import is_cdp_method_allowed
+from skyvern.browser_extension.event_order import EventHold
+from skyvern.browser_extension.protocol import (
+    PAGE_CHANGE_TIER_R_METHODS,
+    PAGE_CHANGED_BEFORE_START_MESSAGE,
+    PAGE_CHANGED_WHILE_RUNNING_MESSAGE,
+    is_cdp_method_allowed,
+    is_page_change_bootstrap,
+    is_page_change_exempt,
+)
 from skyvern.browser_extension.relay import _MAX_WS_MESSAGE_BYTES
 from skyvern.browser_extension.target_registry import VirtualTargetRegistry
+from skyvern.utils.contained_effects import contained_effect
 
 LOG = structlog.get_logger()
+_BACKGROUND_ERROR_URL_PATTERN = re.compile(r'([a-zA-Z][a-zA-Z0-9+.-]*://)(?:[^\s<>"/?#]*@)?([^\s<>"/?#@]*)[^\s<>"]*')
+
+
+def _sanitize_background_error_message(message: str) -> str:
+    return re.sub(_BACKGROUND_ERROR_URL_PATTERN, r"\1\2", message)[:300]
+
+
+def _is_page_changed_cancellation(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, ExtensionRequestError)
+        and exc.code == "COMMAND_TIMEOUT"
+        and exc.message in {PAGE_CHANGED_BEFORE_START_MESSAGE, PAGE_CHANGED_WHILE_RUNNING_MESSAGE}
+    )
+
 
 _VERSION_RESULT = {
     "protocolVersion": "1.3",
@@ -46,6 +71,23 @@ _CHILD_AUTO_ATTACH_PARAMS = {
 _UNSUPPORTED_CHILD_TARGET_TYPES = {"service_worker", "shared_worker", "worker"}
 _CHILD_AUTO_ATTACH_TIMEOUT_SECONDS = 3.0
 _CHILD_DETACH_TIMEOUT_SECONDS = 2.0
+_NAVIGATION_METHODS = frozenset({"Page.navigate", "Page.reload", "Page.navigateToHistoryEntry"})
+_NAVIGATION_EVENT_BUFFER_LIMIT = 2000
+_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT = 2000
+_NAVIGATION_SENSITIVE_EVENT_METHODS = frozenset(
+    {
+        "Page.frameNavigated",
+        "Page.navigatedWithinDocument",
+        "Page.lifecycleEvent",
+        "Page.frameStartedLoading",
+        "Page.frameStoppedLoading",
+        "Page.frameRequestedNavigation",
+        "Page.frameScheduledNavigation",
+        "Page.frameAttached",
+        "Page.frameDetached",
+    }
+)
+_NAVIGATION_COMMIT_EVENT_METHODS = frozenset({"Page.frameNavigated", "Page.navigatedWithinDocument"})
 _ROOT_TARGET_GATE_METHODS = {
     "Browser.close",
     "Target.activateTarget",
@@ -56,12 +98,45 @@ _ROOT_TARGET_GATE_METHODS = {
     "Target.getTargets",
     "Target.setDiscoverTargets",
 }
+_COMMAND_STATE_KEYS = {
+    "Emulation.setFocusEmulationEnabled": "Emulation.setFocusEmulationEnabled",
+    "Emulation.setEmulatedMedia": "Emulation.setEmulatedMedia",
+    "Target.setAutoAttach": "Target.setAutoAttach",
+    "Page.setLifecycleEventsEnabled": "Page.setLifecycleEventsEnabled",
+    "Page.enable": "Page",
+    "Page.disable": "Page",
+    "Runtime.enable": "Runtime",
+    "Runtime.disable": "Runtime",
+    "Log.enable": "Log",
+    "Log.disable": "Log",
+    "Network.enable": "Network",
+    "Network.disable": "Network",
+}
+
+
+@dataclass(frozen=True)
+class TabReconnectEvent:
+    tab_id: int
+    target_id: str
+    state: Literal["pending", "done", "failed"]
+    new_target_id: str | None = None
+
+
+@dataclass
+class _CommandState:
+    latest: tuple[str, dict[str, Any]]
+    in_flight: int = 0
 
 
 class _ExtensionRelay(Protocol):
     scoped_tabs: list[dict[str, Any]]
 
-    async def request(self, op: str, args: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]: ...
+    @property
+    def connected(self) -> bool: ...
+
+    async def request(
+        self, op: str, args: dict[str, Any], timeout: float = 30.0, *, hold: EventHold | None = None
+    ) -> dict[str, Any]: ...
 
     async def ensure_root_lease(self) -> dict[str, Any] | None: ...
 
@@ -69,7 +144,16 @@ class _ExtensionRelay(Protocol):
 
 
 class ExtensionCdpAdapter:
-    def __init__(self, registry: VirtualTargetRegistry, relay: _ExtensionRelay) -> None:
+    def __init__(
+        self,
+        registry: VirtualTargetRegistry,
+        relay: _ExtensionRelay,
+        *,
+        on_tab_reconnect: Callable[[TabReconnectEvent], None] | None = None,
+    ) -> None:
+        self._on_tab_reconnect = on_tab_reconnect
+        self._pending_tab_reconnects: dict[int, TabReconnectEvent] = {}
+        self._extension_detach_epochs: dict[int, int] = {}
         self._registry = registry
         self._relay = relay
         self._capability = secrets.token_urlsafe(32)
@@ -83,6 +167,8 @@ class ExtensionCdpAdapter:
         self._auto_attach = False
         self._discover_targets = False
         self._attached_tabs: set[int] = set()
+        self._unexposed_attached_tabs: set[int] = set()
+        self._command_states: dict[tuple[int, str | None, str], _CommandState] = {}
         self._attach_locks: dict[int, asyncio.Lock] = {}
         self._opener_ids: dict[int, str] = {}
         self._scope_generations: dict[int, int] = {}
@@ -92,6 +178,31 @@ class ExtensionCdpAdapter:
         self._closing_client_websockets: set[web.WebSocketResponse] = set()
         self._pending_child_sessions: set[str] = set()
         self._pending_child_events: dict[str, list[dict]] = {}
+        self._navigation_locks: dict[int, asyncio.Lock] = {}
+        self._navigation_in_flight: dict[int, set[int]] = {}
+        self._navigation_marker_counter = 0
+        self._navigation_events: dict[int, list[dict]] = {}
+        self._navigation_event_generations: dict[int, int] = {}
+        self._navigation_overflowed: set[int] = set()
+        self._connection_generation = 0
+
+    def set_tab_reconnect_listener(self, listener: Callable[[TabReconnectEvent], None] | None) -> None:
+        self._on_tab_reconnect = listener
+
+    def _notify_tab_reconnect(self, event: TabReconnectEvent) -> None:
+        if self._on_tab_reconnect is not None:
+            try:
+                self._on_tab_reconnect(event)
+            except Exception:  # noqa: BLE001 - Listener failures must not interrupt target lifecycle events.
+                LOG.debug("Tab reconnect listener failed", tab_id=event.tab_id, state=event.state)
+
+    def _finish_tab_reconnect(
+        self, pending: TabReconnectEvent | None, state: Literal["done", "failed"], new_target_id: str | None = None
+    ) -> None:
+        if pending is None or self._pending_tab_reconnects.get(pending.tab_id) is not pending:
+            return
+        self._pending_tab_reconnects.pop(pending.tab_id)
+        self._notify_tab_reconnect(TabReconnectEvent(pending.tab_id, pending.target_id, state, new_target_id))
 
     async def start(self) -> None:
         if self._runner is not None:
@@ -133,9 +244,24 @@ class ExtensionCdpAdapter:
         if event == "debugger.event":
             await self._handle_debugger_event(params)
         elif event == "debugger.detached":
-            await self._remove_tab_with_events(params.get("tabId"))
+            tab_id = params.get("tabId")
+            if type(tab_id) is int:
+                self._extension_detach_epochs[tab_id] = self._extension_detach_epochs.get(tab_id, 0) + 1
+                if params.get("reason") == "target_closed":
+                    try:
+                        target_id = self._registry.target_id_for_tab(tab_id)
+                    except KeyError:
+                        pass
+                    else:
+                        pending = TabReconnectEvent(tab_id, target_id, "pending")
+                        self._pending_tab_reconnects[tab_id] = pending
+                        self._notify_tab_reconnect(pending)
+            await self._remove_tab_with_events(tab_id)
         elif event == "scope.tabRemoved":
-            await self._remove_tab_with_events(params.get("tabId"))
+            tab_id = params.get("tabId")
+            if type(tab_id) is int:
+                self._finish_tab_reconnect(self._pending_tab_reconnects.get(tab_id), "failed")
+            await self._remove_tab_with_events(tab_id)
         elif event in {"scope.tabAdded", "tabs.created"}:
             tab_id = params.get("tabId")
             if type(tab_id) is not int:
@@ -154,7 +280,9 @@ class ExtensionCdpAdapter:
                         params,
                         include_opener=event == "tabs.created",
                         generation=generation,
-                    )
+                    ),
+                    event=event,
+                    tab_id=tab_id,
                 )
                 await asyncio.sleep(0)
             else:
@@ -172,7 +300,7 @@ class ExtensionCdpAdapter:
                     if isinstance(tab, dict) and type(tab.get("tabId")) is int
                 ]
                 if self._auto_attach:
-                    self._spawn(self._handle_hello_tabs(tabs))
+                    self._spawn(self._handle_hello_tabs(tabs), event="extension.hello")
                     await asyncio.sleep(0)
                 else:
                     await self._handle_hello_tabs(tabs)
@@ -264,17 +392,288 @@ class ExtensionCdpAdapter:
             return
         if not is_cdp_method_allowed(method, params):
             raise ExtensionRequestError("CDP_METHOD_NOT_ALLOWED", "The requested CDP method is not allowed.")
+        if method == "Target.getTargetInfo" and tab_id in self._unexposed_attached_tabs:
+            await self._send_error(ws, request_id, -32000, "target not found", session_id)
+            return
+        if method == "Target.getTargetInfo" and isinstance(params.get("targetId"), str):
+            try:
+                requested_tab_id = self._registry.tab_for_target(params["targetId"])
+            except KeyError:
+                requested_tab_id = None
+            if requested_tab_id in self._unexposed_attached_tabs:
+                await self._send_error(ws, request_id, -32000, "target not found", session_id)
+                return
+        if method == "Target.getTargetInfo" and chrome_session_id is None and not params:
+            try:
+                target_id = self._registry.target_id_for_tab(tab_id)
+            except KeyError:
+                target_id = None
+            if target_id is not None and self.target_attachment_snapshot(target_id):
+                await self._reply(ws, request_id, {"targetInfo": self._target_info(tab_id)}, session_id)
+                return
         relay_params = params
         if method == "Target.setAutoAttach" and params.get("autoAttach") is True:
             relay_params = {**params, "filter": [{"type": "iframe", "exclude": False}]}
         args = {"tabId": tab_id, "method": method, "params": relay_params}
         if chrome_session_id is not None:
             args["sessionId"] = chrome_session_id
-        relay_result = await self._relay.request("debugger.send", args)
+        is_navigation = chrome_session_id is None and method in _NAVIGATION_METHODS
+        navigation_marker = await self._begin_navigation(tab_id) if is_navigation else None
+        generation = self._active_scope_generation(tab_id)
+
+        def session_is_current() -> bool:
+            try:
+                return self._registry.resolve_session(session_id) == (tab_id, chrome_session_id)
+            except KeyError:
+                return False
+
+        try:
+            if is_navigation:
+                relay_result = await self._relay.request("debugger.send", args)
+            else:
+                relay_result = await self._send_debugger_command(
+                    args, generation=generation, retry_is_current=session_is_current
+                )
+        except (ExtensionRequestError, BrowserExtensionBrokerError) as exc:
+            if not is_navigation:
+                raise
+            await self._finish_navigation(
+                ws,
+                request_id,
+                session_id,
+                tab_id,
+                navigation_marker,
+                error={"code": -32000, "message": f"{exc.code}: {exc.message}"},
+            )
+            return
+        except BaseException:
+            if is_navigation:
+                await self._abort_navigation(tab_id, navigation_marker)
+            raise
+        if is_navigation:
+            await self._finish_navigation(
+                ws,
+                request_id,
+                session_id,
+                tab_id,
+                navigation_marker,
+                result=relay_result.get("result", {}),
+            )
+            return
+        # Event ordering requires no suspending await between the transport result and this send.
         await self._send(
             ws,
             {"id": request_id, "sessionId": session_id, "result": relay_result.get("result", {})},
         )
+
+    async def _send_debugger_command(
+        self,
+        args: dict[str, Any],
+        *,
+        generation: int | None,
+        retry_is_current: Callable[[], bool] | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        method = args["method"]
+        params = args.get("params", {})
+        tab_id = args["tabId"]
+        connection_generation = self._connection_generation
+        state_name = _COMMAND_STATE_KEYS.get(method)
+        state_key = (tab_id, args.get("sessionId"), state_name) if state_name is not None else None
+        hold = EventHold(tab_id) if is_page_change_exempt(method, params) else None
+        command_state = None
+        if state_key is not None:
+            command_state = self._command_states.setdefault(state_key, _CommandState((method, params)))
+            command_state.latest = (method, params)
+            command_state.in_flight += 1
+        try:
+            try:
+                return await self._relay.request("debugger.send", args, timeout=timeout, hold=hold)
+            except ExtensionRequestError as exc:
+                if not _is_page_changed_cancellation(exc) or not is_page_change_exempt(method, params):
+                    raise
+                tier = "R" if method in PAGE_CHANGE_TIER_R_METHODS or is_page_change_bootstrap(method, params) else "Q"
+                if tier == "Q" and exc.message != PAGE_CHANGED_BEFORE_START_MESSAGE:
+                    raise
+                if (
+                    connection_generation != self._connection_generation
+                    or not self._relay.connected
+                    or generation is None
+                    or not self._scope_is_current(tab_id, generation)
+                    or (retry_is_current is not None and not retry_is_current())
+                    or (command_state is not None and command_state.latest != (method, params))
+                ):
+                    raise
+                message_kind = "before_start" if exc.message == PAGE_CHANGED_BEFORE_START_MESSAGE else "while_running"
+            outcome = "error"
+            try:
+                if hold is not None:
+                    hold.activate()
+                result = await self._relay.request("debugger.send", args, timeout=timeout, hold=hold)
+                outcome = "success"
+                return result
+            finally:
+                with contained_effect("browser_extension_page_changed_reissue"):
+                    LOG.info(
+                        "browser_extension_page_changed_reissue",
+                        method=method,
+                        tier=tier,
+                        message_kind=message_kind,
+                        outcome=outcome,
+                    )
+        finally:
+            if hold is not None:
+                hold.release()
+            if state_key is not None and command_state is not None:
+                command_state.in_flight -= 1
+                # Keep the latest request even after it finishes, until older commands can no longer retry.
+                if command_state.in_flight == 0 and self._command_states.get(state_key) is command_state:
+                    self._command_states.pop(state_key)
+
+    async def _begin_navigation(self, tab_id: int) -> int:
+        lock = self._navigation_locks.setdefault(tab_id, asyncio.Lock())
+        async with lock:
+            self._navigation_marker_counter += 1
+            marker = self._navigation_marker_counter
+            self._navigation_in_flight.setdefault(tab_id, set()).add(marker)
+            return marker
+
+    async def _finish_navigation(
+        self,
+        ws: web.WebSocketResponse,
+        request_id: object,
+        session_id: str,
+        tab_id: int,
+        navigation_marker: int | None,
+        *,
+        result: dict | None = None,
+        error: dict | None = None,
+    ) -> None:
+        response = {"id": request_id, "sessionId": session_id}
+        if error is None:
+            response["result"] = result or {}
+        else:
+            response["error"] = error
+        lock = self._navigation_locks.setdefault(tab_id, asyncio.Lock())
+        async with lock:
+            in_flight = self._navigation_in_flight.get(tab_id)
+            if in_flight is None or navigation_marker not in in_flight:
+                await self._send(ws, response)
+                return
+            response_forwarded = False
+            events: list[dict] = []
+            event_generation = self._connection_generation
+            try:
+                await self._send(ws, response)
+                response_forwarded = True
+            finally:
+                in_flight.discard(navigation_marker)
+                is_current_set = self._navigation_in_flight.get(tab_id) is in_flight
+                if is_current_set and not in_flight:
+                    self._navigation_in_flight.pop(tab_id, None)
+                    if not response_forwarded:
+                        self._discard_navigation_events(tab_id)
+                    else:
+                        events, event_generation = self._take_navigation_events(tab_id)
+            if is_current_set and not in_flight:
+                await self._flush_navigation_events(tab_id, events, event_generation)
+
+    async def _abort_navigation(self, tab_id: int, navigation_marker: int | None = None) -> None:
+        lock = self._navigation_locks.setdefault(tab_id, asyncio.Lock())
+        async with lock:
+            in_flight = self._navigation_in_flight.get(tab_id)
+            if not in_flight:
+                return
+            if navigation_marker is not None and navigation_marker not in in_flight:
+                return
+            if navigation_marker is None:
+                in_flight.clear()
+            else:
+                in_flight.discard(navigation_marker)
+            if in_flight:
+                return
+            self._navigation_in_flight.pop(tab_id, None)
+            events, event_generation = self._take_navigation_events(tab_id)
+            await self._flush_navigation_events(
+                tab_id,
+                events,
+                event_generation,
+                forward_navigation_sensitive=False,
+            )
+
+    async def _flush_navigation_events(
+        self,
+        tab_id: int,
+        events: list[dict] | None = None,
+        event_generation: int | None = None,
+        *,
+        forward_navigation_sensitive: bool = True,
+    ) -> None:
+        if events is None:
+            events, event_generation = self._take_navigation_events(tab_id)
+        if event_generation is None:
+            event_generation = self._connection_generation
+        for payload in events:
+            if event_generation != self._connection_generation:
+                LOG.debug(
+                    "browser_extension_stale_navigation_event_batch_dropped",
+                    tab_id=tab_id,
+                    batch_generation=event_generation,
+                    current_generation=self._connection_generation,
+                    buffered_event_count=len(events),
+                )
+                return
+            if not forward_navigation_sensitive and self._is_navigation_sensitive_event(payload):
+                continue
+            await self._forward_debugger_event(payload)
+
+    @staticmethod
+    def _is_navigation_sensitive_event(payload: dict) -> bool:
+        method = payload.get("method")
+        return isinstance(method, str) and (
+            method in _NAVIGATION_SENSITIVE_EVENT_METHODS or method.startswith("Runtime.executionContext")
+        )
+
+    @staticmethod
+    def _is_navigation_commit_event(payload: dict) -> bool:
+        return payload.get("method") in _NAVIGATION_COMMIT_EVENT_METHODS
+
+    def _bound_navigation_sensitive_events(self, tab_id: int, events: list[dict]) -> list[dict]:
+        if len(events) <= _NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT:
+            return events
+
+        commit_indexes = [index for index, event in enumerate(events) if self._is_navigation_commit_event(event)]
+        execution_context_indexes = [
+            index
+            for index, event in enumerate(events)
+            if isinstance(event.get("method"), str) and event["method"].startswith("Runtime.executionContext")
+        ]
+        priority_index_set = set(commit_indexes) | set(execution_context_indexes)
+        priority_indexes = sorted(priority_index_set)
+        if len(priority_indexes) >= _NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT:
+            keep_indexes = set(priority_indexes[-_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT:])
+        else:
+            other_indexes = [index for index in range(len(events)) if index not in priority_index_set]
+            keep_indexes = set(priority_indexes)
+            keep_indexes.update(other_indexes[-(_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT - len(priority_indexes)) :])
+        retained_events = [event for index, event in enumerate(events) if index in keep_indexes]
+        dropped_event_count = len(events) - len(retained_events)
+        dropped_commit_event_count = len(commit_indexes) - sum(index in keep_indexes for index in commit_indexes)
+        dropped_execution_context_event_count = len(execution_context_indexes) - sum(
+            index in keep_indexes for index in execution_context_indexes
+        )
+        LOG.warning(
+            "browser_extension_navigation_sensitive_event_buffer_overflow",
+            tab_id=tab_id,
+            buffered_event_count=len(events),
+            retained_event_count=len(retained_events),
+            dropped_event_count=dropped_event_count,
+            dropped_non_commit_event_count=dropped_event_count - dropped_commit_event_count,
+            dropped_commit_event_count=dropped_commit_event_count,
+            dropped_execution_context_event_count=dropped_execution_context_event_count,
+            max_buffered_events=_NAVIGATION_SENSITIVE_EVENT_BUFFER_LIMIT,
+        )
+        return retained_events
 
     async def _handle_root_command(
         self,
@@ -301,7 +700,7 @@ class ExtensionCdpAdapter:
         elif method == "Browser.close":
             await self._reply(ws, request_id, {}, response_session_id)
             self._closing_client_websockets.add(ws)
-            self._spawn(self._shutdown_client(ws))
+            self._spawn(self._shutdown_client(ws), event="Browser.close")
         elif method == "Browser.getWindowForTarget":
             await self._reply(
                 ws,
@@ -385,6 +784,8 @@ class ExtensionCdpAdapter:
             tabs = [{"tabId": tab_id, "url": "about:blank", "title": ""}]
 
         newly_attached: list[tuple[int, str, int]] = []
+        deferred_tabs: list[tuple[dict, int]] = []
+        connection_generation = self._connection_generation
         try:
             for tab in tabs:
                 tab_id = tab.get("tabId")
@@ -393,7 +794,13 @@ class ExtensionCdpAdapter:
                 generation = self._active_scope_generation(tab_id)
                 if generation is None:
                     continue
-                attached = await self._ensure_attached(tab, generation=generation)
+                try:
+                    attached = await self._ensure_attached(tab, generation=generation)
+                except ExtensionRequestError as exc:
+                    if not _is_page_changed_cancellation(exc):
+                        raise
+                    deferred_tabs.append((tab, generation))
+                    continue
                 if attached is not None:
                     target_id, is_new = attached
                     if is_new:
@@ -410,6 +817,14 @@ class ExtensionCdpAdapter:
         await self._reply(ws, request_id, {}, response_session_id)
         for tab_id, target_id, generation in newly_attached:
             await self._emit_attached(tab_id, target_id, generation)
+        for tab, generation in deferred_tabs:
+            self._spawn(
+                self._handle_tab_added(
+                    tab, include_opener=False, generation=generation, connection_generation=connection_generation
+                ),
+                event="Target.setAutoAttach",
+                tab_id=tab["tabId"],
+            )
 
     async def _set_discover_targets(
         self,
@@ -450,6 +865,8 @@ class ExtensionCdpAdapter:
                 if not isinstance(target_id, str):
                     raise KeyError(target_id)
                 tab_id = self._registry.tab_for_target(target_id)
+                if tab_id in self._unexposed_attached_tabs:
+                    raise KeyError(target_id)
                 target_info = self._registry.target_info(target_id)
                 if target_id == self._registry.target_id_for_tab(tab_id):
                     target_info = self._target_info(tab_id)
@@ -585,11 +1002,68 @@ class ExtensionCdpAdapter:
                 tab_id = None
                 chrome_session_id = None
             if tab_id is not None and chrome_session_id is None:
+                await self._abort_navigation(tab_id)
                 await self._relay.request("debugger.detach", {"tabId": tab_id})
                 self._forget_tab(tab_id)
         await self._reply(ws, request_id, {}, response_session_id)
 
     async def _handle_debugger_event(self, payload: dict, replaying_pending_event: bool = False) -> None:
+        tab_id = payload.get("tabId")
+        method = payload.get("method")
+        event_params = payload.get("params")
+        if type(tab_id) is not int or not isinstance(method, str) or not isinstance(event_params, dict):
+            return
+        event_generation = self._connection_generation
+        lock = self._navigation_locks.setdefault(tab_id, asyncio.Lock())
+        async with lock:
+            if event_generation != self._connection_generation:
+                return
+            if tab_id in self._navigation_in_flight:
+                if tab_id in self._navigation_overflowed:
+                    if self._is_navigation_sensitive_event(payload):
+                        events = self._navigation_events.setdefault(tab_id, [])
+                        self._navigation_event_generations.setdefault(tab_id, event_generation)
+                        events.append(payload)
+                        self._navigation_events[tab_id] = self._bound_navigation_sensitive_events(tab_id, events)
+                    else:
+                        await self._flush_navigation_events(tab_id, [payload], event_generation)
+                    return
+                events = self._navigation_events.setdefault(tab_id, [])
+                batch_generation = self._navigation_event_generations.setdefault(tab_id, event_generation)
+                if batch_generation != self._connection_generation:
+                    return
+                if len(events) < _NAVIGATION_EVENT_BUFFER_LIMIT:
+                    events.append(payload)
+                    return
+                buffered_events = [*events, payload]
+                events.clear()
+                self._navigation_overflowed.add(tab_id)
+                events_to_flush = [event for event in buffered_events if not self._is_navigation_sensitive_event(event)]
+                sensitive_events = [event for event in buffered_events if self._is_navigation_sensitive_event(event)]
+                if sensitive_events:
+                    self._navigation_events[tab_id] = self._bound_navigation_sensitive_events(tab_id, sensitive_events)
+                    self._navigation_event_generations[tab_id] = batch_generation
+                else:
+                    self._navigation_events.pop(tab_id, None)
+                    self._navigation_event_generations.pop(tab_id, None)
+                LOG.warning(
+                    "browser_extension_navigation_event_buffer_overflow",
+                    tab_id=tab_id,
+                    buffered_event_count=len(buffered_events),
+                    forwarded_non_navigation_event_count=len(events_to_flush),
+                    buffered_navigation_event_count=len(sensitive_events),
+                    max_buffered_events=_NAVIGATION_EVENT_BUFFER_LIMIT,
+                )
+                if events_to_flush:
+                    await self._flush_navigation_events(tab_id, events_to_flush, batch_generation)
+                return
+            await self._forward_debugger_event(payload, replaying_pending_event)
+
+    async def _forward_debugger_event(
+        self,
+        payload: dict,
+        replaying_pending_event: bool = False,
+    ) -> None:
         tab_id = payload.get("tabId")
         method = payload.get("method")
         event_params = payload.get("params")
@@ -627,7 +1101,11 @@ class ExtensionCdpAdapter:
                     if child_session_id in self._pending_child_sessions:
                         return
                     self._pending_child_sessions.add(child_session_id)
-                    self._spawn(self._discard_unsupported_child(tab_id, child_session_id, target_info))
+                    self._spawn(
+                        self._discard_unsupported_child(tab_id, child_session_id, target_info),
+                        event="Target.attachedToTarget",
+                        tab_id=tab_id,
+                    )
                     await asyncio.sleep(0)
                     return
                 if self._auto_attach:
@@ -641,7 +1119,9 @@ class ExtensionCdpAdapter:
                             target_info,
                             event_params,
                             outer_session_ids,
-                        )
+                        ),
+                        event="Target.attachedToTarget",
+                        tab_id=tab_id,
                     )
                     await asyncio.sleep(0)
                 else:
@@ -654,7 +1134,11 @@ class ExtensionCdpAdapter:
                 return
             if child_session_id in self._pending_child_sessions:
                 self._pending_child_sessions.discard(child_session_id)
-                self._spawn(self._discard_buffered_child_events(tab_id, child_session_id))
+                self._spawn(
+                    self._discard_buffered_child_events(tab_id, child_session_id),
+                    event="Target.detachedFromTarget",
+                    tab_id=tab_id,
+                )
             try:
                 self._registry.resolve_session(child_session_id)
             except KeyError:
@@ -672,15 +1156,17 @@ class ExtensionCdpAdapter:
         event_params: dict,
         outer_session_ids: list[str],
     ) -> None:
+        generation = self._active_scope_generation(tab_id)
         try:
-            await self._relay.request(
-                "debugger.send",
+            await self._send_debugger_command(
                 {
                     "tabId": tab_id,
                     "sessionId": child_session_id,
                     "method": "Target.setAutoAttach",
                     "params": dict(_CHILD_AUTO_ATTACH_PARAMS),
                 },
+                generation=generation,
+                retry_is_current=lambda: child_session_id in self._pending_child_sessions,
                 timeout=_CHILD_AUTO_ATTACH_TIMEOUT_SECONDS,
             )
         except Exception as exc:
@@ -797,17 +1283,31 @@ class ExtensionCdpAdapter:
         for tab, generation in tabs:
             await self._handle_tab_added(tab, include_opener=False, generation=generation)
 
-    async def _handle_tab_added(self, params: dict, include_opener: bool, generation: int) -> None:
-        if self._auto_attach:
-            async with self._root_target_setup_lock:
-                await self._handle_tab_added_locked(params, include_opener, generation)
-            return
-        await self._handle_tab_added_locked(params, include_opener, generation)
+    async def _handle_tab_added(
+        self, params: dict, include_opener: bool, generation: int, connection_generation: int | None = None
+    ) -> None:
+        tab_id = params.get("tabId")
+        pending = self._pending_tab_reconnects.get(tab_id) if type(tab_id) is int else None
+        try:
+            if self._auto_attach:
+                async with self._root_target_setup_lock:
+                    if connection_generation is not None and (
+                        connection_generation != self._connection_generation or not self._auto_attach
+                    ):
+                        return
+                    await self._handle_tab_added_locked(params, include_opener, generation)
+                return
+            if connection_generation is not None:
+                return
+            await self._handle_tab_added_locked(params, include_opener, generation)
+        finally:
+            self._finish_tab_reconnect(pending, "failed")
 
     async def _handle_tab_added_locked(self, params: dict, include_opener: bool, generation: int) -> None:
         tab_id = params.get("tabId")
         if type(tab_id) is not int:
             return
+        pending = self._pending_tab_reconnects.get(tab_id)
         opener_id = None
         opener_tab_id = params.get("openerTabId")
         if include_opener and self._auto_attach and type(opener_tab_id) is int:
@@ -832,23 +1332,32 @@ class ExtensionCdpAdapter:
                 return
             is_new = not self._registry.has_tab(tab_id)
             self._register_tab(tab, opener_id)
-        if is_new and self._discover_targets and self._scope_is_current(tab_id, generation):
+        if (
+            is_new
+            and self._discover_targets
+            and self._scope_is_current(tab_id, generation)
+            and tab_id not in self._unexposed_attached_tabs
+        ):
             await self._emit(
                 "Target.targetCreated",
                 {"targetInfo": self._target_info(tab_id)},
                 scope_guard=(tab_id, generation),
             )
+        if not self._auto_attach and self._scope_is_current(tab_id, generation):
+            self._finish_tab_reconnect(pending, "done", self._registry.target_id_for_tab(tab_id))
 
     async def _remove_tab_with_events(self, tab_id: object) -> None:
         if type(tab_id) is not int:
             return
         self._revoke_tab_scope(tab_id)
+        await self._abort_navigation(tab_id)
         lock = self._attach_locks.setdefault(tab_id, asyncio.Lock())
         async with lock:
             try:
                 session_ids = self._registry.root_session_ids(tab_id)
                 target_id = self._registry.target_id_for_tab(tab_id)
             except KeyError:
+                self._forget_tab(tab_id)
                 return
             self._forget_tab(tab_id)
             for session_id in session_ids:
@@ -875,28 +1384,47 @@ class ExtensionCdpAdapter:
         async with lock:
             if not self._scope_is_current(tab_id, generation):
                 return None
-            is_new = tab_id not in self._attached_tabs
+            is_new = tab_id not in self._attached_tabs or tab_id in self._unexposed_attached_tabs
             if is_new:
-                debugger_attached = False
+                debugger_attached = tab_id in self._attached_tabs
                 attachment_committed = False
+                preserve_attachment = False
+                connection_generation = self._connection_generation
                 cleanup_suppress_interrupts = True
+                extension_detach_epoch = self._extension_detach_epochs.get(tab_id, 0)
                 try:
-                    try:
-                        await self._relay.request("debugger.attach", {"tabId": tab_id})
-                        debugger_attached = True
-                    except ExtensionRequestError as exc:
-                        if exc.code != "CDP_ERROR" or "already attached" not in exc.message.lower():
-                            raise
-                        debugger_attached = True
-                    real_target_id = await self._fetch_main_frame_id(tab_id)
+                    if not debugger_attached:
+                        try:
+                            await self._relay.request("debugger.attach", {"tabId": tab_id})
+                            debugger_attached = True
+                        except ExtensionRequestError as exc:
+                            if exc.code != "CDP_ERROR" or "already attached" not in exc.message.lower():
+                                raise
+                            debugger_attached = True
+                    real_target_id = await self._fetch_main_frame_id(tab_id, generation)
                     if not self._scope_is_current(tab_id, generation):
                         cleanup_suppress_interrupts = False
                         return None
                     target_id = self._register_tab(tab, opener_id, real_target_id)
                     self._attached_tabs.add(tab_id)
+                    self._unexposed_attached_tabs.discard(tab_id)
                     attachment_committed = True
+                except ExtensionRequestError as exc:
+                    if debugger_attached and _is_page_changed_cancellation(exc):
+                        preserve_attachment = True
+                        if connection_generation == self._connection_generation and self._scope_is_current(
+                            tab_id, generation
+                        ):
+                            self._attached_tabs.add(tab_id)
+                            self._unexposed_attached_tabs.add(tab_id)
+                    raise
                 finally:
-                    if debugger_attached and not attachment_committed:
+                    if (
+                        debugger_attached
+                        and not attachment_committed
+                        and not preserve_attachment
+                        and self._extension_detach_epochs.get(tab_id, 0) == extension_detach_epoch
+                    ):
                         await self._discard_failed_attachment_safely(
                             tab_id,
                             suppress_interrupts=cleanup_suppress_interrupts,
@@ -922,12 +1450,12 @@ class ExtensionCdpAdapter:
             else:
                 raise
 
-    async def _fetch_main_frame_id(self, tab_id: int) -> str | None:
+    async def _fetch_main_frame_id(self, tab_id: int, generation: int) -> str | None:
         # Playwright resolves the main frame's session by targetId, so the exposed
         # page targetId must equal Chrome's real main-frame id for this tab.
-        tree = await self._relay.request(
-            "debugger.send",
+        tree = await self._send_debugger_command(
             {"tabId": tab_id, "method": "Page.getFrameTree", "params": {}},
+            generation=generation,
         )
         frame = tree.get("result", {}).get("frameTree", {}).get("frame", {})
         frame_id = frame.get("id") if isinstance(frame, dict) else None
@@ -962,7 +1490,7 @@ class ExtensionCdpAdapter:
         for tab in self._relay.scoped_tabs:
             if isinstance(tab, dict) and type(tab.get("tabId")) is int:
                 tab_id = tab["tabId"]
-                if self._active_scope_generation(tab_id) is not None:
+                if self._active_scope_generation(tab_id) is not None and tab_id not in self._unexposed_attached_tabs:
                     self._register_tab(tab)
 
     def _target_info(self, tab_id: int) -> dict:
@@ -976,11 +1504,14 @@ class ExtensionCdpAdapter:
         return [
             self._target_info(self._registry.tab_for_target(info["targetId"]))
             for info in self._registry.list_page_targets()
+            if self._registry.tab_for_target(info["targetId"]) not in self._unexposed_attached_tabs
         ]
 
     async def _emit_attached(self, tab_id: int, target_id: str, generation: int) -> None:
-        if not self._scope_is_current(tab_id, generation):
+        if not self._scope_is_current(tab_id, generation) or tab_id in self._unexposed_attached_tabs:
             return
+        ws = self._client_ws
+        pending = self._pending_tab_reconnects.get(tab_id)
         await self._emit(
             "Target.attachedToTarget",
             {
@@ -990,6 +1521,14 @@ class ExtensionCdpAdapter:
             },
             scope_guard=(tab_id, generation),
         )
+        if (
+            ws is not None
+            and ws is self._client_ws
+            and not ws.closed
+            and self._scope_is_current(tab_id, generation)
+            and tab_id not in self._unexposed_attached_tabs
+        ):
+            self._finish_tab_reconnect(pending, "done", target_id)
 
     def _update_main_frame(self, tab_id: int, params: dict) -> None:
         frame = params.get("frame")
@@ -1006,8 +1545,20 @@ class ExtensionCdpAdapter:
         title = raw_title if isinstance(raw_title, str) else str(current["title"])
         self._registry.update_tab(tab_id, url, title)
 
+    def _take_navigation_events(self, tab_id: int) -> tuple[list[dict], int]:
+        events = self._navigation_events.pop(tab_id, [])
+        event_generation = self._navigation_event_generations.pop(tab_id, self._connection_generation)
+        self._navigation_overflowed.discard(tab_id)
+        return events, event_generation
+
+    def _discard_navigation_events(self, tab_id: int) -> None:
+        self._navigation_events.pop(tab_id, None)
+        self._navigation_event_generations.pop(tab_id, None)
+        self._navigation_overflowed.discard(tab_id)
+
     async def _detach_all_tabs(self) -> None:
         tab_ids = {self._registry.tab_for_target(info["targetId"]) for info in self._registry.list_page_targets()}
+        tab_ids.update(self._attached_tabs)
         tab_ids.update(tab["tabId"] for tab in self._relay.scoped_tabs if type(tab.get("tabId")) is int)
         for tab_id in sorted(tab_ids):
             try:
@@ -1026,6 +1577,7 @@ class ExtensionCdpAdapter:
 
     def _forget_tab(self, tab_id: int) -> None:
         self._attached_tabs.discard(tab_id)
+        self._unexposed_attached_tabs.discard(tab_id)
         self._opener_ids.pop(tab_id, None)
         self._registry.remove_tab(tab_id)
 
@@ -1058,14 +1610,47 @@ class ExtensionCdpAdapter:
     def _scope_is_current(self, tab_id: int, generation: int) -> bool:
         return self._scope_generations.get(tab_id) == generation and tab_id not in self._scope_tombstones
 
+    def target_attachment_snapshot(self, target_id: str) -> bool:
+        try:
+            tab_id = self._registry.tab_for_target(target_id)
+            generation = self._scope_generations[tab_id]
+            return (
+                self._relay.connected
+                and tab_id in self._attached_tabs
+                and tab_id not in self._unexposed_attached_tabs
+                and self._scope_is_current(tab_id, generation)
+                and self._registry.target_id_for_tab(tab_id) == target_id
+            )
+        except KeyError:
+            return False
+
+    def scoped_tab_id_for_target(self, target_id: str) -> int | None:
+        """Resolve a live page binding without granting or restoring tab access."""
+        try:
+            tab_id = self._registry.tab_for_target(target_id)
+            generation = self._scope_generations[tab_id]
+            if (
+                self._relay.connected
+                and self._scope_is_current(tab_id, generation)
+                and self._registry.target_id_for_tab(tab_id) == target_id
+            ):
+                return tab_id
+        except KeyError:
+            pass
+        return None
+
     def _reset_connection_state(self) -> None:
+        self._connection_generation += 1
         current_task = asyncio.current_task()
         for task in self._background_tasks:
             if task is not current_task:
                 task.cancel()
         self._auto_attach = False
         self._discover_targets = False
+        self._pending_tab_reconnects.clear()
         self._attached_tabs.clear()
+        self._unexposed_attached_tabs.clear()
+        self._command_states.clear()
         self._attach_locks.clear()
         self._opener_ids.clear()
         self._scope_generations.clear()
@@ -1073,12 +1658,17 @@ class ExtensionCdpAdapter:
         self._closing_client_websockets.clear()
         self._pending_child_sessions.clear()
         self._pending_child_events.clear()
+        self._navigation_locks.clear()
+        self._navigation_in_flight.clear()
+        self._navigation_overflowed.clear()
+        self._navigation_events.clear()
+        self._navigation_event_generations.clear()
         self._registry.clear()
 
-    def _spawn(self, coroutine: Coroutine[object, object, None]) -> None:
+    def _spawn(self, coroutine: Coroutine[object, object, None], *, event: str, tab_id: int | None = None) -> None:
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_task_done)
+        task.add_done_callback(partial(self._background_task_done, event=event, tab_id=tab_id))
 
     def _spawn_client_task(self, ws: web.WebSocketResponse, coroutine: Coroutine[object, object, None]) -> None:
         task = asyncio.create_task(coroutine)
@@ -1104,13 +1694,26 @@ class ExtensionCdpAdapter:
         if error is not None:
             LOG.debug("browser_extension_client_task_failed", error_type=type(error).__name__)
 
-    def _background_task_done(self, task: asyncio.Task[None]) -> None:
+    def _background_task_done(self, task: asyncio.Task[None], *, event: str, tab_id: int | None = None) -> None:
         self._background_tasks.discard(task)
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
-            LOG.debug("browser_extension_event_task_failed", error_type=type(error).__name__)
+            if isinstance(error, (ExtensionRequestError, BrowserExtensionBrokerError)):
+                error_code = error.code
+                error_message = error.message
+            else:
+                error_code = None
+                error_message = str(error)
+            LOG.debug(
+                "browser_extension_event_task_failed",
+                error_type=type(error).__name__,
+                error_code=error_code,
+                error_message=_sanitize_background_error_message(error_message),
+                source_event=event,
+                tab_id=tab_id,
+            )
 
     async def _reply(
         self,
@@ -1163,6 +1766,17 @@ class ExtensionCdpAdapter:
         scope_guard: tuple[int, int] | None = None,
     ) -> None:
         async with self._send_lock:
+            # Discovery and attachment events can wait behind another send while a
+            # probe marks their already-registered tab unexposed. Recheck at delivery.
+            if payload.get("method") in {"Target.targetCreated", "Target.targetInfoChanged", "Target.attachedToTarget"}:
+                target_id = payload.get("params", {}).get("targetInfo", {}).get("targetId")
+                try:
+                    tab_id = self._registry.tab_for_target(target_id)
+                except KeyError:
+                    # Browser targets and not-yet-registered child targets have no tab record.
+                    tab_id = None
+                if tab_id in self._unexposed_attached_tabs:
+                    return
             if scope_guard is not None and not self._scope_is_current(*scope_guard):
                 return
             if not ws.closed:

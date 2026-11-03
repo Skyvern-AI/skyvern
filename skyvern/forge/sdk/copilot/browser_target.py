@@ -9,21 +9,49 @@ report from the other.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from agents import FunctionTool
+
+from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.utils.strings import join_phrases
 
 BROWSER_TARGET_PARAM_NAME = "target"
+
+# Native tools that act in a live page through this resolver; tools.BROWSER_BOUND_TOOL_NAMES cannot be imported
+# here or from the stream adapter without a cycle, so a unit test pins it to the page-state tool set.
+DEBUG_BROWSER_TOOL_NAMES = frozenset(
+    {
+        "run_browser_code",
+        "inspect_page_for_composition",
+        "inspect_locator_matches",
+        "fill_credential_field",
+        "solve_page_challenge",
+        "upload_attached_file",
+        "discover_workflow_entrypoint",
+    }
+)
+
+
+def tool_accepts_target(tool: FunctionTool) -> bool:
+    properties = tool.params_json_schema.get("properties")
+    return isinstance(properties, dict) and BROWSER_TARGET_PARAM_NAME in properties
+
+
+class BrowserTarget(StrEnum):
+    DEBUG = "debug"
+    LAST_RUN = "last_run"
+
+
 BROWSER_TARGET_PARAM: dict[str, Any] = {
     "type": "string",
-    "enum": ["debug", "last_run"],
+    "enum": [target.value for target in BrowserTarget],
     "description": (
-        "Which browser to act in. 'debug' (default) is the scouting browser this chat drives. "
-        "'last_run' is the browser the most recent test run executed in, which is a different "
-        "browser whenever that run minted its own session — it is the only way to observe the page "
-        "a run actually failed on. Acting rather than observing in 'last_run' changes that page: it "
-        "can lose the state you are diagnosing, and any submit, purchase, or message it triggers is "
-        "real. A run's recorded outcome is never changed by what you do afterwards."
+        "Which browser to act in. 'debug' (default) is the one this chat drives. 'last_run' is the one "
+        "the most recent test run used, a separate browser when that run started its own, and the only "
+        "way to observe the page that run failed on. Acting in 'last_run' changes that page, and any "
+        "submit there is real."
     ),
 }
 
@@ -36,7 +64,7 @@ class BrowserSessionBinding:
     that lived on ``ctx.browser_session_id`` could be read by the wrong call.
     """
 
-    target: str
+    target: BrowserTarget
     # Set only when the model pointed this call at a browser other than the chat's own. The debug
     # target deliberately carries none, so a session re-established mid-dispatch still applies.
     session_id_override: str | None
@@ -44,7 +72,7 @@ class BrowserSessionBinding:
     source_matches_target: bool
     unavailable_reason: str | None = None
 
-    def session_id_for(self, copilot_ctx: CopilotContext) -> str | None:
+    def session_id_for(self, copilot_ctx: AgentContext) -> str | None:
         return self.session_id_override or copilot_ctx.browser_session_id
 
     def provenance(self) -> dict[str, Any]:
@@ -61,7 +89,19 @@ class BrowserSessionBinding:
         return stamp
 
 
-def resolve_browser_session_binding(copilot_ctx: CopilotContext, arguments: dict[str, Any]) -> BrowserSessionBinding:
+def last_run_facts(copilot_ctx: AgentContext, failed_browser_session_id: str | None) -> dict[str, str]:
+    """The browser ``last_run`` would bind, stated on a failed call so the model sees the other
+    browser it can name. Facts only: nothing here redirects the call that failed."""
+    run_session_id = copilot_ctx.last_run_blocks_browser_session_id
+    if not run_session_id or run_session_id == failed_browser_session_id:
+        return {}
+    facts = {"last_run_browser_session_id": run_session_id}
+    if copilot_ctx.last_run_blocks_workflow_run_id:
+        facts["last_run_workflow_run_id"] = copilot_ctx.last_run_blocks_workflow_run_id
+    return facts
+
+
+def resolve_browser_session_binding(copilot_ctx: AgentContext, arguments: dict[str, Any]) -> BrowserSessionBinding:
     """Bind this call to the browser the model named, or report why that browser is not addressable.
 
     ``last_run`` is a promise about identity, so it is kept only against the exact recorded run
@@ -69,18 +109,22 @@ def resolve_browser_session_binding(copilot_ctx: CopilotContext, arguments: dict
     browser.
     """
     requested = arguments.get(BROWSER_TARGET_PARAM_NAME)
-    if requested is not None and requested not in ("debug", "last_run"):
+    try:
+        target = BrowserTarget.DEBUG if requested is None else BrowserTarget(requested)
+    except ValueError:
         return BrowserSessionBinding(
-            target="debug",
+            target=BrowserTarget.DEBUG,
             session_id_override=None,
             workflow_run_id=None,
             source_matches_target=False,
-            unavailable_reason=f"Unknown browser target {requested!r}. Name 'debug' or 'last_run'.",
+            unavailable_reason=(
+                f"Unknown browser target {requested!r}. "
+                f"Name {join_phrases([repr(target.value) for target in BrowserTarget], 'or')}."
+            ),
         )
-    target = requested or "debug"
-    if target == "debug":
+    if target is BrowserTarget.DEBUG:
         return BrowserSessionBinding(
-            target="debug",
+            target=BrowserTarget.DEBUG,
             session_id_override=None,
             workflow_run_id=None,
             source_matches_target=True,
@@ -89,11 +133,14 @@ def resolve_browser_session_binding(copilot_ctx: CopilotContext, arguments: dict
     workflow_run_id = copilot_ctx.last_run_blocks_workflow_run_id
     if not run_session_id:
         return BrowserSessionBinding(
-            target="last_run",
+            target=BrowserTarget.LAST_RUN,
             session_id_override=None,
             workflow_run_id=workflow_run_id,
             source_matches_target=False,
-            unavailable_reason="No test run has recorded a browser session in this chat yet.",
+            unavailable_reason=(
+                copilot_ctx.last_run_binding_unavailable_reason
+                or "No test run has recorded a browser session in this chat yet."
+            ),
         )
     if run_session_id == copilot_ctx.browser_session_id:
         # The run executed in this chat's own browser, so there is nothing to redirect. Overriding
@@ -102,13 +149,13 @@ def resolve_browser_session_binding(copilot_ctx: CopilotContext, arguments: dict
         # dispatch moves the call to the live successor, and the session that acted is recoverable
         # from completion_browser_session_id and the continuity generation.
         return BrowserSessionBinding(
-            target="last_run",
+            target=BrowserTarget.LAST_RUN,
             session_id_override=None,
             workflow_run_id=workflow_run_id,
             source_matches_target=True,
         )
     return BrowserSessionBinding(
-        target="last_run",
+        target=BrowserTarget.LAST_RUN,
         session_id_override=run_session_id,
         workflow_run_id=workflow_run_id,
         source_matches_target=True,

@@ -5,13 +5,18 @@ preventing runtime errors like "'State_' is undefined" when using keys like "Sta
 """
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
 
-from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
+from skyvern.constants import SCRUBBED_VALUE
+from skyvern.exceptions import InvalidWorkflowParameter
+from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import (
     TaskBlockYAML,
+    WorkflowCreateYAMLRequest,
     WorkflowParameterYAML,
     sanitize_block_label,
     sanitize_parameter_key,
@@ -30,6 +35,10 @@ class TestIdentifierValidation:
             pytest.param("parameter", "param123", id="parameter-key-with-numbers"),
             pytest.param("parameter", "_private_param", id="parameter-key-underscore-prefix"),
             pytest.param("parameter", "x", id="parameter-key-single-letter"),
+            pytest.param("parameter", "résumé", id="canonical-unicode-key"),
+            pytest.param("parameter", "ﬁle", id="noncanonical-unicode-key"),
+            pytest.param("block", "東京", id="canonical-unicode-label"),
+            pytest.param("block", "ｐage", id="noncanonical-unicode-label"),
             pytest.param("block", "my_task", id="block-label"),
             pytest.param("block", "task123", id="block-label-with-numbers"),
             pytest.param("block", "_private_task", id="block-label-underscore-prefix"),
@@ -137,6 +146,43 @@ class TestReplaceJinjaReference:
 
 class TestSanitizeWorkflowYamlWithReferences:
     """Tests for the sanitize_workflow_yaml_with_references function."""
+
+    @pytest.mark.parametrize(
+        ("label", "target", "nested"),
+        [("extract_data", "extract_data_2", False), ("Ext Data", "Ext_Data_2", False), ("x", "x_2", True)],
+    )
+    def test_duplicate_labels_keep_shared_route_reference_resolution(
+        self, label: str, target: str, nested: bool
+    ) -> None:
+        producer = {"label": label, "block_type": "code", "code": "value = 1"}
+        repeated = (
+            {"label": "each", "block_type": "for_loop", "loop_over_parameter_key": "items", "loop_blocks": [producer]}
+            if nested
+            else producer
+        )
+        reference = "{{ " + label + "_output }}"
+        definition = {
+            "parameters": [
+                {"parameter_type": "workflow", "key": "items", "workflow_parameter_type": "json"},
+                {"parameter_type": "context", "key": "value", "source_parameter_key": label + "_output"},
+            ],
+            "blocks": [producer, repeated, {"label": "consume", "block_type": "code", "code": reference}],
+            "workflow_system_prompt": reference,
+            "error_code_mapping": {"example": reference},
+            **({"finally_block_label": label} if not nested else {}),
+        }
+
+        result = sanitize_workflow_yaml_with_references({"title": "Example", "workflow_definition": definition})
+
+        sanitized = result["workflow_definition"]
+        expected = "{{ " + target + "_output }}"
+        assert sanitized["blocks"][-1]["code"] == expected
+        assert sanitized["parameters"][1]["source_parameter_key"] == target + "_output"
+        assert sanitized["workflow_system_prompt"] == expected
+        assert sanitized["error_code_mapping"]["example"] == expected
+        if not nested:
+            assert sanitized["finally_block_label"] == target
+        WorkflowCreateYAMLRequest.model_validate(result)
 
     def test_sanitize_simple_block_label(self) -> None:
         """Test sanitizing a simple block label."""
@@ -480,3 +526,26 @@ class TestSanitizeWorkflowYamlWithReferences:
         result = sanitize_workflow_yaml_with_references(workflow_yaml)
         assert result["workflow_definition"]["parameters"][0]["key"] == "user_input"
         assert "{{ user_input }}" in result["workflow_definition"]["workflow_system_prompt"]
+
+
+@pytest.mark.parametrize(
+    ("parameter_type", "value"),
+    [
+        (WorkflowParameterType.INTEGER, "3.9"),
+        (WorkflowParameterType.INTEGER, "true"),
+        (WorkflowParameterType.FLOAT, "true"),
+        (WorkflowParameterType.INTEGER, SCRUBBED_VALUE),
+    ],
+)
+def test_run_input_of_the_wrong_shape_is_rejected_at_submit(parameter_type: WorkflowParameterType, value: str) -> None:
+    now = datetime.now(timezone.utc)
+    parameter = WorkflowParameter(
+        workflow_parameter_id="wp_count",
+        workflow_parameter_type=parameter_type,
+        key="count",
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+    with pytest.raises(InvalidWorkflowParameter):
+        WorkflowService._serialize_workflow_run_parameter_value(parameter, value)

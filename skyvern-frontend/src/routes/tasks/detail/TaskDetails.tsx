@@ -37,13 +37,18 @@ import { PlayIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { runViewTabBasePath } from "@/routes/runs/runViewTabBasePath";
-import { statusIsCancellable, statusIsFinalized } from "../types";
+import {
+  statusIsAFailureType,
+  statusIsCancellable,
+  statusIsFinalized,
+} from "../types";
 import { MAX_STEPS_DEFAULT } from "../constants";
 import { useTaskQuery } from "./hooks/useTaskQuery";
 import { useFirstParam } from "@/hooks/useFirstParam";
-import * as env from "@/util/env";
+import { runsApiBaseUrl } from "@/util/env";
 import { TaskRunVerificationCodeForm } from "./TaskRunVerificationCodeForm";
 import { RunTagsEditor } from "../components/tagging/RunTagsEditor";
+import { RunFeedback } from "@/components/feedback/RunFeedback";
 
 function createTaskRequestObject(values: TaskApiResponse) {
   return {
@@ -120,13 +125,6 @@ function TaskDetails() {
         });
         queryClient.invalidateQueries({
           queryKey: ["taskWorkflowRun", task.workflow_run_id],
-        });
-        queryClient.invalidateQueries({
-          queryKey: [
-            "workflowRun",
-            workflow?.workflow_permanent_id,
-            task.workflow_run_id,
-          ],
         });
       }
       toast({
@@ -223,6 +221,16 @@ function TaskDetails() {
               {workflowRunId ? (
                 <RunTagsEditor workflowRunId={workflowRunId} />
               ) : null}
+              {task &&
+              statusIsFinalized(task) &&
+              task.status !== Status.Canceled ? (
+                <RunFeedback
+                  targetType="task"
+                  targetId={task.task_id}
+                  variant={statusIsAFailureType(task) ? "report" : "thumbs"}
+                  className="max-w-md"
+                />
+              ) : null}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -257,7 +265,7 @@ function TaskDetails() {
 
                 return {
                   method: "POST",
-                  url: `${env.runsApiBaseUrl}/run/tasks`,
+                  url: `${runsApiBaseUrl}/run/tasks`,
                   body: buildTaskRunPayload(
                     createTaskRequestObject(task),
                     RunEngine.SkyvernV1,
@@ -323,13 +331,7 @@ function TaskDetails() {
           ) : (
             workflow &&
             workflowRun && (
-              <Link
-                to={
-                  env.useNewRunsUrl
-                    ? `/runs/${workflowRun.workflow_run_id}`
-                    : `/agents/${workflow.workflow_permanent_id}/${workflowRun.workflow_run_id}/overview`
-                }
-              >
+              <Link to={`/runs/${workflowRun.workflow_run_id}`}>
                 {workflow.title}
               </Link>
             )

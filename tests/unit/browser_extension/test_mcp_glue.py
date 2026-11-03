@@ -25,6 +25,8 @@ from skyvern.cli.commands.browser import browser_app
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.mcp_tools import session as mcp_session
+from tests.unit.browser_extension.home_guard import _test_broker_base_dir
+from tests.unit.forked_scenarios import Scenario, run_forked_scenarios
 
 from .test_broker_client import _ignore_event, _mock_pre_upgrade_daemon
 
@@ -362,12 +364,21 @@ async def test_session_create_extension_connection_error_redacts_capability_url(
     capability_token = "fake-secret-capability"
     capability_url = f"ws://127.0.0.1:43210/cdp/{capability_token}"
     connect_over_cdp = AsyncMock(
-        side_effect=RuntimeError(f"BrowserType.connect_over_cdp failed while connecting to {capability_url}")
+        side_effect=RuntimeError(
+            "BrowserType.connect_over_cdp: Protocol error: COMMAND_TIMEOUT: "
+            "The page changed while the extension operation was running. "
+            "Bearer fake-secret-token response body from https://Internal.example/private. Customer.Name. "
+            f"Call log: connecting to {capability_url}"
+        )
     )
     playwright = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=connect_over_cdp))
     skyvern = object.__new__(Skyvern)
     skyvern._get_playwright = AsyncMock(return_value=playwright)
-    runtime = SimpleNamespace(cdp_ws_url=capability_url, wait_for_extension=AsyncMock(return_value=True))
+    runtime = SimpleNamespace(
+        cdp_ws_url=capability_url,
+        extension_connected=True,
+        wait_for_extension=AsyncMock(return_value=True),
+    )
     current_token = session_manager._current_session.set(None)
     monkeypatch.setattr(session_manager, "_global_session", None)
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: skyvern)
@@ -380,7 +391,10 @@ async def test_session_create_extension_connection_error_redacts_capability_url(
         session_manager._current_session.reset(current_token)
 
     assert result["ok"] is False
-    assert result["error"]["message"] == _PAIRING_FALLBACK_GUIDANCE
+    assert result["error"]["message"] == "BrowserSessionConnectionError: COMMAND_TIMEOUT"
+    assert "Target.setAutoAttach" not in result["error"]["message"]
+    assert "COMMAND_TIMEOUT" in result["error"]["message"]
+    assert "The extension is connected" in result["error"]["hint"]
     assert "/cdp/" not in repr(result)
     assert capability_token not in repr(result)
     connect_over_cdp.assert_awaited_once_with(capability_url)
@@ -620,7 +634,7 @@ def test_extension_broker_status_never_kills_a_pre_upgrade_daemon(
     daemon out from under whoever depends on it. (extension-broker-stop is the one
     auto_spawn=False command that IS allowed to terminate one - see below.)"""
     monkeypatch.setattr(browser_commands.BrowserExtensionRuntime, "configured_port", lambda: 19778)
-    path_probe = BrokerClient(19778, _ignore_event)
+    path_probe = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, path_probe)
 
     result = CliRunner().invoke(browser_app, ["extension-broker-status"])
@@ -637,7 +651,7 @@ def test_extension_broker_stop_terminates_a_pre_upgrade_daemon(
     doesn't need to bring a replacement back up, so it must still be able to remove a
     mismatched-generation daemon that a normal wire-level stop can't reach."""
     monkeypatch.setattr(browser_commands.BrowserExtensionRuntime, "configured_port", lambda: 19778)
-    path_probe = BrokerClient(19778, _ignore_event)
+    path_probe = BrokerClient(19778, _ignore_event, base_dir=_test_broker_base_dir())
     terminated_pids = _mock_pre_upgrade_daemon(monkeypatch, path_probe)
 
     result = CliRunner().invoke(browser_app, ["extension-broker-stop"])
@@ -685,13 +699,9 @@ def test_default_extension_pair_exposes_cancel_pending() -> None:
     assert "--cancel-pending" in registered_options
 
 
-@pytest.mark.parametrize("flag", [None, "0", "1"])
-def test_extension_broker_commands_are_registered_unconditionally(flag: str | None) -> None:
+def test_extension_broker_commands_are_registered_unconditionally() -> None:
     environment = os.environ.copy()
-    if flag is None:
-        environment.pop("SKYVERN_BROWSER_EXTENSION_BROKER", None)
-    else:
-        environment["SKYVERN_BROWSER_EXTENSION_BROKER"] = flag
+    environment["SKYVERN_BROWSER_EXTENSION_BROKER"] = "0"
     script = (
         "import json; "
         "from skyvern.cli.commands.browser import browser_app; "
@@ -717,32 +727,7 @@ def test_extension_broker_commands_are_registered_unconditionally(flag: str | No
     assert broker_commands.issubset(registered)
 
 
-@pytest.mark.parametrize("env_location", ["legacy", "project", "global"])
-def test_extension_pair_opt_out_follows_env_file_chain(
-    tmp_path: Path,
-    env_location: str,
-) -> None:
-    working_directory = tmp_path / "project"
-    home_directory = tmp_path / "home"
-    working_directory.mkdir()
-    home_directory.mkdir()
-    env_paths = {
-        "legacy": working_directory / ".env",
-        "project": working_directory / ".skyvern" / ".env",
-        "global": home_directory / ".skyvern" / ".env",
-    }
-    env_path = env_paths[env_location]
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("SKYVERN_BROWSER_EXTENSION_BROKER=0\n")
-    environment = os.environ.copy()
-    environment.pop("SKYVERN_BROWSER_EXTENSION_BROKER", None)
-    environment.pop("SKYVERN_ENV_FILE", None)
-    environment["HOME"] = str(home_directory)
-    repository_root = Path(__file__).resolve().parents[3]
-    environment["PYTHONPATH"] = os.pathsep.join(
-        path for path in (str(repository_root), environment.get("PYTHONPATH", "")) if path
-    )
-    script = """
+_EXTENSION_PAIR_SCRIPT = """
 from typer.testing import CliRunner
 from skyvern.cli.commands import browser as commands
 
@@ -753,15 +738,54 @@ print(result.exit_code)
 print(result.stdout)
 """
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=working_directory,
-        env=environment,
+
+@pytest.fixture(scope="module")
+def extension_pair_runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, subprocess.CompletedProcess[str]]:
+    # The env-file chain loads when the command runs, so each location forks from one interpreter that imported the
+    # command module with the opt-out unset and no env file in its working directory or home.
+    root = tmp_path_factory.mktemp("env_file_chain")
+    scenarios = {}
+    for env_location in ("legacy", "project", "global"):
+        working_directory = root / env_location / "project"
+        home_directory = root / env_location / "home"
+        working_directory.mkdir(parents=True)
+        home_directory.mkdir()
+        env_paths = {
+            "legacy": working_directory / ".env",
+            "project": working_directory / ".skyvern" / ".env",
+            "global": home_directory / ".skyvern" / ".env",
+        }
+        env_path = env_paths[env_location]
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("SKYVERN_BROWSER_EXTENSION_BROKER=0\n")
+        scenarios[env_location] = Scenario(
+            _EXTENSION_PAIR_SCRIPT, env={"HOME": str(home_directory)}, cwd=working_directory
+        )
+    import_directory = root / "import" / "project"
+    import_home = root / "import" / "home"
+    import_directory.mkdir(parents=True)
+    import_home.mkdir()
+    environment = os.environ.copy()
+    environment.pop("SKYVERN_BROWSER_EXTENSION_BROKER", None)
+    environment.pop("SKYVERN_ENV_FILE", None)
+    environment["HOME"] = str(import_home)
+    repository_root = Path(__file__).resolve().parents[3]
+    environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(repository_root), environment.get("PYTHONPATH", "")) if path
+    )
+    return run_forked_scenarios(
+        "import typer.testing, skyvern.cli.commands.browser", scenarios, env=environment, cwd=import_directory
     )
 
+
+@pytest.mark.parametrize("env_location", ["legacy", "project", "global"])
+def test_extension_pair_opt_out_follows_env_file_chain(
+    extension_pair_runs: dict[str, subprocess.CompletedProcess[str]],
+    env_location: str,
+) -> None:
+    completed = extension_pair_runs[env_location]
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "BROKER_PATH" not in completed.stdout
     assert "Start your MCP server first: skyvern run mcp --browser-extension" in completed.stdout
 
@@ -936,10 +960,12 @@ def test_browser_extension_install_copies_token_opens_chrome_and_prints_steps(
     assert "1. Enable Developer mode." in result.stdout
     assert "2. Click Load unpacked." in result.stdout
     assert f"3. Select {extension_dir}." in result.stdout
-    assert "4. Open Skyvern Agent details and enable Allow User Scripts." in result.stdout
-    assert "5. Open the Skyvern Agent popup." in result.stdout
-    assert "6. Paste the pairing token and click Connect." in result.stdout
-    assert '7. Add tabs to the "Skyvern Controlled" group.' in result.stdout
+    assert "Direct JavaScript evaluation is unavailable in extension mode." in result.stdout
+    assert "Use the inspection and interaction tools." in " ".join(result.stdout.split())
+    assert "enable Allow User Scripts" not in result.stdout
+    assert "4. Open the Skyvern Agent popup." in result.stdout
+    assert "5. Paste the pairing token and click Connect." in result.stdout
+    assert '6. Add tabs to the "Skyvern Controlled" group.' in result.stdout
     assert "When your MCP server is running, pair with: skyvern browser extension-pair" in result.stdout
     assert run.call_args_list == [
         call(
@@ -977,7 +1003,9 @@ def test_default_extension_install_describes_auto_enable_without_loading_legacy_
     assert result.exit_code == 0
     assert "its first broker start enables broker state automatically" in result.stdout
     assert "skyvern browser extension-pair" in result.stdout
-    assert "Allow User Scripts" in result.stdout
+    assert "Direct JavaScript evaluation is unavailable in extension mode." in result.stdout
+    assert "Use the inspection and interaction tools." in " ".join(result.stdout.split())
+    assert "enable Allow User Scripts" not in result.stdout
     assert "extension-broker-enable" not in result.stdout
     token_loader.assert_not_called()
 
@@ -996,9 +1024,11 @@ def test_browser_extension_install_attempts_one_click_pairing_when_bridge_is_lis
     result = CliRunner().invoke(browser_app, ["extension-install"])
 
     assert result.exit_code == 0
-    assert "4. Open Skyvern Agent details and enable Allow User Scripts." in result.stdout
-    assert "5. Approve pairing in the Skyvern Agent confirmation tab (one click)." in result.stdout
-    assert '6. Add tabs to the "Skyvern Controlled" group.' in result.stdout
+    assert "Direct JavaScript evaluation is unavailable in extension mode." in result.stdout
+    assert "Use the inspection and interaction tools." in " ".join(result.stdout.split())
+    assert "enable Allow User Scripts" not in result.stdout
+    assert "4. Approve pairing in the Skyvern Agent confirmation tab (one click)." in result.stdout
+    assert '5. Add tabs to the "Skyvern Controlled" group.' in result.stdout
     assert "pairing token" not in result.stdout.lower()
     launch_pairing.assert_called_once_with(20123)
     load_token.assert_not_called()

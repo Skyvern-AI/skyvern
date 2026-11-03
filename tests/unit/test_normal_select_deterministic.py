@@ -8,6 +8,8 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.forge.agent_functions import AgentFunction
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.services.run_cancellation import RunCancellation
 from skyvern.webeye.actions import handler
 from skyvern.webeye.actions.actions import InputOrSelectContext, SelectOption, SelectOptionAction
 from tests.unit.helpers import make_organization, make_task
@@ -101,12 +103,16 @@ async def _run_normal_select(
     evaluate_side_effect: BaseException | None = None,
     collapse_gate: AsyncMock | None = None,
     agent_function: object | None = None,
+    normal_select_llm: AsyncMock | None = None,
+    cancellation_reader: AsyncMock | None = None,
 ) -> tuple[list, MagicMock, AsyncMock]:
     provider = SimpleNamespace(
         is_feature_enabled_cached=AsyncMock(return_value=feature_enabled),
         resolve_feature_enabled_unrecorded=AsyncMock(return_value=feature_enabled),
     )
-    normal_select_llm = AsyncMock(return_value=llm_response or {"value": "fallback", "index": None})
+    normal_select_llm = normal_select_llm or AsyncMock(
+        return_value=llm_response or {"value": "fallback", "index": None}
+    )
 
     if collapse_gate is None:
         monkeypatch.setattr(handler.app, "EXPERIMENTATION_PROVIDER", provider)
@@ -114,6 +120,7 @@ async def _run_normal_select(
         monkeypatch.setattr(handler, "_is_collapse_select_fanout_enabled", collapse_gate)
     monkeypatch.setattr(handler.app, "AGENT_FUNCTION", agent_function or AgentFunction())
     monkeypatch.setattr(handler.app, "NORMAL_SELECT_AGENT_LLM_API_HANDLER", normal_select_llm)
+    monkeypatch.setattr(handler, "read_run_cancellation", cancellation_reader or AsyncMock(return_value=None))
     monkeypatch.setattr(handler.prompt_engine, "load_prompt", MagicMock(return_value="prompt"))
     monkeypatch.setattr(handler.skyvern_context, "ensure_context", MagicMock(return_value=SimpleNamespace(tz_info=UTC)))
 
@@ -132,6 +139,169 @@ async def _run_normal_select(
         builder=MagicMock(),
     )
     return result, locator, normal_select_llm
+
+
+@pytest.mark.parametrize(("cancel_during_llm", "selects"), [(True, False), (False, True)])
+@pytest.mark.asyncio
+async def test_normal_select_does_not_select_after_cancel_during_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_during_llm: bool,
+    selects: bool,
+) -> None:
+    llm_finished = False
+
+    async def llm_side_effect(**_kwargs: object) -> dict[str, str | int | None]:
+        nonlocal llm_finished
+        llm_finished = True
+        return {"value": "US", "index": None}
+
+    cancellation = RunCancellation(TaskStatus.canceled, from_workflow_run=False)
+    cancellation_reader = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: cancellation if llm_finished and cancel_during_llm else None
+    )
+    result, locator, normal_select_llm = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=False,
+        action=_select_action("United States"),
+        options=[{"optionIndex": 0, "text": "United States", "value": "US"}],
+        selected_value="US",
+        normal_select_llm=AsyncMock(side_effect=llm_side_effect),
+        cancellation_reader=cancellation_reader,
+    )
+
+    assert locator.select_option.await_count == (1 if selects else 0)
+    normal_select_llm.assert_awaited_once()
+    assert handler._is_terminal_custom_select_failure(result[-1]) is (not selects)
+    if not selects:
+        cancellation_reader.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_normal_select_does_not_deterministically_select_after_cancel_during_context_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context_parse_finished = False
+
+    async def parse_context(**_kwargs: object) -> InputOrSelectContext:
+        nonlocal context_parse_finished
+        context_parse_finished = True
+        return InputOrSelectContext(field="Department", is_required=True)
+
+    context_parser = AsyncMock(side_effect=parse_context)
+    monkeypatch.setattr(handler, "_get_input_or_select_context", context_parser)
+    cancellation = RunCancellation(TaskStatus.canceled, from_workflow_run=False)
+    cancellation_reader = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: cancellation if context_parse_finished else None
+    )
+    agent_function = SimpleNamespace(
+        resolve_field_option=AsyncMock(
+            return_value=SimpleNamespace(
+                fallback_to_llm=False,
+                matched_index=0,
+                matched_label="United States",
+                matched_value="US",
+            )
+        )
+    )
+    result, locator, normal_select_llm = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=True,
+        action=_select_action("United States"),
+        options=[{"optionIndex": 0, "text": "United States", "value": "US"}],
+        selected_value="US",
+        collapse_gate=AsyncMock(return_value=True),
+        agent_function=agent_function,
+        cancellation_reader=cancellation_reader,
+    )
+
+    assert handler._is_terminal_custom_select_failure(result[-1])
+    locator.select_option.assert_not_awaited()
+    normal_select_llm.assert_not_awaited()
+    context_parser.assert_awaited_once()
+    cancellation_reader.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_normal_select_does_not_deterministically_select_after_cancel_during_focus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    focus_finished = False
+
+    async def focus_before_select(**_kwargs: object) -> None:
+        nonlocal focus_finished
+        focus_finished = True
+
+    monkeypatch.setattr(handler, "_best_effort_focus_click_before_select", focus_before_select)
+    cancellation = RunCancellation(TaskStatus.canceled, from_workflow_run=False)
+    cancellation_reader = AsyncMock(side_effect=lambda *_args, **_kwargs: cancellation if focus_finished else None)
+    agent_function = SimpleNamespace(
+        resolve_field_option=AsyncMock(
+            return_value=SimpleNamespace(
+                fallback_to_llm=False,
+                matched_index=0,
+                matched_label="United States",
+                matched_value="US",
+            )
+        )
+    )
+
+    result, locator, normal_select_llm = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=True,
+        action=_select_action("United States"),
+        options=[{"optionIndex": 0, "text": "United States", "value": "US"}],
+        selected_value="US",
+        collapse_gate=AsyncMock(return_value=True),
+        agent_function=agent_function,
+        cancellation_reader=cancellation_reader,
+    )
+
+    assert handler._is_terminal_custom_select_failure(result[-1])
+    locator.select_option.assert_not_awaited()
+    normal_select_llm.assert_not_awaited()
+    assert cancellation_reader.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feature_enabled", [False, True])
+async def test_normal_select_does_not_try_fallback_after_cancel_between_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    feature_enabled: bool,
+) -> None:
+    cancellation = RunCancellation(TaskStatus.canceled, from_workflow_run=False)
+    cancellation_reader = AsyncMock(side_effect=[None, None, cancellation])
+
+    async def focus_before_select(*, locator: MagicMock, **_kwargs: object) -> None:
+        locator.select_option.side_effect = Exception("timed out")
+
+    monkeypatch.setattr(handler, "_best_effort_focus_click_before_select", focus_before_select)
+    agent_function = SimpleNamespace(
+        resolve_field_option=AsyncMock(
+            return_value=SimpleNamespace(
+                fallback_to_llm=False,
+                matched_index=0,
+                matched_label="United States",
+                matched_value="US",
+            )
+        )
+    )
+    result, locator, _ = await _run_normal_select(
+        monkeypatch,
+        feature_enabled=feature_enabled,
+        action=_select_action("United States"),
+        options=[{"optionIndex": 0, "text": "United States", "value": "US"}],
+        selected_value="US",
+        llm_response={"value": "US", "index": 0},
+        collapse_gate=AsyncMock(return_value=feature_enabled),
+        agent_function=agent_function,
+        cancellation_reader=cancellation_reader,
+    )
+
+    assert handler._is_terminal_custom_select_failure(result[-1])
+    assert locator.select_option.await_args_list == [
+        call(value="US", timeout=handler.settings.BROWSER_ACTION_TIMEOUT_MS)
+    ]
+    assert cancellation_reader.await_count == 3
 
 
 @pytest.mark.parametrize(

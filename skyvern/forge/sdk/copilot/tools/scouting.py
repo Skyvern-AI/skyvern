@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
-from collections.abc import Mapping
-from typing import Any, Literal, cast
-from urllib.parse import urlparse
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, nullcontext
+from typing import Any, Literal, NamedTuple, NotRequired, TypedDict, cast
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import structlog
-from playwright.async_api import Download, Page, Response
+from playwright.async_api import BrowserContext, Download, Frame, Page, Response
 
+from skyvern.cli.core.browser_ops import do_screenshot
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent_context import (
+    PendingBrowserInteractionObservation,
+    ScoutedDragDestination,
+    ScoutedInteraction,
+    ScoutedSelectorCandidate,
+)
+from skyvern.forge.sdk.copilot.browser_code_contract import BROWSER_SESSION_UNAVAILABLE_ERROR_CODE
+from skyvern.forge.sdk.copilot.browser_target import BrowserSessionBinding
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     _AMBIGUOUS_NON_DEMONSTRATION_RUN_REASON_CODES,
     RecordedBuildTestOutcome,
@@ -25,10 +36,8 @@ from skyvern.forge.sdk.copilot.challenge_evidence import (
     challenge_signal_regressed,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    composition_structured_evidence_expression,
     enclosing_form_submit_controls_expression,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    role_name_match_count_expression as _role_name_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
@@ -37,24 +46,32 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     scout_pre_action_expression as _scout_pre_action_expression,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    selector_candidates_expression as _selector_candidates_expression,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     selector_match_count_expression as _selector_match_count_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    CANDIDATE_COUNT_KEYS,
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_actionable_steer_content,
     has_bounded_page_schema,
     has_witnessed_value_content,
+    parse_composition_structured,
     post_run_evidence_source_refused,
     stamp_page_evidence_provenance,
+    without_authoring_facts,
 )
+from skyvern.forge.sdk.copilot.context import SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP, SignedOutPageObservation
 from skyvern.forge.sdk.copilot.enforcement import (
     mint_scout_observation_contract_for_ctx,
     record_reached_terminal_action_observation,
     record_scouted_output_coverage,
 )
+from skyvern.forge.sdk.copilot.mcp_adapter import (
+    BROWSER_SESSION_LOSS_ERROR_CODES,
+    is_redaction_withheld,
+    scrub_model_facing_tool_result,
+    service_worker_blocked_context,
+)
+from skyvern.forge.sdk.copilot.output_utils import BLOCK_FACT_URL_MAX_CHARS, screened_recorded_url
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint as _page_evidence_location_fingerprint
 from skyvern.forge.sdk.copilot.page_identity import page_record_matches_url as _page_evidence_matches_url_identity
 from skyvern.forge.sdk.copilot.page_identity import (
@@ -62,20 +79,31 @@ from skyvern.forge.sdk.copilot.page_identity import (
 )
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    PendingBrowserInteractionObservation,
-    ScoutedInteraction,
-    ScoutedSelectorCandidate,
     current_call_browser_session_override,
+    current_demonstrated_action,
     effective_browser_session_id,
+    live_working_page,
+    raw_secret_browser_denied,
     resolve_browser_state_for_context,
-    sensitive_origin_page_is_tainted,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import (
+    ProvenanceBinding,
     ScreenshotActionRelation,
     ScreenshotProvenance,
+    ViewportFrame,
+    consume_screenshot_artifact,
+    enqueue_screenshot,
     screenshot_result_facts,
-    stage_screenshot_from_artifact,
+    screenshot_viewport_css_px,
 )
+from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
+    registered_scrub_values,
+    scrub_secrets_from_structure,
+    scrub_secrets_from_text,
+)
+from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.utils import challenge_signature
 
 from ._shared import (
     _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
@@ -84,6 +112,7 @@ from ._shared import (
     _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
+from .banned_blocks import upload_routes_for
 
 LOG = structlog.get_logger()
 
@@ -91,6 +120,14 @@ LOG = structlog.get_logger()
 # a result may carry into the authoring context, so it must not follow the transcript
 # recent-window cap.
 _SCOUT_RESULT_CHAR_CAP = 2000
+
+_SIGNED_OUT_SETTLE_DELAY_SECONDS = 2.5
+_SIGNED_OUT_OBSERVATION_TIMEOUT_MS = 20000
+_SIGNED_OUT_OBSERVATION_ATTEMPT_LIMIT = 12
+_SIGNED_OUT_OBSERVATION_ORIGIN_LIMIT = 3
+_SIGNED_OUT_MAX_CONTROLS = 8
+_SIGNED_OUT_MAX_SELECTOR_CANDIDATES = 3
+_SIGNED_OUT_TEXT_EXCERPT_CAP = 400
 
 
 def _clear_pending_browser_interaction_observation(ctx: AgentContext) -> None:
@@ -148,6 +185,10 @@ async def _live_working_page_url(ctx: AgentContext) -> str | None:
 
 async def _capture_scout_source_url(ctx: AgentContext) -> None:
     # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
+    demonstrated_action = current_demonstrated_action()
+    if demonstrated_action is not None:
+        ctx.pending_scout_source_url = demonstrated_action.source_url
+        return
     source_url = await _live_working_page_url(ctx)
     ctx.pending_scout_source_url = source_url
 
@@ -256,76 +297,6 @@ async def _selector_live_match_count(
     return value
 
 
-async def _capture_scout_selector_candidates(ctx: AgentContext, selector: str | None) -> None:
-    """Capture source-page selector identities without selecting a replacement."""
-    ctx.pending_scout_selector_candidates = None
-    selector = _selector_text(selector)
-    server = getattr(ctx, "discovery_mcp_server", None)
-    if not selector or server is None:
-        return
-    try:
-        result = await asyncio.wait_for(
-            server.call_internal_tool(
-                "skyvern_evaluate",
-                {"expression": _selector_candidates_expression(selector)},
-            ),
-            timeout=_PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        return
-    if not isinstance(result, dict) or not result.get("ok"):
-        return
-    raw_candidates = (result.get("data") or {}).get("result")
-    if not isinstance(raw_candidates, list):
-        return
-    candidates: list[ScoutedSelectorCandidate] = []
-    for raw in raw_candidates:
-        if not isinstance(raw, dict):
-            continue
-        candidate_selector = _selector_text(raw.get("selector"))
-        source = _selector_text(raw.get("source"))
-        if not candidate_selector or not source:
-            continue
-        candidate: ScoutedSelectorCandidate = {
-            "selector": candidate_selector,
-            "source": source,
-            "match_count": _non_negative_count(raw.get("match_count")),
-        }
-        if not any(existing["selector"] == candidate_selector for existing in candidates):
-            candidates.append(candidate)
-    if candidates:
-        ctx.pending_scout_selector_candidates = candidates
-
-
-async def _role_name_match_count(
-    ctx: AgentContext, role: str, name: str, *, timeout_seconds: float = _PRE_NAVIGATION_ROLE_NAME_TIMEOUT_SECONDS
-) -> int | None:
-    """Live count of elements whose computed ARIA role and accessible name exactly match, or None when
-    the page read is unavailable; lets the ambiguity guard tell a uniquely-resolvable re-anchor apart from
-    a name-degenerate one before trusting get_by_role(role, name, exact=True)."""
-    if not role or not name:
-        return None
-    server = getattr(ctx, "discovery_mcp_server", None)
-    if server is None or timeout_seconds <= 0:
-        return None
-    try:
-        result = await asyncio.wait_for(
-            server.call_internal_tool(
-                "skyvern_evaluate",
-                {"expression": _role_name_match_count_expression(role, name)},
-            ),
-            timeout=timeout_seconds,
-        )
-    except Exception:
-        return None
-    if not isinstance(result, dict) or not result.get("ok"):
-        return None
-    value = (result.get("data") or {}).get("result")
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
-
-
 def _prenav_role_name_for_selector(pending: tuple[str, str, str] | None, selector: str) -> tuple[str, str]:
     """Return the pre-navigation (role, accessible_name) only when the recorded selector matches the
     stashed one, so a navigating click's anchor is never applied to a different element."""
@@ -364,12 +335,36 @@ def _non_negative_count(value: Any) -> int | None:
     return value
 
 
-def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dict[str, Any], *, source: str) -> None:
-    role, name = "", ""
+def _parse_selector_candidates(raw_candidates: Any) -> list[ScoutedSelectorCandidate]:
+    candidates: list[ScoutedSelectorCandidate] = []
+    if not isinstance(raw_candidates, list):
+        return candidates
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            continue
+        candidate_selector = _selector_text(raw.get("selector"))
+        candidate_source = _selector_text(raw.get("source"))
+        if not candidate_selector or not candidate_source:
+            continue
+        candidate: ScoutedSelectorCandidate = {
+            "selector": candidate_selector,
+            "source": candidate_source,
+            "match_count": _non_negative_count(raw.get("match_count")),
+        }
+        if not any(existing["selector"] == candidate_selector for existing in candidates):
+            candidates.append(candidate)
+    return candidates
+
+
+def _packet_role_name(packet: dict[str, Any]) -> tuple[str, str]:
     role_name = packet.get("role_name")
-    if isinstance(role_name, dict):
-        role = str(role_name.get("role") or "").strip()
-        name = str(role_name.get("accessible_name") or "").strip()
+    if not isinstance(role_name, dict):
+        return "", ""
+    return str(role_name.get("role") or "").strip(), str(role_name.get("accessible_name") or "").strip()
+
+
+def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dict[str, Any], *, source: str) -> None:
+    role, name = _packet_role_name(packet)
     if role and name:
         ctx.pending_scout_role_name = (selector, role, name)
     else:
@@ -384,21 +379,7 @@ def _apply_scout_pre_action_packet(ctx: AgentContext, selector: str, packet: dic
     if role and name and role_count is not None:
         ctx.pending_scout_role_name_match_count = (selector, role, name, role_count)
 
-    candidates: list[ScoutedSelectorCandidate] = []
-    for raw in packet.get("selector_candidates") or []:
-        if not isinstance(raw, dict):
-            continue
-        candidate_selector = _selector_text(raw.get("selector"))
-        candidate_source = _selector_text(raw.get("source"))
-        if not candidate_selector or not candidate_source:
-            continue
-        candidate: ScoutedSelectorCandidate = {
-            "selector": candidate_selector,
-            "source": candidate_source,
-            "match_count": _non_negative_count(raw.get("match_count")),
-        }
-        if not any(existing["selector"] == candidate_selector for existing in candidates):
-            candidates.append(candidate)
+    candidates = _parse_selector_candidates(packet.get("selector_candidates"))
     if candidates:
         ctx.pending_scout_selector_candidates = candidates
 
@@ -423,9 +404,14 @@ async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> 
     selector = _selector_text(selector)
     if not selector:
         return
+    demonstrated_action = current_demonstrated_action()
+    if demonstrated_action is not None and selector == demonstrated_action.selector:
+        if demonstrated_action.packet is not None:
+            _apply_scout_pre_action_packet(ctx, selector, demonstrated_action.packet, source="demonstration")
+        return
     parsed = _role_name_from_selector(selector)
     source = "selector" if parsed is not None else "page_read"
-    parsed_role, parsed_name = parsed if parsed is not None else ("", "")
+    parsed_role, parsed_name = (parsed[0].strip(), parsed[1].strip()) if parsed is not None else ("", "")
     server = ctx.discovery_mcp_server
     result = None
     if server is not None:
@@ -439,6 +425,9 @@ async def _capture_scout_pre_action(ctx: AgentContext, selector: str | None) -> 
             )
         except Exception:
             result = None
+    # Held raw in this turn's pending stash: the record-time scrub compares the raw identity to its
+    # scrubbed form to decide whether a locator was rewritten, and a packet scrubbed here would
+    # defeat that comparison.
     packet = (result.get("data") or {}).get("result") if isinstance(result, dict) and result.get("ok") else None
     if not isinstance(packet, dict):
         LOG.info("copilot_scout_role_name_unavailable", reason="page_read_failed", source=source)
@@ -503,35 +492,54 @@ def _element_fingerprint_expression(css_selector: str) -> str:
     )
 
 
-async def _capture_element_fingerprint(
-    ctx: AgentContext, selector: str | None, *, timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
-) -> dict[str, str]:
-    """Capture element identity fingerprint (id, name, type, placeholder, label, test-id, tag)
-    for credential-fill resolution. Returns empty dict on failure, never None."""
-    selector = _selector_text(selector)
-    if not selector:
+def _clean_element_fingerprint(raw_fingerprint: Any) -> dict[str, str]:
+    if not isinstance(raw_fingerprint, dict):
         return {}
+    captured = {k: str(v).strip() for k, v in raw_fingerprint.items() if v}
+    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
+    return captured
+
+
+def _target_facts_expression(css_selector: str, role: str, name: str, *, fingerprint: bool) -> str:
+    fingerprint_read = (
+        f"(() => {{ try {{ return {_element_fingerprint_expression(css_selector)}; }} catch (e) {{ return null; }} }})()"
+        if fingerprint
+        else "null"
+    )
+    packet_read = (
+        f"(() => {{ try {{ return {_scout_pre_action_expression(css_selector, role, name)}; }} "
+        "catch (e) { return null; } })()"
+    )
+    return f"(() => ({{ packet: {packet_read}, fingerprint: {fingerprint_read} }}))()"
+
+
+async def _probe_target_facts(
+    ctx: AgentContext, selector: str, *, fingerprint: bool
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Read a target's pre-action packet, and its fingerprint when asked, in one page read.
+    A failed read keeps only the TIER 1 role/name parse, which needs no page."""
+    parsed = _role_name_from_selector(selector)
+    parsed_role, parsed_name = (parsed[0].strip(), parsed[1].strip()) if parsed is not None else ("", "")
+    fallback: dict[str, Any] = (
+        {"role_name": {"role": parsed_role, "accessible_name": parsed_name}} if parsed is not None else {}
+    )
     server = ctx.discovery_mcp_server
     if server is None:
-        return {}
+        return fallback, {}
     try:
         result = await asyncio.wait_for(
             server.call_internal_tool(
                 "skyvern_evaluate",
-                {"expression": _element_fingerprint_expression(selector)},
+                {"expression": _target_facts_expression(selector, parsed_role, parsed_name, fingerprint=fingerprint)},
             ),
-            timeout=timeout_seconds,
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except Exception:
-        return {}
-    if not isinstance(result, dict) or not result.get("ok"):
-        return {}
-    fingerprint = (result.get("data") or {}).get("result")
-    if not isinstance(fingerprint, dict):
-        return {}
-    captured = {k: str(v).strip() for k, v in fingerprint.items() if v}
-    captured["probed"] = _FINGERPRINT_PROBED_ATTRS
-    return captured
+        return fallback, {}
+    value = (result.get("data") or {}).get("result") if isinstance(result, dict) and result.get("ok") else None
+    if not isinstance(value, dict) or not isinstance(value.get("packet"), dict):
+        return fallback, {}
+    return value["packet"], _clean_element_fingerprint(value.get("fingerprint"))
 
 
 async def _capture_post_interaction_screenshot(
@@ -541,56 +549,97 @@ async def _capture_post_interaction_screenshot(
     captured_url: str | None,
     observation_step: int | None = None,
     timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+    frame: ViewportFrame | None = None,
 ) -> bool:
     """Attach a look at the page after a state-changing action, reporting whether a frame staged.
     Reading the DOM answers "what is on the page" but not "did that work" -- a filled password reads
     as empty, and a dialog covering the content reads as an ordinary node.
     """
-    if getattr(ctx, "codeblock_redaction_parameters", None):
+    if ctx.codeblock_redaction_parameters:
         return False
-    if sensitive_origin_page_is_tainted(ctx):
+    if not ctx.supports_vision:
         return False
-    # getattr mirrors screenshot_utils: this runs against contexts that predate the vision field.
-    if not getattr(ctx, "supports_vision", False):
-        return False
-    server = getattr(ctx, "discovery_mcp_server", None)
+    if frame is None:
+        frame = await _take_viewport_frame(ctx, timeout_seconds=timeout_seconds)
+        if frame is None:
+            return False
+    # The provenance reaches the model as text, so its URLs pass the same scrub as a tool result's.
+    urls = scrub_model_facing_tool_result(
+        ctx, {"captured_url": frame.producer_url, "dispatch_url": captured_url}, tool_name=source_tool
+    )
+    if is_redaction_withheld(urls):
+        urls = {}
+    return enqueue_screenshot(
+        ctx,
+        base64.b64encode(frame.png).decode("ascii"),
+        provenance=ScreenshotProvenance(
+            source_tool=source_tool,
+            captured_url=urls.get("captured_url"),
+            observation_step=observation_step,
+            browser_session_id=frame.producer_session_id,
+            workflow_run_id=None,
+            action_relation=ScreenshotActionRelation.AFTER_SOURCE_ACTION,
+            dispatch_url=urls.get("dispatch_url"),
+            dispatch_browser_session_id=frame.dispatch_session_id,
+            producer_browser_session_id=frame.producer_session_id,
+            session_binding=frame.session_binding,
+            viewport_css_px=frame.viewport_css_px,
+        ),
+        captured_at=frame.started_at,
+    )
+
+
+async def _take_viewport_frame(
+    ctx: AgentContext, *, timeout_seconds: float, page: Page | None = None
+) -> ViewportFrame | None:
+    """Read the viewport without staging it; withheld during self-heal. A given `page` is shot directly,
+    because the broker's current tab does not follow a worker's `switch_tab`."""
+    if ctx.codeblock_redaction_parameters:
+        return None
+    started_at = time.monotonic()
+    dispatch_session_id = effective_browser_session_id(ctx)
+    if page is not None:
+        try:
+            shot = await asyncio.wait_for(do_screenshot(page), timeout=timeout_seconds)
+        except Exception as exc:
+            LOG.debug("Copilot viewport frame of the given page failed", error_type=type(exc).__name__)
+            return None
+        return ViewportFrame(
+            png=shot.data,
+            dispatch_session_id=dispatch_session_id,
+            producer_url=page.url,
+            producer_session_id=dispatch_session_id,
+            session_binding=ProvenanceBinding.AGREE,
+            started_at=started_at,
+            viewport_css_px=shot.viewport_css_px,
+        )
+    server = ctx.discovery_mcp_server
     if server is None:
-        return False
-    capture_started_at = time.monotonic()
-    capture_session_id = effective_browser_session_id(ctx)
-    screenshot_arguments = {"session_id": capture_session_id} if capture_session_id else {}
+        return None
+    screenshot_arguments = {"session_id": dispatch_session_id} if dispatch_session_id else {}
     try:
         result = await asyncio.wait_for(
             server.call_internal_tool("skyvern_screenshot", screenshot_arguments),
             timeout=timeout_seconds,
         )
     except Exception:
-        return False
+        return None
     if not isinstance(result, dict) or not result.get("ok"):
-        return False
-    if sensitive_origin_page_is_tainted(ctx):
-        return False
+        return None
+    png = consume_screenshot_artifact(result)
+    if png is None:
+        return None
     producer_url, producer_session_id, session_binding = screenshot_result_facts(
-        result,
-        dispatch_url=captured_url,
-        dispatch_browser_session_id=capture_session_id,
+        result, dispatch_url=None, dispatch_browser_session_id=dispatch_session_id
     )
-    return stage_screenshot_from_artifact(
-        ctx,
-        result,
-        provenance=ScreenshotProvenance(
-            source_tool=source_tool,
-            captured_url=producer_url,
-            observation_step=observation_step,
-            browser_session_id=producer_session_id,
-            workflow_run_id=None,
-            action_relation=ScreenshotActionRelation.AFTER_SOURCE_ACTION,
-            dispatch_url=captured_url,
-            dispatch_browser_session_id=capture_session_id,
-            producer_browser_session_id=producer_session_id,
-            session_binding=session_binding,
-        ),
-        captured_at=capture_started_at,
+    return ViewportFrame(
+        png=png,
+        dispatch_session_id=dispatch_session_id,
+        producer_url=producer_url,
+        producer_session_id=producer_session_id,
+        session_binding=session_binding,
+        started_at=started_at,
+        viewport_css_px=screenshot_viewport_css_px(result),
     )
 
 
@@ -598,7 +647,7 @@ def _model_visible_selector_candidates(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return []
     return [
-        {key: item for key, item in candidate.items() if key != "match_count"}
+        {key: item for key, item in candidate.items() if key not in CANDIDATE_COUNT_KEYS}
         if isinstance(candidate, dict)
         else candidate
         for candidate in value
@@ -694,6 +743,45 @@ def _record_scout_trajectory_fact(ctx: AgentContext, artifact: ScoutedInteractio
     return recorded
 
 
+def record_scouted_interaction_fact(ctx: AgentContext, artifact: ScoutedInteraction) -> None:
+    redacted_artifact = _scrub_retained_interaction(ctx, _redact_codeblock_value(ctx, artifact))
+    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
+        return
+    artifact = cast(ScoutedInteraction, redacted_artifact)
+    interactions = [
+        item
+        for item in ctx.scouted_interactions
+        if not (
+            item.get("tool_name") == artifact["tool_name"]
+            and item.get("selector") == artifact.get("selector")
+            and item.get("source_url") == artifact.get("source_url")
+            and item.get("credential_field") == artifact.get("credential_field")
+        )
+    ]
+    interactions.append(artifact)
+    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
+
+    recorded = _record_scout_trajectory_fact(ctx, artifact)
+    if artifact["tool_name"] == "click":
+        click_records: list[ScoutedInteraction] = [artifact]
+        if recorded is not None:
+            click_records.append(recorded)
+        ctx.pending_scout_click_records = click_records
+
+    LOG.info(
+        "copilot_scout_interaction_captured",
+        tool_name=artifact["tool_name"],
+        selector=artifact.get("selector"),
+        source_url=artifact.get("source_url"),
+        role=artifact.get("role"),
+        credential_field=artifact.get("credential_field"),
+        credential_id=artifact.get("credential_id"),
+        total_scouted_interactions=len(ctx.scouted_interactions),
+        total_scout_trajectory=len(ctx.scout_trajectory),
+    )
+    record_reached_terminal_action_observation(ctx)
+
+
 def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: str) -> tuple[bool, bool]:
     """Return (hidden, disabled) when bounded same-page evidence observed this exact selector unready."""
     packets: list[dict[str, Any]] = []
@@ -733,6 +821,45 @@ def _observed_control_readiness(ctx: AgentContext, selector: str, source_url: st
     return observed_hidden, observed_disabled
 
 
+# Every field the synthesizer can build a locator from: selectors, the role/name pair it falls
+# back to, and the element fingerprint that identifies the element across equivalent selectors.
+_RETAINED_LOCATOR_IDENTITY_FIELDS = (
+    "selector",
+    "executed_selector",
+    "selector_candidates",
+    "role",
+    "accessible_name",
+    "element_fingerprint_id",
+    "element_fingerprint_name",
+    "element_fingerprint_type",
+    "element_fingerprint_placeholder",
+    "element_fingerprint_label",
+    "element_fingerprint_test_id",
+    "element_fingerprint_tag",
+    "element_fingerprint_probed",
+    "destination",
+)
+
+
+def _scrub_retained_interaction(ctx: AgentContext, artifact: Any) -> Any:
+    """Scrub a retained interaction with every registered value; if the scrub rewrote any locator
+    identity, drop the whole identity rather than keep it. A placeholder inside a selector, a
+    role/name, or a fingerprint is a dead locator that would fail a later run silently, and the
+    secret it replaced must not survive into the next turn. The identity is dropped as a set so the
+    synthesizer cannot rebuild the dead locator from a sibling field."""
+    scrubbed = scrub_secrets_from_structure(ctx, artifact)
+    if not isinstance(artifact, dict) or not isinstance(scrubbed, dict):
+        return scrubbed
+    rewritten = any(
+        field_name in scrubbed and scrubbed[field_name] != artifact.get(field_name)
+        for field_name in _RETAINED_LOCATOR_IDENTITY_FIELDS
+    )
+    if rewritten:
+        for field_name in _RETAINED_LOCATOR_IDENTITY_FIELDS:
+            scrubbed.pop(field_name, None)
+    return scrubbed
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -750,6 +877,7 @@ def _record_scouted_interaction(
     observation_step: int | None = None,
     key: str = "",
     typed_length: int = 0,
+    destination: ScoutedDragDestination | None = None,
     role: str = "",
     accessible_name: str = "",
     role_name_match_count: int | None = None,
@@ -834,6 +962,8 @@ def _record_scouted_interaction(
         artifact["key"] = key
     if typed_length:
         artifact["typed_length"] = typed_length
+    if destination:
+        artifact["destination"] = destination
     if role:
         artifact["role"] = role
     if accessible_name:
@@ -871,37 +1001,7 @@ def _record_scouted_interaction(
         artifact["element_fingerprint_probed"] = element_fingerprint_probed
     if ambiguous:
         artifact["ambiguous"] = True
-    redacted_artifact = _redact_codeblock_value(ctx, artifact)
-    if not isinstance(redacted_artifact, dict) or "tool_name" not in redacted_artifact:
-        return
-    artifact = cast(ScoutedInteraction, redacted_artifact)
-    interactions = [
-        item
-        for item in ctx.scouted_interactions
-        if not (
-            item.get("tool_name") == artifact["tool_name"]
-            and item.get("selector") == artifact.get("selector")
-            and item.get("source_url") == artifact.get("source_url")
-            and item.get("credential_field") == artifact.get("credential_field")
-        )
-    ]
-    interactions.append(artifact)
-    ctx.scouted_interactions = _capped_with_eviction_accounting(interactions, collection="scouted_interactions")
-
-    _record_scout_trajectory_fact(ctx, artifact)
-
-    LOG.info(
-        "copilot_scout_interaction_captured",
-        tool_name=artifact["tool_name"],
-        selector=artifact.get("selector"),
-        source_url=artifact.get("source_url"),
-        role=artifact.get("role"),
-        credential_field=artifact.get("credential_field"),
-        credential_id=artifact.get("credential_id"),
-        total_scouted_interactions=len(ctx.scouted_interactions),
-        total_scout_trajectory=len(ctx.scout_trajectory),
-    )
-    record_reached_terminal_action_observation(ctx)
+    record_scouted_interaction_fact(ctx, artifact)
 
 
 def _attach_scout_observation_step(
@@ -1013,7 +1113,9 @@ _PAGE_EVIDENCE_STATE_KEYS = (
 
 
 def _page_evidence_state(packet: dict[str, Any]) -> dict[str, Any]:
-    """Return DOM-observed structure without visual augmentation or transport metadata."""
+    """Return DOM-observed structure without visual augmentation, transport metadata or authoring facts:
+    pointer states change with scroll, and can tip the capture over its bound, which drops the visible counts."""
+    packet = without_authoring_facts(packet)
     state = {key: packet.get(key) for key in _PAGE_EVIDENCE_STATE_KEYS}
     page_obstructions = packet.get("page_obstructions")
     state["page_obstructions"] = (
@@ -1202,13 +1304,15 @@ async def _register_scout_interaction_observation(
     # A successful scout interaction reaches the post-action page; record it as an
     # interaction-reached observation so a click-reached block can be authored
     # against it without a separate inspect_page_for_composition.
-    if sensitive_origin_page_is_tainted(ctx):
-        return None, None
     selector = _selector_text(selector)
     if not selector or not url:
         return None, None
-    redacted_identity = _redact_codeblock_value(ctx, {"selector": selector, "source_url": source_url, "url": url})
+    identity = {"selector": selector, "source_url": source_url, "url": url}
+    redacted_identity = scrub_secrets_from_structure(ctx, _redact_codeblock_value(ctx, identity))
     if not isinstance(redacted_identity, dict):
+        return None, None
+    if redacted_identity.get("selector") != selector:
+        # A selector the scrub rewrote is a dead locator; nothing authored against it could run.
         return None, None
     safe_selector = _selector_text(redacted_identity.get("selector"))
     safe_source_url = _selector_text(redacted_identity.get("source_url"))
@@ -1236,10 +1340,10 @@ async def _register_scout_interaction_observation(
             observed_after_interaction=True,
             prior_page_evidence=prior_page_evidence,
         )
-        if sensitive_origin_page_is_tainted(ctx):
-            ctx.last_scout_act_observe_outcome = None
-            ctx.last_scout_act_observe_packet = None
-            return None, None
+        if parsed is not None:
+            scrubbed_parsed = scrub_secrets_from_structure(ctx, parsed)
+            parsed = scrubbed_parsed if isinstance(scrubbed_parsed, dict) else None
+            ctx.last_scout_act_observe_packet = parsed
         # Admission (credit axis) is decoupled from the hollow outcome (no-progress axis): a page
         # that rendered witnessed value content is bindable even when it exposes no actionable schema.
         if parsed is not None and (has_bounded_page_schema(parsed) or has_witnessed_value_content(parsed)):
@@ -1292,13 +1396,25 @@ _PAGE_SUMMARY_MAX_DISMISS_TEXTS = 4
 _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS = 4
 
 
-def _summary_text(value: Any) -> str:
-    return value.strip()[:_PAGE_SUMMARY_TEXT_CAP] if isinstance(value, str) else ""
+def _scrubbed_to(text: str, limit: int, scrub_values: Sequence[str]) -> str:
+    """`text` bounded to `limit`, with this session's registered values taken out first.
+
+    A registered value is matched whole, so a bound that cuts one leaves a prefix no later pass can
+    recognise. The values are this session's: another session's short value rewriting this page's
+    labels would corrupt the very evidence the reading exists to carry.
+    """
+    for value in scrub_values:
+        text = text.replace(value, REDACTED_SECRET_PLACEHOLDER)
+    return text[:limit]
 
 
-def _summary_field_name(field: dict[str, Any]) -> str:
+def _summary_text(value: Any, scrub_values: Sequence[str] = ()) -> str:
+    return _scrubbed_to(value.strip(), _PAGE_SUMMARY_TEXT_CAP, scrub_values) if isinstance(value, str) else ""
+
+
+def _summary_field_name(field: dict[str, Any], scrub_values: Sequence[str] = ()) -> str:
     for key in ("label", "name", "placeholder", "id"):
-        text = _summary_text(field.get(key))
+        text = _summary_text(field.get(key), scrub_values)
         if text:
             return text
     return ""
@@ -1315,12 +1431,12 @@ def _summary_element_facts(control: dict[str, Any]) -> dict[str, Any]:
     return facts
 
 
-def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | None:
+def _summary_disclosure_control(control: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any] | None:
     if not isinstance(control.get("expanded"), bool):
         return None
     summary: dict[str, Any] = {"expanded": control["expanded"]}
     for key in ("text", "controls"):
-        value = _summary_text(control.get(key))
+        value = _summary_text(control.get(key), scrub_values)
         if value:
             summary[key] = value
     summary.update(_summary_element_facts(control))
@@ -1333,11 +1449,22 @@ def _summary_disclosure_control(control: dict[str, Any]) -> dict[str, Any] | Non
     return summary
 
 
-def _summary_entry(text: str, control: dict[str, Any]) -> dict[str, Any]:
-    return {"text": text, **_summary_element_facts(control)}
+def _summary_entry(
+    text: str, control: dict[str, Any], *, upload_routes: Sequence[dict[str, str]] = ()
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"text": text, **_summary_element_facts(control)}
+    if upload_routes and control.get("type") == "file":
+        entry["type"] = "file"
+        entry["upload_routes"] = [dict(route) for route in upload_routes]
+    return entry
 
 
-def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+def _build_scout_page_summary(
+    evidence: dict[str, Any],
+    scrub_values: Sequence[str] = (),
+    *,
+    upload_routes: Sequence[dict[str, str]] = (),
+) -> dict[str, Any]:
     forms_summary: list[dict[str, Any]] = []
     for form in evidence.get("forms") or []:
         if not isinstance(form, dict):
@@ -1348,16 +1475,16 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             {
                 "field_count": len(fields),
                 "fields": [
-                    _summary_entry(name, field)
+                    _summary_entry(name, field, upload_routes=upload_routes)
                     for field, name in (
-                        (field, _summary_field_name(field)) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]
+                        (field, _summary_field_name(field, scrub_values)) for field in fields[:_PAGE_SUMMARY_MAX_FIELDS]
                     )
                     if name
                 ],
                 "submit_controls": [
                     _summary_entry(text, control)
                     for control, text in (
-                        (control, _summary_text(control.get("text") or control.get("value")))
+                        (control, _summary_text(control.get("text") or control.get("value"), scrub_values))
                         for control in submits[:_PAGE_SUMMARY_MAX_SUBMITS]
                     )
                     if text
@@ -1374,7 +1501,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
                 break
             if not isinstance(control, dict):
                 continue
-            text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"))
+            text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"), scrub_values)
             if text:
                 dismiss_entries.append(_summary_entry(text, control))
     interaction_blocking_layers: list[dict[str, Any]] = []
@@ -1386,7 +1513,9 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             for control, text in (
                 (
                     control,
-                    _summary_text(control.get("text") or control.get("aria_label") or control.get("title")),
+                    _summary_text(
+                        control.get("text") or control.get("aria_label") or control.get("title"), scrub_values
+                    ),
                 )
                 for control in obstruction.get("visible_controls") or []
                 if isinstance(control, dict)
@@ -1423,7 +1552,7 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
     for control in controls_for_summary:
         if not isinstance(control, dict) or len(disclosure_controls) >= _PAGE_SUMMARY_MAX_DISCLOSURE_CONTROLS:
             continue
-        summary = _summary_disclosure_control(control)
+        summary = _summary_disclosure_control(control, scrub_values)
         if summary is None:
             continue
         candidate_identity = json.dumps(summary.get("selector_candidates") or [], sort_keys=True)
@@ -1433,14 +1562,15 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
         seen_disclosures.add(identity)
         disclosure_controls.append(summary)
     page_summary: dict[str, Any] = {
-        "page_title": _summary_text(evidence.get("page_title")),
+        "page_title": _summary_text(evidence.get("page_title"), scrub_values),
         "forms": forms_summary,
         "navigation_target_count": len(nav_targets),
         "navigation_targets_truncated": evidence.get("navigation_targets_truncated") is True,
         "navigation_targets": [
             _summary_entry(text, target)
             for target, text in (
-                (target, _summary_text(target.get("text"))) for target in nav_targets[:_PAGE_SUMMARY_MAX_NAV_TEXTS]
+                (target, _summary_text(target.get("text"), scrub_values))
+                for target in nav_targets[:_PAGE_SUMMARY_MAX_NAV_TEXTS]
             )
             if text
         ],
@@ -1456,8 +1586,19 @@ def _build_scout_page_summary(evidence: dict[str, Any]) -> dict[str, Any]:
     return page_summary
 
 
+def _selectorless_summary_entry(entry: dict[str, Any] | str) -> dict[str, Any] | str:
+    """The bare text an entry carries, or a text-plus-route entry when it carries an upload route."""
+    if not isinstance(entry, dict):
+        return entry
+    text = str(entry.get("text") or "")
+    upload_routes = entry.get("upload_routes")
+    if not upload_routes:
+        return text
+    return {"text": text, "type": entry.get("type"), "upload_routes": upload_routes}
+
+
 def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
-    """Collapse every control entry to the bare text it carries, and report whether anything changed."""
+    """Strip every control entry down to the facts selectors are not, and report whether anything changed."""
     dropped = False
     groups: list[Any] = [summary.get("navigation_targets"), summary.get("modal_dismiss_controls")]
     for layer in summary.get("interaction_blocking_layers") or []:
@@ -1473,7 +1614,7 @@ def _drop_scout_page_summary_selectors(summary: dict[str, Any]) -> bool:
     for entries in groups:
         if not isinstance(entries, list):
             continue
-        collapsed = [str(entry.get("text") or "") if isinstance(entry, dict) else entry for entry in entries]
+        collapsed = [_selectorless_summary_entry(entry) for entry in entries]
         if collapsed != entries:
             entries[:] = collapsed
             dropped = True
@@ -1537,7 +1678,9 @@ def _redact_summary_node(ctx: AgentContext, node: Any) -> Any:
     if isinstance(node, list):
         return [_redact_summary_node(ctx, item) for item in node]
     if isinstance(node, str):
-        redacted_leaf = _redact_codeblock_value(ctx, node)
+        # A page echoes what was typed into it, so the session's registered values come out before
+        # the reading is stored: the generic pass after it matches shapes, not arbitrary secrets.
+        redacted_leaf = _redact_codeblock_value(ctx, scrub_secrets_from_text(ctx, node))
         return redacted_leaf if isinstance(redacted_leaf, str) else ""
     return node
 
@@ -1555,7 +1698,9 @@ def _attach_scout_page_summary(ctx: AgentContext, result: dict[str, Any], page_e
     if not isinstance(data, dict):
         return
     try:
-        summary = _redact_summary_node(ctx, _build_scout_page_summary(page_evidence))
+        summary = _redact_summary_node(
+            ctx, _build_scout_page_summary(page_evidence, upload_routes=upload_routes_for(ctx))
+        )
         if not isinstance(summary, dict):
             return
         data["page"] = summary
@@ -1572,6 +1717,220 @@ def _attach_scout_page_summary(ctx: AgentContext, result: dict[str, Any], page_e
     except Exception:
         data.pop("page", None)
         LOG.warning("copilot_scout_act_observe_summary_failed")
+
+
+def _signed_out_page_facts(evidence: dict[str, Any], scrub_values: Sequence[str] = ()) -> dict[str, Any]:
+    """Add the page's own clickable controls and visible text to the scout summary. The summary's
+    fields come from `<form>` elements only, so a sign-in card built without one reaches the reader
+    through these two keys or not at all.
+    """
+    facts = _build_scout_page_summary(evidence, scrub_values)
+    controls: list[dict[str, Any]] = []
+    for control in evidence.get("clickable_controls") or []:
+        if len(controls) >= _SIGNED_OUT_MAX_CONTROLS:
+            break
+        if not isinstance(control, dict):
+            continue
+        text = _summary_text(control.get("text") or control.get("aria_label") or control.get("title"), scrub_values)
+        if not text:
+            continue
+        entry = _summary_entry(text, control)
+        candidates = entry.get("selector_candidates")
+        if isinstance(candidates, list):
+            # A selector carrying a registered value is dropped later anyway, so it must not take one
+            # of the slots from a candidate that would have survived.
+            usable = [
+                candidate
+                for candidate in candidates
+                if not (
+                    isinstance(candidate, dict)
+                    and isinstance(candidate.get("selector"), str)
+                    and any(value in candidate["selector"] for value in scrub_values)
+                )
+            ]
+            entry["selector_candidates"] = usable[:_SIGNED_OUT_MAX_SELECTOR_CANDIDATES]
+        controls.append(entry)
+    facts["controls"] = controls
+    excerpt = evidence.get("visible_text_excerpt")
+    if isinstance(excerpt, str) and excerpt.strip():
+        facts["visible_text"] = _scrubbed_to(excerpt.strip(), _SIGNED_OUT_TEXT_EXCERPT_CAP, scrub_values)
+    return facts
+
+
+def _bounded_signed_out_page_facts(facts: dict[str, Any]) -> dict[str, Any]:
+    while len(json.dumps(facts)) > SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP:
+        controls = facts.get("controls")
+        if isinstance(controls, list) and len(controls) > 1:
+            controls.pop()
+            continue
+        if facts.pop("visible_text", None) is not None:
+            continue
+        if isinstance(controls, list) and controls:
+            controls.pop()
+            continue
+        if _shed_scout_page_summary_section(facts) is not None:
+            continue
+        return {"page_title": facts.get("page_title", ""), "shed": ["signed_out_page_facts"]}
+    return facts
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _canonical_origin(url: str) -> tuple[str, str, int | None] | None:
+    """The origin as a browser reports it back: scheme, lowercased host, and a port only when it is
+    not the scheme's default. `https://Portal.Test:443/x` and `https://portal.test/x` are one origin."""
+    origin = safe_page_origin(url)
+    if not origin:
+        return None
+    parts = urlsplit(origin.rstrip("/"))
+    if not parts.hostname:
+        return None
+    port = parts.port if parts.port != _DEFAULT_PORTS.get(parts.scheme) else None
+    return parts.scheme, parts.hostname.lower(), port
+
+
+def _exact_origin(url: str) -> str | None:
+    """The origin form the deployment's egress guard names, without a path, spelt the way the guard
+    will recognise it."""
+    canonical = _canonical_origin(url)
+    if canonical is None:
+        return None
+    scheme, host, port = canonical
+    return f"{scheme}://{host}:{port}" if port is not None else f"{scheme}://{host}"
+
+
+@asynccontextmanager
+async def _signed_out_navigation_guard(
+    browser_context: BrowserContext, expected_origin: str | None
+) -> AsyncIterator[bool]:
+    """Hold the anonymous probe to the origin it was asked to read, so a redirect meant for
+    signed-out visitors cannot make it fetch somewhere else.
+
+    Yields whether enforcement is actually active. The deployment's guard decides which origins it
+    will cover, and a probe it will not cover is not worth the request.
+    """
+    if expected_origin is None:
+        yield False
+        return
+    async with AsyncExitStack() as stack:
+        try:
+            await stack.enter_async_context(
+                app.AGENT_FUNCTION.copilot_candidate_network_guard(browser_context, expected_origin=expected_origin)
+            )
+        except Exception:
+            # Fail closed on any refusal to enter, not on a list of the ways it has refused so far:
+            # an unenforced probe is the thing this exists to prevent.
+            LOG.info("copilot_signed_out_navigation_guard_unavailable", exc_info=True)
+            yield False
+            return
+        yield True
+
+
+async def capture_signed_out_page_observation(
+    browser_state: BrowserState,
+    *,
+    url: str,
+    organization_id: str,
+    scrub_values: Sequence[str] = (),
+) -> SignedOutPageObservation | None:
+    """Read `url` through a context that carries no cookies or storage, and summarize what it shows.
+
+    Requesting a location is a heavier claim than reporting one, and this is the only place the
+    copilot asks for a URL a page handed it. A location it may not request exactly as recorded — a
+    callback carrying a one-time query, a masked or credential-bearing URL — is not requested at
+    all, rather than requested in a reduced form that addresses a different page.
+    """
+    requestable, withheld = screened_recorded_url(url)
+    if requestable is None or withheld is not None:
+        LOG.info("copilot_signed_out_page_observation_skipped", reason=withheld)
+        return None
+    async with service_worker_blocked_context(browser_state, organization_id=organization_id) as browser_context:
+        page = await browser_state.get_working_page()
+        if page is None:
+            return None
+        async with _signed_out_navigation_guard(browser_context, _exact_origin(url)) as guarded:
+            if not guarded:
+                LOG.info("copilot_signed_out_page_observation_unenforceable")
+                return None
+            await page.goto(url, wait_until="domcontentloaded", timeout=_SIGNED_OUT_OBSERVATION_TIMEOUT_MS)
+            raw = await page.evaluate(composition_structured_evidence_expression())
+            reached_url = page.url
+            # A sign-in card that arrives after DOMContentLoaded is not in the first read, and this
+            # origin gets one attempt. One bounded re-read; the first read stands if the page has
+            # moved on under it by then, which a redirect during the settle would do.
+            await asyncio.sleep(_SIGNED_OUT_SETTLE_DELAY_SECONDS)
+            try:
+                raw = await page.evaluate(composition_structured_evidence_expression())
+                reached_url = page.url
+            except Exception:
+                LOG.info("copilot_signed_out_page_observation_settled_read_failed", exc_info=True)
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(payload, dict):
+        return None
+    if _canonical_origin(reached_url) != _canonical_origin(url):
+        # A reading from somewhere else is not a reading of this page.
+        LOG.info("copilot_signed_out_page_observation_left_its_origin")
+        return None
+    evidence = parse_composition_structured(payload, inspected_url=url, current_url=reached_url)
+    if evidence is None:
+        return None
+    screened_reached, reached_withheld = screened_recorded_url(reached_url)
+    # A registered value can sit in a path, where the recorded-URL screen reads only generic shapes.
+    return SignedOutPageObservation(
+        requested_url=_scrubbed_to(url, BLOCK_FACT_URL_MAX_CHARS, scrub_values),
+        # Where a signed-out visitor is sent may carry a query of its own, and the reading is worth
+        # no less for naming only the route it reached.
+        reached_url=_scrubbed_to(
+            screened_reached if screened_reached is not None else f"(withheld: {reached_withheld})",
+            BLOCK_FACT_URL_MAX_CHARS,
+            scrub_values,
+        ),
+        page_summary=_bounded_signed_out_page_facts(_signed_out_page_facts(evidence, scrub_values)),
+    )
+
+
+async def record_signed_out_page_observation(ctx: AgentContext, url: str) -> None:
+    """Keep one signed-out reading per origin the scout reached, so authoring sees what a cold run starts from."""
+    origin = safe_page_origin(url)
+    recorded = ctx.signed_out_page_observations
+    attempted = ctx.signed_out_page_observation_attempts
+    if not origin or len(recorded) >= _SIGNED_OUT_OBSERVATION_ORIGIN_LIMIT:
+        return
+    if origin in attempted or len(attempted) >= _SIGNED_OUT_OBSERVATION_ATTEMPT_LIMIT:
+        return
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            # No browser to probe with, so nothing was tried: a later action in this turn may find one.
+            return
+        # An origin is spent once a probe can run, whether or not it yields a reading: one that times
+        # out or finds no guard costs seconds, and every later action on the page would pay it again.
+        attempted.append(origin)
+        observation = await capture_signed_out_page_observation(
+            browser_state,
+            url=url,
+            organization_id=ctx.organization_id,
+            scrub_values=registered_scrub_values(ctx),
+        )
+    except Exception:
+        LOG.warning("copilot_signed_out_page_observation_failed", exc_info=True)
+        return
+    if observation is None:
+        return
+    summary = _redact_summary_node(ctx, observation.page_summary)
+    recorded.append(
+        observation.model_copy(update={"page_summary": summary}) if isinstance(summary, dict) else observation
+    )
+    # The one line that says the lever engaged: every failure path above logs, and without this the
+    # claim that the model saw the signed-out page cannot be checked against a run after the fact.
+    LOG.info(
+        "copilot_signed_out_page_observation_recorded",
+        origin=origin,
+        form_count=len(summary.get("forms") or []) if isinstance(summary, dict) else None,
+        control_count=len(summary.get("controls") or []) if isinstance(summary, dict) else None,
+        recorded_origins=len(recorded),
+    )
 
 
 def _page_evidence_names_obstruction(page_evidence: dict[str, Any] | None) -> bool:
@@ -1724,6 +2083,64 @@ async def _arm_scout_popup_listener(ctx: AgentContext) -> None:
         LOG.warning("copilot_scout_popup_listener_failed", exc_info=True)
 
 
+def _release_scout_challenge_listeners(ctx: AgentContext) -> None:
+    for detach in ctx.pending_scout_challenge_detachers:
+        try:
+            detach()
+        except Exception:
+            LOG.debug("copilot_scout_challenge_listener_detach_failed", exc_info=True)
+    ctx.pending_scout_challenge_detachers = []
+
+
+async def _arm_scout_challenge_listener(ctx: AgentContext) -> None:
+    """Arm a frame-navigation listener for the click about to dispatch.
+
+    A widget already mounted before the click is not this click's effect, so only navigations
+    inside the click's window count; main-frame navigations are left to ``url_changed`` and the
+    page summary. A preloaded widget the click merely reveals never navigates, so its rendered area
+    is measured here and compared after the settle."""
+    _release_scout_challenge_listeners(ctx)
+    ctx.pending_scout_challenge_frames = []
+    ctx.pending_scout_challenge_prior_frames = []
+    ctx.pending_scout_challenge_armed_at = None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx)
+        if browser_state is None:
+            return
+        page = await browser_state.get_or_create_page()
+        # A widget already showing a vendor URL re-navigates to refresh its token, and that fires
+        # framenavigated on the same frame — which is the widget's own upkeep, not this click.
+        already_challenged = [
+            frame
+            for frame in page.frames
+            if frame.parent_frame is not None and challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+        ]
+
+        def _capture(frame: Frame) -> None:
+            if frame.parent_frame is None:
+                return
+            baseline = (seen for seen, _area in ctx.pending_scout_challenge_prior_frames)
+            if any(frame is seen for seen in (*already_challenged, *baseline, *ctx.pending_scout_challenge_frames)):
+                return
+            if challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(
+                frame.url or ""
+            ) and not _is_invisible_recaptcha_badge(frame.url):
+                ctx.pending_scout_challenge_frames.append(frame)
+
+        # Listening before the measurement below yields, so a frame that mounts while it runs is still seen.
+        page.on("framenavigated", _capture)
+        ctx.pending_scout_challenge_detachers.append(lambda: page.remove_listener("framenavigated", _capture))
+        ctx.pending_scout_challenge_armed_at = time.monotonic()
+        # Measured together: each reading stops itself after its observer timeout, so a page with several
+        # vendor frames costs one bound before the click dispatches rather than one per frame.
+        prior_areas = await asyncio.gather(
+            *(challenge_signature.challenge_frame_rendered_area(frame) for frame in already_challenged)
+        )
+        ctx.pending_scout_challenge_prior_frames = list(zip(already_challenged, prior_areas, strict=True))
+    except Exception:
+        LOG.warning("copilot_scout_challenge_listener_failed", exc_info=True)
+
+
 # Bounded so a page that stalls the probe cannot spend the turn budget one click at a time.
 _RENDER_PROBE_TIMEOUT_MS = 5000.0
 
@@ -1732,27 +2149,29 @@ def _attach_observed_click_effect(
     ctx: AgentContext,
     result: dict[str, Any],
     *,
-    selector: str,
     effect: str,
+    challenge_vendor: str | None = None,
 ) -> None:
-    """Attach a browser-observed click effect without choosing a future action or locator."""
+    """Attach a browser-observed click effect without choosing a future action or locator.
+
+    The records this click just wrote are updated directly. Searching for them by selector would miss
+    a click whose locator the scrub removed, and could land the effect on an older click that used
+    the same selector.
+    """
     data = result.get("data")
     if not isinstance(data, dict):
         return
     result_effects = data.setdefault("observed_effects", {})
     if isinstance(result_effects, dict):
         result_effects[effect] = True
-    for collection_name in ("scout_trajectory", "scouted_interactions"):
-        collection = getattr(ctx, collection_name, None)
-        if not isinstance(collection, list):
-            continue
-        for interaction in reversed(collection):
-            if interaction.get("tool_name") != "click" or interaction.get("selector") != selector:
-                continue
-            effects = dict(interaction.get("observed_effects") or {})
-            effects[effect] = True
-            interaction["observed_effects"] = effects
-            break
+    if challenge_vendor is not None:
+        data["challenge_vendor"] = challenge_vendor
+    for interaction in ctx.pending_scout_click_records:
+        effects = dict(interaction.get("observed_effects") or {})
+        effects[effect] = True
+        interaction["observed_effects"] = effects
+        if challenge_vendor is not None:
+            interaction["challenge_vendor"] = challenge_vendor
 
 
 async def _maybe_attach_observed_render_target(
@@ -1779,7 +2198,7 @@ async def _maybe_attach_observed_render_target(
         if not content_type.lower().startswith("image/"):
             LOG.debug("copilot_observed_render_declined", reason="not_image_render", url=url, content_type=content_type)
             return
-        _attach_observed_click_effect(ctx, result, selector=selector, effect="rendered_document_opened")
+        _attach_observed_click_effect(ctx, result, effect="rendered_document_opened")
     except Exception:
         LOG.warning("copilot_observed_render_target_attach_failed", exc_info=True)
 
@@ -1810,9 +2229,234 @@ async def _maybe_attach_observed_download_target(
                 return
             download_signal = "store_diff"
         LOG.info("copilot_observed_download_signal", signal=download_signal, url=url)
-        _attach_observed_click_effect(ctx, result, selector=selector, effect="download_started")
+        _attach_observed_click_effect(ctx, result, effect="download_started")
     except Exception:
         LOG.warning("copilot_observed_download_target_attach_failed", exc_info=True)
+
+
+async def _close_scout_challenge_baseline(ctx: AgentContext) -> None:
+    """Close the pre-click window at the dispatch boundary.
+
+    Frames that navigated since the listener went on arrived before the click, so they join the baseline:
+    one the click later reveals is still credited through the reveal check, a visible one is not.
+    """
+    if ctx.pending_scout_challenge_armed_at is None:
+        return
+    arrivals = list(ctx.pending_scout_challenge_frames)
+    ctx.pending_scout_challenge_frames.clear()
+    areas = await asyncio.gather(*(challenge_signature.challenge_frame_rendered_area(frame) for frame in arrivals))
+    ctx.pending_scout_challenge_prior_frames.extend(zip(arrivals, areas, strict=True))
+    # Frames that navigated during that measurement are baselined unmeasured, with no await before dispatch:
+    # an unmeasured baseline frame is never credited, as new or as revealed.
+    ctx.pending_scout_challenge_prior_frames.extend((frame, None) for frame in ctx.pending_scout_challenge_frames)
+    ctx.pending_scout_challenge_frames.clear()
+
+
+def _start_scout_challenge_settle(ctx: AgentContext) -> None:
+    """Start the settle window when the click tool returns.
+
+    The browser clicks somewhere inside the tool call, after resolving and waiting for its target, which
+    can outlast the window; the return is the first moment known to follow the click.
+    """
+    if ctx.pending_scout_challenge_armed_at is not None:
+        ctx.pending_scout_challenge_armed_at = time.monotonic()
+
+
+async def _on_screen_challenge_vendor(ctx: AgentContext) -> str | None:
+    """Vendor of the first challenge frame the click put on screen, whether it mounted one or revealed a placeholder.
+
+    A widget often arrives with hidden helper frames beside it, so every candidate is measured rather
+    than the first to navigate. A hidden vendor frame is still a marker the solve ladder acts on, and
+    crediting one would send a solve through the whole ladder against nothing a person could answer.
+    """
+    # A preload is only revealable if it measured as a placeholder before the click: without that
+    # reading there is no growth to observe, and an already-challenging widget would be credited to
+    # whatever click happened to follow it.
+    revealable = [
+        frame
+        for frame, prior_area in ctx.pending_scout_challenge_prior_frames
+        if prior_area is not None and prior_area <= challenge_signature.CHALLENGE_FRAME_PLACEHOLDER_AREA
+    ]
+    vendor, _unmeasured = await _rendered_vendor_reading([*ctx.pending_scout_challenge_frames, *revealable])
+    return vendor
+
+
+async def _rendered_vendor_reading(frames: list[Frame]) -> tuple[str | None, bool]:
+    return await challenge_signature.rendered_challenge_vendor_reading(
+        [frame for frame in frames if not _is_invisible_recaptcha_badge(frame.url or "")]
+    )
+
+
+def _is_invisible_recaptcha_badge(url: str) -> bool:
+    # Invisible reCAPTCHA and v3 keep this anchor on screen as a badge on every page; a challenge they raise
+    # opens in a separate bframe, which still counts.
+    parsed = urlparse(url)
+    return (
+        "/recaptcha/" in parsed.path
+        and parsed.path.endswith("/anchor")
+        and "invisible" in parse_qs(parsed.query).get("size", [])
+    )
+
+
+_PAGE_STATE_TITLE_MAX_CHARS = 240
+_PAGE_STATE_URL_MAX_CHARS = 200
+# The frame probes and the title read each hang on a renderer that never yields, so the whole read is bounded.
+_PAGE_STATE_READ_TIMEOUT_SECONDS = 3.0
+
+
+class PageState(TypedDict):
+    read: Literal["ok", "failed"]
+    url: NotRequired[str | None]
+    title: NotRequired[str | None]
+    challenge_vendor: str | None
+
+
+def unread_page_state(ctx: AgentContext) -> PageState:
+    return {"read": "failed", "url": None, "title": None, "challenge_vendor": None}
+
+
+_PAGE_UNREADABLE_ERROR_CODES = BROWSER_SESSION_LOSS_ERROR_CODES | {BROWSER_SESSION_UNAVAILABLE_ERROR_CODE}
+
+
+def page_state_probe_allowed(
+    ctx: AgentContext, result: Mapping[str, Any], *, binding: BrowserSessionBinding | None
+) -> bool:
+    return not (
+        (binding is not None and binding.unavailable_reason)
+        or raw_secret_browser_denied(ctx)
+        or result.get("error_code") in _PAGE_UNREADABLE_ERROR_CODES
+    )
+
+
+async def read_page_state_on_page(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    result: Mapping[str, Any],
+    binding: BrowserSessionBinding | None,
+    probe: bool = True,
+    settle: bool = False,
+    custody_lock: AbstractAsyncContextManager[None] | None = None,
+) -> tuple[PageState, Page | None]:
+    """What the call's browser shows now, scrubbed for the model, and the page read, or the unread state and None
+    without touching a browser the call may not probe. An unmeasured vendor frame fails the read, not "no challenge"."""
+    if not (probe and page_state_probe_allowed(ctx, result, binding=binding)):
+        return unread_page_state(ctx), None
+    deadline = _PAGE_STATE_READ_TIMEOUT_SECONDS
+    if settle:
+        deadline += settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS
+    failure: str
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(deadline), custody_lock or nullcontext():
+            reading = await _read_live_page_state(ctx, settle=settle)
+    except TimeoutError:
+        failure = "deadline"
+    except Exception as exc:
+        failure = type(exc).__name__
+    else:
+        if isinstance(reading, str):
+            failure = reading
+        else:
+            url = screened_recorded_url(reading.url)[0]
+            state: PageState = {
+                "read": "ok",
+                # Cut short, a url or title could end partway through a value the scrub only recognises whole.
+                "url": url if url is None or len(url) <= _PAGE_STATE_URL_MAX_CHARS else None,
+                "title": reading.title if len(reading.title) <= _PAGE_STATE_TITLE_MAX_CHARS else None,
+                "challenge_vendor": reading.vendor,
+            }
+            scrubbed = scrub_model_facing_tool_result(ctx, {"page_state": state}).get("page_state")
+            if isinstance(scrubbed, dict):
+                return cast(PageState, scrubbed), reading.page
+            failure = "scrubbed_away"
+    LOG.info(
+        "copilot_page_state_read_failed",
+        tool_name=tool_name,
+        browser_session_id=effective_browser_session_id(ctx),
+        reason=failure,
+        duration_ms=round((time.monotonic() - started) * 1000),
+    )
+    return unread_page_state(ctx), None
+
+
+class _LivePageReading(NamedTuple):
+    url: str
+    title: str
+    vendor: str | None
+    page: Page
+
+
+_PageStateReadFailure = Literal["no_page", "vendor_frame_unmeasured", "unreadable_location", "navigated_during_read"]
+
+
+async def _read_live_page_state(ctx: AgentContext, *, settle: bool) -> _LivePageReading | _PageStateReadFailure:
+    page = await live_working_page(ctx)
+    if page is None:
+        return "no_page"
+    url_before = page.url
+    vendor, unmeasured = await _rendered_vendor_reading(_child_frames(page))
+    if settle and vendor is None and (ctx.pending_scout_challenge_frames or _vendor_frame_present(page)):
+        # Only a page that already has a vendor frame waits for it to mount or grow, so a page without one
+        # pays no delay.
+        settle_started = ctx.pending_scout_challenge_armed_at or time.monotonic()
+        owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - settle_started)
+        if owed > 0:
+            await asyncio.sleep(owed)
+        vendor, unmeasured = await _rendered_vendor_reading(_child_frames(page))
+    title = await page.title()
+    url = page.url
+    if unmeasured:
+        return "vendor_frame_unmeasured"
+    if not isinstance(url, str) or not isinstance(title, str):
+        return "unreadable_location"
+    # A navigation between the vendor probe and the title read would pair one document's vendor with another's.
+    if url != url_before:
+        return "navigated_during_read"
+    return _LivePageReading(url, title, vendor, page)
+
+
+def _child_frames(page: Page) -> list[Frame]:
+    return [frame for frame in page.frames if frame.parent_frame is not None]
+
+
+def _vendor_frame_present(page: Page) -> bool:
+    return any(
+        challenge_signature.CHALLENGE_VENDOR_FRAME_URL.search(frame.url or "")
+        and not _is_invisible_recaptcha_badge(frame.url)
+        for frame in _child_frames(page)
+    )
+
+
+async def _maybe_attach_observed_challenge(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
+    """Report when the scout's click raised an anti-bot challenge.
+
+    Needs no locator: a coordinate click has none, and still raises challenges. The effect goes on the
+    tool result either way, and onto whatever records this click wrote, which for a click with no
+    locator is none. A failed click may carry no data at all, and gets some only when a challenge is found.
+    """
+    if result.get("data") is not None and not isinstance(result.get("data"), dict):
+        return
+    armed_at = ctx.pending_scout_challenge_armed_at
+    if armed_at is None:
+        return
+    vendor = await _on_screen_challenge_vendor(ctx)
+    if vendor is None:
+        # The window started when the click returned, and the observation between then and now usually
+        # outlasts it by itself. Wait only for what is left of it, so a widget
+        # that mounts or grows a beat late still lands without adding a delay to every click.
+        owed = settings.COPILOT_SCOUT_ACT_OBSERVE_RECAPTURE_DELAY_SECONDS - (time.monotonic() - armed_at)
+        if owed > 0:
+            await asyncio.sleep(owed)
+        vendor = await _on_screen_challenge_vendor(ctx)
+    if vendor is None:
+        return
+    try:
+        LOG.info("copilot_observed_challenge_signal", vendor=vendor, page_origin=safe_page_origin(url))
+        result.setdefault("data", {})
+        _attach_observed_click_effect(ctx, result, effect="challenge_raised", challenge_vendor=vendor)
+    except Exception:
+        LOG.warning("copilot_observed_challenge_attach_failed", exc_info=True)
 
 
 async def _attach_evaluate_page_facts(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:

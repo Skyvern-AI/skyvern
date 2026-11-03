@@ -6,24 +6,66 @@ import {
 } from "./failureReasonFormat";
 
 describe("formatFailureReason", () => {
-  test("splits the block headline from the nested failure-reason payload", () => {
+  test("leads with the inner cause of a nested block failure", () => {
     const raw =
-      "for_loop block failed. failure reason: Failed to execute code block. " +
-      "Reason: Exception: select_payer failed for 'Demo Payer' target='DEMO PAYER'";
+      "login block failed. failure reason: Max retries per step (3) exceeded. " +
+      "Possible failure reasons: … website is currently down for maintenance …";
     expect(formatFailureReason(raw)).toEqual({
-      headline: "for_loop block failed",
+      headline: "Max retries per step (3) exceeded",
       detail:
-        "Failed to execute code block. " +
-        "Reason: Exception: select_payer failed for 'Demo Payer' target='DEMO PAYER'",
+        "Max retries per step (3) exceeded. " +
+        "Possible failure reasons: … website is currently down for maintenance …",
+    });
+  });
+
+  test("leads with the error code of a terminated block", () => {
+    expect(
+      formatFailureReason(
+        "navigation block terminated. Reason: DATA_UNAVAILABLE: …",
+      ),
+    ).toEqual({
+      headline: "DATA_UNAVAILABLE: …",
+      detail: "DATA_UNAVAILABLE: …",
+    });
+  });
+
+  test("leads with the cause of a timed-out block", () => {
+    expect(
+      formatFailureReason(
+        "navigation block timed out. Reason: Page did not load within 60 seconds",
+      ).headline,
+    ).toBe("Page did not load within 60 seconds");
+  });
+
+  test("keeps a non-block wrapper as the headline", () => {
+    expect(
+      formatFailureReason(
+        "Setup workflow failed. failure reason: Browser session could not be created. Retry later.",
+      ),
+    ).toEqual({
+      headline: "Setup workflow failed",
+      detail: "Browser session could not be created. Retry later.",
+    });
+  });
+
+  test("keeps an unsplittable cause reachable as the detail", () => {
+    const cause =
+      "Invalid template: unexpected end of template, expected 'end of print statement' while rendering {{ parameters.account_number | default(missing_value) }}";
+    expect(
+      formatFailureReason(`task block failed. failure reason: ${cause}`),
+    ).toEqual({
+      headline: cause,
+      detail: cause,
     });
   });
 
   test("unescapes literal \\n sequences into real line breaks", () => {
     const raw =
       "task block failed. failure reason: Timeout 30000ms exceeded.\\nCall log:\\n - waiting";
-    const { detail } = formatFailureReason(raw);
-    expect(detail).toContain("exceeded.\nCall log:\n - waiting");
-    expect(detail).not.toContain("\\n");
+    expect(formatFailureReason(raw)).toEqual({
+      headline: "Timeout 30000ms exceeded",
+      detail: "Timeout 30000ms exceeded.\nCall log:\n - waiting",
+    });
   });
 
   test("falls back to a first-sentence headline for generic prose", () => {

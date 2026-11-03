@@ -18,26 +18,44 @@ To set it up manually:
 
 2. Open `chrome://extensions`, enable **Developer mode**, and click **Load unpacked**.
 3. Select the directory printed by the command.
-4. Open the extension's **Details** page and enable **Allow User Scripts**.
-5. Start the local MCP server in extension mode:
+4. Start the local MCP server in extension mode:
 
    ```bash
    skyvern run mcp --browser-extension
    ```
 
-6. Start explicit pairing:
+5. Start explicit pairing:
 
    ```bash
    skyvern browser extension-pair
    ```
 
-7. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
+6. The pairing page hands off automatically; click **Approve pairing** in the **Skyvern Agent** confirmation tab
    (the single approval step).
 
 The local pairing page checks that the extension is available before it claims the single-use offer. If pairing starts
 before the extension is loaded, keep the page open. It retains the offer and continues automatically after the
 extension becomes available.
-8. Add controllable tabs to the **Skyvern Controlled** group.
+
+7. Add controllable tabs to the **Skyvern Controlled** group.
+
+Skyvern moves popups from controlled tabs into tabs in the opener's **Skyvern Controlled** group.
+The new tab becomes active only if the opener was active.
+If Chrome rejects the move, Skyvern keeps control of the separate popup.
+
+Every controlled HTTP(S) tab shows a glowing frame and the label "Skyvern is controlling this tab" while the agent is connected.
+To stop control of a tab, select **Remove from Skyvern Controlled** in the extension popup.
+You can also drag the tab out of the group.
+Tabs open before an extension update show the frame after their next reload or navigation.
+A fullscreen video or element covers the frame.
+
+Direct JavaScript evaluation is unavailable in extension mode. The `dom.evaluate` operation returns `OP_NOT_ALLOWED`:
+
+> Direct JavaScript evaluation is unavailable in extension mode. Use skyvern_observe, skyvern_get_html, skyvern_find, or skyvern_get_value to inspect the page. Use skyvern_click or skyvern_type to interact.
+
+This restriction also applies to `skyvern_evaluate` and tools that call it.
+Use the inspection and interaction tools. Do not reroute the expression through CDP or another injection API.
+Fixed value fills with `skyvern_type(input_method="value")` remain available. A debugger disconnect is a separate connection problem.
 
 On POSIX, extension mode uses the persistent broker by default. The first broker start automatically validates or
 initializes its journal and copies an existing legacy credential into the owner-only broker run directory, or creates
@@ -54,9 +72,48 @@ short reconnect window before session creation opens the one-click pairing page 
 `skyvern browser extension-broker-status` to inspect sanitized state and `skyvern browser extension-broker-stop` to
 drain the daemon and release the configured port.
 
-The extension records broker-created root tabs and popups in Chrome session storage until those tabs close. This lets
-the broker close one of its tabs after an external debugger detach removes it from extension scope. The extension still
-rejects `tabs.remove` for every unscoped tab that it did not create.
+The extension records broker-created root tabs and popups in Chrome session storage while it owns them. When a tab
+leaves scope after an unshare or an unrecovered debugger detach, the extension gives up ownership and leaves the tab
+open. Later reset cleanup cannot close a handed-back tab. Controlling it again requires the operator to share it again.
+Explicit removal of an actively scoped tab and cleanup of incomplete tab creation still close those tabs.
+
+When another extension loads its own frame inside a controlled tab, Chrome can end the debugger session with
+`target_closed`. The bridge attempts recovery only while connected and authenticated, with no release pending.
+The tab must still be open, scoped, not discarded or quarantined, and on a permitted HTTP(S) URL.
+User cancellation, restricted URLs, closed tabs, and failed recovery keep the hand-back behavior above.
+
+Recovery emits `debugger.detached`, removes foreign extension frames, attaches again, then emits `scope.tabAdded`
+for the same Chrome tab. It checks the tab and its controlled group again before announcing success.
+The adapter closes the old Playwright page and announces a fresh page. Failure emits `scope.tabRemoved` and ungroups the tab.
+Commands and fixed DOM operations return `DEBUGGER_DETACHED` during recovery.
+Only a client `debugger.attach` received after the new announcement lifts this command fence.
+An attach request queued before the announcement cannot lift it.
+
+While the indicator reports agent control, the script removes foreign frames on insertion or a frame's `src` change.
+After removing a frame, it removes the outermost empty shadow host before the first ancestor with content; reinserted hosts are checked again.
+Whitespace, metadata, empty containers, and foreign frames do not count as content; checks stop after 200 elements and preserve the host.
+The first insertion still cuts the debugger session off once because Chrome starts navigation before the script can remove the frame.
+Observation stops when agent control ends; it covers at most 200 document and shadow roots in total, pruning detached roots when full.
+
+Each tab allows eight recovery starts in any ten seconds, across page changes.
+Each recovery allows three attach attempts within three seconds, with a two-second timeout per attach.
+Only errors naming a foreign extension URL get another attempt, after 100 ms.
+Before each attempt, a packaged script removes the foreign frames and checks their shadow hosts for content.
+The worker waits up to 300 ms for removal; its request expires after 500 ms.
+Missing scripts, timeouts, and invalid replies count as zero removals. Reload a tab opened before an extension update to install the script.
+The script visits at most 5,000 elements and five levels of same-origin child documents, including closed shadow roots.
+
+A step interrupted by the cut-off fails once. After successful recovery, the next step can use the fresh page.
+Scripts holding the old `Page`, frame, or element references must obtain new ones.
+Page routes and other page-scoped state do not carry over. Recovery does not retry the interrupted action.
+Context init scripts can run again in the unchanged document.
+Existing limits for nested frames inside an out-of-process frame still apply.
+
+The script cannot reach cross-origin child documents or identify foreign frames with a concealed destination URL.
+Other extensions' in-page frames and their hosts disappear; their toolbar pop-ups remain available.
+It does not undo other page changes, such as elements made `inert` by another extension.
+An extension that keeps creating new frames can exhaust the recovery budget.
+Chrome can show its debugger information bar again after attachment.
 
 To opt into the legacy embedded relay on POSIX, set exactly:
 
@@ -74,9 +131,9 @@ The extension connects outbound to `ws://127.0.0.1:19777/extension/v1` by defaul
 In broker mode, `extension.secret` is daemon-owned and `skyvern browser extension-token` intentionally refuses to copy
 it. Use the explicit pairing command instead. The popup token-paste flow remains available only with the legacy opt-out.
 
-Debugger-backed tools display Chrome's debugger infobar; direct `skyvern_evaluate` calls do not. Clicking **Cancel** in
+Debugger-backed tools display Chrome's debugger infobar. Clicking **Cancel** in
 the infobar revokes debugger access. Removing a tab with the popup or dragging it out of **Skyvern Controlled** revokes
 all extension access to that tab.
 
 For the complete setup, security model, and limitations, see
-[Control Your Chrome with Skyvern Agent](../../../docs/developers/optimization/chrome-extension.mdx).
+[Browsers: use your own Chrome](https://www.skyvern.com/docs/browsers#share-tabs-with-a-local-mcp-server).

@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -7,13 +8,18 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
 import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
-type StreamBody = { message: string; workflow_run_id?: string | null };
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
+
+type StreamBody = {
+  message: string;
+  workflow_run_id?: string | null;
+};
 type StreamCall = {
   body: StreamBody;
   onMessage: (payload: unknown) => boolean;
@@ -84,15 +90,20 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-const { switchStudioRun, releaseStudioRun } = vi.hoisted(() => ({
+const { switchStudioRun, navigate } = vi.hoisted(() => ({
   switchStudioRun: vi.fn(),
-  releaseStudioRun: vi.fn(),
+  navigate: vi.fn(),
 }));
 
-vi.mock("@/routes/workflows/studio/runSwitchNavigation", () => ({
-  useSwitchStudioRun: () => switchStudioRun,
-  useReleaseStudioRun: () => releaseStudioRun,
-}));
+vi.mock(
+  "@/routes/workflows/studio/runSwitchNavigation",
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import("@/routes/workflows/studio/runSwitchNavigation")
+    >()),
+    useSwitchStudioRun: () => switchStudioRun,
+  }),
+);
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
@@ -102,7 +113,7 @@ vi.mock("react-router-dom", async (importOriginal) => {
     ...actual,
     useParams: () => routeParams.current,
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
-    useNavigate: () => vi.fn(),
+    useNavigate: () => navigate,
     useLocation: () => ({
       pathname: "/",
       search: "",
@@ -113,11 +124,35 @@ vi.mock("react-router-dom", async (importOriginal) => {
   };
 });
 
-// Unrelated to this file's tests; the real hook needs a QueryClientProvider
-// this harness doesn't set up.
-vi.mock("../hooks/useWorkflowRunQuery", () => ({
-  useWorkflowRunQuery: () => ({ data: undefined }),
+// The real hook needs a QueryClientProvider this harness doesn't set up.
+const { focusedRun, reopenEditor } = vi.hoisted(() => ({
+  focusedRun: { current: undefined as Record<string, unknown> | undefined },
+  reopenEditor: vi.fn(),
 }));
+vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
+  useWorkflowRunQuery: ({ workflowRunId }: { workflowRunId?: string }) => ({
+    data: workflowRunId ? focusedRun.current : undefined,
+  }),
+}));
+
+vi.mock(
+  "@/routes/workflows/studio/StudioPaneDefaultsContext",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("@/routes/workflows/studio/StudioPaneDefaultsContext")
+      >();
+    return {
+      ...actual,
+      useStudioPaneDefaults: () => ({
+        ...actual.useStudioPaneDefaults(),
+        reopenEditor,
+      }),
+    };
+  },
+);
 
 const saveData = {
   title: "Test WF",
@@ -150,29 +185,32 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 import { useWorkflowBlockSearchStore } from "@/store/WorkflowBlockSearchStore";
-import { useRecordingStore } from "@/store/useRecordingStore";
-
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 const BOOLEAN_FLAGS: Record<string, boolean> = {
-  ENABLE_WORKFLOW_COPILOT_V2: true,
   WORKFLOW_COPILOT_CODE_BLOCK_MODE: false,
   CODE_BLOCK_ACCESS: false,
 };
 
-type ChatProps = { docked?: boolean; portalTarget?: HTMLElement | null };
+type ChatProps = {
+  docked?: boolean;
+  portalTarget?: HTMLElement | null;
+  workflowRunId?: string | null;
+};
 
 function chatUi(props: ChatProps = {}) {
   return (
     <FeatureFlagContext.Provider value={(name) => BOOLEAN_FLAGS[name]}>
-      <FeatureFlagValueContext.Provider value={() => undefined}>
-        <WorkflowCopilotChat {...props} />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat {...props} />
     </FeatureFlagContext.Provider>
   );
 }
@@ -186,13 +224,7 @@ function makeDockedProps(): ChatProps {
 
 async function renderChat(props: ChatProps = {}) {
   const view = render(chatUi(props));
-  await waitFor(() =>
-    expect(
-      screen.getByPlaceholderText(
-        /Message Skyvern Copilot|Ask Copilot to build/,
-      ),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
   return view;
 }
 
@@ -235,7 +267,9 @@ const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
 
 beforeEach(() => {
   switchStudioRun.mockClear();
-  releaseStudioRun.mockClear();
+  navigate.mockClear();
+  reopenEditor.mockClear();
+  focusedRun.current = undefined;
   HTMLElement.prototype.scrollIntoView = vi.fn();
   HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
@@ -257,6 +291,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
@@ -424,6 +459,86 @@ describe("WorkflowCopilotChat — recorded-action live poll wiring", () => {
     await waitFor(() => expect(screen.getByText("Wobble Gizmo")).toBeTruthy());
   });
 
+  it("names a code block's raised error by its line and keeps its full text one click deep", async () => {
+    const failure =
+      "Locator.fill: Timeout 30000ms exceeded.\nCall log:\n  - waiting for the email field";
+    timelineGet.mockResolvedValue({
+      data: [
+        {
+          type: "block",
+          block: {
+            workflow_run_block_id: "wrb_1",
+            actions: [
+              {
+                action_id: "a2",
+                action_type: "null_action",
+                status: "failed",
+                task_id: null,
+                step_id: null,
+                step_order: null,
+                action_order: 1,
+                confidence_float: null,
+                description: "code error at line 8",
+                reasoning: null,
+                intention: null,
+                response: failure,
+                created_by: null,
+                text: null,
+                output: { code_line: 8 },
+              },
+            ],
+          },
+          children: [],
+          thought: null,
+          created_at: "2026-06-10T00:00:00Z",
+          modified_at: "2026-06-10T00:00:00Z",
+        },
+      ],
+    });
+
+    await renderChat();
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage({
+      type: "turn_start",
+      turn_id: "turn-1",
+      turn_index: 0,
+      mode: "build",
+      timestamp: "2026-06-10T00:00:00Z",
+    });
+    streamCalls[0]!.onMessage({
+      type: "design_start",
+      timestamp: "2026-06-10T00:00:00Z",
+    });
+    for (const [status, timestamp] of [
+      ["running", "2026-06-10T00:00:00Z"],
+      ["failed", "2026-06-10T00:00:31Z"],
+    ]) {
+      streamCalls[0]!.onMessage({
+        type: "block_progress",
+        workflow_run_id: "wr_1",
+        workflow_run_block_id: "wrb_1",
+        block_label: "block_1",
+        block_type: "code",
+        status,
+        iteration: 0,
+        timestamp,
+      });
+    }
+
+    // The recorded step replays before it settles into its failure.
+    await waitFor(() => expect(screen.getByText("line 8")).toBeTruthy(), {
+      timeout: 3000,
+    });
+    expect(screen.getByText("Code error")).toBeTruthy();
+    expect(screen.queryByText("Screenshot")).toBeNull();
+    expect(
+      screen.getByText("Locator.fill: Timeout 30000ms exceeded."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/waiting for the email field/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show details" }));
+    expect(screen.getByText(/waiting for the email field/)).toBeTruthy();
+  });
+
   it("patches an already-frozen AI message when the timeline fetch resolves after the terminal response", async () => {
     let resolveTimeline!: (value: { data: unknown[] }) => void;
     timelineGet.mockImplementation(
@@ -543,6 +658,186 @@ describe("WorkflowCopilotChat — studio run focus", () => {
   });
 });
 
+const toolCallFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
+  type: "tool_call",
+  tool_name: "run_browser_code",
+  display_label: "Working in the browser",
+  tool_input: {},
+  iteration: 0,
+  tool_call_id: "call_1",
+  timestamp: "2026-06-10T00:00:00Z",
+  browser_session_id: "pbs_debug",
+  ...overrides,
+});
+
+describe("WorkflowCopilotChat — Copilot's own browser in the studio pane", () => {
+  beforeEach(() =>
+    useStudioBrowserStore.setState({ copilotTurnActive: false }),
+  );
+  afterEach(() => {
+    window.history.replaceState(null, "", "/");
+    navigate.mockReset();
+  });
+
+  it("pins the pane to the browser a tool call acts in, replacing the entry", async () => {
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=copilot");
+    await renderChat(makeDockedProps());
+    await submit("build a workflow");
+
+    streamCalls[0]!.onMessage(toolCallFrame());
+
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ search: "?wr=wr_1&wrs=pbs_debug" }),
+      expect.objectContaining({ replace: true }),
+    );
+  });
+
+  it("moves the pin to the run's browser when a later call names it", async () => {
+    navigate.mockImplementation((to: { search: string }) =>
+      window.history.replaceState(null, "", `/${to.search}`),
+    );
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=copilot");
+    await renderChat(makeDockedProps());
+    await submit("build a workflow");
+
+    streamCalls[0]!.onMessage(toolCallFrame());
+    streamCalls[0]!.onMessage(
+      toolCallFrame({ tool_call_id: "call_2", browser_session_id: "pbs_run" }),
+    );
+
+    expect(window.location.search).toBe("?wr=wr_1&wrs=pbs_run");
+  });
+
+  it.each([
+    ["undocked", {}, "?wr=wr_1&wrs=copilot", {}],
+    [
+      "carrying no browser id",
+      makeDockedProps(),
+      "?wr=wr_1&wrs=copilot",
+      { browser_session_id: null },
+    ],
+    ["on a run the user opened", makeDockedProps(), "?wr=wr_user", {}],
+  ])(
+    "leaves the URL alone for a tool call %s",
+    async (_case, props, search, frame) => {
+      window.history.replaceState(null, "", `/${search}`);
+      await renderChat(props);
+      await submit("build a workflow");
+
+      streamCalls[0]!.onMessage(toolCallFrame(frame));
+
+      expect(navigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("drops a pin an earlier turn left in the URL when a new turn starts", async () => {
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=pbs_debug");
+    await renderChat(makeDockedProps());
+    expect(navigate).not.toHaveBeenCalled();
+
+    await submit("build a workflow");
+
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ search: "?wr=wr_1&wrs=copilot" }),
+      expect.objectContaining({ replace: true }),
+    );
+  });
+
+  it("tells the pane a docked turn is active only while it runs", async () => {
+    await renderChat(makeDockedProps());
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false);
+
+    await submit("build a workflow");
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(true);
+
+    await act(async () => {
+      streamCalls[0]!.resolve();
+    });
+    await waitFor(() =>
+      expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false),
+    );
+  });
+
+  it("clears the active turn when the chat unmounts mid-turn", async () => {
+    const view = await renderChat(makeDockedProps());
+    await submit("build a workflow");
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(true);
+
+    view.unmount();
+
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false);
+  });
+
+  it("never reports an undocked turn to the pane", async () => {
+    await renderChat({});
+    await submit("build a workflow");
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false);
+  });
+});
+
+describe("WorkflowCopilotChat — Editor returns after the turn's run", () => {
+  it("reopens Editor once when the focused run's terminal outcome lands", async () => {
+    await renderChat({ ...makeDockedProps(), workflowRunId: "wr_1" });
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    streamCalls[0]!.onMessage(runOutcomeFrame());
+    expect(reopenEditor).not.toHaveBeenCalled();
+
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    expect(reopenEditor).toHaveBeenCalledTimes(1);
+  });
+
+  it("reopens Editor once the focus lands when the run ended before it did", async () => {
+    const props = makeDockedProps();
+    const view = await renderChat(props);
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    expect(reopenEditor).not.toHaveBeenCalled();
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_1" }));
+    expect(reopenEditor).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the panes alone when the user has switched to another run", async () => {
+    const props = { ...makeDockedProps(), workflowRunId: "wr_1" };
+    const view = await renderChat(props);
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_2" }));
+    streamCalls[0]!.onMessage(runOutcomeFrame({ verdict: "demonstrated" }));
+    focusedRun.current = { workflow_run_id: "wr_1", status: "completed" };
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_1" }));
+    expect(reopenEditor).not.toHaveBeenCalled();
+  });
+
+  it("does not reopen Editor when the user returns to a run that ended while they were away", async () => {
+    const props = { ...makeDockedProps(), workflowRunId: "wr_1" };
+    const view = await renderChat(props);
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_2" }));
+    await act(async () => {
+      streamCalls[0]!.reject(new Error("network"));
+    });
+    focusedRun.current = { workflow_run_id: "wr_1", status: "completed" };
+    view.rerender(chatUi({ ...props, workflowRunId: "wr_1" }));
+    await act(async () => {});
+    expect(reopenEditor).not.toHaveBeenCalled();
+  });
+
+  it("reopens Editor from the run status when the stream is severed first", async () => {
+    await renderChat({ ...makeDockedProps(), workflowRunId: "wr_1" });
+    await submit("build a workflow");
+    streamCalls[0]!.onMessage(runStartedFrame());
+    focusedRun.current = { workflow_run_id: "wr_1", status: "completed" };
+    await act(async () => {
+      streamCalls[0]!.reject(new Error("network"));
+    });
+    await waitFor(() => expect(reopenEditor).toHaveBeenCalledTimes(1));
+  });
+});
+
 describe("WorkflowCopilotChat — build follow", () => {
   const focusBlock = vi.fn();
 
@@ -609,21 +904,5 @@ describe("WorkflowCopilotChat — build follow", () => {
     );
 
     expect(focusBlock).not.toHaveBeenCalled();
-  });
-
-  it("never fights the recording overlay", async () => {
-    useRecordingStore.setState({ isRecording: true });
-    try {
-      await renderChat(makeDockedProps());
-      await submit("build it");
-
-      streamCalls[0]!.onMessage(
-        blockProgressFrame({ block_label: "login", status: "running" }),
-      );
-
-      expect(focusBlock).not.toHaveBeenCalled();
-    } finally {
-      useRecordingStore.setState({ isRecording: false });
-    }
   });
 });

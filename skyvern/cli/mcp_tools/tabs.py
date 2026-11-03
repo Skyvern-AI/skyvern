@@ -9,28 +9,37 @@ import asyncio
 import contextlib
 from collections import deque
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import structlog
 from pydantic import BaseModel, Field
 
-from skyvern.cli.core.browser_ops import do_screenshot
+from skyvern.browser_extension.runtime import BrowserExtensionRuntime
+from skyvern.cli.core.browser_ops import do_navigate, do_screenshot
 from skyvern.cli.core.guards import GuardError, validate_wait_until
-from skyvern.exceptions import BlockedHost, SkyvernHTTPException
+from skyvern.cli.core.js_dispatch import under_action_deadline
+from skyvern.cli.core.session_manager import SessionState, reconcile_extension_selection
+from skyvern.exceptions import ActionDeadlineExceeded, BlockedHost, SkyvernHTTPException
 from skyvern.utils.url_validators import validate_fetch_url
 
 from ._common import ErrorCode, Timer, make_error, make_result, save_artifact
+from ._element_state import DEFAULT_ACTION_TIMEOUT_MS, action_deadline_error
 from ._localhost import is_localhost_url
 from ._session import (
     BrowserNotAvailableError,
     clear_session_ref_map,
+    ensure_browser_hooks,
     get_current_session,
     get_page,
     no_browser_error,
+    resolve_browser,
 )
 from .browser import _must_reject_localhost_url
 
 LOG = structlog.get_logger(__name__)
+
+if TYPE_CHECKING:
+    from playwright.async_api import Page
 
 _MAX_OPEN_TABS_PER_CALL = 40
 TAB_TITLE_TIMEOUT_SECONDS = 5.0
@@ -68,7 +77,8 @@ def _tab_info(page: Any, *, index: int, is_active: bool) -> TabInfo:
 async def _tab_info_with_title(page: Any, *, index: int, is_active: bool) -> TabInfo:
     info = _tab_info(page, index=index, is_active=is_active)
     try:
-        info.title = await asyncio.wait_for(page.title(), timeout=TAB_TITLE_TIMEOUT_SECONDS)
+        async with under_action_deadline(budget_ms=int(TAB_TITLE_TIMEOUT_SECONDS * 1000)):
+            info.title = await page.title()
     except Exception:
         pass  # title defaults to ""
     return info
@@ -94,6 +104,29 @@ def _resolve_tab(
     return None
 
 
+def _effective_active_page(state: Any, raw_pages: list[Any]) -> Any | None:
+    active_page = state._active_page
+    if active_page is not None:
+        try:
+            if active_page.is_closed() or active_page not in raw_pages:
+                return None
+        except Exception:
+            return None
+        return active_page
+
+    implicit_page = state._implicit_page
+    if implicit_page is not None:
+        try:
+            if implicit_page in raw_pages and not implicit_page.is_closed():
+                return implicit_page
+        except Exception:
+            pass
+
+    if state.selection_lost:
+        return None
+    return raw_pages[-1] if raw_pages else None
+
+
 async def skyvern_tab_list(
     session_id: Annotated[str | None, Field(description="Browser session ID (pbs_...)")] = None,
     cdp_url: Annotated[str | None, Field(description="CDP WebSocket URL")] = None,
@@ -101,32 +134,63 @@ async def skyvern_tab_list(
     """List all open browser tabs with their URLs, titles, and active status.
 
     Returns an array of tabs, each with tab_id (session-scoped identifier for switching),
-    index (position), url, title, and is_active flag.
+    index (position), url, title, and is_active flag. Extension sessions also include
+    debugger_attached, the locally known debugger attachment state.
     """
     try:
-        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+        browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError as exc:
         return make_result("skyvern_tab_list", ok=False, error=no_browser_error(exc))
 
+    ensure_browser_hooks(browser)
+    while await reconcile_extension_selection(browser, ctx):
+        browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
+        ensure_browser_hooks(browser)
     state = get_current_session()
-    browser = state.browser
-    if browser is None:
-        return make_result("skyvern_tab_list", ok=False, error=no_browser_error())
-
     raw_pages = browser._browser_context.pages
-    active_page = page.page  # The raw Playwright Page currently active
+    active_page = _effective_active_page(state, raw_pages)
+    if (
+        state._active_page is None
+        and state._implicit_page is None
+        and not state.selection_lost
+        and raw_pages
+        and active_page is raw_pages[-1]
+    ):
+        state._implicit_page = active_page
+        if ctx.mode == "extension":
+            state._selection_generation += 1
+
+    extension_runtime = None
+    if ctx.mode == "extension":
+        extension_runtime = BrowserExtensionRuntime.instance()
+
+    infos: list[TabInfo] = []
+    try:
+        async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+            for i, p in enumerate(raw_pages):
+                infos.append(await _tab_info_with_title(p, index=i, is_active=(p is active_page)))
+    except ActionDeadlineExceeded:
+        # One list call gets one title budget in total, not one per tab against a dead transport.
+        infos.extend(
+            _tab_info(p, index=i, is_active=(p is active_page)) for i, p in enumerate(raw_pages) if i >= len(infos)
+        )
 
     tabs = []
-    for i, p in enumerate(raw_pages):
-        tabs.append(await _tab_info_with_title(p, index=i, is_active=(p is active_page)))
+    for info, p in zip(infos, raw_pages, strict=True):
+        tab = info.model_dump()
+        if ctx.mode == "extension":
+            tab["debugger_attached"] = (
+                await extension_runtime.page_debugger_attached(p) if extension_runtime is not None else False
+            )
+        tabs.append(tab)
 
     return make_result(
         "skyvern_tab_list",
         browser_context=ctx,
         data={
-            "tabs": [t.model_dump() for t in tabs],
+            "tabs": tabs,
             "count": len(tabs),
-            "active_tab_id": str(id(active_page)),
+            "active_tab_id": str(id(active_page)) if active_page is not None else None,
         },
     )
 
@@ -143,14 +207,12 @@ async def skyvern_tab_new(
     Use skyvern_tab_switch to go back to a previous tab.
     """
     try:
-        _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+        browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError as exc:
         return make_result("skyvern_tab_new", ok=False, error=no_browser_error(exc))
 
+    ensure_browser_hooks(browser)
     state = get_current_session()
-    browser = state.browser
-    if browser is None:
-        return make_result("skyvern_tab_new", ok=False, error=no_browser_error())
 
     if url:
         allow_localhost = ctx.can_access_localhost is True and is_localhost_url(url)
@@ -162,22 +224,34 @@ async def skyvern_tab_new(
                     "skyvern_tab_new",
                     ok=False,
                     browser_context=ctx,
-                    error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a public HTTP(S) URL"),
+                    error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a public HTTP(S) URL", exc=e),
                 )
         except SkyvernHTTPException as e:
             return make_result(
                 "skyvern_tab_new",
                 ok=False,
                 browser_context=ctx,
-                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL"),
+                error=make_error(ErrorCode.INVALID_INPUT, str(e), "Use a valid public HTTP(S) URL", exc=e),
             )
 
     prev_active = state._active_page
+    prev_implicit_page = state._implicit_page
+    prev_selection_lost = state.selection_lost
     new_page = None
+    page_created = False
+    navigate_result = None
+    can_access_localhost = ctx.can_access_localhost is True
+    is_localhost_destination = is_localhost_url(url) if url else False
     with Timer() as timer:
         try:
-            new_page = await browser._browser_context.new_page()
+            async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+                new_page = await browser._browser_context.new_page()
+                if ctx.mode == "extension" and (runtime := BrowserExtensionRuntime.instance()) is not None:
+                    await runtime.page_target_id(new_page)
+            page_created = True
             state._active_page = new_page
+            state._implicit_page = None
+            state._selection_generation += 1
             # New tab has no iframes yet — clear stale frame reference
             state._working_frame = None
             clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
@@ -190,32 +264,94 @@ async def skyvern_tab_new(
             timer.mark("new_page")
 
             if url:
-                await new_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                navigate_result = await do_navigate(
+                    new_page,
+                    url,
+                    timeout=30000,
+                    wait_until="domcontentloaded",
+                    can_access_localhost=can_access_localhost,
+                    is_localhost_destination=is_localhost_destination,
+                )
                 timer.mark("navigate")
-        except Exception as e:
-            # Clean up the orphan tab and restore the previous active page
-            try:
+        except Exception as e:  # noqa: BLE001
+            state._selection_generation += 1
+            if not page_created:
                 state._active_page = prev_active
-                if new_page is not None:
-                    await new_page.close()
-            except Exception:
-                pass
+                state._implicit_page = prev_implicit_page
+                state.selection_lost = prev_selection_lost
+                hint = (
+                    "The previous active tab was left selected; list the tabs before creating another."
+                    if isinstance(e, ActionDeadlineExceeded)
+                    else "The new tab could not be created; the previous active tab was unchanged."
+                )
+                details = None
+            elif new_page is not None and not new_page.is_closed() and new_page in browser._browser_context.pages:
+                state._active_page = new_page
+                state.selection_lost = False
+                tab_id = str(id(new_page))
+                hint = f"Tab {tab_id} remains open and active. Check URL or browser state."
+                details = {"tab_id": tab_id}
+            elif (
+                ctx.mode == "extension"
+                and new_page is not None
+                and new_page.is_closed()
+                and (runtime := BrowserExtensionRuntime.instance()) is not None
+                and (target_id := runtime.last_page_target_id(new_page)) is not None
+                and (record := runtime.tab_reconnect(target_id)) is not None
+                and record.state in {"pending", "done"}
+            ):
+                state._active_page = new_page
+                state.selection_lost = False
+                hint = "The tab reconnected during navigation; the next tool call uses the reconnected tab."
+                details = {"tab_id": str(id(new_page))}
+            else:
+                state._active_page = prev_active
+                state._implicit_page = prev_implicit_page
+                state.selection_lost = prev_selection_lost
+                hint = "The new tab closed during navigation; the previous active tab was restored."
+                details = None
+            if isinstance(e, ActionDeadlineExceeded):
+                return make_result(
+                    "skyvern_tab_new",
+                    ok=False,
+                    browser_context=ctx,
+                    timing_ms=timer.timing_ms,
+                    error=action_deadline_error(e, details=details, suffix=hint),
+                )
             return make_result(
                 "skyvern_tab_new",
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check URL or browser state"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), hint, details=details, exc=e),
             )
 
     pages = browser._browser_context.pages
+    state.selection_lost = False
     index = pages.index(new_page) if new_page in pages else len(pages) - 1
-    tab = await _tab_info_with_title(new_page, index=index, is_active=True)
+    if navigate_result is None:
+        tab = (await _tab_info_with_title(new_page, index=index, is_active=True)).model_dump()
+    else:
+        tab = TabInfo(
+            tab_id=str(id(new_page)),
+            index=index,
+            url=navigate_result.url,
+            title=navigate_result.title,
+            is_active=True,
+        ).model_dump()
+
+    warnings = []
+    if navigate_result is not None and navigate_result.load_state != "domcontentloaded":
+        warnings.append(
+            "Navigation succeeded but the page never reached 'domcontentloaded'; "
+            f"it settled at '{navigate_result.load_state}'. The page is loaded — retrying the navigation will not help."
+        )
 
     return make_result(
         "skyvern_tab_new",
         browser_context=ctx,
-        data=tab.model_dump(),
+        data=tab,
+        warnings=warnings,
         timing_ms=timer.timing_ms,
     )
 
@@ -258,7 +394,7 @@ async def skyvern_open_tabs(
         return make_result(
             "skyvern_open_tabs",
             ok=False,
-            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint),
+            error=make_error(ErrorCode.INVALID_INPUT, str(e), e.hint, exc=e),
         )
 
     if len(urls) > _MAX_OPEN_TABS_PER_CALL:
@@ -311,7 +447,12 @@ async def skyvern_open_tabs(
         try:
             new_page = await context.new_page()
             created_pages.append(new_page)
-            await new_page.goto(url, wait_until=wait_until, timeout=per_tab_timeout_ms)
+            if ctx.mode == "extension" and (runtime := BrowserExtensionRuntime.instance()) is not None:
+                async with under_action_deadline(budget_ms=per_tab_timeout_ms):
+                    await runtime.page_target_id(new_page)
+                    await new_page.goto(url, wait_until=wait_until, timeout=per_tab_timeout_ms)
+            else:
+                await new_page.goto(url, wait_until=wait_until, timeout=per_tab_timeout_ms)
             pages = browser._browser_context.pages
             index = pages.index(new_page) if new_page in pages else len(pages) - 1
             tab = await _tab_info_with_title(new_page, index=index, is_active=False)
@@ -341,9 +482,12 @@ async def skyvern_open_tabs(
     if set_active_last and last_ok is not None:
         state._active_page = last_ok
         clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+        state.selection_lost = False
+        state._implicit_page = None
     else:
         state._active_page = prev_active
     state._working_frame = None
+    state._selection_generation += 1
 
     shot_path = None
     artifact = None
@@ -394,10 +538,11 @@ async def skyvern_tab_switch(
         )
 
     try:
-        _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+        browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError as exc:
         return make_result("skyvern_tab_switch", ok=False, error=no_browser_error(exc))
 
+    ensure_browser_hooks(browser)
     state = get_current_session()
     if not state.tab_state_persists:
         return make_result(
@@ -406,10 +551,6 @@ async def skyvern_tab_switch(
             browser_context=ctx,
             error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
         )
-
-    browser = state.browser
-    if browser is None:
-        return make_result("skyvern_tab_switch", ok=False, error=no_browser_error())
 
     raw_pages = browser._browser_context.pages
     target = _resolve_tab(raw_pages, tab_id=tab_id, index=index)
@@ -427,18 +568,28 @@ async def skyvern_tab_switch(
         )
 
     state._active_page = target
+    state._implicit_page = None
+    state._selection_generation += 1
+    state.selection_lost = False
     # Switching tabs invalidates any iframe frame reference from the old tab
     state._working_frame = None
     clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
 
-    # bring_to_front is a no-op in headless but helps in headed mode
-    try:
-        await target.bring_to_front()
-    except Exception:
-        pass
-
+    # bring_to_front is a no-op in headless but helps in headed mode, and the switch itself is
+    # already done, so a browser that never answers it or the title read costs the deadline and
+    # nothing else: the tab comes back with an empty title.
     tab_index = raw_pages.index(target) if target in raw_pages else 0
-    tab = await _tab_info_with_title(target, index=tab_index, is_active=True)
+    try:
+        async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+            if ctx.mode == "extension" and (runtime := BrowserExtensionRuntime.instance()) is not None:
+                await runtime.page_target_id(target)
+            try:
+                await target.bring_to_front()
+            except Exception:
+                pass
+            tab = await _tab_info_with_title(target, index=tab_index, is_active=True)
+    except ActionDeadlineExceeded:
+        tab = _tab_info(target, index=tab_index, is_active=True)
 
     return make_result(
         "skyvern_tab_switch",
@@ -458,11 +609,23 @@ async def skyvern_tab_close(
     If the last tab is closed, a new blank tab is created automatically.
     If the active tab is closed, the most recent remaining tab becomes active.
     """
-    try:
-        page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
-    except BrowserNotAvailableError as exc:
-        return make_result("skyvern_tab_close", ok=False, error=no_browser_error(exc))
+    has_explicit_target = tab_id is not None or index is not None
+    page = None
+    if not has_explicit_target:
+        try:
+            page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+        except BrowserNotAvailableError as exc:
+            return make_result("skyvern_tab_close", ok=False, error=no_browser_error(exc))
+        browser = get_current_session().browser
+        if browser is None:
+            return make_result("skyvern_tab_close", ok=False, error=no_browser_error())
+    else:
+        try:
+            browser, ctx = await resolve_browser(session_id=session_id, cdp_url=cdp_url)
+        except BrowserNotAvailableError as exc:
+            return make_result("skyvern_tab_close", ok=False, error=no_browser_error(exc))
 
+    ensure_browser_hooks(browser)
     state = get_current_session()
     if not state.tab_state_persists:
         return make_result(
@@ -472,15 +635,22 @@ async def skyvern_tab_close(
             error=make_error(ErrorCode.ACTION_FAILED, _STATELESS_TAB_MSG, _STATELESS_TAB_HINT),
         )
 
-    browser = state.browser
-    if browser is None:
-        return make_result("skyvern_tab_close", ok=False, error=no_browser_error())
-
     raw_pages = browser._browser_context.pages
 
-    if tab_id is not None or index is not None:
+    if has_explicit_target:
         target = _resolve_tab(raw_pages, tab_id=tab_id, index=index)
         if target is None:
+            # Preserve fail-loud semantics when the caller explicitly targets
+            # the selected page, even if it disappeared from the context list.
+            selected_target = state._active_page is not None and (
+                (tab_id is not None and tab_id == str(id(state._active_page)))
+                or (index is not None and 0 <= index < len(raw_pages) and raw_pages[index] is state._active_page)
+            )
+            if selected_target:
+                try:
+                    await get_page(session_id=session_id, cdp_url=cdp_url)
+                except BrowserNotAvailableError as exc:
+                    return make_result("skyvern_tab_close", ok=False, error=no_browser_error(exc))
             return make_result(
                 "skyvern_tab_close",
                 ok=False,
@@ -491,33 +661,67 @@ async def skyvern_tab_close(
                     "Use skyvern_tab_list to see available tabs",
                 ),
             )
-    else:
+    elif page is not None:
         target = page.page  # Close the active tab
 
+    if has_explicit_target and target is state._active_page:
+        try:
+            page, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
+        except BrowserNotAvailableError as exc:
+            return make_result("skyvern_tab_close", ok=False, error=no_browser_error(exc))
+        target = page.page
+
+    assert target is not None
     target_id = id(target)
     closed_tab_id = str(target_id)
-    closing_active = target is page.page
+    effective_active_page = _effective_active_page(state, raw_pages)
+    closing_active = target is effective_active_page or (page is not None and target is page.page)
+
+    def forget_target(*, release_hooks: bool) -> None:
+        # Clear active page — get_working_page() will lazily pick the last remaining page
+        if closing_active or (state._active_page is not None and state._active_page is target):
+            state._active_page = None
+            state._implicit_page = None
+            state._selection_generation += 1
+            # Closed tab's frame reference is no longer valid
+            state._working_frame = None
+            clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
+        elif state._implicit_page is target:
+            state._implicit_page = None
+            state._selection_generation += 1
+        if release_hooks:
+            # Clean up inspection hooks for the closed page
+            state._hooked_page_ids.discard(target_id)
+            state._hooked_handlers_map.pop(target_id, None)
 
     try:
-        await target.close()
+        async with under_action_deadline(budget_ms=DEFAULT_ACTION_TIMEOUT_MS):
+            await target.close()
+    except ActionDeadlineExceeded as e:
+        # The close may land after the deadline, so the selection is dropped either way: the next
+        # action re-selects a live tab instead of a page that closed after this reply.
+        closed = target.is_closed()
+        forget_target(release_hooks=closed)
+        suffix = (
+            "The tab closed after the deadline and is no longer selected."
+            if closed
+            else "The tab may still close once the browser answers; the next action selects a live tab."
+        )
+        return make_result(
+            "skyvern_tab_close",
+            ok=False,
+            browser_context=ctx,
+            error=action_deadline_error(e, suffix=suffix),
+        )
     except Exception as e:
         return make_result(
             "skyvern_tab_close",
             ok=False,
             browser_context=ctx,
-            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Tab may already be closed"),
+            error=make_error(ErrorCode.ACTION_FAILED, str(e), "Tab may already be closed", exc=e),
         )
 
-    # Clear active page — get_working_page() will lazily pick the last remaining page
-    if closing_active or (state._active_page is not None and state._active_page is target):
-        state._active_page = None
-        # Closed tab's frame reference is no longer valid
-        state._working_frame = None
-        clear_session_ref_map(session_id=ctx.session_id, cdp_url=ctx.cdp_url)
-
-    # Clean up inspection hooks for the closed page
-    state._hooked_page_ids.discard(target_id)
-    state._hooked_handlers_map.pop(target_id, None)
+    forget_target(release_hooks=True)
 
     remaining = len(browser._browser_context.pages)
 
@@ -545,6 +749,30 @@ async def skyvern_tab_wait_for_new(
     Returns one tab per call. If multiple popups may open, call repeatedly to drain them.
     Does NOT auto-switch to the new tab. Use skyvern_tab_switch after if desired.
     """
+    state = get_current_session()
+    if (
+        state.context is not None
+        and state.context.mode == "extension"
+        and BrowserExtensionRuntime.instance() is not None
+    ):
+        try:
+            async with asyncio.timeout(timeout_ms / 1000.0):
+                return await _tab_wait_for_new(session_id, cdp_url, timeout_ms)
+        except TimeoutError:
+            return make_result(
+                "skyvern_tab_wait_for_new",
+                ok=False,
+                browser_context=state.context,
+                error=make_error(
+                    ErrorCode.TIMEOUT,
+                    f"No new tab opened within {timeout_ms}ms",
+                    "Ensure the page action that opens a new tab has been triggered first",
+                ),
+            )
+    return await _tab_wait_for_new(session_id, cdp_url, timeout_ms)
+
+
+async def _tab_wait_for_new(session_id: str | None, cdp_url: str | None, timeout_ms: int) -> dict[str, Any]:
     try:
         _, ctx = await get_page(session_id=session_id, cdp_url=cdp_url)
     except BrowserNotAvailableError as exc:
@@ -569,7 +797,14 @@ async def skyvern_tab_wait_for_new(
         while state._page_events:
             event = state._page_events.popleft()
             raw_page = event["page"]
-            if not raw_page.is_closed():
+            if raw_page.is_closed():
+                continue
+            try:
+                replacement = await _is_reconnect_replacement(state, raw_page)
+            except asyncio.CancelledError:
+                state._page_events.appendleft(event)
+                raise
+            if not replacement and not raw_page.is_closed():
                 pages = browser._browser_context.pages
                 idx = pages.index(raw_page) if raw_page in pages else -1
                 tab = await _tab_info_with_title(raw_page, index=idx, is_active=False)
@@ -613,7 +848,14 @@ async def skyvern_tab_wait_for_new(
     )
 
 
-async def _wait_for_page_event(state: Any) -> Any:
+async def _is_reconnect_replacement(state: SessionState, page: Page) -> bool:
+    if state.context is None or state.context.mode != "extension":
+        return False
+    runtime = BrowserExtensionRuntime.instance()
+    return runtime is not None and await runtime.is_reconnect_replacement(page)
+
+
+async def _wait_for_page_event(state: SessionState) -> Page:
     """Wait for a new page event using asyncio.Event for near-instant response."""
     while True:
         # Clear BEFORE draining the queue to prevent lost wakeups: if _on_new_page
@@ -623,6 +865,13 @@ async def _wait_for_page_event(state: Any) -> Any:
         while state._page_events:
             event = state._page_events.popleft()
             raw_page = event["page"]
-            if not raw_page.is_closed():
+            if raw_page.is_closed():
+                continue
+            try:
+                replacement = await _is_reconnect_replacement(state, raw_page)
+            except asyncio.CancelledError:
+                state._page_events.appendleft(event)
+                raise
+            if not replacement and not raw_page.is_closed():
                 return raw_page
         await state._page_event_signal.wait()

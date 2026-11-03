@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
-from contextlib import asynccontextmanager, contextmanager
+import time
+import uuid
+from collections.abc import AsyncIterator, Iterable, Iterator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from enum import StrEnum
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+from urllib.parse import urlsplit
 
 import structlog
+from playwright._impl._errors import TargetClosedError as PlaywrightTargetClosedError
 
 from skyvern.cli.core.api_key_hash import hash_api_key_for_cache
 from skyvern.cli.core.client import (
@@ -21,21 +23,32 @@ from skyvern.cli.core.client import (
     reset_api_key_override,
     set_api_key_override,
 )
+from skyvern.cli.core.copilot_sessions import register_copilot_session, unregister_copilot_session
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import (
+    RequestFailureLog,
     SessionState,
-    register_copilot_session,
     scoped_session,
-    unregister_copilot_session,
 )
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent_context import (
+    AgentContext,
+    AttachedBrowserDriver,
+    BuildTestPrestart,
+    PrestartedBrowser,
+    SdkActionWorkflowRunCacheKey,
+)
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
-from skyvern.forge.sdk.copilot.screenshot_utils import PendingFrameLease, ScreenshotEntry
+from skyvern.forge.sdk.copilot.config import (
+    TOTAL_TIMEOUT_SECONDS,
+)
+from skyvern.forge.sdk.copilot.human_input_wait import turn_clock_seconds
+from skyvern.forge.sdk.copilot.secret_scrub import clear_session_scrub_values
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import (
     HealAdoptionFailed,
@@ -43,67 +56,29 @@ from skyvern.forge.sdk.copilot.turn_origin import (
     is_self_heal_session_id,
     make_self_heal_session_id,
 )
-from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.db.enums import WorkflowRunStatus
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.webeye.browser_errors import BrowserCdpConnectionError, BrowserTargetClosedError
+from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE, BrowserSessionKind
+from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
+from skyvern.webeye.browser_engine import is_any_engine_error
+from skyvern.webeye.browser_errors import (
+    BrowserCdpAcquisitionError,
+    BrowserCdpConnectionError,
+    BrowserTargetClosedError,
+    is_target_closed_message,
+)
 from skyvern.webeye.browser_retirement import BrowserOperationRejected, BrowserRetirement, BrowserRetirementReason
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.persistent_session_errors import BrowserSessionCreditAdmissionRefusal
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
-    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
-    from skyvern.forge.sdk.copilot.build_test_outcome import (
-        RecordedBuildTestOutcome,
-    )
-    from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
-    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
-    from skyvern.forge.sdk.copilot.context import CodeAuthoringRepairContext
-    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
-    from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
-    from skyvern.forge.sdk.copilot.result_evidence import ScoutObservationContract
-    from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
-    from skyvern.forge.sdk.copilot.terminal_envelope import QuestionPart
-    from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
-    from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
-    from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import FreshExitReceipt, PersistentBrowserSession
 
 LOG = structlog.get_logger()
-
-# Where a planned frontier run starts its browser from; only a non-``unanchored`` start proves the
-# run began in a composition state the workflow itself established.
-FrontierStartProvenance = Literal["initial", "replayed", "resumed", "unanchored"]
-
-
-def _immutable_redaction_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _immutable_redaction_value(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_immutable_redaction_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return frozenset(_immutable_redaction_value(item) for item in value)
-    return deepcopy(value)
-
-
-@dataclass(frozen=True)
-class OriginRunRedactionRegistry:
-    """Run-bound redaction sets for model disclosures and persisted artifacts."""
-
-    workflow_run_id: str
-    parameters: Mapping[str, Any]
-    contains_sensitive_values: bool
-    contains_all_sensitive_values: bool
-    contains_all_static_sensitive_values: bool = True
-    awaiting_runtime_secret_values: bool = False
-    artifact_parameters: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "parameters", _immutable_redaction_value(self.parameters))
-        object.__setattr__(self, "artifact_parameters", _immutable_redaction_value(self.artifact_parameters))
-
 
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 # Browser contexts can lag the persistent-session row under load; this keeps
@@ -114,6 +89,29 @@ _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 # a vendor replacement was measured booting in 13.5s, so this leaves room to have one ready.
 _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS = 60.0
 _ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
+_DETACHED_TASKS: set[asyncio.Task[bool] | asyncio.Task[None] | asyncio.Task[PrestartedBrowser | None]] = set()
+# Per session: attached turns in this process, and the newest generation any of them attached.
+# Only the last one out releases, and it retires that newest generation rather than its own.
+_ATTACHED_TURNS_PER_SESSION: dict[str, tuple[int, BrowserState]] = {}
+# Closed sessions whose scrub values wait for the last attached turn's release: that turn may still be
+# scrubbing a readback it took before the close.
+_SCRUB_VALUES_CLEARED_ON_RELEASE: set[str] = set()
+# Set while a last-out release has popped its ledger entry but the evict has not finished; an attach
+# in that window would record the generation the evict is about to retire.
+_DRIVER_RELEASES_IN_FLIGHT: dict[str, asyncio.Event] = {}
+# Bumped per session when a release starts, so a lookup can tell one began and finished while it
+# was out. Never pruned: one int per session id this process has ever released.
+_DRIVER_RELEASE_EPOCHS: dict[str, int] = {}
+# A positive closed report that landed after its caller gave up, keyed by session to the release epoch
+# it was determined under. ponytail: pod-local, so a determination finished on another pod is lost.
+_ABANDONED_CLOSED_FACTS: dict[str, int] = {}
+# How long a superseded run's owner gets to drop the lease. The worker releases only after its own
+# cooperative cancel check, so a cleared runnable_id is the evidence its browser work stopped.
+_SUPERSEDE_RELEASE_WAIT_SECONDS = 15.0
+_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS = 0.5
+# Time the typed occupied report needs to reach the user once the release wait gives up. The turn's
+# own deadline must not fire inside that window, or outer cancellation replaces the typed report.
+_SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -128,11 +126,6 @@ _ACTIVE_MCP_BROWSER_CONTEXT: ContextVar[_ActiveMcpBrowserContext | None] = Conte
     "active_mcp_browser_context",
     default=None,
 )
-CodeArtifactMetadataValue: TypeAlias = (
-    str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
-)
-CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
-SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
 class CopilotBrowserSessionUnavailable(RuntimeError):
@@ -180,11 +173,11 @@ def _browser_context_attachability(browser_context: object | None) -> BrowserPro
     if browser_context is None:
         return BrowserProbeOutcome.positively_unreachable
 
-    # Playwright Python has no public BrowserContext.closed flag. These private
-    # attrs are a best-effort early guard; fallback defaults keep future
+    # These private attrs are a best-effort early guard that also tolerates
+    # Playwright-like contexts without is_closed(); fallback defaults keep future
     # Playwright changes from breaking the public browser.is_connected probe.
     impl = _playwright_private_impl(browser_context)
-    if _object_bool_attr(impl, "_close_was_called") or _object_bool_attr(impl, "_closed"):
+    if _object_bool_attr(impl, "_closing_or_closed") or _object_bool_attr(impl, "_closed"):
         return BrowserProbeOutcome.positively_unreachable
 
     # Test doubles and older Playwright-like wrappers may omit the public
@@ -209,440 +202,6 @@ def _copilot_session_can_access_localhost() -> bool:
     return settings.ENV == "local"
 
 
-@dataclass
-class PendingBrowserInteractionObservation:
-    tool_name: str
-    url: str = ""
-
-
-@dataclass(frozen=True)
-class PreRunPageReference:
-    text: str
-    workflow_run_id: str
-
-
-@dataclass(frozen=True)
-class RegisteredArtifactEntry:
-    artifact_id: str
-    file_name: str
-    parsed_text: str
-
-
-@dataclass(frozen=True)
-class RegisteredArtifactEvidence:
-    entries: tuple[RegisteredArtifactEntry, ...]
-    workflow_run_id: str
-
-
-class ScoutedEquivalentInput(TypedDict):
-    input_key: str
-    parameter_value: str
-    transform: str
-
-
-class ScoutedInputCorrespondence(TypedDict):
-    input_key: str
-    matched_literal: str
-    parameter_value: str
-    surface: str
-    transform: str
-    position: int
-    equivalent_inputs: NotRequired[list[ScoutedEquivalentInput]]
-
-
-class ScoutedDynamicRowPeriodMatch(TypedDict):
-    period: str
-    selected_row_match_count: int
-    row_match_count: int
-
-
-class ScoutedDynamicRowEvidence(TypedDict):
-    source_url: str
-    target_selector: str
-    row_selector: str
-    row_text: str
-    row_selector_count: int
-    row_text_match_count: int
-    period_matches: list[ScoutedDynamicRowPeriodMatch]
-    selected_index: int
-    evidence_fingerprint: str
-
-
-class ScoutedSelectorCandidate(TypedDict):
-    selector: str
-    source: str
-    match_count: int | None
-
-
-class ScoutedInteraction(TypedDict):
-    # Every field here crosses the turn boundary into persisted, model-visible context except
-    # those named in context._TURN_EPHEMERAL_INTERACTION_FIELDS. A field added here that holds a
-    # raw value — a literal, page text — has to be listed there too; nothing enforces the pair.
-    tool_name: str
-    # Set only when the action was demonstrated somewhere other than the chat's own browser, so
-    # absence means the chat's browser. Without it a demonstration in the last run's browser is
-    # indistinguishable from one the chat drove.
-    demonstrated_browser_session_id: NotRequired[str]
-    selector: NotRequired[str]
-    executed_selector: NotRequired[str]
-    selector_candidates: NotRequired[list[ScoutedSelectorCandidate]]
-    selector_match_count: NotRequired[int]
-    source_url: NotRequired[str]
-    result_url: NotRequired[str]
-    observed_effects: NotRequired[dict[str, bool]]
-    observed_wait_ms: NotRequired[int]
-    input_id: NotRequired[str]
-    input_value: NotRequired[str]
-    value: NotRequired[str]
-    # Grounded value-containment witnesses computed at the update_workflow confluence; drive
-    # generator-owned templated locators. Empty/absent => literal replay.
-    input_correspondences: NotRequired[list[ScoutedInputCorrespondence]]
-    dynamic_row_evidence: NotRequired[ScoutedDynamicRowEvidence]
-    key: NotRequired[str]
-    typed_length: NotRequired[int]
-    role: NotRequired[str]
-    accessible_name: NotRequired[str]
-    role_name_match_count: NotRequired[int]
-    # Captured for the type_text lane only; absent on credential fills (secret-leak boundary).
-    control_readonly: NotRequired[bool]
-    control_disabled: NotRequired[bool]
-    control_value_satisfied: NotRequired[bool]
-    # Exact-selector facts from an earlier bounded observation of the same page.
-    # Synthesis compiles these into runtime readiness waits before replaying the
-    # demonstrated action; they are evidence, not inferred failure categories.
-    observed_hidden: NotRequired[bool]
-    observed_disabled: NotRequired[bool]
-    trajectory_index: NotRequired[int]
-    observation_step: NotRequired[int]
-    carried: NotRequired[bool]
-    # A read the scout proved on the live page: the expression it ran and the output path the
-    # value answers. Recorded so the model receives the observed read without guessing a selector.
-    read_expression: NotRequired[str]
-    read_output_path: NotRequired[str]
-    # Whether the reader named this path or it was the only one left. A witness binds a value to a
-    # path, so a read that merely inherited the path by elimination is not evidence of that path.
-    read_output_path_source: NotRequired[str]
-    read_result_shape: NotRequired[str]
-    # The scalar the read actually returned, so a later binding can locate the element that still
-    # carries it rather than re-deriving one from labels. Bounded and scalar-only; turn-ephemeral,
-    # turn-ephemeral and excluded from every persistence path.
-    read_result_value: NotRequired[str]
-    # Set when a live scout-time count()==1 probe found the captured selector matching >1 element on its
-    # source page; synthesis re-anchors or drops it rather than emitting a selector that strict-mode-fails.
-    ambiguous: NotRequired[bool]
-    # Credential fills carry references and metadata only — never secret values.
-    credential_id: NotRequired[str]
-    credential_field: NotRequired[str]
-    credential_name: NotRequired[str]
-    # Element identity fingerprint for credential-fill resolution: captured at fill time, attributes
-    # only (never values). Enables unambiguous identification of the scouted credential element
-    # across equivalent selectors (e.g., #pass vs input[type="password"]).
-    element_fingerprint_id: NotRequired[str]
-    element_fingerprint_name: NotRequired[str]
-    element_fingerprint_type: NotRequired[str]
-    element_fingerprint_placeholder: NotRequired[str]
-    element_fingerprint_label: NotRequired[str]
-    element_fingerprint_test_id: NotRequired[str]
-    element_fingerprint_tag: NotRequired[str]
-    element_fingerprint_probed: NotRequired[str]
-
-
-@dataclass
-class AgentContext:
-    organization_id: str
-    workflow_id: str
-    workflow_permanent_id: str
-    workflow_yaml: str
-    browser_session_id: str | None
-    stream: EventSourceStream
-    persisted_workflow_yaml: str | None = None
-    api_key: str | None = None
-    turn_origin: TurnOrigin = TurnOrigin.interactive
-    injected_browser_state: BrowserState | None = None
-    heal_workflow_run_id: str | None = None
-    # The deadline the current model stream runs under, published by the enforcement loop so a tool
-    # that parks on a user decision can suspend it instead of being cancelled mid-question.
-    model_stream_deadline: asyncio.Timeout | None = None
-    # The streaming adapter narrates any context it is handed, so the design-phase latches live here
-    # rather than on the copilot subclass it is annotated for.
-    design_start_emitted: bool = False
-    design_end_emitted: bool = False
-    # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
-    sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
-        default_factory=dict
-    )
-    browser_session_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    browser_session_replacements: dict[str, str | None] = field(default_factory=dict)
-    # Calls capture this before waiting for the recovery lock. A continuity recovery increments it
-    # under that lock so every sibling queued against stale page state is suppressed.
-    browser_session_continuity_generation: int = 0
-    browser_session_continuity_disposition: str | None = None
-    # Whether the session this turn lost was ended by the deadline its infrastructure fixes, rather
-    # than by an unexplained browser failure. Reported to the model and the user as the cause.
-    browser_session_continuity_deadline_expired: bool = False
-    supports_vision: bool = True
-    pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
-    pending_frame_lease: PendingFrameLease | None = None
-    tool_activity: list[dict[str, Any]] = field(default_factory=list)
-    unrecoverable_tool_error_streak_count: int = 0
-    unrecoverable_tool_error_signature: str | None = None
-    unrecoverable_tool_error_reason: str | None = None
-    unrecoverable_tool_error_tool_name: str | None = None
-
-    # Cross-turn agent state accumulated by tools.py as the agent runs.
-    # Read back by failure_tracking / loop_detection to detect stuck loops,
-    # preserve verified prefixes across partial runs, etc. All optional —
-    # downstream accessors use ``getattr(ctx, name, default)`` where
-    # tolerant-to-unset is the right default.
-    last_requested_block_labels: list[str] = field(default_factory=list)
-    last_executed_block_labels: list[str] = field(default_factory=list)
-    executed_block_labels: set[str] = field(default_factory=set)
-    executed_block_fingerprints: dict[str, set[str]] = field(default_factory=dict)
-    last_frontier_start_label: str | None = None
-    verified_block_outputs: dict[str, Any] = field(default_factory=dict)
-    verified_prefix_labels: list[str] = field(default_factory=list)
-    # Page each verified block ended on, from the run rows the worker persisted; a block's entry is
-    # the page its successor started from. The session id is the browser they were observed in,
-    # because the same URL in a different browser is a different state.
-    verified_prefix_block_end_urls: dict[str, str] = field(default_factory=dict)
-    verified_prefix_block_end_session_id: str | None = None
-    # Label of the block that ran last, which is where the browser stopped.
-    verified_prefix_terminal_label: str | None = None
-    # Set by the planner when it proved a resume against the browser above; the next run is
-    # threaded into that browser instead of the chat's. Consumed and cleared by that run.
-    frontier_resume_session_id: str | None = None
-    # Where the planned run starts from, stamped once per plan and consumed by that run. Only a
-    # non-``unanchored`` start can credit its labels as composition-verified.
-    frontier_start_provenance: FrontierStartProvenance | None = None
-    # Labels whose last successful run started from a provable composition state. Distinct from
-    # verified_prefix_labels, which drives frontier advancement and must stay per-label.
-    composition_verified_labels: list[str] = field(default_factory=list)
-    last_full_workflow_test_ok: bool = False
-    last_unverified_block_labels: list[str] = field(default_factory=list)
-    workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
-
-    # Enforcement state. Set lazily by streaming_adapter, tools, and
-    # failure_tracking; declared here so enforcement_decision can read them on a
-    # fresh context without AttributeError.
-    navigate_called: bool = False
-    observation_after_navigate: bool = False
-    update_workflow_called: bool = False
-    test_after_update_done: bool = False
-    copilot_total_timeout_exceeded: bool = False
-    copilot_turn_cancelled_iteration: int | None = None
-    copilot_max_turns_exceeded: bool = False
-    model_calls_this_turn: int = 0
-    enforcement_pass_count: int = 0
-    pre_run_gated_output_warning_fingerprint: tuple[tuple[str, str, bool, str], ...] = ()
-    last_test_ok: bool | None = None
-    last_test_suspicious_success: bool = False
-    last_test_anti_bot: str | None = None
-    last_test_failure_reason: str | None = None
-    last_failure_category_top: str | None = None
-    last_update_block_count: int | None = None
-    last_failed_workflow_yaml: str | None = None
-    code_only_code_schema_seen: bool = False
-    code_only_target_page_evidence_seen: bool = False
-    code_native_pending_capability: str | None = None
-    # Captures whether the latest click produced attached, hollow, or unchanged
-    # post-action evidence; downstream repair reads the factual outcome.
-    last_scout_act_observe_outcome: str | None = None
-    last_scout_act_observe_packet: dict[str, Any] | None = None
-    last_scout_act_observe_recapture_attempted: bool = False
-    last_scout_act_observe_recapture_result: str = ""
-    pending_code_authoring_runtime_repair_context: CodeAuthoringRepairContext | None = None
-    last_code_authoring_repair_context: CodeAuthoringRepairContext | None = None
-    last_test_non_retriable_nav_error: str | None = None
-    last_infrastructure_tool_error: str | None = None
-    workflow_persisted: bool = False
-    last_workflow: Any | None = None
-    last_workflow_yaml: str | None = None
-    staged_workflow_yaml: str | None = None
-    staged_workflow: Any | None = None
-    has_staged_proposal: bool = False
-    # The chat row's setting, not the turn's commit decision: the route can still refuse to apply a
-    # staged draft at turn end. None on entrypoints that load no chat row.
-    auto_accept: bool | None = None
-    # Server-owned only: maps current raw code-block labels to opaque identities. It is never
-    # serialized into the workflow YAML or model-facing repair evidence.
-    runner_code_block_associations_by_label: dict[str, str] = field(default_factory=dict)
-    # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
-    prior_copilot_workflow_yaml: str | None = None
-    canonical_was_persisted_due_to_param_change: bool = False
-    allow_untested_workflow_draft: bool = False
-    request_policy: RequestPolicy | None = None
-    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
-    effective_workflow_proxy_location: Any | None = None
-
-    copilot_run_start_monotonic: float | None = None
-
-    last_good_workflow: Any | None = None
-    last_good_workflow_yaml: str | None = None
-    last_run_blocks_workflow_run_id: str | None = None
-    last_run_blocks_browser_session_id: str | None = None
-    last_artifact_health_blocker_reason: str | None = None
-    last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
-    last_artifact_health_failure_classes: list[str] = field(default_factory=list)
-    last_run_blocks_block_ids: list[str] = field(default_factory=list)
-    last_run_blocks_block_labels: list[str] = field(default_factory=list)
-    last_run_outcome: RecordedRunOutcome | None = None
-    last_run_outcome_block_labels: list[str] = field(default_factory=list)
-    latest_recorded_build_test_outcome: RecordedBuildTestOutcome | None = None
-    recorded_build_test_outcome_history: list[dict[str, object]] = field(default_factory=list)
-    recorded_persisted_block_run_workflow_run_id: str | None = None
-    block_run_calls_this_turn: int = 0
-    completion_verification_result: CompletionVerificationResult | None = None
-    completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
-    verified_terminal_proposal_ready: bool = False
-    outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
-    composition_page_evidence: dict[str, Any] | None = None
-    # None means nobody has asked yet, which reads as unavailable: a challenge stays a wall until
-    # something proves this deployment can clear it. The answer is keyed by the page it was resolved
-    # against, because the gate behind it is a domain denylist.
-    captcha_solver_available: bool | None = None
-    captcha_solver_available_for_url: str | None = None
-    # Pre-run page state pinned at the run seam before the post-run capture overwrites the slot;
-    # stamped with the graded run id so a stale prior-run pin cannot anchor the absence scan.
-    pre_run_page_reference: PreRunPageReference | None = None
-    # Parsed text of this run's registered download artifacts, stamped with the run id.
-    registered_artifact_evidence: RegisteredArtifactEvidence | None = None
-    # Ordered, bounded list of typed page-evidence packets — one per page observed
-    # while scouting the goal path, each tagged with how that state was reached.
-    # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
-    flow_evidence: list[dict[str, Any]] = field(default_factory=list)
-    # Challenge-advisory reasons already surfaced to the model this turn, so the advisory fires once.
-    pending_browser_interaction_observation: PendingBrowserInteractionObservation | None = None
-    # In-turn side channel from workflow mutation calls: block label -> flow_evidence
-    # observation step used to ground the newly authored page-acting block.
-    block_observation_refs: dict[str, int] = field(default_factory=dict)
-    # Raw tool input for block_observation_refs, retained only for diagnostics
-    # when normalization drops malformed entries before composition validation.
-    raw_block_observation_refs: object | None = None
-    # Block-label keyed metadata describing authored code artifacts. This layer
-    # only normalizes and carries the metadata; sufficiency checks live elsewhere.
-    code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
-    raw_code_artifact_metadata: object | None = None
-    submitted_code_artifact_metadata_snapshot: Any = None
-    # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
-    # composition gate credit a page observed on a prior turn when this turn's
-    # flow_evidence does not cover it (closes the spent-inspection-budget
-    # deadlock). Each item: {url, had_bounded_schema, reached_via}.
-    prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
-    prior_carried_trajectory: list[dict[str, str | int | bool | list[str] | None]] = field(default_factory=list)
-    carried_trajectory_rebound_done: bool = False
-    post_run_page_observation_tool: str | None = None
-    post_run_page_observation_url: str | None = None
-    post_run_page_observation_workflow_run_id: str | None = None
-    post_run_page_observation_after_failed_test: bool = False
-    post_run_page_observation_generation: int = 0
-    post_run_current_page_inspection_workflow_run_id: str | None = None
-    observed_browser_urls: list[str] = field(default_factory=list)
-    # Ephemeral within-turn scout captures; not persisted across turns.
-    scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
-    # Append-only, non-deduped record of the scout's interaction sequence in
-    # acted order. Unlike scouted_interactions (deduped for auto-credit), this
-    # preserves repeats and ordering as factual model input.
-    scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
-    scouted_output_covered_paths: set[str] = field(default_factory=set)
-    # Ids of active terminal_action completion criteria the scout has structurally reached past the
-    # login prefix; releases the corresponding is_goal_complete terminal-action gate.
-    scout_observed_terminal_criterion_ids: set[str] = field(default_factory=set)
-    scout_observation_contract: ScoutObservationContract | None = None
-    # Which requires-live-scout fields (username/password, non-empty) each scouted credential
-    # carries; recorded at credential resolve time and rehydrated from FillCarry across turns.
-    scouted_credential_field_inventory_by_credential_id: dict[str, frozenset[str]] = field(default_factory=dict)
-    credential_fill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # Serializes model-visible browser evidence commits with sensitive-run custody changes. Raw
-    # browser work may overlap, but a post-hook or native credential fill owns this lock while it
-    # decides whether its facts are admissible, so rollback cannot erase another call's evidence.
-    browser_page_custody_locks_by_session_id: dict[str, asyncio.Lock] = field(default_factory=dict)
-    browser_evidence_commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # A tainted page cannot be released by fresh navigation while its sensitive workflow run still
-    # owns the same browser. Paused runs retain this lease until a terminal result is observed.
-    active_sensitive_origin_browser_session_ids: set[str] = field(default_factory=set)
-    active_sensitive_origin_run_sessions: dict[str, str] = field(default_factory=dict)
-    # Read once per turn: repeated fill attempts must not re-scan the org's credentials.
-    org_credentials_for_turn: list[Credential] | None = None
-    vault_login_uris_by_credential_id: dict[str, list[str]] = field(default_factory=dict)
-    # Highest trajectory_index visible at the latest parsed evaluate observation and whether that page
-    # showed a password-type control; orders page evidence against post-fill submits across evictions.
-    last_scout_observation_trajectory_index: int | None = None
-    last_scout_observation_has_password_control: bool = False
-    # Required parameter keys the build-test resolution seam could not bind from a user param,
-    # a non-empty default, or a scout value. Reset per run; read when composing the run outcome.
-    unbound_required_parameter_keys: list[str] = field(default_factory=list)
-    # Source page of an in-flight scout action, captured before it may navigate away.
-    pending_scout_source_url: str | None = None
-    pending_scout_selector_candidates: list[ScoutedSelectorCandidate] | None = None
-    pending_scout_input_value: str | None = None
-    # (selector, role, accessible_name) read before an in-flight click that may navigate: a post-action
-    # read would describe the landing element, so a navigating click's anchor is captured pre-navigation.
-    pending_scout_role_name: tuple[str, str, str] | None = None
-    pending_scout_role_name_match_count: tuple[str, str, str, int] | None = None
-    # Selector of an in-flight click, captured pre-dispatch so a failed/timed-out click can gate a
-    # settle re-perception on whether that selector still resolves to a live element.
-    pending_scout_click_selector: str | None = None
-    # Browser-session download filenames snapshotted before a scout click, so the post-hook can tell
-    # a download this click produced from one an earlier click left behind.
-    pending_scout_download_snapshot: frozenset[str] | None = None
-    # Whether the in-flight click fired a browser download, recorded by the listener armed at click
-    # dispatch. Event-driven, so it holds before the session store registers the file (the store lags
-    # the event by seconds, or never sees it on vendor sessions).
-    pending_scout_download: bool = False
-    # Removers for the download listeners armed for the in-flight click, on the clicked page and on
-    # any popup it opened. Run when the click's result is consumed and again before the next click
-    # arms: a listener left attached would write a later download into another click's window.
-    pending_scout_download_detachers: list[Callable[[], None]] = field(default_factory=list)
-    pending_scout_popup: Page | None = None
-    pending_scout_popup_content_type: str | None = None
-    # (selector, ambiguous) verdict from a pre-dispatch live count probe, applied to the recorded
-    # interaction only when the post-action resolved selector matches the probed one.
-    pending_scout_ambiguous: tuple[str, bool] | None = None
-    pending_scout_selector_match_count: tuple[str, int] | None = None
-    # (selector, role, accessible_name) captured pre-dispatch for an ambiguous selector only when the
-    # get_by_role(role, name, exact=True) re-anchor resolves to exactly one live element on the source
-    # page; a non-unique or nameless ambiguous selector leaves this None so synthesis drops the interaction.
-    pending_scout_reanchor: tuple[str, str, str] | None = None
-    # Source-bound row identity captured before a positional click dispatches. The post-hook consumes it
-    # only for the exact selector/source pair, so navigation cannot transfer the witness to another click.
-    # Expression of an in-flight evaluate, stashed pre-dispatch: the MCP response carries only the
-    # result, so a post-hook that wants the expression must receive it from the invocation side.
-    pending_scout_read_expression: str | None = None
-    # Requested output the in-flight evaluate says it fills. Without it a read can only be attributed
-    # when the turn requests exactly one output, so a multi-field request binds nothing.
-    pending_scout_read_output_path: str | None = None
-    # Connected overlay used by bounded pre-click evidence probes; declared so capture code accesses it
-    # directly instead of silently accepting a dynamically attached dependency.
-    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
-    # Exact secret strings filled into the live browser this turn (passwords,
-    # call-time-minted OTP codes). Page-readback tool results are exact-string
-    # scrubbed against this set before being recorded or returned to the model.
-    secret_scrub_values: list[str] = field(default_factory=list)
-    codeblock_redaction_parameters: dict[str, Any] = field(default_factory=dict)
-    origin_run_redaction_registry: OriginRunRedactionRegistry | None = None
-    # Browser session whose current page may contain values entered by a sensitive inline run.
-    # This is mutable page custody, separate from the immutable run redaction registry: only a
-    # successful fresh navigation of this exact session clears it.
-    sensitive_origin_browser_session_ids: set[str] = field(default_factory=set)
-
-    # Set by tool gates / loop guards / tool-side error branches when a tool
-    # dispatch is blocked. The finalization shim in agent.py reads this at
-    # turn end and overrides the AgentResult with a deterministic
-    # product-language reply. See blocker_signal.py for the contract.
-    blocker_signal: CopilotToolBlockerSignal | None = None
-    # Presentation-only recovery rows; authority remains in RequestPolicy.
-    connected_account_recovery_choices: list[ConnectedAccountChoice] = field(default_factory=list)
-    # Admitted parts of the model's own terminal question; set at final translation and read
-    # by the terminal-envelope assembler. Presentation-only, like the rows above.
-    question_parts: list[QuestionPart] = field(default_factory=list)
-    turn_halt: TurnHalt | None = None
-    # Most recently emitted blocker signal for the current tool output. Unlike
-    # blocker_signal, this is last-wins so the activity-log projection can
-    # render the current tool result from structured product text.
-    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
-    tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
-
-
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
     """Convert an MCP result dict to the copilot {ok, data, error} format."""
     error = mcp_result.get("error")
@@ -657,13 +216,22 @@ def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
 
     if error is not None:
         if isinstance(error, dict):
-            # MCP error: {code, message, hint, details}
-            msg = error.get("message", "Unknown error")
-            hint = error.get("hint", "")
-            result["error"] = f"{msg}. {hint}".strip() if hint else msg
+            # The server's hint is written for its own tool surface and names tools Copilot may not have.
+            result["error"] = error.get("message", "Unknown error")
             error_code = error.get("code")
             if isinstance(error_code, str) and error_code:
                 result["error_code"] = error_code
+            # The message is flattened to a string here, so the driver's typed verdicts are lifted out
+            # of details to survive as values rather than as prose.
+            details = error.get("details")
+            if isinstance(details, dict):
+                for key in ("nav_error_code", "element_state"):
+                    value = details.get(key)
+                    if isinstance(value, str) and value:
+                        result[key] = value
+                observed_options = details.get("observed_options")
+                if isinstance(observed_options, list) and all(isinstance(option, str) for option in observed_options):
+                    result["observed_options"] = observed_options
         else:
             result["error"] = str(error)
 
@@ -757,6 +325,32 @@ async def _resolve_self_heal_browser_state_inner(ctx: AgentContext) -> tuple[str
 _CALL_BROWSER_SESSION_ID: ContextVar[str | None] = ContextVar("copilot_call_browser_session_id", default=None)
 
 
+@dataclass(frozen=True)
+class DemonstratedAction:
+    selector: str
+    source_url: str
+    packet: dict[str, Any] | None
+    synthesized_result: dict[str, Any]
+    readback: str | None = None
+    target_packet: dict[str, Any] | None = None
+
+
+_DEMONSTRATED_ACTION: ContextVar[DemonstratedAction | None] = ContextVar("copilot_demonstrated_action", default=None)
+
+
+@contextmanager
+def staged_demonstrated_action(action: DemonstratedAction) -> Iterator[None]:
+    token = _DEMONSTRATED_ACTION.set(action)
+    try:
+        yield
+    finally:
+        _DEMONSTRATED_ACTION.reset(token)
+
+
+def current_demonstrated_action() -> DemonstratedAction | None:
+    return _DEMONSTRATED_ACTION.get()
+
+
 @contextmanager
 def bound_call_browser_session(session_id: str | None) -> Iterator[None]:
     """Bind one tool call's browser for everything it reaches: hooks, preparation, dispatch.
@@ -788,35 +382,58 @@ def effective_browser_session_id(ctx: AgentContext) -> str | None:
     return _CALL_BROWSER_SESSION_ID.get() or ctx.browser_session_id
 
 
-SENSITIVE_ORIGIN_PAGE_ERROR = (
-    "This browser page is unavailable after a run with sensitive inputs. Navigate to a specific named URL first; "
-    "a successful fresh navigation makes browser inspection available again."
-)
-SENSITIVE_ORIGIN_ACTIVE_RUN_PAGE_ERROR = (
-    "This browser page is unavailable while a run with sensitive inputs is active. Wait for that run to finish and "
-    "call get_run_results; then navigate to a specific named URL to make browser inspection available again."
+BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
+RAW_SECRET_BROWSER_ERROR = (
+    "This turn withheld a value that may be a secret. Do not use the browser; persist only the redacted draft and call "
+    "`request_credential` with the user's sign-in URL so they can connect a saved credential before testing."
 )
 
 
-def sensitive_origin_page_is_tainted(ctx: AgentContext) -> bool:
-    tainted_session_ids: set[str] = getattr(ctx, "sensitive_origin_browser_session_ids", set())
-    if not tainted_session_ids:
-        return False
-    return effective_browser_session_id(ctx) in tainted_session_ids
+def raw_secret_browser_denied(ctx: AgentContext) -> bool:
+    return ctx.request_policy is not None and ctx.request_policy.raw_secret_detected
 
 
-def browser_page_custody_lock(ctx: AgentContext, *, session_id: str | None = None) -> asyncio.Lock:
-    """Return the per-turn lock that makes sensitive-page custody and evidence commits atomic."""
+def browser_session_lock(ctx: AgentContext, *, session_id: str | None = None) -> asyncio.Lock:
     lock_key = session_id or effective_browser_session_id(ctx) or "__unbound_browser_session__"
-    locks = getattr(ctx, "browser_page_custody_locks_by_session_id", None)
+    locks = getattr(ctx, "browser_session_locks_by_session_id", None)
     if not isinstance(locks, dict):
         locks = {}
-        ctx.browser_page_custody_locks_by_session_id = locks
+        ctx.browser_session_locks_by_session_id = locks
     lock = locks.get(lock_key)
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         locks[lock_key] = lock
     return lock
+
+
+class RunSecretsNotRegistered(RuntimeError):
+    def __init__(self, workflow_run_id: str) -> None:
+        self.workflow_run_id = workflow_run_id
+        super().__init__(
+            f"Test run {workflow_run_id} used a one-time code or a secret resolved only inside the run in this "
+            "browser, and has not handed those values over yet, so this browser cannot be read or driven without "
+            "risking them. Nothing was done. The run hands them over when it reaches a final status "
+            "(`get_run_results` shows it); this call works after that. If the run has already finished and this "
+            "keeps failing, the handoff was lost: this browser stays withheld for the rest of the turn, and other "
+            "browsers are not affected."
+        )
+
+
+@asynccontextmanager
+async def browser_session_turn(ctx: AgentContext, *, session_id: str | None = None) -> AsyncIterator[None]:
+    """Hold a browser for one tool call, first registering any secrets its runs still owed so the
+    call's result is scrubbed of them. A run that still owes them after that retry withholds the call."""
+    async with browser_session_lock(ctx, session_id=session_id):
+        handoffs = getattr(ctx, "awaited_run_secret_handoffs", None)
+        if isinstance(handoffs, dict):
+            held_session_id = session_id or effective_browser_session_id(ctx) or ""
+            for owed, settle in list(handoffs.items()):
+                if owed[0] != held_session_id:
+                    continue
+                await settle()
+                if owed in handoffs:
+                    raise RunSecretsNotRegistered(owed[1])
+        yield
 
 
 def browser_evidence_commit_lock(ctx: AgentContext) -> asyncio.Lock:
@@ -827,48 +444,60 @@ def browser_evidence_commit_lock(ctx: AgentContext) -> asyncio.Lock:
     return lock
 
 
-def active_sensitive_origin_page_sessions(ctx: AgentContext) -> set[str]:
-    active_session_ids = getattr(ctx, "active_sensitive_origin_browser_session_ids", None)
-    if not isinstance(active_session_ids, set):
-        active_session_ids = set()
-        ctx.active_sensitive_origin_browser_session_ids = active_session_ids
-    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
-    if not isinstance(active_run_sessions, dict):
-        active_run_sessions = {}
-        ctx.active_sensitive_origin_run_sessions = active_run_sessions
-    active_session_ids.update(session_id for session_id in active_run_sessions.values() if session_id)
-    return active_session_ids
-
-
-def register_sensitive_origin_run_lease(ctx: AgentContext, *, workflow_run_id: str, session_id: str) -> None:
-    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
-    if not isinstance(active_run_sessions, dict):
-        active_run_sessions = {}
-        ctx.active_sensitive_origin_run_sessions = active_run_sessions
-    active_run_sessions[workflow_run_id] = session_id
-    active_sensitive_origin_page_sessions(ctx).add(session_id)
-
-
-def release_sensitive_origin_run_lease(ctx: AgentContext, *, workflow_run_id: str) -> None:
-    active_run_sessions = getattr(ctx, "active_sensitive_origin_run_sessions", None)
-    if not isinstance(active_run_sessions, dict):
-        return
-    released_session_id = active_run_sessions.pop(workflow_run_id, None)
-    if released_session_id and released_session_id not in active_run_sessions.values():
-        active_session_ids = getattr(ctx, "active_sensitive_origin_browser_session_ids", None)
-        if isinstance(active_session_ids, set):
-            active_session_ids.discard(released_session_id)
-
-
-def sensitive_origin_page_has_active_run(ctx: AgentContext) -> bool:
-    return effective_browser_session_id(ctx) in active_sensitive_origin_page_sessions(ctx)
-
-
-def clear_sensitive_origin_page_taint(ctx: AgentContext) -> None:
+async def live_working_page(ctx: AgentContext) -> Page | None:
+    """The page the browser's tool calls act on, read without letting the read close a tab."""
     session_id = effective_browser_session_id(ctx)
-    active_session_ids = active_sensitive_origin_page_sessions(ctx)
-    if session_id is not None and session_id not in active_session_ids:
-        ctx.sensitive_origin_browser_session_ids.discard(session_id)
+    if not session_id:
+        return None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if browser_state is None:
+            return None
+        return await browser_state.get_working_page(prune_excess_pages=False)
+    except Exception:
+        return None
+
+
+async def tab_switch_refusal(ctx: AgentContext, *, tab_id: str | None, index: int | None) -> str | None:
+    """Why a switch would not carry into the next call: the browser state honours a pinned tab only
+    while it is an http(s) or blank page, so switching to any other tab would silently snap back."""
+    session_id = effective_browser_session_id(ctx)
+    if not session_id:
+        return None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if browser_state is None or browser_state.browser_context is None:
+            return None
+        pages = list(browser_state.browser_context.pages)
+        if tab_id is not None:
+            target = next((page for page in pages if str(id(page)) == tab_id), None)
+        elif index is not None and 0 <= index < len(pages):
+            target = pages[index]
+        else:
+            target = None
+        if target is None or target.is_closed() or target in await browser_state.list_valid_pages(0):
+            return None
+        scheme = urlsplit(target.url).scheme or "unknown"
+        return (
+            f"Tab {pages.index(target)} is a {scheme}: page; the browser tools act only on http(s) tabs, so "
+            "switching to it would not carry into the next call. Pick an http(s) tab from skyvern_tab_list."
+        )
+    except Exception:
+        return None
+
+
+async def browser_valid_tab_count(ctx: AgentContext) -> int | None:
+    """Pages the browser state counts against BROWSER_MAX_PAGES_NUMBER, or None when unreadable."""
+    session_id = effective_browser_session_id(ctx)
+    if not session_id:
+        return None
+    try:
+        browser_state = await resolve_browser_state_for_context(ctx, session_id=session_id)
+        if browser_state is None:
+            return None
+        return len(await browser_state.list_valid_pages(0))
+    except Exception:
+        return None
 
 
 async def resolve_browser_state_for_context(
@@ -876,14 +505,16 @@ async def resolve_browser_state_for_context(
     *,
     session_id: str | None = None,
 ) -> BrowserState | None:
+    if current_demonstrated_action() is not None:
+        return None
     resolved_session_id = session_id if session_id is not None else _CALL_BROWSER_SESSION_ID.get()
     if resolved_session_id is None:
         resolved_session_id = ctx.browser_session_id
     if not resolved_session_id:
         return None
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal or is_self_heal_session_id(resolved_session_id):
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback or is_self_heal_session_id(resolved_session_id):
         try:
-            _resolved_session_id, browser_state, _ = await _resolve_self_heal_browser_state(ctx)
+            _resolved_session_id, injected_state, _ = await _resolve_self_heal_browser_state(ctx)
             if _resolved_session_id != resolved_session_id:
                 LOG.info(
                     "Resolved self-heal browser session id differs from requested",
@@ -891,13 +522,46 @@ async def resolve_browser_state_for_context(
                     resolved_session_id=_resolved_session_id,
                     organization_id=ctx.organization_id,
                 )
-            return browser_state
+            track_page_crashes(ctx, _resolved_session_id, injected_state)
+            return injected_state
         except HealAdoptionFailed:
             return None
-    return await resolve_persistent_browser_state(
+    browser_state = await resolve_persistent_browser_state(
         session_id=resolved_session_id,
         organization_id=ctx.organization_id,
     )
+    if browser_state is not None:
+        # Only this branch's state lives in the pod's cache; the self-heal branch above returns the
+        # healer's injected state, which the turn-exit release would look for and never find.
+        record_attached_browser_driver(ctx, resolved_session_id, browser_state)
+        track_page_crashes(ctx, resolved_session_id, browser_state)
+    return browser_state
+
+
+def _exception_causes(exc: BaseException) -> list[BaseException]:
+    causes: list[BaseException] = []
+    cause = exc.__cause__
+    while cause is not None and cause not in causes:
+        causes.append(cause)
+        cause = cause.__cause__
+    return causes
+
+
+def _is_native_target_closed(exc: BaseException) -> bool:
+    if isinstance(exc, PlaywrightTargetClosedError):
+        return True
+    return is_any_engine_error(exc) and is_target_closed_message(str(exc))
+
+
+def is_positive_browser_closed_fact(exc: BrowserTargetClosedError) -> bool:
+    """Only a measurement counts as death. The manager reports closed with no cause when a completed
+    connect's first roundtrip fails, and a native target-closed cause is the protocol saying the target
+    is gone. A failed connect wraps whatever the transport raised as the cause, and the copilot dials a
+    relay, so a refused or dropped connection says nothing about the browser behind it."""
+    causes = _exception_causes(exc)
+    if not causes:
+        return True
+    return any(_is_native_target_closed(cause) for cause in causes)
 
 
 def _abandonable_browser_state_resolve(session_id: str, organization_id: str) -> asyncio.Task[BrowserState | None]:
@@ -937,7 +601,111 @@ async def resolve_persistent_browser_state(
     Every caller still issues its OWN lookup. A determination that is merely stuck must never be
     inherited by a later attach, which is the oracle and has to be free to answer on its own.
     """
-    return await asyncio.shield(_abandonable_browser_state_resolve(session_id, organization_id))
+    while True:
+        release_in_flight = _DRIVER_RELEASES_IN_FLIGHT.get(session_id)
+        if release_in_flight is not None:
+            await release_in_flight.wait()
+        epoch_before_lookup = _DRIVER_RELEASE_EPOCHS.get(session_id, 0)
+        resolve = _abandonable_browser_state_resolve(session_id, organization_id)
+        try:
+            browser_state = await asyncio.shield(resolve)
+        except asyncio.CancelledError:
+            _settle_abandoned_browser_state_resolve(resolve, session_id, organization_id, epoch_before_lookup)
+            raise
+        except Exception as exc:
+            positive = isinstance(exc, BrowserTargetClosedError) and is_positive_browser_closed_fact(exc)
+            # The manager answers closed once, then drops the handle: a closed report an earlier, abandoned
+            # lookup received is the only positive fact this ambiguous failure can carry.
+            if not _take_abandoned_closed_fact(session_id, epoch_before_lookup) and not positive:
+                raise
+            LOG.info(
+                "Persistent browser reported closed; treating the session as unreachable",
+                session_id=session_id,
+                organization_id=organization_id,
+                error_type=type(exc).__name__,
+                cause_types=[type(cause).__name__ for cause in _exception_causes(exc)],
+            )
+            browser_state = None
+        else:
+            _ABANDONED_CLOSED_FACTS.pop(session_id, None)
+        # A release that began while this lookup was out may have retired the generation it
+        # returned; the caller records synchronously after this returns, so re-issuing is enough.
+        if _DRIVER_RELEASE_EPOCHS.get(session_id, 0) == epoch_before_lookup:
+            return browser_state
+
+
+def _take_abandoned_closed_fact(session_id: str, epoch: int) -> bool:
+    return _ABANDONED_CLOSED_FACTS.pop(session_id, None) == epoch
+
+
+def _settle_abandoned_browser_state_resolve(
+    resolve: asyncio.Task[BrowserState | None], session_id: str, organization_id: str, epoch: int
+) -> None:
+    """A caller cancelled mid-resolve never sees what the shielded lookup went on to find: without this
+    the driver it attached has no owner to release it, and a positive closed report is lost."""
+
+    def _release(finished: asyncio.Task[BrowserState | None]) -> None:
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is not None:
+            if isinstance(exc, BrowserTargetClosedError) and is_positive_browser_closed_fact(exc):
+                _ABANDONED_CLOSED_FACTS[session_id] = epoch
+            return
+        browser_state = finished.result()
+        if browser_state is None:
+            return
+        _ABANDONED_CLOSED_FACTS.pop(session_id, None)
+        _hold_attached_browser_driver(session_id, browser_state, new_holder=True)
+        start_browser_driver_release(organization_id, AttachedBrowserDriver(session_id, browser_state))
+
+    resolve.add_done_callback(_release)
+
+
+def start_browser_driver_release(
+    organization_id: str,
+    attached: AttachedBrowserDriver,
+    *,
+    unwinding_operations: set[asyncio.Task[object]] | None = None,
+) -> asyncio.Task[None]:
+    """The release runs as its own task so a cancel landing on the caller's await cannot stop it
+    before it hands back the attach count; a stuck count skips every later release on that session."""
+    release = asyncio.ensure_future(
+        release_browser_driver_quietly(organization_id, attached, unwinding_operations=unwinding_operations)
+    )
+    _DETACHED_TASKS.add(release)
+    release.add_done_callback(_discard_finished_detached_task)
+    return release
+
+
+async def wait_for_driver_releases(releases: Iterable[asyncio.Task[None]]) -> None:
+    """Bounded here, not in the release: a slow unwind delays the detach, never the turn's exit."""
+    pending = [release for release in releases if not release.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
+
+
+def _close_session_once_created(organization_id: str, create: asyncio.Future[PersistentBrowserSession]) -> None:
+    async def _close() -> None:
+        try:
+            session = await create
+        except Exception:
+            return
+        session_id = session.persistent_browser_session_id
+        closed = await close_browser_session_quietly(
+            organization_id, session_id, reason=BrowserSessionCloseReason.turn_ended
+        )
+        log = LOG.info if closed else LOG.warning
+        log(
+            "Requested close of browser session created after its turn was cancelled",
+            session_id=session_id,
+            organization_id=organization_id,
+            closed=closed,
+        )
+
+    closer = asyncio.ensure_future(_close())
+    _DETACHED_TASKS.add(closer)
+    closer.add_done_callback(_discard_finished_detached_task)
 
 
 async def close_browser_session_quietly(
@@ -945,9 +713,10 @@ async def close_browser_session_quietly(
     session_id: str,
     *,
     reason: BrowserSessionCloseReason = BrowserSessionCloseReason.aborted,
-) -> None:
+) -> bool:
     """Bounded: the session-manager backend is often the reason we are closing at all, so an
-    unbounded close could hang the request."""
+    unbounded close could hang the request. Returns whether the close landed; a caller that needs
+    the browser gone, not merely asked to go, has nothing else to tell it."""
     try:
         await asyncio.wait_for(
             app.PERSISTENT_SESSIONS_MANAGER.close_session(organization_id, session_id, reason=reason),
@@ -955,13 +724,159 @@ async def close_browser_session_quietly(
         )
     except Exception:
         LOG.debug("Failed to close browser session", session_id=session_id, exc_info=True)
+        return False
+    _clear_closed_session_scrub_values(session_id)
+    return True
 
 
-def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None) -> None:
-    """Retire an id that a completed resolve found unusable, unless a concurrent call already
-    replaced it — nulling a live replacement would discard the session this exists to protect."""
-    if ctx.browser_session_id == examined_session_id:
-        ctx.browser_session_id = None
+def _clear_closed_session_scrub_values(session_id: str) -> None:
+    """Only a landed close, never a retired id: a retired session can still be alive and reattached."""
+    if session_id in _ATTACHED_TURNS_PER_SESSION:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.add(session_id)
+    else:
+        clear_session_scrub_values(session_id)
+
+
+def _discard_finished_detached_task(
+    task: asyncio.Task[bool] | asyncio.Task[None] | asyncio.Task[PrestartedBrowser | None],
+) -> None:
+    _DETACHED_TASKS.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+def _hold_attached_browser_driver(session_id: str, browser_state: BrowserState, *, new_holder: bool) -> None:
+    turns, _ = _ATTACHED_TURNS_PER_SESSION.get(session_id, (0, browser_state))
+    _ATTACHED_TURNS_PER_SESSION[session_id] = (turns + 1 if new_holder else turns, browser_state)
+
+
+def track_page_crashes(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
+    ctx.page_crash_records_by_browser_session[session_id] = browser_state.page_crash_records
+
+
+def record_attached_browser_driver(ctx: AgentContext, session_id: str, browser_state: BrowserState) -> None:
+    _hold_attached_browser_driver(session_id, browser_state, new_holder=session_id not in ctx.attached_browser_drivers)
+    ctx.attached_browser_drivers[session_id] = AttachedBrowserDriver(session_id, browser_state)
+
+
+async def release_browser_driver_quietly(
+    organization_id: str,
+    attached: AttachedBrowserDriver,
+    *,
+    unwinding_operations: set[asyncio.Task[object]] | None = None,
+) -> None:
+    """Detach the driver this turn attached, leaving the persistent session itself running. The
+    evict is shielded because it pops the cache entry before awaiting the detach, so a cancelled
+    wait would strand the popped driver."""
+    # The manager refuses to retire a generation with an admitted operation, and this turn's own
+    # tool task can still be unwinding one; a refusal taken as done would leave the driver cached.
+    # Unbounded on purpose: an operation that never ends is still using the driver, and this task
+    # runs off the turn, whose exit is bounded by its caller.
+    pending = {task for task in unwinding_operations or () if task is not asyncio.current_task() and not task.done()}
+    if pending:
+        await asyncio.wait(pending)
+    turns, latest_browser_state = _ATTACHED_TURNS_PER_SESSION.get(attached.session_id, (1, attached.browser_state))
+    still_attached = turns - 1
+    if still_attached > 0:
+        _ATTACHED_TURNS_PER_SESSION[attached.session_id] = (still_attached, latest_browser_state)
+        LOG.info(
+            "copilot_browser_driver_released",
+            session_id=attached.session_id,
+            had_cached_driver=False,
+            concurrent_turns_still_attached=still_attached,
+        )
+        return
+    _ATTACHED_TURNS_PER_SESSION.pop(attached.session_id, None)
+    if attached.session_id in _SCRUB_VALUES_CLEARED_ON_RELEASE:
+        _SCRUB_VALUES_CLEARED_ON_RELEASE.discard(attached.session_id)
+        clear_session_scrub_values(attached.session_id)
+    manager = app.PERSISTENT_SESSIONS_MANAGER
+    if not manager.supports_evict_and_reconnect():
+        # This process drives the browser itself; detaching its driver would strand the browser
+        # and leave the session uncacheable for the rest of its life.
+        return
+    evict: asyncio.Task[bool] | None = None
+    try:
+        evict = asyncio.ensure_future(
+            manager.evict_cached_browser_state(
+                attached.session_id,
+                organization_id,
+                expected=latest_browser_state,
+                detach_remote_driver=True,
+                only_if_unleased=True,
+            )
+        )
+        _DETACHED_TASKS.add(evict)
+        evict.add_done_callback(_discard_finished_detached_task)
+        # The marker must outlive this wait: a resolve admitted after a timed-out wait but before
+        # the evict pops the entry would still be handed the generation being retired.
+        _DRIVER_RELEASE_EPOCHS[attached.session_id] = _DRIVER_RELEASE_EPOCHS.get(attached.session_id, 0) + 1
+        releasing = asyncio.Event()
+        _DRIVER_RELEASES_IN_FLIGHT[attached.session_id] = releasing
+
+        def _release_marker(_task: asyncio.Task[bool]) -> None:
+            if _DRIVER_RELEASES_IN_FLIGHT.get(attached.session_id) is releasing:
+                del _DRIVER_RELEASES_IN_FLIGHT[attached.session_id]
+            releasing.set()
+
+        evict.add_done_callback(_release_marker)
+        had_cached_driver = await asyncio.wait_for(asyncio.shield(evict), timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
+    except (asyncio.CancelledError, Exception) as exc:
+        LOG.warning(
+            "Failed to release browser driver",
+            session_id=attached.session_id,
+            error_type=type(exc).__name__,
+            error=str(exc)[:200],
+        )
+        # A cancel the evict did not raise itself is this turn being cancelled mid-cleanup, and
+        # swallowing it would report a task that finished when the caller asked it to stop.
+        if isinstance(exc, asyncio.CancelledError) and (evict is None or not evict.cancelled()):
+            raise
+        return
+    LOG.info(
+        "copilot_browser_driver_released",
+        session_id=attached.session_id,
+        had_cached_driver=had_cached_driver,
+    )
+
+
+@asynccontextmanager
+async def browser_session_recovery(ctx: AgentContext) -> AsyncIterator[None]:
+    """Serialize every interactive browser-session mutation with source promotion.
+
+    Recovery transactions call lower mutation helpers recursively, so ownership is reentrant for
+    the current task while sibling tasks still wait on the one context lock.
+    """
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("Browser session recovery requires an asyncio task")
+    lock = ctx.browser_session_recovery_lock
+    if ctx.browser_session_recovery_owner is task:
+        ctx.browser_session_recovery_depth += 1
+        try:
+            yield
+        finally:
+            ctx.browser_session_recovery_depth -= 1
+        return
+    async with lock:
+        ctx.browser_session_recovery_owner = task
+        ctx.browser_session_recovery_depth = 1
+        try:
+            yield
+        finally:
+            ctx.browser_session_recovery_depth = 0
+            ctx.browser_session_recovery_owner = None
+
+
+async def retire_browser_session_id(ctx: AgentContext, examined_session_id: str | None) -> None:
+    """Retire an unusable id at the browser-session mutation spine.
+
+    Compare-and-swap protects a concurrent replacement; the recovery scope protects source
+    promotion from any session mutation while exact validated bytes are being persisted.
+    """
+    async with browser_session_recovery(ctx):
+        if ctx.browser_session_id == examined_session_id:
+            ctx.browser_session_id = None
 
 
 @asynccontextmanager
@@ -978,7 +893,7 @@ async def _mcp_browser_context_impl(
     """
     browser_session_id = session_id_override or ctx.browser_session_id
     # Equality, not identity: a plain-string origin must still route to the fail-closed heal branch.
-    if ctx.turn_origin != TurnOrigin.runtime_self_heal and not browser_session_id:
+    if ctx.turn_origin != TurnOrigin.code_block_ai_fallback and not browser_session_id:
         raise RuntimeError("No browser_session_id set on agent context")
     if browser_session_id is None:
         # Self-heal only; always overwritten below before use. Just satisfies the
@@ -1004,7 +919,7 @@ async def _mcp_browser_context_impl(
 
     browser_state: BrowserState | None
     working_page: Page | None = None
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback:
         browser_session_id, browser_state, working_page = await _resolve_self_heal_browser_state(ctx)
         ctx.browser_session_id = browser_session_id
         sdk_action_workflow_run_cache_key = (ctx.organization_id, browser_session_id)
@@ -1036,9 +951,10 @@ async def _mcp_browser_context_impl(
             # structurally cannot get, so this is where a dead id gets retired. An unavailable
             # connectivity signal is not that evidence, so the call fails but the id survives.
             if retiring:
-                retire_browser_session_id(ctx, browser_session_id)
+                await retire_browser_session_id(ctx, browser_session_id)
                 raise CopilotBrowserSessionUnavailable(browser_session_id)
             raise CopilotBrowserLivenessUndetermined()
+        working_page = await browser_state.get_working_page(prune_excess_pages=False)
 
     override_token = set_api_key_override(ctx.api_key)
     try:
@@ -1062,11 +978,14 @@ async def _mcp_browser_context_impl(
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
             organization_id=ctx.organization_id,
+            request_failures=ctx.request_failure_logs_by_browser_session.setdefault(
+                browser_session_id, RequestFailureLog()
+            ),
         )
+        track_page_crashes(ctx, browser_session_id, browser_state)
         if working_page is not None:
-            # Seed the tab pin from the already-probed page (mirrors what skyvern_tab_switch
-            # sets interactively) so self-heal tools land on the adopted tab instead of the
-            # new SkyvernBrowser's pages[-1] fallback.
+            # The browser state's pin outlives this per-call SessionState, so every tool call
+            # starts on the page the last tab operation selected instead of pages[-1].
             state._active_page = working_page
         register_copilot_session(browser_session_id, state, organization_id=ctx.organization_id)
         if is_self_heal_session_id(browser_session_id):
@@ -1079,6 +998,8 @@ async def _mcp_browser_context_impl(
             async with scoped_session(state):
                 yield
         finally:
+            with suppress(Exception):
+                await _persist_selected_page(browser_state, state, seeded=working_page)
             if skyvern_browser.workflow_run_id:
                 ctx.sdk_action_workflow_run_ids_by_browser_session[sdk_action_workflow_run_cache_key] = (
                     skyvern_browser.workflow_run_id
@@ -1094,6 +1015,15 @@ async def _mcp_browser_context_impl(
                 LOG.info("unregistered self-heal browser session", session_id=browser_session_id)
     finally:
         reset_api_key_override(override_token)
+
+
+async def _persist_selected_page(browser_state: BrowserState, state: SessionState, *, seeded: Page | None) -> None:
+    """Pin a tab the call selected; a call that kept its page leaves the pin alone, so a popup it
+    opened takes focus on the next call exactly as before tab tools existed."""
+    selected = state._active_page
+    if selected is None or selected is seeded or selected.is_closed():
+        return
+    await browser_state.set_active_page(selected, prune_excess_pages=False)
 
 
 def _raise_if_browser_generation_retired(
@@ -1139,7 +1069,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             active_context.session_id,
         )
         return
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal or not browser_session_id or not ctx.api_key:
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback or not browser_session_id or not ctx.api_key:
         async with _mcp_browser_context_impl(ctx, session_id_override=session_id_override):
             yield
         return
@@ -1167,6 +1097,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             raise CopilotBrowserGenerationRetired(browser_session_id, operation.reason)
         if operation_task is None:
             raise RuntimeError("A Copilot browser context requires an asyncio task")
+        ctx.admitted_browser_operations.setdefault(browser_session_id, set()).add(operation_task)
         scope_token = _ACTIVE_MCP_BROWSER_CONTEXT.set(
             _ActiveMcpBrowserContext(
                 task=operation_task,
@@ -1190,6 +1121,7 @@ async def mcp_browser_context(ctx: AgentContext, *, session_id_override: str | N
             _raise_if_browser_generation_retired(operation_task, operation.retirement, browser_session_id)
         finally:
             _ACTIVE_MCP_BROWSER_CONTEXT.reset(scope_token)
+            ctx.admitted_browser_operations.get(browser_session_id, set()).discard(operation_task)
 
 
 async def _attach_current_browser_generation(ctx: AgentContext) -> None:
@@ -1240,11 +1172,12 @@ async def _drop_browser_session_id_at_its_fixed_deadline(ctx: AgentContext) -> N
     )
     # Stop using it, do not close it: the studio browser pane streams this same session, and it is
     # going to be torn down on its own deadline within the minute either way.
-    retire_browser_session_id(ctx, session_id)
+    await retire_browser_session_id(ctx, session_id)
 
 
 def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     sentence = build_test_connect_failure_sentence(failure)
+    explicit_absence = failure.retry_action is None
     return {
         "ok": False,
         "error": sentence,
@@ -1252,13 +1185,178 @@ def _build_test_connect_failure_result(failure: BuildTestConnectFailure) -> dict
             "overall_status": "setup_failed",
             "failure_reason": sentence,
             "browser_session_id": failure.browser_session_id,
-            "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=True),
+            "build_test_connect_failure": failure.model_dump(mode="json", exclude_none=not explicit_absence),
             "blocks": [],
         },
     }
 
 
-async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailure | None:
+def _browser_session_denial(ctx: AgentContext) -> BuildTestConnectFailure | None:
+    # Belt and braces: the tool surface already withholds every browser tool on such a turn.
+    if ctx.copilot_config is not None and not ctx.copilot_config.browser_tools_available:
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=ctx.browser_session_id,
+            diagnostic=BROWSER_TOOLS_UNAVAILABLE_ERROR,
+        )
+    if raw_secret_browser_denied(ctx):
+        return BuildTestConnectFailure(
+            state="provisioning_unavailable",
+            browser_session_id=ctx.browser_session_id,
+            diagnostic=RAW_SECRET_BROWSER_ERROR,
+        )
+    return None
+
+
+async def acquire_fresh_exit_browser_session(
+    ctx: AgentContext,
+    *,
+    prior_browser_session_id: str,
+    proxy_location: ProxyLocationInput,
+    browser_profile_id: str | None,
+) -> FreshExitReceipt | dict[str, Any]:
+    """The platform's verified-new-exit browser for a build test, or the same typed failure envelope as any
+    other build-test browser acquisition."""
+    denial = _browser_session_denial(ctx)
+    if denial is not None:
+        return _browser_session_acquisition_failure_result(denial)
+    try:
+        allocation_id = uuid.uuid4().hex
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, None)
+        receipt = await app.PERSISTENT_SESSIONS_MANAGER.create_fresh_exit_session(
+            organization_id=ctx.organization_id,
+            prior_browser_session_id=prior_browser_session_id,
+            proxy_location=proxy_location,
+            browser_profile_id=browser_profile_id,
+            session_kind=BrowserSessionKind.copilot,
+            created_for_workflow_permanent_id=ctx.workflow_permanent_id,
+        )
+        if receipt.new_browser_session_id:
+            await _record_minted_browser(ctx, receipt.new_browser_session_id)
+            if ctx.browser_allocation_recorder is not None:
+                await ctx.browser_allocation_recorder(allocation_id, receipt.new_browser_session_id)
+        return receipt
+    except BrowserSessionCreditAdmissionRefusal:
+        return _browser_session_acquisition_failure_result(
+            BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None)
+        )
+    except Exception:
+        LOG.warning("Failed to create a fresh-exit browser session for a build test", exc_info=True)
+        return _browser_session_acquisition_failure_result(BuildTestConnectFailure(state="provisioning_unavailable"))
+
+
+def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
+    """Keep the generic acquisition envelope while retaining its typed, actionable cause."""
+    if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
+        return {"ok": False, "error": failure.diagnostic}
+    if failure.state == "billing_credit_admission_refusal":
+        return {
+            "ok": False,
+            "error": ("Browser session did not start because credits are exhausted. Upgrade your plan in Billing."),
+            "data": {
+                "browser_session_acquisition_failure": {
+                    "state": failure.state,
+                    "retry_action": failure.retry_action,
+                }
+            },
+        }
+    return {"ok": False, "error": "Failed to create browser session"}
+
+
+@dataclass(frozen=True)
+class BuildTestBrowserSeed:
+    browser_profile_id: str
+    proxy_session_id: str | None
+
+
+class _SeededCreateSessionKwargs(TypedDict, total=False):
+    browser_profile_id: str
+    profile_read_only: bool
+    generate_browser_profile: bool
+    proxy_session_id: str
+    proxy_location: ProxyLocationInput
+    inherit_profile_proxy: bool
+    runnable_type: str
+
+
+def _seeded_create_session_kwargs(seed: BuildTestBrowserSeed | None) -> _SeededCreateSessionKwargs:
+    if seed is None:
+        return {}
+    # An exporter that cannot read or predates profile_read_only then saves under the session id, never the bp_.
+    kwargs: _SeededCreateSessionKwargs = {
+        "browser_profile_id": seed.browser_profile_id,
+        "profile_read_only": True,
+        "generate_browser_profile": True,
+    }
+    if seed.proxy_session_id:
+        kwargs["proxy_session_id"] = seed.proxy_session_id
+        kwargs["proxy_location"] = ProxyLocation.RESIDENTIAL_ISP
+    else:
+        kwargs["inherit_profile_proxy"] = True
+    return kwargs
+
+
+# A turn that hangs outside its model-stream deadline never reaches the turn-end release, so its live process would
+# stamp the browser up to the session cap. Measured on the turn's own clock, which a healthy turn cannot pass.
+MINTED_BROWSER_RENEWAL_TURN_SECONDS = TOTAL_TIMEOUT_SECONDS + 10 * 60
+MINTED_BROWSER_RENEWAL_CHECK_SECONDS = 60.0
+
+
+async def _record_minted_browser(ctx: AgentContext, session_id: str) -> None:
+    if session_id in ctx.minted_browser_sessions:
+        return
+    # Ledgered first: the turn ends renewal for every ledgered id, and begin takes its refcount before it can raise.
+    ctx.minted_browser_sessions[session_id] = None
+    _arm_minted_browser_renewal_check(ctx, session_id)
+    try:
+        await app.BROWSER_MANAGER.begin_session_activity_renewal(session_id)
+    except Exception:
+        LOG.warning(
+            "Failed to start activity renewal for a copilot browser session",
+            browser_session_id=session_id,
+            organization_id=ctx.organization_id,
+            exc_info=True,
+        )
+
+
+def _arm_minted_browser_renewal_check(ctx: AgentContext, session_id: str) -> None:
+    ctx.minted_browser_renewal_checks[session_id] = asyncio.get_running_loop().call_later(
+        MINTED_BROWSER_RENEWAL_CHECK_SECONDS, _check_minted_browser_renewal, ctx, session_id
+    )
+
+
+def _check_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+    started_at = ctx.copilot_run_start_monotonic
+    if (
+        started_at is not None
+        and turn_clock_seconds(ctx, started_at, time.monotonic()) >= MINTED_BROWSER_RENEWAL_TURN_SECONDS
+    ):
+        end_minted_browser_renewal(ctx, session_id)
+    else:
+        _arm_minted_browser_renewal_check(ctx, session_id)
+
+
+def end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+    check = ctx.minted_browser_renewal_checks.pop(session_id, None)
+    if check is None:
+        return
+    check.cancel()
+    app.BROWSER_MANAGER.end_session_activity_renewal(session_id)
+
+
+def end_minted_browser_renewals(ctx: AgentContext) -> None:
+    for session_id in list(ctx.minted_browser_renewal_checks):
+        end_minted_browser_renewal(ctx, session_id)
+
+
+async def _provision_browser_session(
+    ctx: AgentContext,
+    *,
+    seed: BuildTestBrowserSeed | None = None,
+    proxy_location: ProxyLocationInput = None,
+    runnable_type: str | None = None,
+) -> BuildTestConnectFailure | None:
     """Create a browser session if the context holds none.
 
     Returns an immutable acquisition fact on failure and ``None`` on success. Generic callers
@@ -1272,7 +1370,11 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
     failure fact, so a failed adoption aborts the turn rather than degrading to a normal
     tool-level error. Callers must let it propagate.
     """
-    if ctx.turn_origin == TurnOrigin.runtime_self_heal:
+    denial = _browser_session_denial(ctx)
+    if denial is not None:
+        return denial
+
+    if ctx.turn_origin == TurnOrigin.code_block_ai_fallback:
         browser_session_id, _, _ = await _resolve_self_heal_browser_state(ctx)
         ctx.browser_session_id = browser_session_id
         return None
@@ -1292,11 +1394,41 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
     session = None
     installed_session_id: str | None = None
     try:
-        with copilot_span("browser_session_create", data={"organization_id": ctx.organization_id}):
-            session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
-                organization_id=ctx.organization_id,
-                timeout_minutes=30,
+        allocation_id = uuid.uuid4().hex
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, None)
+        with copilot_span(
+            "browser_session_create",
+            data={
+                "organization_id": ctx.organization_id,
+                "prestart": runnable_type == COPILOT_PRESTART_RUNNABLE_TYPE,
+            },
+        ):
+            creation_kwargs = _seeded_create_session_kwargs(seed)
+            if proxy_location is not None:
+                creation_kwargs.setdefault("proxy_location", proxy_location)
+            if runnable_type is not None:
+                creation_kwargs["runnable_type"] = runnable_type
+            # The manager may apply a shorter budget for copilot-kind sessions.
+            create = asyncio.ensure_future(
+                app.PERSISTENT_SESSIONS_MANAGER.create_session(
+                    organization_id=ctx.organization_id,
+                    timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
+                    created_by="copilot",
+                    session_kind=BrowserSessionKind.copilot,
+                    created_for_workflow_permanent_id=ctx.workflow_permanent_id,
+                    **creation_kwargs,
+                )
             )
+            # The manager does not clean up a create cancelled mid-startup, so the browser it still
+            # produces is closed here once the id exists.
+            try:
+                session = await asyncio.shield(create)
+            except asyncio.CancelledError:
+                _close_session_once_created(ctx.organization_id, create)
+                raise
+        if ctx.browser_allocation_recorder is not None:
+            await ctx.browser_allocation_recorder(allocation_id, session.persistent_browser_session_id)
         if ctx.browser_session_id:
             # A sibling call installed a session while this create was in flight. Adopt theirs and
             # close ours: assigning over it would leave a live browser referenced by nobody until
@@ -1316,6 +1448,9 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
         else:
             ctx.browser_session_id = session.persistent_browser_session_id
             installed_session_id = ctx.browser_session_id
+            # Recorded before the boot wait: a session that never became attachable is still a live
+            # browser this turn is the only reader of.
+            await _record_minted_browser(ctx, installed_session_id)
 
         # DefaultPersistentSessionsManager schedules chromium in a background
         # task and returns from create_session before browser_context is set,
@@ -1327,6 +1462,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
                     organization_id=ctx.organization_id,
                 )
                 if state and _browser_context_is_attachable(state.browser_context):
+                    record_attached_browser_driver(ctx, ctx.browser_session_id, state)
                     break
                 await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
 
@@ -1342,8 +1478,13 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
     except asyncio.CancelledError:
         if session is not None:
             await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
-        retire_browser_session_id(ctx, installed_session_id)
+        await retire_browser_session_id(ctx, installed_session_id)
         raise
+    except BrowserSessionCreditAdmissionRefusal:
+        return BuildTestConnectFailure(
+            state="billing_credit_admission_refusal",
+            retry_action=None,
+        )
     except Exception as e:
         LOG.warning("Failed to auto-create browser session", error=str(e), exc_info=True)
         # Cleanup keys off the local `session`, not ctx.browser_session_id --
@@ -1355,7 +1496,7 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
         if session is not None:
             await close_browser_session_quietly(ctx.organization_id, session.persistent_browser_session_id)
         # Only clear an id this call installed; a sibling's session is not ours to drop.
-        retire_browser_session_id(ctx, installed_session_id)
+        await retire_browser_session_id(ctx, installed_session_id)
         # Detail stays in the log above (exc_info=True). The returned string
         # flows back through the tool/agent path and could end up in
         # LLM-visible or user-visible output, so strip raw exception text
@@ -1368,15 +1509,247 @@ async def _provision_browser_session(ctx: AgentContext) -> BuildTestConnectFailu
 
 
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
-    failure = await _provision_browser_session(ctx)
-    if failure is None:
+    async with browser_session_recovery(ctx):
+        failure = await _provision_browser_session(ctx)
+        return None if failure is None else _browser_session_acquisition_failure_result(failure)
+
+
+async def ensure_build_test_browser_session(
+    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None, proxy_location: ProxyLocationInput = None
+) -> dict[str, Any] | None:
+    async with browser_session_recovery(ctx):
+        failure = await _provision_browser_session(ctx, seed=seed, proxy_location=proxy_location)
+        return None if failure is None else _build_test_connect_failure_result(failure)
+
+
+def start_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLocationInput) -> None:
+    # ENV=local: the session manager closes every open session in the org before a create, the failed test's included.
+    if (
+        ctx.build_test_prestart is not None
+        or ctx.prestart_teardown_started
+        or settings.ENV == "local"
+        or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
+    ):
+        return
+    prestart_ctx = replace(ctx)
+    prestart_ctx.browser_session_id = None
+    task = asyncio.create_task(_prestart_build_test_browser(ctx, prestart_ctx, proxy_location))
+    _DETACHED_TASKS.add(task)
+    task.add_done_callback(_discard_finished_detached_task)
+    ctx.pending_build_test_prestarts[task] = prestart_ctx
+    task.add_done_callback(lambda done: ctx.pending_build_test_prestarts.pop(done, None))
+    ctx.build_test_prestart = BuildTestPrestart(task=task, proxy_location=proxy_location)
+
+
+def cancel_ledgered_build_test_prestarts(ctx: AgentContext) -> None:
+    # Only once its browser is ledgered: a cancel that lands mid-close then still leaves the turn-end sweep to close it.
+    for task, prestart_ctx in list(ctx.pending_build_test_prestarts.items()):
+        session_id = prestart_ctx.browser_session_id
+        if not task.done() and session_id is not None and session_id in ctx.minted_browser_sessions:
+            ctx.cancelled_build_test_prestarts[task] = session_id
+            task.cancel()
+
+
+async def _prestart_build_test_browser(
+    ctx: AgentContext, prestart_ctx: AgentContext, proxy_location: ProxyLocationInput
+) -> PrestartedBrowser | None:
+    chat_context = skyvern_context.current()
+    # Its own context, so the provision's run_id write never lands on the chat's.
+    with skyvern_context.scoped(
+        skyvern_context.SkyvernContext(
+            organization_id=ctx.organization_id,
+            copilot_session_id=chat_context.copilot_session_id if chat_context else None,
+        )
+    ):
+        try:
+            failure = await _provision_browser_session(
+                prestart_ctx, proxy_location=proxy_location, runnable_type=COPILOT_PRESTART_RUNNABLE_TYPE
+            )
+        except Exception:
+            LOG.warning(
+                "copilot_build_test_browser_prestart_failed",
+                prestart_browser_session_id=prestart_ctx.browser_session_id,
+                exc_info=True,
+            )
+            raise
+    session_id = prestart_ctx.browser_session_id if failure is None else failure.browser_session_id
+    # No await since the provision's last registration, so a teardown that has not started yet will sweep it.
+    if ctx.prestart_teardown_started:
+        if session_id:
+            await _close_build_test_prestart(ctx, session_id, reason=BrowserSessionCloseReason.turn_ended)
         return None
-    return {"ok": False, "error": "Failed to create browser session"}
+    if failure is not None or session_id is None:
+        LOG.info(
+            "copilot_build_test_browser_prestart_failed",
+            state=failure.state if failure is not None else None,
+            prestart_browser_session_id=session_id,
+        )
+        return None
+    LOG.info("copilot_build_test_browser_prestarted", prestart_browser_session_id=session_id)
+    return PrestartedBrowser(session_id=session_id, ready_monotonic=time.monotonic())
 
 
-async def ensure_build_test_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
-    failure = await _provision_browser_session(ctx)
-    return None if failure is None else _build_test_connect_failure_result(failure)
+async def _close_build_test_prestart(ctx: AgentContext, session_id: str, *, reason: BrowserSessionCloseReason) -> None:
+    end_minted_browser_renewal(ctx, session_id)
+    attached = ctx.attached_browser_drivers.pop(session_id, None)
+    if attached is not None:
+        await wait_for_driver_releases([start_browser_driver_release(ctx.organization_id, attached)])
+    await close_browser_session_quietly(ctx.organization_id, session_id, reason=reason)
+    ctx.minted_browser_sessions.pop(session_id, None)
+
+
+def discard_build_test_prestart(ctx: AgentContext, reason: str) -> None:
+    """Closes the pending pre-start in the background; the caller never waits on its start."""
+    prestart = ctx.build_test_prestart
+    if prestart is None:
+        return
+    ctx.build_test_prestart = None
+    _start_prestart_discard(ctx, prestart.task, reason)
+
+
+def _start_prestart_discard(ctx: AgentContext, started: asyncio.Task[PrestartedBrowser | None], reason: str) -> None:
+    async def _discard() -> None:
+        session_id: str | None = None
+        try:
+            prestarted = await started
+        except asyncio.CancelledError:
+            if not started.cancelled():
+                raise
+            prestarted = None
+            session_id = ctx.cancelled_build_test_prestarts.pop(started, None)
+        except Exception:
+            prestarted = None
+        if prestarted is not None:
+            session_id = prestarted.session_id
+            await _close_build_test_prestart(ctx, session_id, reason=BrowserSessionCloseReason.aborted)
+        LOG.info("copilot_build_test_browser_prestart_discarded", reason=reason, prestart_browser_session_id=session_id)
+
+    cleanup = asyncio.ensure_future(_discard())
+    _DETACHED_TASKS.add(cleanup)
+    cleanup.add_done_callback(_discard_finished_detached_task)
+
+
+async def claim_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLocationInput) -> str | None:
+    # Only the swap takes the recovery lock: the start runs on a ctx copy sharing it, so awaiting it there deadlocks.
+    prestart = ctx.build_test_prestart
+    if prestart is None:
+        return None
+    if prestart.proxy_location != proxy_location:
+        discard_build_test_prestart(ctx, "proxy_change")
+        return None
+    ctx.build_test_prestart = None
+    prestarted: PrestartedBrowser | None = None
+    try:
+        # Shielded so a cancelled test leaves the start to finish and be closed with the turn's other minted browsers.
+        prestarted = await asyncio.shield(prestart.task)
+        if prestarted is None:
+            LOG.info(
+                "copilot_build_test_browser_prestart_discarded", reason="start_failed", prestart_browser_session_id=None
+            )
+            return None
+        try:
+            remaining_seconds = await app.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline(
+                prestarted.session_id, ctx.organization_id
+            )
+        except Exception:
+            LOG.warning(
+                "Could not read the pre-started browser's deadline; claiming it anyway",
+                prestart_browser_session_id=prestarted.session_id,
+                exc_info=True,
+            )
+            remaining_seconds = None
+        if remaining_seconds is not None and remaining_seconds < _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS:
+            _start_prestart_discard(ctx, prestart.task, "unavailable")
+            return None
+        async with browser_session_recovery(ctx):
+            claimed = await app.DATABASE.browser_sessions.claim_copilot_prestart(
+                session_id=prestarted.session_id, organization_id=ctx.organization_id
+            )
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        # A start cancelled by turn end surfaces here through the shield; the test itself was not cancelled.
+        if prestart.task.cancelled() and current is not None and not current.cancelling():
+            LOG.info(
+                "copilot_build_test_browser_prestart_discarded", reason="turn_ended", prestart_browser_session_id=None
+            )
+            return None
+        # The pre-start is already off ctx, so without this a later failed test could start a second one.
+        _start_prestart_discard(ctx, prestart.task, "cancelled")
+        raise
+    except Exception:
+        LOG.warning(
+            "copilot_build_test_browser_prestart_claim_failed",
+            prestart_browser_session_id=prestarted.session_id if prestarted is not None else None,
+            exc_info=True,
+        )
+        _start_prestart_discard(ctx, prestart.task, "start_failed" if prestarted is None else "claim_error")
+        return None
+    if not claimed:
+        _start_prestart_discard(ctx, prestart.task, "unavailable")
+        return None
+    LOG.info(
+        "copilot_build_test_browser_prestart_claimed",
+        prestart_browser_session_id=prestarted.session_id,
+        idle_seconds=round(max(0.0, time.monotonic() - prestarted.ready_monotonic), 1),
+    )
+    return prestarted.session_id
+
+
+@dataclass(frozen=True)
+class BrowserSessionReplacement:
+    old_session_id: str | None
+    new_session_id: str
+    old_closed: bool
+    pane_kept_old: bool
+
+
+async def _browser_session_is_studio_pane(ctx: AgentContext, session_id: str) -> bool:
+    try:
+        debug_session = await app.DATABASE.debug.get_debug_session_by_browser_session_id(
+            browser_session_id=session_id,
+            organization_id=ctx.organization_id,
+        )
+    except Exception:
+        LOG.warning("Could not tell whether the studio pane streams this browser; keeping it", exc_info=True)
+        return True
+    return debug_session is not None
+
+
+async def replace_browser_session(ctx: AgentContext) -> BrowserSessionReplacement | BuildTestConnectFailure:
+    """Retire the chat's browser and provision a new one, keeping the old one when the new one cannot start."""
+    async with (
+        browser_session_lock(ctx, session_id=ctx.browser_session_id),
+        browser_evidence_commit_lock(ctx),
+        browser_session_recovery(ctx),
+    ):
+        old_session_id = ctx.browser_session_id
+        await retire_browser_session_id(ctx, old_session_id)
+        failure = await _provision_browser_session(ctx)
+        new_session_id = ctx.browser_session_id
+        if failure is not None or not new_session_id:
+            ctx.browser_session_id = old_session_id
+            return failure or BuildTestConnectFailure(state="provisioning_unavailable")
+        if old_session_id is None:
+            return BrowserSessionReplacement(None, new_session_id, old_closed=False, pane_kept_old=False)
+        # The studio pane streams its session and re-sends it next turn, so that session is left running.
+        pane_kept_old = await _browser_session_is_studio_pane(ctx, old_session_id)
+        old_closed = not pane_kept_old and await close_browser_session_quietly(
+            ctx.organization_id,
+            old_session_id,
+            reason=BrowserSessionCloseReason.user_requested,
+        )
+        ctx.browser_session_replacements[old_session_id] = new_session_id
+        ctx.browser_session_continuity_generation += 1
+        ctx.browser_session_continuity_disposition = "reestablished"
+        ctx.browser_session_continuity_deadline_expired = False
+        LOG.info(
+            "Copilot replaced its browser session",
+            old_session_id=old_session_id,
+            new_session_id=new_session_id,
+            old_closed=old_closed,
+            pane_kept_old=pane_kept_old,
+        )
+        return BrowserSessionReplacement(old_session_id, new_session_id, old_closed, pane_kept_old)
 
 
 async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
@@ -1394,7 +1767,7 @@ async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, An
         await _attach_current_browser_generation(ctx)
         return None
     except CopilotBrowserSessionUnavailable:
-        retire_browser_session_id(ctx, examined_session_id)
+        await retire_browser_session_id(ctx, examined_session_id)
         return await ensure_browser_session(ctx)
     except asyncio.CancelledError:
         raise
@@ -1416,7 +1789,134 @@ async def verify_browser_session_by_attaching(ctx: AgentContext) -> dict[str, An
         }
 
 
-async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> dict[str, Any] | None:
+def _supersede_release_budget_seconds(ctx: AgentContext) -> float:
+    """Seconds the release poll may spend before the turn's own deadline needs what is left to
+    terminalize. A deadline suspended for a user decision reports no ``when()`` and imposes no clamp."""
+    deadline = ctx.model_stream_deadline
+    when = deadline.when() if deadline is not None else None
+    if when is None:
+        return _SUPERSEDE_RELEASE_WAIT_SECONDS
+    remaining = when - asyncio.get_running_loop().time() - _SUPERSEDE_TERMINALIZATION_HEADROOM_SECONDS
+    return min(_SUPERSEDE_RELEASE_WAIT_SECONDS, remaining)
+
+
+async def _build_test_session_occupancy_stop(
+    ctx: AgentContext,
+    *,
+    session_id: str,
+    copilot_chat_id: str | None,
+    copilot_turn_id: str | None,
+) -> BuildTestConnectFailure | None:
+    """Whether a live lease on the attached session blocks dispatching a build test into it.
+
+    ``None`` means the session was free when read: nothing held it, or this chat's own older test
+    run was superseded and its owner dropped the lease. It is a read, not a reservation — the new
+    run takes the lease later, in the worker, so a third party can still win that gap and the run
+    dies on the shared lease exactly as it does today.
+    """
+    session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+        session_id=session_id,
+        organization_id=ctx.organization_id,
+    )
+    if session is None or not session.runnable_id:
+        return None
+    holder_id = session.runnable_id
+
+    def _stop(reason: str) -> BuildTestConnectFailure:
+        LOG.info(
+            "copilot_build_test_session_occupied",
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+            occupier_runnable_id=holder_id,
+            occupier_runnable_type=session.runnable_type,
+            reason=reason,
+        )
+        return BuildTestConnectFailure(
+            state="occupied",
+            browser_session_id=session_id,
+            occupier_run_id=holder_id if session.runnable_type == "workflow_run" else None,
+        )
+
+    if session.runnable_type != "workflow_run":
+        return _stop("non_run_owner")
+    holder = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=holder_id,
+        organization_id=ctx.organization_id,
+    )
+    if holder is None:
+        return _stop("owner_run_missing")
+    if holder.status.is_final():
+        return _stop("owner_run_terminal")
+    if not copilot_chat_id or holder.copilot_session_id != copilot_chat_id:
+        return _stop("foreign_chat")
+    # Descendant runs inherit the chat id from their parent, so a child would otherwise pass every
+    # guard: cancelling it leaves the parent running and misreporting a failed child block.
+    if holder.parent_workflow_run_id is not None:
+        return _stop("owner_run_is_child")
+    # A run the user is answering is live work, and ``is_final`` does not cover ``paused``.
+    if holder.status == WorkflowRunStatus.paused:
+        return _stop("owner_run_paused")
+    if ctx.build_test_tool_calls_in_model_response > 1:
+        return _stop("sibling_dispatch_this_turn")
+
+    # Cancelling without time left to see the lease drop would destroy the older test and start
+    # nothing in its place, so a spent budget reports occupied and leaves the holder running.
+    release_budget = _supersede_release_budget_seconds(ctx)
+    if release_budget <= 0:
+        return _stop("supersede_release_budget_exhausted")
+    try:
+        canceled = await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled_if_not_final(
+            holder_id,
+            failure_reason=SUPERSEDED_BY_NEWER_TEST_REASON,
+        )
+    except Exception:
+        LOG.warning(
+            "copilot_build_test_supersede_cancel_failed",
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+            superseded_workflow_run_id=holder_id,
+            exc_info=True,
+        )
+        return _stop("supersede_cancel_failed")
+    # A no-op cancel means the holder reached its own terminal state in the gap after the status
+    # read, so this turn superseded nothing and must not claim it did.
+    if canceled is not None and copilot_chat_id and copilot_turn_id:
+        # The reason on the run row is the fast path, but the superseded run's own finalizer can
+        # still overwrite it; this record is copilot's and nothing else writes it.
+        await app.DATABASE.workflow_params.record_superseded_build_test_run(
+            organization_id=ctx.organization_id,
+            workflow_copilot_chat_id=copilot_chat_id,
+            turn_id=copilot_turn_id,
+            workflow_run_id=holder_id,
+        )
+    LOG.info(
+        "copilot_build_test_session_superseded",
+        session_id=session_id,
+        organization_id=ctx.organization_id,
+        superseded_workflow_run_id=holder_id,
+    )
+    deadline = time.monotonic() + release_budget
+    while time.monotonic() < deadline:
+        await asyncio.sleep(_SUPERSEDE_RELEASE_POLL_INTERVAL_SECONDS)
+        current = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+            session_id=session_id,
+            organization_id=ctx.organization_id,
+        )
+        if current is None:
+            return _stop("session_row_gone_after_supersede")
+        if not current.runnable_id:
+            return None
+        if current.runnable_id != holder_id:
+            return _stop("relet_after_supersede")
+    return _stop("supersede_release_timed_out")
+
+
+async def verify_build_test_browser_session_by_attaching(
+    ctx: AgentContext,
+    *,
+    copilot_chat_id: str | None = None,
+    copilot_turn_id: str | None = None,
+) -> dict[str, Any] | None:
     """Attach once for a build test; report supported acquisition state without replacing it."""
     await _drop_browser_session_id_at_its_fixed_deadline(ctx)
     if not ctx.browser_session_id:
@@ -1424,16 +1924,27 @@ async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> d
     examined_session_id = ctx.browser_session_id
     try:
         await _attach_current_browser_generation(ctx)
-        return None
     except CopilotBrowserSessionUnavailable:
-        retire_browser_session_id(ctx, examined_session_id)
+        await retire_browser_session_id(ctx, examined_session_id)
         return _build_test_connect_failure_result(
             BuildTestConnectFailure(state="already_closed", browser_session_id=examined_session_id)
         )
-    except BrowserTargetClosedError:
-        retire_browser_session_id(ctx, examined_session_id)
+    except BrowserTargetClosedError as exc:
+        if not is_positive_browser_closed_fact(exc):
+            return _build_test_connect_failure_result(
+                BuildTestConnectFailure(state="cdp_connect_failed", browser_session_id=examined_session_id)
+            )
+        await retire_browser_session_id(ctx, examined_session_id)
         return _build_test_connect_failure_result(
             BuildTestConnectFailure(state="already_closed", browser_session_id=examined_session_id)
+        )
+    except BrowserCdpAcquisitionError as exc:
+        return _build_test_connect_failure_result(
+            BuildTestConnectFailure(
+                state="cdp_connect_failed",
+                browser_session_id=examined_session_id,
+                diagnostic=str(exc),
+            )
         )
     except BrowserCdpConnectionError:
         # A failed attach does not prove the remote session is dead; keep its id as
@@ -1456,3 +1967,11 @@ async def verify_build_test_browser_session_by_attaching(ctx: AgentContext) -> d
             "error": "The build-test browser attach could not be classified.",
             "probe_error_type": type(exc).__name__,
         }
+
+    occupancy = await _build_test_session_occupancy_stop(
+        ctx,
+        session_id=examined_session_id,
+        copilot_chat_id=copilot_chat_id,
+        copilot_turn_id=copilot_turn_id,
+    )
+    return None if occupancy is None else _build_test_connect_failure_result(occupancy)

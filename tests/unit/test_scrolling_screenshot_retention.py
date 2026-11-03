@@ -1,23 +1,19 @@
 """The multi-viewport LITE stitch must release its decoded images eagerly.
 
 ``SkyvernFrame.take_scrolling_screenshot`` decodes one ``PIL.Image`` per viewport,
-stitches them, and PNG-encodes the result. Those objects land in reference cycles that
-generation-0 GC defers, so plain refcount drop leaves ~100 MB/event resident until a full
-collection runs (which can exhaust worker memory). These tests pin the fix: explicit close of the decoded
-images, the stitched image, and the PNG buffer, followed by a full ``gc.collect()`` scoped
-to the multi-viewport stitch — without changing the returned bytes or scroll restoration.
+stitches them, and PNG-encodes the result. These tests pin explicit close of the decoded
+images, the stitched image, and the PNG buffer, followed by a rate-limited full ``gc.collect()``
+after a multi-viewport stitch, without changing the returned bytes or scroll restoration.
 
-The ``test_cdp_rescue_*`` cases cover the same handler's other branch: the raw-CDP rescue that runs
-when the capture primitive itself failed, and the conditions under which it must stay out of the way.
+Viewport CDP recovery contracts live in ``webeye/test_screenshot_cdp_fallback.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,15 +21,10 @@ from PIL import Image
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import skyvern.webeye.utils.page as page_module
-from skyvern.exceptions import FailedToTakeScreenshot
-from skyvern.webeye.browser_engine import (
-    SKYCDP_ENGINE_NAME,
-    BrowserDriverStarter,
-    BrowserEngineMetadata,
-    BrowserEngineSelection,
-)
-from skyvern.webeye.browser_health import BrowserOperation
+from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.utils.page import ScreenshotMode
+from tests.unit.conftest import settle_or_fail, stalling_async_mock
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
 def _png_bytes(width: int, height: int, color: tuple[int, int, int]) -> bytes:
@@ -110,28 +101,36 @@ async def _invoke_take_scrolling_screenshot(
     page: MagicMock | None = None,
     engine_selection: BrowserEngineSelection | None = None,
     scroll_helper_exc: Exception | None = None,
-    record_recovery: MagicMock | None = None,
     file_path: str | None = None,
+    timeout_ms: float | None = None,
+    scroll_helper: AsyncMock | None = None,
+    fallback: AsyncMock | None = None,
+    create_instance: AsyncMock | None = None,
 ) -> bytes:
     tracking_bytesio = _tracking_bytesio_factory(bytesio_instances)
-    scroll_helper = (
-        AsyncMock(side_effect=scroll_helper_exc)
-        if scroll_helper_exc is not None
-        else AsyncMock(return_value=(list(screenshots), list(positions)))
-    )
+    if scroll_helper is None:
+        scroll_helper = (
+            AsyncMock(side_effect=scroll_helper_exc)
+            if scroll_helper_exc is not None
+            else AsyncMock(return_value=(list(screenshots), list(positions)))
+        )
+    timeout_kwargs = {} if timeout_ms is None else {"timeout": timeout_ms}
     with (
-        patch.object(page_module.SkyvernFrame, "create_instance", AsyncMock(return_value=fake_frame)),
+        patch.object(
+            page_module.SkyvernFrame,
+            "create_instance",
+            create_instance if create_instance is not None else AsyncMock(return_value=fake_frame),
+        ),
         patch.object(page_module, "_scrolling_screenshots_helper", scroll_helper),
         patch.object(page_module, "_merge_images_by_position", MagicMock(side_effect=merge_impl)),
         patch.object(
             page_module,
             "_current_viewpoint_screenshot_helper",
-            AsyncMock(return_value=fallback_bytes),
+            fallback if fallback is not None else AsyncMock(return_value=fallback_bytes),
         ),
         patch.object(page_module, "BytesIO", tracking_bytesio),
         patch.object(page_module, "gc", fake_gc, create=True),
         patch.object(page_module.skyvern_context, "record_browser_success", MagicMock()),
-        patch.object(page_module.skyvern_context, "record_browser_recovery", record_recovery or MagicMock()),
         patch.object(page_module, "CDP_RESCUE_SESSION_TIMEOUT_SECONDS", 0.05),
         patch.object(page_module, "CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS", 0.05),
         patch.object(page_module, "CDP_RESCUE_DETACH_TIMEOUT_SECONDS", 0.05),
@@ -142,7 +141,13 @@ async def _invoke_take_scrolling_screenshot(
             mode=ScreenshotMode.LITE,
             scrolling_number=scrolling_number,
             engine_selection=engine_selection,
+            **timeout_kwargs,
         )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_stitch_gc_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(page_module, "_last_stitch_gc_at", float("-inf"))
 
 
 @pytest.mark.asyncio
@@ -206,6 +211,33 @@ async def test_multi_viewport_stitch_closes_resources_and_collects() -> None:
     assert gc_state.get("all_closed_at_gc") is True, "gc.collect() must run AFTER explicit cleanup"
 
     assert fake_frame.scroll_restore_calls == [(11, 22)], "scroll position must be restored"
+
+
+@pytest.mark.asyncio
+async def test_multi_viewport_stitch_collects_at_most_once_per_interval() -> None:
+    screenshots = [_png_bytes(120, 100, (10, 20, 30)), _png_bytes(120, 100, (40, 50, 60))]
+    fake_gc = MagicMock()
+
+    async def _stitch_once() -> None:
+        await _invoke_take_scrolling_screenshot(
+            screenshots=screenshots,
+            positions=[0, 80],
+            scrolling_number=2,
+            merge_impl=page_module._merge_images_by_position,
+            fake_gc=fake_gc,
+            bytesio_instances=[],
+            fake_frame=_FakeSkyvernFrame(),
+        )
+
+    await _stitch_once()
+    await _stitch_once()
+    assert fake_gc.collect.call_count == 1, "a second stitch inside the interval must not pause the loop again"
+
+    page_module._last_stitch_gc_at -= (
+        page_module.SettingsManager.get_settings().SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS
+    )
+    await _stitch_once()
+    assert fake_gc.collect.call_count == 2, "the first stitch after the interval must collect"
 
 
 @pytest.mark.asyncio
@@ -441,202 +473,6 @@ def test_merge_images_closes_canvas_and_crop_when_paste_fails_after_allocation()
         img.close()
 
 
-async def _hang(*args: object, **kwargs: object) -> None:
-    await asyncio.sleep(30)
-
-
-def _skycdp_selection() -> BrowserEngineSelection:
-    return BrowserEngineSelection(
-        name=SKYCDP_ENGINE_NAME,
-        start_driver=cast("BrowserDriverStarter", lambda: None),
-        error_type=Exception,
-        timeout_error_type=TimeoutError,
-        metadata=BrowserEngineMetadata(name=SKYCDP_ENGINE_NAME),
-        selection_reason="test-skycdp",
-    )
-
-
-def _cdp_page(
-    *,
-    send_result: dict[str, str] | None = None,
-    send_exc: Exception | None = None,
-    send_hang: bool = False,
-    detach_exc: Exception | None = None,
-    detach_hang: bool = False,
-    open_hang: bool = False,
-) -> tuple[MagicMock, AsyncMock]:
-    session = AsyncMock(name="cdp_session")
-    if send_hang:
-        session.send = AsyncMock(side_effect=_hang)
-    else:
-        session.send = AsyncMock(side_effect=send_exc) if send_exc else AsyncMock(return_value=send_result or {})
-    if detach_hang:
-        session.detach = AsyncMock(side_effect=_hang)
-    else:
-        session.detach = AsyncMock(side_effect=detach_exc) if detach_exc else AsyncMock(return_value=None)
-    page = MagicMock(name="page")
-    page.context.new_cdp_session = AsyncMock(side_effect=_hang) if open_hang else AsyncMock(return_value=session)
-    return page, session
-
-
-async def _invoke_rescue_case(
-    *,
-    page: MagicMock,
-    fake_frame: _FakeSkyvernFrame,
-    scroll_helper_exc: Exception,
-    engine_selection: BrowserEngineSelection | None = None,
-    record_recovery: MagicMock | None = None,
-    file_path: str | None = None,
-) -> bytes:
-    return await _invoke_take_scrolling_screenshot(
-        screenshots=[],
-        positions=[],
-        scrolling_number=2,
-        merge_impl=MagicMock(),
-        fake_gc=MagicMock(),
-        bytesio_instances=[],
-        fake_frame=fake_frame,
-        page=page,
-        engine_selection=engine_selection,
-        scroll_helper_exc=scroll_helper_exc,
-        record_recovery=record_recovery,
-        file_path=file_path,
-    )
-
-
-@pytest.mark.asyncio
-async def test_cdp_rescue_returns_png_writes_file_and_records_success(tmp_path: Path) -> None:
-    expected_png = _png_bytes(800, 600, (43, 108, 176))
-    page, session = _cdp_page(send_result={"data": base64.b64encode(expected_png).decode()})
-    fake_frame = _FakeSkyvernFrame()
-    record_recovery = MagicMock()
-    out_path = tmp_path / "not" / "yet" / "created" / "rescued.png"
-
-    result = await _invoke_rescue_case(
-        page=page,
-        fake_frame=fake_frame,
-        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
-        record_recovery=record_recovery,
-        file_path=str(out_path),
-    )
-
-    assert result == expected_png
-    assert out_path.read_bytes() == expected_png, (
-        "the rescue must create missing parent directories like page.screenshot"
-    )
-    record_recovery.assert_called_once_with(BrowserOperation.SCREENSHOT)
-    session.send.assert_awaited_once_with("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": False})
-    session.detach.assert_awaited_once()
-    assert fake_frame.scroll_restore_calls == [], "rescue must not scroll the page that just failed to capture"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("detach_exc,detach_hang", [(RuntimeError("detach boom"), False), (None, True)])
-async def test_cdp_rescue_keeps_bytes_when_detach_fails_or_hangs(
-    detach_exc: Exception | None, detach_hang: bool
-) -> None:
-    expected_png = _png_bytes(120, 100, (10, 20, 30))
-    page, session = _cdp_page(
-        send_result={"data": base64.b64encode(expected_png).decode()},
-        detach_exc=detach_exc,
-        detach_hang=detach_hang,
-    )
-
-    result = await _invoke_rescue_case(
-        page=page,
-        fake_frame=_FakeSkyvernFrame(),
-        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
-    )
-
-    assert result == expected_png
-    session.detach.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("send_exc,send_hang", [(RuntimeError("cdp send boom"), False), (None, True)])
-async def test_cdp_rescue_send_failure_or_hang_falls_back_and_detaches(
-    send_exc: Exception | None, send_hang: bool, tmp_path: Path
-) -> None:
-    page, session = _cdp_page(send_exc=send_exc, send_hang=send_hang)
-    record_recovery = MagicMock()
-    out_path = tmp_path / "rescued.png"
-
-    result = await _invoke_rescue_case(
-        page=page,
-        fake_frame=_FakeSkyvernFrame(),
-        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
-        record_recovery=record_recovery,
-        file_path=str(out_path),
-    )
-
-    assert result == b"FALLBACK"
-    assert not out_path.exists()
-    record_recovery.assert_not_called()
-    session.detach.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("send_result", [{}, {"data": ""}, {"data": "abcde"}, {"data": "!!!!YQ=="}])
-async def test_cdp_rescue_rejects_non_png_payloads(send_result: dict[str, str], tmp_path: Path) -> None:
-    page, _ = _cdp_page(send_result=send_result)
-    record_recovery = MagicMock()
-    out_path = tmp_path / "rescued.png"
-
-    result = await _invoke_rescue_case(
-        page=page,
-        fake_frame=_FakeSkyvernFrame(),
-        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
-        record_recovery=record_recovery,
-        file_path=str(out_path),
-    )
-
-    assert result == b"FALLBACK"
-    assert not out_path.exists(), "a non-PNG payload must never be written to the artifact path"
-    record_recovery.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_cdp_rescue_session_open_timeout_falls_back() -> None:
-    page, _ = _cdp_page(open_hang=True)
-
-    result = await _invoke_rescue_case(
-        page=page,
-        fake_frame=_FakeSkyvernFrame(),
-        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
-    )
-
-    assert result == b"FALLBACK"
-
-
-@pytest.mark.asyncio
-async def test_cdp_rescue_skipped_on_skycdp_engine() -> None:
-    page, _ = _cdp_page(send_result={"data": base64.b64encode(_png_bytes(120, 100, (1, 2, 3))).decode()})
-
-    result = await _invoke_rescue_case(
-        page=page,
-        fake_frame=_FakeSkyvernFrame(),
-        scroll_helper_exc=FailedToTakeScreenshot(error_message="capture stalled"),
-        engine_selection=_skycdp_selection(),
-    )
-
-    assert result == b"FALLBACK"
-    page.context.new_cdp_session.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_cdp_rescue_skipped_for_non_screenshot_exception() -> None:
-    page, _ = _cdp_page(send_result={"data": base64.b64encode(_png_bytes(120, 100, (1, 2, 3))).decode()})
-
-    result = await _invoke_rescue_case(
-        page=page,
-        fake_frame=_FakeSkyvernFrame(),
-        scroll_helper_exc=RuntimeError("stitch boom"),
-    )
-
-    assert result == b"FALLBACK"
-    page.context.new_cdp_session.assert_not_called()
-
-
 def _fake_timeout_page(message: str) -> MagicMock:
     page = MagicMock(name="page")
     page.is_closed.return_value = False
@@ -692,3 +528,207 @@ async def test_screenshot_timeout_warning_reads_an_undashed_single_entry_call_lo
 async def test_screenshot_timeout_warning_stage_is_unknown_without_a_call_log() -> None:
     kwargs = await _screenshot_timeout_warning_kwargs("Page.screenshot: Timeout 20000ms exceeded.")
     assert kwargs["screenshot_stage"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_hung_scroll_restoration_cannot_extend_the_screenshot_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The outer finally restores the pre-screenshot scroll position as courtesy cleanup, and it
+    runs while the caller's screenshot budget is already unwinding. An unresponsive page there must
+    not extend that budget: a caller unwinding this call to publish an established failure would
+    otherwise wait for the hang."""
+
+    class _HangingFrame(_FakeSkyvernFrame):
+        async def safe_scroll_to_x_y(self, x: int, y: int) -> None:
+            self.scroll_restore_calls.append((x, y))
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(page_module.SettingsManager.get_settings(), "BROWSER_ACTION_TIMEOUT_MS", 50)
+    screenshots = [_png_bytes(120, 100, (10, 20, 30))]
+    positions = [0]
+    expected = _expected_merged_png(screenshots, positions)
+    fake_frame = _HangingFrame()
+
+    result = await asyncio.wait_for(
+        _invoke_take_scrolling_screenshot(
+            screenshots=screenshots,
+            positions=positions,
+            scrolling_number=1,
+            merge_impl=page_module._merge_images_by_position,
+            fake_gc=MagicMock(),
+            bytesio_instances=[],
+            fake_frame=fake_frame,
+        ),
+        timeout=5,
+    )
+
+    # The screenshot still comes back, and the restoration was attempted and then abandoned.
+    assert result == expected
+    assert fake_frame.scroll_restore_calls == [(11, 22)]
+
+
+class _HangingRestoreFrame(_FakeSkyvernFrame):
+    async def safe_scroll_to_x_y(self, x: int, y: int) -> None:
+        self.scroll_restore_calls.append((x, y))
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_stalled_capture_settles_within_the_millisecond_budget() -> None:
+    entered = asyncio.Event()
+    fallback = AsyncMock(return_value=b"FALLBACK")
+    fake_frame = _HangingRestoreFrame()
+
+    task, elapsed = await settle_or_fail(
+        _invoke_take_scrolling_screenshot(
+            screenshots=[],
+            positions=[],
+            scrolling_number=1,
+            merge_impl=page_module._merge_images_by_position,
+            fake_gc=MagicMock(),
+            bytesio_instances=[],
+            fake_frame=fake_frame,
+            timeout_ms=200,
+            scroll_helper=stalling_async_mock(entered),
+            fallback=fallback,
+        )
+    )
+
+    assert entered.is_set()
+    assert isinstance(task.exception(), TimeoutError)
+    assert 0.15 <= elapsed < 1.0, elapsed
+    fallback.assert_not_awaited()
+    assert fake_frame.scroll_restore_calls == [(11, 22)]
+
+
+@pytest.mark.asyncio
+async def test_failed_capture_and_stalled_fallback_share_one_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.active_deadlines: list[float] = []
+
+        def time(self) -> float:
+            return self.now
+
+        async def sleep(self, seconds: float) -> None:
+            self.now += seconds
+            if self.active_deadlines:
+                deadline = min(self.active_deadlines)
+                if self.now >= deadline:
+                    self.now = deadline
+                    raise TimeoutError
+
+    clock = _Clock()
+    armed_deadlines: list[float] = []
+    fallback_deadlines: list[float] = []
+    capture_failed_at: list[float] = []
+    timeout_ms = 300
+    budget_started_at = clock.now
+
+    def _timeout_at(deadline: float):
+        armed_deadlines.append(deadline)
+
+        @asynccontextmanager
+        async def _scope():
+            clock.active_deadlines.append(deadline)
+            try:
+                yield
+            finally:
+                clock.active_deadlines.remove(deadline)
+
+        return _scope()
+
+    monkeypatch.setattr(
+        page_module,
+        "asyncio",
+        ScopedAsyncio(
+            get_running_loop=lambda: clock,
+            sleep=clock.sleep,
+            timeout_at=_timeout_at,
+        ),
+    )
+
+    async def _fail_late(*args: object, **kwargs: object) -> None:
+        await page_module.asyncio.sleep(0.25)
+        capture_failed_at.append(clock.now)
+        raise RuntimeError("capture boom")
+
+    async def _stall_fallback(*args: object, **kwargs: object) -> None:
+        fallback_deadlines.extend(clock.active_deadlines)
+        await page_module.asyncio.sleep(1.0)
+
+    with patch.object(page_module.LOG, "warning", MagicMock()):
+        task, _ = await settle_or_fail(
+            _invoke_take_scrolling_screenshot(
+                screenshots=[],
+                positions=[],
+                scrolling_number=1,
+                merge_impl=page_module._merge_images_by_position,
+                fake_gc=MagicMock(),
+                bytesio_instances=[],
+                fake_frame=_HangingRestoreFrame(),
+                timeout_ms=timeout_ms,
+                scroll_helper=AsyncMock(side_effect=_fail_late),
+                fallback=AsyncMock(side_effect=_stall_fallback),
+            )
+        )
+
+    assert isinstance(task.exception(), TimeoutError)
+    assert capture_failed_at == [pytest.approx(0.25)]
+    assert armed_deadlines == [pytest.approx(budget_started_at + timeout_ms / 1000)]
+    assert fallback_deadlines == armed_deadlines
+    assert clock.now == pytest.approx(armed_deadlines[0])
+
+
+@pytest.mark.asyncio
+async def test_healthy_capture_returns_and_writes_bytes_under_an_explicit_budget(tmp_path: Path) -> None:
+    screenshots = [_png_bytes(120, 100, (10, 20, 30)), _png_bytes(120, 100, (40, 50, 60))]
+    positions = [0, 80]
+    expected = _expected_merged_png(screenshots, positions)
+    fake_frame = _FakeSkyvernFrame()
+    out = tmp_path / "full.png"
+
+    task, _ = await settle_or_fail(
+        _invoke_take_scrolling_screenshot(
+            screenshots=screenshots,
+            positions=positions,
+            scrolling_number=2,
+            merge_impl=page_module._merge_images_by_position,
+            fake_gc=MagicMock(),
+            bytesio_instances=[],
+            fake_frame=fake_frame,
+            timeout_ms=2000,
+            file_path=str(out),
+        )
+    )
+
+    assert task.result() == expected
+    assert out.read_bytes() == expected
+    assert fake_frame.scroll_restore_calls == [(11, 22)]
+
+
+@pytest.mark.asyncio
+async def test_stalled_create_instance_is_inside_the_budget() -> None:
+    entered = asyncio.Event()
+    fake_frame = _FakeSkyvernFrame()
+
+    task, elapsed = await settle_or_fail(
+        _invoke_take_scrolling_screenshot(
+            screenshots=[],
+            positions=[],
+            scrolling_number=1,
+            merge_impl=page_module._merge_images_by_position,
+            fake_gc=MagicMock(),
+            bytesio_instances=[],
+            fake_frame=fake_frame,
+            timeout_ms=200,
+            create_instance=stalling_async_mock(entered),
+        )
+    )
+
+    assert entered.is_set()
+    assert isinstance(task.exception(), TimeoutError)
+    assert 0.15 <= elapsed < 1.0, elapsed
+    assert fake_frame.scroll_restore_calls == []

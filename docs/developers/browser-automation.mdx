@@ -1,0 +1,591 @@
+---
+title: Browser automation
+subtitle: Drive a browser from code with Playwright plus AI
+description: Launch a Skyvern cloud browser from Python or TypeScript, mix Playwright selectors with AI actions, extract data with JSON schemas, log in, download and upload files, work across tabs and frames, and replay agents as cached code.
+slug: developers/browser-automation
+keywords:
+  - launch_cloud_browser
+  - get_working_page
+  - page.act
+  - page.extract
+  - page.validate
+  - page.prompt
+  - page.agent.run_task
+  - page.agent.login
+  - page.agent.download_files
+  - JSON schema
+  - Playwright
+  - selector fallback
+  - code caching
+  - run_with
+  - invoice download
+---
+
+With the SDK you launch a browser in Skyvern Cloud and get a Playwright page with AI methods added. Use selectors where you know the page, natural language where you don't, and hand whole goals to the agent when a step needs judgment. Your code lives in your repo and runs wherever you deploy it.
+
+This page assumes you have an API key and the SDK installed. If not, start with the [Quickstart](/developers/getting-started/quickstart). Every method and parameter is listed in the [actions reference](/reference/actions).
+
+<Note>
+In Python, the browser and page methods need the `local` extra, which adds Playwright: `pip install "skyvern[local]"`. You need it even when the browser runs in Skyvern Cloud. The TypeScript package (`@skyvern/client`) already includes Playwright.
+</Note>
+
+## Launch a browser
+
+<CodeGroup>
+```python Python
+import os
+from skyvern import Skyvern
+
+skyvern = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
+browser = await skyvern.launch_cloud_browser()
+page = await browser.get_working_page()
+try:
+    await page.goto("https://example.com")
+    # ... your automation ...
+finally:
+    await browser.close()
+```
+
+```typescript TypeScript
+import { Skyvern } from "@skyvern/client";
+
+const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+const browser = await skyvern.launchCloudBrowser();
+const page = await browser.getWorkingPage();
+try {
+  await page.goto("https://example.com");
+  // ... your automation ...
+} finally {
+  await browser.close();
+}
+```
+</CodeGroup>
+
+The snippets on this page run inside an async function; the [worked example](#worked-example-download-invoices-from-a-vendor-portal) is a complete script.
+
+- `launch_cloud_browser` starts a new cloud session and logs a link to watch it live.
+- **`timeout`**: session length in minutes, from 5 to 240, default 60. Values above 240 are capped at 240.
+- **`proxy_location`**: route traffic through a proxy, for example `"RESIDENTIAL"` (US) or `"RESIDENTIAL_GB"`. See [Proxies and geo-targeting](/developers/production#proxies-and-geo-targeting) for locations.
+- **`browser_profile_id`** (Python): start with a saved profile's cookies and storage, so you skip the login.
+- `browser.close()` closes the browser and ends the cloud session. Always call it in `finally`.
+
+To reuse a session instead of starting one:
+
+<CodeGroup>
+```python Python
+# The newest idle session, or a new one
+browser = await skyvern.use_cloud_browser()
+
+# Or a specific session
+# browser = await skyvern.connect_to_cloud_browser_session("pbs_123")
+```
+
+```typescript TypeScript
+// The newest idle session, or a new one
+const browser = await skyvern.useCloudBrowser();
+
+// Or a specific session
+// const browser = await skyvern.connectToCloudBrowserSession("pbs_123");
+```
+</CodeGroup>
+
+All tabs in one browser share cookies, local storage and login state. Sessions, profiles and running your own Chrome are covered in [Browsers](/browsers). To run the browser on your own machine against a self-hosted server, see [Self-host](/developers/self-hosted/overview).
+
+## Use AI on the page
+
+Four methods take natural language. `act`, `extract` and `validate` read the current page. `prompt` sends only your text to the model.
+
+<CodeGroup>
+```python Python
+# Do one thing per call. Returns None.
+await page.act("Accept the cookie banner")
+await page.act("Open the Pricing page")
+
+# Read data. Returns a dict, or a list when the schema root is an array.
+plan = await page.extract("Get the name and monthly price of the cheapest plan")
+
+# Check a condition. Returns True or False.
+logged_in = await page.validate("The user is logged in")
+
+# Ask the model about text you pass. It doesn't see the page. Returns {"llm_response": "..."} without a schema.
+answer = await page.prompt("Classify this support ticket as billing, bug or other: 'I was charged twice this month.'")
+```
+
+```typescript TypeScript
+// Do one thing per call.
+await page.act("Accept the cookie banner");
+await page.act("Open the Pricing page");
+
+// Read data. Returns an object, or an array when the schema root is an array.
+const plan = await page.extract({ prompt: "Get the name and monthly price of the cheapest plan" });
+
+// Check a condition. Returns true or false.
+const loggedIn = await page.validate("The user is logged in");
+
+// Ask the model about text you pass. It doesn't see the page. Returns { llm_response: "..." } without a schema.
+const answer = await page.prompt("Classify this support ticket as billing, bug or other: 'I was charged twice this month.'");
+```
+</CodeGroup>
+
+Use `validate` for yes/no checks. It returns a plain boolean. `act` performs one action per call; for a multi-step goal, make several calls or use [`page.agent`](#hand-a-goal-to-the-agent).
+
+## Mix selectors and AI
+
+The page is a full Playwright page, so `goto`, `wait_for_selector`, `locator` and the rest work as usual. `click`, `fill` and `select_option` also accept a `prompt`:
+
+- **Selector only**: fast and deterministic.
+- **Prompt only**: no selector; Skyvern finds the element.
+- **Both**: Skyvern tries the selector first and uses the prompt only if the selector fails. This is the safest choice for production.
+
+<CodeGroup>
+```python Python
+await page.click("#submit")                                    # selector
+await page.click(prompt="Click the Submit button")             # AI
+await page.click("#submit", prompt="Click the Submit button")  # selector, AI fallback
+
+await page.fill("#email", "you@example.com", prompt="Fill the email field")
+await page.select_option("#country", "US", prompt="Select United States")
+
+await page.wait_for_selector("#dashboard")                     # plain Playwright
+```
+
+```typescript TypeScript
+await page.click("#submit");                                     // selector
+await page.click({ prompt: "Click the Submit button" });         // AI
+await page.click("#submit", { prompt: "Click the Submit button" }); // selector, AI fallback
+
+await page.fill("#email", "you@example.com", { prompt: "Fill the email field" });
+await page.selectOption("#country", "US", { prompt: "Select United States" });
+
+await page.waitForSelector("#dashboard");                        // plain Playwright
+```
+</CodeGroup>
+
+A good rule: selectors for stable elements you control or have inspected, prompts for anything whose markup changes or differs between sites.
+
+## Extract structured data
+
+Pass a [JSON Schema](https://json-schema.org/) to get the same shape every time. `page.extract` takes `schema`; `page.agent.run_task` and `run_task` take `data_extraction_schema`.
+
+<CodeGroup>
+```python Python
+posts = await page.extract(
+    "Extract the top 5 posts",
+    schema={
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Post title as shown"},
+                "points": {"type": "integer", "description": "Points, digits only"},
+                "url": {"type": "string", "description": "Link the title points to"},
+            },
+            "required": ["title"],
+        },
+    },
+)
+for post in posts:
+    print(post["title"], post.get("points"))
+```
+
+```typescript TypeScript
+type Post = { title: string; points?: number; url?: string };
+
+const posts = (await page.extract({
+  prompt: "Extract the top 5 posts",
+  schema: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Post title as shown" },
+        points: { type: "integer", description: "Points, digits only" },
+        url: { type: "string", description: "Link the title points to" },
+      },
+      required: ["title"],
+    },
+  },
+})) as Post[];
+for (const post of posts) console.log(post.title, post.points);
+```
+</CodeGroup>
+
+- **Write specific `description`s.** They steer extraction more than anything else. "Price in USD, number only" beats "the price".
+- **Expect missing values.** A field that isn't on the page comes back `null` or absent. Handle it in your code.
+- **Limit arrays.** Without a limit, an array schema collects everything visible. Say "top 5" in the prompt.
+- Supported types are the standard ones: `string`, `number`, `integer`, `boolean`, `array`, `object`, nested as deep as you need.
+
+## Hand a goal to the agent
+
+`page.agent` runs a full Skyvern agent inside your browser. Use it for multi-step goals, logins and downloads. Each call waits for the run to finish (30 minutes by default, set with `timeout` in seconds) and leaves the page where the agent stopped, so you can keep going with page methods.
+
+<CodeGroup>
+```python Python
+# Log in with a credential stored in Skyvern. Handles multi-page logins and 2FA.
+await page.agent.login(credential_type="skyvern", credential_id="cred_123")
+
+# Run a multi-step goal and get structured output.
+result = await page.agent.run_task(
+    "Open Billing and get the plan name and next invoice date",
+    data_extraction_schema={
+        "type": "object",
+        "properties": {
+            "plan": {"type": "string"},
+            "next_invoice_date": {"type": "string"},
+        },
+    },
+)
+print(result.status, result.output, result.app_url)
+
+# Run an agent you built in Studio on this page, after your own setup steps.
+run = await page.agent.run_workflow("wpid_123", parameters={"month": "2026-09"})
+```
+
+```typescript TypeScript
+// Log in with a credential stored in Skyvern. Handles multi-page logins and 2FA.
+await page.agent.login("skyvern", { credentialId: "cred_123" });
+
+// Run a multi-step goal and get structured output.
+const result = await page.agent.runTask(
+  "Open Billing and get the plan name and next invoice date",
+  {
+    dataExtractionSchema: {
+      type: "object",
+      properties: {
+        plan: { type: "string" },
+        next_invoice_date: { type: "string" },
+      },
+    },
+  },
+);
+console.log(result.status, result.output, result.app_url);
+
+// Run an agent you built in Studio on this page, after your own setup steps.
+const run = await page.agent.runWorkflow("wpid_123", { parameters: { month: "2026-09" } });
+```
+</CodeGroup>
+
+`login` also works with Bitwarden (`"bitwarden"`), 1Password (`"1password"`) and Azure Key Vault (`"azure_vault"`). Store credentials and set up 2FA in [Credentials and 2FA](/credentials).
+
+Agent calls return a run with `status`, `output`, `failure_reason`, `downloaded_files` and `app_url`. In TypeScript the fields are snake_case too (`result.app_url`). Check `status` before you use `output`; anything other than `completed` means the goal wasn't met.
+
+## Download and upload files
+
+`page.agent.download_files` finds and clicks the download for you, then returns the files as presigned URLs.
+
+<CodeGroup>
+```python Python
+result = await page.agent.download_files(
+    "Download the statement for September 2026",
+    download_suffix="statement-2026-09",
+)
+for file in result.downloaded_files or []:
+    print(file.filename, file.url, file.checksum)
+```
+
+```typescript TypeScript
+const result = await page.agent.downloadFiles("Download the statement for September 2026", {
+  downloadSuffix: "statement-2026-09",
+});
+for (const file of result.downloaded_files ?? []) {
+  console.log(file.filename, file.url, file.checksum);
+}
+```
+</CodeGroup>
+
+- **`download_suffix`** sets the saved file name. Without an extension, Skyvern keeps the downloaded file's (`"statement-2026-09"` becomes `statement-2026-09.pdf`). With an extension, it's the full name. Don't pass a bare extension like `".pdf"`; that saves as `.pdf.pdf`. Without a suffix, files get a generated name like `download-<timestamp>-<random>.pdf`. To keep the name the site gave the file, use `{{ original_filename }}`, alone or with other text: `"{{ fund }}_{{ original_filename }}"` saves `Fund A_Q4 Report.pdf`. Use it as a plain placeholder, without filters.
+- **`download_timeout`** is a hint, in seconds, for how long to wait for the download to start. The overall `timeout` is what fails the call.
+- Each file has `url` (presigned, expires), `filename`, `checksum` (SHA-256), `file_size` and `modified_at`. Files stay in Skyvern's storage; fetch the URL to save a copy, as the [worked example](#worked-example-download-invoices-from-a-vendor-portal) does.
+
+To **upload** a file into a form (Python only), pass a URL Skyvern can fetch. `upload_file` takes a selector, a prompt, or both:
+
+```python
+await page.upload_file(
+    "input[type=file]",
+    "https://example.com/files/resume.pdf",
+    prompt="Upload the resume",
+)
+```
+
+In agents built in Studio, the File Download and File Parser blocks do the same jobs; see the [blocks reference](/reference/blocks).
+
+## Tabs and frames
+
+Every tab in the browser shares the same login state.
+
+<CodeGroup>
+```python Python
+second = await browser.new_page()          # open a new tab
+await second.goto("https://example.com/reports")
+
+latest = await browser.get_working_page()  # the most recent tab
+
+# Wrap a tab the site opened itself (browser.pages lists Playwright pages)
+popup = await browser.get_page_for(browser.pages[-1])
+```
+
+```typescript TypeScript
+const second = await browser.newPage(); // open a new tab
+await second.goto("https://example.com/reports");
+
+const latest = await browser.getWorkingPage(); // the most recent tab
+
+// Every open tab, with AI methods
+const tabs = browser.pages();
+```
+</CodeGroup>
+
+For content inside an iframe, switch the page into the frame (Python). Later actions on that page, AI and selector alike, run inside the frame until you switch back:
+
+```python
+print(await page.frame_list())                # index, name, url of each frame
+await page.frame_switch(selector="iframe#payment")  # or name=..., or index=...
+await page.fill("#card-number", "4242424242424242")
+page.frame_main()                             # back to the main page
+```
+
+In TypeScript, use Playwright's frame APIs (`page.frameLocator`) for selector work inside iframes.
+
+## Run tasks and agents from code
+
+You don't need to hold a browser to use Skyvern from code. The client methods start a run on a fresh cloud browser and, with `wait_for_completion`, return when it ends:
+
+<CodeGroup>
+```python Python
+task = await skyvern.run_task(
+    prompt="Find the support email on the Contact page",
+    url="https://example.com",
+    wait_for_completion=True,
+)
+
+agent_run = await skyvern.run_workflow(
+    "wpid_123",                      # the agent's ID
+    parameters={"month": "2026-09"},
+    wait_for_completion=True,
+)
+```
+
+```typescript TypeScript
+const task = await skyvern.runTask({
+  prompt: "Find the support email on the Contact page",
+  url: "https://example.com",
+  waitForCompletion: true,
+});
+
+const agentRun = await skyvern.runWorkflow({
+  agent_id: "wpid_123", // the agent's ID
+  parameters: { month: "2026-09" },
+  waitForCompletion: true,
+});
+```
+</CodeGroup>
+
+Use `page.agent.*` when the run must start from a browser you prepared, for example after your own login or setup. Use the client methods when the run can start fresh. For webhooks instead of waiting, retries and error handling, see [Going to production](/developers/production).
+
+## Replay agents as cached code
+
+After an agent run succeeds, Skyvern can generate code from the actions it took. Later runs can execute that code directly instead of asking the model at each step, which makes them faster and cheaper.
+
+- In Studio, open the agent's **Start** block settings and set **Run With** to **Code**. **Skyvern Agent** always uses the model.
+- **AI Fallback (cached scripts)** is on by default: if the cached code fails, for example because the page changed, Skyvern falls back to the agent and regenerates the code.
+- From code, override the setting for one run with `run_with`:
+
+<CodeGroup>
+```python Python
+run = await skyvern.run_workflow("wpid_123", run_with="code", wait_for_completion=True)
+```
+
+```typescript TypeScript
+const run = await skyvern.runWorkflow({ agent_id: "wpid_123", run_with: "code", waitForCompletion: true });
+```
+</CodeGroup>
+
+Accepted values are `"agent"` and `"code"`; leave it out to use the agent's setting. Cached code pairs well with [schedules](/cloud/runs): the first successful run produces the code and later runs reuse it.
+
+## Worked example: download invoices from a vendor portal
+
+This script logs in to a vendor portal with a stored credential, filters the order history by date, extracts the orders, downloads each invoice PDF and saves it locally. It uses selectors where the portal is predictable and AI where it isn't.
+
+Before you run it:
+1. Store the portal login in Skyvern and copy its `cred_...` ID ([Credentials and 2FA](/credentials)).
+2. Replace `PORTAL_URL` with your portal's login page.
+
+<CodeGroup>
+```python Python
+import asyncio
+import os
+from pathlib import Path
+
+import httpx
+from skyvern import Skyvern
+
+PORTAL_URL = "https://vendor-portal.example.com/login"
+CREDENTIAL_ID = os.environ["VENDOR_CREDENTIAL_ID"]  # cred_...
+SINCE = "2026-09-01"
+OUT_DIR = Path("invoices")
+
+ORDER_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "order_number": {"type": "string", "description": "Order number as shown in the table"},
+            "order_date": {"type": "string", "description": "Order date, YYYY-MM-DD"},
+            "total": {"type": "number", "description": "Order total, number only, no currency symbol"},
+        },
+        "required": ["order_number"],
+    },
+}
+
+
+async def main():
+    skyvern = Skyvern(api_key=os.environ["SKYVERN_API_KEY"])
+    browser = await skyvern.launch_cloud_browser()
+    try:
+        page = await browser.get_working_page()
+        await page.goto(PORTAL_URL)
+
+        # 1. Log in with the stored credential (no password in your code)
+        login = await page.agent.login(credential_type="skyvern", credential_id=CREDENTIAL_ID)
+        if login.status != "completed":
+            raise RuntimeError(f"Login failed: {login.failure_reason}")
+
+        # 2. Open order history: selector first, AI if the link moved
+        await page.click("a[href*='orders']", prompt="Open the order history page")
+        await page.act(f"Filter the orders to show only orders placed on or after {SINCE}")
+        orders_url = page.url
+
+        # 3. Extract the orders as typed data
+        orders = await page.extract("Extract every order in the order history table", schema=ORDER_SCHEMA)
+        print(f"Found {len(orders)} orders")
+
+        # 4. Download each invoice and save it locally
+        OUT_DIR.mkdir(exist_ok=True)
+        async with httpx.AsyncClient() as http:
+            for order in orders:
+                number = order["order_number"]
+                result = await page.agent.download_files(
+                    f"Download the invoice PDF for order {number}",
+                    url=orders_url,
+                    download_suffix=f"invoice-{number}",
+                )
+                if result.status != "completed":
+                    print(f"{number}: {result.status} {result.failure_reason}")
+                    continue
+                for file in result.downloaded_files or []:
+                    response = await http.get(file.url)
+                    response.raise_for_status()
+                    path = OUT_DIR / (file.filename or f"invoice-{number}.pdf")
+                    path.write_bytes(response.content)
+                    print(f"{number}: saved {path}")
+    finally:
+        await browser.close()
+
+
+asyncio.run(main())
+```
+
+```typescript TypeScript
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { Skyvern } from "@skyvern/client";
+
+const PORTAL_URL = "https://vendor-portal.example.com/login";
+const CREDENTIAL_ID = process.env.VENDOR_CREDENTIAL_ID!; // cred_...
+const SINCE = "2026-09-01";
+const OUT_DIR = "invoices";
+
+type Order = { order_number: string; order_date?: string; total?: number };
+
+const ORDER_SCHEMA = {
+  type: "array",
+  items: {
+    type: "object",
+    properties: {
+      order_number: { type: "string", description: "Order number as shown in the table" },
+      order_date: { type: "string", description: "Order date, YYYY-MM-DD" },
+      total: { type: "number", description: "Order total, number only, no currency symbol" },
+    },
+    required: ["order_number"],
+  },
+};
+
+async function main() {
+  const skyvern = new Skyvern({ apiKey: process.env.SKYVERN_API_KEY! });
+  const browser = await skyvern.launchCloudBrowser();
+  try {
+    const page = await browser.getWorkingPage();
+    await page.goto(PORTAL_URL);
+
+    // 1. Log in with the stored credential (no password in your code)
+    const login = await page.agent.login("skyvern", { credentialId: CREDENTIAL_ID });
+    if (login.status !== "completed") {
+      throw new Error(`Login failed: ${login.failure_reason}`);
+    }
+
+    // 2. Open order history: selector first, AI if the link moved
+    await page.click("a[href*='orders']", { prompt: "Open the order history page" });
+    await page.act(`Filter the orders to show only orders placed on or after ${SINCE}`);
+    const ordersUrl = page.url();
+
+    // 3. Extract the orders as typed data
+    const orders = (await page.extract({
+      prompt: "Extract every order in the order history table",
+      schema: ORDER_SCHEMA,
+    })) as Order[];
+    console.log(`Found ${orders.length} orders`);
+
+    // 4. Download each invoice and save it locally
+    await mkdir(OUT_DIR, { recursive: true });
+    for (const order of orders) {
+      const number = order.order_number;
+      const result = await page.agent.downloadFiles(`Download the invoice PDF for order ${number}`, {
+        url: ordersUrl,
+        downloadSuffix: `invoice-${number}`,
+      });
+      if (result.status !== "completed") {
+        console.log(`${number}: ${result.status} ${result.failure_reason ?? ""}`);
+        continue;
+      }
+      for (const file of result.downloaded_files ?? []) {
+        const response = await fetch(file.url);
+        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+        const filePath = path.join(OUT_DIR, file.filename ?? `invoice-${number}.pdf`);
+        await writeFile(filePath, Buffer.from(await response.arrayBuffer()));
+        console.log(`${number}: saved ${filePath}`);
+      }
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+main();
+```
+</CodeGroup>
+
+Run it with `python download_invoices.py` or `npx tsx download_invoices.ts`. Each `page.agent` call returns an `app_url`. Open it for an order that failed to see the recording and every step the agent took.
+
+To run this every month without your own server, build the same steps as an agent in [Studio](/cloud/studio) with Login, Extraction, Loop and File Download blocks, and put it on a [schedule](/cloud/runs).
+
+## More examples
+
+The same building blocks cover most portal work:
+
+- **Data behind a login, many pages deep** (for example a records portal): log in once, save a [browser profile](/browsers) so later runs skip the login, use a residential `proxy_location` for sites that block data-center traffic, and loop `extract` plus a "next page" `click` until `validate("There is no next page")` is true.
+- **Filling application forms**: `fill` and `select_option` with prompts handle forms that differ from site to site, and `upload_file` attaches a resume or document. For job applications, the **Job Apps** recipe in the app already does this end to end.
+- **Recurring downloads and reports**: the worked example above, moved into an agent in [Studio](/cloud/studio) with cached code and a schedule.
+
+## Next
+
+<CardGroup cols={3}>
+  <Card title="Actions reference" icon="list" href="/reference/actions">
+    Every page and agent method, with parameters and return types.
+  </Card>
+  <Card title="Browsers" icon="window-maximize" href="/browsers">
+    Sessions, profiles, proxies and connecting your own Chrome.
+  </Card>
+  <Card title="Going to production" icon="rocket" href="/developers/production">
+    Webhooks, retries, error handling and cost control.
+  </Card>
+</CardGroup>

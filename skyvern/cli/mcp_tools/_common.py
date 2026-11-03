@@ -20,18 +20,13 @@ DIRECT_TARGET_DESCRIPTION = "Direct target: deterministic, 0 LLM calls."
 AI_FALLBACK_DESCRIPTION = (
     "AI fallback: costs Skyvern LLM calls, slower and nondeterministic — prefer selector when known."
 )
-CODE_ONLY_POLICY_HINT = (
-    "If you did not pass code_only=true yourself, this server enforces code-only authoring by "
-    "organization policy — the rejection is intentional, not an error. Do not pass code_only=false "
-    "to bypass it unless the user explicitly asked for agentic (non-code) blocks."
-)
-CODE_ONLY_SCHEMA_GUIDANCE = (
-    "Omit `code_only` or pass null to use this server's default; organization policy may enforce "
-    "code-only, making rejection intentional."
-)
-CODE_ONLY_FIELD_DESCRIPTION = (
-    "When true, structurally reject non-code browser/page block types (code-only mode). " + CODE_ONLY_SCHEMA_GUIDANCE
-)
+
+
+class RawHTTPError(RuntimeError):
+    def __init__(self, status_code: int, detail: Any) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"HTTP {status_code}: {detail}")
 
 
 async def raw_http_get(path: str, params: dict[str, Any] | None = None) -> Any:
@@ -91,7 +86,7 @@ async def _raw_http_request(
             detail = response.json().get("detail", response.text)
         except Exception:
             detail = response.text
-        raise RuntimeError(f"HTTP {response.status_code}: {detail}")
+        raise RawHTTPError(response.status_code, detail)
     if response.status_code == 204:
         return {}
     try:
@@ -107,6 +102,7 @@ __all__ = [
     "DIRECT_TARGET_DESCRIPTION",
     "ErrorCode",
     "Timer",
+    "RawHTTPError",
     "get_artifact_dir",
     "make_error",
     "make_result",

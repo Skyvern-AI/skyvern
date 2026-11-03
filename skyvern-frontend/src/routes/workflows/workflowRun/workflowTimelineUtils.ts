@@ -1,4 +1,4 @@
-import { Status } from "@/api/types";
+import { Status, type WorkflowRunAttempt } from "@/api/types";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import {
   findUnexecutedDefinedBlocks,
@@ -11,6 +11,52 @@ import {
 } from "../types/workflowRunTypes";
 import { BranchCondition, WorkflowBlock } from "../types/workflowTypes";
 import { WorkflowRunOverviewActiveElement } from "./WorkflowRunOverview";
+
+import { resolveTimelineItemAttempt } from "./runRetryState";
+
+export function groupTimelineByAttempt(
+  items: Array<WorkflowRunTimelineItem>,
+  attempts: Array<WorkflowRunAttempt>,
+  currentAttempt: number,
+): Array<{
+  attemptNumber: number;
+  items: Array<WorkflowRunTimelineItem>;
+  summary: WorkflowRunAttempt | null;
+  isCurrent: boolean;
+}> {
+  const itemsByAttempt = new Map<number, Array<WorkflowRunTimelineItem>>();
+  for (const item of items) {
+    const attempt = resolveTimelineItemAttempt(item, attempts);
+    const group = itemsByAttempt.get(attempt) ?? [];
+    group.push(item);
+    itemsByAttempt.set(attempt, group);
+  }
+  const numbers = new Set([
+    ...attempts.map((attempt) => attempt.attempt_number),
+    ...itemsByAttempt.keys(),
+    currentAttempt,
+  ]);
+  return [...numbers]
+    .sort((a, b) => a - b)
+    .map((attemptNumber) => ({
+      attemptNumber,
+      items: itemsByAttempt.get(attemptNumber) ?? [],
+      summary:
+        attempts.find((attempt) => attempt.attempt_number === attemptNumber) ??
+        null,
+      isCurrent: attemptNumber === currentAttempt,
+    }));
+}
+
+export function filterTimelineToAttempt(
+  items: Array<WorkflowRunTimelineItem>,
+  attempts: Array<WorkflowRunAttempt>,
+  attempt: number,
+): Array<WorkflowRunTimelineItem> {
+  return items.filter(
+    (item) => resolveTimelineItemAttempt(item, attempts) === attempt,
+  );
+}
 
 const containerBlockTypes = new Set(["for_loop", "while_loop", "conditional"]);
 
@@ -93,6 +139,34 @@ type BranchOutcome = {
   takenTargets: Array<SkippedBranchMetadata>;
   notTakenTargets: Array<SkippedBranchMetadata>;
 };
+
+type ConditionalEvaluationError = {
+  summary: string;
+  message: string;
+};
+
+// The block still reports completed when this is set: the backend routed
+// despite a branch it could not evaluate. Absent on cached-code and older runs.
+function getConditionalEvaluationError(
+  block: WorkflowRunBlock,
+): ConditionalEvaluationError | null {
+  if (block.block_type !== "conditional" || !hasEvaluations(block.output)) {
+    return null;
+  }
+  const { evaluation_error: message, evaluations = [] } = block.output;
+  if (!message) {
+    return null;
+  }
+  const tookDefaultBranch = evaluations.some(
+    (evaluation) => evaluation.is_matched && evaluation.is_default,
+  );
+  return {
+    summary: tookDefaultBranch
+      ? "A condition could not be evaluated, so the default branch was taken."
+      : "A condition could not be evaluated. The branch that ran was chosen without it.",
+    message,
+  };
+}
 
 function collectExecutedConditionals(
   timelineItems: Array<WorkflowRunTimelineItem>,
@@ -665,6 +739,31 @@ function findRunningBlock(
 }
 
 /**
+ * The human-interaction block the run is currently paused on, wherever it sits
+ * in the tree. Only a running one counts: a resolved block's prompt would act
+ * on a later pause.
+ */
+function findAwaitingHumanInteractionBlock(
+  timeline: Array<WorkflowRunTimelineItem>,
+): WorkflowRunBlock | null {
+  const stack = [...timeline].reverse();
+
+  while (stack.length > 0) {
+    const item = stack.pop()!;
+    if (
+      isBlockItem(item) &&
+      item.block.block_type === "human_interaction" &&
+      item.block.status === Status.Running
+    ) {
+      return item.block;
+    }
+    stack.push(...[...item.children].reverse());
+  }
+
+  return null;
+}
+
+/**
  * Most-recent leaf in a terminal state. Filter to leaves: containers
  * always close last, so modified_at alone would pick the outer block.
  */
@@ -802,6 +901,7 @@ export {
   aggregateIterationStatus,
   classifyUnexecutedDefinedBlocks,
   findActiveItem,
+  findAwaitingHumanInteractionBlock,
   findBlockSurroundingAction,
   findBlockSurroundingThought,
   findLastExecutedBlock,
@@ -809,10 +909,12 @@ export {
   findThoughtsForBlock,
   findTimelineBlock,
   flattenTimelineChronologically,
+  getConditionalEvaluationError,
   parseActiveIterationParam,
   resolveScreenshotBlockId,
 };
 export type {
+  ConditionalEvaluationError,
   SkippedBranchMetadata,
   UnexecutedBlockReason,
   UnexecutedDefinedBlock,

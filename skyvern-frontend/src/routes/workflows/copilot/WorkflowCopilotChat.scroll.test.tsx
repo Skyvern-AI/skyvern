@@ -68,13 +68,20 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => true,
 }));
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => ({}) }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => ({}), setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
@@ -82,9 +89,7 @@ import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
 
 async function renderChat() {
   render(<WorkflowCopilotChat />);
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
-  );
+  await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
 }
 
 beforeEach(() => {

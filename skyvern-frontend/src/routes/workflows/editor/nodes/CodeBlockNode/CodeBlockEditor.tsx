@@ -7,16 +7,40 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import {
+  primaryButton,
+  secondaryButton,
+} from "@/routes/workflows/copilot/PendingGoalChangesCard";
 import { jinjaHighlight } from "@/routes/workflows/components/jinjaHighlight";
 import { lineHighlight } from "@/routes/workflows/components/lineHighlight";
 import { analyzeCodeBlockErrorCodes } from "@/routes/workflows/editor/codeBlockErrorCodeDiagnostics";
+import {
+  classifyUse,
+  codeBlockUses,
+  stripPythonComments,
+} from "@/routes/workflows/editor/jinjaReferences";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
+import { pythonSyntaxExtensions } from "@/routes/workflows/editor/pythonSyntaxLinter";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import type { CodeBlockStep } from "@/routes/workflows/types/workflowTypes";
+import {
+  codeEditedNoticeIsShown,
+  freshGoalSuggestion,
+  goalChangeIsPending,
+  goalChangeUndoPatch,
+  keepCodeWithGoalPatch,
+} from "@/routes/workflows/editor/workflowEditorUtils";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
-import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import {
+  goalActionIsLocked,
+  useCopilotActionStore,
+} from "@/store/useCopilotActionStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import {
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
 import { deepEqualStringArrays } from "@/util/equality";
 import { cn } from "@/util/utils";
 
@@ -68,18 +92,19 @@ function CodeBlockEditorBody({
   const { editable } = data;
   const update = useUpdate<CodeBlockNodeData>({ id: blockId, editable });
   const scopeReadOnly = useWorkflowScopeReadOnly();
-  const codeFirstAccess = useFeatureFlag("CODE_BLOCK_ACCESS") === true;
-  // Code-first layout needs the access flag plus a prompt; otherwise keep the legacy manual layout.
-  const isCodeFirst = data.prompt != null && codeFirstAccess;
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
   const steps = data.steps ?? [];
-  const [view, setView] = useState<CodeBlockView>("plain");
+  // Steps are derived from any saved code, so only a goal marks a block as code-first.
+  const [view, setView] = useState<CodeBlockView>(
+    data.prompt == null ? "code" : "plain",
+  );
   const [stepsOpen, setStepsOpen] = useState(true);
   const [activeStepIndex, setActiveStepIndex] = useState<number | null>(null);
   const activeStep =
     activeStepIndex != null ? (steps[activeStepIndex] ?? null) : null;
   const codeExtensions = useMemo<Array<Extension>>(() => {
     if (activeStep?.line_start == null) {
-      return jinjaHighlight;
+      return [...jinjaHighlight, ...pythonSyntaxExtensions];
     }
     const activeLineExtensions = lineHighlight([
       {
@@ -90,6 +115,7 @@ function CodeBlockEditorBody({
     ]);
     return [
       ...jinjaHighlight,
+      ...pythonSyntaxExtensions,
       ...(Array.isArray(activeLineExtensions)
         ? activeLineExtensions
         : [activeLineExtensions]),
@@ -98,6 +124,9 @@ function CodeBlockEditorBody({
 
   const requestBuild = useCopilotActionStore((state) => state.requestBuild);
   const requestCancel = useCopilotActionStore((state) => state.requestCancel);
+  const stopBlockedReason = useCopilotActionStore(
+    (state) => state.stopBlockedReason,
+  );
   const generatingBlockLabel = useCopilotActionStore(
     (state) => state.generatingBlockLabel,
   );
@@ -107,8 +136,33 @@ function CodeBlockEditorBody({
     (data.prompt ?? "").trim().length > 0 &&
     !isGenerating &&
     editable &&
-    !scopeReadOnly;
-  const hasGenerated = steps.length > 0;
+    !scopeReadOnly &&
+    !mutationLocked;
+  const hasCode = stripPythonComments(data.code ?? "").trim().length > 0;
+  const isQueued = useCopilotActionStore((state) =>
+    state.queuedBuilds.some((queued) => queued.blockLabel === data.label),
+  );
+  const goalChangePending = goalChangeIsPending(data);
+  const canEditGoalChange = editable && !scopeReadOnly && !mutationLocked;
+  const undoPatch = goalChangeUndoPatch(data);
+  const keepCodePatch = keepCodeWithGoalPatch(data);
+  const codeEditedNotice = codeEditedNoticeIsShown(data);
+  const suggestedGoal = useCopilotActionStore((state) =>
+    freshGoalSuggestion(data, state.goalSuggestions[data.label]),
+  );
+  const suggestingGoal = useCopilotActionStore((state) =>
+    state.suggestingGoalLabels.includes(data.label),
+  );
+  const updateGoal = useCopilotActionStore((state) => state.updateGoal);
+  const keepGoal = useCopilotActionStore((state) => state.keepGoal);
+  const acceptGoal = useCopilotActionStore((state) => state.acceptGoal);
+  const canActOnCodeEdit = useCopilotActionStore(
+    (state) =>
+      !goalActionIsLocked(state, data.label, {
+        readOnly: !editable || scopeReadOnly,
+        mutationLocked,
+      }),
+  );
   const workflowStartNode = nodes
     .filter(isStartNode)
     .find((candidate) => "errorCodeMapping" in candidate.data);
@@ -141,49 +195,152 @@ function CodeBlockEditorBody({
     () => analyzeCodeBlockErrorCodes(data.code, effectiveManifest),
     [data.code, effectiveManifest],
   );
+  const workflowParameters = useWorkflowParametersStore(
+    (state) => state.parameters,
+  );
+  const uses = useMemo(() => {
+    const inputKeys = new Set(
+      workflowParameters.map((parameter) => parameter.key),
+    );
+    const blockLabels = new Set(
+      nodes.filter(isWorkflowBlockNode).map((other) => other.data.label),
+    );
+    return codeBlockUses(data.parameterKeys ?? [], data.code ?? "").map(
+      (name) => ({ name, kind: classifyUse(name, inputKeys, blockLabels) }),
+    );
+  }, [workflowParameters, nodes, data.parameterKeys, data.code]);
 
   const goalField = (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <Label className="text-xs text-tertiary-foreground">Goal</Label>
-        <button
-          type="button"
-          disabled={!canGenerate}
-          aria-label={hasGenerated ? "Regenerate block" : "Generate block"}
-          onClick={() =>
-            requestBuild({ blockLabel: data.label, prompt: data.prompt ?? "" })
-          }
-          className={cn(
-            "nodrag nopan flex items-center gap-1 rounded-md border border-border bg-slate-elevation1 px-2 py-0.5 text-xs text-foreground dark:text-slate-200",
-            canGenerate
-              ? "hover:bg-slate-elevation2"
-              : "cursor-not-allowed opacity-50",
-          )}
-        >
-          <MagicWandIcon className="size-3" />
-          {isGenerating
-            ? "Generating…"
-            : hasGenerated
-              ? "Regenerate"
-              : "Generate"}
-        </button>
+        {goalChangePending ? null : (
+          <button
+            type="button"
+            disabled={!canGenerate}
+            aria-label={hasCode ? "Regenerate block" : "Generate block"}
+            onClick={() =>
+              requestBuild({
+                blockLabel: data.label,
+                prompt: data.prompt ?? "",
+              })
+            }
+            className={cn(
+              "nodrag nopan flex items-center gap-1 rounded-md border border-border bg-slate-elevation1 px-2 py-0.5 text-xs text-foreground dark:text-slate-200",
+              canGenerate
+                ? "hover:bg-slate-elevation2"
+                : "cursor-not-allowed opacity-50",
+            )}
+          >
+            <MagicWandIcon className="size-3" />
+            {isGenerating ? "Generating…" : hasCode ? "Regenerate" : "Generate"}
+          </button>
+        )}
       </div>
       <WorkflowBlockInputTextarea
+        name="prompt"
         nodeId={blockId}
-        onChange={(value) => update({ prompt: value })}
+        onChange={(value) => {
+          if (value === (data.prompt ?? "")) {
+            return;
+          }
+          if (undoPatch && value === (data.goalBeforeEdit?.prompt ?? "")) {
+            update(undoPatch);
+            return;
+          }
+          if (value.trim().length > 0) {
+            update({
+              prompt: value,
+              userOwnedGoal: true,
+              goalNeedsRegeneration: true,
+              ...(!goalChangePending && {
+                goalBeforeEdit: {
+                  prompt: data.prompt,
+                  userOwnedGoal: data.userOwnedGoal,
+                  goalNeedsRegeneration: data.goalNeedsRegeneration,
+                },
+              }),
+            });
+            return;
+          }
+          update({
+            prompt: value,
+            ...(data.userOwnedGoal === true && { userOwnedGoal: false }),
+            ...(goalChangePending && {
+              goalNeedsRegeneration: false,
+              goalBeforeEdit: null,
+            }),
+          });
+        }}
         value={data.prompt ?? ""}
+        // The build in flight carries the Goal it was started with; a later edit would be lost to it.
+        disabled={isGenerating || isQueued}
         className="nopan text-xs"
       />
+      {uses.length > 0 && (
+        <div className="flex min-w-0 flex-wrap items-center gap-1 text-xs">
+          <span aria-hidden="true" className="text-muted-foreground">
+            Uses
+          </span>
+          <ul
+            aria-label="Names this code reads"
+            className="flex min-w-0 flex-wrap gap-1"
+          >
+            {uses.map(({ name, kind }) => (
+              <li
+                key={name}
+                data-kind={kind}
+                title={`${name} (${kind})`}
+                className="max-w-full truncate rounded border border-border bg-slate-elevation1 px-1.5 py-0.5 font-mono text-[10px] text-tertiary-foreground"
+              >
+                {name}
+                <span className="ml-1 font-sans text-muted-foreground">
+                  {kind}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 
+  const dataSchemaText = data.dataSchema?.trim() ?? "";
+  const dataSchemaField =
+    dataSchemaText === "" || dataSchemaText === "null" ? null : (
+      <div className="space-y-2">
+        <Label className="text-xs text-tertiary-foreground">
+          Returned data schema
+        </Label>
+        <pre
+          data-testid="code-block-data-schema"
+          tabIndex={0}
+          className="nopan nowheel max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation1 p-2 text-xs text-tertiary-foreground"
+        >
+          {dataSchemaText}
+        </pre>
+      </div>
+    );
+
   const codeEditorElement = (
     <CodeEditor
+      deferKey={JSON.stringify([blockId, "code"])}
       language="python"
       value={data.code}
       readOnly={scopeReadOnly}
       onChange={(value) => {
-        update({ code: value });
+        if (value === data.code) {
+          return;
+        }
+        update({
+          code: value,
+          ...((data.prompt ?? "").trim().length > 0 &&
+            data.codeEditedByHand !== true && { codeEditedByHand: true }),
+          ...(goalChangePending && {
+            goalNeedsRegeneration: false,
+            goalBeforeEdit: null,
+          }),
+        });
       }}
       className="nopan"
       fontSize={10}
@@ -271,6 +428,7 @@ function CodeBlockEditorBody({
       </div>
       {errorCodeMapping !== "null" && (
         <ErrorCodeMappingEditor
+          deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
           label={data.label}
           value={errorCodeMapping}
           onChange={(value) => update({ errorCodeMapping: value })}
@@ -369,18 +527,122 @@ function CodeBlockEditorBody({
       </div>
     ) : null;
 
-  if (!isCodeFirst) {
-    return (
-      <div data-testid="code-block-block-form" className="space-y-4">
-        {inputsField}
-        <div className="space-y-2">
-          <Label className="text-xs text-tertiary-foreground">Code Input</Label>
-          {codeEditorElement}
+  const goalChangeBanner = goalChangePending ? (
+    <div
+      role="status"
+      data-testid="goal-change-banner"
+      className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs"
+    >
+      <p className="font-medium text-foreground">
+        {isGenerating
+          ? "Applying the new Goal…"
+          : isQueued
+            ? "Waiting to apply the new Goal…"
+            : "Goal changed — not applied yet"}
+      </p>
+      {isGenerating || isQueued ? null : (
+        <>
+          <p className="text-muted-foreground">
+            {keepCodePatch
+              ? "The code was also edited by hand. Keep it if the new Goal describes it."
+              : "This block still does what its old Goal said."}
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={!canEditGoalChange}
+              onClick={() =>
+                requestBuild({
+                  blockLabel: data.label,
+                  prompt: data.prompt ?? "",
+                  applyingGoalChange: true,
+                })
+              }
+              className="nodrag nopan rounded-md bg-primary px-2 py-0.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Apply new Goal
+            </button>
+            {keepCodePatch ? (
+              <button
+                type="button"
+                disabled={!canEditGoalChange}
+                onClick={() => update(keepCodePatch)}
+                className={cn("nodrag nopan", secondaryButton)}
+              >
+                Keep my code
+              </button>
+            ) : null}
+            {undoPatch ? (
+              <button
+                type="button"
+                disabled={!canEditGoalChange}
+                onClick={() => update(undoPatch)}
+                className="nodrag nopan rounded-md border border-border bg-slate-elevation1 px-2 py-0.5 text-xs text-foreground hover:bg-slate-elevation2 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-200"
+              >
+                Undo
+              </button>
+            ) : null}
+          </div>
+        </>
+      )}
+    </div>
+  ) : null;
+
+  const codeEditedBanner =
+    !goalChangePending && codeEditedNotice ? (
+      <div
+        role="status"
+        data-testid="goal-change-banner"
+        className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs"
+      >
+        <p className="font-medium text-foreground">
+          Code changed — Goal may be out of date
+        </p>
+        {suggestedGoal === null ? null : (
+          <>
+            <p className="text-muted-foreground">
+              <span aria-hidden="true">− </span>
+              <span className="sr-only">Old Goal: </span>
+              {data.prompt}
+            </p>
+            <p className="text-foreground">
+              <span aria-hidden="true">+ </span>
+              <span className="sr-only">Suggested Goal: </span>
+              {suggestedGoal}
+            </p>
+          </>
+        )}
+        <div className="flex items-center gap-2">
+          {suggestedGoal === null ? (
+            <button
+              type="button"
+              disabled={!canActOnCodeEdit || suggestingGoal}
+              onClick={() => updateGoal(data.label)}
+              className={cn("nodrag nopan", primaryButton)}
+            >
+              {suggestingGoal ? "Writing a Goal…" : "Update Goal"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={!canActOnCodeEdit}
+              onClick={() => acceptGoal(data.label)}
+              className={cn("nodrag nopan", primaryButton)}
+            >
+              Accept
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={!canActOnCodeEdit}
+            onClick={() => keepGoal(data.label)}
+            className={cn("nodrag nopan", secondaryButton)}
+          >
+            Keep Goal
+          </button>
         </div>
-        {errorCodeMappingField}
       </div>
-    );
-  }
+    ) : null;
 
   return (
     <div data-testid="code-block-block-form" className="space-y-4">
@@ -388,19 +650,34 @@ function CodeBlockEditorBody({
         <Label className="text-xs text-tertiary-foreground">View</Label>
         <CodeBlockViewToggle value={view} onChange={setView} />
       </div>
+      {goalChangeBanner}
       {view === "plain" ? (
         <>
+          {codeEditedBanner}
           {goalField}
-          <CodeBlockPlainCard
-            steps={steps}
-            generating={isGenerating}
-            onStop={requestCancel}
-          />
+          {dataSchemaField}
+          <div
+            className={cn(goalChangePending && !isGenerating && "opacity-50")}
+          >
+            <CodeBlockPlainCard
+              steps={steps}
+              hasCode={hasCode}
+              generating={isGenerating}
+              onStop={requestCancel}
+              stopBlockedReason={stopBlockedReason}
+            />
+          </div>
           {errorCodeMappingField}
         </>
       ) : (
         <>
-          {stepLineList}
+          {stepLineList && (
+            <div
+              className={cn(goalChangePending && !isGenerating && "opacity-50")}
+            >
+              {stepLineList}
+            </div>
+          )}
           {inputsField}
           <div className="space-y-2">
             <Label className="text-xs text-tertiary-foreground">
@@ -408,6 +685,7 @@ function CodeBlockEditorBody({
             </Label>
             {codeEditorElement}
           </div>
+          {codeEditedBanner}
           {errorCodeMappingField}
         </>
       )}

@@ -18,6 +18,7 @@ from skyvern.browser_extension.workstation_grant import (
     workstation_grant_path,
     write_workstation_grant,
 )
+from tests.unit.browser_extension.home_guard import _test_broker_base_dir
 
 from .test_broker_server import FakeRelay, _connect_over_socketpair, _ignore_event
 
@@ -52,10 +53,10 @@ async def test_authentication_with_valid_workstation_grant_skips_pairing(
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
     write_workstation_grant(workstation_grant_path(), token, source="cli")
-    server = BrowserExtensionBrokerServer(19777)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
     server._broker_auth_token = token
     server._relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client, auto_approve=False)
     try:
         assert (await client.broker_status())["approved"] is True
@@ -73,13 +74,13 @@ async def test_interactive_pairing_refreshes_workstation_grant_and_approves_peer
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client, auto_approve=False)
-    peer = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    peer = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     peer_task = await _connect_over_socketpair(server, peer, auto_approve=False)
     try:
         await client.begin_pairing()
@@ -107,11 +108,11 @@ async def test_interactive_pairing_ack_survives_grant_persist_failure(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     server_task = await _connect_over_socketpair(server, client, auto_approve=False)
 
     def fail_write(*_args: object, **_kwargs: object) -> None:
@@ -142,12 +143,12 @@ async def test_workstation_control_ops_are_operator_only_and_revoke_future_auth(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    operator = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    operator = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False, operator=True)
     client_task = await _connect_over_socketpair(server, client, auto_approve=False)
     operator_task = await _connect_over_socketpair(server, operator)
     try:
@@ -246,7 +247,7 @@ async def test_malformed_grants_are_no_grant_and_auth_survives(
     await server.start()
     try:
         assert server._workstation_grant is None
-        client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         server_task = await _connect_over_socketpair(server, client, auto_approve=False)
         try:
             assert (await client.broker_status())["approved"] is False
@@ -263,11 +264,11 @@ async def test_revoked_grant_does_not_approve_overlapping_reauthentication(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir())
     server._broker_auth_token = token
     server._relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    operator = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    operator = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False, operator=True)
     client_task = await _connect_over_socketpair(server, client, auto_approve=False)
     operator_task = await _connect_over_socketpair(server, operator)
     replacement: BrokerClient | None = None
@@ -278,7 +279,7 @@ async def test_revoked_grant_does_not_approve_overlapping_reauthentication(
         await operator.revoke_workstation()
         assert (await client.broker_status())["approved"] is False
 
-        replacement = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        replacement = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         replacement._client_id = client._client_id
         replacement._recovery_secret = client._recovery_secret
         replacement_task = await _connect_over_socketpair(server, replacement, auto_approve=False)
@@ -299,12 +300,12 @@ async def test_revoked_grant_does_not_approve_overlapping_reauthentication(
 async def test_revoke_preserves_interactive_approval(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    operator = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    operator = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False, operator=True)
     client_task = await _connect_over_socketpair(server, client, auto_approve=False)
     operator_task = await _connect_over_socketpair(server, operator)
     replacement: BrokerClient | None = None
@@ -323,7 +324,7 @@ async def test_revoke_preserves_interactive_approval(monkeypatch: pytest.MonkeyP
         assert result["cleared"]["interactive"] == 0
         assert (await client.broker_status())["approved"] is True
 
-        replacement = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        replacement = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         replacement._client_id = client._client_id
         replacement._recovery_secret = client._recovery_secret
         replacement_task = await _connect_over_socketpair(server, replacement, auto_approve=False)
@@ -345,11 +346,11 @@ async def test_revoke_preserves_interactive_approval(monkeypatch: pytest.MonkeyP
 async def test_interactive_approval_dies_on_true_disconnect(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client_task = await _connect_over_socketpair(server, client, auto_approve=False)
     replacement: BrokerClient | None = None
     replacement_task: asyncio.Task[None] | None = None
@@ -367,7 +368,7 @@ async def test_interactive_approval_dies_on_true_disconnect(monkeypatch: pytest.
         await client.stop()
         await asyncio.wait_for(client_task, 1.0)
 
-        replacement = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        replacement = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         replacement._client_id = client._client_id
         replacement._recovery_secret = client._recovery_secret
         replacement_task = await _connect_over_socketpair(server, replacement, auto_approve=False)
@@ -393,12 +394,12 @@ async def test_revoke_all_clears_interactive_approval_and_blocks_replacement(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    operator = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    operator = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False, operator=True)
     client_task = await _connect_over_socketpair(server, client, auto_approve=False)
     operator_task = await _connect_over_socketpair(server, operator)
     replacement: BrokerClient | None = None
@@ -422,7 +423,7 @@ async def test_revoke_all_clears_interactive_approval_and_blocks_replacement(
         assert credential.approval_source is None
         assert credential.approval_event.is_set() is False
 
-        replacement = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        replacement = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         replacement._client_id = client._client_id
         replacement._recovery_secret = client._recovery_secret
         replacement_task = await _connect_over_socketpair(server, replacement, auto_approve=False)
@@ -446,12 +447,12 @@ async def test_revoke_all_clears_live_approvals_when_grant_path_is_unsafe(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    interactive_client = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    operator = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
+    interactive_client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    operator = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False, operator=True)
     grant_client: BrokerClient | None = None
     interactive_task = await _connect_over_socketpair(server, interactive_client, auto_approve=False)
     operator_task = await _connect_over_socketpair(server, operator)
@@ -463,7 +464,7 @@ async def test_revoke_all_clears_live_approvals_when_grant_path_is_unsafe(
         await relay.emit_event("pairing.approved", {"approvalNonce": offer["approvalNonce"]})
         assert server._credentials[interactive_client._client_id].approval_source == "interactive"
 
-        grant_client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        grant_client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         grant_task = await _connect_over_socketpair(server, grant_client, auto_approve=False)
         assert (await grant_client.broker_status())["approved"] is True
         assert server._credentials[grant_client._client_id].approval_source == "grant"
@@ -496,12 +497,12 @@ async def test_revoke_default_clears_live_grant_approval_when_grant_path_is_fifo
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    interactive_client = BrokerClient(19777, _ignore_event, auto_spawn=False)
-    operator = BrokerClient(19777, _ignore_event, auto_spawn=False, operator=True)
+    interactive_client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
+    operator = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False, operator=True)
     grant_client: BrokerClient | None = None
     interactive_task = await _connect_over_socketpair(server, interactive_client, auto_approve=False)
     operator_task = await _connect_over_socketpair(server, operator)
@@ -512,7 +513,7 @@ async def test_revoke_default_clears_live_grant_approval_when_grant_path_is_fifo
         assert offer is not None
         await relay.emit_event("pairing.approved", {"approvalNonce": offer["approvalNonce"]})
 
-        grant_client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        grant_client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         grant_task = await _connect_over_socketpair(server, grant_client, auto_approve=False)
         assert (await grant_client.broker_status())["approved"] is True
         assert server._credentials[grant_client._client_id].approval_source == "grant"
@@ -545,11 +546,11 @@ async def test_failed_successor_handshake_clears_transferred_approval(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     token = "broker-token"
-    server = BrowserExtensionBrokerServer(19777, pairing_opener=lambda _url: True)
+    server = BrowserExtensionBrokerServer(19777, base_dir=_test_broker_base_dir(), pairing_opener=lambda _url: True)
     server._broker_auth_token = token
     relay = FakeRelay(token, 19777, server._handle_extension_event, server._handle_disconnect)
     server._relay = relay
-    client = BrokerClient(19777, _ignore_event, auto_spawn=False)
+    client = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     client_task = await _connect_over_socketpair(server, client, auto_approve=False)
     replacement: BrokerClient | None = None
     replacement_task: asyncio.Task[None] | None = None
@@ -564,7 +565,7 @@ async def test_failed_successor_handshake_clears_transferred_approval(
             raise RuntimeError("successor snapshot failed")
 
         monkeypatch.setattr(server, "_send_client_snapshot", fail_snapshot)
-        replacement = BrokerClient(19777, _ignore_event, auto_spawn=False)
+        replacement = BrokerClient(19777, _ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
         replacement._client_id = client._client_id
         replacement._recovery_secret = client._recovery_secret
         replacement_task = await _connect_over_socketpair(server, replacement, auto_approve=False)

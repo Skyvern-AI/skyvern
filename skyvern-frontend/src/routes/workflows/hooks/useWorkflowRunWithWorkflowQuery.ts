@@ -1,55 +1,16 @@
-import { getClient } from "@/api/AxiosClient";
-import { WorkflowRunStatusApiResponseWithWorkflow } from "@/api/types";
-import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { statusIsRunningOrQueued } from "@/routes/tasks/types";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useFirstParam } from "@/hooks/useFirstParam";
-import { getRunStatusRefetchInterval } from "./useWorkflowRunQuery";
-import {
-  getActiveOrgQueryKeyScope,
-  getOrgScopedQueryKey,
-  useActiveOrgId,
-} from "@/store/ActiveOrgContext";
+import { useWorkflowRunByIdQuery } from "./useWorkflowRunQuery";
 
+// The key is required so that passing an options object always states a run, even
+// when that run is undefined; omitting the object entirely is what defers to the
+// route. Optional-key typing made those two cases identical to tsc.
 function useWorkflowRunWithWorkflowQuery(options?: {
-  workflowRunId?: string;
+  workflowRunId: string | undefined;
   enabled?: boolean;
 }) {
   const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
-  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
-  const credentialGetter = useCredentialGetter();
-  const activeOrgId = useActiveOrgId();
-  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
-
-  return useQuery<WorkflowRunStatusApiResponseWithWorkflow>({
-    queryKey: getOrgScopedQueryKey(
-      ["workflowRun", workflowRunId],
-      activeOrgQueryKeyScope,
-    ),
-    queryFn: async ({ signal }) => {
-      const client = await getClient(credentialGetter, "sans-api-v1");
-      return client
-        .get(`/workflows/runs/${workflowRunId}`, { signal })
-        .then((response) => response.data);
-    },
-    refetchInterval: (query) => getRunStatusRefetchInterval(query.state),
-    // required for OS-level notifications to work (workflow run completion)
-    refetchIntervalInBackground: true,
-    placeholderData: keepPreviousData,
-    refetchOnMount: (query) => {
-      if (!query.state.data) {
-        return false;
-      }
-      return statusIsRunningOrQueued(query.state.data) ? "always" : false;
-    },
-    refetchOnWindowFocus: (query) => {
-      if (!query.state.data) {
-        return false;
-      }
-      return statusIsRunningOrQueued(query.state.data);
-    },
-    enabled: (options?.enabled ?? true) && !!workflowRunId,
-  });
+  const workflowRunId = options ? options.workflowRunId : urlWorkflowRunId;
+  return useWorkflowRunByIdQuery(workflowRunId, options?.enabled ?? true);
 }
 
 export { useWorkflowRunWithWorkflowQuery };

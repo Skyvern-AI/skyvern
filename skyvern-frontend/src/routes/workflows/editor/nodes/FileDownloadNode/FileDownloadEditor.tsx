@@ -26,6 +26,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { GOOGLE_DRIVE_REQUIRED_SCOPES } from "@/util/googleScopes";
+import { cn } from "@/util/utils";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
@@ -35,15 +36,22 @@ import { type AppNode } from "..";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
+import { SftpPrivateKeyField } from "../components/SftpPrivateKeyField";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
 import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
+import {
+  blockUrlErrorId,
+  useBlockUrlError,
+} from "../../hooks/useBlockUrlError";
 import { errorMappingExampleValue } from "../types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useUpdate } from "../../useUpdate";
 import {
   getAvailableOutputParameterKeys,
   getParentLoopSkipsOnFail,
+  isFirstBrowserTaskBlock,
   isNodeInsideForLoop,
+  urlMayBeGoogleDrive,
 } from "../../workflowEditorUtils";
 
 const urlTooltip =
@@ -127,6 +135,7 @@ function FileDownloadEditorBody({
     sftpPrivateKeyPassphrase,
     sftpRemotePath,
     sftpHostKey,
+    sftpSourcePath,
   } = data;
 
   const nodes = useNodes<AppNode>();
@@ -136,17 +145,147 @@ function FileDownloadEditorBody({
     edges,
     blockId,
   );
+  const isFirstBrowserTask = isFirstBrowserTaskBlock(nodes, edges, blockId);
+  const urlError = useBlockUrlError(blockId);
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const update = useUpdate<FileDownloadNodeData>({ id: blockId, editable });
   const hasInteracted = useHasInteractedThisSession();
+  const hasSftpSource = Boolean(sftpSourcePath);
   const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
     parameterKeys.length > 0 ? parameterKeys[0] : undefined,
   );
+  // Keep an already-selected account editable even once the URL stops looking like a
+  // Drive link, so the field never disappears with a value still attached to the block.
+  const showGoogleDriveSourceAccount =
+    !hasSftpSource &&
+    downloadTarget !== "website" &&
+    downloadTarget !== "google_drive" &&
+    (urlMayBeGoogleDrive(url) || Boolean(googleCredentialId));
 
   return (
     <div data-testid="file-download-block-form" className="space-y-4">
       <div className="space-y-4">
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <Label className="text-xs text-tertiary-foreground">URL</Label>
+            <HelpTooltip
+              content={
+                hasSftpSource
+                  ? "A URL is not required when reading a file from SFTP."
+                  : urlTooltip
+              }
+            />
+          </div>
+          <WorkflowBlockInputTextarea
+            name="url"
+            nodeId={blockId}
+            onChange={(next) => update({ url: next })}
+            value={url}
+            placeholder={urlPlaceholder}
+            aria-invalid={urlError !== null}
+            aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+            className={cn(
+              "nopan text-xs",
+              urlError !== null && "border-destructive",
+            )}
+          />
+          {urlError ? (
+            <p
+              id={blockUrlErrorId(blockId)}
+              className="text-xs text-destructive"
+            >
+              {urlError}
+            </p>
+          ) : (
+            isFirstBrowserTask &&
+            !hasSftpSource &&
+            !url.trim() && (
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                Nothing runs before this block, so it needs a URL to start from.
+              </p>
+            )
+          )}
+        </div>
+        <Accordion
+          type="single"
+          collapsible
+          defaultValue={hasSftpSource ? "sftp-source" : undefined}
+        >
+          <AccordionItem value="sftp-source" className="border-b-0">
+            <AccordionTrigger className="py-0">
+              Read from SFTP (Optional)
+            </AccordionTrigger>
+            <AccordionContent className="pt-2">
+              <DestinationField
+                label="SFTP Source Path"
+                help="The file path to read from the SFTP server. Setting this path uses SFTP as the source instead of a browser URL."
+              >
+                <WorkflowBlockInputTextarea
+                  name="sftpSourcePath"
+                  nodeId={blockId}
+                  onChange={(value) => update({ sftpSourcePath: value })}
+                  value={sftpSourcePath ?? ""}
+                  placeholder="/path/to/file"
+                  className="nopan text-xs"
+                />
+              </DestinationField>
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+        {!hasSftpSource && (
+          <>
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <Label className="text-xs text-tertiary-foreground">
+                  Download Goal
+                </Label>
+                <HelpTooltip content={navigationGoalTooltip} />
+              </div>
+              <WorkflowBlockInputTextarea
+                name="navigationGoal"
+                aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
+                nodeId={blockId}
+                onChange={(next) => update({ navigationGoal: next })}
+                value={navigationGoal}
+                placeholder={navigationGoalPlaceholder}
+                className="nopan text-xs"
+              />
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Label className="text-xs text-tertiary-foreground">
+                  Download Timeout (sec)
+                </Label>
+                <HelpTooltip
+                  content={`The maximum time to wait for downloads to complete, in seconds. If not set, defaults to ${BROWSER_DOWNLOAD_TIMEOUT_SECONDS} seconds.`}
+                />
+                <Input
+                  className="ml-auto w-16 text-right"
+                  type="number"
+                  min={1}
+                  value={downloadTimeout ?? ""}
+                  placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
+                  onChange={(event) => {
+                    // Empty input clears the override; numeric inputs land
+                    // verbatim. The previous `if (next) { update(...) }`
+                    // silently dropped `0`, so a user typing "0" thinking
+                    // "no timeout" got no save and no feedback.
+                    if (event.target.value === "") {
+                      update({ downloadTimeout: null });
+                      return;
+                    }
+                    const next = Number(event.target.value);
+                    if (Number.isFinite(next) && next >= 0) {
+                      update({ downloadTimeout: next });
+                    }
+                  }}
+                />
+              </div>
+            </div>
+          </>
+        )}
+
         <div className="space-y-2">
           <div className="flex items-center gap-2">
             <Label className="text-sm text-slate-400">Download Target</Label>
@@ -182,49 +321,6 @@ function FileDownloadEditorBody({
           </Select>
         </div>
 
-        {downloadTarget !== "website" && (
-          <DestinationField
-            label="Prompt"
-            help={helpTooltips["fileDownload"]["prompt"]}
-          >
-            <WorkflowBlockInputTextarea
-              nodeId={blockId}
-              onChange={(value) => update({ prompt: value })}
-              value={prompt ?? ""}
-              placeholder={
-                'e.g. Only send the PDF files whose names contain "invoice"'
-              }
-              className="nopan text-xs"
-            />
-            <p className="text-xs text-slate-400">
-              Optional. Leave empty to send all downloaded files.
-            </p>
-          </DestinationField>
-        )}
-
-        {downloadTarget !== "website" && (
-          <DestinationField
-            label={
-              downloadTarget === "google_drive"
-                ? "Google Account"
-                : "Google Drive Source Account (Optional)"
-            }
-            help={
-              downloadTarget === "google_drive"
-                ? "The connected Google account used for Drive downloads and uploads."
-                : "Select a connected Google account to download private Google Drive links before sending the file to this destination."
-            }
-          >
-            <GoogleOAuthCredentialSelector
-              nodeId={blockId}
-              value={googleCredentialId ?? ""}
-              onChange={(value) => update({ googleCredentialId: value })}
-              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
-              optional={downloadTarget !== "google_drive"}
-            />
-          </DestinationField>
-        )}
-
         {downloadTarget === "s3" && (
           <>
             <DestinationField
@@ -232,6 +328,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["aws_access_key_id"]}
             >
               <WorkflowBlockInputTextarea
+                name="awsAccessKeyId"
                 nodeId={blockId}
                 onChange={(value) => update({ awsAccessKeyId: value })}
                 value={awsAccessKeyId as string}
@@ -243,6 +340,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["aws_secret_access_key"]}
             >
               <WorkflowBlockInput
+                name="awsSecretAccessKey"
                 nodeId={blockId}
                 type="password"
                 value={awsSecretAccessKey as string}
@@ -255,6 +353,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["s3_bucket"]}
             >
               <WorkflowBlockInputTextarea
+                name="s3Bucket"
                 nodeId={blockId}
                 onChange={(value) => update({ s3Bucket: value })}
                 value={s3Bucket as string}
@@ -266,6 +365,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["region_name"]}
             >
               <WorkflowBlockInputTextarea
+                name="regionName"
                 nodeId={blockId}
                 onChange={(value) => update({ regionName: value })}
                 value={regionName as string}
@@ -277,6 +377,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["endpoint_url"]}
             >
               <WorkflowBlockInputTextarea
+                name="endpointUrl"
                 nodeId={blockId}
                 onChange={(value) => update({ endpointUrl: value })}
                 value={endpointUrl as string}
@@ -289,6 +390,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["path"]}
             >
               <WorkflowBlockInputTextarea
+                name="path:s3"
                 nodeId={blockId}
                 onChange={(value) => update({ path: value })}
                 value={path as string}
@@ -305,6 +407,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["azure_storage_account_name"]}
             >
               <WorkflowBlockInputTextarea
+                name="azureStorageAccountName"
                 nodeId={blockId}
                 onChange={(value) => update({ azureStorageAccountName: value })}
                 value={azureStorageAccountName as string}
@@ -316,6 +419,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["azure_storage_account_key"]}
             >
               <WorkflowBlockInput
+                name="azureStorageAccountKey"
                 nodeId={blockId}
                 type="password"
                 value={azureStorageAccountKey as string}
@@ -328,6 +432,7 @@ function FileDownloadEditorBody({
               help={helpTooltips["fileDownload"]["azure_blob_container_name"]}
             >
               <WorkflowBlockInputTextarea
+                name="azureBlobContainerName"
                 nodeId={blockId}
                 onChange={(value) => update({ azureBlobContainerName: value })}
                 value={azureBlobContainerName as string}
@@ -339,6 +444,7 @@ function FileDownloadEditorBody({
               help="Optional folder path within the blob container. Defaults to {{ workflow_run_id }} if not specified."
             >
               <WorkflowBlockInputTextarea
+                name="path:azure"
                 nodeId={blockId}
                 onChange={(value) => update({ path: value })}
                 value={path as string}
@@ -349,26 +455,53 @@ function FileDownloadEditorBody({
         )}
 
         {downloadTarget === "google_drive" && (
-          <DestinationField
-            label="Google Drive Folder ID (Optional)"
-            help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
-          >
-            <WorkflowBlockInputTextarea
-              nodeId={blockId}
-              onChange={(value) => update({ googleDriveFolderId: value })}
-              value={googleDriveFolderId ?? ""}
-              className="nopan text-xs"
-            />
-          </DestinationField>
-        )}
-
-        {downloadTarget === "sftp" && (
           <>
             <DestinationField
-              label="SFTP Host"
-              help="The SFTP host to upload files to."
+              label="Google Account"
+              help="The connected Google account used for Drive downloads and uploads."
+            >
+              <GoogleOAuthCredentialSelector
+                nodeId={blockId}
+                value={googleCredentialId ?? ""}
+                onChange={(value) => update({ googleCredentialId: value })}
+                requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              />
+            </DestinationField>
+            <DestinationField
+              label="Google Drive Folder ID (Optional)"
+              help="Destination Google Drive folder. You can paste a Drive folder URL or a bare folder ID. Leave empty to upload to the account's My Drive root."
             >
               <WorkflowBlockInputTextarea
+                name="googleDriveFolderId"
+                nodeId={blockId}
+                onChange={(value) => update({ googleDriveFolderId: value })}
+                value={googleDriveFolderId ?? ""}
+                className="nopan text-xs"
+              />
+            </DestinationField>
+          </>
+        )}
+
+        {(downloadTarget === "sftp" || hasSftpSource) && (
+          <>
+            <DestinationField
+              label={
+                hasSftpSource
+                  ? downloadTarget === "sftp"
+                    ? "SFTP Host (Source and Destination)"
+                    : "SFTP Host (Source)"
+                  : "SFTP Host"
+              }
+              help={
+                hasSftpSource
+                  ? downloadTarget === "sftp"
+                    ? "The SFTP host used to read the source file and upload files to the destination."
+                    : "The SFTP host to read files from."
+                  : "The SFTP host to upload files to."
+              }
+            >
+              <WorkflowBlockInputTextarea
+                name="sftpHost"
                 nodeId={blockId}
                 onChange={(value) => update({ sftpHost: value })}
                 value={sftpHost ?? ""}
@@ -380,6 +513,7 @@ function FileDownloadEditorBody({
               help="Numeric only — template values are not supported. Defaults to 22 if left blank."
             >
               <WorkflowBlockInputTextarea
+                name="sftpPort"
                 nodeId={blockId}
                 onChange={(value) =>
                   update({ sftpPort: value.replace(/[^0-9]/g, "") })
@@ -390,6 +524,7 @@ function FileDownloadEditorBody({
             </DestinationField>
             <DestinationField label="Username" help="The SFTP username.">
               <WorkflowBlockInputTextarea
+                name="sftpUsername"
                 nodeId={blockId}
                 onChange={(value) => update({ sftpUsername: value })}
                 value={sftpUsername ?? ""}
@@ -401,6 +536,7 @@ function FileDownloadEditorBody({
               help="Password auth. Leave blank if using a private key. Reference a secret parameter for security."
             >
               <WorkflowBlockInput
+                name="sftpPassword"
                 nodeId={blockId}
                 type="password"
                 onChange={(value) => update({ sftpPassword: value })}
@@ -412,10 +548,12 @@ function FileDownloadEditorBody({
               label="Private Key"
               help="PEM private key for key-based auth. Leave blank if using a password. Reference a secret parameter for security."
             >
-              <WorkflowBlockInputTextarea
+              <SftpPrivateKeyField
+                key={blockId}
                 nodeId={blockId}
                 onChange={(value) => update({ sftpPrivateKey: value })}
                 value={sftpPrivateKey ?? ""}
+                disabled={!editable}
                 className="nopan text-xs"
               />
             </DestinationField>
@@ -424,6 +562,7 @@ function FileDownloadEditorBody({
               help="Optional passphrase for the private key."
             >
               <WorkflowBlockInput
+                name="sftpPrivateKeyPassphrase"
                 nodeId={blockId}
                 type="password"
                 onChange={(value) =>
@@ -433,23 +572,36 @@ function FileDownloadEditorBody({
                 className="nopan text-xs"
               />
             </DestinationField>
+            {downloadTarget === "sftp" && (
+              <DestinationField
+                label="(Optional) Remote Directory"
+                help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
+              >
+                <WorkflowBlockInputTextarea
+                  name="sftpRemotePath"
+                  nodeId={blockId}
+                  onChange={(value) => update({ sftpRemotePath: value })}
+                  value={sftpRemotePath ?? ""}
+                  className="nopan text-xs"
+                />
+              </DestinationField>
+            )}
             <DestinationField
-              label="(Optional) Remote Directory"
-              help="Remote directory to upload into. Created if it does not exist. Defaults to the login directory."
+              label={
+                hasSftpSource
+                  ? "Host Key (Required for SFTP source)"
+                  : "(Optional) Host Key"
+              }
+              help={
+                hasSftpSource
+                  ? "Required when reading from SFTP. Pin the server's host key (e.g. 'ssh-ed25519 AAAA...') so the connection can be verified."
+                  : "If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
+              }
             >
               <WorkflowBlockInputTextarea
+                name="sftpHostKey"
                 nodeId={blockId}
-                onChange={(value) => update({ sftpRemotePath: value })}
-                value={sftpRemotePath ?? ""}
-                className="nopan text-xs"
-              />
-            </DestinationField>
-            <DestinationField
-              label="(Optional) Host Key"
-              help="If blank, the server's host key is NOT verified and the connection can be intercepted (MITM). Pin a host key (e.g. 'ssh-ed25519 AAAA...') for untrusted networks."
-            >
-              <WorkflowBlockInputTextarea
-                nodeId={blockId}
+                aria-required={hasSftpSource}
                 onChange={(value) => update({ sftpHostKey: value })}
                 value={sftpHostKey ?? ""}
                 className="nopan text-xs"
@@ -458,66 +610,42 @@ function FileDownloadEditorBody({
           </>
         )}
 
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">URL</Label>
-            <HelpTooltip content={urlTooltip} />
-          </div>
-          <WorkflowBlockInputTextarea
-            nodeId={blockId}
-            onChange={(next) => update({ url: next })}
-            value={url}
-            placeholder={urlPlaceholder}
-            className="nopan text-xs"
-          />
-        </div>
-        <div className="space-y-2">
-          <div className="flex gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Download Goal
-            </Label>
-            <HelpTooltip content={navigationGoalTooltip} />
-          </div>
-          <WorkflowBlockInputTextarea
-            aiImprove={AI_IMPROVE_CONFIGS.fileDownload.navigationGoal}
-            nodeId={blockId}
-            onChange={(next) => update({ navigationGoal: next })}
-            value={navigationGoal}
-            placeholder={navigationGoalPlaceholder}
-            className="nopan text-xs"
-          />
-        </div>
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Label className="text-xs text-tertiary-foreground">
-              Download Timeout (sec)
-            </Label>
-            <HelpTooltip
-              content={`The maximum time to wait for downloads to complete, in seconds. If not set, defaults to ${BROWSER_DOWNLOAD_TIMEOUT_SECONDS} seconds.`}
+        {showGoogleDriveSourceAccount && (
+          <DestinationField
+            label="Google Drive Source Account (Optional)"
+            help="Only applies when the URL above is a private Google Drive link: the file is fetched through this connected account instead of the browser."
+          >
+            <GoogleOAuthCredentialSelector
+              nodeId={blockId}
+              value={googleCredentialId ?? ""}
+              onChange={(value) => update({ googleCredentialId: value })}
+              requiredScopes={GOOGLE_DRIVE_REQUIRED_SCOPES}
+              optional
             />
-            <Input
-              className="ml-auto w-16 text-right"
-              type="number"
-              min={1}
-              value={downloadTimeout ?? ""}
-              placeholder={`${BROWSER_DOWNLOAD_TIMEOUT_SECONDS}`}
-              onChange={(event) => {
-                // Empty input clears the override; numeric inputs land
-                // verbatim. The previous `if (next) { update(...) }`
-                // silently dropped `0`, so a user typing "0" thinking
-                // "no timeout" got no save and no feedback.
-                if (event.target.value === "") {
-                  update({ downloadTimeout: null });
-                  return;
-                }
-                const next = Number(event.target.value);
-                if (Number.isFinite(next) && next >= 0) {
-                  update({ downloadTimeout: next });
-                }
-              }}
+          </DestinationField>
+        )}
+
+        {downloadTarget !== "website" && (
+          <DestinationField
+            label="Files to Send (Optional)"
+            help={helpTooltips["fileDownload"]["prompt"]}
+          >
+            <WorkflowBlockInputTextarea
+              name="prompt"
+              nodeId={blockId}
+              onChange={(value) => update({ prompt: value })}
+              value={prompt ?? ""}
+              placeholder={
+                'e.g. Only send the PDF files whose names contain "invoice"'
+              }
+              className="nopan text-xs"
             />
-          </div>
-        </div>
+            <p className="text-xs text-slate-400">
+              Filters the files this block already downloaded. Leave empty to
+              send all of them.
+            </p>
+          </DestinationField>
+        )}
         {!hasInteracted && (
           <div className="workflow-editor-tip rounded-md bg-muted p-2 text-xs text-muted-foreground">
             Once the file is downloaded, this block will complete.
@@ -608,6 +736,7 @@ function FileDownloadEditorBody({
                 </div>
                 {errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={label}
                     value={errorCodeMapping}
                     onChange={(next) => update({ errorCodeMapping: next })}
@@ -656,6 +785,7 @@ function FileDownloadEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="downloadSuffix"
                   nodeId={blockId}
                   onChange={(next) => update({ downloadSuffix: next })}
                   value={downloadSuffix ?? ""}
@@ -674,6 +804,7 @@ function FileDownloadEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpIdentifier"
                   nodeId={blockId}
                   onChange={(next) => update({ totpIdentifier: next })}
                   value={totpIdentifier ?? ""}
@@ -700,6 +831,7 @@ function FileDownloadEditorBody({
                   />
                 </div>
                 <WorkflowBlockInputTextarea
+                  name="totpVerificationUrl"
                   nodeId={blockId}
                   onChange={(next) => update({ totpVerificationUrl: next })}
                   value={totpVerificationUrl ?? ""}

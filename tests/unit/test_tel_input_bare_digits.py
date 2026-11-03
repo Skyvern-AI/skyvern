@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -13,12 +11,10 @@ from skyvern.constants import TEXT_INPUT_DELAY
 from skyvern.forge.sdk.event.default import DefaultInputStrategy
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.handler import (
-    _is_tel_digit_fix_enabled,
     _nanp_e164_fallback,
     _nanp_national_digits,
     _plan_tel_text,
 )
-from tests.unit.helpers import make_organization, make_task
 
 
 @pytest.mark.parametrize(
@@ -525,20 +521,4 @@ async def test_strategy_aware_input_appends_without_atomic_fill(monkeypatch: pyt
         text,
         timeout=4321,
         allow_batched_playwright=True,
-    )
-
-
-@pytest.mark.asyncio
-async def test_is_tel_digit_fix_enabled_uses_org_keyed_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime.now(UTC)
-    organization = make_organization(now)
-    task = make_task(now, organization)
-    provider = SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=True))
-    monkeypatch.setattr("skyvern.webeye.actions.handler.app.EXPERIMENTATION_PROVIDER", provider)
-
-    assert await _is_tel_digit_fix_enabled(task) is True
-    provider.is_feature_enabled_cached.assert_awaited_once_with(
-        "FIX_TEL_INPUT_DIGIT_DROP",
-        organization.organization_id,
-        properties={"organization_id": organization.organization_id},
     )

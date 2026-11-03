@@ -13,6 +13,7 @@ import re
 import zlib
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 import libcst as cst
@@ -20,7 +21,11 @@ import structlog
 from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
 from skyvern.config import settings
-from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS, SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION
+from skyvern.core.script_generations.constants import (
+    SCRIPT_TASK_BLOCKS,
+    SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION,
+    engine_only_loop_child_types,
+)
 from skyvern.core.script_generations.deterministic_field_naming import (
     infer_credential_subscript_for_emit,
     pick_credential_root_for_block,
@@ -423,12 +428,34 @@ MIN_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 4
 MAX_PARAM_VALUE_LENGTH_FOR_PROMPT_SUB = 500
 
 
+def _has_multi_field_totp_action(actions: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(action.get("totp_timing_info"), dict) and action["totp_timing_info"].get("is_totp_sequence") is True
+        for action in actions
+    )
+
+
+def _has_unsupported_close_page_action(actions: list[dict[str, Any]]) -> bool:
+    return any(
+        action.get("action_type") == ActionType.CLOSE_PAGE and not action.get("is_internal_recovery")
+        for action in actions
+    )
+
+
 def _actions_support_cached_scripts(actions: list[dict[str, Any]]) -> bool:
-    return not any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+    return not (
+        _has_multi_field_totp_action(actions)
+        or _has_unsupported_close_page_action(actions)
+        or any(action.get("action_type") == ActionType.PASTE_TEXT for action in actions)
+    )
 
 
 def _ensure_actions_support_cached_scripts(actions: list[dict[str, Any]]) -> None:
     if not _actions_support_cached_scripts(actions):
+        if _has_multi_field_totp_action(actions):
+            raise ValueError("Multi-field TOTP has no cached-script representation")
+        if _has_unsupported_close_page_action(actions):
+            raise ValueError("CLOSE_PAGE has no cached-script representation")
         raise ValueError("PASTE_TEXT has no cached-script representation")
 
 
@@ -750,6 +777,9 @@ def _per_action_reasoning(act: dict) -> str:
 
 def _value(value: Any) -> cst.BaseExpression:
     """Convert simple Python objects to CST expressions."""
+    if isinstance(value, Enum):
+        # model_dump() hands over enum members, whose repr is not a literal.
+        value = value.value
     if isinstance(value, str):
         if "\n" in value:
             # For multi-line strings, use repr() which handles all escaping properly
@@ -1558,9 +1588,11 @@ def _build_block_fn(
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
                 ActionType.NULL_ACTION,
-                # These actions have no ACTION_MAP representation in cached scripts.
+                # Tab management has no ACTION_MAP representation. Ordinary closes are rejected
+                # by the support check above; only internal-recovery closes are skipped here.
                 ActionType.NEW_TAB,
                 ActionType.SWITCH_TAB,
+                ActionType.CLOSE_PAGE,
             ]:
                 continue
 
@@ -1744,6 +1776,20 @@ def _build_download_statement(
         ],
     }
     destination_fields = destination_fields_by_target.get(download_target)
+    source_fields = (
+        [
+            "sftp_source_path",
+            "sftp_host",
+            "sftp_port",
+            "sftp_username",
+            "sftp_password",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_host_key",
+        ]
+        if block.get("sftp_source_path")
+        else []
+    )
     if destination_fields is not None and block.get("prompt") is not None:
         args[0] = args[0].with_changes(keyword=cst.Name("navigation_goal"))
 
@@ -1770,6 +1816,20 @@ def _build_download_statement(
                         ),
                     )
                 )
+    for key in source_fields:
+        if destination_fields is not None and key in destination_fields:
+            continue
+        if block.get(key) is not None:
+            args.append(
+                cst.Arg(
+                    keyword=cst.Name(key),
+                    value=_value(block.get(key, "")),
+                    whitespace_after_arg=cst.ParenthesizedWhitespace(
+                        indent=True,
+                        last_line=cst.SimpleWhitespace(INDENT),
+                    ),
+                )
+            )
     _mark_last_arg_as_comma(args)
     call = cst.Call(
         func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("download")),
@@ -1959,8 +2019,46 @@ def _build_navigate_statement(
     return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
 
 
+def _build_gmail_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
+    # Only the label and the connection are emitted: the cached call is logged, and the helper reads the
+    # recipients, subject and body from the workflow definition by label.
+    fields: list[tuple[str, Any]] = [("transport", "gmail")]
+    if block.get("credential_id"):
+        fields.append(("credential_id", block["credential_id"]))
+    args = [
+        cst.Arg(
+            keyword=cst.Name(field),
+            value=_value(value),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(
+                indent=True,
+                last_line=cst.SimpleWhitespace(INDENT),
+            ),
+        )
+        for field, value in fields
+    ]
+    args.append(
+        cst.Arg(
+            keyword=cst.Name("label"),
+            value=_value(block.get("label", "")),
+            whitespace_after_arg=cst.ParenthesizedWhitespace(indent=True),
+            comma=cst.Comma(),
+        )
+    )
+    call = cst.Call(
+        func=cst.Attribute(value=cst.Name("skyvern"), attr=cst.Name("send_email")),
+        args=args,
+        whitespace_before_args=cst.ParenthesizedWhitespace(
+            indent=True,
+            last_line=cst.SimpleWhitespace(INDENT),
+        ),
+    )
+    return cst.SimpleStatementLine([cst.Expr(cst.Await(call))])
+
+
 def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLine:
     """Build a skyvern.send_email statement."""
+    if block.get("transport") == "gmail":
+        return _build_gmail_send_email_statement(block)
     args = [
         cst.Arg(
             keyword=cst.Name("sender"),
@@ -2004,14 +2102,21 @@ def _build_send_email_statement(block: dict[str, Any]) -> cst.SimpleStatementLin
         ),
     ]
 
-    for custom_smtp_field in ("custom_smtp_host", "custom_smtp_port", "custom_smtp_username", "custom_smtp_password"):
-        custom_smtp_value = block.get(custom_smtp_field)
-        if custom_smtp_value is None or custom_smtp_value == "":
+    body_format = block.get("body_format")
+    optional_fields: list[tuple[str, Any]] = [
+        ("custom_smtp_host", block.get("custom_smtp_host")),
+        ("custom_smtp_port", block.get("custom_smtp_port")),
+        ("custom_smtp_username", block.get("custom_smtp_username")),
+        ("custom_smtp_password", block.get("custom_smtp_password")),
+        ("body_format", None if body_format in (None, "", "text") else body_format),
+    ]
+    for field, value in optional_fields:
+        if value is None or value == "":
             continue
         args.append(
             cst.Arg(
-                keyword=cst.Name(custom_smtp_field),
-                value=_value(custom_smtp_value),
+                keyword=cst.Name(field),
+                value=_value(value),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -2418,6 +2523,30 @@ def _build_file_url_parser_statement(block: dict[str, Any]) -> cst.SimpleStateme
             cst.Arg(
                 keyword=cst.Name("model"),
                 value=_value(block.get("model")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("worksheet"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("worksheet"),
+                value=_value(block.get("worksheet")),
+                whitespace_after_arg=cst.ParenthesizedWhitespace(
+                    indent=True,
+                    last_line=cst.SimpleWhitespace(INDENT),
+                ),
+            )
+        )
+
+    if block.get("force_ocr"):
+        args.append(
+            cst.Arg(
+                keyword=cst.Name("force_ocr"),
+                value=_value(True),
                 whitespace_after_arg=cst.ParenthesizedWhitespace(
                     indent=True,
                     last_line=cst.SimpleWhitespace(INDENT),
@@ -2878,10 +3007,7 @@ def _build_for_loop_statement(block_title: str, block: dict[str, Any]) -> cst.Fo
     # Create the for loop target (current_value)
     target = cst.Name("current_value")
 
-    # Build body statements from loop_blocks
     body_statements = []
-
-    # Add loop_data assignment as the first statement
     for loop_block in loop_blocks:
         stmt = _build_block_statement(loop_block)
         body_statements.append(stmt)
@@ -3250,7 +3376,20 @@ def _build_block_statement(
 
 
 def _build_run_fn(blocks: list[dict[str, Any]], wf_req: dict[str, Any]) -> FunctionDef:
-    body = [
+    body: list[cst.BaseStatement] = []
+    # Loop code cannot run an engine-only child (a conditional would run every branch), so refuse before setup.
+    held = ", ".join(
+        f"{block.get('label')!r} ({', '.join(sorted(child_type.value for child_type in child_types))})"
+        for block in blocks
+        if (child_types := engine_only_loop_child_types(block))
+    )
+    if held:
+        message = (
+            "This script cannot run end to end because these loops hold blocks that only a workflow run "
+            f"executes: {held}. Run it as a workflow run instead."
+        )
+        body.append(cst.parse_statement(f"raise RuntimeError({message!r})"))
+    body += [
         cst.parse_statement(
             "parameters = parameters.model_dump() if isinstance(parameters, WorkflowParameters) else parameters"
         ),

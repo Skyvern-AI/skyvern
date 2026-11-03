@@ -1,14 +1,23 @@
-import { getClient } from "@/api/AxiosClient";
-import { Status, WorkflowRunStatusApiResponse } from "@/api/types";
+import { runIsLogicallyActive } from "@/routes/workflows/workflowRun/runRetryState";
+import { isAxiosError } from "axios";
+import { useCallback } from "react";
+import { type CredentialGetter, getClient } from "@/api/AxiosClient";
+import { isForbiddenError } from "@/api/forbidden";
+import {
+  Status,
+  WorkflowRunRetryFields,
+  WorkflowRunStatusApiResponseWithWorkflow,
+} from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useFirstParam } from "@/hooks/useFirstParam";
+
 import {
-  statusIsNotFinalized,
-  statusIsRunningOrQueued,
-} from "@/routes/tasks/types";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+  DefaultError,
+  keepPreviousData,
+  useQueries,
+  useQuery,
+} from "@tanstack/react-query";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
-import { useGlobalWorkflowsQuery } from "./useGlobalWorkflowsQuery";
 import {
   getActiveOrgQueryKeyScope,
   getOrgScopedQueryKey,
@@ -28,14 +37,14 @@ const RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS = 30000;
 // fetchFailureCount, which query-core resets at the start of every fetch.
 function getRunStatusRefetchInterval(state: {
   status: "pending" | "error" | "success";
-  data?: { status: Status };
+  data?: { status: Status } & WorkflowRunRetryFields;
   dataUpdatedAt: number;
   errorUpdatedAt: number;
 }): number | false {
   if (!state.data) {
     return false;
   }
-  if (!statusIsNotFinalized(state.data)) {
+  if (!runIsLogicallyActive(state.data)) {
     return false;
   }
   if (
@@ -47,67 +56,134 @@ function getRunStatusRefetchInterval(state: {
   return RUN_STATUS_POLL_INTERVAL_MS;
 }
 
-function useWorkflowRunQuery(options?: {
-  workflowRunId?: string;
-  enabled?: boolean;
-}) {
-  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
-  const workflowRunId = options?.workflowRunId ?? urlWorkflowRunId;
-  const workflowPermanentId = useWorkflowPermanentId();
-  const credentialGetter = useCredentialGetter();
-  const { data: globalWorkflows } = useGlobalWorkflowsQuery();
-  const activeOrgId = useActiveOrgId();
-  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
+async function fetchWorkflowRunById(
+  credentialGetter: CredentialGetter | null,
+  workflowRunId: string | undefined,
+  signal: AbortSignal,
+): Promise<WorkflowRunStatusApiResponseWithWorkflow> {
+  const client = await getClient(credentialGetter, "sans-api-v1");
+  return client
+    .get(`/workflows/runs/${encodeURIComponent(workflowRunId ?? "")}`, {
+      signal,
+    })
+    .then((response) => response.data);
+}
 
-  return useQuery<WorkflowRunStatusApiResponse>({
+type RunStatusQuery = {
+  state: Parameters<typeof getRunStatusRefetchInterval>[0];
+};
+
+// Every reader of this route shares one cache entry. A second key over the same
+// run builds the whole response again per view and doubles the status poll.
+function workflowRunByIdQueryOptions(
+  credentialGetter: CredentialGetter | null,
+  workflowRunId: string | undefined,
+  activeOrgQueryKeyScope: ReturnType<typeof getActiveOrgQueryKeyScope>,
+) {
+  return {
     queryKey: getOrgScopedQueryKey(
-      ["workflowRun", workflowPermanentId, workflowRunId],
+      ["workflowRun", workflowRunId],
       activeOrgQueryKeyScope,
     ),
-    queryFn: async ({ signal }) => {
-      const client = await getClient(credentialGetter);
-      const isGlobalWorkflow = globalWorkflows?.some(
-        (workflow) => workflow.workflow_permanent_id === workflowPermanentId,
-      );
-      const params = new URLSearchParams();
-      if (isGlobalWorkflow) {
-        params.set("template", "true");
-      }
-      return client
-        .get(`/workflows/${workflowPermanentId}/runs/${workflowRunId}`, {
-          params,
-          signal,
-        })
-        .then((response) => response.data);
-    },
-    refetchInterval: (query) => getRunStatusRefetchInterval(query.state),
+    // The by-run-id route still serves a run whose workflow version was retired
+    // (a Copilot test version), where the per-workflow route answers 404.
+    queryFn: ({ signal }: { signal: AbortSignal }) =>
+      fetchWorkflowRunById(credentialGetter, workflowRunId, signal),
+    refetchInterval: (query: RunStatusQuery) =>
+      getRunStatusRefetchInterval(query.state),
     // required for OS-level notifications to work (workflow run completion)
     refetchIntervalInBackground: true,
+    refetchOnMount: (query: RunStatusQuery) =>
+      query.state.data && runIsLogicallyActive(query.state.data)
+        ? ("always" as const)
+        : false,
+    refetchOnWindowFocus: (query: RunStatusQuery) =>
+      !!query.state.data && runIsLogicallyActive(query.state.data),
+  };
+}
+
+function useWorkflowRunByIdQuery(
+  workflowRunId: string | undefined,
+  enabled: boolean,
+) {
+  const credentialGetter = useCredentialGetter();
+  const activeOrgId = useActiveOrgId();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(activeOrgId);
+  // A fresh arrow each render defeats query-core's select memo, re-running the
+  // comparison and a deep equality check over the whole payload every time.
+  const selectRequestedRun = useCallback(
+    (run: WorkflowRunStatusApiResponseWithWorkflow) =>
+      run.workflow_run_id === workflowRunId ? run : undefined,
+    [workflowRunId],
+  );
+
+  return useQuery<
+    WorkflowRunStatusApiResponseWithWorkflow,
+    DefaultError,
+    WorkflowRunStatusApiResponseWithWorkflow | undefined
+  >({
+    ...workflowRunByIdQueryOptions(
+      credentialGetter,
+      workflowRunId,
+      activeOrgQueryKeyScope,
+    ),
     placeholderData: keepPreviousData,
-    refetchOnMount: (query) => {
-      if (!query.state.data) {
-        return false;
-      }
-      return statusIsRunningOrQueued(query.state.data) ? "always" : false;
-    },
-    refetchOnWindowFocus: (query) => {
-      if (!query.state.data) {
-        return false;
-      }
-      return statusIsRunningOrQueued(query.state.data);
-    },
-    enabled:
-      (options?.enabled ?? true) &&
-      !!globalWorkflows &&
-      !!workflowPermanentId &&
-      !!workflowRunId,
+    // keepPreviousData serves the previous run's payload whenever the requested run
+    // changes or clears, so withhold it rather than present it as the run in view.
+    select: selectRequestedRun,
+    enabled: enabled && !!workflowRunId,
+  });
+}
+
+// The key is required so that passing an options object always states a run, even
+// when that run is undefined; omitting the object entirely is what defers to the
+// route. Optional-key typing made those two cases identical to tsc.
+function useWorkflowRunQuery(options?: { workflowRunId: string | undefined }) {
+  const urlWorkflowRunId = useFirstParam("workflowRunId", "runId");
+  const workflowRunId = options ? options.workflowRunId : urlWorkflowRunId;
+  const workflowPermanentId = useWorkflowPermanentId();
+  return useWorkflowRunByIdQuery(workflowRunId, !!workflowPermanentId);
+}
+
+type WatchedRunState = RunStatusQuery["state"] & { error?: unknown };
+
+// A watched run whose first read failed is still owed a status, unless it is missing or forbidden.
+function getWatchedRunRefetchInterval(state: WatchedRunState): number | false {
+  if (!state.data && state.status === "error") {
+    const missing =
+      isAxiosError(state.error) && state.error.response?.status === 404;
+    return missing || isForbiddenError(state.error)
+      ? false
+      : RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS;
+  }
+  return getRunStatusRefetchInterval(state);
+}
+
+function useWorkflowRunQueries(workflowRunIds: readonly string[]) {
+  const credentialGetter = useCredentialGetter();
+  const activeOrgQueryKeyScope = getActiveOrgQueryKeyScope(useActiveOrgId());
+  const workflowPermanentId = useWorkflowPermanentId();
+  return useQueries({
+    queries: workflowRunIds.map((workflowRunId) => ({
+      ...workflowRunByIdQueryOptions(
+        credentialGetter,
+        workflowRunId,
+        activeOrgQueryKeyScope,
+      ),
+      refetchInterval: (query: { state: WatchedRunState }) =>
+        getWatchedRunRefetchInterval(query.state),
+      enabled: !!workflowPermanentId,
+    })),
   });
 }
 
 export {
   getRunStatusRefetchInterval,
+  getWatchedRunRefetchInterval,
   POLL_OUTAGE_BUDGET_MS,
   RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS,
   RUN_STATUS_POLL_INTERVAL_MS,
+  useWorkflowRunByIdQuery,
+  useWorkflowRunQueries,
   useWorkflowRunQuery,
 };

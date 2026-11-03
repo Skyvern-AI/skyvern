@@ -4,6 +4,7 @@ export const RunStatus = {
     Created: "created",
     Queued: "queued",
     Running: "running",
+    Paused: "paused",
     TimedOut: "timed_out",
     Failed: "failed",
     Terminated: "terminated",

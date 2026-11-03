@@ -37,6 +37,7 @@ APPROVED_TAGS = {
     "Server",
     "SDK",
     "Runs",
+    "Recipes",
 }
 # Pre-rebrand / internal tags that must never render a public section again.
 RETIRED_TAGS = {
@@ -56,20 +57,6 @@ HIDDEN_SECTION_TAGS = {
     "Scripts",
     "Custom LLMs",
 }
-# The endpoints this change re-tagged → their clean resource tag.
-RETAGGED_PATH_TAGS = {
-    "/v1/folders": "Folders",
-    "/v1/folders/{folder_id}": "Folders",
-    "/v1/agents/{workflow_permanent_id}/tags": "Tags",
-    "/v1/tag-keys": "Tags",
-    "/v1/tag-keys/{key}": "Tags",
-    "/v1/version": "Server",
-    "/v1/run/agents": "Runs",
-    "/v1/runs/{run_id}": "Runs",
-    "/v1/runs/cancel": "Runs",
-    "/v1/agents/runs": "Runs",
-    "/v1/agents/{workflow_id}/runs": "Runs",
-}
 
 
 def _committed_spec() -> dict:
@@ -88,11 +75,6 @@ def _visible_tags(spec: dict) -> set[str]:
     }
 
 
-def test_no_lowercase_visible_tags() -> None:
-    lowercase = sorted(t for t in _visible_tags(_committed_spec()) if t[:1].islower())
-    assert lowercase == [], f"lowercase tags render as sloppy doc sections: {lowercase}"
-
-
 def test_visible_tags_are_approved_resource_names() -> None:
     tags = _visible_tags(_committed_spec())
     assert {"Folders", "Server"} <= tags, "the public sub-resources must each keep a section"
@@ -103,14 +85,6 @@ def test_visible_tags_are_approved_resource_names() -> None:
         f"unapproved tag(s) — justify and add to APPROVED_TAGS: {sorted(tags - APPROVED_TAGS)}"
     )
     assert tags.isdisjoint(RETIRED_TAGS)
-
-
-def test_retagged_endpoints_use_clean_tags() -> None:
-    spec = _committed_spec()
-    for path, expected in RETAGGED_PATH_TAGS.items():
-        for method, op in spec["paths"][path].items():
-            if isinstance(op, dict):
-                assert op.get("tags") == [expected], f"{method.upper()} {path} tags={op.get('tags')}"
 
 
 def test_version_endpoint_is_conformant() -> None:

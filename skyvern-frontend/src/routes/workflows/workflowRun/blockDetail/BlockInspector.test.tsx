@@ -287,3 +287,50 @@ describe("BlockInspector failure scoping", () => {
     expect(screen.queryByText("Technical details")).toBeNull();
   });
 });
+
+describe("BlockInspector Gmail send outcome", () => {
+  it("shows an unconfirmed send as unknown, never as not sent", () => {
+    const reason = "Gmail did not confirm the send, and it was not retried.";
+    const block = buildBlock({
+      block_type: "send_email",
+      failure_reason: reason,
+      output: { transport: "gmail", outcome: "unknown", replayed: false },
+    });
+    render(<BlockInspector block={block} />);
+
+    expect(screen.getByText("Outcome unknown")).toBeDefined();
+    expect(screen.getByText(reason)).toBeDefined();
+    expect(screen.queryByText(/not sent|nothing was sent/i)).toBeNull();
+  });
+});
+
+describe("BlockInspector Power BI query output", () => {
+  it("renders the direct row array without a response wrapper", () => {
+    render(
+      <BlockInspector
+        block={buildBlock({
+          block_type: "powerbi_query",
+          output: [{ "Product Name": "Widget", "Net Sales": 17 }],
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/Product Name: "Widget"/)).toBeDefined();
+    expect(screen.queryByText(/rows:/i)).toBeNull();
+  });
+
+  it("shows the standard safe failure reason in the summary", () => {
+    const safeFailure = "Power BI query could not be completed.";
+    render(
+      <BlockInspector
+        block={buildBlock({
+          block_type: "powerbi_query",
+          status: Status.Failed,
+          failure_reason: safeFailure,
+        })}
+      />,
+    );
+
+    expect(screen.getByText(safeFailure)).toBeDefined();
+  });
+});

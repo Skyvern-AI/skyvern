@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import os
 import pathlib
 import platform
@@ -11,15 +12,17 @@ import socket
 import subprocess
 import time
 import uuid
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Protocol, cast
 from urllib.parse import parse_qsl, urlparse
 
 import psutil
 import structlog
+import websockets
 from playwright.async_api import (
     Browser,
     BrowserContext,
@@ -38,25 +41,40 @@ from playwright.async_api import (
 from skyvern.config import settings
 from skyvern.constants import (
     BROWSER_DOWNLOAD_TIMEOUT,
+    BROWSER_DOWNLOADING_SUFFIX,
     SAVE_DOWNLOADED_FILES_TIMEOUT,
     SKYVERN_DIR,
 )
 from skyvern.exceptions import (
+    BrowserSettingsUnsupported,
     UnknownBrowserType,
     UnknownErrorWhileCreatingBrowserContext,
 )
 from skyvern.forge import app
-from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory, resolve_run_download_id
+from skyvern.forge.sdk.api.files import (
+    discard_temp_working_dir,
+    get_current_run_dir,
+    get_download_dir,
+    make_run_temp_directory,
+    resolve_run_download_id,
+)
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
+from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_get_json
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.http_request_authorization import (
     RunScopedRedirectHopAuthorizer,
     deny_unenrolled_redirect_hop,
 )
-from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext, current, ensure_context
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
+from skyvern.utils.url_validators import redacted_url_origin, signed_url_ttl_remaining_seconds
 from skyvern.webeye.attach_only import forbid
 from skyvern.webeye.attach_only import is_enforcing as attach_only_enforcing
+from skyvern.webeye.browser_acquisition_sample import (
+    ACQUIRE_MODE_ATTACH,
+    ACQUIRE_MODE_CREATE,
+    note_resolved_acquire_mode,
+)
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding, VideoArtifact
 from skyvern.webeye.browser_engine import BrowserEngineBootstrapError
 from skyvern.webeye.cdp_connection import (
@@ -70,8 +88,25 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor, bind_download_interceptor_to_context
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.display_recorder import (
+    DisplayRecorderAcquisition,
+    carry_display_recording,
+    prepare_local_display_recording,
+    release_display_recorder,
+    release_started_display_recording,
+)
+from skyvern.webeye.native_downloads import (
+    DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS,
+    NativeDownloadAttempt,
+    NativeDownloads,
+)
 from skyvern.webeye.playwright_input import register_playwright_input_context
-from skyvern.webeye.session_cookies import restore_banked_cookies, restore_session_cookies
+from skyvern.webeye.profile_download_state import strip_download_history_state
+from skyvern.webeye.session_cookies import (
+    restore_banked_cookies,
+    restore_session_cookies,
+    restore_signin_cookies,
+)
 
 LOG = structlog.get_logger()
 
@@ -271,7 +306,8 @@ async def _capture_seed_profile_state(
 
 def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
     if browser_artifacts.browser_console_log_path is None:
-        log_path = f"{settings.LOG_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{uuid.uuid4()}.log"
+        log_folder = get_current_run_dir(settings.LOG_PATH) or f"{settings.LOG_PATH}/{datetime.utcnow():%Y-%m-%d}"
+        log_path = f"{log_folder}/{uuid.uuid4()}.log"
         try:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             # create the empty log file
@@ -330,7 +366,15 @@ def _consume_abandoned_task_result(task: asyncio.Task) -> None:
         task.exception()
 
 
-DOWNLOAD_FAILURE_READ_TIMEOUT_SECONDS = 5.0
+_DOWNLOADS_CANCELLED_BY_SKYVERN: weakref.WeakSet[Download] = weakref.WeakSet()
+
+
+def mark_download_cancelled_by_skyvern(download: Download) -> None:
+    _DOWNLOADS_CANCELLED_BY_SKYVERN.add(download)
+
+
+def was_download_cancelled_by_skyvern(download: Download) -> bool:
+    return download in _DOWNLOADS_CANCELLED_BY_SKYVERN
 
 
 async def read_download_failure(download: Download) -> str | None:
@@ -389,6 +433,12 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
         asyncio.ensure_future(_on_page(page))
 
 
+def _completed_file_suffix(name: str) -> str:
+    # Storage treats the in-progress suffix as a partial, so a finished file named "x.crdownload" must not take it.
+    suffix = Path(name).suffix
+    return "" if suffix == BROWSER_DOWNLOADING_SUFFIX else suffix
+
+
 def _redact_url_query(url: str) -> str:
     # Download URLs are often S3 presigned, carrying an X-Amz signature in the query — drop it before logging.
     try:
@@ -398,25 +448,51 @@ def _redact_url_query(url: str) -> str:
 
 
 def set_download_file_listener(
-    browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
+    browser_context: BrowserContext,
+    download_timeout: float | None = None,
+    browser_artifacts: BrowserArtifacts | None = None,
+    **kwargs: Any,
 ) -> None:
-    async def listen_to_download(download: Download) -> None:
-        context = current()
+    async def save_download(
+        download: Download,
+        context: SkyvernContext | None,
+        owner_task_id: str | None,
+        residential_egress: bool,
+        observer: NativeDownloads | None,
+        attempt: NativeDownloadAttempt | None,
+    ) -> None:
+        download_started_at = time.monotonic()
+        failed = False
+        self_cancelled = False
+        # An unreadable terminal state stays pending: only a known outcome may release the wait.
+        settled = True
+        resolved = False
         workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
-        task_id = (context.task_id if context else None) or kwargs.get("task_id")
+        task_id = owner_task_id or (context.task_id if context else None) or kwargs.get("task_id")
+        # Read when the download starts, not when the context is built: one browser serves many tasks.
+        timeout_seconds = (
+            download_timeout or (context.download_timeout if context else None) or BROWSER_DOWNLOAD_TIMEOUT
+        )
         try:
             # Route path() through resolve_artifact_path so a timeout can never cancel a shared
             # artifact future (see resolve_artifact_path). Everything after the await is synchronous
             # filesystem work, so it does not need to run under a timeout.
-            resolved_path = await resolve_artifact_path(download, download_timeout or BROWSER_DOWNLOAD_TIMEOUT)
+            resolved_path = await resolve_artifact_path(download, timeout_seconds)
             if resolved_path is None:
                 LOG.error(
                     "timeout to download file, going to cancel the download",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
+                    timeout_seconds=timeout_seconds,
                 )
+                mark_download_cancelled_by_skyvern(download)
                 await download.cancel()
+                self_cancelled = await read_download_failure(download) is not None
+                settled = self_cancelled
                 return
+            resolved = True
+            if context and owner_task_id:
+                context.download_completed_task_ids.add(owner_task_id)
             file_path = Path(resolved_path)
             if not file_path.exists():
                 # On an adopted persistent session the bytes live on the run connection, not
@@ -438,7 +514,7 @@ def set_download_file_listener(
                 suggested_filename_fp=diagnostic_fingerprint(download.suggested_filename),
                 url=_redact_url_query(download.url),
             )
-            suffix = Path(download.suggested_filename).suffix
+            suffix = _completed_file_suffix(download.suggested_filename)
             if suffix:
                 LOG.info(
                     "Add extension according to suggested filename",
@@ -453,7 +529,7 @@ def set_download_file_listener(
             parsed_qs = parse_qsl(parsed_url.query)
             for key, value in parsed_qs:
                 if key.lower() == "filename":
-                    suffix = Path(value).suffix
+                    suffix = _completed_file_suffix(value)
                     if suffix:
                         LOG.info(
                             "Add extension according to the parsed query params of download url",
@@ -464,7 +540,7 @@ def set_download_file_listener(
                         file_path.rename(str(file_path) + suffix)
                         return
 
-            suffix = Path(parsed_url.path).suffix
+            suffix = _completed_file_suffix(parsed_url.path)
             if suffix:
                 LOG.info(
                     "Add extension according to download url path",
@@ -476,29 +552,147 @@ def set_download_file_listener(
                 return
             # TODO: maybe should try to parse it from URL response
 
+        except asyncio.CancelledError:
+            settled = False
+            raise
         except Exception:
             # An aborted transfer surfaces here as a path() error; reporting it as a rename failure
             # sends triage to the wrong subsystem and hides that no file was ever saved.
-            failure = await read_download_failure(download)
+            try:
+                failure = await read_download_failure(download)
+            except asyncio.CancelledError:
+                settled = False
+                raise
+            if (
+                failure == "canceled"
+                and not was_download_cancelled_by_skyvern(download)
+                and not download.page.is_closed()
+                and context
+                and owner_task_id
+                and residential_egress
+            ):
+                context.residential_download_interrupted_task_ids.add(owner_task_id)
             if failure is not None:
+                failed = True
+                self_cancelled = was_download_cancelled_by_skyvern(download)
                 LOG.warning(
                     "Browser aborted the download before any file was saved",
                     workflow_run_id=workflow_run_id,
                     task_id=task_id,
                     failure=failure,
                     url=_redact_url_query(download.url),
+                    seconds_since_download_event=time.monotonic() - download_started_at,
+                    url_origin=redacted_url_origin(download.url),
+                    signed_url_ttl_remaining_s=signed_url_ttl_remaining_seconds(download.url, datetime.now(UTC)),
                 )
                 return
+            settled = resolved
             LOG.exception(
                 "Failed to add file extension name to downloaded file",
                 workflow_run_id=workflow_run_id,
                 task_id=task_id,
             )
 
+        finally:
+            if observer is not None and settled:
+                observer.finished(download, attempt, failed=failed, self_cancelled=self_cancelled)
+
+    def on_download(download: Download) -> asyncio.Task[None]:
+        # Snapshot the task synchronously at event delivery; the context can change before the coroutine runs.
+        # Callback kwargs can belong to an older task or run and cannot establish ownership.
+        context = current()
+        owner_task_id = context.task_id if context else None
+        residential_egress = False
+        try:
+            state = app.BROWSER_MANAGER.get_for_task(owner_task_id) if owner_task_id else None
+            # Workflow blocks register their browser under the run id only. A plain lookup avoids aliasing the task.
+            if state is None and owner_task_id and context and context.workflow_run_id:
+                state = app.BROWSER_MANAGER.get_for_workflow_run(context.workflow_run_id)
+            if state is None or state.browser_context is not browser_context:
+                owner_task_id = None
+            elif owner_task_id:
+                residential_egress = app.AGENT_FUNCTION.is_residential_browser_egress(browser_context)
+        except Exception:
+            owner_task_id = None
+        observer = browser_artifacts.native_downloads if browser_artifacts is not None else None
+        if observer is not None and observer.context is not browser_context:
+            observer = None
+        attempt = observer.started(download) if observer is not None else None
+        return asyncio.create_task(
+            save_download(download, context, owner_task_id, residential_egress, observer, attempt)
+        )
+
     def listen_to_new_page(page: Page) -> None:
-        page.on("download", listen_to_download)
+        page.on("download", on_download)
 
     browser_context.on("page", listen_to_new_page)
+    for page in browser_context.pages:
+        listen_to_new_page(page)
+    observer = browser_artifacts.native_downloads if browser_artifacts is not None else None
+    if observer is not None and observer.context is browser_context:
+        observer.listeners_registered()
+
+
+async def start_unreported_download_renamer(cdp_port: int, download_dir: str) -> asyncio.Task[None] | None:
+    """Playwright drops ``Browser.downloadWillBegin`` for a tab that is still uninitialized and has no opener (e.g. one
+    an outside CDP client opens straight to an attachment), so add the suggested extension to its ``<guid>`` file."""
+    cdp: websockets.ClientConnection | None = None
+
+    async def call(
+        connection: websockets.ClientConnection, message_id: int, method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        await connection.send(json.dumps({"id": message_id, "method": method, "params": params}))
+        reply = json.loads(await connection.recv())
+        if "error" in reply:
+            raise RuntimeError(f"{method} failed: {reply['error']}")
+        return reply["result"]
+
+    try:
+        version = await aiohttp_get_json(f"http://127.0.0.1:{cdp_port}/json/version", timeout=5)
+        cdp = await websockets.connect(version["webSocketDebuggerUrl"])
+        # Only the session that enabled download events receives them, and detaching reverts that session's binding,
+        # so enable them on a throwaway context and leave the default context's binding to Playwright.
+        throwaway = await call(cdp, 1, "Target.createBrowserContext", {"disposeOnDetach": True})
+        await call(
+            cdp,
+            2,
+            "Browser.setDownloadBehavior",
+            {"behavior": "deny", "browserContextId": throwaway["browserContextId"], "eventsEnabled": True},
+        )
+    except Exception:
+        LOG.warning("Failed to listen for unreported downloads", exc_info=True)
+        if cdp is not None:
+            await cdp.close()
+        return None
+    return asyncio.create_task(_rename_unreported_downloads(cdp, Path(download_dir)))
+
+
+async def _rename_unreported_downloads(cdp: websockets.ClientConnection, download_dir: Path) -> None:
+    suggested_filenames: dict[str, str] = {}
+    async with cdp:
+        with suppress(websockets.ConnectionClosed):
+            async for message in cdp:
+                # Nothing awaits this task, so an escaping error would silently stop renaming for the session.
+                try:
+                    _add_suggested_extension(json.loads(message), suggested_filenames, download_dir)
+                except Exception:
+                    LOG.warning("Failed to add file extension to an unreported download", exc_info=True)
+
+
+def _add_suggested_extension(event: dict[str, Any], suggested_filenames: dict[str, str], download_dir: Path) -> None:
+    params = event.get("params", {})
+    if event.get("method") == "Browser.downloadWillBegin":
+        suggested_filenames[params["guid"]] = params["suggestedFilename"]
+    if event.get("method") != "Browser.downloadProgress" or params["state"] == "inProgress":
+        return
+    suffix = _completed_file_suffix(suggested_filenames.pop(params["guid"], ""))
+    file_path = download_dir / params["guid"]
+    # set_download_file_listener also checks and renames without awaiting in between, so on one event loop whichever
+    # runs second finds the file already renamed and skips it.
+    if params["state"] != "completed" or not suffix or not file_path.exists():
+        return
+    LOG.info("Add extension according to suggested filename", filepath=f"{file_path}{suffix}")
+    file_path.rename(f"{file_path}{suffix}")
 
 
 def initialize_download_dir() -> str:
@@ -552,6 +746,10 @@ async def rebind_download_dir(browser: Browser | None, run_id: str | None, *, pa
                     raise
 
     setdownloadbehavior_applied = False
+    if any(getattr(context, "_skyvern_external_browser", False) is True for context in rebind_contexts):
+        # Browser-wide and on the caller's machine: it would redirect their own downloads to a worker path.
+        LOG.info("setDownloadBehavior skipped: registered external browser", run_id=run_id)
+        return
     if monitor_owns_binding:
         # The download monitor holds {behavior:deny, eventsEnabled:True} and saves files over HTTP
         # (remote CDP has no valid downloadPath). Re-sending allow/downloadPath would disable it, so
@@ -666,11 +864,13 @@ class BrowserContextFactory:
         proxy_location: ProxyLocationInput = None,
         cdp_port: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        timezone_id: str | None = None,
     ) -> dict[str, Any]:
-        video_dir = f"{settings.VIDEO_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}"
-        har_dir = (
-            f"{settings.HAR_PATH}/{datetime.utcnow().strftime('%Y-%m-%d')}/{BrowserContextFactory.get_subdir()}.har"
-        )
+        # Inside a run, its recordings and HAR go in <root>/<org>/<run>, which the run's teardown deletes.
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        video_dir = get_current_run_dir(settings.VIDEO_PATH) or f"{settings.VIDEO_PATH}/{today}"
+        har_folder = get_current_run_dir(settings.HAR_PATH) or f"{settings.HAR_PATH}/{today}"
+        har_dir = f"{har_folder}/{BrowserContextFactory.get_subdir()}.har"
 
         extension_paths = []
         if settings.EXTENSIONS and settings.EXTENSIONS_BASE_PATH:
@@ -721,7 +921,9 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        if isinstance(proxy_location, ProxyLocation):
+        if timezone_id is not None:
+            args["timezone_id"] = timezone_id
+        elif isinstance(proxy_location, ProxyLocation):
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
         return args
@@ -750,9 +952,13 @@ class BrowserContextFactory:
     async def create_browser_context(
         cls, playwright: Playwright, **kwargs: Any
     ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+        reconcile_persistent_init_scripts = bool(kwargs.pop("_reconcile_persistent_init_scripts", False))
+        sessionless_init_script_registrations = tuple(kwargs.pop("_sessionless_init_script_registrations", ()))
+        route_policy_url = cast(str | None, kwargs.pop("_browser_context_route_policy_url", None))
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         cleanup_func: BrowserCleanupFunc = None
+        started_display_recorder = None
         browser_internal_headers, scoped_headers = _partition_browser_headers(kwargs.get("extra_http_headers"))
         creator_kwargs = {**kwargs, "extra_http_headers": browser_internal_headers}
         try:
@@ -760,6 +966,14 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **creator_kwargs)
+            # The creator acquired the whole-display recorder before creating the context
+            # (prepare_local_display_recording) and stashed the acquisition. Register a NEWLY-started recorder
+            # for the outer cleanup below so a later context-setup failure releases it; a reused/adopted recorder
+            # (started=False) belongs to a live owner and is deliberately left running.
+            acquisition = browser_artifacts._display_recorder_acquisition
+            if isinstance(acquisition, DisplayRecorderAcquisition) and acquisition.started:
+                started_display_recorder = acquisition.recorder
+            browser_artifacts._display_recorder_acquisition = None
             requested_profile_id = cast(str | None, kwargs.get("browser_profile_id"))
             if requested_profile_id and browser_artifacts.applied_browser_profile_id != requested_profile_id:
                 LOG.warning(
@@ -772,6 +986,7 @@ class BrowserContextFactory:
                     organization_id=kwargs.get("organization_id"),
                 )
             await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
+            await restore_signin_cookies(browser_context, browser_artifacts.browser_session_dir)
             # After session cookies so a verified-login heal (banked by the credential living-profile
             # engine) wins over the profile's own older session cookies on a key clash. Gated on the
             # engine kill-switch so a rollback also stops applying previously banked login state.
@@ -780,25 +995,29 @@ class BrowserContextFactory:
                 await _capture_seed_profile_state(browser_context, browser_artifacts, kwargs)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
-            # Gated on the process MODE, not the browser type. The earlier version keyed on
-            # is_attach_only_browser_type(settings.BROWSER_TYPE) and justified it with "an attached
-            # browser was configured by whoever launched it, so recording could only no-op" -- which
-            # is false: Playwright records video on a context IT created over connect_over_cdp
-            # regardless of who launched the browser. That gate therefore dropped video for every
-            # process using an attach-capable BROWSER_TYPE, and since this listener is the only
-            # producer of video_artifacts it took the main page's recording with it, not just popups.
-            # The thing that genuinely cannot record is the attach-only worker, which is what
-            # is_enforcing() names.
-            if not attach_only_enforcing():
+            # Playwright popup/page video is the ONLY producer of video_artifacts here, so register it whenever no
+            # whole-display recorder was acquired (an eligible-but-refused acquisition must still fall back). Gate
+            # on the attach-only WORKER mode, not BROWSER_TYPE (Playwright records a connect_over_cdp context it
+            # created regardless of who launched the browser).
+            if not attach_only_enforcing() and browser_artifacts._display_recorder is None:
                 set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
-            set_download_file_listener(browser_context=browser_context, **kwargs)
+            set_download_file_listener(browser_context=browser_context, browser_artifacts=browser_artifacts, **kwargs)
             set_dialog_handler(browser_context=browser_context)
             route_handlers_allowed = None
-            if scoped_headers:
-                route_handlers_allowed = await app.AGENT_FUNCTION.browser_context_route_handlers_allowed(**kwargs)
+            if scoped_headers or route_policy_url is not None:
+                route_policy_kwargs = {
+                    **kwargs,
+                    "url": route_policy_url or kwargs.get("url"),
+                    "_fail_on_error": reconcile_persistent_init_scripts,
+                }
+                route_handlers_allowed = await app.AGENT_FUNCTION.browser_context_route_handlers_allowed(
+                    **route_policy_kwargs
+                )
             extension_kwargs = {
                 **kwargs,
                 "_browser_context_route_handlers_allowed": route_handlers_allowed,
+                "_reconcile_persistent_init_scripts": reconcile_persistent_init_scripts,
+                "_sessionless_init_script_registrations": sessionless_init_script_registrations,
             }
             await app.AGENT_FUNCTION.setup_browser_context_extensions(
                 browser_context=browser_context,
@@ -820,18 +1039,38 @@ class BrowserContextFactory:
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
+            # The whole-display recorder was already acquired by the creator before context creation and
+            # consumed into ``started_display_recorder`` above; nothing to acquire here.
             return browser_context, browser_artifacts, cleanup_func
         except BaseException as e:
+            # Close the context FIRST (unmap the window) so the display fence is never freed while the window is
+            # still mapped; a close cancel is latched so the recorder still releases and cancellation wins after.
+            close_cancelled = False
             if browser_context is not None:
                 # FIXME: sometimes it can't close the browser context?
                 LOG.error("unexpected error happens after created browser context, going to close the context")
-                with suppress(Exception):
+                try:
                     await browser_context.close()
+                except asyncio.CancelledError:
+                    close_cancelled = True
+                except Exception:
+                    LOG.warning("Failed to close browser context after creation failure", exc_info=True)
+            if started_display_recorder is not None:
+                try:
+                    await release_display_recorder(started_display_recorder)
+                except asyncio.CancelledError:
+                    close_cancelled = True  # release finishes-then-re-raises; still run cleanup_func, cancel wins
+                except Exception:
+                    LOG.warning("Failed to release display recorder after creation failure", exc_info=True)
             if cleanup_func:
                 with suppress(Exception):
                     await cleanup_func()
 
-            if not isinstance(e, Exception) or isinstance(e, (UnknownBrowserType, BrowserEngineBootstrapError)):
+            if close_cancelled:
+                raise asyncio.CancelledError()
+            if not isinstance(e, Exception) or isinstance(
+                e, (UnknownBrowserType, BrowserEngineBootstrapError, BrowserSettingsUnsupported)
+            ):
                 raise e
 
             raise UnknownErrorWhileCreatingBrowserContext(browser_type, e) from e
@@ -937,6 +1176,17 @@ def _is_chrome_running() -> bool:
     return False
 
 
+def _read_only_copy_cleanup(read_only_copy: str | None) -> BrowserCleanupFunc:
+    if read_only_copy is None:
+        return None
+    copy_dir = read_only_copy
+
+    async def _discard() -> None:
+        await asyncio.to_thread(discard_temp_working_dir, copy_dir)
+
+    return _discard
+
+
 @_forbidden_in_attach_only_worker("a local headless Chromium launch")
 async def _create_headless_chromium(
     playwright: Playwright,
@@ -963,13 +1213,21 @@ async def _create_headless_chromium(
     loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
-        profile_dir = await app.STORAGE.retrieve_browser_profile(
+        retrieve_profile = (
+            app.STORAGE.retrieve_browser_profile_copy
+            if kwargs.get("profile_read_only")
+            else app.STORAGE.retrieve_browser_profile
+        )
+        profile_dir = await retrieve_profile(
             organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,
         )
         if profile_dir:
             user_data_dir = profile_dir
             loaded_from_saved_profile = True
+            strip_download_history_state(
+                profile_dir, browser_profile_id=browser_profile_id, organization_id=organization_id_for_profile
+            )
             LOG.info(
                 "Using browser profile",
                 browser_profile_id=browser_profile_id,
@@ -982,8 +1240,9 @@ async def _create_headless_chromium(
                 organization_id=organization_id_for_profile,
             )
 
+    read_only_copy = user_data_dir if loaded_from_saved_profile and kwargs.get("profile_read_only") else None
     if not user_data_dir:
-        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+        user_data_dir = make_run_temp_directory(prefix="skyvern_browser_")
 
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -992,7 +1251,10 @@ async def _create_headless_chromium(
     )
     cdp_port: int | None = _get_cdp_port(kwargs)
     browser_args = BrowserContextFactory.build_browser_args(
-        proxy_location=proxy_location, cdp_port=cdp_port, extra_http_headers=extra_http_headers
+        proxy_location=proxy_location,
+        cdp_port=cdp_port,
+        extra_http_headers=extra_http_headers,
+        timezone_id=cast(str | None, kwargs.get("timezone_id")),
     )
     browser_args.update(
         {
@@ -1000,7 +1262,6 @@ async def _create_headless_chromium(
             "downloads_path": download_dir,
         }
     )
-
     browser_artifacts = BrowserContextFactory.build_browser_artifacts(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
@@ -1008,30 +1269,49 @@ async def _create_headless_chromium(
     if loaded_from_saved_profile:
         browser_artifacts.applied_browser_profile_id = browser_profile_id
     try:
-        browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-    except Exception as launch_error:
-        if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
-            LOG.warning(
-                "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
-                browser_profile_id=browser_profile_id,
-                organization_id=organization_id_for_profile,
-                error=str(launch_error),
-            )
-            fallback_dir = make_temp_directory(prefix="skyvern_browser_")
-            BrowserContextFactory.update_chromium_browser_preferences(
-                user_data_dir=fallback_dir,
-                download_dir=download_dir,
-            )
-            browser_args["user_data_dir"] = fallback_dir
-            browser_artifacts = BrowserContextFactory.build_browser_artifacts(
-                har_path=browser_args["record_har_path"],
-                browser_session_dir=fallback_dir,
-            )
-            browser_artifacts.mark_seed_load_failed()
+        try:
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-        else:
-            raise
-    return browser_context, browser_artifacts, None
+        except Exception as launch_error:
+            if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+                LOG.warning(
+                    "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
+                    browser_profile_id=browser_profile_id,
+                    organization_id=organization_id_for_profile,
+                    error=str(launch_error),
+                )
+                discard_temp_working_dir(read_only_copy)
+                read_only_copy = None
+                fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
+                BrowserContextFactory.update_chromium_browser_preferences(
+                    user_data_dir=fallback_dir,
+                    download_dir=download_dir,
+                )
+                browser_args["user_data_dir"] = fallback_dir
+                browser_artifacts = BrowserContextFactory.build_browser_artifacts(
+                    har_path=browser_args["record_har_path"],
+                    browser_session_dir=fallback_dir,
+                )
+                browser_artifacts.mark_seed_load_failed()
+                browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+            else:
+                raise
+    except BaseException:
+        discard_temp_working_dir(read_only_copy)
+        raise
+    browser_artifacts.note_requested_launch_args(browser_args.get("args"))
+    browser_artifacts.attach_native_downloads(
+        NativeDownloads.attach(
+            browser_context,
+            download_dir=download_dir,
+            before_activity=(
+                not loaded_from_saved_profile
+                and not settings.EXTENSIONS
+                and not settings.BROWSER_ADDITIONAL_ARGS
+                and not cdp_port
+            ),
+        )
+    )
+    return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 
 @_forbidden_in_attach_only_worker("a local headful Chromium launch")
@@ -1060,13 +1340,21 @@ async def _create_headful_chromium(
     loaded_from_saved_profile = False
 
     if browser_profile_id and organization_id_for_profile:
-        profile_dir = await app.STORAGE.retrieve_browser_profile(
+        retrieve_profile = (
+            app.STORAGE.retrieve_browser_profile_copy
+            if kwargs.get("profile_read_only")
+            else app.STORAGE.retrieve_browser_profile
+        )
+        profile_dir = await retrieve_profile(
             organization_id=organization_id_for_profile,
             profile_id=browser_profile_id,
         )
         if profile_dir:
             user_data_dir = profile_dir
             loaded_from_saved_profile = True
+            strip_download_history_state(
+                profile_dir, browser_profile_id=browser_profile_id, organization_id=organization_id_for_profile
+            )
             LOG.info(
                 "Using browser profile",
                 browser_profile_id=browser_profile_id,
@@ -1079,8 +1367,9 @@ async def _create_headful_chromium(
                 organization_id=organization_id_for_profile,
             )
 
+    read_only_copy = user_data_dir if loaded_from_saved_profile and kwargs.get("profile_read_only") else None
     if not user_data_dir:
-        user_data_dir = make_temp_directory(prefix="skyvern_browser_")
+        user_data_dir = make_run_temp_directory(prefix="skyvern_browser_")
 
     download_dir = initialize_download_dir()
     BrowserContextFactory.update_chromium_browser_preferences(
@@ -1089,7 +1378,10 @@ async def _create_headful_chromium(
     )
     cdp_port: int | None = _get_cdp_port(kwargs)
     browser_args = BrowserContextFactory.build_browser_args(
-        proxy_location=proxy_location, cdp_port=cdp_port, extra_http_headers=extra_http_headers
+        proxy_location=proxy_location,
+        cdp_port=cdp_port,
+        extra_http_headers=extra_http_headers,
+        timezone_id=cast(str | None, kwargs.get("timezone_id")),
     )
     browser_args.update(
         {
@@ -1104,31 +1396,68 @@ async def _create_headful_chromium(
     )
     if loaded_from_saved_profile:
         browser_artifacts.applied_browser_profile_id = browser_profile_id
+    # Acquire the whole-display recorder BEFORE the context is created; the Playwright record_video_* args are
+    # popped ONLY if a live recorder is obtained, so a refusal/startup failure keeps Playwright per-page
+    # recording (exactly one recording either way).
+    await prepare_local_display_recording(
+        browser_args,
+        browser_artifacts,
+        owner_id_override=cast(str | None, kwargs.get("display_recording_owner_id")),
+        workflow_run_id=cast(str | None, kwargs.get("workflow_run_id")),
+        task_id=cast(str | None, kwargs.get("task_id")),
+        script_id=cast(str | None, kwargs.get("script_id")),
+    )
+    # Outer BaseException holder: release the already-started whole-display recorder for ANY escape (including a
+    # Temporal CancelledError) from launch through return, so the bridge/flock/registry never leak (SKY-15466).
     try:
-        browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-    except Exception as launch_error:
-        if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
-            LOG.warning(
-                "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
-                browser_profile_id=browser_profile_id,
-                organization_id=organization_id_for_profile,
-                error=str(launch_error),
-            )
-            fallback_dir = make_temp_directory(prefix="skyvern_browser_")
-            BrowserContextFactory.update_chromium_browser_preferences(
-                user_data_dir=fallback_dir,
-                download_dir=download_dir,
-            )
-            browser_args["user_data_dir"] = fallback_dir
-            browser_artifacts = BrowserContextFactory.build_browser_artifacts(
-                har_path=browser_args["record_har_path"],
-                browser_session_dir=fallback_dir,
-            )
-            browser_artifacts.mark_seed_load_failed()
+        try:
             browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
-        else:
-            raise
-    return browser_context, browser_artifacts, None
+        except Exception as launch_error:
+            if loaded_from_saved_profile and _is_browser_profile_corruption_error(launch_error):
+                LOG.warning(
+                    "Browser launch failed with saved profile — profile may be corrupted, falling back to fresh profile",
+                    browser_profile_id=browser_profile_id,
+                    organization_id=organization_id_for_profile,
+                    error=str(launch_error),
+                )
+                discard_temp_working_dir(read_only_copy)
+                read_only_copy = None
+                fallback_dir = make_run_temp_directory(prefix="skyvern_browser_")
+                BrowserContextFactory.update_chromium_browser_preferences(
+                    user_data_dir=fallback_dir,
+                    download_dir=download_dir,
+                )
+                browser_args["user_data_dir"] = fallback_dir
+                fallback_artifacts = BrowserContextFactory.build_browser_artifacts(
+                    har_path=browser_args["record_har_path"],
+                    browser_session_dir=fallback_dir,
+                )
+                fallback_artifacts.mark_seed_load_failed()
+                # Recorder already started before the first launch; carry it onto the rebuilt artifacts so it is not
+                # orphaned. record_video_* was already popped from the shared browser_args, so no double recording.
+                carry_display_recording(browser_artifacts, fallback_artifacts)
+                browser_artifacts = fallback_artifacts
+                browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
+            else:
+                raise
+    except BaseException:
+        discard_temp_working_dir(read_only_copy)
+        await release_started_display_recording(browser_artifacts)
+        raise
+    browser_artifacts.note_requested_launch_args(browser_args.get("args"))
+    browser_artifacts.attach_native_downloads(
+        NativeDownloads.attach(
+            browser_context,
+            download_dir=download_dir,
+            before_activity=(
+                not loaded_from_saved_profile
+                and not settings.EXTENSIONS
+                and not settings.BROWSER_ADDITIONAL_ARGS
+                and not cdp_port
+            ),
+        )
+    )
+    return browser_context, browser_artifacts, _read_only_copy_cleanup(read_only_copy)
 
 
 def default_user_data_dir() -> pathlib.Path:
@@ -1166,7 +1495,11 @@ async def _create_cdp_connection_browser(
     cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
+    if kwargs.get("timezone_id"):
+        raise BrowserSettingsUnsupported()
     if browser_address := kwargs.get("browser_address"):
+        # Dialing a caller-supplied CDP endpoint is an attach, not a session creation.
+        note_resolved_acquire_mode(ACQUIRE_MODE_ATTACH)
         return await _connect_to_cdp_browser(
             playwright,
             remote_browser_url=str(browser_address),
@@ -1177,8 +1510,14 @@ async def _create_cdp_connection_browser(
             download_binding=_resolve_download_binding(kwargs),
         )
 
+    # Default with no per-run address: attach to an already-running or configured remote CDP endpoint
+    # (settings.BROWSER_REMOTE_DEBUGGING_URL). Overridden to create only where this invocation
+    # actually launches a new Chrome process below, so the heuristic's no-address "create" guess for a
+    # fixed cdp-connect worker does not mislabel a configured-endpoint attach.
+    note_resolved_acquire_mode(ACQUIRE_MODE_ATTACH)
     browser_type = settings.BROWSER_TYPE
     browser_path = settings.CHROME_EXECUTABLE_PATH
+    spawn_args: list[str] | None = None
 
     if browser_type == "cdp-connect" and browser_path:
         LOG.info("Local browser path is given. Connecting to local browser with CDP", browser_path=browser_path)
@@ -1205,15 +1544,19 @@ async def _create_cdp_connection_browser(
                 # If directory exists, remove it first then copy
                 shutil.rmtree("./tmp/user_data_dir")
                 shutil.copytree(default_user_data_dir(), "./tmp/user_data_dir")
+            # This invocation launches a new Chrome process, so it is a genuine create — recorded
+            # before the launch so a launch failure inherits create rather than the default attach.
+            note_resolved_acquire_mode(ACQUIRE_MODE_CREATE)
+            spawn_args = [
+                browser_path,
+                "--remote-debugging-port=9222",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--user-data-dir=./tmp/user_data_dir",
+                "--remote-debugging-address=0.0.0.0",
+            ]
             browser_process = subprocess.Popen(
-                [
-                    browser_path,
-                    "--remote-debugging-port=9222",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--user-data-dir=./tmp/user_data_dir",
-                    "--remote-debugging-address=0.0.0.0",
-                ],
+                spawn_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -1224,13 +1567,29 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
-    return await _connect_to_cdp_browser(
+    result = await _connect_to_cdp_browser(
         playwright,
         settings.BROWSER_REMOTE_DEBUGGING_URL,
         extra_http_headers=extra_http_headers,
         cdp_connect_headers=cdp_connect_headers,
         validate_browser_address=False,
     )
+    # Only a Chrome started here and dialed at its own debugging endpoint is this invocation's browser.
+    if spawn_args is not None and _dials_spawned_chrome(settings.BROWSER_REMOTE_DEBUGGING_URL):
+        result[1].note_spawned_local_browser()
+        result[1].note_requested_launch_args(spawn_args)
+    return result
+
+
+def _dials_spawned_chrome(endpoint: str) -> bool:
+    # The port check and the spawn are IPv4 only, so ::1, a resolved name, or another or missing port may reach a
+    # different browser.
+    parsed = urlparse(endpoint)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return parsed.hostname == "127.0.0.1" and port == 9222
 
 
 async def _connect_to_cdp_browser(
@@ -1302,9 +1661,11 @@ async def _connect_to_cdp_browser(
             viewport=browser_args["viewport"],
             extra_http_headers=browser_args["extra_http_headers"],
         )
+        browser_artifacts.note_cdp_context(browser_context, "new", browser_args["viewport"])
     else:
         LOG.info("Reusing existing browser context", existing_contexts=len(contexts))
         browser_context = contexts[0]
+        browser_artifacts.note_cdp_context(browser_context, "existing")
 
     # Enable CDPDownloadInterceptor when enable_download is set.
     # This captures downloads via the Fetch domain and saves them locally.

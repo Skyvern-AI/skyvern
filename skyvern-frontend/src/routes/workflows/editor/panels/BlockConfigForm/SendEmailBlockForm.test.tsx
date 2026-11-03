@@ -26,6 +26,7 @@ vi.mock("@xyflow/react", async () => {
       getNode: (id: string) => mockNodeFixtures.get(id),
       updateNodeData: updateNodeDataMock,
     }),
+    useNodesData: (id: string) => mockNodeFixtures.get(id),
     useNodes: () => Array.from(mockNodeFixtures.values()).filter(Boolean),
     useEdges: () => [],
   };
@@ -101,6 +102,7 @@ const baseSendEmailData = {
   recipients: "alice@example.com",
   subject: "hello",
   body: "world",
+  bodyFormat: "text",
   fileAttachments: "/downloads",
   sender: "noreply@skyvern.com",
   smtpHostSecretParameterKey: "SMTP_HOST",
@@ -163,10 +165,15 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     expect(
       screen.getByPlaceholderText("example@gmail.com, example2@gmail.com..."),
     ).toBeDefined();
-    expect(screen.getByPlaceholderText("What is the gist?")).toBeDefined();
+    expect(
+      screen.getByPlaceholderText("Your Run is Finished {{workflow_run_id}}"),
+    ).toBeDefined();
     expect(
       screen.getByPlaceholderText("What would you like to say?"),
     ).toBeDefined();
+    expect(
+      screen.getByRole("combobox", { name: "Body format" }).textContent,
+    ).toBe("Text");
   });
 
   test("File Attachments input is disabled (beta parity)", () => {
@@ -215,7 +222,7 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     render(<SendEmailBlockForm blockId="b1" />);
 
     const input = screen.getByPlaceholderText(
-      "What is the gist?",
+      "Your Run is Finished {{workflow_run_id}}",
     ) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "new subject" } });
 
@@ -257,7 +264,7 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
     render(<SendEmailBlockForm blockId="b1" />);
 
     const input = screen.getByPlaceholderText(
-      "What is the gist?",
+      "Your Run is Finished {{workflow_run_id}}",
     ) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "subject change" } });
 

@@ -123,6 +123,32 @@ async def test_get_secret_reraises_transient_read_failure(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_delete_secret_succeeds_when_secret_is_already_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret_client = MagicMock()
+    secret_client.delete_secret = AsyncMock(side_effect=ResourceNotFoundError("secret not found"))
+    secret_client.close = AsyncMock()
+    client = _vault_client(monkeypatch, secret_client)
+
+    result = await client.delete_secret("my-secret", "vault")
+
+    assert result == "my-secret"
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_secret_reraises_failure_other_than_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret_client = MagicMock()
+    secret_client.delete_secret = AsyncMock(side_effect=ResourceExistsError("secret is being deleted"))
+    secret_client.close = AsyncMock()
+    client = _vault_client(monkeypatch, secret_client)
+
+    with pytest.raises(ResourceExistsError):
+        await client.delete_secret("my-secret", "vault")
+
+    secret_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_create_or_update_secret_disables_only_preexisting_enabled_versions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

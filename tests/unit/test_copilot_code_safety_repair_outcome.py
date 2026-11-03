@@ -16,6 +16,9 @@ from skyvern.forge.sdk.copilot.secret_scrub import scrub_all_registered_from_tex
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.workflow_update import _update_workflow
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.utils.yaml_loader import safe_load_no_dates
+
+pytestmark = pytest.mark.usefixtures("no_saved_workflow")
 
 _SUBMISSION_REF = "call_code_safety_repair_1"
 _SOURCE_SECRET = "source-secret-must-not-survive"
@@ -295,9 +298,7 @@ async def test_safe_helper_arm_persists_and_reaches_test_run(
     monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        tools_module,
-        "_plan_frontier",
-        lambda *args: (["download_result"], {}, "download_result", "initial"),
+        tools_module.FrontierRequest, "plan", lambda self, ctx: (["download_result"], {}, "download_result", "initial")
     )
     monkeypatch.setattr(tools_module, "_frontier_runtime_page_url", AsyncMock(return_value=None))
     monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", run_blocks)
@@ -310,7 +311,7 @@ async def test_safe_helper_arm_persists_and_reaches_test_run(
         SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
         json.dumps(
             {
-                "workflow_yaml": _SAFE_HELPER_YAML,
+                "workflow": safe_load_no_dates(_SAFE_HELPER_YAML),
                 "block_labels": ["download_result"],
                 "parameters": {},
             }
@@ -319,8 +320,8 @@ async def test_safe_helper_arm_persists_and_reaches_test_run(
 
     parsed_result = json.loads(result)
     assert parsed_result["ok"] is True, parsed_result.get("error")
-    assert ctx.workflow_yaml == _SAFE_HELPER_YAML
+    assert safe_load_no_dates(ctx.workflow_yaml) == safe_load_no_dates(_SAFE_HELPER_YAML)
     assert ctx.has_staged_proposal is True
     assert len(run_calls) == 1
-    assert run_calls[0]["workflow_yaml"] == _SAFE_HELPER_YAML
+    assert run_calls[0]["workflow_yaml"] == ctx.workflow_yaml
     assert run_calls[0]["params"] == {"block_labels": ["download_result"], "parameters": {}}

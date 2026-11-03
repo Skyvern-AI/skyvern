@@ -58,6 +58,8 @@ vi.mock("../../workflowEditorUtils", () => ({
   getAvailableOutputParameterKeys: () => [],
   isNodeInsideForLoop: () => false,
   getParentLoopSkipsOnFail: () => false,
+  isFirstBrowserTaskBlock: () => false,
+  isMissingRequiredStartUrl: () => false,
 }));
 
 import { BLOCK_FORMS, BlockConfigForm } from "../BlockConfigForm";

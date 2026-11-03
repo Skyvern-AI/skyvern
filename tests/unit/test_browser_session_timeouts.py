@@ -1,17 +1,31 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
+from structlog.testing import capture_logs
 
+from skyvern.exceptions import BrowserSessionClosed, BrowserSessionExpired, BrowserSessionStartupTimeout
 from skyvern.forge.sdk.routes import browser_sessions as browser_sessions_routes
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    PersistentBrowserSession,
+    unusable_browser_session_error,
+)
+from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
 from skyvern.schemas.browser_session_timeouts import (
     DEFAULT_TIMEOUT,
+    LIFETIME_END_TOLERANCE_SECONDS,
+    MAX_EXTENDED_LIFETIME_SECONDS,
+    MAX_EXTENDED_TIMEOUT,
     MAX_LIFETIME_SECONDS,
     MAX_TIMEOUT,
     MAX_TIMEOUT_EXCEEDED_MESSAGE,
     MIN_TIMEOUT,
+    creation_timeout_minutes,
+    lifetime_cap_seconds,
+    lived_full_lifetime,
+    max_lifetime_exceeded_warning,
     max_timeout_exceeded_warning,
     seconds_until_expiry,
     session_is_active,
@@ -27,8 +41,8 @@ _CAP = MAX_LIFETIME_SECONDS
 _PAST_BASE = _BASE * 2
 
 
-def _active(**overrides: float | None) -> bool:
-    kwargs: dict[str, float | None] = {
+def _active(**overrides: float | bool | None) -> bool:
+    kwargs: dict[str, float | bool | None] = {
         "seconds_since_start": 0.0,
         "base_timeout_seconds": _BASE,
         "seconds_since_last_activity": None,
@@ -143,6 +157,66 @@ def test_seconds_until_expiry_is_capped_by_max_lifetime() -> None:
     )
 
 
+def test_an_extended_budget_lifts_the_hard_cap_only_where_the_caller_allows_it() -> None:
+    # A budget only exceeds the creation cap through an extension, and only a pod can serve one, so
+    # the lift is opt-in: first-party gates follow the mirrored budget past 4h, and a vendor row
+    # carrying an oversized budget still ends at the cap.
+    extended = MAX_EXTENDED_LIFETIME_SECONDS - 30 * 60
+
+    assert (
+        _active(
+            seconds_since_start=_CAP + 1,
+            base_timeout_seconds=extended,
+            idle_timeout_seconds=extended,
+            budget_may_lift_cap=True,
+        )
+        is True
+    )
+    assert _active(seconds_since_start=_CAP + 1, base_timeout_seconds=extended, idle_timeout_seconds=extended) is False
+    assert (
+        seconds_until_expiry(
+            seconds_since_start=_CAP,
+            base_timeout_seconds=extended,
+            seconds_since_last_activity=None,
+            idle_timeout_seconds=extended,
+            budget_may_lift_cap=True,
+        )
+        == extended - _CAP
+    )
+
+
+def test_the_lifted_cap_never_exceeds_the_extended_maximum() -> None:
+    runaway = MAX_EXTENDED_LIFETIME_SECONDS * 2
+
+    assert lifetime_cap_seconds(runaway) == MAX_EXTENDED_LIFETIME_SECONDS
+    assert lifetime_cap_seconds(_BASE) == MAX_LIFETIME_SECONDS
+    assert (
+        seconds_until_expiry(
+            seconds_since_start=MAX_EXTENDED_LIFETIME_SECONDS - 30,
+            base_timeout_seconds=runaway,
+            seconds_since_last_activity=0,
+            idle_timeout_seconds=runaway,
+            budget_may_lift_cap=True,
+        )
+        == 30
+    )
+
+
+def test_creation_is_capped_so_only_an_extension_can_exceed_the_creation_cap() -> None:
+    assert creation_timeout_minutes(MAX_TIMEOUT + 60) == MAX_TIMEOUT
+    assert creation_timeout_minutes(90) == 90
+    assert creation_timeout_minutes(None) is None
+
+
+def test_max_lifetime_exceeded_warning_states_the_request_and_the_grant() -> None:
+    warning = max_lifetime_exceeded_warning(90, 20)
+
+    assert "90 minutes" in warning
+    assert "20 minutes" in warning
+    assert str(MAX_EXTENDED_TIMEOUT) in warning
+    assert MAX_TIMEOUT_EXCEEDED_MESSAGE in warning
+
+
 def test_session_is_active_matches_positive_remaining_time() -> None:
     cases = (
         (_BASE - 1, None),
@@ -167,6 +241,7 @@ def test_session_is_active_matches_positive_remaining_time() -> None:
 
 async def _create_session(timeout: int | None) -> tuple[MagicMock, BrowserSessionResponse]:
     app_mock = MagicMock()
+    app_mock.AGENT_FUNCTION.validate_enterprise_feature_access = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(
         return_value=SimpleNamespace(persistent_browser_session_id="pbs_1")
     )
@@ -224,3 +299,87 @@ def test_requested_timeout_below_the_minimum_is_still_rejected() -> None:
 def test_timeout_defaults_and_explicit_none_are_untouched() -> None:
     assert CreateBrowserSessionRequest().timeout == DEFAULT_TIMEOUT
     assert CreateBrowserSessionRequest(timeout=None).timeout is None
+
+
+@pytest.mark.parametrize(
+    ("lived_seconds", "expected"),
+    [
+        (60 * 60, True),
+        (60 * 60 - LIFETIME_END_TOLERANCE_SECONDS, True),
+        (60 * 60 - LIFETIME_END_TOLERANCE_SECONDS - 1, False),
+        (60, False),
+    ],
+)
+def test_a_session_lived_its_full_lifetime_only_within_the_end_tolerance(lived_seconds: int, expected: bool) -> None:
+    started_at = datetime(2026, 9, 28, 13, 0, tzinfo=UTC)
+    ended_at = started_at + timedelta(seconds=lived_seconds)
+
+    assert lived_full_lifetime(started_at=started_at, ended_at=ended_at, timeout_minutes=60) is expected
+    assert not lived_full_lifetime(started_at=None, ended_at=ended_at, timeout_minutes=60)
+    assert not lived_full_lifetime(started_at=started_at, ended_at=ended_at, timeout_minutes=None)
+
+
+def _ended_session(**overrides: object) -> PersistentBrowserSession:
+    started_at = datetime(2026, 9, 28, 13, 0, tzinfo=UTC)
+    fields: dict[str, object] = {
+        "persistent_browser_session_id": "pbs_x",
+        "organization_id": "o_test",
+        "status": "timeout",
+        "timeout_minutes": 60,
+        "started_at": started_at,
+        "completed_at": started_at + timedelta(minutes=60),
+        "created_at": started_at,
+        "modified_at": started_at,
+    }
+    return PersistentBrowserSession(**{**fields, **overrides})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param({}, BrowserSessionExpired, id="timeout"),
+        pytest.param({"started_at": None}, BrowserSessionStartupTimeout, id="timeout-before-start"),
+        pytest.param(
+            {"status": "completed", "close_reason": BrowserSessionCloseReason.expired},
+            BrowserSessionExpired,
+            id="oss-reaper-full-lifetime",
+        ),
+        pytest.param(
+            {
+                "status": "completed",
+                "close_reason": BrowserSessionCloseReason.expired,
+                "completed_at": datetime(2026, 9, 28, 13, 10, tzinfo=UTC),
+            },
+            BrowserSessionClosed,
+            id="expired-reason-stamped-early",
+        ),
+        pytest.param({"status": "completed"}, BrowserSessionClosed, id="completed-by-the-caller"),
+        pytest.param({"status": "failed"}, BrowserSessionClosed, id="failed"),
+        pytest.param(
+            {"status": "running", "completed_at": None, "close_requested_at": datetime(2026, 9, 28, 13, 5, tzinfo=UTC)},
+            BrowserSessionClosed,
+            id="close-requested",
+        ),
+        pytest.param({"status": "running", "completed_at": None}, type(None), id="live"),
+    ],
+)
+def test_unusable_browser_session_error_tells_expiry_from_an_early_close(
+    overrides: dict[str, object], expected: type
+) -> None:
+    error = unusable_browser_session_error(_ended_session(**overrides))
+
+    assert type(error) is expected
+
+
+def test_submission_refusal_emits_a_structured_countable_event() -> None:
+    with capture_logs() as logs:
+        error = unusable_browser_session_error(
+            _ended_session(), refused_at_submission=True, submission_path="workflow_run"
+        )
+
+    assert isinstance(error, BrowserSessionExpired)
+    assert len(logs) == 1
+    assert logs[0]["event"] == "browser_session_run_refused"
+    assert logs[0]["error_code"] == "browser_session_expired"
+    assert logs[0]["browser_session_id"] == "pbs_x"
+    assert logs[0]["submission_path"] == "workflow_run"

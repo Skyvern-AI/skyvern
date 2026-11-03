@@ -1,11 +1,13 @@
 import asyncio
+import dataclasses
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TypedDict
 
 import structlog
 
 from skyvern.exceptions import CredentialVaultShapeMismatchError
 from skyvern.forge import app
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
@@ -15,9 +17,84 @@ from skyvern.forge.sdk.schemas.credentials import (
     CreditCardBillingAddress,
     CreditCardCredential,
     PasswordCredential,
+    TotpType,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 
 LOG = structlog.get_logger()
+
+
+@dataclasses.dataclass(frozen=True)
+class VaultLogin:
+    """A login a vault lists, as metadata only; `credential_id` is the saved credential it was imported as."""
+
+    vault_type: CredentialVaultType
+    vault_id: str
+    item_id: str
+    title: str
+    # Every saved URI without its match mode: enough to say the login competes for a page, never to grant it.
+    urls: tuple[str, ...]
+    sites: tuple[LoginSite, ...]
+    tested_url: str | None = None
+    credential_id: str | None = None
+
+
+# The vaults whose logins are listed, and imported as metadata-only saved credentials.
+LISTED_VAULT_TYPES = frozenset({CredentialVaultType.BITWARDEN_CONNECTED, CredentialVaultType.ONEPASSWORD})
+
+
+@dataclasses.dataclass(frozen=True)
+class VaultLoginListing:
+    logins: tuple[VaultLogin, ...] = ()
+    unreadable: tuple[CredentialVaultType, ...] = ()
+    hidden: bool = False
+
+
+async def vault_logins_hidden(organization_id: str) -> bool:
+    """Vault items carry no credential folder, so only a principal no folder restricts may see them."""
+    principal = get_request_principal()
+    if principal is None:
+        return await app.AGENT_FUNCTION.credential_folders_restricted(organization_id)
+    return await app.AGENT_FUNCTION.accessible_credential_folder_ids(principal) is not None
+
+
+async def list_vault_logins(organization_id: str) -> VaultLoginListing:
+    if await vault_logins_hidden(organization_id):
+        return VaultLoginListing(hidden=True)
+    services = [(vault_type, service) for vault_type, service in app.CREDENTIAL_VAULT_SERVICES.items() if service]
+    listings = await asyncio.gather(
+        *(service.list_logins(organization_id) for _, service in services), return_exceptions=True
+    )
+    logins: list[VaultLogin] = []
+    unreadable: list[CredentialVaultType] = []
+    for (vault_type, _), listed in zip(services, listings, strict=True):
+        if isinstance(listed, BaseException):
+            # Vault errors can quote the account email, so only the type is logged.
+            LOG.warning(
+                "Vault logins unreadable",
+                organization_id=organization_id,
+                vault_type=vault_type,
+                error_type=type(listed).__name__,
+            )
+            unreadable.append(CredentialVaultType(vault_type))
+            continue
+        if not listed:
+            continue
+        imported = await app.DATABASE.credentials.get_onepassword_credentials(
+            organization_id,
+            vault_type=CredentialVaultType(vault_type),
+            item_keys=[(login.vault_id, login.item_id) for login in listed],
+        )
+        imported_ids = {(credential.vault_id, credential.item_id): credential.credential_id for credential in imported}
+        logins.extend(
+            dataclasses.replace(login, credential_id=imported_ids.get((login.vault_id, login.item_id)))
+            for login in listed
+        )
+    return VaultLoginListing(tuple(logins), tuple(unreadable))
+
+
+class _HasTotpSeedKwargs(TypedDict, total=False):
+    has_totp_seed: bool
 
 
 class CredentialVaultService(ABC):
@@ -35,7 +112,13 @@ class CredentialVaultService(ABC):
         return None
 
     @abstractmethod
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
+    ) -> Credential:
         """Create a new credential in the vault and database."""
 
     @abstractmethod
@@ -56,6 +139,10 @@ class CredentialVaultService(ABC):
     @abstractmethod
     async def get_credential_item(self, db_credential: Credential) -> CredentialItem:
         """Retrieve the full credential data from the vault."""
+
+    async def list_logins(self, organization_id: str) -> list[VaultLogin] | None:
+        """The organization's own logins in this vault, or None when it lists none for the organization."""
+        return None
 
     async def _enqueue_orphaned_vault_item_cleanup(
         self,
@@ -199,10 +286,13 @@ class CredentialVaultService(ABC):
 
         `password` defaults to "" so a login with no password can be stored, which makes an omitted
         password indistinguishable from an explicitly blanked one by value alone. Only an explicitly
-        set password may overwrite the stored one.
+        set password may overwrite the stored one. An omitted `totp` likewise preserves a stored
+        TOTP seed.
         """
         updated_fields = updated_credential.model_fields_set
-        if {"metadata", "password"}.issubset(updated_fields):
+        if {"metadata", "password"}.issubset(updated_fields) and (
+            "totp" in updated_fields or credential.has_totp_seed is False
+        ):
             return updated_credential
 
         existing_item = await self.get_credential_item(credential)
@@ -217,11 +307,13 @@ class CredentialVaultService(ABC):
                 )
             return updated_credential
 
+        if "totp" not in updated_fields:
+            # Assignment adds totp to the original request's model_fields_set so _update_db_credential derives has_totp_seed.
+            updated_credential.totp = existing_item.credential.totp
         preserved_fields: dict[str, object] = {}
-        for field_name in ("metadata", "password"):
+        for field_name in ("metadata", "password", "totp"):
             if field_name not in updated_fields:
                 preserved_fields[field_name] = getattr(existing_item.credential, field_name)
-
         return updated_credential.model_copy(update=preserved_fields)
 
     @staticmethod
@@ -254,6 +346,8 @@ class CredentialVaultService(ABC):
         data: CreateCredentialRequest,
         item_id: str,
         vault_type: CredentialVaultType,
+        created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
     ) -> Credential:
         if data.credential_type == CredentialType.PASSWORD:
             return await app.DATABASE.credentials.create_credential(
@@ -265,11 +359,16 @@ class CredentialVaultService(ABC):
                 username=data.credential.username,
                 totp_type=data.credential.totp_type,
                 totp_identifier=data.credential.totp_identifier,
+                has_totp_seed=bool((data.credential.totp or "").strip()),
                 card_last4=None,
                 card_brand=None,
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
+                created_by=created_by,
+                is_passkey_setup_pending=(
+                    True if is_passkey_setup_pending and data.credential.totp_type == TotpType.PASSKEY else None
+                ),
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
             return await app.DATABASE.credentials.create_credential(
@@ -283,9 +382,11 @@ class CredentialVaultService(ABC):
                 card_last4=data.credential.card_number[-4:],
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
+                has_totp_seed=False,
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
+                created_by=created_by,
             )
         elif data.credential_type == CredentialType.SECRET:
             return await app.DATABASE.credentials.create_credential(
@@ -299,10 +400,12 @@ class CredentialVaultService(ABC):
                 card_last4=None,
                 card_brand=None,
                 totp_identifier=None,
+                has_totp_seed=False,
                 secret_label=data.credential.secret_label,
                 tested_url=data.tested_url,
                 proxy_location=data.proxy_location,
                 proxy_session_id=data.proxy_session_id,
+                created_by=created_by,
             )
         else:
             raise Exception(f"Unsupported credential type: {data.credential_type}")
@@ -322,6 +425,11 @@ class CredentialVaultService(ABC):
             proxy_kwargs["rotate_proxy_session_id"] = True
 
         if data.credential_type == CredentialType.PASSWORD:
+            has_totp_seed_kwargs: _HasTotpSeedKwargs = (
+                {"has_totp_seed": bool((data.credential.totp or "").strip())}
+                if "totp" in data.credential.model_fields_set
+                else {}
+            )
             return await app.DATABASE.credentials.update_credential_vault_data(
                 credential_id=credential.credential_id,
                 organization_id=credential.organization_id,
@@ -334,6 +442,7 @@ class CredentialVaultService(ABC):
                 card_last4=None,
                 card_brand=None,
                 tested_url=data.tested_url,
+                **has_totp_seed_kwargs,
                 **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.CREDIT_CARD:
@@ -349,6 +458,7 @@ class CredentialVaultService(ABC):
                 card_brand=data.credential.card_brand,
                 totp_identifier=None,
                 tested_url=data.tested_url,
+                has_totp_seed=False,
                 **proxy_kwargs,
             )
         elif data.credential_type == CredentialType.SECRET:
@@ -365,6 +475,7 @@ class CredentialVaultService(ABC):
                 totp_identifier=None,
                 secret_label=data.credential.secret_label,
                 tested_url=data.tested_url,
+                has_totp_seed=False,
                 **proxy_kwargs,
             )
         else:

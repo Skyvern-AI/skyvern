@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,17 +14,21 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from PIL import Image
 
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import _consume_pending_screenshots
 from skyvern.forge.sdk.copilot.screenshot_utils import (
     COPILOT_SCREENSHOT_MAX_HEIGHT,
     COPILOT_SCREENSHOT_MAX_WIDTH,
+    PendingFrameLease,
     ScreenshotActionRelation,
     ScreenshotEntry,
     ScreenshotProvenance,
     enqueue_screenshot,
-    stage_screenshot_from_artifact,
+    enqueue_screenshot_from_result,
 )
 from skyvern.forge.sdk.copilot.session_factory import copilot_call_model_input_filter
+from skyvern.forge.sdk.copilot.tools import _run_result_screenshot_provenance
+from skyvern.forge.sdk.copilot.tools.composition_capture import store_post_run_page_evidence
 from skyvern.forge.sdk.copilot.tools.run_execution import (
     NO_PERSISTED_END_URL,
     RECORDED_FAILURE_RESPONSE_MAX_CHARS,
@@ -35,7 +41,14 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
 )
 from skyvern.forge.sdk.copilot.tools.scouting import _capture_post_interaction_screenshot
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
-from tests.unit.copilot_test_helpers import make_model_input_data
+from tests.unit.copilot_test_helpers import (
+    captured_frame_entry,
+    install_get_run_results_harness,
+    make_copilot_ctx,
+    make_model_input_data,
+    run_result_block_row,
+    sent_image_px,
+)
 
 
 def _install_mock_database(monkeypatch: pytest.MonkeyPatch, mock_db: Any) -> None:
@@ -127,14 +140,23 @@ class TestEnqueueScreenshot:
         assert entry.provenance == provenance
 
     def test_older_capture_cannot_replace_newer_pending_frame(self) -> None:
-        ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[])
+        ctx = SimpleNamespace(
+            supports_vision=True,
+            pending_screenshots=[],
+            pending_chat_screenshots=[],
+            chat_screenshot_capture_ids=set(),
+        )
         provenance = ScreenshotProvenance.unknown(source_tool="inspect_page_for_composition")
+        older = io.BytesIO()
+        Image.new("RGB", (30, 20), (10, 120, 200)).save(older, format="PNG")
+        older_b64 = base64.b64encode(older.getvalue()).decode()
 
         assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=20.0) is True
         newest = ctx.pending_screenshots[0]
-        assert enqueue_screenshot(ctx, self.VALID_PNG_B64, provenance=provenance, captured_at=10.0) is False
+        assert enqueue_screenshot(ctx, older_b64, provenance=provenance, captured_at=10.0) is False
 
         assert ctx.pending_screenshots == [newest]
+        assert [frame.capture_id for frame in ctx.pending_chat_screenshots] == [newest.capture_id]
 
     def test_skips_when_no_vision(self) -> None:
         from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
@@ -205,8 +227,6 @@ class TestEnqueueScreenshot:
 
 
 def test_run_result_screenshot_provenance_reads_nested_run_facts() -> None:
-    from skyvern.forge.sdk.copilot.tools import _run_result_screenshot_provenance
-
     provenance = _run_result_screenshot_provenance(
         {
             "ok": False,
@@ -227,78 +247,6 @@ def test_run_result_screenshot_provenance_reads_nested_run_facts() -> None:
         workflow_run_id="wr_123",
         action_relation=ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
     )
-
-
-class TestStageScreenshotFromArtifact:
-    """The non-inline screenshot tool returns a local artifact path, not image bytes."""
-
-    @staticmethod
-    def _png(path: Path, size: tuple[int, int]) -> str:
-        Image.new("RGB", size, (10, 120, 200)).save(path, format="PNG")
-        return str(path)
-
-    @staticmethod
-    def _ctx() -> SimpleNamespace:
-        return SimpleNamespace(supports_vision=True, pending_screenshots=[])
-
-    @staticmethod
-    def _provenance() -> ScreenshotProvenance:
-        return ScreenshotProvenance.unknown(source_tool="click")
-
-    def test_stages_the_artifact_the_path_names(self, tmp_path: Path) -> None:
-        ctx = self._ctx()
-        result = {"ok": True, "data": {"path": self._png(tmp_path / "frame.png", (400, 300))}}
-
-        assert stage_screenshot_from_artifact(ctx, result, provenance=self._provenance()) is True
-        assert len(ctx.pending_screenshots) == 1
-        assert ctx.pending_screenshots[0].mime == "image/jpeg"
-
-    def test_staged_frame_is_bounded_to_the_copilot_maximum(self, tmp_path: Path) -> None:
-        ctx = self._ctx()
-        result = {"ok": True, "data": {"path": self._png(tmp_path / "big.png", (2400, 1800))}}
-
-        assert stage_screenshot_from_artifact(ctx, result, provenance=self._provenance()) is True
-        width, height = Image.open(io.BytesIO(base64.b64decode(ctx.pending_screenshots[0].b64))).size
-        assert width <= COPILOT_SCREENSHOT_MAX_WIDTH
-        assert height <= COPILOT_SCREENSHOT_MAX_HEIGHT
-
-    @pytest.mark.parametrize(
-        "data",
-        [
-            pytest.param({}, id="no_path"),
-            pytest.param({"path": ""}, id="empty_path"),
-            pytest.param({"path": "/nonexistent/frame.png"}, id="missing_file"),
-        ],
-    )
-    def test_unresolvable_artifact_is_no_frame_not_an_error(self, data: dict[str, Any]) -> None:
-        ctx = self._ctx()
-
-        assert (
-            stage_screenshot_from_artifact(
-                ctx,
-                {"ok": True, "data": data},
-                provenance=self._provenance(),
-            )
-            is False
-        )
-        assert ctx.pending_screenshots == []
-
-    def test_failed_capture_over_a_stale_entry_does_not_report_staged(self, tmp_path: Path) -> None:
-        """A queue-length check would call this staged: the earlier frame is still pending."""
-        stale = _screenshot_entry("stale")
-        ctx = SimpleNamespace(supports_vision=True, pending_screenshots=[stale])
-        corrupt = tmp_path / "corrupt.png"
-        corrupt.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not-an-image" * 40)
-
-        assert (
-            stage_screenshot_from_artifact(
-                ctx,
-                {"ok": True, "data": {"path": str(corrupt)}},
-                provenance=self._provenance(),
-            )
-            is False
-        )
-        assert ctx.pending_screenshots == [stale]
 
 
 class TestCapturePostInteractionScreenshot:
@@ -410,6 +358,58 @@ class TestCapturePostInteractionScreenshot:
         )
         assert ctx.pending_screenshots == []
 
+    @pytest.mark.asyncio
+    async def test_staged_frame_is_bounded_to_the_copilot_maximum(self, tmp_path: Path) -> None:
+        frame = tmp_path / "big.png"
+        Image.new("RGB", (2400, 1800), (10, 120, 200)).save(frame, format="PNG")
+        ctx = self._ctx({"ok": True, "data": {"path": str(frame)}})
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is True
+        width, height = Image.open(io.BytesIO(base64.b64decode(ctx.pending_screenshots[0].b64))).size
+        assert width <= COPILOT_SCREENSHOT_MAX_WIDTH
+        assert height <= COPILOT_SCREENSHOT_MAX_HEIGHT
+
+    @pytest.mark.asyncio
+    async def test_delivered_frame_states_its_image_size_and_the_measured_viewport(self, tmp_path: Path) -> None:
+        frame = tmp_path / "frame.png"
+        Image.new("RGB", (1920, 947), (10, 120, 200)).save(frame, format="PNG")
+        ctx = self._ctx({"ok": True, "data": {"path": str(frame), "viewport": {"width": 1920, "height": 947}}})
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is True
+        result = copilot_call_model_input_filter(
+            make_model_input_data([{"role": "user", "content": "go"}], context=ctx)
+        )
+
+        message = result.input[-1]
+        assert sent_image_px(message) == [(1600, 789)]
+        assert "image_px=1600x789; viewport_css_px=1920x947" in message["content"][0]["text"]
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({}, id="no_path"),
+            pytest.param({"path": ""}, id="empty_path"),
+            pytest.param({"path": "/nonexistent/frame.png"}, id="missing_file"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unresolvable_artifact_is_no_frame_not_an_error(self, data: dict[str, Any]) -> None:
+        ctx = self._ctx({"ok": True, "data": data})
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is False
+        assert ctx.pending_screenshots == []
+
+    @pytest.mark.asyncio
+    async def test_failed_capture_over_a_stale_entry_does_not_report_staged(self, tmp_path: Path) -> None:
+        """A queue-length check would call this staged: the earlier frame is still pending."""
+        stale = _screenshot_entry("stale")
+        corrupt = tmp_path / "corrupt.png"
+        corrupt.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not-an-image" * 40)
+        ctx = self._ctx({"ok": True, "data": {"path": str(corrupt)}}, pending_screenshots=[stale])
+
+        assert await _capture_post_interaction_screenshot(ctx, source_tool="click", captured_url=None) is False
+        assert ctx.pending_screenshots == [stale]
+
 
 class TestConsumePendingScreenshots:
     def test_returns_none_when_empty(self) -> None:
@@ -496,6 +496,18 @@ class TestNudgeDrainAndFilterExclusivity:
 
         assert result.input == items
 
+    def test_a_frame_sent_sharp_is_saved_small_with_a_nudge(self) -> None:
+        ctx = SimpleNamespace(pending_screenshots=[captured_frame_entry()], supports_vision=True)
+        items = [{"role": "user", "content": "read the reference code"}]
+        seen = copilot_call_model_input_filter(make_model_input_data(items, context=ctx))
+        saved = _consume_pending_screenshots(ctx)
+        history = [*items, {"role": "assistant", "content": "done"}, saved]
+
+        after = copilot_call_model_input_filter(make_model_input_data(history, context=ctx))
+
+        assert sent_image_px(seen.input[-1]) == [(1600, 789)]
+        assert sent_image_px(after.input[-1]) == [(1024, 505)]
+
     def test_the_nudge_path_also_withholds_the_frame_from_a_non_vision_model(self) -> None:
         # The vision check lives in the shared builder so every delivery path inherits it;
         # the drain still empties the queue.
@@ -506,6 +518,158 @@ class TestNudgeDrainAndFilterExclusivity:
 
         assert _consume_pending_screenshots(ctx) is None
         assert ctx.pending_screenshots == []
+
+
+def _png_b64(color: tuple[int, int, int]) -> str:
+    buf = io.BytesIO()
+    Image.new("RGB", (320, 200), color).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _terminal_capture_provenance(
+    run_id: str,
+    *,
+    action_relation: ScreenshotActionRelation = ScreenshotActionRelation.WORKFLOW_RUN_RESULT,
+) -> ScreenshotProvenance:
+    return ScreenshotProvenance(
+        source_tool="dispatched_terminal_page_capture",
+        captured_url="https://example.com/done",
+        observation_step=None,
+        browser_session_id="pbs_run",
+        workflow_run_id=run_id,
+        action_relation=action_relation,
+    )
+
+
+def _store_run_evidence(ctx: CopilotContext, run_id: str, *, source_browser_session_id: str = "pbs_run") -> bool:
+    _, preserved = store_post_run_page_evidence(
+        ctx,
+        {"current_url": "https://example.com/done", "forms": [{"name": "apply"}]},
+        run_id=run_id,
+        current_url="https://example.com/done",
+        source_browser_session_id=source_browser_session_id,
+        run_browser_session_id="pbs_run",
+    )
+    return preserved
+
+
+def _sent_frame_text(ctx: CopilotContext) -> str | None:
+    result = copilot_call_model_input_filter(make_model_input_data([{"role": "user", "content": "go"}], context=ctx))
+    frames = [message for message in result.input if sent_image_px(message)]
+    return frames[-1]["content"][0]["text"] if frames else None
+
+
+class TestSupersededRunResultFrame:
+    def _ctx_with_terminal_frame(
+        self, frame_run_id: str = "wr_A", *, last_run_id: str = "wr_A"
+    ) -> tuple[CopilotContext, ScreenshotEntry]:
+        ctx = make_copilot_ctx(last_run_blocks_workflow_run_id=last_run_id)
+        assert enqueue_screenshot(ctx, _png_b64((200, 30, 30)), provenance=_terminal_capture_provenance(frame_run_id))
+        return ctx, ctx.pending_screenshots[0]
+
+    def test_a_later_run_storing_evidence_without_a_frame_stops_the_terminal_capture_frame(self) -> None:
+        ctx, frame_a = self._ctx_with_terminal_frame()
+        ctx.pending_frame_lease = PendingFrameLease(
+            capture_event_id=frame_a.capture_event_id, capture_id=frame_a.capture_id, input_fingerprint="f"
+        )
+        assert frame_a.capture_id in (_sent_frame_text(ctx) or "")
+
+        ctx.last_run_blocks_workflow_run_id = "wr_B"
+        assert _store_run_evidence(ctx, "wr_B") is False
+
+        assert _sent_frame_text(ctx) is None
+        assert ctx.pending_screenshots == []
+        assert ctx.pending_frame_lease is None
+
+    @pytest.mark.parametrize(
+        "run_data",
+        [
+            pytest.param({"workflow_run_id": "wr_A"}, id="with_run_id"),
+            pytest.param({}, id="without_run_id"),
+        ],
+    )
+    def test_a_later_run_storing_evidence_without_a_frame_stops_the_run_result_wrapper_frame(
+        self, run_data: dict[str, str]
+    ) -> None:
+        ctx = make_copilot_ctx(last_run_blocks_workflow_run_id="wr_A")
+        result = {"ok": False, "data": {**run_data, "screenshot_base64": _png_b64((200, 30, 30))}}
+        enqueue_screenshot_from_result(
+            ctx,
+            result,
+            provenance=_run_result_screenshot_provenance(result, source_tool="run_blocks_and_collect_debug"),
+        )
+        frame_a = ctx.pending_screenshots[0]
+        assert frame_a.provenance.workflow_run_id == run_data.get("workflow_run_id")
+        assert frame_a.capture_id in (_sent_frame_text(ctx) or "")
+
+        ctx.last_run_blocks_workflow_run_id = "wr_B"
+        _store_run_evidence(ctx, "wr_B")
+
+        assert _sent_frame_text(ctx) is None
+
+    def test_a_later_run_storing_evidence_keeps_a_same_page_observation_frame(self) -> None:
+        ctx = make_copilot_ctx(last_run_blocks_workflow_run_id="wr_B")
+        provenance = _terminal_capture_provenance(
+            "wr_A", action_relation=ScreenshotActionRelation.SAME_PAGE_OBSERVATION
+        )
+        assert enqueue_screenshot(ctx, _png_b64((30, 30, 200)), provenance=provenance)
+        frame = ctx.pending_screenshots[0]
+        assert frame.capture_id in (_sent_frame_text(ctx) or "")
+
+        _store_run_evidence(ctx, "wr_B")
+
+        assert frame.capture_id in (_sent_frame_text(ctx) or "")
+
+    def test_a_later_runs_own_frame_is_what_the_model_sees(self) -> None:
+        ctx, frame_a = self._ctx_with_terminal_frame()
+
+        ctx.last_run_blocks_workflow_run_id = "wr_B"
+        _store_run_evidence(ctx, "wr_B")
+        assert enqueue_screenshot(ctx, _png_b64((30, 200, 30)), provenance=_terminal_capture_provenance("wr_B"))
+        frame_b = ctx.pending_screenshots[0]
+
+        sent = _sent_frame_text(ctx) or ""
+        assert frame_b.capture_id in sent
+        assert frame_a.capture_id not in sent
+
+    @pytest.mark.parametrize(
+        ("existing_evidence", "source_browser_session_id", "frame_run_id", "preserved"),
+        [
+            pytest.param(
+                {
+                    "source_tool": "inspect_page_for_composition",
+                    "observed_after_workflow_run": True,
+                    "workflow_run_id": "wr_A",
+                    "forms": [{"name": "apply"}],
+                },
+                "pbs_other",
+                "wr_Z",
+                True,
+                id="preserve_branch",
+            ),
+            pytest.param(None, "pbs_run", "wr_A", False, id="replacing_branch"),
+        ],
+    )
+    def test_restoring_the_same_runs_evidence_keeps_the_pending_frame(
+        self,
+        existing_evidence: dict[str, Any] | None,
+        source_browser_session_id: str,
+        frame_run_id: str,
+        preserved: bool,
+    ) -> None:
+        ctx, frame = self._ctx_with_terminal_frame(frame_run_id)
+        ctx.composition_page_evidence = existing_evidence
+
+        assert _store_run_evidence(ctx, "wr_A", source_browser_session_id=source_browser_session_id) is preserved
+
+        assert frame.capture_id in (_sent_frame_text(ctx) or "")
+
+    def test_a_late_store_for_an_older_run_keeps_the_newer_runs_frame(self) -> None:
+        ctx, frame_b = self._ctx_with_terminal_frame("wr_B", last_run_id="wr_B")
+
+        _store_run_evidence(ctx, "wr_A")
+
+        assert frame_b.capture_id in (_sent_frame_text(ctx) or "")
 
 
 class TestExtractScreenshotB64:
@@ -1005,6 +1169,20 @@ class TestAttachFailedBlockScreenshots:
 
         monkeypatch.setattr(run_execution_module, "app", _AppStub())
 
+    def _add_artifact_store(self, *, run_block_artifact: object | None) -> None:
+        """Bolt an artifact store onto whatever app stub is already installed.
+
+        The run-results harness installs its own app, so replacing it here would strip the
+        collaborators ``_get_run_results`` needs.
+        """
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        artifacts = MagicMock()
+        artifacts.get_artifact_by_entity_id = AsyncMock(return_value=run_block_artifact)
+        artifacts.get_artifacts_for_task_v2 = AsyncMock(return_value=[])
+        run_execution_module.app.DATABASE.artifacts = artifacts
+        run_execution_module.app.ARTIFACT_MANAGER = MagicMock(retrieve_artifact=AsyncMock(return_value=self.PNG_BYTES))
+
     @pytest.mark.asyncio
     async def test_failed_code_block_carries_screenshot_and_final_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The regression: a code block's screenshot lives on the workflow_run_block.
@@ -1090,7 +1268,7 @@ class TestAttachFailedBlockScreenshots:
             packet["current_url"] = end_url
 
         assert results[0]["at_failure_evidence"] == (
-            "No at-failure screenshot or final URL was persisted for this block."
+            "No at-failure screenshot or final URL is available for this block."
         )
         assert "final_url" not in results[0]
         assert "screenshot_b64" not in results[0]
@@ -1100,59 +1278,103 @@ class TestAttachFailedBlockScreenshots:
         assert packet["screenshot_base64"] is None
 
     @pytest.mark.asyncio
+    async def test_credential_run_failure_still_reaches_the_model_with_its_at_failure_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SKY-15899: a saved credential must not blind the repair loop.
+
+        Pins the call site with the real attach, because the regression was a guard around it:
+        every credential-bearing run had its captured frame and masked URL dropped, and the model
+        was told no evidence was persisted while the frame sat in the artifact store.
+        """
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        block = run_result_block_row("extract_failure_rate", "failed", "https://dash.example.com/board")
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            workflow_parameters=[{"parameter_type": "credential", "key": "dashboard_credential"}],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        self._add_artifact_store(run_block_artifact=MagicMock())
+
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+        failed_block = result["data"]["blocks"][0]
+        assert failed_block["screenshot_b64"] == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+        assert failed_block["final_url"] == "https://dash.example.com/board"
+        assert "at_failure_evidence" not in failed_block
+        assert _resolve_run_screenshot_b64(
+            live_capture=None, results=result["data"]["blocks"], run_ok=False
+        ) == base64.b64encode(self.PNG_BYTES).decode("utf-8")
+
+    @pytest.mark.asyncio
+    async def test_credential_run_without_captured_evidence_says_so_without_inventing_a_frame(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of SKY-15899: delivering evidence must not mean claiming it always exists."""
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+
+        block = run_result_block_row("extract_failure_rate", "failed", None)
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            workflow_parameters=[{"parameter_type": "credential", "key": "dashboard_credential"}],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        self._add_artifact_store(run_block_artifact=None)
+
+        result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
+
+        failed_block = result["data"]["blocks"][0]
+        assert "screenshot_b64" not in failed_block
+        assert failed_block["at_failure_evidence"] == (
+            "No at-failure screenshot or final URL is available for this block."
+        )
+        assert _resolve_run_screenshot_b64(live_capture=None, results=result["data"]["blocks"], run_ok=False) is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_row_read_by_key_keeps_its_at_failure_facts_without_the_image_bytes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
+        from skyvern.forge.sdk.copilot.tools import get_run_results_tool
+
+        block = run_result_block_row("open_item", "failed", "https://example.com/item/7")
+        block.created_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        block.parent_workflow_run_block_id = None
+        block.current_index = None
+        block.current_value = None
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[block],
+            attach_failed_block_screenshots=run_execution_module._attach_failed_block_screenshots,
+        )
+        ctx.secret_scrub_values = []
+        self._add_artifact_store(run_block_artifact=MagicMock())
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._authority_tool_error", lambda *_args: None)
+
+        raw = await get_run_results_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="get_run_results"),
+            json.dumps({"workflow_run_id": "wr-1", "row_keys": ["wrb_open_item"]}),
+        )
+
+        row = json.loads(raw)["data"]["block_details"][0]
+        assert row["final_url"] == "https://example.com/item/7"
+        assert row["screenshot_b64"] == "[base64 image omitted — screenshot was taken successfully]"
+        assert base64.b64encode(self.PNG_BYTES).decode("utf-8") not in raw
+
+    @pytest.mark.asyncio
     async def test_get_run_results_wires_the_persisted_end_url_into_the_packet(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Pins the call site, not the helper: reverting the dispatched branch to ("", "") must fail here."""
         import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
 
-        block = MagicMock()
-        block.label = "accept_notice"
-        block.block_type = SimpleNamespace(name="code")
-        block.status = "failed"
-        block.failure_reason = None
-        block.output = None
-        block.task_id = None
-        block.final_url = "https://example.com/step-2"
-        block.workflow_run_block_id = "wrb-1"
-
-        run = SimpleNamespace(
-            status="failed",
-            workflow_permanent_id="wpid-1",
-            workflow_id="wf-1",
-            failure_reason=None,
-            browser_session_id="pbs-1",
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[run_result_block_row("accept_notice", "failed", "https://example.com/step-2")],
         )
-
-        class _AppStub:
-            class DATABASE:
-                class workflow_runs:
-                    get_workflow_run = AsyncMock(return_value=run)
-
-                class workflows:
-                    get_workflow_for_workflow_run = AsyncMock(
-                        return_value=SimpleNamespace(workflow_definition=SimpleNamespace(parameters=[]))
-                    )
-
-                class observer:
-                    get_workflow_run_blocks = AsyncMock(return_value=[block])
-
-            class AGENT_FUNCTION:
-                should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=True)
-
-        monkeypatch.setattr(run_execution_module, "app", _AppStub())
-        monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
-        monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
-        monkeypatch.setattr(
-            run_execution_module,
-            "_attach_registered_output_parameter_values",
-            AsyncMock(return_value={}),
-        )
-        monkeypatch.setattr(
-            run_execution_module, "_fetch_dispatched_terminal_page_evidence", AsyncMock(return_value=None)
-        )
-
-        ctx = SimpleNamespace(organization_id="org-1", workflow_permanent_id="wpid-1")
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
 
         assert result["data"]["current_url"] == "https://example.com/step-2"
@@ -1166,50 +1388,21 @@ class TestAttachFailedBlockScreenshots:
         """Pins the call site: dropping error_codes or the line from the cold projection fails here."""
         import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
 
-        block = MagicMock()
-        block.label = "extract_failure_rate"
-        block.block_type = SimpleNamespace(name="code")
-        block.status = "failed"
-        block.failure_reason = "code error at line 6"
-        block.error_codes = ["user_code_error"]
-        block.output = None
-        block.task_id = "tsk-1"
-        block.final_url = None
-        block.workflow_run_block_id = "wrb-1"
-
-        run = SimpleNamespace(
-            status="failed",
-            workflow_permanent_id="wpid-1",
-            workflow_id="wf-1",
-            failure_reason=None,
-            browser_session_id="pbs-1",
-        )
-
-        class _AppStub:
-            class DATABASE:
-                class workflow_runs:
-                    get_workflow_run = AsyncMock(return_value=run)
-
-                class workflows:
-                    get_workflow = AsyncMock(return_value=None)
-
-                class observer:
-                    get_workflow_run_blocks = AsyncMock(return_value=[block])
-
-            class AGENT_FUNCTION:
-                should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=True)
-
-        async def _stamp_trace(_blocks: object, results: list, _org: str) -> None:
+        async def _stamp_trace(_blocks: object, results: list, _org: str, include_completed: bool = False) -> None:
             results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": 6}]
 
-        monkeypatch.setattr(run_execution_module, "app", _AppStub())
-        monkeypatch.setattr(run_execution_module, "_attach_action_traces", _stamp_trace)
-        monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
-
-        ctx = SimpleNamespace(
-            organization_id="org-1",
-            workflow_permanent_id="wpid-1",
-            copilot_total_timeout_exceeded=False,
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[
+                run_result_block_row(
+                    "extract_failure_rate",
+                    "failed",
+                    failure_reason="code error at line 6",
+                    error_codes=["user_code_error"],
+                    task_id="tsk-1",
+                )
+            ],
+            attach_action_traces=_stamp_trace,
         )
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx)
 
@@ -1222,52 +1415,15 @@ class TestAttachFailedBlockScreenshots:
         live page read resolves the chat's own browser and reports its page as the run's."""
         import skyvern.forge.sdk.copilot.tools.run_execution as run_execution_module
 
-        block = MagicMock()
-        block.label = "extract"
-        block.block_type = SimpleNamespace(name="code")
-        block.status = "failed"
-        block.failure_reason = None
-        block.error_codes = []
-        block.output = None
-        block.task_id = None
-        block.final_url = None
-        block.workflow_run_block_id = "wrb-1"
-
-        run = SimpleNamespace(
-            status="failed",
-            workflow_permanent_id="wpid-1",
-            workflow_id="wf-1",
-            failure_reason=None,
-            browser_session_id="pbs-1",
-        )
-
-        class _AppStub:
-            class DATABASE:
-                class workflow_runs:
-                    get_workflow_run = AsyncMock(return_value=run)
-
-                class workflows:
-                    get_workflow = AsyncMock(return_value=None)
-
-                class observer:
-                    get_workflow_run_blocks = AsyncMock(return_value=[block])
-
-            class AGENT_FUNCTION:
-                should_dispatch_copilot_block_run_to_worker = AsyncMock(return_value=False)
-
         async def _no_live_read(*args: object, **kwargs: object) -> tuple[str, str]:
             raise AssertionError("read the live page while hydrating a prior run")
 
-        monkeypatch.setattr(run_execution_module, "app", _AppStub())
-        monkeypatch.setattr(run_execution_module, "_attach_action_traces", AsyncMock())
-        monkeypatch.setattr(run_execution_module, "_attach_failed_block_screenshots", AsyncMock())
-        monkeypatch.setattr(run_execution_module, "_fallback_page_info", _no_live_read)
-
-        ctx = SimpleNamespace(
-            organization_id="org-1",
-            workflow_permanent_id="wpid-1",
-            copilot_total_timeout_exceeded=False,
+        ctx = install_get_run_results_harness(
+            monkeypatch,
+            blocks=[run_result_block_row("extract", "failed")],
+            dispatch_to_worker=False,
         )
+        monkeypatch.setattr(run_execution_module, "_fallback_page_info", _no_live_read)
         result = await run_execution_module._get_run_results({"workflow_run_id": "wr-1"}, ctx, read_live_page=False)
 
         assert "current_url" not in result["data"]
@@ -1345,17 +1501,42 @@ class TestAttachFailedBlockScreenshots:
 
         assert _dispatched_end_url([terminal]) is None
 
-    def test_a_runtime_token_in_the_end_url_is_screened(self) -> None:
+    def test_a_runtime_token_in_the_end_url_is_refused_rather_than_rewritten(self) -> None:
+        """A redacted URL still parses, so reporting it would name a page the run never reached."""
         terminal = self._make_block(
             workflow_run_block_id="wrb-tok",
             task_id="tsk-tok",
             final_url="https://example.com/cb?access_token=abcdef1234567890xyz",
         )
 
-        end_url = _dispatched_end_url([terminal])
+        assert _dispatched_end_url([terminal]) is None
 
-        assert end_url is not None
-        assert "abcdef1234567890xyz" not in end_url
+    def test_the_end_url_screen_reduces_a_query_bearing_url_to_its_path(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-code",
+            task_id="tsk-code",
+            final_url="https://example.com/directory/results?access_code=4A0XF9&page=2",
+        )
+
+        assert _dispatched_end_url([terminal]) == "https://example.com/directory/results"
+
+    def test_the_end_url_screen_refuses_a_netloc_credential_whole(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-userinfo",
+            task_id="tsk-userinfo",
+            final_url="https://svc:hunter2@example.com/directory/results",
+        )
+
+        assert _dispatched_end_url([terminal]) is None
+
+    def test_the_end_url_screen_reports_a_query_free_url_whole(self) -> None:
+        terminal = self._make_block(
+            workflow_run_block_id="wrb-plain",
+            task_id="tsk-plain",
+            final_url="https://example.com/results/90210",
+        )
+
+        assert _dispatched_end_url([terminal]) == "https://example.com/results/90210"
 
     def test_a_secret_masked_url_is_not_reported_as_a_resumable_page(self) -> None:
         terminal = self._make_block(
@@ -1403,14 +1584,15 @@ class TestRunScreenshotResolution:
         results = [{"status": "failed", "screenshot_b64": "block-b64"}]
         assert self._resolve("live-b64", results, run_ok=False) == "live-b64"
 
-    def test_failed_run_promotes_first_failed_block(self) -> None:
-        """The dispatched path: no live capture, so the block's at-failure shot is all there is."""
+    def test_failed_run_promotes_newest_failed_block(self) -> None:
+        """The dispatched path: no live capture, so the block's at-failure shot is all there is. Rows
+        arrive chronologically, and the image has to match the failure the run is attributed to."""
         results = [
             {"label": "start", "status": "completed"},
-            {"label": "login", "status": "failed", "screenshot_b64": "first-b64"},
-            {"label": "extract", "status": "failed", "screenshot_b64": "second-b64"},
+            {"label": "login", "status": "failed", "screenshot_b64": "earlier-b64"},
+            {"label": "extract", "status": "failed", "screenshot_b64": "newest-b64"},
         ]
-        assert self._resolve(None, results, run_ok=False) == "first-b64"
+        assert self._resolve(None, results, run_ok=False) == "newest-b64"
 
     def test_successful_run_never_promotes_a_failure_screenshot(self) -> None:
         """A healed or continue_on_failure block leaves a failure screenshot behind on a run

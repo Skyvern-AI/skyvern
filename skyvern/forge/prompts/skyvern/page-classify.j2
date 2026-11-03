@@ -6,7 +6,9 @@ Page text (first 2000 characters):
 ```
 {{ extracted_text }}
 ```
-
+{% if step_notes %}
+{{ step_notes }}
+{% endif %}
 Classify the page into ONE of the following options:
 {% for key, description in options.items() %}
 - "{{ key }}": {{ description }}

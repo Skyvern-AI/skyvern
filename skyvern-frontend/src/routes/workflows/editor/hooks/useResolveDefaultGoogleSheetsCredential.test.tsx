@@ -1,28 +1,63 @@
 // @vitest-environment jsdom
 
-import { cleanup, render } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import {
+  clearDeferredEdits,
+  deferredEdits,
+} from "@/hooks/useDeferredLockedEdit";
+import { WorkflowScopeContext } from "../WorkflowScopeContext";
+
 import type { GoogleOAuthCredential } from "@/api/types";
+import { ReactFlowProvider, useNodes, useReactFlow } from "@xyflow/react";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import {
+  beginCopilotAcceptance,
+  beginSaveTransaction,
+  beginYamlCommit,
+  createYamlCommitOwner,
+  finishCopilotAcceptance,
+  finishSaveTransaction,
+  finishYamlCommit,
+  registerEditorOwner,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import {
+  googleSheetsReadNodeDefaultData,
+  type GoogleSheetsReadNode,
+} from "../nodes/GoogleSheetsReadNode/types";
+import {
+  googleSheetsWriteNodeDefaultData,
+  type GoogleSheetsWriteNode,
+} from "../nodes/GoogleSheetsWriteNode/types";
 
 import { useResolveDefaultGoogleSheetsCredential } from "./useResolveDefaultGoogleSheetsCredential";
 
 const updateNodeData = vi.fn();
-const setHasChanges = vi.fn();
+const getNode = vi.fn();
+const setHasChanges = vi.fn(
+  useWorkflowHasChangesStore.getInitialState().setHasChanges,
+);
+let useRealReactFlow = false;
 
 vi.mock("@xyflow/react", async () => {
   const actual =
     await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
   return {
     ...actual,
-    useReactFlow: () => ({ updateNodeData }),
+    useReactFlow: () =>
+      useRealReactFlow ? actual.useReactFlow() : { getNode, updateNodeData },
   };
 });
-
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: (selector: (s: unknown) => unknown) =>
-    selector({ setHasChanges }),
-}));
 
 let mockCredentials: GoogleOAuthCredential[] = [];
 let mockIsLoading = false;
@@ -123,13 +158,29 @@ function Harness({
   nodes: any[];
   readOnly?: boolean;
 }) {
+  getNode.mockImplementation((id: string) =>
+    nodes.find((node) => node.id === id),
+  );
   useResolveDefaultGoogleSheetsCredential(nodes, readOnly);
   return null;
 }
 
 beforeEach(() => {
   updateNodeData.mockReset();
-  setHasChanges.mockReset();
+  getNode.mockReset();
+  setHasChanges.mockClear();
+  useRealReactFlow = false;
+  useWorkflowYamlEditorStore.setState(
+    useWorkflowYamlEditorStore.getInitialState(),
+    true,
+  );
+  useWorkflowHasChangesStore.setState(
+    {
+      ...useWorkflowHasChangesStore.getInitialState(),
+      setHasChanges,
+    },
+    true,
+  );
   mockCredentials = [];
   mockIsLoading = false;
   mockIsFetching = false;
@@ -137,6 +188,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  clearDeferredEdits();
+  vi.useRealTimers();
 });
 
 describe("useResolveDefaultGoogleSheetsCredential (SKY-11219)", () => {
@@ -280,4 +333,194 @@ describe("useResolveDefaultGoogleSheetsCredential (SKY-11219)", () => {
 
     expect(updateNodeData).not.toHaveBeenCalled();
   });
+});
+
+function DeferredSheetsInput() {
+  const nodes = useNodes<GoogleSheetsReadNode | GoogleSheetsWriteNode>();
+  const { updateNodeData } = useReactFlow<
+    GoogleSheetsReadNode | GoogleSheetsWriteNode
+  >();
+  return (
+    <WorkflowBlockInputTextarea
+      name="credentialId:google"
+      nodeId="g1"
+      value={nodes[0]?.data.credentialId ?? ""}
+      onChange={(credentialId) => updateNodeData("g1", { credentialId })}
+      hideActions
+    />
+  );
+}
+
+function DeferredSheetsHarness({ autoFillFirst }: { autoFillFirst: boolean }) {
+  const input = <DeferredSheetsInput key="input" />;
+  const autoFill = <LiveHarness key="auto-fill" />;
+  return (
+    <WorkflowScopeContext.Provider
+      value={{ workflowId: "workflow-test", readOnly: false }}
+    >
+      {autoFillFirst ? [autoFill, input] : [input, autoFill]}
+    </WorkflowScopeContext.Provider>
+  );
+}
+
+function LiveHarness() {
+  const nodes = useNodes<GoogleSheetsReadNode | GoogleSheetsWriteNode>();
+  const hasChanges = useWorkflowHasChangesStore((state) => state.hasChanges);
+  useResolveDefaultGoogleSheetsCredential(nodes, false, "workflow-test");
+  return (
+    <>
+      <output data-testid="credential">{nodes[0]?.data.credentialId}</output>
+      <output data-testid="dirty">{String(hasChanges)}</output>
+    </>
+  );
+}
+
+describe("default Sheets credentials during editor locks", () => {
+  test.each([
+    ["save", "googleSheetsRead", false],
+    ["save", "googleSheetsRead", true],
+    ["copilot", "googleSheetsRead", false],
+    ["copilot", "googleSheetsRead", true],
+    ["save", "googleSheetsWrite", false],
+    ["save", "googleSheetsWrite", true],
+    ["copilot", "googleSheetsWrite", false],
+    ["copilot", "googleSheetsWrite", true],
+  ] as const)(
+    "preserves a buffered %s template in %s (auto-fill first: %s)",
+    async (lock, type, autoFillFirst) => {
+      vi.useFakeTimers();
+      useRealReactFlow = true;
+      mockIsFetching = true;
+      const nodes: Array<GoogleSheetsReadNode | GoogleSheetsWriteNode> = [
+        type === "googleSheetsRead"
+          ? {
+              id: "g1",
+              type,
+              position: { x: 0, y: 0 },
+              data: { ...googleSheetsReadNodeDefaultData, credentialId: "" },
+            }
+          : {
+              id: "g1",
+              type,
+              position: { x: 0, y: 0 },
+              data: { ...googleSheetsWriteNodeDefaultData, credentialId: "" },
+            },
+      ];
+      const harness = (
+        <ReactFlowProvider defaultNodes={nodes}>
+          <DeferredSheetsHarness autoFillFirst={autoFillFirst} />
+        </ReactFlowProvider>
+      );
+      const view = render(harness);
+      const userValue = "{{ chosen_credential }}";
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: userValue },
+      });
+      let releaseLock: () => void;
+      act(() => {
+        if (lock === "save") {
+          const owner = createYamlCommitOwner("workflow-test");
+          registerEditorOwner(owner);
+          expect(beginSaveTransaction(owner)).toBe(true);
+          releaseLock = () => finishSaveTransaction(owner);
+        } else {
+          const token = beginCopilotAcceptance();
+          expect(token).not.toBeNull();
+          releaseLock = () => finishCopilotAcceptance(token!);
+        }
+      });
+      const deferKey = JSON.stringify([
+        "workflow-test",
+        "g1",
+        "credentialId:google",
+      ]);
+      expect(deferredEdits.get(deferKey)?.value).toBe(userValue);
+      mockCredentials = [credential("cred_default")];
+      mockIsFetching = false;
+      view.rerender(
+        <ReactFlowProvider defaultNodes={nodes}>
+          <DeferredSheetsHarness autoFillFirst={autoFillFirst} />
+        </ReactFlowProvider>,
+      );
+      act(() => vi.advanceTimersByTime(300));
+      expect(screen.getByTestId("credential").textContent).toBe("");
+
+      await act(async () => releaseLock());
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(screen.getByTestId("credential").textContent).toBe(userValue);
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+        userValue,
+      );
+      expect(deferredEdits.has(deferKey)).toBe(false);
+      expect(setHasChanges).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(["save", "yaml", "copilot"] as const)(
+    "fills and marks dirty after the %s lock releases",
+    async (lock) => {
+      useRealReactFlow = true;
+      mockIsLoading = true;
+      mockIsFetching = true;
+      const nodes: Array<GoogleSheetsReadNode | GoogleSheetsWriteNode> = [
+        lock === "save"
+          ? {
+              id: "g1",
+              type: "googleSheetsWrite",
+              position: { x: 0, y: 0 },
+              data: { ...googleSheetsWriteNodeDefaultData, credentialId: "" },
+            }
+          : {
+              id: "g1",
+              type: "googleSheetsRead",
+              position: { x: 0, y: 0 },
+              data: { ...googleSheetsReadNodeDefaultData, credentialId: "" },
+            },
+      ];
+      const view = render(
+        <ReactFlowProvider defaultNodes={nodes}>
+          <LiveHarness />
+        </ReactFlowProvider>,
+      );
+      let releaseLock: () => void;
+      act(() => {
+        if (lock === "save") {
+          const owner = createYamlCommitOwner("wpid_test");
+          registerEditorOwner(owner);
+          expect(beginSaveTransaction(owner)).toBe(true);
+          releaseLock = () => finishSaveTransaction(owner);
+        } else if (lock === "yaml") {
+          const owner = createYamlCommitOwner("wpid_test");
+          expect(beginYamlCommit(owner)).toBe(true);
+          releaseLock = () => finishYamlCommit(owner);
+        } else {
+          const token = beginCopilotAcceptance();
+          expect(token).not.toBeNull();
+          releaseLock = () => finishCopilotAcceptance(token!);
+        }
+      });
+
+      mockCredentials = [credential("cred_default")];
+      mockIsLoading = false;
+      mockIsFetching = false;
+      view.rerender(
+        <ReactFlowProvider defaultNodes={nodes}>
+          <LiveHarness />
+        </ReactFlowProvider>,
+      );
+      await act(async () => {});
+      expect(screen.getByTestId("credential").textContent).toBe("");
+      expect(screen.getByTestId("dirty").textContent).toBe("false");
+      expect(setHasChanges).not.toHaveBeenCalled();
+
+      await act(async () => releaseLock());
+      await waitFor(() => {
+        expect(screen.getByTestId("credential").textContent).toBe(
+          "cred_default",
+        );
+        expect(screen.getByTestId("dirty").textContent).toBe("true");
+      });
+    },
+  );
 });

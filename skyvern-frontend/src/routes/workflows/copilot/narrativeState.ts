@@ -5,24 +5,90 @@
 
 import { buildRevealOffsets } from "./actionReveal";
 import {
+  type ActivityBucket,
+  BudgetExpiryOutcome,
   ConnectedAccountChoice,
-  QuestionPart,
   CopilotResponseType,
+  CopilotSteerMessage,
+  type CopilotTestInput,
+  type CopilotTestInputSource,
+  DeliveredOutputFile,
   ProposalDisposition,
   RunOutcomeRole,
+  SkippedPrefixBlock,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotCodegenProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotRunOutcomeUpdate,
+  WorkflowCopilotRunStartedUpdate,
+  WorkflowCopilotScreenshotUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
+  WorkflowCopilotSteerDeliveredUpdate,
   WorkflowCopilotToolCallUpdate,
   CodeWriteDiff,
   WorkflowCopilotToolResultUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
+
+export interface BudgetExpiryState {
+  budgetExpired: true;
+  source: "deadline" | "max_turns";
+  reportProduced: boolean | null;
+  stagedDraftId: string | null;
+  drainFingerprint: string | null;
+  // Test runs the turn's hard time limit left to their worker; the backend saves only their blocks as unfinished.
+  leftRunIds: string[];
+}
+
+function parseBudgetExpiry(raw: unknown): BudgetExpiryState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (
+    value.budgetExpired !== true ||
+    (value.source !== "deadline" && value.source !== "max_turns")
+  ) {
+    return null;
+  }
+  return {
+    budgetExpired: true,
+    source: value.source,
+    reportProduced:
+      typeof value.reportProduced === "boolean" ? value.reportProduced : null,
+    stagedDraftId:
+      typeof value.stagedDraftId === "string" ? value.stagedDraftId : null,
+    drainFingerprint:
+      typeof value.drainFingerprint === "string"
+        ? value.drainFingerprint
+        : null,
+    leftRunIds: Array.isArray(value.leftRunIds)
+      ? value.leftRunIds.filter((id): id is string => typeof id === "string")
+      : [],
+  };
+}
+
+function budgetExpiryFromOutcome(
+  outcome: BudgetExpiryOutcome | null | undefined,
+): BudgetExpiryState | null {
+  if (
+    outcome?.budget_expired !== true ||
+    (outcome.budget_expiry_source !== "deadline" &&
+      outcome.budget_expiry_source !== "max_turns")
+  ) {
+    return null;
+  }
+  return {
+    budgetExpired: true,
+    source: outcome.budget_expiry_source,
+    reportProduced: outcome.budget_expiry_report_produced ?? null,
+    stagedDraftId: outcome.budget_expiry_staged_draft_id ?? null,
+    drainFingerprint: outcome.drain_fingerprint ?? null,
+    leftRunIds: [],
+  };
+}
 
 // A block's recorded actions, fetched from the run timeline while the test run
 // is live (polled from the first frame that carries the run id) and again at
@@ -33,6 +99,11 @@ export interface RecordedActionSummary {
   summary: string | null;
   durationMs: number | null;
   failed: boolean;
+  // The failing line of a code error; null for every other action, and when
+  // the line is unknown.
+  codeLine: number | null;
+  // A failed action's full recorded failure text; the secure runner records none.
+  response: string | null;
 }
 
 // Client-synthesized event (never sent by the backend) that carries the
@@ -47,15 +118,6 @@ export interface CopilotBlockActionsEvent {
   receivedAtMs: number;
 }
 
-// Client-synthesized event marking that the drafting silence (no frames
-// while the LLM writes code) has lasted long enough to assume Draft has
-// started. Idempotent in the reducer so a re-armed timer or StrictMode
-// double-fire is a no-op.
-export interface CopilotPhaseHintEvent {
-  type: "client_phase_hint";
-  hintedAtMs: number;
-}
-
 // Discriminated union of every event the reducer below consumes. The bubble
 // derives all of its rendering from these payloads.
 export type NarrativeEvent =
@@ -65,19 +127,23 @@ export type NarrativeEvent =
   | WorkflowCopilotWorkflowDraftUpdate
   | WorkflowCopilotBlockProgressUpdate
   | WorkflowCopilotRunOutcomeUpdate
+  | WorkflowCopilotRunStartedUpdate
   | WorkflowCopilotStreamResponseUpdate
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotToolCallUpdate
   | WorkflowCopilotToolResultUpdate
-  | CopilotBlockActionsEvent
-  | CopilotPhaseHintEvent;
+  | WorkflowCopilotCodegenProgressUpdate
+  | WorkflowCopilotSteerDeliveredUpdate
+  | WorkflowCopilotScreenshotUpdate
+  | CopilotBlockActionsEvent;
 
 // Block lifecycle states as observed via block_progress. The bubble groups
 // failed-style states (failed, terminated, timed_out) under one chip and
 // treats `skipped` and `stopped` as separate neutral states. `stopped` is a
 // user cancel: it ran and was interrupted, which is not a failure and must
-// never be rendered as one.
+// never be rendered as one. `unfinished` is a block still running when a turn
+// limit ended the turn; its run may still be going, so it is neither.
 export type BlockUIState =
   | "queued"
   | "drafted"
@@ -85,6 +151,7 @@ export type BlockUIState =
   | "completed"
   | "failed"
   | "stopped"
+  | "unfinished"
   | "skipped";
 
 // Recorded per-run outcome verdict, distinct from lifecycle state: a row can
@@ -151,55 +218,43 @@ export function humanizeJudgeText(text: string): string {
   return stripJudgeInstruction(rewritten).replace(/ {2,}/g, " ").trim();
 }
 
+export function terminalNarrativeText(turn: TurnNarrativeState): string {
+  if (turn.budgetExpiry?.reportProduced === false) {
+    const limit =
+      turn.budgetExpiry.source === "deadline" ? "time" : "model-call";
+    const status = `This turn reached its ${limit} limit without producing a report.`;
+    return turn.budgetExpiry.stagedDraftId
+      ? `${status} A draft was staged during this session.`
+      : status;
+  }
+  if (turn.budgetExpiry) {
+    const drainReply = turn.terminalMessage?.trim() || "";
+    if (drainReply) return drainReply;
+  }
+  return turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
+}
+
 type BuildTestConnectFailureState =
   | "already_closed"
   | "provisioning_unavailable"
-  | "cdp_connect_failed";
+  | "cdp_connect_failed"
+  | "occupied"
+  | "billing_credit_admission_refusal";
 
-function isBuildTestConnectFailureState(
+export function isBuildTestConnectFailureState(
   value: unknown,
 ): value is BuildTestConnectFailureState {
   return (
     value === "already_closed" ||
     value === "provisioning_unavailable" ||
-    value === "cdp_connect_failed"
+    value === "cdp_connect_failed" ||
+    value === "occupied" ||
+    value === "billing_credit_admission_refusal"
   );
 }
 
-// Closed vocabulary of TerminalOutcomeEnvelope.next_state. The envelope's
-// sibling response_kind and user_action_required carry the same bit for a
-// question turn, so only this one is parsed.
-export type TerminalNextState =
-  | "completed"
-  | "proposal_pending"
-  | "awaiting_user_input"
-  | "stopped";
-
-export interface TerminalEnvelopeFacts {
-  nextState: TerminalNextState | null;
-  // Server-admitted parts of the model's own question, in the order it asked
-  // them. Optional like connectFailure: absent on an envelope an older backend
-  // wrote, and empty on every turn that did not end on an ASK_QUESTION.
-  questionParts?: QuestionPart[];
-  // The backend stamps this only when the terminal-envelope render flag is on
-  // for the org; until then the envelope is carried but is not display
-  // authority, so no surface may key off it.
-  renderedFromEnvelope: boolean;
-  runVerdict: BlockOutcome | null;
-  runDisplayReason: string | null;
-  // Absent on envelopes persisted before the role was carried.
-  runOutcomeRole?: RunOutcomeRole | null;
-  connectFailure?: {
-    state: BuildTestConnectFailureState;
-    retryAction: "test_end_to_end";
-    workflowRunId: string | null;
-    workflowRunBlockId: string | null;
-    taskId: string | null;
-    browserSessionId: string | null;
-  } | null;
-}
-
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type InputChange = "added" | "changed" | "removed";
 export type BlockCoverage =
   | "current_source"
   | "different_source"
@@ -224,6 +279,10 @@ export interface TurnFacts {
   runCompleted: boolean | null;
   terminalCause: string | null;
   blocksRunThisTurn: number | null;
+  // The failed run's own recorded reason, scrubbed at source. Survives a reload
+  // even when no block carries an outcome reason of its own. Optional: turns
+  // persisted before it was published carry no such key.
+  recordedFailure?: string | null;
   ranCleanOnCurrentSource: boolean;
 }
 
@@ -244,117 +303,16 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
-}
-
-// part_id and the choice strings are minted or admitted server-side, so this
-// only has to drop a payload shape an older backend never sends.
-function parseQuestionParts(raw: unknown): QuestionPart[] {
-  if (!Array.isArray(raw)) return [];
-  const parts: QuestionPart[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== "object") continue;
-    const part = entry as Record<string, unknown>;
-    if (typeof part.part_id !== "string" || typeof part.prompt !== "string") {
-      continue;
-    }
-    parts.push({
-      part_id: part.part_id,
-      prompt: part.prompt,
-      choices: Array.isArray(part.choices)
-        ? part.choices.filter(
-            (choice): choice is string => typeof choice === "string",
-          )
-        : [],
-    });
-  }
-  return parts;
-}
-
-// Envelope dicts are backend model_dump output, so keys stay snake_case.
-// The backend anchors run_verdict from final outcomes only, so "evaluating"
-// is not a wire value here and parses to null like any unknown.
-export function parseTerminalEnvelope(
-  raw: unknown,
-): TerminalEnvelopeFacts | null {
-  if (!raw || typeof raw !== "object") return null;
-  const obj = raw as Record<string, unknown>;
-  const v = obj.run_verdict;
-  const rawConnectFailure = obj.connect_failure;
-  const connectFailure = (() => {
-    if (!rawConnectFailure || typeof rawConnectFailure !== "object")
-      return null;
-    const failure = rawConnectFailure as Record<string, unknown>;
-    const state = failure.state;
-    if (
-      !isBuildTestConnectFailureState(state) ||
-      failure.retry_action !== "test_end_to_end"
-    ) {
-      return null;
-    }
-    const text = (key: string) =>
-      typeof failure[key] === "string" ? (failure[key] as string) : null;
-    return {
-      state,
-      retryAction: "test_end_to_end" as const,
-      workflowRunId: text("workflow_run_id"),
-      workflowRunBlockId: text("workflow_run_block_id"),
-      taskId: text("task_id"),
-      browserSessionId: text("browser_session_id"),
-    };
-  })();
-  const role = obj.run_outcome_role;
-  const nextState = obj.next_state;
-  return {
-    questionParts: parseQuestionParts(obj.question_parts),
-    nextState:
-      nextState === "completed" ||
-      nextState === "proposal_pending" ||
-      nextState === "awaiting_user_input" ||
-      nextState === "stopped"
-        ? nextState
-        : null,
-    renderedFromEnvelope: obj.rendered_from_envelope === true,
-    runVerdict:
-      v === "demonstrated" || v === "not_demonstrated" || v === "not_evaluated"
-        ? v
-        : null,
-    runDisplayReason:
-      typeof obj.run_display_reason === "string"
-        ? obj.run_display_reason
-        : null,
-    runOutcomeRole:
-      role === "recorded" ||
-      role === "adjudicated" ||
-      role === "interim_build_test"
-        ? role
-        : null,
-    connectFailure,
-  };
-}
-
-// The one typed source for "this turn ended on the user". The backend derives
-// next_state from response_type == ASK_QUESTION and keeps it through a failed
-// build test, so a question asked after scouting or a run still reads as one.
-// Read-gated: the envelope is display authority only once the backend stamped
-// rendered_from_envelope. A user stop is not an ask -- next_state is derived
-// before the cancel lands, so the cancel path persists awaiting_user_input on a
-// turn nobody is waiting on.
-export function awaitsUserInput(
-  turn:
-    | Pick<TurnNarrativeState, "terminalEnvelope" | "cancelled">
-    | null
-    | undefined,
-): boolean {
-  if (!turn || turn.cancelled) return false;
-  const envelope = turn.terminalEnvelope;
-  return (
-    envelope?.renderedFromEnvelope === true &&
-    envelope.nextState === "awaiting_user_input"
-  );
+  inputs?: Array<{ key: string; change: InputChange }>;
+  // Blocks whose saved notes Copilot's YAML left out, so the saved notes were kept.
+  keptNotes?: string[];
+  // The same for descriptions.
+  keptDescriptions?: string[];
 }
 
 export interface BlockState {
   workflowRunBlockId: string;
+  workflowRunId?: string;
   label: string;
   blockType: string;
   state: BlockUIState;
@@ -362,6 +320,8 @@ export interface BlockState {
   outcome?: BlockOutcome;
   outcomeReason?: string;
   outcomeRole?: RunOutcomeRole;
+  // Requested blocks the run did not execute, shown before this, the run's first card.
+  skippedBefore?: SkippedPrefixBlock[];
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -379,7 +339,21 @@ export interface BlockState {
   recordedActionsAt?: number;
 }
 
+export function hasObservedBlockEvidence(block: BlockState): boolean {
+  return (
+    block.workflowRunBlockId.length > 0 ||
+    block.activity.length > 0 ||
+    (block.recordedActions?.length ?? 0) > 0 ||
+    block.recordedActionsAt !== undefined ||
+    block.startedAt !== null ||
+    block.endedAt !== null ||
+    block.outcome !== undefined
+  );
+}
+
 export interface ActivityEntry {
+  reason?: string;
+  activityBucket?: ActivityBucket;
   kind: "tool_call" | "tool_result" | "narration";
   // Free-text label rendered as a one-line summary in the card body.
   text: string;
@@ -390,15 +364,23 @@ export interface ActivityEntry {
   toolName?: string;
   // Product-safe label for rendering tool activity to users.
   displayLabel?: string;
-  // activeLabel reads while the step runs; outcomeLabel replaces it once
-  // finished. Absent when the narrator did not speak for this step.
+  // The narrator's intent for the step, used only to group browse retries.
   activeLabel?: string;
-  outcomeLabel?: string;
   // Result success when kind is tool_result.
   success?: boolean;
+  // A failed tool_result's sanitized failure text. Live-only: saved turns
+  // do not carry it.
+  detail?: string;
   // Server-computed line delta per code block this write changed. Absent on
   // every other row and on payloads from a backend that predates it.
   codeDiffs?: CodeWriteDiff[];
+  // A successful run_browser_code result's operations as display phrases,
+  // in order. Absent on every other row.
+  browserSteps?: string[];
+  // The run a block-running result dispatched, and where each of its inputs
+  // came from. Absent on every other row.
+  workflowRunId?: string;
+  testInputs?: CopilotTestInput[];
   // Stable per-event id used as React key.
   id: string;
   // Consecutive same-tool retries folded into this row by
@@ -432,7 +414,14 @@ export type TurnResponseKind =
   | "refuse"
   | "recover";
 
+interface CallPresentation {
+  bucket: ActivityBucket;
+  reason?: string;
+  startedAt?: string;
+}
+
 export interface TurnNarrativeState {
+  callPresentations?: Record<string, CallPresentation>;
   turnId: string | null;
   turnIndex: number | null;
   responseType: CopilotResponseType | null;
@@ -440,10 +429,6 @@ export interface TurnNarrativeState {
   // Typed terminal response kind for the turn (TurnOutcome.response_kind).
   // Null on legacy rows and frames from an older backend.
   responseKind: TurnResponseKind | null;
-  // Run-outcome facts from the backend-finalized terminal envelope carried
-  // in the narrative payload. Authoritative once runVerdict is set; null on
-  // rows persisted before the envelope existed.
-  terminalEnvelope: TerminalEnvelopeFacts | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -467,20 +452,19 @@ export interface TurnNarrativeState {
   // Activity events fired BEFORE any block started running this turn
   // (design phase + pre-execution tool calls), rendered inside the Design card.
   designActivity: ActivityEntry[];
-  // Client-only phase-progress state (never persisted): epoch ms of the most
-  // recent tool_call/tool_result/narration, and when the 8s drafting-gap
-  // heuristic fired. Grafted across the terminal payload swap by turnId so a
-  // cancel-mid-silence doesn't visually un-check the Draft phase.
-  lastActivityAtMs: number | null;
-  draftingSignaledAt: number | null;
-  // Count of AUTHORING_TOOLS tool_calls this turn, kept outside designActivity
-  // so it survives the MAX_DESIGN_ACTIVITY_ENTRIES eviction cap.
-  authoringCount: number;
+  // Live-only drafting progress from codegen_progress, never persisted. Holds
+  // only what the row renders: the frames' cumulative character count changes
+  // on every frame and would re-render the chat for nothing.
+  codegenProgress: {
+    blockLabels: string[];
+    generationId: string | null;
+  } | null;
   // Snapshot of the most recent factual run outcome.
   lastRunOutcome: {
     verdict: BlockOutcome;
     role?: RunOutcomeRole;
     displayReason: string | null;
+    workflowRunId?: string;
   } | null;
   // Terminal-mode credential ask, from the credentialPrompt narrative signal.
   // reason is kept as a raw string — the card tolerates unknown tokens.
@@ -488,23 +472,63 @@ export interface TurnNarrativeState {
   // Resolved pause outcome, from the credentialPause narrative signal.
   // "declined" means the pause engaged but never sent a frame, so no card.
   credentialPause: {
-    outcome: "connected" | "skipped" | "timeout" | "declined";
+    outcome: "connected" | "skipped" | "timeout" | "declined" | "signed_in";
     credentialId: string | null;
+    // The tool call whose row was newest when the card was raised. Absent on
+    // turns recorded before it was stamped.
+    anchorToolCallId?: string;
   } | null;
+  // Every pick card's credentialPause, oldest first; the backend sends it only when more than one settled.
+  credentialPauses: NonNullable<TurnNarrativeState["credentialPause"]>[];
   // Silently auto-bound credential, from the credentialAutoBound narrative signal — rendered as a
   // receipt with a Change affordance so a confident-but-wrong pick can be corrected after the fact.
   credentialAutoBound: { credentialId: string; name: string } | null;
+  // The last plan a successful set_work_plan stored this turn, kept apart from the activity rows
+  // because their cap can trim the call's row in a long turn.
+  workPlan?: TurnWorkPlan | null;
   connectedAccountChoices: ConnectedAccountChoice[];
+  outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
+  demonstrationOffer: boolean;
+  canonicalWorkflowUnavailable: CanonicalWorkflowUnavailable | null;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
+  budgetExpiry: BudgetExpiryState | null;
+  // Messages the user sent into this turn, in the order the model received them.
+  steerMessages: CopilotSteerMessage[];
+  // Browser frames captured for the agent this turn, in capture order.
+  screenshots: TurnScreenshot[];
+  // Live-only: a started run's skipped prefix, keyed by run id until the run's first block arrives.
+  pendingSkippedPrefix: Record<string, SkippedPrefixBlock[]>;
 }
+
+export interface TurnScreenshot {
+  artifactId: string;
+  capturedAt: string;
+  // The call that staged the frame; null places it by time alone.
+  toolCallId: string | null;
+}
+
+export type GoogleSetupScopeProfile = "gmail" | "google_sheets";
 
 export interface GoogleConnectionNotice {
   provider: "google";
-  connectionId: string;
+  connectionId: string | null;
   displayName: string | null;
-  condition: "missing" | "unusable";
+  condition: "missing" | "unusable" | "unbound";
+  scopeProfile: GoogleSetupScopeProfile;
+  origin: "setup" | "workflow";
+  choices?: ConnectedAccountChoice[];
+}
+
+export function googleConnectionNoticeKey(
+  notice: GoogleConnectionNotice,
+): string {
+  return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
+}
+
+export interface CanonicalWorkflowUnavailable {
+  workflowPermanentId: string;
 }
 
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
@@ -513,7 +537,6 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   responseType: null,
   proposalDisposition: null,
   responseKind: null,
-  terminalEnvelope: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -526,23 +549,43 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   startedAt: null,
   endedAt: null,
   designActivity: [],
-  lastActivityAtMs: null,
-  draftingSignaledAt: null,
-  authoringCount: 0,
+  callPresentations: {},
+  codegenProgress: null,
   lastRunOutcome: null,
   credentialPrompt: null,
   credentialPause: null,
+  credentialPauses: [],
   credentialAutoBound: null,
   connectedAccountChoices: [],
+  outputFiles: [],
   googleConnectionNotices: [],
+  demonstrationOffer: false,
+  canonicalWorkflowUnavailable: null,
   review: null,
   turnFacts: null,
+  budgetExpiry: null,
+  steerMessages: [],
+  screenshots: [],
+  pendingSkippedPrefix: {},
 }) as TurnNarrativeState;
 
 // Caps to keep long-running narrations from unbounded growth (and to keep
 // the rendered card from becoming a wall of text).
 const MAX_ACTIVITY_ENTRIES = 30;
 const MAX_DESIGN_ACTIVITY_ENTRIES = 50;
+// Mirrors MAX_NARRATIVE_BLOCK_ATTEMPTS in context.py: a loop body mints a fresh
+// run-block id every iteration, so the block list is unbounded without this.
+const MAX_BLOCK_ATTEMPTS = 200;
+
+// A saved turn at an activity cap may have dropped its oldest entries, so what it lacks is unknown.
+export function activityMayBeTrimmed(narrative: TurnNarrativeState): boolean {
+  return (
+    narrative.designActivity.length >= MAX_DESIGN_ACTIVITY_ENTRIES ||
+    narrative.blocks.some(
+      (block) => block.activity.length >= MAX_ACTIVITY_ENTRIES,
+    )
+  );
+}
 
 // Some BE paths emit naive ISO datetimes (no timezone offset), e.g. the
 // chat-history endpoint serializing SQLAlchemy created_at columns. JS
@@ -581,18 +624,86 @@ export function parseCredentialPause(
   if (!value || typeof value !== "object") return null;
   const o = value as Record<string, unknown>;
   const outcome = o.outcome;
+  const anchorToolCallId =
+    typeof o.anchorToolCallId === "string" && o.anchorToolCallId
+      ? o.anchorToolCallId
+      : undefined;
+  // The user answered but nothing was bound, which the card already renders as a skip.
+  if (outcome === "not_admitted") {
+    return { outcome: "skipped", credentialId: null, anchorToolCallId };
+  }
   if (
     outcome !== "connected" &&
     outcome !== "skipped" &&
     outcome !== "timeout" &&
-    outcome !== "declined"
+    outcome !== "declined" &&
+    outcome !== "signed_in"
   ) {
     return null;
   }
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
+    anchorToolCallId,
   };
+}
+
+export function parseCredentialPauses(
+  value: unknown,
+): TurnNarrativeState["credentialPauses"] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(parseCredentialPause)
+    .filter(
+      (pause): pause is NonNullable<TurnNarrativeState["credentialPause"]> =>
+        pause !== null,
+    );
+}
+
+export interface TurnWorkPlan {
+  toolCallId: string;
+  items: string[];
+}
+
+function parseStringList(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? [...value]
+    : null;
+}
+
+function parseTurnWorkPlan(value: unknown): TurnWorkPlan | null {
+  if (!value || typeof value !== "object") return null;
+  const o = value as Record<string, unknown>;
+  const items = parseStringList(o.items);
+  return typeof o.toolCallId === "string" && o.toolCallId && items
+    ? { toolCallId: o.toolCallId, items }
+    : null;
+}
+
+const TEST_INPUT_SOURCES: ReadonlySet<string> = new Set<CopilotTestInputSource>(
+  ["copilot", "page", "earlier_run", "default", "placeholder"],
+);
+
+export function parseTestInputs(
+  value: unknown,
+): CopilotTestInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const inputs: CopilotTestInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.key !== "string" || typeof row.source !== "string") {
+      continue;
+    }
+    if (!TEST_INPUT_SOURCES.has(row.source)) continue;
+    inputs.push({
+      key: row.key,
+      source: row.source as CopilotTestInputSource,
+      sourceRunId:
+        typeof row.sourceRunId === "string" ? row.sourceRunId : undefined,
+    });
+  }
+  return inputs.length > 0 ? inputs : undefined;
 }
 
 export function parseCodeDiffs(value: unknown): CodeWriteDiff[] | undefined {
@@ -645,6 +756,18 @@ export function parseConnectedAccountChoices(
   return choices;
 }
 
+export function parseOutputFiles(value: unknown): DeliveredOutputFile[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    return typeof row.artifact_id === "string" &&
+      typeof row.filename === "string"
+      ? [{ artifact_id: row.artifact_id, filename: row.filename }]
+      : [];
+  });
+}
+
 export function parseCredentialAutoBound(
   value: unknown,
 ): TurnNarrativeState["credentialAutoBound"] {
@@ -660,6 +783,19 @@ export function parseCredentialAutoBound(
     : null;
 }
 
+export function parseCanonicalWorkflowUnavailable(
+  value: unknown,
+): CanonicalWorkflowUnavailable | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  return typeof row.workflow_permanent_id === "string" &&
+    row.workflow_permanent_id.length > 0 &&
+    row.candidate_published !== true &&
+    row.test_started === false
+    ? { workflowPermanentId: row.workflow_permanent_id }
+    : null;
+}
+
 export function parseGoogleConnectionNotices(
   value: unknown,
 ): GoogleConnectionNotice[] {
@@ -671,40 +807,57 @@ export function parseGoogleConnectionNotices(
     const row = item as Record<string, unknown>;
     if (
       row.provider !== "google" ||
-      typeof row.connectionId !== "string" ||
-      row.connectionId.length === 0 ||
-      (row.condition !== "missing" && row.condition !== "unusable") ||
-      seen.has(row.connectionId)
+      (row.condition === "unbound"
+        ? row.connectionId !== null
+        : typeof row.connectionId !== "string" ||
+          row.connectionId.length === 0) ||
+      (row.condition !== "missing" &&
+        row.condition !== "unusable" &&
+        row.condition !== "unbound") ||
+      (row.scopeProfile !== undefined &&
+        row.scopeProfile !== "gmail" &&
+        row.scopeProfile !== "google_sheets")
     ) {
       continue;
     }
-    seen.add(row.connectionId);
-    notices.push({
+    const notice: GoogleConnectionNotice = {
       provider: "google",
-      connectionId: row.connectionId,
+      connectionId:
+        row.condition === "unbound" ? null : (row.connectionId as string),
       displayName:
         typeof row.displayName === "string" && row.displayName.length > 0
           ? row.displayName
           : null,
       condition: row.condition,
-    });
+      scopeProfile: row.scopeProfile === "gmail" ? "gmail" : "google_sheets",
+      origin: row.origin === "setup" ? "setup" : "workflow",
+      ...(row.condition === "unbound"
+        ? { choices: parseConnectedAccountChoices(row.choices) }
+        : {}),
+    };
+    const key = googleConnectionNoticeKey(notice);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    notices.push(notice);
   }
   return notices;
 }
 
 // Tool calls that write the workflow definition. update_workflow only
 // validates/saves the draft; update_and_run_blocks also runs it, so it's
-// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member (its
-// activity lands in the Test phase bucket, not Draft — see copilotPhases.ts).
+// the one AUTHORING_TOOLS member that's also a RUN_TOOLS member.
 export const AUTHORING_TOOLS = new Set([
   "update_workflow",
   "update_and_run_blocks",
   "edit_block_and_run",
 ]);
+export const ACCOUNT_GROUP_SUBMIT_TOOL = "run_workflow_for_accounts";
+
 export const RUN_TOOLS = new Set([
   "update_and_run_blocks",
   "edit_block_and_run",
   "run_blocks_and_collect_debug",
+  "test_workflow_from_blank_browser",
 ]);
 
 // Tool names we never surface in the user-facing activity log. Internal
@@ -727,27 +880,140 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   scroll: "Interacting with page",
   select_option: "Selecting option",
   press_key: "Interacting with page",
+  drag: "Interacting with page",
   navigate_browser: "Opening page",
   wait_for_either_state: "Waiting for the page",
   skyvern_frame_list: "Finding embedded pages",
   skyvern_frame_switch: "Opening embedded page",
   skyvern_frame_main: "Returning to main page",
+  skyvern_tab_list: "Listing browser tabs",
+  skyvern_tab_new: "Opening a new tab",
+  skyvern_tab_switch: "Switching tabs",
+  skyvern_tab_close: "Closing a tab",
+  list_workflow_schedules: "Checking this workflow's schedules",
+  get_workflow_schedule: "Reading a schedule",
+  create_workflow_schedule: "Creating a schedule",
+  update_workflow_schedule: "Updating a schedule",
+  enable_workflow_schedule: "Resuming a schedule",
+  disable_workflow_schedule: "Pausing a schedule",
+  delete_workflow_schedule: "Deleting a schedule",
+  cancel_workflow_schedule: "Canceling a schedule",
+  list_browser_profiles: "Checking saved browser profiles",
+  get_browser_profile: "Reading a browser profile",
+  create_browser_profile: "Saving a browser profile",
   get_block_schema: "Checking workflow block options",
   inspect_current_workflow: "Inspecting workflow",
   discover_workflow_entrypoint: "Finding the entry page",
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
+  get_organization_usage_quota: "Checking account usage",
+  create_webhook_trigger: "Creating a webhook trigger",
+  test_trigger_mapping: "Testing the trigger mapping",
+  list_workflow_triggers: "Checking this workflow's triggers",
+  extend_browser_session: "Extending the browser session",
+  run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
   add_block: "Adding block",
   delete_block: "Deleting block",
   request_credential: "Requesting a credential",
+  ask_user: "Asking you",
+  set_work_plan: "Updating its plan",
   synthesize_demonstrated_block: "Building a block from the recorded steps",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "Reviewing the accounts with you",
+  get_account_group_status: "Checking the account runs",
+  cancel_account_group: "Reviewing a cancel with you",
+  delete_saved_credentials: "Reviewing a credential deletion with you",
 };
+
+// What kind of work a call did, for the activity log's per-step rollup. Keyed
+// on the tool name alone; anything unlisted is a browser tool, which is what
+// the MCP overlay adds.
+export type ToolCallKind =
+  | "browser"
+  | "credential"
+  | "plan"
+  | "guidance"
+  | "write"
+  | "run"
+  | "other";
+
+const WRITE_TOOLS = new Set([
+  ...AUTHORING_TOOLS,
+  "edit_block",
+  "add_block",
+  "delete_block",
+  "synthesize_demonstrated_block",
+]);
+
+const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
+  list_credentials: "credential",
+  fill_credential_field: "credential",
+  request_credential: "credential",
+  set_work_plan: "plan",
+  get_workflow_knowledge: "guidance",
+  ask_user: "other",
+  get_block_schema: "other",
+  validate_block: "other",
+  inspect_current_workflow: "other",
+  list_integrations: "other",
+  request_google_connection: "other",
+  offer_demonstration: "other",
+  read_google_sheet: "other",
+  read_attached_pdf: "other",
+  get_organization_usage_quota: "other",
+  create_webhook_trigger: "other",
+  test_trigger_mapping: "other",
+  list_workflow_triggers: "other",
+  extend_browser_session: "other",
+  search_web: "other",
+  list_org_workflows: "other",
+  get_org_workflow: "other",
+  list_workflow_runs: "other",
+  list_workflow_schedules: "other",
+  get_workflow_schedule: "other",
+  create_workflow_schedule: "other",
+  update_workflow_schedule: "other",
+  enable_workflow_schedule: "other",
+  disable_workflow_schedule: "other",
+  cancel_workflow_schedule: "other",
+  delete_workflow_schedule: "other",
+  [ACCOUNT_GROUP_SUBMIT_TOOL]: "run",
+  get_account_group_status: "other",
+  cancel_account_group: "other",
+  delete_saved_credentials: "other",
+};
+
+export function toolCallKind(toolName: string): ToolCallKind {
+  if (RUN_TOOLS.has(toolName)) return "run";
+  if (WRITE_TOOLS.has(toolName)) return "write";
+  return TOOL_CALL_KINDS[toolName] ?? "browser";
+}
 
 export function toolActivityDisplayLabel(toolName?: string | null): string {
   if (!toolName) return "Working";
   return ACTIVITY_TOOL_DISPLAY_LABELS[toolName] ?? "Working";
+}
+
+function actionReason(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseActivityBucket(value: unknown): ActivityBucket | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const bucket = value as Record<string, unknown>;
+  if (bucket.kind === "design") return { kind: "design" };
+  if (
+    bucket.kind === "block" &&
+    typeof bucket.workflow_run_block_id === "string" &&
+    bucket.workflow_run_block_id
+  ) {
+    return {
+      kind: "block",
+      workflow_run_block_id: bucket.workflow_run_block_id,
+    };
+  }
+  return undefined;
 }
 
 function buildActivityFromToolCall(
@@ -764,6 +1030,9 @@ function buildActivityFromToolCall(
     iteration: event.iteration,
     toolName: event.tool_name,
     displayLabel,
+    reason: actionReason(event.reason),
+    activityBucket: parseActivityBucket(event.activity_bucket),
+    activityStartedAt: event.timestamp ?? undefined,
     id: `tc-${event.tool_call_id}`,
     timestamp: event.timestamp ?? undefined,
   };
@@ -793,7 +1062,14 @@ function buildActivityFromToolResult(
     toolName: event.tool_name,
     displayLabel,
     success: event.success,
+    detail: event.detail || undefined,
     codeDiffs: parseCodeDiffs(event.code_diffs),
+    browserSteps: parseStringList(event.browser_steps) ?? undefined,
+    workflowRunId: event.workflow_run_id || undefined,
+    testInputs: parseTestInputs(event.test_inputs),
+    reason: actionReason(event.reason),
+    activityBucket: parseActivityBucket(event.activity_bucket),
+    activityStartedAt: event.activity_started_at ?? undefined,
     id: `tr-${event.tool_call_id}`,
     timestamp: event.timestamp ?? undefined,
   };
@@ -808,7 +1084,6 @@ function buildActivityFromNarration(
     text: event.narration,
     iteration: event.iteration,
     activeLabel: event.active_label ?? undefined,
-    outcomeLabel: event.outcome_label ?? undefined,
     id: `n-${event.iteration}-${event.timestamp}`,
     timestamp: event.timestamp,
     receivedAtMs,
@@ -909,19 +1184,16 @@ export function condenseActivityEntries(
       if (idx !== undefined) {
         callIndexById.delete(id!);
         const call = paired[idx];
-        const settled =
-          call?.timestamp === undefined
-            ? entry
-            : {
-                ...entry,
-                activityStartedAt: call.activityStartedAt ?? call.timestamp,
-              };
-        if (idx === paired.length - 1) {
-          paired[idx] = settled;
-        } else {
-          paired[idx] = null;
-          paired.push(settled);
-        }
+        const settled = {
+          ...entry,
+          reason: call ? call.reason : entry.reason,
+          activityBucket: call?.activityBucket ?? entry.activityBucket,
+          activityStartedAt:
+            call?.activityStartedAt ??
+            call?.timestamp ??
+            entry.activityStartedAt,
+        };
+        paired[idx] = settled;
       } else {
         // Its tool_call was evicted past the activity cap — keep the
         // result visible rather than silently dropping it.
@@ -932,6 +1204,11 @@ export function condenseActivityEntries(
     paired.push(entry);
   }
   const ordered = paired.filter((e): e is ActivityEntry => e !== null);
+  ordered.sort((a, b) => {
+    const first = parseUtcIsoMs(a.activityStartedAt ?? a.timestamp);
+    const second = parseUtcIsoMs(b.activityStartedAt ?? b.timestamp);
+    return first !== null && second !== null ? first - second : 0;
+  });
 
   const condensed: (ActivityEntry | null)[] = [];
   let lastToolIdx = -1;
@@ -945,15 +1222,21 @@ export function condenseActivityEntries(
       previousEndedMs === null ||
       currentStartedMs === null ||
       currentStartedMs >= previousEndedMs;
+    const announcedRetry = condensed
+      .slice(lastToolIdx + 1)
+      .some((between) => between?.kind === "narration");
     if (
       prevTool &&
+      entry.reason === undefined &&
+      prevTool.reason === undefined &&
       entry.toolName !== undefined &&
       prevTool.toolName === entry.toolName &&
       (prevTool.displayLabel === undefined ||
         entry.displayLabel === undefined ||
         prevTool.displayLabel === entry.displayLabel) &&
       prevTool.success === false &&
-      followsPreviousAttempt
+      followsPreviousAttempt &&
+      !announcedRetry
     ) {
       const { priorFailures: earlierFailures, ...previousAttempt } = prevTool;
       condensed[lastToolIdx] = null;
@@ -988,78 +1271,93 @@ function appendCapped<T>(arr: T[], entry: T, cap: number): T[] {
   return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
-function findActivityBlockIndex(blocks: BlockState[], entryId: string): number {
-  return blocks.findIndex((block) =>
-    block.activity.some((entry) => entry.id === entryId),
-  );
-}
-
 function appendActivity(
   blocks: BlockState[],
   designActivity: ActivityEntry[],
   entry: ActivityEntry,
 ): { blocks: BlockState[]; designActivity: ActivityEntry[] } {
-  // Mirrors NarratorState._activity_bucket_label: narration renders inside the
-  // design step it explains, so it stays in design activity even mid-run.
-  if (entry.kind === "narration") {
+  const bucket = entry.activityBucket;
+  const index =
+    bucket?.kind === "block"
+      ? blocks.findIndex(
+          (block) => block.workflowRunBlockId === bucket.workflow_run_block_id,
+        )
+      : -1;
+  if (index === -1) {
     return {
       blocks,
-      designActivity: appendCapped(
-        designActivity,
-        entry,
-        MAX_DESIGN_ACTIVITY_ENTRIES,
-      ),
+      designActivity: designActivity.some((saved) => saved.id === entry.id)
+        ? designActivity
+        : appendCapped(designActivity, entry, MAX_DESIGN_ACTIVITY_ENTRIES),
     };
   }
-  // A run tool's result must rejoin its call's bucket. The run flips the active
-  // block between the call and the result, so routing the result to the live
-  // active block would split the call/result pair across buckets and it could
-  // never fold (mirrors the backend NarratorState._activity_bucket_label fix).
-  if (
-    entry.kind === "tool_result" &&
-    entry.toolName !== undefined &&
-    RUN_TOOLS.has(entry.toolName)
-  ) {
-    const callId = `tc-${toolCallIdOf(entry) ?? ""}`;
-    if (designActivity.some((e) => e.id === callId)) {
-      return {
-        blocks,
-        designActivity: appendCapped(
-          designActivity,
-          entry,
-          MAX_DESIGN_ACTIVITY_ENTRIES,
-        ),
-      };
-    }
-    const callBlockIdx = findActivityBlockIndex(blocks, callId);
-    if (callBlockIdx !== -1) {
-      const nextBlocks = blocks.slice();
-      const callBlock = nextBlocks[callBlockIdx]!;
-      nextBlocks[callBlockIdx] = {
-        ...callBlock,
-        activity: appendCapped(callBlock.activity, entry, MAX_ACTIVITY_ENTRIES),
-      };
-      return { blocks: nextBlocks, designActivity };
-    }
-  }
-  const activeIdx = blocks.findIndex((b) => b.state === "running");
-  if (activeIdx === -1) {
-    return {
-      blocks,
-      designActivity: appendCapped(
-        designActivity,
-        entry,
-        MAX_DESIGN_ACTIVITY_ENTRIES,
-      ),
-    };
-  }
-  const nextBlocks = blocks.slice();
-  const active = nextBlocks[activeIdx]!;
-  nextBlocks[activeIdx] = {
-    ...active,
-    activity: appendCapped(active.activity, entry, MAX_ACTIVITY_ENTRIES),
+  const next = blocks.slice();
+  const block = next[index]!;
+  next[index] = {
+    ...block,
+    activity: block.activity.some((saved) => saved.id === entry.id)
+      ? block.activity
+      : appendCapped(block.activity, entry, MAX_ACTIVITY_ENTRIES),
   };
-  return { blocks: nextBlocks, designActivity };
+  return { blocks: next, designActivity };
+}
+
+function appendToolActivity(prev: TurnNarrativeState, entry: ActivityEntry) {
+  const callId = toolCallIdOf(entry)!;
+  const known = prev.callPresentations?.[callId];
+  const active = prev.blocks.find((block) => block.state === "running");
+  const bucket =
+    known?.bucket ??
+    entry.activityBucket ??
+    (entry.kind === "tool_call" && active?.workflowRunBlockId
+      ? {
+          kind: "block" as const,
+          workflow_run_block_id: active.workflowRunBlockId,
+        }
+      : { kind: "design" as const });
+  const presentation: CallPresentation = known ?? {
+    bucket,
+    reason: entry.reason,
+    startedAt: entry.activityStartedAt ?? entry.timestamp,
+  };
+  const immutable = {
+    ...entry,
+    activityBucket: presentation.bucket,
+    reason: presentation.reason,
+    activityStartedAt: presentation.startedAt,
+  };
+  return {
+    ...appendActivity(prev.blocks, prev.designActivity, immutable),
+    callPresentations: { ...prev.callPresentations, [callId]: presentation },
+  };
+}
+
+function indexCallPresentations(
+  entries: ActivityEntry[],
+  blocks: BlockState[],
+): Record<string, CallPresentation> {
+  const index: Record<string, CallPresentation> = {};
+  const record = (entry: ActivityEntry, bucket: ActivityBucket) => {
+    const id = toolCallIdOf(entry);
+    if (id !== undefined && index[id] === undefined)
+      index[id] = {
+        bucket: entry.activityBucket ?? bucket,
+        reason: entry.reason,
+        startedAt: entry.activityStartedAt ?? entry.timestamp,
+      };
+  };
+  entries.forEach((entry) => record(entry, { kind: "design" }));
+  blocks.forEach((block) =>
+    block.activity.forEach((entry) =>
+      record(
+        entry,
+        block.workflowRunBlockId
+          ? { kind: "block", workflow_run_block_id: block.workflowRunBlockId }
+          : { kind: "design" },
+      ),
+    ),
+  );
+  return index;
 }
 
 function attachCodeDiffsToActivity(
@@ -1080,7 +1378,9 @@ function attachCodeDiffsToActivity(
     return { blocks, designActivity: nextDesignActivity };
   }
 
-  const blockIndex = findActivityBlockIndex(blocks, targetId);
+  const blockIndex = blocks.findIndex((block) =>
+    block.activity.some((entry) => entry.id === targetId),
+  );
   if (blockIndex === -1) return { blocks, designActivity };
 
   const nextBlocks = blocks.slice();
@@ -1129,6 +1429,13 @@ export function isBlockOk(
   );
 }
 
+// Stricter than isBlockOk: a block passed only when its run demonstrated it.
+export function blockPassed(
+  block: Pick<BlockState, "state" | "outcome">,
+): boolean {
+  return block.state === "completed" && block.outcome === "demonstrated";
+}
+
 // Labels that occur exactly once in the given set — the only labels safe to key
 // recorded actions on when the run-block id is missing (a block that never
 // reported progress, or an older backend). Loop iterations reuse a label, so an
@@ -1167,29 +1474,9 @@ export function applyNarrativeEvent(
 
     case "workflow_draft": {
       // Bubble shows the summary fields; canvas mid-turn rendering of
-      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. Seed
-      // ``blocks`` from block_labels so each drafted block renders its own
-      // card even on draft-only turns (where no block_progress fires).
-      // Existing entries from prior block_progress events take precedence;
-      // new labels join as ``drafted`` until block_progress upgrades them.
-      const labelToExisting = new Map(prev.blocks.map((b) => [b.label, b]));
-      const nextBlocks: BlockState[] = event.block_labels.map((label) => {
-        const existing = labelToExisting.get(label);
-        if (existing) return existing;
-        return {
-          workflowRunBlockId: "",
-          label,
-          blockType: "task",
-          state: "drafted",
-          lastSeenIteration: 0,
-          activity: [],
-          startedAt: null,
-          endedAt: null,
-        };
-      });
-      // Preserve any prior block whose label was dropped from the draft (rare
-      // — happens if the agent renames a block mid-turn). Drop those that no
-      // longer exist; they no longer participate in the proposal.
+      // ``event.workflow`` is wired in WorkflowCopilotChat.tsx. A draft is a
+      // workflow snapshot, not evidence that any block was authored or run,
+      // so it never creates, reorders, or removes narrative block attempts.
       // The write's patch arrives here rather than on the tool_result, because a write and its
       // test share one tool call and that result lands only after the run. Attach it to the
       // call's own entry so the row shows the code as soon as it is written.
@@ -1198,9 +1485,9 @@ export function applyNarrativeEvent(
         event.tool_call_id == null ? null : `tc-${event.tool_call_id}`;
       const withDiffs =
         draftDiffs === undefined || diffTarget === null
-          ? { blocks: nextBlocks, designActivity: prev.designActivity }
+          ? { blocks: prev.blocks, designActivity: prev.designActivity }
           : attachCodeDiffsToActivity(
-              nextBlocks,
+              prev.blocks,
               prev.designActivity,
               diffTarget,
               draftDiffs,
@@ -1215,6 +1502,37 @@ export function applyNarrativeEvent(
         },
         blocks: withDiffs.blocks,
         designActivity: withDiffs.designActivity,
+        codegenProgress: null,
+      };
+    }
+
+    case "codegen_progress": {
+      // `blocks_drafted` is cumulative only WITHIN one authoring call: the
+      // producer keys its state by output_index and opens each call with an
+      // empty frame. One generation can carry several authoring calls, so union
+      // rather than replace — otherwise a second call's opening frame erases
+      // the blocks the first one drafted. A restarted generation opens the same
+      // way, so a changed generation_id is what drops the abandoned labels; an
+      // older server sends none, and every frame then counts as one generation.
+      const generationId = event.generation_id ?? null;
+      const drafting = prev.codegenProgress;
+      const sameGeneration =
+        drafting !== null && drafting.generationId === generationId;
+      const drafted = sameGeneration ? drafting.blockLabels : [];
+      const merged = drafted.concat(
+        event.blocks_drafted.filter((label) => !drafted.includes(label)),
+      );
+      // Frames stay throttled but still arrive every couple of seconds naming
+      // nothing new, and their character count — which nothing renders — moves
+      // on every one. Returning prev unchanged is what keeps a fast stream from
+      // re-rendering the chat between labels. The first frame of a generation
+      // still has to land: it is what opens the row, and it carries no labels.
+      if (sameGeneration && merged.length === drafted.length) {
+        return prev;
+      }
+      return {
+        ...prev,
+        codegenProgress: { blockLabels: merged, generationId },
       };
     }
 
@@ -1222,20 +1540,9 @@ export function applyNarrativeEvent(
       const incomingState = mapBlockStatus(event.status);
       // Key on workflow_run_block_id, not block_label, so loop iterations
       // (e.g. a for_loop body) render as distinct rows.
-      let existing = prev.blocks.findIndex(
+      const existing = prev.blocks.findIndex(
         (b) => b.workflowRunBlockId === event.workflow_run_block_id,
       );
-      // A drafted placeholder seeded by workflow_draft has no run-block id
-      // yet; upgrade it in place on its first block_progress rather than
-      // spawning a duplicate row.
-      if (existing < 0) {
-        existing = prev.blocks.findIndex(
-          (b) =>
-            b.workflowRunBlockId === "" &&
-            b.state === "drafted" &&
-            b.label === event.block_label,
-        );
-      }
       const eventTs = event.timestamp ?? null;
       const previousBlock = existing >= 0 ? prev.blocks[existing]! : null;
       const startedAt =
@@ -1251,8 +1558,14 @@ export function applyNarrativeEvent(
       // terminal event take the latest wall clock so a retry-then-succeed
       // sequence reflects the final completion time, not the first failure.
       const endedAt = isTerminal ? eventTs : null;
+      const runId = event.workflow_run_id;
+      const pendingSkipped =
+        previousBlock === null && runId
+          ? prev.pendingSkippedPrefix[runId]
+          : undefined;
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
+        workflowRunId: runId || previousBlock?.workflowRunId,
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
@@ -1262,6 +1575,7 @@ export function applyNarrativeEvent(
         outcome: previousBlock?.outcome,
         outcomeReason: previousBlock?.outcomeReason,
         outcomeRole: previousBlock?.outcomeRole,
+        skippedBefore: previousBlock?.skippedBefore ?? pendingSkipped,
         recordedActions: previousBlock?.recordedActions,
         recordedActionsAt: previousBlock?.recordedActionsAt,
         lastSeenIteration: event.iteration,
@@ -1274,8 +1588,28 @@ export function applyNarrativeEvent(
         nextBlocks[existing] = baseEntry;
         return { ...prev, blocks: nextBlocks };
       }
-      return { ...prev, blocks: [...prev.blocks, baseEntry] };
+      return {
+        ...prev,
+        pendingSkippedPrefix: pendingSkipped
+          ? Object.fromEntries(
+              Object.entries(prev.pendingSkippedPrefix).filter(
+                ([id]) => id !== runId,
+              ),
+            )
+          : prev.pendingSkippedPrefix,
+        blocks: [...prev.blocks, baseEntry].slice(-MAX_BLOCK_ATTEMPTS),
+      };
     }
+
+    case "run_started":
+      if (!event.skipped_prefix?.length) return prev;
+      return {
+        ...prev,
+        pendingSkippedPrefix: {
+          ...prev.pendingSkippedPrefix,
+          [event.workflow_run_id]: event.skipped_prefix,
+        },
+      };
 
     case "run_outcome": {
       // Apply the recorded verdict by run-block id only — no label fallback, so
@@ -1300,6 +1634,7 @@ export function applyNarrativeEvent(
           verdict: event.verdict,
           role: event.role ?? "recorded",
           displayReason: event.display_reason ?? null,
+          workflowRunId: event.workflow_run_id,
         },
       };
     }
@@ -1346,42 +1681,74 @@ export function applyNarrativeEvent(
 
     case "tool_call": {
       const entry = buildActivityFromToolCall(event);
-      const authoringCount =
-        prev.authoringCount + (AUTHORING_TOOLS.has(event.tool_name) ? 1 : 0);
+      // The model has finished streaming arguments: the call the drafting
+      // frames described is executing, and its own row reports it from here.
       if (!entry) {
         return {
           ...prev,
-          lastActivityAtMs: nowMs,
-          authoringCount,
+          codegenProgress: null,
         };
       }
-      const { blocks, designActivity } = appendActivity(
-        prev.blocks,
-        prev.designActivity,
+      const { blocks, designActivity, callPresentations } = appendToolActivity(
+        prev,
         entry,
       );
       return {
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
-        authoringCount,
+        callPresentations,
+        codegenProgress: null,
       };
     }
 
+    case "steer_delivered": {
+      const known = new Set(prev.steerMessages.map((item) => item.steer_id));
+      return {
+        ...prev,
+        steerMessages: [
+          ...prev.steerMessages,
+          ...event.steer_messages.filter((item) => !known.has(item.steer_id)),
+        ],
+        // A delivery can abort the model call those drafting frames described.
+        codegenProgress: null,
+      };
+    }
+
+    case "screenshot":
+      return prev.screenshots.some(
+        (shot) => shot.artifactId === event.artifact_id,
+      )
+        ? prev
+        : {
+            ...prev,
+            screenshots: [
+              ...prev.screenshots,
+              {
+                artifactId: event.artifact_id,
+                capturedAt: event.captured_at,
+                toolCallId: event.tool_call_id ?? null,
+              },
+            ],
+          };
+
     case "tool_result": {
+      const planItems = parseStringList(event.work_plan);
+      const workPlan = planItems
+        ? { toolCallId: event.tool_call_id, items: planItems }
+        : prev.workPlan;
       const entry = buildActivityFromToolResult(event);
-      if (!entry) return { ...prev, lastActivityAtMs: nowMs };
-      const { blocks, designActivity } = appendActivity(
-        prev.blocks,
-        prev.designActivity,
+      if (!entry) return { ...prev, workPlan };
+      const { blocks, designActivity, callPresentations } = appendToolActivity(
+        prev,
         entry,
       );
       return {
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
+        callPresentations,
+        workPlan,
       };
     }
 
@@ -1396,23 +1763,7 @@ export function applyNarrativeEvent(
         ...prev,
         blocks,
         designActivity,
-        lastActivityAtMs: nowMs,
       };
-    }
-
-    case "client_phase_hint": {
-      // No-op once drafting is already signaled or the turn has moved past
-      // pure exploration — idempotent by construction so a re-armed timer or
-      // a StrictMode double-fire never overwrites an earlier timestamp.
-      if (
-        prev.draftingSignaledAt !== null ||
-        prev.draft !== null ||
-        prev.designEnded ||
-        prev.blocks.some((b) => b.state !== "drafted")
-      ) {
-        return prev;
-      }
-      return { ...prev, draftingSignaledAt: event.hintedAtMs };
     }
 
     case "response": {
@@ -1457,18 +1808,10 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           blocks,
-          // Graft across the terminal replacement so a cancel mid-silence
-          // doesn't visually un-check the Draft phase (hydrated payloads never
-          // carry these client-only fields). authoringCount is grafted too so a
-          // turn whose only authoring entry aged out of the capped activity
-          // list still completes Explore at the swap. lastRunOutcome remains
-          // sourced from the hydrated terminal payload.
-          draftingSignaledAt:
-            hydrated.turnId === prev.turnId ? prev.draftingSignaledAt : null,
-          authoringCount:
-            hydrated.turnId === prev.turnId
-              ? prev.authoringCount
-              : hydrated.authoringCount,
+          steerMessages:
+            hydrated.steerMessages.length > 0
+              ? hydrated.steerMessages
+              : prev.steerMessages,
           responseType: event.response_type ?? hydrated.responseType,
           cancelled: event.cancelled ?? hydrated.cancelled,
           proposalDisposition:
@@ -1561,11 +1904,21 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
         typeof o.displayLabel === "string" ? o.displayLabel : undefined,
       activeLabel:
         typeof o.activeLabel === "string" ? o.activeLabel : undefined,
-      outcomeLabel:
-        typeof o.outcomeLabel === "string" ? o.outcomeLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       codeDiffs: parseCodeDiffs(o.codeDiffs),
+      browserSteps: parseStringList(o.browserSteps) ?? undefined,
+      workflowRunId:
+        typeof o.workflowRunId === "string" && o.workflowRunId
+          ? o.workflowRunId
+          : undefined,
+      testInputs: parseTestInputs(o.testInputs),
       id: o.id,
+      reason: actionReason(o.reason),
+      activityBucket: parseActivityBucket(o.activityBucket),
+      activityStartedAt:
+        typeof o.activityStartedAt === "string"
+          ? o.activityStartedAt
+          : undefined,
       timestamp: typeof o.timestamp === "string" ? o.timestamp : undefined,
     });
   }
@@ -1596,6 +1949,7 @@ function parseTurnFacts(raw: unknown): TurnFacts | null {
       typeof value.runCompleted === "boolean" ? value.runCompleted : null,
     terminalCause: text("terminalCause"),
     blocksRunThisTurn: count("blocksRunThisTurn"),
+    recordedFailure: text("recordedFailure"),
     ranCleanOnCurrentSource: value.ranCleanOnCurrentSource === true,
   };
 }
@@ -1648,7 +2002,53 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
       blockLabels: group.blockLabels,
     });
   }
-  return { blocks, duplicateWrites };
+  const labels = (raw: unknown): string[] =>
+    Array.isArray(raw)
+      ? raw.filter((label): label is string => typeof label === "string")
+      : [];
+  // Payloads persisted before inputs were published carry none, and a malformed row drops
+  // alone rather than voiding the review.
+  const inputs: NonNullable<ReviewProjection["inputs"]> = [];
+  for (const rawInput of Array.isArray(value.inputs) ? value.inputs : []) {
+    const input = (rawInput ?? {}) as Record<string, unknown>;
+    if (
+      typeof input.key === "string" &&
+      (input.change === "added" ||
+        input.change === "changed" ||
+        input.change === "removed")
+    ) {
+      inputs.push({ key: input.key, change: input.change });
+    }
+  }
+  return {
+    blocks,
+    duplicateWrites,
+    inputs,
+    keptNotes: labels(value.keptNotes),
+    keptDescriptions: labels(value.keptDescriptions),
+  };
+}
+
+function parseSkippedPrefix(raw: unknown): SkippedPrefixBlock[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const entries = raw.flatMap((item): SkippedPrefixBlock[] => {
+    const obj = item as Record<string, unknown>;
+    if (
+      typeof obj?.label !== "string" ||
+      (obj.kind !== "reused" && obj.kind !== "not_run")
+    )
+      return [];
+    return [
+      typeof obj.sourceWorkflowRunId === "string"
+        ? {
+            label: obj.label,
+            kind: obj.kind,
+            sourceWorkflowRunId: obj.sourceWorkflowRunId,
+          }
+        : { label: obj.label, kind: obj.kind },
+    ];
+  });
+  return entries.length > 0 ? entries : undefined;
 }
 
 export function hydrateNarrativeFromPayload(
@@ -1699,59 +2099,67 @@ export function hydrateNarrativeFromPayload(
       : null;
 
   const blocksRaw = Array.isArray(payload.blocks) ? payload.blocks : [];
-  const blocks: BlockState[] = blocksRaw.map((b) => {
-    const obj = b as Record<string, unknown>;
-    const outcome = ((): BlockOutcome | undefined => {
-      const o = obj.outcome;
-      if (
-        o === "evaluating" ||
-        o === "demonstrated" ||
-        o === "not_demonstrated" ||
-        o === "not_evaluated"
-      )
-        return o;
-      return undefined;
-    })();
-    const outcomeRole: RunOutcomeRole | undefined =
-      outcome === undefined
-        ? undefined
-        : obj.outcomeRole === "recorded" ||
-            obj.outcomeRole === "adjudicated" ||
-            obj.outcomeRole === "interim_build_test"
-          ? obj.outcomeRole
-          : "adjudicated";
-    return {
-      workflowRunBlockId:
-        typeof obj.workflowRunBlockId === "string"
-          ? obj.workflowRunBlockId
-          : "",
-      label: typeof obj.label === "string" ? obj.label : "",
-      blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
-      outcome,
-      outcomeRole,
-      outcomeReason:
-        typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
-      state: ((): BlockState["state"] => {
-        const s = obj.state;
+  const blocks: BlockState[] = blocksRaw
+    .map((b) => {
+      const obj = b as Record<string, unknown>;
+      const outcome = ((): BlockOutcome | undefined => {
+        const o = obj.outcome;
         if (
-          s === "queued" ||
-          s === "drafted" ||
-          s === "running" ||
-          s === "completed" ||
-          s === "failed" ||
-          s === "stopped" ||
-          s === "skipped"
+          o === "evaluating" ||
+          o === "demonstrated" ||
+          o === "not_demonstrated" ||
+          o === "not_evaluated"
         )
-          return s;
-        return "queued";
-      })(),
-      lastSeenIteration:
-        typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
-      activity: normalizeActivityEntries(obj.activity),
-      startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
-      endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
-    };
-  });
+          return o;
+        return undefined;
+      })();
+      const outcomeRole: RunOutcomeRole | undefined =
+        outcome === undefined
+          ? undefined
+          : obj.outcomeRole === "recorded" ||
+              obj.outcomeRole === "adjudicated" ||
+              obj.outcomeRole === "interim_build_test"
+            ? obj.outcomeRole
+            : "adjudicated";
+      return {
+        workflowRunBlockId:
+          typeof obj.workflowRunBlockId === "string"
+            ? obj.workflowRunBlockId
+            : "",
+        workflowRunId:
+          typeof obj.workflowRunId === "string" && obj.workflowRunId
+            ? obj.workflowRunId
+            : undefined,
+        label: typeof obj.label === "string" ? obj.label : "",
+        blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
+        outcome,
+        outcomeRole,
+        outcomeReason:
+          typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
+        skippedBefore: parseSkippedPrefix(obj.skippedBefore),
+        state: ((): BlockState["state"] => {
+          const s = obj.state;
+          if (
+            s === "queued" ||
+            s === "drafted" ||
+            s === "running" ||
+            s === "completed" ||
+            s === "failed" ||
+            s === "stopped" ||
+            s === "unfinished" ||
+            s === "skipped"
+          )
+            return s;
+          return "queued";
+        })(),
+        lastSeenIteration:
+          typeof obj.lastSeenIteration === "number" ? obj.lastSeenIteration : 0,
+        activity: normalizeActivityEntries(obj.activity),
+        startedAt: typeof obj.startedAt === "string" ? obj.startedAt : null,
+        endedAt: typeof obj.endedAt === "string" ? obj.endedAt : null,
+      };
+    })
+    .filter(hasObservedBlockEvidence);
 
   const terminal = ((): TurnNarrativeState["terminal"] => {
     const t = payload.terminal;
@@ -1767,19 +2175,21 @@ export function hydrateNarrativeFromPayload(
     typeof payload.endedAt === "string" ? (payload.endedAt as string) : null;
   const cancelled = payload.cancelled === true;
   const turnFacts = parseTurnFacts(payload.turnFacts);
-  // A deadline cuts a running block off; that is a stop, so it must not be swept
-  // to failed and then read back as the turn having failed.
-  const halted = cancelled || turnFacts?.terminalCause === "deadline_expired";
+  // The backend saves a left run's blocks as unfinished; any other block
+  // cut off by a turn limit is a stop, never a failure.
+  const budgetExpiry = parseBudgetExpiry(payload.budgetExpiry);
+  const halted = budgetHalted({ turnFacts, budgetExpiry });
   const sweptBlocks: BlockState[] = terminal
     ? blocks.map((b) =>
         b.state === "running"
           ? {
               ...b,
-              state: halted
-                ? "stopped"
-                : terminal === "error"
-                  ? "failed"
-                  : "completed",
+              state:
+                cancelled || halted
+                  ? "stopped"
+                  : terminal === "error"
+                    ? "failed"
+                    : "completed",
               endedAt: b.endedAt ?? endedAtIso,
             }
           : b,
@@ -1809,12 +2219,15 @@ export function hydrateNarrativeFromPayload(
     cancelled,
     proposalDisposition,
     responseKind: parseResponseKind(payload.responseKind),
-    terminalEnvelope: parseTerminalEnvelope(payload.terminalEnvelope),
     designStarted: true,
     designEnded: true,
     draft,
     blocks: stoppedBlocks,
     designActivity: normalizeActivityEntries(payload.designActivity),
+    callPresentations: indexCallPresentations(
+      normalizeActivityEntries(payload.designActivity),
+      stoppedBlocks,
+    ),
     terminal,
     terminalMessage:
       typeof payload.terminalMessage === "string"
@@ -1833,16 +2246,57 @@ export function hydrateNarrativeFromPayload(
       typeof payload.endedAt === "string" ? (payload.endedAt as string) : null,
     credentialPrompt: parseCredentialPrompt(payload.credentialPrompt),
     credentialPause: parseCredentialPause(payload.credentialPause),
+    credentialPauses: parseCredentialPauses(payload.credentialPauses),
     credentialAutoBound: parseCredentialAutoBound(payload.credentialAutoBound),
+    workPlan: parseTurnWorkPlan(payload.workPlan),
     connectedAccountChoices: parseConnectedAccountChoices(
       payload.connectedAccountChoices,
     ),
+    outputFiles: parseOutputFiles(payload.outputFiles),
     googleConnectionNotices: parseGoogleConnectionNotices(
       payload.googleConnectionNotices,
     ),
+    demonstrationOffer: payload.demonstrationOffer === true,
+    canonicalWorkflowUnavailable: parseCanonicalWorkflowUnavailable(
+      payload.canonicalWorkflowUnavailable,
+    ),
     review: parseReviewProjection(payload.review),
     turnFacts,
+    budgetExpiry,
+    steerMessages: parseSteerMessages(payload.steerMessages),
+    screenshots: parseScreenshots(payload.screenshots),
   };
+}
+
+function parseScreenshots(value: unknown): TurnScreenshot[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) =>
+    typeof item === "object" &&
+    item !== null &&
+    typeof item.artifactId === "string" &&
+    typeof item.capturedAt === "string"
+      ? [
+          {
+            artifactId: item.artifactId,
+            capturedAt: item.capturedAt,
+            toolCallId:
+              typeof item.toolCallId === "string" ? item.toolCallId : null,
+          },
+        ]
+      : [],
+  );
+}
+
+function parseSteerMessages(value: unknown): CopilotSteerMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is CopilotSteerMessage =>
+      typeof item === "object" &&
+      item !== null &&
+      typeof item.steer_id === "string" &&
+      typeof item.text === "string" &&
+      typeof item.delivered_at === "string",
+  );
 }
 
 // History rows persisted before narrative_payload carried responseKind still
@@ -1852,10 +2306,11 @@ export function hydrateNarrativeFromPayload(
 export function hydrateHistoryNarrative(
   payload: Record<string, unknown> | null | undefined,
   turnOutcome:
-    | {
+    | (BudgetExpiryOutcome & {
         response_kind?: string | null;
         connected_account_choices?: ConnectedAccountChoice[] | null;
-      }
+        output_files?: DeliveredOutputFile[] | null;
+      })
     | null
     | undefined,
 ): TurnNarrativeState | undefined {
@@ -1878,6 +2333,10 @@ export function hydrateHistoryNarrative(
     connectedAccountChoices: hasTurnOutcomeChoices
       ? choices
       : hydrated.connectedAccountChoices,
+    outputFiles: turnOutcome?.output_files
+      ? parseOutputFiles(turnOutcome.output_files)
+      : hydrated.outputFiles,
+    budgetExpiry: hydrated.budgetExpiry ?? budgetExpiryFromOutcome(turnOutcome),
   };
 }
 
@@ -1905,59 +2364,72 @@ export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
 export interface NotConfirmedOutcome {
   verdict: "not_demonstrated";
   displayReason: string | null;
+  workflowRunId?: string;
+}
+
+function notDemonstratedBlock(blocks: BlockState[]): BlockState | null {
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]!;
+    if (
+      block.outcome === "not_demonstrated" &&
+      !isInterimOutcome(block.outcomeRole)
+    ) {
+      return block;
+    }
+  }
+  return null;
 }
 
 export function notConfirmedOutcome(
-  turn: Pick<
-    TurnNarrativeState,
-    "terminalEnvelope" | "lastRunOutcome" | "blocks"
-  >,
+  turn: Pick<TurnNarrativeState, "lastRunOutcome" | "turnFacts" | "blocks">,
 ): NotConfirmedOutcome | null {
-  // The backend-finalized envelope is authoritative once it carries a run
-  // verdict; the pointer/block inference below only covers rows persisted
-  // before the envelope existed (or envelopes from run-less turns).
-  const envelope = turn.terminalEnvelope;
-  if (
-    envelope !== null &&
-    envelope.runVerdict !== null &&
-    !isInterimOutcome(envelope.runOutcomeRole ?? undefined)
-  ) {
-    return envelope.runVerdict === "not_demonstrated"
-      ? {
-          verdict: "not_demonstrated",
-          displayReason: envelope.runDisplayReason,
-        }
-      : null;
-  }
   if (turn.lastRunOutcome !== null) {
     return turn.lastRunOutcome.verdict === "not_demonstrated" &&
       !isInterimOutcome(turn.lastRunOutcome.role)
       ? {
           verdict: "not_demonstrated",
           displayReason: turn.lastRunOutcome.displayReason,
+          workflowRunId: turn.lastRunOutcome.workflowRunId,
         }
       : null;
   }
-  for (let i = turn.blocks.length - 1; i >= 0; i -= 1) {
-    const block = turn.blocks[i]!;
-    if (
-      block.outcome === "not_demonstrated" &&
-      !isInterimOutcome(block.outcomeRole)
-    ) {
-      return {
+  // lastRunOutcome is live-only; a reloaded turn carries the same anchored verdict here.
+  const evaluationState = turn.turnFacts?.evaluationState;
+  if (evaluationState != null) {
+    if (evaluationState !== "not_demonstrated") return null;
+    return {
+      verdict: "not_demonstrated",
+      displayReason:
+        turn.turnFacts?.recordedFailure ??
+        notDemonstratedBlock(turn.blocks)?.outcomeReason ??
+        null,
+      workflowRunId: turn.turnFacts?.runId ?? undefined,
+    };
+  }
+  const block = notDemonstratedBlock(turn.blocks);
+  return block === null
+    ? null
+    : {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
+        workflowRunId: block.workflowRunId,
       };
-    }
-  }
-  return null;
 }
 
 // A deadline exit stamps terminal="error" for budget reasons; that is a halt,
 // not a block failure, so no surface may give it failure's treatment.
 export function isDeadlineHalt(turn: TurnNarrativeState): boolean {
   return (
-    turn.turnFacts?.terminalCause === "deadline_expired" &&
+    budgetHalted(turn) &&
     !latestBlocksByLabel(turn.blocks).some((b) => b.state === "failed")
+  );
+}
+
+type TurnLimitFacts = Pick<TurnNarrativeState, "turnFacts" | "budgetExpiry">;
+
+function budgetHalted(turn: TurnLimitFacts): boolean {
+  return (
+    turn.turnFacts?.terminalCause === "deadline_expired" ||
+    turn.budgetExpiry !== null
   );
 }

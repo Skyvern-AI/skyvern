@@ -28,7 +28,11 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 import { ErrorCodeMappingEditor } from "../../ErrorCodeMappingEditor";
 import { AI_IMPROVE_CONFIGS } from "../../constants";
-import { helpTooltips, placeholders } from "../../helpContent";
+import {
+  firstBrowserBlockUrlPlaceholder,
+  helpTooltips,
+  placeholders,
+} from "../../helpContent";
 import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
 import { type AppNode } from "..";
 import { parameterIsSkyvernCredential } from "../../types";
@@ -40,10 +44,16 @@ import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCred
 import { type LoginNode, type LoginNodeData } from "./types";
 import { errorMappingExampleValue } from "../types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
+import { cn } from "@/util/utils";
+import {
+  blockUrlErrorId,
+  useBlockUrlError,
+} from "../../hooks/useBlockUrlError";
 import { useUpdate } from "../../useUpdate";
 import {
   getAvailableOutputParameterKeys,
   getParentLoopSkipsOnFail,
+  isFirstBrowserTaskBlock,
   isNodeInsideForLoop,
 } from "../../workflowEditorUtils";
 
@@ -80,6 +90,10 @@ function LoginEditorBody({
   const update = useUpdate<LoginNodeData>({ id: blockId, editable });
   const nodes = useNodes<AppNode>();
   const edges = useEdges();
+  const urlPlaceholder = isFirstBrowserTaskBlock(nodes, edges, blockId)
+    ? firstBrowserBlockUrlPlaceholder
+    : placeholders["login"]["url"];
+  const urlError = useBlockUrlError(blockId);
   const outputParameterKeys = getAvailableOutputParameterKeys(
     nodes,
     edges,
@@ -135,12 +149,23 @@ function LoginEditorBody({
           ) : null}
         </div>
         <WorkflowBlockInputTextarea
+          name="url"
           nodeId={blockId}
           onChange={(value) => update({ url: value })}
           value={data.url}
-          placeholder={placeholders["login"]["url"]}
-          className="nopan text-xs"
+          placeholder={urlPlaceholder}
+          aria-invalid={urlError !== null}
+          aria-describedby={urlError ? blockUrlErrorId(blockId) : undefined}
+          className={cn(
+            "nopan text-xs",
+            urlError !== null && "border-destructive",
+          )}
         />
+        {urlError ? (
+          <p id={blockUrlErrorId(blockId)} className="text-xs text-destructive">
+            {urlError}
+          </p>
+        ) : null}
       </div>
       <div className="space-y-2">
         <div className="flex gap-2">
@@ -148,6 +173,7 @@ function LoginEditorBody({
           <HelpTooltip content={helpTooltips["login"]["navigationGoal"]} />
         </div>
         <WorkflowBlockInputTextarea
+          name="navigationGoal"
           aiImprove={AI_IMPROVE_CONFIGS.login.navigationGoal}
           nodeId={blockId}
           onChange={(value) => update({ navigationGoal: value })}
@@ -219,6 +245,7 @@ function LoginEditorBody({
                 disabled={!editable}
                 renderCustomInput={({ value, onChange }) => (
                   <WorkflowBlockInputTextarea
+                    name="totpIdentifier"
                     nodeId={blockId}
                     onChange={onChange}
                     value={value}
@@ -247,6 +274,7 @@ function LoginEditorBody({
                 />
               </div>
               <WorkflowBlockInputTextarea
+                name="totpVerificationUrl"
                 nodeId={blockId}
                 onChange={(value) => update({ totpVerificationUrl: value })}
                 value={data.totpVerificationUrl ?? ""}
@@ -335,6 +363,7 @@ function LoginEditorBody({
                   Complete if...
                 </Label>
                 <WorkflowBlockInputTextarea
+                  name="completeCriterion"
                   aiImprove={AI_IMPROVE_CONFIGS.login.completeCriterion}
                   nodeId={blockId}
                   onChange={(value) => update({ completeCriterion: value })}
@@ -406,6 +435,7 @@ function LoginEditorBody({
                 </div>
                 {data.errorCodeMapping !== "null" && (
                   <ErrorCodeMappingEditor
+                    deferKey={JSON.stringify([blockId, "errorCodeMapping"])}
                     label={data.label}
                     value={data.errorCodeMapping}
                     onChange={(value) => update({ errorCodeMapping: value })}

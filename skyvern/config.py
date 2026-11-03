@@ -1,6 +1,7 @@
 import logging
 import os
 import platform
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -87,19 +88,36 @@ class Settings(BaseSettings):
 
     # Script reviewer settings
     SCRIPT_REVIEW_DAILY_CAP: int = 5  # Max script reviews per wpid per day (all review types)
-    SELF_HEAL_DAILY_CAP: int = 5
 
     ADDITIONAL_MODULES: list[str] = []
 
+    # Whole-display recording is opt-in and intended for packaged Linux workers only. Default OFF keeps
+    # ordinary local/OSS users on the existing Playwright per-page recording path. Enabling replaces
+    # per-page recording with one change-driven whole-display MP4 for an explicitly selected cohort.
+    EXCLUSIVE_DISPLAY_RECORDING: bool = False
+    # Narrow, validated whole-display recording profile (safe defaults; invalid values fall back explicitly).
+    DISPLAY_RECORDING_OUTPUT_WIDTH: int = 1280
+    DISPLAY_RECORDING_OUTPUT_HEIGHT: int = 720
+    DISPLAY_RECORDING_MAX_FPS: int = 15
+    DISPLAY_RECORDING_CRF: int = 28
+    DISPLAY_RECORDING_KEYFRAME_SECONDS: int = 5
+    # How many browser runs one worker drives at once (mirrors the worker env of the same name; default 1 =
+    # historical pod-per-run). Whole-display recording captures the ENTIRE display, and the per-display flock
+    # only blocks a second recorder, not a second browser sharing the display — so it is display-ownership-safe
+    # only at concurrency == 1. The recorder reads this to fail closed above 1.
+    BROWSER_WORKER_MAX_CONCURRENT_ACTIVITIES: int = 1
+
     BROWSER_TYPE: str = "chromium-headful"
+    BROWSER_SESSION_STARTUP_TIMEOUT_SECONDS: float = 55.0
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
     BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
-    # Configurable safety caps. The defaults are rollout candidates, not capacity-calibrated policy.
+    # Uncalibrated rollout defaults: the byte limits bound worker disk and memory per run, and the file limit bounds
+    # per-file save cost within the 180 s save timeout.
     BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES: int = Field(default=100 * 1024 * 1024, gt=0)
     BROWSER_DOWNLOAD_MAX_RUN_SIZE_BYTES: int = Field(default=512 * 1024 * 1024, gt=0)
-    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=64, gt=0)
+    BROWSER_DOWNLOAD_MAX_FILES_PER_RUN: int = Field(default=300, gt=0)
     # connect_over_cdp_with_retry budget. The defaults give ~15s of total backoff
     # (1+2+3+4+5) across attempts so a browser that is slow to bind its local CDP
     # port (e.g. a cold-starting stealth Chromium on 127.0.0.1:9222) is reconnected
@@ -110,6 +128,10 @@ class Settings(BaseSettings):
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
     VIDEO_COMPRESSION_ENABLED: bool = True
+    # SKY-15288: when enabled, in-progress recording snapshots copy the already-uploaded prefix
+    # server-side (UploadPartCopy against the prior ETag) and upload only the new tail; any unsupported
+    # condition or failure falls back to the Phase 1 full-prefix stream. Off by default.
+    RECORDING_INCREMENTAL_COMPOSE_ENABLED: bool = False
     VIDEO_COMPRESSION_CRF: int = 28
     VIDEO_COMPRESSION_PRESET: str = "veryfast"
     VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
@@ -119,6 +141,11 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    # Playwright's `Locator.count()` and the iframe-chain `query_selector`/`content_frame` probes take
+    # no timeout argument, so a renderer that stopped answering leaves each one waiting on a protocol
+    # reply forever. The action deadline adds its headroom to this budget; expiry means the page stopped
+    # answering, not that a healthy lookup was merely slow.
+    BROWSER_ELEMENT_LOOKUP_TIMEOUT_MS: int = 5000
     BROWSER_ACTION_MAX_EXECUTION_SECONDS: int = 1200
     WORKER_STALL_DUMP_SECONDS: int = 0
     # "enforce" is deliberately absent: the policy core can only observe until every sink consumes
@@ -133,6 +160,9 @@ class Settings(BaseSettings):
     PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
     PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
+    # Minimum seconds between the full gc.collect() runs after multi-viewport screenshot stitches, per
+    # process. Each run pauses every browser session on the event loop; 0 collects after every stitch.
+    SCREENSHOT_STITCH_GC_MIN_INTERVAL_SECONDS: float = 60.0
     # Consecutive unanswered browser-protocol operations (spanning more than one kind) after which
     # a run stops starting new steps against that browser. Sized so a healthy run — which lands
     # hundreds of successful operations per step, any one of which resets the count — cannot reach
@@ -151,7 +181,17 @@ class Settings(BaseSettings):
     # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
     # so one fetch can't consume the whole block. TOTP re-mint is instant and unaffected.
     CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS: int = 120
-    OPTION_LOADING_TIMEOUT_MS: int = 600000
+    # Backstop for the dropdown option-loading scroll loop, which now ends on its own once the menu
+    # is scrolled to the bottom and has stopped growing. Exceeding it is non-fatal — the LLM still
+    # picks from whatever loaded — so this is kept short enough that a never-settling menu costs
+    # seconds rather than the minutes a run's elapsed budget cannot absorb.
+    OPTION_LOADING_TIMEOUT_MS: int = 60000
+    # Wall-clock budget for the autocomplete guessed-value fanout, measured from the ladder's first
+    # probe. The probe for the requested value always runs; this only gates the LLM-guessed retries,
+    # each of which costs a full clear-and-retype plus a DOM scrape. Without it a control whose
+    # options never match spent minutes per field before the discovery fallback was reached. The budget
+    # stops new guesses from starting; a guess already in progress may overrun it. 0 disables this limit.
+    AUTO_COMPLETION_LADDER_BUDGET_SECONDS: float = 60.0
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 50
@@ -209,6 +249,8 @@ class Settings(BaseSettings):
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
     ENV: str = "local"
+    # Synthetic browser fixture: never installed outside staging, disabled by default.
+    COPILOT_EVAL_AUTH_FIXTURE_ENABLED: bool = False
     BROWSER_STREAMING_MODE: str = "vnc"
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
@@ -225,6 +267,8 @@ class Settings(BaseSettings):
     LOG_SAMPLING_RATE: float = 1.0
     LOG_SAMPLING_ORG_IDS: list[str] = []
     COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED: bool = True
+    COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS: float = 3.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     COPILOT_OUTPUT_DESIGNATION_TIMEOUT_SECONDS: float = 12.0
     # A capture that runs out of time yields no page evidence at all, so the scout falls back to
@@ -238,20 +282,14 @@ class Settings(BaseSettings):
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
-    # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
-    # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
-    # On = new agent-SDK path under skyvern.forge.sdk.copilot.
-    # Per-environment canary; default off until we are confident.
-    ENABLE_WORKFLOW_COPILOT_V2: bool = False
     # Internal eval-only selector for the least-privileged direct-browser Copilot surface.
     WORKFLOW_COPILOT_BROWSER_ABLATION_ENABLED: bool = False
     # Enabling the process-level kill switch is insufficient on a shared deployment: only API
     # credentials belonging to these explicitly configured eval organizations may select the mode.
     WORKFLOW_COPILOT_BROWSER_ABLATION_ORGANIZATION_IDS: list[str] = []
-    # Experimental Workflow Copilot v2 branch mode.
+    # Experimental Workflow Copilot code-first authoring mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
-    WORKFLOW_COPILOT_TERMINAL_ENVELOPE_RENDER: bool = False
     WORKFLOW_COPILOT_QA_TOKEN_BUDGET: int | None = Field(default=None, gt=0)
     # Process-global override of the per-turn copilot deadline, read once at import;
     # changing it needs a hard restart. QA/debug only -- unset keeps the 900s default.
@@ -263,6 +301,8 @@ class Settings(BaseSettings):
     # so this is a guaranteed no-op behind app.CACHE.is_shared regardless of this flag.
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_ENABLED: bool = True
     WORKFLOW_COPILOT_CREDENTIAL_PAUSE_TIMEOUT_SECONDS: int = 300
+    # Replaces the pause countdown once when the user chooses to sign in themselves in the live browser.
+    WORKFLOW_COPILOT_MANUAL_SIGN_IN_TIMEOUT_SECONDS: int = 900
     # Kill switch for the live codegen-progress SSE frame (drafted block labels while an authoring
     # tool call streams). Off restores exact pre-change behavior; old frontends drop the frame either way.
     WORKFLOW_COPILOT_CODEGEN_PROGRESS_ENABLED: bool = True
@@ -272,22 +312,28 @@ class Settings(BaseSettings):
     # The caller-supplied header is not an authorization: on a shared deployment only API
     # credentials belonging to these explicitly configured eval organizations may seed an entry point.
     WORKFLOW_COPILOT_ODYSSEYS_EVAL_ORGANIZATION_IDS: list[str] = []
+    # Request-scoped model overrides require an authenticated organization in this allowlist.
+    WORKFLOW_COPILOT_EVAL_LLM_OVERRIDES_ORGANIZATION_IDS: list[str] = []
+    WORKFLOW_COPILOT_EVAL_COST_ENABLED: bool = False
+    WORKFLOW_COPILOT_EVAL_COST_ORGANIZATION_IDS: list[str] = []
     # Local-development escape hatch: run a copilot block test run in the API process when sandbox
     # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
-    # Default code_only for MCP block/workflow tools. Off = permissive.
-    MCP_CODE_ONLY_MODE: bool = False
-    # Default for the bounded code-block self-heal; off by default.
-    ENABLE_CODE_BLOCK_SELF_HEALING: bool = False
-    SELF_HEAL_MAX_ACTIONS: int = 15
-    SELF_HEAL_WALL_CLOCK_BUDGET_SECONDS: int = 300
+    RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
     # requests reach this. Open connections is the binding term -- idle keep-alives and long-lived
     # /stream sockets all count -- so size it against connections per task, not request concurrency.
     # Set it empty or 0 to disable shedding.
     API_LIMIT_CONCURRENCY: int | None = Field(default=512, gt=0)
+    # Run submissions one API process dispatches at once; later ones wait without holding a pooled connection, and
+    # get a retryable 503 before anything is written if no slot frees. 0 (the default) leaves them unbounded and 32
+    # is the suggested first value, checked against the skyvern.run_submission.in_flight gauge, which records either
+    # way; the DISABLE_RUN_SUBMISSION_GATE feature flag switches an enabled gate off without a restart.
+    RUN_SUBMISSION_MAX_CONCURRENCY: int = Field(default=0, ge=0)
+    # Below the SDK's 60 s client timeout, so a waiting caller is answered before it gives up.
+    RUN_SUBMISSION_SLOT_WAIT_SECONDS: float = Field(default=20.0, gt=0)
     # Must exceed the load balancer's idle timeout (infra/terraform/production/alb.tf); otherwise
     # the ALB reuses a connection the server already closed and answers the client with a 502.
     UVICORN_TIMEOUT_KEEP_ALIVE: int = 125
@@ -295,6 +341,9 @@ class Settings(BaseSettings):
     ALLOWED_ORIGIN_REGEX: str | None = None
     BLOCKED_HOSTS: list[str] = ["localhost"]
     ALLOWED_HOSTS: list[str] = []
+    # Off by default on purpose, so self-hosted and open-source installs reach internal hosts without setup; set true to refuse
+    # loopback, private-network and metadata addresses. Skyvern's staging and production deployments set it to true.
+    ENABLE_URL_VALIDATION: bool = False
     # SFTP uploads connect directly from the worker, so private/internal hosts are
     # blocked by default; self-hosted deployments with internal SFTP targets can enable.
     ALLOW_SFTP_INTERNAL_HOSTS: bool = False
@@ -306,11 +355,17 @@ class Settings(BaseSettings):
     # also permits plaintext http:// endpoints, for self-hosted deployments pointing at an
     # object store on their own network (e.g. MinIO).
     ALLOW_S3_ENDPOINT_INTERNAL_HOSTS: bool = False
+    # Let SSRF-checked requests (webhooks, TOTP, downloads) use HTTP(S)_PROXY. A forward proxy resolves the host
+    # itself, so this gives up DNS-rebinding protection; enable only where egress must go through a proxy.
+    OUTBOUND_TRUST_ENV_PROXY: bool = False
 
     # Secret key for JWT. Please generate your own secret key in production
     SECRET_KEY: str = "PLACEHOLDER"
     # Algorithm used to sign the JWT
     SIGNATURE_ALGORITHM: str = "HS256"
+    # Strict-Transport-Security value for API responses. Off by default: HSTS binds every port on the host,
+    # so a self-hosted install serving anything else there over plain HTTP would be forced onto HTTPS.
+    STRICT_TRANSPORT_SECURITY: str | None = None
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # one week
     UI_SESSION_TOKEN_TTL_MINUTES: int = Field(default=60, gt=0)
 
@@ -325,8 +380,18 @@ class Settings(BaseSettings):
 
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
-    MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    MAX_UPLOAD_FILE_SIZE: int = 30 * 1024 * 1024  # 30 MB
     MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
+    # Most memory a pdfplumber child may add (RLIMIT_AS on Linux, an RSS watchdog everywhere); rendering a 300 dpi A0
+    # or A1 scan for OCR can need more than 512 MiB. A pod with less free memory than this, after a 256 MiB margin and
+    # the result reserve, gets what is left, and under 128 MiB the call fails, because memory.oom.group kills the whole
+    # worker at its limit.
+    PDFPLUMBER_MAX_MEMORY_BYTES: int = Field(default=1536 * 1024 * 1024, gt=0)
+    # Most page PNG data a pdfplumber child may hand back for OCR; text, word and page-count results have smaller caps
+    # in pdf_parser. The parent holds a result outside the child's memory cap, so it reserves the decoded size.
+    PDFPLUMBER_MAX_RESULT_BYTES: int = Field(default=256 * 1024 * 1024, gt=0)
+    # Server kill switch for notes in PDF imports; Copilot keeps reading saved notes because they still guide runs.
+    WORKFLOW_PDF_IMPORT_NOTES_ENABLED: bool = True
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     # Ceiling on the retention_days a caller may request at upload time. A cap exists so a
     # retention period cannot be used to pin storage indefinitely; omitting retention_days
@@ -341,11 +406,6 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
     AWS_S3_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AWS_S3_BUCKET_UPLOADS: str = "skyvern-uploads"
-    # ISO-8601 UTC timestamp. Runs created at/after it that have zero DOWNLOAD artifact
-    # rows skip the legacy S3 LIST fallback in get_downloaded_files — such runs register
-    # every download as a row at save time (SKY-8861), so the LIST can only return empty.
-    # None keeps the LIST fallback for every run.
-    DOWNLOADS_EMPTY_S3_LISTING_CUTOVER: str | None = None
 
     # Azure Blob Storage settings
     AZURE_STORAGE_ACCOUNT_NAME: str | None = None
@@ -371,6 +431,7 @@ class Settings(BaseSettings):
     POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
     MCP_POSTHOG_PROJECT_API_KEY: str | None = "phc_m4epBbGS1Hf4NPRFNpR4WQ9Ob6yGy6SLbQckBxp3n0P"
     MCP_POSTHOG_PROJECT_HOST: str = "https://app.posthog.com"
+    AGENT_FEEDBACK_HOURLY_LIMIT: int = 20
 
     # email settings
     SMTP_HOST: str = "localhost"
@@ -393,18 +454,6 @@ class Settings(BaseSettings):
     # set both to record at an explicit resolution.
     BROWSER_RECORDING_WIDTH: int | None = None
     BROWSER_RECORDING_HEIGHT: int | None = None
-    # Max concurrent LLM enrichment calls per live browser-recording interpretation
-    # session. Bounds the per-action enrichment fan-out so a burst of interactions
-    # can't flood the event loop with simultaneous LLM requests.
-    RECORDING_ENRICHMENT_MAX_CONCURRENCY: int = 4
-    # LLM used to enrich live recording draft steps (label/title/goal). A fast, cheap
-    # model keeps the click->labeled-draft latency low. Falls back to the default
-    # LLM_API_HANDLER when the key is unset or not registered in this environment.
-    RECORDING_ENRICHMENT_LLM_KEY: str = "GEMINI_3.1_FLASH_LITE"
-    # Server-side kill switch for delta interpretation updates. Deltas are also
-    # gated per-connection on the client declaring support (begin-exfiltration
-    # supports_interpretation_deltas); this only force-disables them everywhere.
-    RECORDING_INTERPRETATION_DELTAS_ENABLED: bool = True
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False
@@ -432,6 +481,11 @@ class Settings(BaseSettings):
     # Bitwarden Configs #
     #####################
     BITWARDEN_TIMEOUT_SECONDS: int = 60
+    # A cold `bw login` downloads and decrypts the whole vault, so it is categorically slower than the
+    # reads behind it and needs its own budget. Runs arriving as a batch each start on their own pod and
+    # pay that login concurrently, which pushes it well past a budget sized for a read. The unlock that
+    # follows an API-key login gets the same budget.
+    BITWARDEN_LOGIN_TIMEOUT_SECONDS: int = 180
     BITWARDEN_MAX_RETRIES: int = 3
     BITWARDEN_MAX_JITTER_SECONDS: float = 2.0
     # A logged-in CLI session is kept per vault identity and reused across runs, so a batch of
@@ -441,10 +495,12 @@ class Settings(BaseSettings):
     # How long a cached vault may go without a `bw sync`. A miss forces a sync and one retry,
     # so this is the staleness ceiling for an *edit*, not for a newly created item.
     BITWARDEN_SESSION_SYNC_INTERVAL_SECONDS: float = 60.0
-    # How long an unused session may keep an unlocked vault in memory and on disk before it is
-    # logged out. Long enough that a batch stays warm throughout, short enough that an idle pod is
-    # not sitting on someone's open vault. Set to 0 to keep sessions for the pod's lifetime.
+    # How long an unused session may keep an unlocked vault in memory and on disk before it is logged
+    # out (0 disables): long enough to keep a batch warm, short enough that an idle pod holds no open vault.
     BITWARDEN_SESSION_MAX_IDLE_SECONDS: float = 900.0
+    # Retires even a busy session after this long, ±15% per session (0 disables); each retirement costs a
+    # cold login. The periodic sync catches a revoked login sooner, so this only bounds an open vault's age.
+    BITWARDEN_SESSION_MAX_LIFETIME_SECONDS: float = 14400.0
     # Each `bw` invocation is a Node process costing real CPU and ~hundreds of MB. Bound how many
     # run at once so a burst of runs cannot starve the browsers sharing the pod.
     BITWARDEN_MAX_CONCURRENT_CLI_COMMANDS: int = 4
@@ -506,6 +562,8 @@ class Settings(BaseSettings):
     # OPENAI
     OPENAI_API_KEY: str | None = None
     GPT5_REASONING_EFFORT: str | None = "medium"
+    # Pinned on every GPT-6 Luna key; high matches the gpt-5.6-luna key Task V3 serves (OPENAI_GPT5_6_LUNA_HIGH).
+    GPT6_LUNA_REASONING_EFFORT: str = "high"
     OPENAI_CUA_MODEL: str = "computer-use-preview"
     # xAI
     XAI_API_KEY: str | None = None
@@ -516,20 +574,68 @@ class Settings(BaseSettings):
     ANTHROPIC_CUA_LLM_KEY: str = "ANTHROPIC_CLAUDE4.6_SONNET"
     # Task V3 native engine (skyvern-3.0) model; empty falls back to LLM_KEY. Cloud pins the validated model.
     TASK_V3_LLM_KEY: str = ""
-    # Forbid no-tool "narration" turns in the Task V3 loop. Only takes effect where the resolved
-    # model declares tool_choice support; the NO_TOOL_CALL_NUDGE fallback stays either way.
-    TASK_V3_TOOL_CHOICE_REQUIRED: bool = False
     # Fraction of Task V3 runs (keyed by workflow run, else task) that persist their last pre-submit
     # page frames as artifacts. Instrumentation sampling, not a traffic knob; 0 disables.
     TASK_V3_PRE_SUBMIT_CAPTURE_SAMPLE_RATE: float = 0.25
+    # Kill switch: one page DOM per Task V3 block, saved after the loop as html_action (v1 saves html_scrape).
+    TASK_V3_BLOCK_END_DOM: bool = True
+    # Fallback only: runs are randomized per run by the flag of the same name (TURN_DOM_FLAG). This is the fraction
+    # of the runs it leaves unrandomized (keyed like the pre-submit sample) that store the page DOM every turn.
+    TASK_V3_TURN_DOM_SAMPLE_RATE: float = 0.05
     # Kill switch for the tier-1 semantic commit read (SKY-15322): decisive-accept-only ARIA/value
     # probe consulted before the shape heuristics, which remain the fallback either way.
     TASK_V3_SEMANTIC_COMMIT_VERIFY: bool = True
-    # Render the previous block's outcome (status / finish reason / final URL) and whether this is the
-    # last block into a v3 block's goal. Costs prompt tokens on every turn of the block, so it is
-    # measured via taskv3_block_context_tokens before it earns default-on. The outcome itself is
-    # persisted on workflow_run_blocks regardless of this flag (one row read + one update per block).
-    TASK_V3_BLOCK_HANDOFF: bool = False
+    # Kill switch for committing a list row that names the value without being it exactly (its main label, a
+    # singular/plural, a unique word prefix on a click-opened list) (SKY-18017). Off: typeaheads commit exact rows only.
+    TASK_V3_CHOICE_NONEXACT_COMMIT: bool = True
+    # Kill switch: hold a Task V3 typing call whose field is still refused by the same live layer that refused an earlier
+    # one, instead of re-running the full typing path for it (SKY-19408). Off: every call runs its full path as before.
+    TASK_V3_SAME_LAYER_TYPE_HOLD: bool = True
+    # Press a sub-pixel date segment through the layer painted over it, and route month/year and
+    # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
+    # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
+    TASK_V3_DATE_SEGMENT_AIM: bool = False
+    # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
+    # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
+    TASK_V3_LOGIN_PACE: bool = False
+    # Return an in-loop navigate's 404/410 to the model as the navigate result instead of ending the run (SKY-16206).
+    # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
+    TASK_V3_DEAD_END_RETURN: bool = False
+    # The acting model declares whether a run is a job application, and only a yes delivers the application defaults.
+    # Force-on term only: runs are randomized per run by the flag of the same name (APPLICATION_CONTEXT_FLAG).
+    TASK_V3_APPLICATION_CONTEXT: bool = False
+    # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
+    # as before. Force-on term only: where it is off, organizations are gated by the flag of the same name.
+    # Retry policies match on stored codes, so turning this on can change which runs retry.
+    TASK_V3_ERROR_CODE_ON_FINISH: bool = False
+    # Kill switch for the hold on a Task V3 run's first terminated verdict that asks for what prevents the task.
+    # On: every terminated verdict stands as the model gave it.
+    DISABLE_TASK_V3_JUSTIFY_HOLD: bool = False
+    # Which browser surface the v3 loop offers: today's action tools ("off"), those plus a code
+    # tool ("add"), or the code tool instead of them ("replace"). Three states rather than a boolean
+    # because the benchmark separated add from replace on speed alone, not on success. The code tool
+    # executes only in the sandboxed runner and is withheld whenever that runner is unavailable --
+    # there is no in-process execution path to fall back to.
+    TASK_V3_CODE_TOOL_SURFACE: Literal["off", "add", "replace"] = "off"
+    # How long the Task V3 navigate tool waits for the committed document's domcontentloaded and then
+    # load events. Carved OUT OF BROWSER_LOADING_TIMEOUT_MS, never added to it -- the commit attempt
+    # gets the remainder, so one navigate call's worst case stays at that total.
+    TASK_V3_NAVIGATE_READINESS_TIMEOUT_MS: int = 20000
+    # Workflows whose permanent id was born at or after this instant run their task blocks on Task V3
+    # when the organization resolves to the self-serve billing tier (an unknown tier is not enrolled),
+    # bypassing WORKFLOW_TASK_V3_AB. None disables the rule (the OSS default), as does having no flag
+    # provider; DISABLE_TASK_V3 still wins over it. A naive value is read as UTC. Per-call platform
+    # workflows are excluded twice over -- by an auto_generated executing version, which covers the
+    # login, download_files, credential test-login, SDK and job recipe endpoints, and by a per-call trigger
+    # kind, which also covers older job recipe workflows created as published. Enrolled runs
+    # are not randomized, so every per-arm read must exclude them by route_reason.
+    TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF: datetime | None = None
+    # Workflows whose permanent id was born at or after this instant, in every billing tier, honor each
+    # task block's chosen engine and run a block with no engine on Task V3 (or on the per-run split of
+    # WORKFLOW_TASK_V3_AB_NEW_WORKFLOWS for a listed org or workflow), outside WORKFLOW_TASK_V3_AB.
+    # Excludes the same per-call platform workflows as the cutoff above. None disables the rule, as does
+    # having no flag provider; DISABLE_TASK_V3 still wins. A naive value is read as UTC.
+    TASK_V3_CHOSEN_ENGINE_CUTOFF: datetime | None = None
 
     # VOLCENGINE (Doubao)
     ENABLE_VOLCENGINE: bool = False
@@ -540,6 +646,11 @@ class Settings(BaseSettings):
     # Yutori Navigator
     ENABLE_YUTORI: bool = False
     YUTORI_API_KEY: str | None = None
+    SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
+    EXA_API_KEY: str | None = Field(default=None, repr=False)
+    # Lets the search_web helper and Copilot tool spend the Search block's keys above. Off by default so
+    # keys set only for the Search block are not spent by code blocks and the Copilot.
+    ENABLE_SEARCH_WEB: bool = False
     YUTORI_API_BASE: str = "https://api.yutori.com/v1"
     YUTORI_MODEL: str = "n1.5-latest"
     YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
@@ -656,6 +767,36 @@ class Settings(BaseSettings):
     AZURE_GPT5_4_API_BASE: str | None = None
     AZURE_GPT5_4_API_VERSION: str = "2025-04-01-preview"
 
+    ENABLE_AZURE_GPT6_ASTRA: bool = False
+    AZURE_GPT6_ASTRA_DEPLOYMENT: str = "gpt-6-astra"
+    AZURE_GPT6_ASTRA_API_KEY: str | None = None
+    AZURE_GPT6_ASTRA_API_BASE: str | None = None
+    AZURE_GPT6_ASTRA_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_SOL: bool = False
+    AZURE_GPT6_SOL_DEPLOYMENT: str = "gpt-6-sol"
+    AZURE_GPT6_SOL_API_KEY: str | None = None
+    AZURE_GPT6_SOL_API_BASE: str | None = None
+    AZURE_GPT6_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_1_SOL: bool = False
+    AZURE_GPT6_1_SOL_DEPLOYMENT: str = "gpt-6.1-sol"
+    AZURE_GPT6_1_SOL_API_KEY: str | None = None
+    AZURE_GPT6_1_SOL_API_BASE: str | None = None
+    AZURE_GPT6_1_SOL_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_1_TERRA: bool = False
+    AZURE_GPT6_1_TERRA_DEPLOYMENT: str = "gpt-6.1-terra"
+    AZURE_GPT6_1_TERRA_API_KEY: str | None = None
+    AZURE_GPT6_1_TERRA_API_BASE: str | None = None
+    AZURE_GPT6_1_TERRA_API_VERSION: str = "2025-04-01-preview"
+
+    ENABLE_AZURE_GPT6_LUNA: bool = False
+    AZURE_GPT6_LUNA_DEPLOYMENT: str = "gpt-6-luna"
+    AZURE_GPT6_LUNA_API_KEY: str | None = None
+    AZURE_GPT6_LUNA_API_BASE: str | None = None
+    AZURE_GPT6_LUNA_API_VERSION: str = "2025-04-01-preview"
+
     # AZURE gpt-5.6 sol
     ENABLE_AZURE_GPT5_6_SOL: bool = False
     AZURE_GPT5_6_SOL_DEPLOYMENT: str = "gpt-5.6-sol"
@@ -731,6 +872,8 @@ class Settings(BaseSettings):
     # TOTP Settings
     TOTP_LIFESPAN_MINUTES: int = 10
     TOTP_RAW_CONTENT_MAX_LENGTH: int = 65536
+    TOTP_MULTI_FIELD_MIN_REMAINING_SECONDS: int = 20
+    TWILIO_SMS_2FA_ENABLED: bool = False
     VERIFICATION_CODE_INITIAL_WAIT_TIME_SECS: int = 40
     VERIFICATION_CODE_POLLING_TIMEOUT_MINS: int = 15
 
@@ -897,6 +1040,10 @@ class Settings(BaseSettings):
     """Interval in minutes for the cleanup cron job."""
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
+    HOSTED_MCP_DRIVER_IDLE_SECONDS: float = 600.0
+    """Stop a hosted MCP API key's shared Playwright driver after no tool call has used it this long; <=0 disables."""
+    HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS: float = 300.0
+    """How often the API checks hosted MCP drivers for idleness; <=0 disables the sweep."""
 
     TEMP_ARTIFACT_SWEEP_MAX_AGE_HOURS: float = 48.0
     """Age gate (hours) for the always-on sweep of per-run LOG_PATH/DOWNLOAD_PATH dirs left behind on
@@ -909,12 +1056,21 @@ class Settings(BaseSettings):
     """How often the OSS/local scheduler scans for due workflow schedules."""
     WORKFLOW_SCHEDULE_MAX_CONCURRENT_RUNS: int = 1
     """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
+    RETRY_DISPATCH_GRACE_SECONDS: int = Field(default=600, ge=600)
+    """OSS dispatch claim grace; the executor also enforces the retry lease takeover minimum."""
+    WORKFLOW_RUN_GROUPS_SUBMIT_ENABLED: bool = True
+    """Accept new serial workflow run groups. Turning it off stops submission only; reads, cancels and
+    dispatch of already-submitted groups continue."""
+    COPILOT_ACCOUNT_GROUP_SUBMIT_ENABLED: bool = True
+    """Offer Copilot's run_workflow_for_accounts tool. Turning it off keeps group status, cancel and receipts."""
+    COPILOT_CREDENTIAL_DELETE_ENABLED: bool = True
+    """Offer Copilot's delete_saved_credentials card. Turning it off hides the tool and refuses confirmations."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
-    # Which infrastructure this process runs on ("aws", "hetzner", or "local"
-    # for self-hosted/dev); stamped on run-telemetry metrics so run time and
+    # Which infrastructure this process runs on ("aws", or "local" in
+    # self-hosted and dev); stamped on run-telemetry metrics so run time and
     # cost can be split by infra. Cloud deploy configs set it explicitly.
     INFRA_PROVIDER: str = "local"
     OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
@@ -982,11 +1138,28 @@ class Settings(BaseSettings):
 
         return self
 
+    @field_validator("RUN_HEARTBEAT_TIMEOUT_MINUTES")
+    @classmethod
+    def _run_heartbeat_timeout_minutes_bounds(cls, value: int) -> int:
+        if value != 0 and not 2 <= value <= 1440:
+            raise ValueError("RUN_HEARTBEAT_TIMEOUT_MINUTES must be 0 (off) or between 2 and 1440 minutes")
+        return value
+
     @field_validator("API_LIMIT_CONCURRENCY", mode="before")
     @classmethod
     def _api_limit_concurrency_unlimited_sentinels(cls, value: Any) -> Any:
         # gt=0 otherwise leaves the unlimited setting unreachable from the environment.
         if value is None or str(value).strip().lower() in ("", "0", "none", "null"):
+            return None
+        return value
+
+    @field_validator("TASK_V3_DEFAULT_ENGINE_WORKFLOW_CUTOFF", "TASK_V3_CHOSEN_ENGINE_CUTOFF", mode="before")
+    @classmethod
+    def _task_v3_default_engine_workflow_cutoff_off_sentinels(cls, value: Any) -> Any:
+        # This setting is the rule's settings-side kill path, and blanking an already-set env var is
+        # how it gets turned off mid-incident. Without this, every off-spelling fails datetime
+        # validation and crashes the process at import instead of disabling the rule.
+        if value is None or str(value).strip().lower() in ("", "0", "none", "null", "off", "disabled"):
             return None
         return value
 
@@ -1012,8 +1185,6 @@ class Settings(BaseSettings):
 
         # Gemini models: prefer Vertex when enabled, fall back to direct Gemini API
         gemini_models = [
-            ("gemini-2.5-pro-preview-05-06", "VERTEX_GEMINI_2.5_PRO", "GEMINI_2.5_PRO", "Gemini 2.5 Pro"),
-            ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
             ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
             ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
             ("gemini-3.5-flash", "VERTEX_GEMINI_3.5_FLASH", "GEMINI_3.5_FLASH", "Gemini 3.5 Flash"),
@@ -1025,12 +1196,6 @@ class Settings(BaseSettings):
                 "llm_key": vertex_key if self.ENABLE_VERTEX_AI else gemini_key,
                 "label": label,
             }
-
-        # Gemini Flash Lite: Vertex-only (no direct Gemini API config exists)
-        mapping["gemini-2.5-flash-lite"] = {
-            "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-            "label": "Gemini 2.5 Flash Lite",
-        }
 
         mapping["mercury-2"] = {"llm_key": "INCEPTION_MERCURY_2", "label": "Inception Mercury 2"}
 
@@ -1056,6 +1221,34 @@ class Settings(BaseSettings):
             ),
             ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
             ("azure/gpt-5.4", self.ENABLE_AZURE_GPT5_4, "AZURE_OPENAI_GPT5_4", "OPENAI_GPT5_4", "GPT 5.4"),
+            (
+                "azure/gpt-6-astra",
+                self.ENABLE_AZURE_GPT6_ASTRA,
+                "AZURE_OPENAI_GPT6_ASTRA",
+                "OPENAI_GPT6_ASTRA",
+                "GPT 6 Astra",
+            ),
+            (
+                "azure/gpt-6-sol",
+                self.ENABLE_AZURE_GPT6_SOL,
+                "AZURE_OPENAI_GPT6_SOL",
+                "OPENAI_GPT6_SOL",
+                "GPT 6 Sol",
+            ),
+            (
+                "azure/gpt-6.1-sol",
+                self.ENABLE_AZURE_GPT6_1_SOL,
+                "AZURE_OPENAI_GPT6_1_SOL",
+                "OPENAI_GPT6_1_SOL",
+                "GPT 6.1 Sol",
+            ),
+            (
+                "azure/gpt-6-luna",
+                self.ENABLE_AZURE_GPT6_LUNA,
+                "AZURE_OPENAI_GPT6_LUNA",
+                "OPENAI_GPT6_LUNA",
+                "GPT 6 Luna",
+            ),
             (
                 "azure/gpt-5.6-sol",
                 self.ENABLE_AZURE_GPT5_6_SOL,
@@ -1151,6 +1344,18 @@ class Settings(BaseSettings):
                 "label": "Anthropic Claude Fable 5",
             }
 
+        # Anthropic Claude Fable 5.1: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-fable-5-1"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5.1_FABLE_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Fable 5.1",
+            }
+        else:
+            mapping["claude-fable-5-1"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5.1_FABLE",
+                "label": "Anthropic Claude Fable 5.1",
+            }
+
         # Anthropic Claude Opus 5: prefer Bedrock when enabled, fall back to direct API
         if self.ENABLE_BEDROCK_ANTHROPIC:
             mapping["claude-opus-5"] = {
@@ -1162,6 +1367,14 @@ class Settings(BaseSettings):
                 "llm_key": "ANTHROPIC_CLAUDE5_OPUS",
                 "label": "Anthropic Claude Opus 5",
             }
+        mapping["claude-opus-5-5"] = {
+            "llm_key": (
+                "BEDROCK_ANTHROPIC_CLAUDE5.5_OPUS_INFERENCE_PROFILE"
+                if self.ENABLE_BEDROCK_ANTHROPIC
+                else "ANTHROPIC_CLAUDE5.5_OPUS"
+            ),
+            "label": "Anthropic Claude Opus 5.5",
+        }
 
         try:
             from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415

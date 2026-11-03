@@ -27,10 +27,21 @@ skyvern_evaluate(expression="fetch('/api/v1/workflows?page=1&page_size=1', {cred
 A 2xx means fully healthy; 401/403 means the backend is running but requires authentication.
 Only `status: 0` or a network error means the backend is actually down.
 
+In extension mode, `skyvern_evaluate` is unavailable, so use these commands after you create the browser session:
+
+```
+skyvern_navigate(url="{{base_url}}/api/v1/workflows?page=1&page_size=1")
+skyvern_network_requests(url_pattern="/api/v1/workflows", resource_type="document")
+```
+
+**Pass**: Read the document response's `status`; any HTTP status confirms the backend is reachable.
+A 2xx means fully healthy; 401 or 403 means the backend is running but requires authentication.
+No captured response means the backend is down.
+
 ```
 skyvern_navigate(url="{{base_url}}/discover")
 skyvern_validate(prompt="The page does NOT show any error messages, error toasts, 'Something went wrong', a persistent loading spinner, a blank white screen, or a connection refused message")
-skyvern_validate(prompt="The page shows 'What task would you like to accomplish?' as a heading, a text input area with 'Enter your prompt...' placeholder, an engine version selector, and a send/submit button icon")
+skyvern_validate(prompt="The page shows 'What task would you like to accomplish?' as a heading, a prompt text input area, an engine version selector, and a send/submit button icon")
 skyvern_screenshot()
 skyvern_browser_session_close()
 ```

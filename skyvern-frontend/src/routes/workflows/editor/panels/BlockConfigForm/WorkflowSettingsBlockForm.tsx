@@ -34,7 +34,6 @@ function WorkflowSettingsBlockFormBody({
       proxyLocation: data.proxyLocation,
       runWith: data.runWith,
       aiFallback: data.aiFallback,
-      enableSelfHealing: data.enableSelfHealing,
       scriptCacheKey: data.scriptCacheKey,
       maskSecrets: data.maskSecrets,
       runSequentially: data.runSequentially,
@@ -44,11 +43,13 @@ function WorkflowSettingsBlockFormBody({
       pinSavedSessionIp: data.pinSavedSessionIp,
       browserProfileId: data.browserProfileId,
       browserProfileKey: data.browserProfileKey,
+      browserType: data.browserType,
       extraHttpHeaders: data.extraHttpHeaders,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
       maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
       finallyBlockLabel: data.finallyBlockLabel,
       workflowSystemPrompt: data.workflowSystemPrompt,
+      retryPolicy: data.retryPolicy,
     };
   }, [data]);
 

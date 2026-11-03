@@ -5,6 +5,7 @@ import errno
 import subprocess
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -12,8 +13,10 @@ import pytest_asyncio
 
 import skyvern.browser_extension.runtime as runtime_module
 from skyvern.browser_extension.broker_client import BrokerClient
+from skyvern.browser_extension.cdp_adapter import TabReconnectEvent
 from skyvern.browser_extension.errors import BrowserExtensionBrokerError, BrowserExtensionError
 from skyvern.browser_extension.runtime import BrowserExtensionRuntime, broker_mode_enabled
+from tests.unit.browser_extension.home_guard import _test_broker_base_dir
 
 
 class StubRelay:
@@ -63,6 +66,9 @@ class StubAdapter:
         self.stop_count = 0
         self.cdp_ws_url = "ws://127.0.0.1:23456/cdp/test-capability"
 
+    def set_tab_reconnect_listener(self, listener: Callable[[TabReconnectEvent], None] | None) -> None:
+        self.on_tab_reconnect = listener
+
     async def start(self) -> None:
         self.calls.append("adapter.start")
 
@@ -75,6 +81,12 @@ class StubAdapter:
 
     async def on_extension_disconnect(self) -> None:
         self.disconnect_count += 1
+
+    def target_attachment_snapshot(self, target_id: str) -> bool:
+        return target_id == "target-17"
+
+    def scoped_tab_id_for_target(self, target_id: str) -> int | None:
+        return 17 if target_id == "target-17" else None
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -97,7 +109,7 @@ def install_stubs(
     adapters: list[StubAdapter] = []
     calls: list[str] = []
 
-    def relay_factory(token, port, on_event, on_disconnect) -> StubRelay:
+    def relay_factory(token, port, on_event, on_disconnect, *, order_debugger_events=False) -> StubRelay:
         relay = StubRelay(
             token,
             port,
@@ -145,25 +157,126 @@ async def test_singleton_is_idempotent_and_late_binds_adapter_callbacks(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_evaluate_routes_to_active_controlled_tab() -> None:
+async def test_page_debugger_attached_caches_target_binding_and_detaches_alias() -> None:
     relay = MagicMock()
-    relay.ensure_root_lease = AsyncMock(return_value={"tabId": 17})
-    relay.list_scoped_tabs = AsyncMock(
-        return_value=[
-            {"tabId": 17, "active": False},
-            {"tabId": 18, "active": True},
-        ]
-    )
-    relay.request = AsyncMock(return_value={"result": {"answer": 42}})
-    runtime = BrowserExtensionRuntime(relay, MagicMock())
+    relay.connected = True
+    adapter = MagicMock()
+    adapter.target_attachment_snapshot.return_value = True
+    runtime = BrowserExtensionRuntime(relay, adapter)
 
-    assert await runtime.evaluate("({ answer: 6 * 7 })") == {"answer": 42}
-    relay.ensure_root_lease.assert_awaited_once_with()
-    relay.list_scoped_tabs.assert_awaited_once_with()
-    relay.request.assert_awaited_once_with(
-        "dom.evaluate",
-        {"tabId": 18, "expression": "({ answer: 6 * 7 })"},
-    )
+    page = MagicMock()
+    page.is_closed.return_value = False
+    cdp_session = MagicMock()
+    cdp_session.send = AsyncMock(return_value={"targetInfo": {"targetId": "target-17"}})
+    cdp_session.detach = AsyncMock()
+    page.context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=cdp_session))
+
+    assert await runtime.page_debugger_attached(page) is True
+    assert await runtime.page_debugger_attached(page) is True
+    page.context.new_cdp_session.assert_awaited_once_with(page)
+    cdp_session.send.assert_awaited_once_with("Target.getTargetInfo")
+    cdp_session.detach.assert_awaited_once_with()
+    adapter.target_attachment_snapshot.assert_called_with("target-17")
+
+    relay.connected = False
+    assert await runtime.page_debugger_attached(page) is False
+
+
+@pytest.mark.asyncio
+async def test_page_close_during_target_binding_returns_false_without_cancelling_caller() -> None:
+    relay = MagicMock()
+    relay.connected = True
+    runtime = BrowserExtensionRuntime(relay, MagicMock())
+    binding_started = asyncio.Event()
+    binding_released = asyncio.Event()
+    binding_finished = asyncio.Event()
+
+    async def acquire(_page: MagicMock) -> None:
+        binding_started.set()
+        try:
+            await binding_released.wait()
+        finally:
+            binding_finished.set()
+
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.context = SimpleNamespace(new_cdp_session=acquire)
+    caller = asyncio.create_task(runtime.page_debugger_attached(page))
+    await binding_started.wait()
+
+    page.is_closed.return_value = True
+    runtime._invalidate_page_binding(page)
+    try:
+        assert await asyncio.wait_for(caller, 1) is False
+        assert caller.cancelled() is False
+    finally:
+        binding_released.set()
+    await asyncio.wait_for(binding_finished.wait(), 1)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_binding_callback_does_not_remove_replacement_task() -> None:
+    relay = MagicMock()
+    relay.connected = True
+    runtime = BrowserExtensionRuntime(relay, MagicMock())
+    binding_started = asyncio.Event()
+    binding_released = asyncio.Event()
+
+    async def acquire(_page: MagicMock) -> None:
+        binding_started.set()
+        await binding_released.wait()
+
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.context = SimpleNamespace(new_cdp_session=acquire)
+    target_id_task = asyncio.create_task(runtime._target_id_for_page(page))
+    await binding_started.wait()
+
+    binding_task = runtime._page_target_binding_tasks[page]
+    runtime._invalidate_page_binding(page)
+    replacement_task = asyncio.create_task(asyncio.sleep(60))
+    runtime._page_target_binding_tasks[page] = replacement_task
+    await asyncio.sleep(0)
+
+    assert runtime._page_target_binding_tasks.get(page) is replacement_task
+    assert await asyncio.wait_for(target_id_task, 1) is None
+
+    binding_released.set()
+    replacement_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replacement_task
+    await asyncio.sleep(0)
+    assert binding_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_late_target_acquisition_detaches_alias_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    relay = MagicMock()
+    relay.connected = True
+    runtime = BrowserExtensionRuntime(relay, MagicMock())
+    monkeypatch.setattr(runtime_module, "_PAGE_TARGET_ACQUISITION_TIMEOUT_SECONDS", 0.01)
+    acquisition_started = asyncio.Event()
+    acquisition_released = asyncio.Event()
+    detach_finished = asyncio.Event()
+    cdp_session = MagicMock()
+    cdp_session.detach = AsyncMock(side_effect=detach_finished.set)
+
+    async def acquire(_page: MagicMock) -> MagicMock:
+        acquisition_started.set()
+        await acquisition_released.wait()
+        return cdp_session
+
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.context = SimpleNamespace(new_cdp_session=acquire)
+    result_task = asyncio.create_task(runtime.page_debugger_attached(page))
+    await acquisition_started.wait()
+    assert await asyncio.wait_for(result_task, 1) is False
+    assert cdp_session.detach.await_count == 0
+
+    acquisition_released.set()
+    await asyncio.wait_for(detach_finished.wait(), 1)
+    cdp_session.detach.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -185,7 +298,7 @@ async def test_busy_pairing_waits_then_opens_this_clients_offer(monkeypatch: pyt
     async def ignore_event(_event: str, _params: dict) -> None:
         return None
 
-    relay = BrokerClient(19777, ignore_event, auto_spawn=False)
+    relay = BrokerClient(19777, ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     begin_pairing = AsyncMock(
         side_effect=[
             BrowserExtensionBrokerError("PAIRING_BUSY", "Another client is pairing"),
@@ -208,7 +321,7 @@ async def test_pairing_surfaces_extension_upgrade_requirement(monkeypatch: pytes
     async def ignore_event(_event: str, _params: dict) -> None:
         return None
 
-    relay = BrokerClient(19777, ignore_event, auto_spawn=False)
+    relay = BrokerClient(19777, ignore_event, base_dir=_test_broker_base_dir(), auto_spawn=False)
     monkeypatch.setattr(
         relay,
         "begin_pairing",
@@ -472,3 +585,65 @@ async def test_windows_default_logs_and_uses_legacy_relay(monkeypatch: pytest.Mo
         platform="win32",
     )
     await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_targets_selected_page_instead_of_active_chrome_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = MagicMock()
+    page.is_closed.return_value = False
+    relay = SimpleNamespace(
+        connected=True,
+        scoped_tabs=[{"tabId": 17, "active": True}, {"tabId": 42, "active": False}],
+        request=AsyncMock(return_value={"textLength": 3}),
+    )
+    adapter = SimpleNamespace(
+        scoped_tab_id_for_target=lambda target: 42 if target == "selected-target" else None,
+        set_tab_reconnect_listener=MagicMock(),
+    )
+    runtime = BrowserExtensionRuntime(relay, adapter)
+    monkeypatch.setattr(runtime_module, "time", SimpleNamespace(time=lambda: 100.0))
+    binding = AsyncMock(return_value="selected-target")
+    monkeypatch.setattr(runtime, "_target_id_for_page", binding)
+
+    assert await runtime.fill_input(page, "#email", "abc", timeout=5.0) == {"textLength": 3}
+    binding.assert_awaited_once_with(page)
+    relay.request.assert_awaited_once_with(
+        "dom.fill", {"tabId": 42, "selector": "#email", "text": "abc", "deadline": 105000}, timeout=5.0
+    )
+    page.evaluate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_refuses_a_target_that_lost_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = MagicMock()
+    page.is_closed.return_value = False
+    relay = SimpleNamespace(connected=True, request=AsyncMock())
+    runtime = BrowserExtensionRuntime(
+        relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: None, set_tab_reconnect_listener=MagicMock())
+    )
+    monkeypatch.setattr(runtime, "_target_id_for_page", AsyncMock(return_value="old-target"))
+
+    with pytest.raises(BrowserExtensionError, match="selected page"):
+        await runtime.fill_input(page, "#email", "abc")
+    relay.request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fixed_fill_keeps_deadline_while_binding_selected_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = MagicMock()
+    page.is_closed.return_value = False
+    relay = SimpleNamespace(connected=True, request=AsyncMock())
+    runtime = BrowserExtensionRuntime(
+        relay, SimpleNamespace(scoped_tab_id_for_target=lambda target: 42, set_tab_reconnect_listener=MagicMock())
+    )
+    clock = [100.0]
+    monkeypatch.setattr(runtime_module, "time", SimpleNamespace(time=lambda: clock[0]))
+
+    async def bind(_page):
+        clock[0] += 2.0
+        return "selected-target"
+
+    monkeypatch.setattr(runtime, "_target_id_for_page", bind)
+    with pytest.raises(TimeoutError, match="expired"):
+        await runtime.fill_input(page, "#email", "example", timeout=1.0)
+    relay.request.assert_not_awaited()

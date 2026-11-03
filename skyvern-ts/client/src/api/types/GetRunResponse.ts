@@ -9,6 +9,7 @@ export type GetRunResponse =
     | Skyvern.GetRunResponse.AnthropicCua
     | Skyvern.GetRunResponse.UiTars
     | Skyvern.GetRunResponse.YutoriNavigator
+    | Skyvern.GetRunResponse.TaskV3
     | Skyvern.GetRunResponse.WorkflowRun;
 
 export namespace GetRunResponse {
@@ -34,6 +35,10 @@ export namespace GetRunResponse {
 
     export interface YutoriNavigator extends Skyvern.TaskRunResponse {
         run_type: "yutori_navigator";
+    }
+
+    export interface TaskV3 extends Skyvern.TaskRunResponse {
+        run_type: "task_v3";
     }
 
     export interface WorkflowRun extends Skyvern.WorkflowRunResponse {

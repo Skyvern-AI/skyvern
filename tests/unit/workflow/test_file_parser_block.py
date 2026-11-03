@@ -8,25 +8,55 @@ token truncation, and error handling for DOCX files.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
+import os
+import re
+import struct
+import tempfile
 import time
-from collections.abc import Awaitable
-from contextlib import suppress
-from datetime import datetime, timezone
+import zipfile
+import zlib
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, get_args
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import docx
+import libcst as cst
 import pandas as pd
 import pytest
+import structlog
+from pypdf import PdfReader, apply_configuration
+from pypdf.errors import LimitReachedError, PdfReadError
 
+import skyvern.forge.sdk.utils.capped_subprocess as capped_subprocess_module
+import skyvern.forge.sdk.utils.pdf_parser as pdf_parser_module
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.config import settings
+from skyvern.core.script_generations.generate_script import _build_file_url_parser_statement
+from skyvern.exceptions import PDFParsingError
+from skyvern.forge import app
+from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.sdk.api.llm.exceptions import InvalidLLMResponseFormat
-from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType
+from skyvern.forge.sdk.utils.capped_subprocess import MEMORY_CAP_ENFORCED, CappedSubprocessError
+from skyvern.forge.sdk.utils.capped_subprocess_child import MIN_MEMORY_BUDGET_BYTES
+from skyvern.forge.sdk.utils.pdf_parser import (
+    extract_pdf_file,
+    extract_upright_pdf_words,
+    render_pdf_pages_as_images,
+    scrambled_text_layer_reason,
+    validate_pdf_file,
+)
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import FileParseTimeout, InvalidFileType, WorksheetNotFound
 from skyvern.forge.sdk.workflow.models.block import BlockType, FileParserBlock, PDFParserBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
-from skyvern.schemas.workflows import BlockResult, BlockStatus, FileType
+from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.schemas.workflows import BlockResult, BlockStatus, FileParserBlockYAML, FileType
+from skyvern.services import script_service
 
 
 def _make_output_parameter(key: str) -> OutputParameter:
@@ -36,8 +66,8 @@ def _make_output_parameter(key: str) -> OutputParameter:
         description="test",
         output_parameter_id="test-output-id",
         workflow_id="test-workflow-id",
-        created_at=datetime.now(timezone.utc),
-        modified_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
+        modified_at=datetime.now(UTC),
     )
 
 
@@ -62,6 +92,7 @@ def _make_pdf_parser_block(file_url: str) -> PDFParserBlock:
 
 def _mock_workflow_run_context() -> MagicMock:
     ctx = MagicMock()
+    ctx.resolve_block_notes_section.return_value = None
     ctx.has_parameter.return_value = False
     ctx.has_value.return_value = False
     ctx.register_output_parameter_value_post_execution = AsyncMock()
@@ -69,9 +100,12 @@ def _mock_workflow_run_context() -> MagicMock:
 
 
 async def _execute_with_downloaded_file(
-    block: FileParserBlock, file_path: Path, monkeypatch: pytest.MonkeyPatch
+    block: FileParserBlock,
+    file_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_run_context: WorkflowRunContext | MagicMock | None = None,
 ) -> BlockResult:
-    workflow_run_context = _mock_workflow_run_context()
+    workflow_run_context = workflow_run_context or _mock_workflow_run_context()
     monkeypatch.setattr(
         FileParserBlock,
         "get_workflow_run_context",
@@ -711,6 +745,7 @@ class TestPDFParserSchemaValidation:
     @staticmethod
     def _patch_execute_dependencies(mp: pytest.MonkeyPatch, block: PDFParserBlock, handler: AsyncMock) -> AsyncMock:
         workflow_run_context = MagicMock()
+        workflow_run_context.resolve_block_notes_section.return_value = None
         workflow_run_context.has_parameter.return_value = False
         record_output_parameter_value = AsyncMock()
 
@@ -762,6 +797,25 @@ class TestPDFParserSchemaValidation:
         assert "previous response failed JSON schema validation" in prompts[1]
         assert "expected type object, got array" in prompts[1]
         record_output_parameter_value.assert_awaited_once()
+
+    async def test_stalled_model_fails_the_block_at_the_deadline(self) -> None:
+        block = _make_pdf_parser_block("https://example.com/resume.pdf")
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_execute_dependencies(mp, block, AsyncMock(side_effect=stalled_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute("workflow-run", "workflow-run-block", organization_id="org-1"), timeout=10
+            )
+
+        assert result.success is False
+        assert result.status == BlockStatus.failed
+        assert "did not answer within" in (result.failure_reason or "")
 
 
 @pytest.mark.asyncio
@@ -888,6 +942,31 @@ class TestOcrPdfPages:
             with pytest.raises(RuntimeError, match="vision model outage"):
                 await block._ocr_pdf_pages([b"p1", b"p2", b"p3"])
 
+    @pytest.mark.parametrize(
+        ("call_timeout", "pass_timeout", "expected_reason"),
+        [(0.05, 10, "did not answer within"), (10, 0.05, "did not transcribe")],
+        ids=["page_deadline", "whole_pass_deadline"],
+    )
+    async def test_stalled_page_fails_the_pass_instead_of_being_skipped(
+        self, call_timeout: float, pass_timeout: float, expected_reason: str
+    ) -> None:
+        """Skipping a page the model never answered would hand extraction a document with that page missing."""
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            if image == b"stalled":
+                await asyncio.Event().wait()
+            return {"extracted_text": f"text for {image.decode()}"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(side_effect=fake_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", call_timeout)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.PDF_OCR_TOTAL_TIMEOUT_SECONDS", pass_timeout)
+
+            with pytest.raises(TimeoutError, match=expected_reason):
+                await asyncio.wait_for(block._ocr_pdf_pages([b"good-1", b"stalled", b"good-3"]), timeout=5)
+
     async def test_empty_pages_contribute_nothing(self) -> None:
         """Pages that OCR to empty text add neither a marker nor content."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -925,6 +1004,50 @@ class TestOcrPdfPages:
         assert "--- Page 1 ---" in result
         assert "--- Page 2 ---" not in result and "--- Page 3 ---" not in result
 
+    async def test_token_cap_counts_pages_that_reached_the_model_with_an_unknown_total(self) -> None:
+        """`pages_included` counts pages whose content is in the produced text (D3-fields-amend).
+
+        A page that rendered but transcribed to nothing is not included, so the count matches
+        SKY-15830's record rather than the number of pages iterated over. `total_pages` stays
+        unknown: the render step caps at MAX_PDF_OCR_PAGES without reporting the document's page
+        count, so any number this code could produce would be the rendered count (D7-review F1,
+        option B), and SKY-15830 supplies the real one.
+        """
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        async def fake_handler(**kwargs: Any) -> dict[str, str]:
+            (image,) = kwargs["screenshots"]
+            return {"extracted_text": "" if image == b"blank" else "real content"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(side_effect=fake_handler))
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.count_tokens", lambda text: 10)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.MAX_FILE_PARSE_INPUT_TOKENS", 15)
+            with structlog.testing.capture_logs() as logs:
+                await block._ocr_pdf_pages([b"blank", b"page-2", b"page-3"])
+
+        # Page 1 transcribed to nothing and page 3 was cut, so one page's content is in the output.
+        assert block._telemetry.pages_included == 1
+        assert block._telemetry.total_pages is None
+        assert block._telemetry.limit == "token_limit"
+        assert block._telemetry.truncated is True
+        # The adjacent WARNING reports the same count from its own expression; without this the two
+        # can drift and a dashboard reading the WARNING disagrees with one reading the telemetry.
+        (page_cap_warning,) = _events(logs, "PDF OCR text exceeds token limit, truncating at page boundary")
+        assert page_cap_warning["pages_included"] == block._telemetry.pages_included
+        assert page_cap_warning["pages_rendered"] == 3
+
+    async def test_untruncated_ocr_marks_no_truncation(self) -> None:
+        block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_handler(mp, AsyncMock(return_value={"extracted_text": "content"}))
+            await block._ocr_pdf_pages([b"page-1", b"page-2"])
+
+        assert block._telemetry.truncated is False
+        assert block._telemetry.limit is None
+        assert block._telemetry.truncation_source is None
+
     async def test_parse_pdf_file_routes_empty_text_to_per_page_ocr(self) -> None:
         """A scanned PDF (no extractable text layer) is routed through per-page OCR."""
         block = _make_file_parser_block("https://example.com/scan.pdf", FileType.PDF)
@@ -948,7 +1071,504 @@ class TestOcrPdfPages:
         assert "page A" in result and "page B" in result
 
 
-BLOCKING_PARSE_SECONDS = 0.3
+# digit d -> U+0111 + d, ':' -> U+0146, '.' -> U+0144
+_DIGIT_REMAP = {ord(str(digit)): 0x0111 + digit for digit in range(10)} | {ord(":"): 0x0146, ord("."): 0x0144}
+
+_INVOICE_LINES = (
+    "Mobile Manager Invoice",
+    "Account Number: 7249163085",
+    "Date: 17 Aug 26",
+    "Invoice Total: 1234.56 GBP",
+    "Billing Period: 01 Jul 26 to 31 Jul 26",
+    "Please remit payment using the reference above.",
+)
+
+# An itemised page is mostly digits, so the scrambled glyphs outnumber the English labels.
+_ITEMISED_INVOICE_LINES = _INVOICE_LINES + tuple(
+    f"07700 9000{index % 10:02d}  17 Aug 26  09:1{index % 10}  00:0{index % 6}:12  0.0{index % 9} GBP"
+    for index in range(40)
+)
+
+
+def _lzw_literals(data: bytes) -> bytes:
+    """LZW-encode ``data`` as bare 9-bit literals, clearing the table often enough that the code width never grows."""
+    codes = [code for index, byte in enumerate(data) for code in ((256, byte) if index % 100 == 0 else (byte,))]
+    bits = "".join(f"{code:09b}" for code in (*codes, 257))
+    bits += "0" * (-len(bits) % 8)
+    return int(bits, 2).to_bytes(len(bits) // 8, "big")
+
+
+def _run_length_literals(data: bytes) -> bytes:
+    """Run-length-encode ``data`` as literal runs only."""
+    runs = (data[start : start + 128] for start in range(0, len(data), 128))
+    return b"".join(bytes([len(run) - 1]) + run for run in runs) + b"\x80"
+
+
+def _build_pdf(
+    lines: tuple[str, ...],
+    remap: dict[int, int] | None = None,
+    font_entries: bytes = b"",
+    flate_content: bool = False,
+    lzw_content: bool = False,
+    run_length_content: bool = False,
+    gzip_content: bool = False,
+    jbig2_content: bool = False,
+    png_predictor: tuple[int, int] | None = None,
+    flate_xref_stream: bool = False,
+    content_copies: int = 1,
+    cid_widths: bytes | None = None,
+    cid_to_unicode_range: str | None = None,
+    cid_to_unicode_char: str | None = None,
+    content_length: int | None = None,
+) -> bytes:
+    """Build a one-page PDF that always draws plain ASCII codes, so ``remap`` alone makes the ToUnicode map lie.
+
+    The other options each shape one structure a limit test needs: Flate, LZW, run-length, gzip-wrapped Flate or JBIG2
+    content (at most one; gzip reaches pypdf's recovery loop, JBIG2 stays undecoded), a PNG predictor as
+    (Colors, Columns) on Flate content, a Flate xref stream, repeated /Contents, a CID font with its /W array and
+    ToUnicode bfrange or bfchar, and a replaced content /Length. Options that would silently override or ignore each
+    other raise ValueError.
+    """
+    if sum([flate_content, lzw_content, run_length_content, gzip_content, jbig2_content]) > 1:
+        raise ValueError("the content encodings are mutually exclusive")
+    if png_predictor is not None and not flate_content:
+        raise ValueError("png_predictor needs flate_content")
+    if cid_widths is not None and (remap or font_entries):
+        raise ValueError("remap and font_entries are ignored by a CID font, which defines its own ToUnicode")
+    if cid_widths is None and (cid_to_unicode_range is not None or cid_to_unicode_char is not None):
+        raise ValueError("cid_to_unicode_range and cid_to_unicode_char need cid_widths")
+    if cid_widths is None:
+        shown = "".join(f"({line}) Tj T*\n" for line in lines)
+    else:
+        shown = "".join("<" + "".join(f"{ord(char):04X}" for char in line) + "> Tj T*\n" for line in lines)
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + shown + "ET").encode()
+    content_filter = b""
+    if flate_content:
+        if png_predictor is not None:
+            colors, columns = png_predictor
+            row_length = colors * columns
+            content += b" " * (-len(content) % row_length)
+            content = b"".join(
+                b"\x00" + content[start : start + row_length] for start in range(0, len(content), row_length)
+            )
+            content_filter = b" /DecodeParms << /Predictor 12 /Colors %d /Columns %d >>" % (colors, columns)
+        content = zlib.compress(content)
+        content_filter += b" /Filter /FlateDecode"
+    elif gzip_content:
+        content = gzip.compress(content)
+        content_filter = b" /Filter /FlateDecode"
+    elif lzw_content:
+        content = _lzw_literals(content)
+        content_filter = b" /Filter /LZWDecode"
+    elif run_length_content:
+        content = _run_length_literals(content)
+        content_filter = b" /Filter /RunLengthDecode"
+    elif jbig2_content:
+        content_filter = b" /Filter /JBIG2Decode"
+    to_unicode: str | None = None
+    if remap:
+        entries = "\n".join(f"<{code:02X}> <{unicode_point:04X}>" for code, unicode_point in sorted(remap.items()))
+        to_unicode = (
+            f"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n{len(remap)} beginbfchar\n{entries}\nendbfchar\n"
+        )
+    if cid_widths is None:
+        font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica" + font_entries
+    else:
+        to_unicode = (
+            "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            f"1 beginbfrange\n{cid_to_unicode_range or '<0000> <00FF> <0000>'}\nendbfrange\n"
+        )
+        if cid_to_unicode_char:
+            to_unicode += f"1 beginbfchar\n{cid_to_unicode_char}\nendbfchar\n"
+        font = (
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /Helvetica /Encoding /Identity-H /DescendantFonts "
+            b"[<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica "
+            b"/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W %s >>]" % cid_widths
+        )
+    contents = b"5 0 R" if content_copies == 1 else b"[%s]" % b" ".join([b"5 0 R"] * content_copies)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents %s >>" % contents,
+        font + (b" /ToUnicode 6 0 R >>" if to_unicode else b" >>"),
+        b"<< /Length %d%s >>\nstream\n" % (len(content) if content_length is None else content_length, content_filter)
+        + content
+        + b"\nendstream",
+    ]
+    if to_unicode:
+        cmap = (
+            "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Broken def\n"
+            f"/CMapType 2 def\n{to_unicode}endcmap\n"
+            "CMapName currentdict /CMap defineresource pop\nend\nend"
+        ).encode()
+        objects.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, payload in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    xref_at = len(out)
+    if flate_xref_stream:
+        rows = struct.pack(">BIH", 0, 0, 65535)
+        rows += b"".join(struct.pack(">BIH", 1, offset, 0) for offset in (*offsets, xref_at))
+        xref_data = zlib.compress(rows)
+        out += b"%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /Length %d >>\n" % (
+            len(objects) + 1,
+            len(objects) + 2,
+            len(xref_data),
+        )
+        out += b"stream\n" + xref_data + b"\nendstream\nendobj\n"
+    else:
+        out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+        out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+        out += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
+    out += b"startxref\n%d\n%%%%EOF\n" % xref_at
+    return bytes(out)
+
+
+@pytest.mark.asyncio
+class TestScrambledTextLayerFallback:
+    """A text layer the embedded font has scrambled must reach OCR, not the extraction LLM.
+
+    Without this, every digit in the document arrives as an unrelated glyph and the
+    extraction LLM invents plausible values for dates and account numbers.
+    """
+
+    @staticmethod
+    def _patch_ocr(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="prompt"),
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.render_pdf_pages_as_images",
+            lambda *a, **kw: [b"page-1"],
+        )
+
+    async def test_remapped_digits_route_to_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_ITEMISED_INVOICE_LINES, remap=_DIGIT_REMAP))
+        # The real extractors run against the real broken font: no digit survives them.
+        text_layer = extract_pdf_file(str(pdf_path))
+        assert "17 Aug 26" not in text_layer and "7249163085" not in text_layer
+
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        assert handler.await_count == 1
+        assert "17 Aug 26" in result
+
+    async def test_readable_text_layer_is_returned_without_ocr(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        handler = AsyncMock(return_value={"extracted_text": "transcribed"})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        handler.assert_not_awaited()
+        assert "17 Aug 26" in result
+
+    async def test_force_ocr_skips_the_text_layer(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES))
+        block = _make_file_parser_block("https://example.com/invoice.pdf", FileType.PDF)
+        block.force_ocr = True
+        handler = AsyncMock(return_value={"extracted_text": "Date: 17 Aug 26"})
+        extract = MagicMock(return_value="text layer that must not be read")
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_ocr(mp, handler)
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.extract_pdf_file", extract)
+            result = await block._parse_pdf_file(str(pdf_path))
+
+        extract.assert_not_called()
+        assert result == "--- Page 1 ---\nDate: 17 Aug 26"
+
+
+class TestScrambledTextLayerDetection:
+    """Text layers that must stay trusted, so a real document is never re-read by OCR."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            pytest.param(
+                "Dear Sir or Madam,\nThank you for your continued business. Please find enclosed the "
+                "statement for your account.\nShould you have any questions, contact our support team.",
+                id="english_prose_without_digits",
+            ),
+            pytest.param(
+                "Faktura VAT nr 12/2026\nNabywca: Zakład Usług Łącznościowych\nKwota brutto: 1234,56 zł\n"
+                "Termin płatności: 17 sierpnia 2026\nDziękujemy za współpracę. Życzymy miłego dnia.",
+                id="polish_invoice",
+            ),
+            pytest.param(
+                "Zakład Usług Łącznościowych\nDziękujemy za współpracę i życzymy miłego dnia.\n"
+                "Prosimy o zapłatę należności w terminie wskazanym w umowie.\nPozdrawiamy serdecznie.",
+                id="polish_prose_without_digits",
+            ),
+            pytest.param(
+                "Děkujeme za vaši důvěru. Přejeme příjemný den.\nVáš účet byl úspěšně aktivován.\n"
+                "V případě dotazů se obraťte na naši zákaznickou linku.",
+                id="czech_prose_without_digits",
+            ),
+            pytest.param(
+                "Sayın müşterimiz, faturanız hazırlanmıştır. İlginiz için teşekkür ederiz.\n"
+                "Sorularınız için müşteri hizmetlerimize başvurabilirsiniz.",
+                id="turkish_prose_without_digits",
+            ),
+            pytest.param(
+                "Kính gửi quý khách hàng, hóa đơn của quý khách đã được lập và đã gửi tới địa chỉ đăng ký.\n"
+                "Để thanh toán, quý khách vui lòng chuyển khoản tới số tài khoản được ghi ở dưới.\n"
+                "Nếu quý khách đã thanh toán rồi thì xin vui lòng bỏ qua thông báo này.",
+                id="vietnamese_prose",
+            ),
+            pytest.param(
+                "Application for Service\n I confirm the details above are correct\n"
+                " I agree to the terms and conditions of supply\n"
+                " Please send my statements by email\n I am over 18 years of age\n"
+                " I would like marketing updates\n I have read the privacy notice\n"
+                " Direct debit\n Card payment\nSignature: ______  Date: 17 Aug 26",
+                id="icon_font_checkboxes",
+            ),
+            pytest.param("尊敬的客户，您的账单已经生成。请在到期日前付款。感谢您的支持。", id="chinese_prose"),
+            pytest.param("Уважаемый клиент, ваш счет сформирован. Оплатите до указанной даты.", id="russian_prose"),
+            pytest.param("Date: 17 Aug 26", id="too_short_to_judge"),
+        ],
+    )
+    def test_trustworthy_text_layers_are_not_flagged(self, text: str) -> None:
+        assert scrambled_text_layer_reason(text) is None
+
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            pytest.param(_INVOICE_LINES, id="label_heavy_header"),
+            # The real document is an itemised invoice. Its scrambled digits are Latin letters
+            # to str.isalpha, so counting them as the document's own script sank the ASCII share
+            # below the Latin-script floor and the page escaped every check.
+            pytest.param(_ITEMISED_INVOICE_LINES, id="page_of_call_rows"),
+        ],
+    )
+    def test_remapped_digits_are_flagged(self, lines: tuple[str, ...]) -> None:
+        scrambled = "\n".join(line.translate(_DIGIT_REMAP) for line in lines)
+        assert scrambled_text_layer_reason(scrambled) is not None
+
+
+@contextmanager
+def _fails_at_a_pypdf_limit() -> Iterator[None]:
+    """Expect the no-fallback error, raised from the pypdf error; a failed pdfplumber fallback raises with no cause."""
+    with pytest.raises(PDFParsingError) as excinfo:
+        yield
+    assert excinfo.value.__cause__ is not None
+
+
+class TestPypdfLimitFallback:
+    """Only pypdf's structural limits may fall back to pdfplumber, whose pdfminer has no decompressed-size limit."""
+
+    def test_decompression_limit_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, flate_content=True))
+
+        with apply_configuration(zlib_maximum_output_length=64), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    def test_lzw_limit_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, lzw_content=True))
+        assert "17 Aug 26" in PdfReader(str(pdf_path)).pages[0].extract_text()
+
+        with apply_configuration(lzw_maximum_output_length=64), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    def test_validation_fails_without_falling_back_when_the_xref_stream_hits_the_limit(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, flate_xref_stream=True))
+
+        with apply_configuration(zlib_maximum_output_length=16), _fails_at_a_pypdf_limit():
+            validate_pdf_file(str(pdf_path))
+
+    def test_content_array_over_the_cap_fails_without_falling_back(self, tmp_path: Path) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, content_copies=2))
+
+        # Each copy is under the cap; only the array's total is over it.
+        with apply_configuration(array_based_stream_maximum_output_length=400), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        "pdf_options",
+        [
+            pytest.param({"cid_widths": b"[0 65536 500]"}, id="cid_width_range"),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_range": "<000000> <0186A0> <000000>"},
+                id="to_unicode_range",
+            ),
+        ],
+    )
+    def test_range_pdfminer_would_expand_fails_without_falling_back(
+        self, tmp_path: Path, pdf_options: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        ("pdf_options", "limits"),
+        [
+            pytest.param({}, {"maximum_declared_stream_length": 100}, id="declared_stream_length"),
+            pytest.param(
+                {"content_length": -1}, {"maximum_declared_stream_length": 100}, id="stream_read_to_endstream"
+            ),
+            pytest.param(
+                {"content_length": 5}, {"maximum_declared_stream_length": 100}, id="stream_length_understated"
+            ),
+            pytest.param({}, {"page_tree_maximum_entries": 0}, id="page_tree_entries"),
+            pytest.param({}, {"array_maximum_element_count": 0}, id="array_elements"),
+            pytest.param({}, {"dictionary_maximum_element_count": 0}, id="dictionary_entries"),
+            pytest.param({}, {"stream_parsing_work_maximum_count": 0}, id="content_stream_tokens"),
+            pytest.param({"cid_widths": b"[0 65535 500 65536 131071 500]"}, {}, id="cid_width_entries"),
+            pytest.param({"gzip_content": True}, {"zlib_maximum_output_length": 64}, id="flate_recovery_output"),
+            pytest.param(
+                {"run_length_content": True}, {"run_length_maximum_output_length": 64}, id="run_length_output"
+            ),
+            # pdfminer sizes a buffer by Columns without any limit.
+            pytest.param(
+                {"flate_content": True, "png_predictor": (1, 17)}, {"flate_maximum_columns": 16}, id="predictor_columns"
+            ),
+            pytest.param(
+                {"flate_content": True, "png_predictor": (17, 1)},
+                {"flate_maximum_row_length": 16},
+                id="predictor_colors_over_row_limit",
+            ),
+            pytest.param(
+                {
+                    "cid_widths": b"[0 [500]]",
+                    "cid_to_unicode_range": "<000000000000000041> <000000000000000042> <0041>",
+                },
+                {},
+                id="to_unicode_code_length",
+            ),
+        ],
+    )
+    def test_other_size_cap_pdfminer_lacks_fails_without_falling_back(
+        self, tmp_path: Path, pdf_options: dict[str, Any], limits: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with apply_configuration(**limits), _fails_at_a_pypdf_limit():
+            extract_pdf_file(str(pdf_path))
+
+    @pytest.mark.parametrize(
+        ("pdf_options", "limits"),
+        [
+            pytest.param(
+                {"font_entries": b" /FirstChar 0 /LastChar 299 /Widths [%s]" % b" ".join([b"500"] * 300)},
+                {},
+                id="simple_font_with_300_widths",
+            ),
+            pytest.param({"cid_widths": b"[40 30 500]"}, {}, id="inverted_cid_width_range"),
+            pytest.param({"font_entries": b" /Extra " + b"0" * 100}, {}, id="oversized_number_token"),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_char": "<000000000000000041> <0041>"},
+                {},
+                id="oversized_bfchar_code",
+            ),
+            pytest.param(
+                {"cid_widths": b"[0 [500]]", "cid_to_unicode_char": "<0100> <" + "0041" * 300 + ">"},
+                {},
+                id="oversized_bfchar_string",
+            ),
+            pytest.param({}, {"page_tree_maximum_depth": 0}, id="page_tree_depth"),
+            pytest.param({"flate_content": True, "png_predictor": (17, 1)}, {}, id="predictor_colors"),
+            pytest.param(
+                {"flate_content": True, "png_predictor": (1, 17)},
+                {"flate_maximum_row_length": 16},
+                id="predictor_row_length",
+            ),
+        ],
+    )
+    def test_structural_limit_still_falls_back_to_pdfplumber(
+        self, tmp_path: Path, pdf_options: dict[str, Any], limits: dict[str, Any]
+    ) -> None:
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, **pdf_options))
+
+        with apply_configuration(**limits):
+            # pypdf re-raises a limit hit while reading a dictionary value as PdfReadError.
+            with pytest.raises((LimitReachedError, PdfReadError)):
+                PdfReader(str(pdf_path)).pages[0].extract_text()
+
+            assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+
+    def test_jbig2_buffer_limit_still_falls_back_to_pdfplumber(self, tmp_path: Path) -> None:
+        # pdfminer passes a JBIG2 stream through undecoded, so only pypdf's jbig2dec call can hit the limit.
+        jbig2dec = tmp_path / "jbig2dec"
+        jbig2dec.write_text("#!/bin/sh\necho 'FATAL ERROR failed to allocate image data buffer' >&2\nexit 1\n")
+        jbig2dec.chmod(0o755)
+        pdf_path = tmp_path / "invoice.pdf"
+        pdf_path.write_bytes(_build_pdf(_INVOICE_LINES, jbig2_content=True))
+
+        with apply_configuration(jbig2dec_binary=str(jbig2dec)):
+            with pytest.raises((LimitReachedError, PdfReadError)):
+                PdfReader(str(pdf_path)).pages[0].extract_text()
+
+            assert "17 Aug 26" in extract_pdf_file(str(pdf_path))
+
+
+class TestForceOcrOnTheCachedScriptPath:
+    """A cached run must honor force OCR, or the fix only holds while the block runs via the agent."""
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_carries_force_ocr(self) -> None:
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(script_service, "_render_template_with_label", lambda template, label=None: template),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/invoice.pdf",
+                file_type=FileType.PDF,
+                label="parse_invoice",
+                force_ocr=True,
+            )
+
+        (block,) = built
+        assert block.force_ocr is True
+
+    def test_generated_script_carries_force_ocr(self) -> None:
+        base = {"file_url": "https://example.com/invoice.pdf", "file_type": "pdf", "label": "parse_invoice"}
+        module = cst.Module([])
+
+        with_force_ocr = module.code_for_node(_build_file_url_parser_statement({**base, "force_ocr": True}))
+        without_force_ocr = module.code_for_node(_build_file_url_parser_statement(base))
+
+        assert "force_ocr = True" in with_force_ocr
+        assert "force_ocr" not in without_force_ocr
+
+
+BLOCKING_PARSE_SECONDS = 0.1
 TICK_INTERVAL_SECONDS = 0.01
 
 
@@ -1038,6 +1658,20 @@ class TestParsingDoesNotBlockEventLoop:
             text, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
 
         assert text == "extracted text"
+        assert ticks > 0
+
+    async def test_text_layer_scramble_check_yields_to_event_loop(self) -> None:
+        """The check walks every character of a text layer that can reach a million of them."""
+        block = _make_file_parser_block("https://example.com/large.pdf", FileType.PDF)
+        text_layer = "Account Number: 7249163085 Date: 17 Aug 26 Please remit payment.\n" * 20_000
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file",
+                lambda *a, **kw: text_layer,
+            )
+            _, ticks = await _count_event_loop_ticks_during(block._parse_pdf_file("/tmp/large.pdf"))
+
         assert ticks > 0
 
     async def test_docx_parse_yields_to_event_loop(self) -> None:
@@ -1146,6 +1780,245 @@ class TestParsingDoesNotBlockEventLoop:
         assert ticks > 0
 
 
+def _build_inflating_pdf(inflated_mib: int) -> bytes:
+    """One text page, no xref table, and an object stream inflating to inflated_mib MiB of zeros.
+    Past pypdf's 75 MB decompression limit pypdf cannot find the catalog, so the pdfplumber fallback gets the file."""
+    compressor = zlib.compressobj(9)
+    zeros = b"\x00" * (16 << 20)
+    stream = compressor.compress(b"10 0 ") + b"".join(compressor.compress(zeros) for _ in range(inflated_mib // 16))
+    stream += compressor.flush()
+    content = b"BT /F1 12 Tf 72 720 Td (Invoice Total 1234.56 GBP) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> "
+        b"/Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+        b"<< /Type /ObjStm /N 1 /First 5 /Filter /FlateDecode /Length %d >>\nstream\n" % len(stream)
+        + stream
+        + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.7\n")
+    for number, payload in enumerate(objects, start=1):
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, len(out))
+    return bytes(out)
+
+
+def _build_letter_pdf(pages: int, lines: tuple[str, ...] = _INVOICE_LINES) -> bytes:
+    """A Letter-size PDF with the same few lines of text on each page."""
+    content = ("BT /F1 12 Tf 72 720 Td 16 TL\n" + "".join(f"({line}) Tj T*\n" for line in lines) + "ET").encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(b"%d 0 R" % (5 + i) for i in range(pages)), pages),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    objects += [
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>"
+    ] * pages
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, payload in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + payload + b"\nendobj\n"
+    xref_at = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1) + b"0000000000 65535 f \n"
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref_at)
+    return bytes(out)
+
+
+class _RejectingPdfReader:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise ValueError("pypdf rejected the file")
+
+
+@pytest.fixture(scope="module")
+def inflating_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("inflating") / "inflating.pdf"
+    path.write_bytes(_build_inflating_pdf(128))
+    return path
+
+
+class TestPdfplumberFallbackIsContained:
+    """pdfplumber's parser has no decoded-size limit, so a hostile PDF must fail alone, not OOM-kill the pod."""
+
+    def test_fallback_that_outlives_the_parse_budget_fails_the_pdf(
+        self, inflating_pdf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pdf_parser_module, "FILE_PARSE_STEP_TIMEOUT_SECONDS", 1)
+
+        with pytest.raises(PDFParsingError, match="did not finish within 1 second"):
+            extract_pdf_file(str(inflating_pdf))
+
+    @pytest.mark.skipif(
+        not MEMORY_CAP_ENFORCED, reason="only Linux enforces RLIMIT_AS; elsewhere the child is uncapped"
+    )
+    def test_fallback_that_outgrows_its_memory_cap_fails_the_pdf(
+        self, inflating_pdf: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", 16 * 1024 * 1024)
+
+        with pytest.raises(PDFParsingError, match="ran out of memory"):
+            extract_pdf_file(str(inflating_pdf))
+
+    def test_words_past_the_word_cap_fail_the_lookup_instead_of_filling_the_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every glyph here is its own word, so a small file decodes to many times its pickled size in the parent."""
+        crowded_pdf = tmp_path / "crowded.pdf"
+        crowded_pdf.write_bytes(_build_letter_pdf(1, ("a " * 30,) * 20))
+        monkeypatch.setattr(pdf_parser_module, "_UPRIGHT_WORDS_RESULT", pdf_parser_module._ResultLimit(16 * 1024, 6))
+
+        with pytest.raises(CappedSubprocessError) as excinfo:
+            extract_upright_pdf_words(str(crowded_pdf), {0})
+
+        assert excinfo.value.kind == "result_too_large"
+
+    def test_fallback_in_a_pod_without_free_memory_fails_the_pdf_before_parsing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cgroup = tmp_path / "cgroup"
+        cgroup.mkdir()
+        (cgroup / "memory.max").write_text(str(6144 * 1024 * 1024))
+        (cgroup / "memory.current").write_text(str(6000 * 1024 * 1024))
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(1))
+        monkeypatch.setattr(capped_subprocess_module, "MEMORY_CAP_ENFORCED", True)
+        monkeypatch.setattr(capped_subprocess_module, "CGROUP_DIR", str(cgroup))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        with pytest.raises(PDFParsingError, match="not enough free memory"):
+            extract_pdf_file(str(letter_pdf))
+
+    def test_page_images_past_the_result_cap_fail_the_render(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(3))
+        monkeypatch.setattr(settings, "PDFPLUMBER_MAX_RESULT_BYTES", 16 * 1024)
+
+        with pytest.raises(CappedSubprocessError, match="limit on page images"):
+            render_pdf_pages_as_images(str(letter_pdf))
+
+    @pytest.mark.skipif(
+        not MEMORY_CAP_ENFORCED, reason="only Linux enforces RLIMIT_AS; elsewhere the child is uncapped"
+    )
+    @pytest.mark.parametrize(
+        ("memory_ceiling", "letter_pages"),
+        [
+            pytest.param(None, 10, id="default ceiling"),
+            pytest.param(MIN_MEMORY_BUDGET_BYTES, 1, id="budget floor"),
+        ],
+    )
+    def test_ordinary_pdfs_fit_the_memory_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, memory_ceiling: int | None, letter_pages: int
+    ) -> None:
+        if memory_ceiling is not None:
+            monkeypatch.setattr(settings, "PDFPLUMBER_MAX_MEMORY_BYTES", memory_ceiling)
+        text_pdf = tmp_path / "invoice.pdf"
+        text_pdf.write_bytes(_build_pdf(_ITEMISED_INVOICE_LINES))
+        letter_pdf = tmp_path / "letter.pdf"
+        letter_pdf.write_bytes(_build_letter_pdf(letter_pages))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(text_pdf))
+            images = render_pdf_pages_as_images(str(letter_pdf))
+
+        assert "Invoice Total: 1234.56 GBP" in text
+        assert len(images) == letter_pages and all(image.startswith(b"\x89PNG") for image in images)
+        finished = {
+            log["target"].rpartition(".")[2]: log for log in logs if log["event"] == "Capped subprocess finished"
+        }
+        assert set(finished) == {"page_texts", "page_images"}
+        for log in finished.values():
+            assert log["memory_budget_bytes"] <= (memory_ceiling or settings.PDFPLUMBER_MAX_MEMORY_BYTES)
+            assert 0 <= log["rss_growth_sampled_bytes"] < log["memory_budget_bytes"]
+
+
+class TestPdfplumberFallbackTokenLimit:
+    def test_pages_the_character_stop_skipped_are_still_read_up_to_the_token_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A long run of one symbol is a few tokens, so the first pass stops at its character limit with the token
+        cap not yet reached and the pages that fit must be read in a second pass."""
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(3, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+
+        text = extract_pdf_file(str(symbols_pdf), max_tokens=14)
+
+        # Each page is 3 lines and 6 tokens: two pages fit under 14 tokens, the third does not.
+        assert text.count("=" * 60) == 6
+
+    def test_text_past_the_character_limit_is_cut_at_a_page_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_CHAR_LIMIT", 500)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
+
+        # Pages are 182 characters, so the read goes on to the third page, which takes it past 500.
+        assert text.count("=" * 60) == 9
+        assert any("exceeds the size limit" in log["event"] for log in logs)
+
+    def test_a_second_pass_that_fails_keeps_the_pages_the_first_pass_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        run_in_capped_subprocess = pdf_parser_module.run_in_capped_subprocess
+        passes: list[int] = []
+
+        def time_out_on_the_second_pass(*args: Any, **kwargs: Any) -> Any:
+            passes.append(1)
+            if len(passes) == 2:
+                raise CappedSubprocessError("did not finish within 1 second and was stopped", kind="timeout")
+            return run_in_capped_subprocess(*args, **kwargs)
+
+        monkeypatch.setattr(pdf_parser_module, "run_in_capped_subprocess", time_out_on_the_second_pass)
+
+        with structlog.testing.capture_logs() as logs:
+            text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
+
+        assert text.count("=" * 60) == 6
+        (warning,) = (log for log in logs if "failed, keeping the pages already read" in log["event"])
+        assert warning["failure"] == "timeout"
+
+    def test_the_page_that_crosses_the_result_cap_is_cut_instead_of_failing_the_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(2048, 6))
+
+        text = extract_pdf_file(str(symbols_pdf), max_tokens=0)
+
+        # The child keeps 1024 of the 2048 bytes for the text and counts 198 for each page, so the sixth is cut.
+        assert text.count("=" * 60) == 15
+
+    def test_a_first_page_that_does_not_fit_the_result_cap_fails_the_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        symbols_pdf = tmp_path / "symbols.pdf"
+        symbols_pdf.write_bytes(_build_letter_pdf(2, ("=" * 60,) * 3))
+        monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
+        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(300, 6))
+
+        with pytest.raises(PDFParsingError, match="a result may hold"):
+            extract_pdf_file(str(symbols_pdf), max_tokens=0)
+
+
 @pytest.mark.asyncio
 class TestParseStepTimeout:
     """A pathological document must fail its own block instead of consuming the whole run."""
@@ -1195,6 +2068,62 @@ class TestParseStepTimeout:
         assert captured["error_codes"] == ["FILE_PARSER_ERROR"]
         assert "timed out" in captured["failure_reason"].lower()
 
+    @pytest.mark.parametrize(
+        ("handler_error", "expected_reason"),
+        [
+            (None, "did not answer within"),
+            (TimeoutError("gateway gave up on the request"), "gateway gave up on the request"),
+        ],
+        ids=["stalled_model_hits_the_deadline", "handler_timeout_keeps_its_own_cause"],
+    )
+    async def test_stalled_extraction_model_fails_the_block_at_the_deadline(
+        self, handler_error: Exception | None, expected_reason: str
+    ) -> None:
+        """A provider that never answers fails the block at the deadline instead of holding the run's slot."""
+        block = _make_file_parser_block("https://example.com/resume.pdf", FileType.PDF)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        mock_ctx = _mock_workflow_run_context()
+
+        async def stalled_handler(**kwargs: Any) -> Any:
+            if handler_error is not None:
+                raise handler_error
+            await asyncio.Event().wait()
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(FileParserBlock, "get_workflow_run_context", lambda *a, **kw: mock_ctx)
+            mp.setattr(FileParserBlock, "format_potential_template_parameters", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file",
+                AsyncMock(return_value="/tmp/resume.pdf"),
+            )
+            mp.setattr(FileParserBlock, "validate_file_type", lambda *a, **kw: None)
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.extract_pdf_file", lambda *a, **kw: "Jane Doe, engineer"
+            )
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: stalled_handler,
+            )
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.FILE_PARSER_LLM_CALL_TIMEOUT_SECONDS", 0.05)
+            mp.setattr(FileParserBlock, "record_output_parameter_value", AsyncMock())
+
+            captured: dict[str, Any] = {}
+
+            async def fake_build_block_result(*args: Any, **kwargs: Any) -> Any:
+                captured.update(kwargs)
+                return MagicMock(success=kwargs.get("success"))
+
+            mp.setattr(FileParserBlock, "build_block_result", fake_build_block_result)
+
+            # The outer bound turns a missing deadline into a failure rather than a hung test run.
+            result = await asyncio.wait_for(
+                block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="org_test"),
+                timeout=10,
+            )
+
+        assert result.success is False
+        assert expected_reason in captured["failure_reason"]
+
     async def test_validation_timeout_fails_the_block(self) -> None:
         block = _make_file_parser_block("https://example.com/huge.pdf", FileType.PDF)
         mock_ctx = _mock_workflow_run_context()
@@ -1225,3 +2154,1366 @@ class TestParseStepTimeout:
         assert result.success is False
         assert "timed out" in captured["failure_reason"].lower()
         assert "file type validation" in captured["failure_reason"]
+
+
+FAILURE_EVENT = "FileParserBlock failed"
+COMPLETED_EVENT = "FileParserBlock parse completed"
+SCHEMA_FAILED_EVENT = "FileParserBlock extraction LLM response failed schema validation"
+SCHEMA_SUCCEEDED_EVENT = "FileParserBlock schema validation succeeded"
+CSV_FALLBACK_EVENT = "FileParserBlock fell back to CSV for unrecognized content"
+
+
+def _events(logs: list[dict[str, Any]], event: str) -> list[dict[str, Any]]:
+    return [log for log in logs if log.get("event") == event]
+
+
+def _assert_no_content_in_fields(log: dict[str, Any], forbidden: tuple[str, ...]) -> None:
+    for key, value in log.items():
+        if key in ("event", "log_level"):
+            continue
+        rendered = json.dumps(value, default=str)
+        for needle in forbidden:
+            assert needle not in rendered, f"{needle!r} leaked into log field {key!r}"
+
+
+@pytest.mark.asyncio
+class TestFileParserTelemetryLogs:
+    """Field-name contracts for the countable parser log lines (SKY-15828)."""
+
+    @staticmethod
+    def _patch_extraction(mp: pytest.MonkeyPatch, handler: AsyncMock) -> None:
+        # A real key, so `llm_key` assertions discriminate: an AsyncMock's auto-attribute is not a
+        # str, so `handler_llm_key` would return None and a null assertion would prove nothing.
+        handler.llm_key = "test-llm-key"
+        mp.setattr(FileParserBlock, "_resolve_file_parser_handler", AsyncMock(return_value=handler))
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+            lambda *a, **kw: handler,
+        )
+        mp.setattr(
+            "skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt",
+            MagicMock(return_value="base prompt"),
+        )
+
+    async def test_failure_log_carries_url_free_family_and_run_ids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x0cplain text with a null byte\x00")
+        block = _make_file_parser_block("https://example.com/private/download?token=abc123", FileType.AUTO_DETECT)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        (failure_log,) = _events(logs, FAILURE_EVENT)
+        assert {
+            "failure_family",
+            "error_codes",
+            "configured_file_type",
+            "file_type_detected",
+            "detection_source",
+            "workflow_run_id",
+            "workflow_run_block_id",
+            "workflow_permanent_id",
+            "organization_id",
+        } <= failure_log.keys()
+        assert failure_log["error_codes"] == ["FILE_PARSER_ERROR"]
+        assert failure_log["workflow_run_id"] == "wr_test"
+        assert failure_log["detection_source"] == "fallback"
+        assert len(failure_log["failure_family"]) <= 60
+        assert failure_log["failure_family"].startswith("Failed to download or validate file: ")
+        _assert_no_content_in_fields(failure_log, ("example.com", "token=abc123", "plain text"))
+        assert not _events(logs, COMPLETED_EVENT)
+
+    async def test_parse_completed_log_fields_without_schema(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\nAlice,Paris\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert {
+            "configured_file_type",
+            "file_type_detected",
+            "detection_source",
+            "content_tokens",
+            "content_tokens_sent",
+            "truncated",
+            "truncation_source",
+            "limit",
+            "pages_included",
+            "total_pages",
+            "tokens_included",
+            "token_limit",
+            "had_schema",
+            "extraction_attempts",
+            "llm_key",
+            "workflow_run_id",
+            "workflow_run_block_id",
+            "organization_id",
+        } <= completed.keys()
+        assert completed["file_type_detected"] == FileType.CSV
+        assert completed["configured_file_type"] == FileType.AUTO_DETECT
+        assert completed["detection_source"] == "extension"
+        assert completed["had_schema"] is False
+        assert completed["extraction_attempts"] == 0
+        assert completed["truncated"] is False
+        assert completed["truncation_source"] is None
+        assert completed["content_tokens"] is None
+        assert not _events(logs, FAILURE_EVENT)
+        _assert_no_content_in_fields(completed, ("example.com", "Alice", "Paris"))
+
+    async def test_explicit_file_type_is_reported_as_explicit_detection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_docx(tmp_path / "downloaded", paragraphs=["Hello"])
+        block = _make_file_parser_block("https://example.com/download?id=1", FileType.DOCX)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["file_type_detected"] == FileType.DOCX
+        assert completed["detection_source"] == "explicit"
+
+    async def test_parse_completed_with_schema_reports_attempts_tokens_and_truncation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\n" + "\n".join(f"person{i},city{i}" for i in range(200)) + "\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        monkeypatch.setattr(block_module, "MAX_FILE_PARSE_INPUT_TOKENS", 50)
+        handler = AsyncMock(side_effect=[{"name": None}, {"name": "person0"}])
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, handler)
+            with structlog.testing.capture_logs() as logs:
+                result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["had_schema"] is True
+        assert completed["extraction_attempts"] == 2
+        assert completed["truncated"] is True
+        assert completed["truncation_source"] == "platform_cap"
+        assert completed["content_tokens"] > 50
+        assert completed["content_tokens_sent"] == 50
+        assert completed["tokens_included"] == 50
+        assert completed["token_limit"] == 50
+        assert completed["pages_included"] is None
+
+        (warning,) = _events(logs, SCHEMA_FAILED_EVENT)
+        assert warning["failure_class"] == "null_for_non_nullable"
+        assert warning["content_truncated"] is True
+        assert warning["attempt"] == 1
+
+        (succeeded,) = _events(logs, SCHEMA_SUCCEEDED_EVENT)
+        assert {
+            "attempt",
+            "schema_sha256",
+            "recovered_from_failure_class",
+            "llm_key",
+            "response_root_type",
+            "content_truncated",
+        } <= succeeded.keys()
+        assert succeeded["attempt"] == 2
+        assert succeeded["recovered_from_failure_class"] == "null_for_non_nullable"
+        # A null here is indistinguishable from a handler that exposes no key, so pin the value.
+        assert completed["llm_key"] == "test-llm-key"
+        assert succeeded["llm_key"] == "test-llm-key"
+        assert succeeded["response_root_type"] == "object"
+        _assert_no_content_in_fields(completed, ("person0", "city0"))
+        _assert_no_content_in_fields(succeeded, ("person0", "city0"))
+
+    async def test_schema_warning_classifies_required_not_in_properties_without_values(self) -> None:
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = {
+            "type": "object",
+            "required": ["date_issued", "account_number"],
+            "properties": {"account_number_extracted": {"type": "string"}},
+        }
+        secret_value = "customer-private-value-9f8e7d"
+        handler = AsyncMock(return_value={"account_number_extracted": secret_value})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, handler)
+            with structlog.testing.capture_logs() as logs:
+                with pytest.raises(ValueError, match="does not match file parser JSON schema"):
+                    await block._extract_with_ai("name\nAlice", MagicMock())
+
+        warnings = _events(logs, SCHEMA_FAILED_EVENT)
+        assert [w["attempt"] for w in warnings] == [1, 2]
+        for warning in warnings:
+            assert {
+                "failure_class",
+                "schema_sha256",
+                "required_count",
+                "properties_count",
+                "response_root_type",
+                "response_top_level_keys",
+                "llm_key",
+                "content_truncated",
+                "content_tokens",
+                "attempt",
+                "will_retry",
+            } <= warning.keys()
+            assert warning["failure_class"] == "required_not_in_properties"
+            assert warning["llm_key"] == "test-llm-key"
+            assert warning["required_count"] == 2
+            assert warning["properties_count"] == 1
+            assert warning["response_root_type"] == "object"
+            assert warning["response_top_level_keys"] == ["account_number_extracted"]
+            assert warning["unexpected_key_count"] == 0
+            assert warning["undeclared_required_count"] == 2
+            assert re.fullmatch(r"[0-9a-f]{64}", warning["schema_sha256"])
+            assert warning["content_truncated"] is False
+            _assert_no_content_in_fields(warning, (secret_value, "Alice"))
+        assert not _events(logs, SCHEMA_SUCCEEDED_EVENT)
+
+    async def test_truncated_run_emits_the_truncation_fields_on_the_log_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A truncated run must SAY it was truncated, on the line Datadog actually receives.
+
+        REBASE TRIPWIRE (D21). The three `mark_platform_cap` call sites are the same three hunks
+        SKY-15830 rewrites: the OCR token cap, the DOCX cap, and `_bound_extraction_input_tokens`.
+        A "keep mine" conflict resolution drops the wiring, and `parse completed` then reports
+        `truncated=false` with null truncation fields on every truncated run -- the exact inverse
+        of what both PRs exist to produce, invisible to either suite. Asserting on the emitted log
+        line rather than on `_telemetry` is what makes that severed wiring fail here.
+        """
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\n" + "\n".join(f"person{i},city{i}" for i in range(200)) + "\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+        block.json_schema = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        monkeypatch.setattr(block_module, "MAX_FILE_PARSE_INPUT_TOKENS", 50)
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, AsyncMock(return_value={"name": "person0"}))
+            with structlog.testing.capture_logs() as logs:
+                result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["truncated"] is True
+        assert completed["truncation_source"] == "platform_cap"
+        # `limit` is D3-amend item 5's canonical name: SKY-15830 keys on it and QA groups by it.
+        assert completed["limit"] == "token_limit"
+        assert completed["tokens_included"] == 50
+        assert completed["token_limit"] == 50
+
+    async def test_a_limit_value_this_pr_never_emits_still_reaches_the_log_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`ocr_page_failure` arrives with SKY-15830, so nothing here emits it yet.
+
+        It is asserted through the real log path anyway: if the value is dropped from
+        `TruncationLimit` at that rebase, or the telemetry stops reaching `parse completed`,
+        this fails rather than the value silently never appearing on a dashboard.
+        """
+        path = tmp_path / "data.csv"
+        path.write_text("name,city\nAlice,Paris\n")
+        block = _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT)
+
+        async def parse_and_mark(self: FileParserBlock, file_path: str) -> str:
+            self._telemetry.mark_platform_cap(
+                limit="ocr_page_failure", tokens_included=7, token_limit=99, pages_included=3
+            )
+            return "name,city\nAlice,Paris\n"
+
+        monkeypatch.setattr(FileParserBlock, "_parse_csv_file", parse_and_mark)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["limit"] == "ocr_page_failure"
+        assert completed["truncation_source"] == "platform_cap"
+        assert completed["truncated"] is True
+        assert completed["pages_included"] == 3
+
+    async def test_both_parser_lines_carry_the_file_type_join_fields(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The join between failures and completions is these two names on both lines (F7).
+
+        A query that counts fallback share or failure rate by file type reads them off whichever
+        line fired, so a null on either side silently drops that run from the denominator.
+        """
+        good = tmp_path / "data.csv"
+        good.write_text("name,city\nAlice,Paris\n")
+        bad = tmp_path / "downloaded"
+        bad.write_bytes(b"\x0cplain text with a null byte\x00")
+
+        with structlog.testing.capture_logs() as logs:
+            ok = await _execute_with_downloaded_file(
+                _make_file_parser_block("https://example.com/export/data.csv", FileType.AUTO_DETECT),
+                good,
+                monkeypatch,
+            )
+        (completed,) = _events(logs, COMPLETED_EVENT)
+
+        with structlog.testing.capture_logs() as logs:
+            failed_result = await _execute_with_downloaded_file(
+                _make_file_parser_block("https://example.com/private/download", FileType.AUTO_DETECT),
+                bad,
+                monkeypatch,
+            )
+        (failure,) = _events(logs, FAILURE_EVENT)
+
+        assert ok.success is True and failed_result.success is False
+        assert completed["configured_file_type"] == FileType.AUTO_DETECT
+        assert completed["file_type_detected"] == FileType.CSV
+        assert failure["configured_file_type"] == FileType.AUTO_DETECT
+        assert failure["file_type_detected"] == FileType.CSV
+
+    async def _warning_for_schema(self, schema: dict[str, Any], response: Any) -> dict[str, Any]:
+        """Drive the real extraction path and return the schema-validation WARNING it emitted."""
+        block = _make_file_parser_block("https://example.com/data.csv", FileType.CSV)
+        block.json_schema = schema
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, AsyncMock(return_value=response))
+            with structlog.testing.capture_logs() as logs, pytest.raises(ValueError):
+                await block._extract_with_ai("name\nAlice", MagicMock())
+        warnings = _events(logs, SCHEMA_FAILED_EVENT)
+        assert warnings
+        return warnings[0]
+
+    async def test_the_emitted_schema_sha256_discriminates_between_schemas(self) -> None:
+        """Asserting the hash function discriminates does not prove the FIELD does.
+
+        A constant substituted at the call site leaves the function untouched and satisfies the
+        hex-shape assertion, so the value that reaches Datadog has to be compared across schemas.
+        """
+        one = await self._warning_for_schema(
+            {"type": "object", "required": ["alpha"], "properties": {"other": {}}}, {"other": 1}
+        )
+        another = await self._warning_for_schema(
+            {"type": "object", "required": ["beta"], "properties": {"other": {}}}, {"other": 1}
+        )
+        assert one["schema_sha256"] != another["schema_sha256"]
+
+    async def test_an_unreadable_schema_emits_null_counts_not_zero(self) -> None:
+        """The honest-null half of the resolver, asserted on the fields that carry it.
+
+        A dangling local reference passes `validate_schema`, so this reaches the real logging path.
+        Zero here would be indistinguishable from a schema that genuinely declares nothing --
+        the false zero the resolver exists to remove, on the fields it was added for.
+        """
+        warning = await self._warning_for_schema({"$ref": "#/$defs/Missing", "$defs": {}}, {"a": 1})
+
+        assert warning["required_count"] is None
+        assert warning["properties_count"] is None
+        # The same line must not claim the schema was readable for the response-key fields.
+        assert warning["response_top_level_keys"] is None
+        assert warning["unexpected_key_count"] is None
+
+    async def test_a_readable_schema_declaring_nothing_still_emits_zero(self) -> None:
+        """Null means "not measured"; a schema that really declares nothing must still say zero."""
+        warning = await self._warning_for_schema({"type": "object", "required": ["a"]}, {})
+
+        assert warning["required_count"] == 1
+        assert warning["properties_count"] == 0
+        assert warning["response_top_level_keys"] == []
+        assert warning["unexpected_key_count"] == 0
+
+    async def test_schema_warning_leaks_neither_response_keys_nor_signing_material(self) -> None:
+        """This line fires only when the model ignored the schema, i.e. when its keys came from the file."""
+        block = _make_file_parser_block(
+            "https://artifacts.example.com/org/run/file.pdf?sig=deadbeef&expiry=1788800400", FileType.CSV
+        )
+        block.json_schema = {"type": "object", "properties": {"rows": {"type": "array"}}, "required": ["rows"]}
+        leaked_person = "Jane Q Doe (SSN 123-45-6789)"
+        leaked_account = "acct 4111111111111111"
+        handler = AsyncMock(return_value={leaked_person: 1, leaked_account: 2})
+
+        with pytest.MonkeyPatch.context() as mp:
+            self._patch_extraction(mp, handler)
+            with structlog.testing.capture_logs() as logs:
+                with pytest.raises(ValueError, match="does not match file parser JSON schema"):
+                    await block._extract_with_ai("name\nAlice", MagicMock())
+
+        warnings = _events(logs, SCHEMA_FAILED_EVENT)
+        assert warnings
+        for warning in warnings:
+            assert warning["response_top_level_keys"] == []
+            assert warning["unexpected_key_count"] == 2
+            assert warning["file_url"] == "https://artifacts.example.com/org/run/file.pdf"
+            _assert_no_content_in_fields(warning, (leaked_person, "123-45-6789", "4111111111111111", "sig=", "expiry="))
+
+    async def test_docx_truncation_sets_truncated_flag(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = _create_docx(tmp_path / "downloaded.docx", paragraphs=["word " * 200, "more words " * 200])
+        block = _make_file_parser_block("https://example.com/report.docx", FileType.AUTO_DETECT)
+
+        async def parse_with_small_budget(self: FileParserBlock, file_path: str) -> str:
+            return self._parse_docx_file_sync(file_path, max_tokens=50)
+
+        monkeypatch.setattr(FileParserBlock, "_parse_docx_file", parse_with_small_budget)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (completed,) = _events(logs, COMPLETED_EVENT)
+        assert completed["truncated"] is True
+        assert completed["truncation_source"] == "platform_cap"
+        assert completed["token_limit"] == 50
+        assert 0 <= completed["tokens_included"] <= 50  # first paragraph alone exceeds the budget
+        assert completed["had_schema"] is False
+
+
+class TestClassifySchemaValidationFailure:
+    """Contract for failure_class; eng-schema-fix keys its no-retry decision on these values (SKY-15829)."""
+
+    @pytest.mark.parametrize(
+        ("schema", "response", "expected"),
+        [
+            (
+                {"type": "object", "required": ["a", "b"], "properties": {"c": {"type": "string"}}},
+                {"c": "x"},
+                "required_not_in_properties",
+            ),
+            (
+                {"type": "array", "items": {"type": "object", "required": ["n"], "properties": {"z": {}}}},
+                [{"z": 1}],
+                "required_not_in_properties",
+            ),
+            (
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+                {},
+                "missing_required_defined",
+            ),
+            (
+                {"type": "object", "required": ["a", "b"], "properties": {"b": {"type": "string"}}},
+                {},
+                "missing_required_defined",
+            ),
+            (
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+                {"a": None},
+                "null_for_non_nullable",
+            ),
+            (
+                {"type": "object", "properties": {"rows": {"type": "array", "items": {"type": "string"}}}},
+                {"rows": [None, None]},
+                "null_for_non_nullable",
+            ),
+            (
+                {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+                {"a": 5},
+                "type_mismatch_other",
+            ),
+            (
+                {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},
+                {"a": None, "b": 5},
+                "type_mismatch_other",
+            ),
+            (
+                {"type": "object", "additionalProperties": False, "properties": {"a": {"type": "string"}}},
+                {"a": "ok", "extra": 1},
+                "type_mismatch_other",
+            ),
+        ],
+    )
+    def test_classes(self, schema: dict[str, Any], response: Any, expected: str) -> None:
+        failure = block_module._validate_response_against_json_schema(response, schema, "File parser")
+        assert failure is not None
+        assert block_module._classify_schema_validation_failure(failure, response, schema) == expected
+
+    def test_schema_configuration_failures_are_schema_invalid(self) -> None:
+        schema = {"type": "object"}
+        assert (
+            block_module._classify_schema_validation_failure("File parser JSON schema is invalid.", {}, schema)
+            == "schema_invalid"
+        )
+        assert (
+            block_module._classify_schema_validation_failure(
+                "File parser JSON schema validation failed (TypeError).", {}, schema
+            )
+            == "schema_invalid"
+        )
+
+    def test_undeclared_required_count_survives_a_mixed_failure(self) -> None:
+        """The same broken schema falls into either required bucket depending on what the model returned.
+
+        `failure_class` must keep the strict rule eng-schema-fix's customer-visible message keys on
+        (D4-text-amend), so the undeclared family is sized by its own field instead.
+        """
+        schema = {
+            "type": "object",
+            "required": ["date_issued", "vendor"],
+            "properties": {"vendor": {"type": "string"}},
+        }
+        omitted_everything: dict[str, Any] = {}
+        returned_the_declared_key = {"vendor": "v"}
+
+        for response, expected_class in (
+            (omitted_everything, "missing_required_defined"),
+            (returned_the_declared_key, "required_not_in_properties"),
+        ):
+            failure = block_module._validate_response_against_json_schema(response, schema, "File parser")
+            assert failure is not None
+            facts = block_module._schema_validation_facts(failure, response, schema)
+            assert facts["failure_class"] == expected_class
+            # Same defective schema, same one undeclared required key, either way.
+            assert facts["undeclared_required_count"] == 1
+
+    def test_a_slash_in_a_property_name_does_not_collapse_two_violations(self) -> None:
+        """A property named "a/b" and the nested path a -> b flatten to the same string.
+
+        Both omitting the same undeclared key would dedupe to one, silently under-reporting the
+        count that sizes this family.
+        """
+        schema = {
+            "type": "object",
+            "required": ["a/b", "a"],
+            "properties": {
+                "a/b": {"type": "object", "required": ["x"], "properties": {}},
+                "a": {"type": "object", "properties": {"b": {"type": "object", "required": ["x"], "properties": {}}}},
+            },
+        }
+        response = {"a/b": {}, "a": {"b": {}}}
+        failure = block_module._validate_response_against_json_schema(response, schema, "File parser")
+        assert failure is not None
+
+        facts = block_module._schema_validation_facts(failure, response, schema)
+
+        assert facts["undeclared_required_count"] == 2
+
+    def test_undeclared_required_count_is_none_when_the_class_is_schema_invalid(self) -> None:
+        facts = block_module._schema_validation_facts(
+            "File parser JSON schema validation failed (TypeError).", {}, {"type": "object"}
+        )
+        assert facts["failure_class"] == "schema_invalid"
+        assert facts["undeclared_required_count"] is None
+
+
+class TestSchemaShapeFacts:
+    """`required_count` / `properties_count` must never report a false zero (Codex P2)."""
+
+    REF_ROOTED = {
+        "$ref": "#/$defs/Invoice",
+        "$defs": {
+            "Invoice": {
+                "type": "object",
+                "required": ["total", "date"],
+                "properties": {"total": {}, "date": {}, "vendor": {}},
+            }
+        },
+    }
+
+    def test_two_schemas_hash_differently(self) -> None:
+        """`schema_sha256` exists to tell schemas apart, and the shape assertions cannot check that.
+
+        A hex-shape regex is satisfied by a constant, so a hash degraded to one fixed value would
+        group every schema together and pass every other test — silently collapsing the grouping
+        the residual analysis depends on.
+        """
+        one = block_module._schema_sha256({"type": "object", "required": ["a"]})
+        another = block_module._schema_sha256({"type": "object", "required": ["b"]})
+        assert one != another
+
+    def test_hash_is_stable_across_key_order(self) -> None:
+        """Grouping by it requires the same schema to hash the same however it was serialised."""
+        assert block_module._schema_sha256({"type": "object", "required": ["a"]}) == block_module._schema_sha256(
+            {"required": ["a"], "type": "object"}
+        )
+
+    def test_ref_rooted_schema_reports_the_referenced_object(self) -> None:
+        node = block_module._schema_object_node(self.REF_ROOTED)
+        assert node is not None
+        assert len(node["required"]) == 2
+        assert len(node["properties"]) == 3
+
+    def test_ref_rooted_schema_does_not_look_like_an_empty_one(self) -> None:
+        """A zero is a legitimate value, so a false zero is indistinguishable from a real one."""
+        empty = block_module._schema_object_node({"type": "object"})
+        ref_rooted = block_module._schema_object_node(self.REF_ROOTED)
+        assert empty is not None and ref_rooted is not None
+        assert len(ref_rooted.get("required") or []) != len(empty.get("required") or [])
+
+    @staticmethod
+    def _ref_chain(length: int) -> dict[str, Any]:
+        defs: dict[str, Any] = {f"r{i}": {"$ref": f"#/$defs/r{i + 1}"} for i in range(length - 1)}
+        defs[f"r{length - 1}"] = {"type": "object", "required": ["a"], "properties": {"a": {}, "b": {}}}
+        return {"$ref": "#/$defs/r0", "$defs": defs}
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            pytest.param({"$ref": "https://example.com/schema.json"}, id="remote"),
+            pytest.param({"$ref": "#/$defs/Missing", "$defs": {}}, id="dangling"),
+            pytest.param({"$ref": "#/$defs/A", "$defs": {"A": {"$ref": "#/$defs/A"}}}, id="direct-cycle"),
+            pytest.param(
+                {"$ref": "#/$defs/A", "$defs": {"A": {"$ref": "#/$defs/B"}, "B": {"$ref": "#/$defs/A"}}},
+                id="indirect-cycle",
+            ),
+            pytest.param({"$ref": "#"}, id="whole-document"),
+            pytest.param({"$ref": "#/"}, id="empty-pointer"),
+            pytest.param({"$ref": "#/$defs/A", "$defs": {"A": "not an object"}}, id="resolves-to-string"),
+            pytest.param({"$ref": "#/$defs/A", "$defs": {"A": [1, 2]}}, id="resolves-to-list"),
+            # Rejected upstream by validate_schema today; the invariant must not depend on that.
+            pytest.param({"$ref": 42}, id="non-string-ref"),
+            pytest.param({"$ref": None}, id="null-ref"),
+        ],
+    )
+    def test_unresolvable_ref_reports_unknown_rather_than_zero(self, schema: dict[str, Any]) -> None:
+        """A node that HAS a `$ref` we cannot follow is unknown, never empty.
+
+        Returning the wrapper would report zero required and zero properties -- the exact false
+        zero this resolver exists to remove, reappearing inside its own fix.
+        """
+        assert block_module._schema_object_node(schema) is None
+
+    def test_a_chain_at_the_depth_cap_still_resolves(self) -> None:
+        """`_SCHEMA_REF_MAX_DEPTH` is a promise about how many refs are followed, not one fewer."""
+        at_cap = block_module._schema_object_node(self._ref_chain(block_module._SCHEMA_REF_MAX_DEPTH))
+        assert at_cap is not None
+        assert len(at_cap["required"]) == 1
+
+    def test_a_chain_past_the_depth_cap_reports_unknown(self) -> None:
+        assert block_module._schema_object_node(self._ref_chain(block_module._SCHEMA_REF_MAX_DEPTH + 1)) is None
+
+    def test_json_pointer_escapes_are_honoured(self) -> None:
+        schema = {
+            "$ref": "#/$defs/a~1b",
+            "$defs": {"a/b": {"type": "object", "required": ["x"], "properties": {"x": {}}}},
+        }
+        node = block_module._schema_object_node(schema)
+        assert node is not None and len(node["required"]) == 1
+
+    def test_an_unresolvable_ref_reports_unknown_response_key_facts(self) -> None:
+        """An unreadable schema makes "undeclared" meaningless, so both fields are null.
+
+        Naming nothing is safe in the privacy direction, but a definite count would say every key
+        was undeclared -- over-counting on every unresolvable-reference schema, and disagreeing
+        with the null shape fields sitting on the same line.
+        """
+        facts = block_module._response_key_facts(
+            {"Jane Q Doe (SSN 123-45-6789)": 1, "acct 4111111111111111": 2}, {"$ref": "https://x/s.json"}
+        )
+        assert facts["response_top_level_keys"] is None
+        assert facts["unexpected_key_count"] is None
+
+    def test_a_readable_schema_still_names_only_declared_keys(self) -> None:
+        """The privacy guarantee is unchanged when the schema IS readable."""
+        facts = block_module._response_key_facts({"a": 1, "Jane Q Doe (SSN 1)": 2}, self._ref_chain(2))
+        assert facts["response_top_level_keys"] == ["a"]
+        assert facts["unexpected_key_count"] == 1
+
+    def test_ref_rooted_array_root_resolves_its_items(self) -> None:
+        schema = {
+            "type": "array",
+            "items": {"$ref": "#/$defs/Row"},
+            "$defs": {"Row": {"type": "object", "required": ["a"], "properties": {"a": {}}}},
+        }
+        node = block_module._schema_object_node(schema)
+        assert node is not None and len(node["required"]) == 1
+
+    def test_declared_keys_are_recognised_through_a_ref(self) -> None:
+        """Without resolution every declared key counts as unexpected, inflating the leak metric."""
+        facts = block_module._response_key_facts({"total": 1, "date": "x"}, self.REF_ROOTED)
+        assert facts["response_top_level_keys"] == ["date", "total"]
+        assert facts["unexpected_key_count"] == 0
+
+
+class TestFailureFamily:
+    """failure_family is the aggregation key for FILE_PARSER_ERROR volume (D7-fields item 1)."""
+
+    # Verbatim from SKY-15831 (D8-text / D8-text-amend2): the quoted reference is the customer's
+    # own parameter key and sits inside the 60-char window this field cuts at.
+    EMPTY_INPUT_MESSAGE = (
+        'File URL is empty: "{ref}" resolved to no downloaded file ({detail}). '
+        'Check the upstream block\'s output, or set "On block failure" on this block '
+        "to skip the iteration."
+    )
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "its downloaded_files list was empty",
+            "no value was set for it",
+            "its value is not a downloaded file URL",
+        ],
+    )
+    def test_quoted_references_collapse_so_one_failure_is_one_family(self, detail: str) -> None:
+        refs = ["download_block_output", "invoice_pdf", "{{ download_2_output }}", "a_much_longer_parameter_name"]
+        families = {block_module._failure_family(self.EMPTY_INPUT_MESSAGE.format(ref=r, detail=detail)) for r in refs}
+
+        assert len(families) == 1, f"one failure split into {len(families)} families: {families}"
+        (family,) = families
+        assert family.startswith("File URL is empty: <ref> resolved to")
+        assert len(family) <= 60
+        for ref in refs:
+            assert ref not in family
+
+    def test_urls_are_still_stripped_before_truncation(self) -> None:
+        family = block_module._failure_family(
+            "Failed to download or validate file: File URL https://x.example.com/a?sig=1 is not valid"
+        )
+        assert "x.example.com" not in family
+        assert "<url>" in family
+
+
+class TestTruncationSourceDerivation:
+    """`truncation_source` is derived from `limit`, never stored (D3-fields dropped `source`)."""
+
+    def test_limit_vocabulary_is_the_shared_one(self) -> None:
+        """`TruncationLimit` is a cross-PR contract; SKY-15830 emits values this PR never does.
+
+        `Literal` is checked by mypy, not at runtime, so dropping a value at rebase would leave
+        every test green and the value would simply never appear on a dashboard. Assert the set.
+        """
+        assert set(get_args(block_module.TruncationLimit)) == {
+            "token_limit",
+            "ocr_page_limit",
+            "ocr_page_failure",
+            "max_pages",
+        }
+
+    @pytest.mark.parametrize(
+        ("limit", "expected"),
+        [
+            ("token_limit", "platform_cap"),
+            ("ocr_page_limit", "platform_cap"),
+            # SKY-15830's fourth value: pages lost to OCR failure is not the user's doing.
+            ("ocr_page_failure", "platform_cap"),
+            ("max_pages", "max_pages"),
+        ],
+    )
+    def test_source_follows_limit(self, limit: str, expected: str) -> None:
+        telemetry = block_module.FileParserTelemetry()
+        assert telemetry.truncation_source is None
+        assert telemetry.truncated is False
+
+        telemetry.mark_platform_cap(limit=limit, tokens_included=10, token_limit=20)
+
+        assert telemetry.truncation_source == expected
+        assert telemetry.truncated is True
+
+    def test_first_cut_wins(self) -> None:
+        telemetry = block_module.FileParserTelemetry()
+        telemetry.mark_platform_cap(limit="ocr_page_limit", tokens_included=10, token_limit=20, pages_included=3)
+        telemetry.mark_platform_cap(limit="token_limit", tokens_included=99, token_limit=99)
+
+        assert telemetry.limit == "ocr_page_limit"
+        assert telemetry.tokens_included == 10
+        assert telemetry.pages_included == 3
+
+
+class TestCsvFallbackWarning:
+    """Shadow log for the silent CSV fallback (D5); detection behavior is unchanged."""
+
+    @staticmethod
+    def _detect_with_logs(url: str, path: Path | None) -> tuple[FileType, list[dict[str, Any]]]:
+        block = _make_file_parser_block(url, FileType.AUTO_DETECT)
+        with structlog.testing.capture_logs() as logs:
+            detected = block._detect_file_type_from_url(url, file_path=str(path) if path else None)
+        return detected, _events(logs, CSV_FALLBACK_EVENT)
+
+    def test_html_page_is_flagged_without_logging_content(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_text("<!DOCTYPE html><html><head><title>Sign in</title></head><body>secret-body-text</body></html>")
+
+        detected, events = self._detect_with_logs("https://portal.example.com/download?id=42", path)
+
+        assert detected == FileType.CSV
+        (event,) = events
+        assert {
+            "url_host",
+            "url_suffix",
+            "configured_file_type",
+            "delimiter",
+            "delimiter_sniffed",
+            "column_count",
+            "consistent_columns",
+            "sampled_rows",
+            "looks_like_html",
+            "looks_binary",
+        } <= event.keys()
+        assert event["url_host"] == "portal.example.com"
+        assert event["url_suffix"] == ""
+        assert event["looks_like_html"] is True
+        assert event["looks_binary"] is False
+        _assert_no_content_in_fields(event, ("secret-body-text", "Sign in", "id=42", "https://"))
+
+    def test_consistent_delimited_text(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_text("a,b,c,d\n1,2,3,4\n5,6,7,8\n")
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["delimiter"] == ","
+        assert event["delimiter_sniffed"] is True
+        assert event["column_count"] == 4
+        assert event["consistent_columns"] is True
+        assert event["sampled_rows"] == 2
+        assert event["looks_like_html"] is False
+
+    def test_ragged_delimited_text(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_text("a,b\n1,2,3\n4,5\n")
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["delimiter"] == ","
+        assert event["delimiter_sniffed"] is False
+        assert event["column_count"] == 2
+        assert event["consistent_columns"] is False
+
+    def test_utf16_csv_is_decoded_the_way_the_parser_will_read_it(self, tmp_path: Path) -> None:
+        """A UTF-16 CSV decoded as UTF-8 reports false ragged columns and biases the D5 decision."""
+        path = tmp_path / "downloaded"
+        path.write_bytes("a,b\n1,2\n3,4\n".encode("utf-16"))
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["looks_binary"] is False
+        assert event["column_count"] == 2
+        assert event["consistent_columns"] is True
+        assert event["sampled_rows"] == 2
+        assert event["sniff_error"] is None
+
+    def test_binary_content_is_flagged(self, tmp_path: Path) -> None:
+        path = tmp_path / "downloaded"
+        path.write_bytes(b"\x00\x01\x02binary\x00")
+
+        _, events = self._detect_with_logs("https://example.com/export", path)
+
+        (event,) = events
+        assert event["looks_binary"] is True
+        assert event["delimiter"] is None
+
+    def test_no_file_path_logs_fallback_without_content_facts(self) -> None:
+        _, events = self._detect_with_logs("https://example.com/data.txt", None)
+
+        (event,) = events
+        assert event["url_suffix"] == ".txt"
+        assert event["looks_like_html"] is None
+        assert event["column_count"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_raising_sniffer_cannot_fail_the_block(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shadow log runs inside execute()'s try, whose except is a customer-visible failure."""
+        path = tmp_path / "downloaded"
+        path.write_text("a,b\n1,2\n")
+        block = _make_file_parser_block("https://example.com/export", FileType.AUTO_DETECT)
+
+        def explode(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("sniffer blew up")
+
+        monkeypatch.setattr(FileParserBlock, "_fill_fallback_sniff_facts", explode)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        (event,) = _events(logs, CSV_FALLBACK_EVENT)
+        assert event["sniff_error"] == "RuntimeError"
+        assert event["column_count"] is None
+        assert not _events(logs, FAILURE_EVENT)
+
+    def test_recognised_extension_does_not_log_fallback(self, tmp_path: Path) -> None:
+        path = tmp_path / "data.csv"
+        path.write_text("a,b\n1,2\n")
+
+        detected, events = self._detect_with_logs("https://example.com/data.csv", path)
+
+        assert detected == FileType.CSV
+        assert events == []
+
+
+SUMMARY_ROWS = [{"metric": "total_spend", "amount": 4210}]
+QUERY_LOG_ROWS = [{"query_id": "q-8817", "duration_ms": 942}]
+
+
+def _create_two_sheet_workbook(path: Path) -> Path:
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        pd.DataFrame(SUMMARY_ROWS).to_excel(writer, sheet_name="Summary", index=False)
+        pd.DataFrame(QUERY_LOG_ROWS).to_excel(writer, sheet_name="Query Log", index=False)
+    return path
+
+
+def _workflow_run_context_with(**values: str) -> WorkflowRunContext:
+    ctx = WorkflowRunContext(
+        workflow_title="test",
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        workflow_run_id="wr_test",
+        aws_client=MagicMock(),
+    )
+    ctx.values.update(values)
+    return ctx
+
+
+def _script_output() -> MagicMock:
+    output = MagicMock()
+    output.label = "parse_workbook"
+    output.output_parameter = _make_output_parameter("parse_workbook_output")
+    output.input_parameters = []
+    return output
+
+
+def _block_from_yaml(**overrides: str) -> FileParserBlock:
+    block_yaml = FileParserBlockYAML(
+        label="parse_workbook",
+        file_url="https://example.com/workbook.xlsx",
+        file_type=FileType.EXCEL,
+        **overrides,
+    )
+    block = block_yaml_to_block(block_yaml, {"parse_workbook_output": _make_output_parameter("parse_workbook_output")})
+    assert isinstance(block, FileParserBlock)
+    return block
+
+
+class TestFileParserWorksheetSelector:
+    @pytest.mark.asyncio
+    async def test_absent_selector_reads_first_worksheet(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml()
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == SUMMARY_ROWS
+
+    @pytest.mark.asyncio
+    async def test_named_worksheet_returns_only_that_sheet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="Query Log")
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == QUERY_LOG_ROWS
+
+    @pytest.mark.asyncio
+    async def test_missing_worksheet_names_only_the_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="Nope")
+
+        with pytest.raises(WorksheetNotFound) as raised:
+            block._parse_excel_file_sync(str(path))
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is False
+        for message in (str(raised.value), str(result.failure_reason)):
+            assert "Nope" in message
+            assert "Query Log" not in message
+            assert "Summary" not in message
+            assert "total_spend" not in message
+            assert "q-8817" not in message
+
+    def test_literal_persists_and_template_renders(self) -> None:
+        assert _block_from_yaml(worksheet="Query Log").worksheet == "Query Log"
+
+        block = _block_from_yaml(worksheet="{{ sheet_param }}")
+
+        block.format_potential_template_parameters(_workflow_run_context_with(sheet_param="Query Log"))
+
+        assert block.worksheet == "Query Log"
+
+    @pytest.mark.asyncio
+    async def test_selector_rendering_to_blank_fails_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _create_two_sheet_workbook(tmp_path / "workbook.xlsx")
+        block = _block_from_yaml(worksheet="{{ sheet_param }}")
+
+        result = await _execute_with_downloaded_file(
+            block, path, monkeypatch, workflow_run_context=_workflow_run_context_with(sheet_param="")
+        )
+
+        assert result.success is False
+        assert result.output_parameter_value != SUMMARY_ROWS
+        assert "sheet_param" in str(result.failure_reason)
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_carries_the_selector(self, tmp_path: Path) -> None:
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(script_service, "_render_template_with_label", lambda template, label=None: template),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/workbook.xlsx",
+                file_type=FileType.EXCEL,
+                label="parse_workbook",
+                worksheet="{{ sheet_param }}",
+            )
+
+        (block,) = built
+        block.format_potential_template_parameters(_workflow_run_context_with(sheet_param=""))
+
+        with pytest.raises(WorksheetNotFound):
+            block._parse_excel_file_sync(str(_create_two_sheet_workbook(tmp_path / "workbook.xlsx")))
+
+    @pytest.mark.asyncio
+    async def test_selector_keeps_the_spaces_the_author_typed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """openpyxl writes and calamine reads a padded sheet name verbatim, so normalizing the
+        selector would make that sheet permanently unreachable."""
+        path = tmp_path / "workbook.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            pd.DataFrame(SUMMARY_ROWS).to_excel(writer, sheet_name="Summary", index=False)
+            pd.DataFrame(QUERY_LOG_ROWS).to_excel(writer, sheet_name=" Query Log ", index=False)
+        block = _block_from_yaml(worksheet=" Query Log ")
+
+        result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert result.output_parameter_value == QUERY_LOG_ROWS
+
+    @pytest.mark.asyncio
+    async def test_cached_script_path_renders_a_templated_selector(self) -> None:
+        """The script path resolves worksheet the same way it resolves its file_url sibling."""
+        built: list[FileParserBlock] = []
+
+        async def capture(self: FileParserBlock, **kwargs: str | None) -> None:
+            built.append(self)
+
+        with (
+            patch.object(
+                script_service, "_validate_and_get_output_parameter", AsyncMock(return_value=_script_output())
+            ),
+            patch.object(
+                script_service,
+                "_render_template_with_label",
+                lambda template, label=None: "Query Log" if template == "{{ sheet_param }}" else template,
+            ),
+            patch.object(FileParserBlock, "execute_safe", capture),
+        ):
+            await script_service.parse_file(
+                file_url="https://example.com/workbook.xlsx",
+                file_type=FileType.EXCEL,
+                label="parse_workbook",
+                worksheet="{{ sheet_param }}",
+            )
+
+        (block,) = built
+        assert block.worksheet == "Query Log"
+
+    @pytest.mark.asyncio
+    async def test_a_selector_on_a_zip_is_reported_as_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ZIP never reaches the per-type parser, so the warning has to sit above that fork."""
+        path = tmp_path / "archive.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("readme.txt", "hello")
+        block = _make_file_parser_block("https://example.com/archive.zip", FileType.ZIP)
+        block.worksheet = "Query Log"
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _execute_with_downloaded_file(block, path, monkeypatch)
+
+        assert result.success is True
+        assert [log for log in logs if log["event"] == "FileParserBlock ignoring worksheet on a non-Excel file"]
+
+    def test_generated_script_carries_the_selector(self) -> None:
+        base = {"file_url": "https://example.com/workbook.xlsx", "file_type": "excel", "label": "parse_workbook"}
+        module = cst.Module([])
+
+        with_selector = module.code_for_node(_build_file_url_parser_statement({**base, "worksheet": "Query Log"}))
+        without_selector = module.code_for_node(_build_file_url_parser_statement(base))
+
+        assert "worksheet = 'Query Log'" in with_selector
+        assert "worksheet" not in without_selector
+
+
+@pytest.fixture(scope="module")
+def forge_app() -> None:
+    start_forge_app()
+
+
+@pytest.mark.usefixtures("forge_app")
+class TestFileParserBlock:
+    @pytest.fixture
+    def file_parser_block(self):
+        """Create a basic FileParserBlock instance for testing."""
+        # Create a mock OutputParameter with all required fields
+        mock_output_parameter = MagicMock(spec=OutputParameter)
+        mock_output_parameter.parameter_type = "output"
+        mock_output_parameter.key = "test_output"
+        mock_output_parameter.output_parameter_id = "test_id"
+        mock_output_parameter.workflow_id = "test_workflow_id"
+        mock_output_parameter.created_at = datetime.now()
+        mock_output_parameter.modified_at = datetime.now()
+        mock_output_parameter.deleted_at = None
+
+        return FileParserBlock(
+            label="test_parser", output_parameter=mock_output_parameter, file_url="test.csv", file_type=FileType.CSV
+        )
+
+    @pytest.fixture
+    def csv_file(self):
+        """Create a temporary CSV file for testing."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("name,age,city\nJohn,30,New York\nJane,25,Boston")
+            temp_file = f.name
+
+        yield temp_file
+        os.unlink(temp_file)
+
+    @pytest.fixture
+    def excel_file(self):
+        """Create a temporary Excel file for testing."""
+        df = pd.DataFrame({"name": ["John", "Jane"], "age": [30, 25], "city": ["New York", "Boston"]})
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            df.to_excel(f.name, index=False)
+            temp_file = f.name
+
+        yield temp_file
+        os.unlink(temp_file)
+
+    @pytest.fixture
+    def tsv_file(self):
+        """Create a temporary TSV file for testing."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".tsv", delete=False) as f:
+            f.write("name\tage\tcity\nJohn\t30\tNew York\nJane\t25\tBoston")
+            temp_file = f.name
+
+        yield temp_file
+        os.unlink(temp_file)
+
+    def test_file_type_enum_values(self):
+        """Test that FileType enum has the expected values."""
+        assert FileType.CSV == "csv"
+        assert FileType.EXCEL == "excel"
+        assert FileType.PDF == "pdf"
+
+    def test_file_parser_block_initialization(self, file_parser_block):
+        """Test that FileParserBlock initializes correctly."""
+        assert file_parser_block.label == "test_parser"
+        assert file_parser_block.file_url == "test.csv"
+        assert file_parser_block.file_type == FileType.CSV
+        assert file_parser_block.json_schema is None
+
+    def test_file_parser_block_with_schema(self):
+        """Test that FileParserBlock can be initialized with a schema."""
+        schema = {"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}}
+
+        # Create a mock OutputParameter
+        mock_output_parameter = MagicMock(spec=OutputParameter)
+        mock_output_parameter.parameter_type = "output"
+        mock_output_parameter.key = "test_output"
+        mock_output_parameter.output_parameter_id = "test_id"
+        mock_output_parameter.workflow_id = "test_workflow_id"
+        mock_output_parameter.created_at = datetime.now()
+        mock_output_parameter.modified_at = datetime.now()
+        mock_output_parameter.deleted_at = None
+
+        block = FileParserBlock(
+            label="test_parser",
+            output_parameter=mock_output_parameter,
+            file_url="test.csv",
+            file_type=FileType.CSV,
+            json_schema=schema,
+        )
+
+        assert block.json_schema == schema
+
+    @pytest.mark.asyncio
+    async def test_parse_csv_file(self, file_parser_block, csv_file):
+        """Test CSV file parsing."""
+        result = await file_parser_block._parse_csv_file(csv_file)
+
+        expected = [{"name": "John", "age": "30", "city": "New York"}, {"name": "Jane", "age": "25", "city": "Boston"}]
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_parse_excel_file(self, file_parser_block, excel_file):
+        """Test Excel file parsing."""
+        result = await file_parser_block._parse_excel_file(excel_file)
+
+        expected = [{"name": "John", "age": 30, "city": "New York"}, {"name": "Jane", "age": 25, "city": "Boston"}]
+
+        assert result == expected
+
+    def test_parse_excel_keeps_literal_na_text(self, file_parser_block, tmp_path: Path):
+        path = tmp_path / "status.xlsx"
+        pd.DataFrame(
+            {
+                "status": ["N/A", "NULL", None, "ok"],
+                "reading": ["NaN", "NaT", None, "ok"],
+                "count": [12, None, 7, 3],
+                "due": [datetime(2024, 1, 2), None, datetime(2024, 1, 4), datetime(2024, 1, 5)],
+            }
+        ).to_excel(path, index=False)
+
+        result = file_parser_block._parse_excel_file_sync(str(path))
+
+        assert [row["status"] for row in result] == ["N/A", "NULL", "nan", "ok"]
+        assert [row["reading"] for row in result] == ["NaN", "NaT", "nan", "ok"]
+        assert [str(row["count"]) for row in result] == ["12", "nan", "7", "3"]
+        assert [row["due"] for row in result] == [
+            "2024-01-02T00:00:00",
+            "nan",
+            "2024-01-04T00:00:00",
+            "2024-01-05T00:00:00",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_parse_tsv_file(self, file_parser_block, tsv_file):
+        """Test TSV file parsing."""
+        result = await file_parser_block._parse_csv_file(tsv_file)
+
+        expected = [{"name": "John", "age": "30", "city": "New York"}, {"name": "Jane", "age": "25", "city": "Boston"}]
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_validate_csv_file_type(self, file_parser_block, csv_file):
+        """Test CSV file type validation."""
+        # Should not raise an exception
+        file_parser_block.validate_file_type("test.csv", csv_file)
+
+    @pytest.mark.asyncio
+    async def test_validate_excel_file_type(self, file_parser_block, excel_file):
+        """Test Excel file type validation."""
+        file_parser_block.file_type = FileType.EXCEL
+        # Should not raise an exception
+        file_parser_block.validate_file_type("test.xlsx", excel_file)
+
+    @pytest.mark.asyncio
+    async def test_validate_invalid_csv_file(self, file_parser_block):
+        """Test validation of invalid CSV file."""
+        # Create a binary file that's definitely not CSV
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".csv", delete=False) as f:
+            f.write(b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f")
+            temp_file = f.name
+
+        try:
+            with pytest.raises(Exception):
+                file_parser_block.validate_file_type("test.csv", temp_file)
+        finally:
+            os.unlink(temp_file)
+
+    @pytest.mark.asyncio
+    async def test_extract_with_ai_with_schema(self, file_parser_block):
+        """Test AI extraction with a provided schema."""
+        schema = {
+            "type": "object",
+            "properties": {
+                "extracted_data": {
+                    "type": "object",
+                    "properties": {
+                        "names": {"type": "array", "items": {"type": "string"}},
+                        "total_count": {"type": "integer"},
+                    },
+                }
+            },
+        }
+
+        file_parser_block.json_schema = schema
+
+        # Mock the LLM response
+        mock_response = {"extracted_data": {"names": ["John", "Jane"], "total_count": 2}}
+
+        with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
+            mock_llm.return_value = mock_response
+
+            with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:
+                mock_prompt.return_value = "mocked prompt"
+
+                result = await file_parser_block._extract_with_ai([{"name": "John"}, {"name": "Jane"}], MagicMock())
+
+                assert result == mock_response
+                mock_llm.assert_called_once()
+                mock_prompt.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_with_ai_without_schema(self, file_parser_block):
+        """Test AI extraction without a provided schema (should use default)."""
+        # Mock the LLM response
+        mock_response = {"output": {"summary": "Extracted data from file"}}
+
+        with patch.object(object.__getattribute__(app, "_inst"), "LLM_API_HANDLER") as mock_llm:
+            mock_llm.return_value = mock_response
+
+            with patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt") as mock_prompt:
+                mock_prompt.return_value = "mocked prompt"
+
+                result = await file_parser_block._extract_with_ai("Some text content", MagicMock())
+
+                assert result == mock_response
+                # Should NOT mutate the instance - json_schema should remain None
+                assert file_parser_block.json_schema is None
+                mock_llm.assert_called_once()
+                mock_prompt.assert_called_once()
+
+    def test_detect_file_type_from_url(self, file_parser_block):
+        """Test file type detection based on URL extension."""
+        # Test Excel files
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xlsx") == FileType.EXCEL
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xls") == FileType.EXCEL
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.xlsm") == FileType.EXCEL
+
+        # Test PDF files
+        assert file_parser_block._detect_file_type_from_url("https://example.com/document.pdf") == FileType.PDF
+
+        # Test CSV files (default)
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.csv") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.tsv") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data.txt") == FileType.CSV
+        assert file_parser_block._detect_file_type_from_url("https://example.com/data") == FileType.CSV
+
+    def test_clean_dataframe_for_json(self, file_parser_block):
+        """Test DataFrame cleaning for JSON serialization."""
+        # Create a DataFrame with NaN, NaT, and timestamp values
+        df = pd.DataFrame(
+            {
+                "OrderDate": ["2018-01-01", pd.NaT, "2018-01-03"],
+                "Region": ["North", "South", pd.NA],
+                "Sales": [1000.0, pd.NA, 3000.0],
+                "Timestamp": [pd.Timestamp("2018-01-01"), pd.NaT, pd.Timestamp("2018-01-03")],
+            }
+        )
+
+        # Clean the DataFrame
+        result = file_parser_block._clean_dataframe_for_json(df)
+
+        # Check that NaN and NaT values are converted to "nan" string
+        assert result[0]["OrderDate"] == "2018-01-01"
+        assert result[0]["Region"] == "North"
+        assert result[0]["Sales"] == 1000.0
+        assert result[0]["Timestamp"] == "2018-01-01T00:00:00"
+
+        assert result[1]["OrderDate"] == "nan"
+        assert result[1]["Region"] == "South"
+        assert result[1]["Sales"] == "nan"
+        assert result[1]["Timestamp"] == "nan"
+
+        assert result[2]["OrderDate"] == "2018-01-03"
+        assert result[2]["Region"] == "nan"
+        assert result[2]["Sales"] == 3000.0
+        assert result[2]["Timestamp"] == "2018-01-03T00:00:00"

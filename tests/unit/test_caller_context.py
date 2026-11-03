@@ -62,7 +62,7 @@ def patched_app(monkeypatch: pytest.MonkeyPatch):
     app.authentication_function = lambda token, attribution_header=None: _async_return(_org())
     app.authenticate_user_function = lambda token: _async_return("user_42")
 
-    async def fakeget_current_org_cached(x_api_key: str, db) -> Organization:
+    async def fakeget_current_org_cached(x_api_key: str, db, **_: object) -> Organization:
         return _org()
 
     async def fakeauthenticate_helper(authorization: str) -> Organization:

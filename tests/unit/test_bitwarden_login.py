@@ -1,9 +1,16 @@
 import asyncio
 import json
+import os
+import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import tldextract
+from pydantic import ValidationError
+from structlog.testing import capture_logs
 
+from skyvern.exceptions import BitwardenGetItemError, BitwardenLoginError, BitwardenUnlockError
 from skyvern.forge.sdk.schemas.credentials import PasswordCredential
 from skyvern.forge.sdk.services import bitwarden as bitwarden_module
 from skyvern.forge.sdk.services.bitwarden import (
@@ -13,13 +20,52 @@ from skyvern.forge.sdk.services.bitwarden import (
     RunCommandResult,
     get_list_response_item_from_bitwarden_item,
 )
+from tests.unit.scoped_asyncio import ScopedAsyncio
 
 # The vault server omits `totp` entirely for a login saved without a two-factor secret,
 # and returns it as JSON null for some hand-made items.
 MISSING_TOTP_LOGINS = [
     pytest.param({"username": "user@example.com", "password": "pw"}, id="totp-absent"),
     pytest.param({"username": "user@example.com", "password": "pw", "totp": None}, id="totp-null"),
+    pytest.param({"password": "pw"}, id="username-and-totp-absent"),
+    pytest.param({"username": "user@example.com"}, id="password-and-totp-absent"),
 ]
+
+
+def _cli_item(item_type: BitwardenItemType = BitwardenItemType.LOGIN) -> dict:
+    item = {
+        "object": "item",
+        "id": "11111111-1111-1111-1111-111111111111",
+        "type": int(item_type),
+        "organizationId": None,
+        "collectionIds": [],
+        "folderId": None,
+        "name": "Example item",
+        "notes": None,
+        "favorite": False,
+        "fields": None,
+        "reprompt": 0,
+        "revisionDate": "2026-01-01T00:00:00.000Z",
+        "creationDate": "2026-01-01T00:00:00.000Z",
+        "deletedDate": None,
+    }
+    if item_type == BitwardenItemType.LOGIN:
+        item["login"] = {
+            "username": "user@example.test",
+            "password": "example-password",
+            "totp": None,
+            "uris": [{"match": None, "uri": "https://example.test/login"}],
+        }
+    else:
+        item["card"] = {
+            "cardholderName": "Example Holder",
+            "number": "4111111111111111",
+            "expMonth": "12",
+            "expYear": "2030",
+            "code": None,
+            "brand": "Visa",
+        }
+    return item
 
 
 @pytest.mark.asyncio
@@ -36,6 +82,42 @@ async def test_login_ignores_data_file_creation_notice_on_stderr(
     monkeypatch.setattr(BitwardenService, "run_command", fake_run_command)
 
     await BitwardenService.login("client-id", "client-secret", master_password="master-password")
+
+
+_BACKFILL_ADVISORY = (
+    "[UserKeyIdBackfillMigration] Could not determine whether user 11111111-1111-4111-8111-111111111111 "
+    "needs migration: KeyIdBackfillError: User key is not available in key store"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stderr", "tolerated"),
+    [
+        (f"{_BACKFILL_ADVISORY}\n", True),
+        (_BACKFILL_ADVISORY.replace("User key is not available in key store", "Api error"), False),
+        (f"{_BACKFILL_ADVISORY}\nUnable to fetch ServerConfig from https://example.test/api FetchError", False),
+        ("[UserKeyIdBackfillMigration] Could not determine whether user someone needs migration", False),
+    ],
+    ids=["exact-advisory", "other-backfill-error", "advisory-plus-other-line", "malformed-user-id"],
+)
+async def test_apikey_login_tolerates_only_the_exact_user_key_id_backfill_advisory(
+    monkeypatch: pytest.MonkeyPatch, stderr: str, tolerated: bool
+) -> None:
+    async def fake_run_command(*args, **kwargs) -> RunCommandResult:
+        return RunCommandResult(
+            stdout="You are logged in!\n\nTo unlock your vault, use the `unlock` command. ex:\n$ bw unlock",
+            stderr=stderr,
+            returncode=0,
+        )
+
+    monkeypatch.setattr(BitwardenService, "run_command", fake_run_command)
+
+    if tolerated:
+        assert await BitwardenService.login("client-id", "client-secret") is None
+    else:
+        with pytest.raises(BitwardenLoginError):
+            await BitwardenService.login("client-id", "client-secret")
 
 
 @pytest.mark.asyncio
@@ -117,6 +199,411 @@ async def test_get_credential_item_by_id_reads_login_without_totp(monkeypatch: p
     assert fetched_item.credential.totp == ""
 
 
+@pytest.mark.parametrize("item_type", [BitwardenItemType.LOGIN, BitwardenItemType.CREDIT_CARD])
+@pytest.mark.parametrize(
+    ("stderr", "stderr_class"),
+    [
+        ("", None),
+        ("Event post failed.\n", "event_post_failed"),
+        ("Event post failed.\nEvent post failed.\n", "event_post_failed"),
+    ],
+    ids=["clean", "event-upload", "event-upload-repeated"],
+)
+def test_get_item_keeps_valid_credentials_with_safe_advisory_telemetry(
+    item_type: BitwardenItemType, stderr: str, stderr_class: str | None
+) -> None:
+    item = _cli_item(item_type)
+    result = RunCommandResult(stdout=json.dumps(item), stderr=stderr, returncode=0)
+
+    with capture_logs() as logs:
+        assert BitwardenService._parse_fetched_item(result, item["id"]) == item
+
+    if stderr_class is None:
+        assert not logs
+    else:
+        assert len(logs) == 1
+        # Accepted-advisory telemetry stays bounded: a classification only, never raw stderr or the item id.
+        assert logs[0] == {
+            "event": "Bitwarden CLI reported advisory stderr while fetching an item",
+            "log_level": "warning",
+            "command_kind": "get_item",
+            "stderr_class": stderr_class,
+            "returncode": 0,
+            "item_valid": True,
+        }
+
+
+def test_get_item_accepts_uppercase_uuid_request_matching_lowercase_canonical_id() -> None:
+    # is_uuid() accepts an uppercase UUID, but the CLI lowercases the request and returns the
+    # canonical lowercase id, so identity must compare by canonical UUID, not exact string.
+    item = _cli_item()
+    item["id"] = "479d0fec-6ab3-4f74-a92e-b4c2007704d3"
+    requested_id = "479D0FEC-6AB3-4F74-A92E-B4C2007704D3"
+    result = RunCommandResult(stdout=json.dumps(item), stderr="Event post failed.\n", returncode=0)
+
+    with capture_logs() as logs:
+        assert BitwardenService._parse_fetched_item(result, requested_id) == item
+    assert len(logs) == 1 and logs[0]["stderr_class"] == "event_post_failed"
+
+
+def test_get_item_rejects_valid_item_with_unknown_stderr() -> None:
+    # A valid item does not license an unknown stderr line; it stays fatal and keeps the CLI's
+    # diagnostic so `_repair_for_failure` can still classify it (here a stale-vault marker).
+    item = _cli_item()
+    result = RunCommandResult(stdout=json.dumps(item), stderr="Not found.\n", returncode=0)
+
+    with capture_logs() as logs:
+        with pytest.raises(BitwardenGetItemError, match="Not found."):
+            BitwardenService._parse_fetched_item(result, item["id"])
+    assert not logs
+
+
+def test_get_item_rejects_exact_advisory_mixed_with_unknown_line() -> None:
+    # The exact advisory line does not whitelist the whole stderr; a mixed unknown line stays fatal
+    # and its repair-relevant diagnostic is retained.
+    item = _cli_item()
+    result = RunCommandResult(
+        stdout=json.dumps(item), stderr="Event post failed.\nYou are not logged in.\n", returncode=0
+    )
+
+    with capture_logs() as logs:
+        with pytest.raises(BitwardenGetItemError, match="You are not logged in."):
+            BitwardenService._parse_fetched_item(result, item["id"])
+    assert not logs
+
+
+@pytest.mark.parametrize("stderr", ["You are not logged in.\n", "Not found.\n"], ids=["relogin", "resync"])
+def test_get_item_preserves_repair_stderr_over_shape_error(stderr: str) -> None:
+    # An exit-zero error/status envelope with repairable stderr must keep the CLI diagnostic so
+    # `_repair_for_failure` can still pick RELOGIN/RESYNC — not be masked by a static shape error.
+    result = RunCommandResult(stdout=json.dumps({"error": "not an item"}), stderr=stderr, returncode=0)
+
+    with capture_logs() as logs:
+        with pytest.raises(BitwardenGetItemError, match=stderr.strip()):
+            BitwardenService._parse_fetched_item(result, _cli_item()["id"])
+    assert not logs
+
+
+def test_get_item_defers_exact_advisory_until_after_item_validation() -> None:
+    # A malformed item carrying only the exact advisory must fail as a shape/envelope error and must
+    # not be accepted or logged as a valid item — advisory acceptance is deferred until validation passes.
+    result = RunCommandResult(stdout=json.dumps({"object": "not-item"}), stderr="Event post failed.\n", returncode=0)
+
+    with capture_logs() as logs:
+        with pytest.raises(BitwardenGetItemError):
+            BitwardenService._parse_fetched_item(result, _cli_item()["id"])
+    assert not logs
+
+
+def test_get_item_still_raises_and_keeps_the_clis_message_on_a_nonzero_exit() -> None:
+    result = RunCommandResult(stdout="", stderr="Not found.\n", returncode=1)
+
+    with pytest.raises(BitwardenGetItemError, match="Not found."):
+        BitwardenService._parse_fetched_item(result, "item-1")
+
+
+def test_get_item_stays_fatal_when_a_field_failed_to_decrypt_despite_exit_zero() -> None:
+    item = _cli_item()
+    item["login"]["password"] = "[error: cannot decrypt]"
+    result = RunCommandResult(
+        stdout=json.dumps(item),
+        stderr="[EncString Generic Decrypt] failed to decrypt encstring\n",
+        returncode=0,
+    )
+
+    with pytest.raises(BitwardenGetItemError, match="failed to decrypt"):
+        BitwardenService._parse_fetched_item(result, item["id"])
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["password", "nested-value"])
+@pytest.mark.parametrize("escaped", [False, True], ids=["literal", "json-escaped"])
+def test_get_item_rejects_stdout_only_decrypt_poison(nested: bool, escaped: bool) -> None:
+    item = _cli_item()
+    if nested:
+        item["fields"] = [{"name": "extra", "value": {"nested": ["prefix [error: cannot decrypt] suffix"]}}]
+    else:
+        item["login"]["password"] = "[error: cannot decrypt]"
+    stdout = json.dumps(item)
+    if escaped:
+        stdout = stdout.replace("[error: cannot decrypt]", r"\u005berror: cannot decrypt\u005d")
+
+    with pytest.raises(BitwardenGetItemError):
+        BitwardenService._parse_fetched_item(RunCommandResult(stdout=stdout, stderr="", returncode=0), item["id"])
+
+
+def test_get_item_rejects_stderr_only_decrypt_failure() -> None:
+    item = _cli_item()
+    result = RunCommandResult(
+        stdout=json.dumps(item), stderr="[EncString Generic Decrypt] FAILED TO DECRYPT encstring\n", returncode=0
+    )
+
+    with pytest.raises(BitwardenGetItemError):
+        BitwardenService._parse_fetched_item(result, item["id"])
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "",
+        "{",
+        "null",
+        "{}",
+        "[]",
+        '[{"object":"item"}]',
+        '"item"',
+        "1",
+        "true",
+        '{"error":"Not found."}',
+        '{"response":null,"statusCode":500}',
+        '{"success":false,"message":"Not found."}',
+        json.dumps({"success": True, "data": _cli_item()}),
+        '{"serverUrl":null,"lastSync":null,"status":"unlocked"}',
+    ],
+    ids=[
+        "empty",
+        "invalid-json",
+        "null",
+        "empty-object",
+        "empty-list",
+        "item-list",
+        "string",
+        "number",
+        "bool",
+        "error",
+        "http-response",
+        "failure-response",
+        "success-response",
+        "status",
+    ],
+)
+def test_get_item_rejects_non_item_envelopes_before_logging_advisories(stdout: str) -> None:
+    result = RunCommandResult(stdout=stdout, stderr="Event post failed.\n", returncode=0)
+
+    with capture_logs() as logs, pytest.raises(BitwardenGetItemError):
+        BitwardenService._parse_fetched_item(result, _cli_item()["id"])
+
+    assert not logs
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("id", "22222222-2222-2222-2222-222222222222"),
+        ("id", None),
+        ("object", "response"),
+        ("object", None),
+        ("type", True),
+        ("type", "1"),
+        ("type", 1.0),
+        ("type", 2),
+        ("type", 4),
+        ("type", None),
+        ("login", None),
+        ("login", []),
+        ("login", "login"),
+        ("login", {}),
+        ("login", {"uris": []}),
+        ("login", {"username": ["user"]}),
+        ("login", {"password": {"value": "pw"}}),
+        ("login", {"totp": 123}),
+        ("login", {"password": False}),
+    ],
+)
+def test_get_item_rejects_invalid_identity_type_and_login_shape(key: str, value: object) -> None:
+    item = _cli_item()
+    requested_id = item["id"]
+    item[key] = value
+    result = RunCommandResult(stdout=json.dumps(item), stderr="Event post failed.\n", returncode=0)
+
+    with capture_logs() as logs, pytest.raises(BitwardenGetItemError):
+        BitwardenService._parse_fetched_item(result, requested_id)
+
+    assert not logs
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("card", None),
+        ("card", []),
+        ("card", "card"),
+        ("card", {}),
+        ("fields", "fields"),
+        ("fields", {}),
+        ("fields", [None]),
+        ("fields", ["field"]),
+        ("fields", [{"name": ["billing_email"], "value": "value"}]),
+        ("fields", [{"name": "billing_email", "value": 123}]),
+    ],
+)
+def test_get_item_rejects_malformed_card_payload_and_custom_fields(key: str, value: object) -> None:
+    item = _cli_item(BitwardenItemType.CREDIT_CARD)
+    item[key] = value
+    result = RunCommandResult(stdout=json.dumps(item), stderr="Event post failed.\n", returncode=0)
+
+    with capture_logs() as logs, pytest.raises(BitwardenGetItemError):
+        BitwardenService._parse_fetched_item(result, item["id"])
+
+    assert not logs
+
+
+@pytest.mark.parametrize("field", ["cardholderName", "number", "expMonth", "expYear", "code", "brand"])
+def test_get_item_rejects_non_string_consumed_card_fields(field: str) -> None:
+    item = _cli_item(BitwardenItemType.CREDIT_CARD)
+    item["card"][field] = 123
+
+    with pytest.raises(BitwardenGetItemError):
+        BitwardenService._parse_fetched_item(
+            RunCommandResult(stdout=json.dumps(item), stderr="", returncode=0), item["id"]
+        )
+
+
+# The same vault entries as the real CLI printed them (synthetic data, captured against a local fake server):
+# 2025.9.0 spells an empty field as an explicit null, 2026.9.0 leaves the key out.
+_CLI_EMPTY_FIELD_SHAPES = {
+    "login-without-username": (
+        BitwardenItemType.LOGIN,
+        {
+            "login": {
+                "username": None,
+                "password": "pw-only",
+                "totp": None,
+                "uris": [{"match": None, "uri": "https://example.test/"}],
+            }
+        },
+        {
+            "login": {
+                "password": "pw-only",
+                "passwordRevisionDate": None,
+                "fido2Credentials": [],
+                "uris": [{"uri": "https://example.test/"}],
+            }
+        },
+    ),
+    "login-without-password": (
+        BitwardenItemType.LOGIN,
+        {
+            "login": {
+                "username": "user-only",
+                "password": None,
+                "totp": None,
+                "uris": [{"match": None, "uri": "https://example.test/"}],
+            }
+        },
+        {
+            "login": {
+                "username": "user-only",
+                "passwordRevisionDate": None,
+                "fido2Credentials": [],
+                "uris": [{"uri": "https://example.test/"}],
+            }
+        },
+    ),
+    "card-without-brand-and-cvv": (
+        BitwardenItemType.CREDIT_CARD,
+        {
+            "card": {
+                "cardholderName": "Only Holder",
+                "number": "4000056655665556",
+                "expMonth": "11",
+                "expYear": "2031",
+                "code": None,
+                "brand": None,
+            }
+        },
+        {"card": {"cardholderName": "Only Holder", "number": "4000056655665556", "expMonth": "11", "expYear": "2031"}},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_CLI_EMPTY_FIELD_SHAPES))
+def test_cli_2026_omitted_keys_read_the_same_as_2025_nulls(case: str) -> None:
+    item_type, shape_2025, shape_2026 = _CLI_EMPTY_FIELD_SHAPES[case]
+    outcomes = []
+    for nested, omits_null_keys in ((shape_2025, False), (shape_2026, True)):
+        item = {**_cli_item(item_type), **nested, "fields": []}
+        if omits_null_keys:
+            item = {key: value for key, value in item.items() if value is not None}
+
+        fetched = BitwardenService._parse_fetched_item(
+            RunCommandResult(stdout=json.dumps(item), stderr="", returncode=0), item["id"]
+        )
+        try:
+            outcomes.append(get_list_response_item_from_bitwarden_item(fetched).credential)
+        except ValidationError as error:
+            outcomes.append(type(error))
+
+    assert outcomes[0] == outcomes[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_mode", [None, "true"], ids=["parent-only", "explicit-override"])
+async def test_run_command_scrubs_inherited_cli_output_modes(
+    monkeypatch: pytest.MonkeyPatch, explicit_mode: str | None
+) -> None:
+    # Every inherited BW_* var is scrubbed fail-closed — including BW_RAW (which makes `bw unlock`
+    # print the raw vault session key on stdout) and BW_SESSION — so only additional_env can re-supply
+    # a BW_* var to the child.
+    flags = ["BW_CLEANEXIT", "BW_RESPONSE", "BW_QUIET", "BW_PRETTY", "BW_RAW", "BW_SESSION"]
+    for flag in flags:
+        monkeypatch.setenv(flag, "true")
+    monkeypatch.setenv("BW_TEST_PARENT", "parent-value")
+    monkeypatch.setenv("KEEP_PARENT", "keep-value")
+    additional_env = {"BW_TEST_EXPLICIT": "command-value"}
+    if explicit_mode:
+        additional_env["BW_PRETTY"] = explicit_mode
+    keys = [*flags, "BW_TEST_PARENT", "KEEP_PARENT", "BW_TEST_EXPLICIT", "NODE_NO_WARNINGS"]
+    script = f"import json, os; print(json.dumps({{key: os.environ.get(key) for key in {keys!r}}}))"
+
+    result = await BitwardenService.run_command([sys.executable, "-c", script], additional_env=additional_env)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        **dict.fromkeys(flags),  # every inherited BW_* scrubbed to None...
+        "BW_PRETTY": explicit_mode,  # ...unless additional_env re-supplies it (additional_env wins)
+        "BW_TEST_PARENT": None,  # an inherited BW_* is scrubbed even if it is not a known flag
+        "KEEP_PARENT": "keep-value",  # non-BW parent env still passes through
+        "BW_TEST_EXPLICIT": "command-value",
+        "NODE_NO_WARNINGS": "1",
+    }
+    assert all(os.environ[flag] == "true" for flag in flags)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("subcommand", "noninteractive"), [("get", "true"), ("login", None)])
+async def test_run_command_never_lets_a_read_prompt(tmp_path, subcommand: str, noninteractive: str | None) -> None:
+    # A locked read that may prompt exits 0 with no output on a closed stdin and hangs on an open one;
+    # with BW_NOINTERACTION it fails with "Vault is locked.". Login stays interactive for its device prompt.
+    fake_cli = tmp_path / "bw"
+    fake_cli.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\n"
+        "print(json.dumps({'noninteractive': os.environ.get('BW_NOINTERACTION'),"
+        " 'stdin_is_devnull': os.path.samestat(os.fstat(0), os.stat(os.devnull))}))\n"
+    )
+    fake_cli.chmod(0o755)
+
+    result = await BitwardenService.run_command([str(fake_cli), subcommand])
+
+    assert json.loads(result.stdout) == {"noninteractive": noninteractive, "stdin_is_devnull": True}
+
+
+@pytest.mark.asyncio
+async def test_unlock_never_echoes_raw_session_key_in_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With an inherited BW_RAW, `bw unlock` prints the bare session key (the vault decryption key) on
+    # stdout with no banner. The unlock failure path must never interpolate that stdout into an error.
+    raw_session_key = "cV3rYS3cr3tS3ss10nK3yAAAABBBBCCCC=="
+
+    async def fake_run_command(command: list[str], additional_env: dict | None = None, timeout: int = 60):
+        return RunCommandResult(stdout=raw_session_key, stderr="mac failed", returncode=0)
+
+    monkeypatch.setattr(BitwardenService, "run_command", fake_run_command)
+
+    with pytest.raises(BitwardenUnlockError) as excinfo:
+        await BitwardenService.unlock("master-password")
+    assert raw_session_key not in str(excinfo.value)
+
+
 class _HangingProcess:
     """A subprocess whose communicate() never returns, so only the deadline can end the call."""
 
@@ -189,8 +676,272 @@ def test_retry_backoff_is_full_jitter_with_doubling_cap(monkeypatch: pytest.Monk
 
     delays = [bitwarden_module._retry_backoff_seconds(attempt) for attempt in range(5)]
 
-    assert seen == [(0, 5.0), (0, 10.0), (0, 20.0), (0, 40.0), (0, 60.0)]
-    assert delays == [5.0, 10.0, 20.0, 40.0, 60.0]
+    assert seen == [(0, 20.0), (0, 40.0), (0, 60.0), (0, 60.0), (0, 60.0)]
+    assert delays == [20.0, 40.0, 60.0, 60.0, 60.0]
+
+
+# Scaled budgets for the cold-session tests: a read gets `_READ`, a cold login (and an API-key unlock)
+# gets `_COLD`. The API-key attempt is then capped at 2 * _COLD + _READ, an email attempt at _COLD + _READ.
+_READ = 0.3
+_COLD = 0.9
+_ITEM_ID = "11111111-1111-1111-1111-111111111111"
+
+
+class _TimedVaultProcess:
+    """A fake `bw` process that takes a scripted time to answer, so real `run_command` timeouts apply."""
+
+    def __init__(self, step: str, seconds: float, stdout: str, gate: asyncio.Event | None = None) -> None:
+        self.step = step
+        self.seconds = seconds
+        self.stdout = stdout
+        self.gate = gate
+        self.returncode: int | None = None
+        self.pid = 4243
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        if self.gate is not None:
+            self.gate.set()
+        await asyncio.sleep(self.seconds)
+        self.returncode = 0
+        return self.stdout.encode(), b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int | None:
+        self.waited = True
+        return self.returncode
+
+
+class _TimedVaultCli:
+    """Installs `_TimedVaultProcess` behind `asyncio.create_subprocess_exec` and records every process."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, seconds: dict[str, float], read_stdout: str) -> None:
+        self.seconds = seconds
+        self.read_stdout = read_stdout
+        self.login_stdout = "You are logged in!"
+        self.processes: list[_TimedVaultProcess] = []
+        self.unlock_started = asyncio.Event()
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", self._exec)
+        monkeypatch.setattr(bitwarden_module, "_cli_sessions", bitwarden_module._CliSessionCache())
+        monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_LOGIN_TIMEOUT_SECONDS", _COLD)
+        monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_TIMEOUT_SECONDS", _READ)
+        monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_MAX_JITTER_SECONDS", 0.0)
+        # A configured global email turns every request into an email login; these tests choose their own.
+        monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_EMAIL", None)
+        # The default domain extractor fetches the public suffix list on its first call, blocking the event
+        # loop for most of a second inside the timed attempt. Use the bundled list, loaded before the clock.
+        extractor = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+        extractor("https://example.test")
+        monkeypatch.setattr(bitwarden_module, "tldextract", SimpleNamespace(extract=extractor))
+
+    async def _exec(self, *command: str, **kwargs: object) -> _TimedVaultProcess:
+        step = command[1]
+        stdout = {
+            "login": self.login_stdout,
+            "unlock": 'Your vault is now unlocked!\nBW_SESSION="session-key"',
+        }.get(step, self.read_stdout)
+        gate = self.unlock_started if step == "unlock" else None
+        process = _TimedVaultProcess(step, self.seconds.get(step, 0.0), stdout, gate)
+        self.processes.append(process)
+        return process
+
+    def steps(self) -> list[str]:
+        return [process.step for process in self.processes]
+
+    @staticmethod
+    def sessions() -> int:
+        return len(bitwarden_module._cli_sessions._sessions)
+
+
+def _login_list_stdout() -> str:
+    return json.dumps([_cli_item()])
+
+
+def _identity_list_stdout() -> str:
+    item = _cli_item()
+    item["fields"] = [{"name": "first_name", "value": "Ada", "type": 0}]
+    return json.dumps([item])
+
+
+async def _fetch_password_by_id(**overrides: object) -> dict[str, str]:
+    kwargs: dict = {
+        "client_id": "client-id",
+        "client_secret": "client-secret",
+        "master_password": "master-password",
+        "bw_organization_id": None,
+        "bw_collection_ids": None,
+        "collection_id": "coll-1",
+        "item_id": _ITEM_ID,
+        "max_retries": 1,
+        "timeout": _READ,
+    }
+    kwargs.update(overrides)
+    return await BitwardenService.get_secret_value_from_url(**kwargs)
+
+
+async def _fetch_password_by_url() -> dict[str, str]:
+    return await BitwardenService.get_secret_value_from_url(
+        client_id="client-id",
+        client_secret="client-secret",
+        master_password="master-password",
+        bw_organization_id=None,
+        bw_collection_ids=None,
+        url="https://example.test/login",
+        collection_id="coll-1",
+        max_retries=1,
+        timeout=_READ,
+    )
+
+
+async def _fetch_identity() -> dict[str, str]:
+    return await BitwardenService.get_sensitive_information_from_identity(
+        client_id="client-id",
+        client_secret="client-secret",
+        master_password="master-password",
+        bw_organization_id=None,
+        bw_collection_ids=None,
+        collection_id="coll-1",
+        identity_key="identity",
+        identity_fields=["first_name"],
+        remaining_retries=0,
+        timeout=_READ,
+        fail_reasons=[],
+    )
+
+
+async def _fetch_card() -> dict[str, str]:
+    return await BitwardenService.get_credit_card_data(
+        client_id="client-id",
+        client_secret="client-secret",
+        master_password="master-password",
+        bw_organization_id=None,
+        bw_collection_ids=None,
+        collection_id="coll-1",
+        item_id=_ITEM_ID,
+        remaining_retries=0,
+        fail_reasons=[],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fetch", "read_step", "read_stdout", "field", "expected"),
+    [
+        (_fetch_password_by_id, "get", json.dumps(_cli_item()), "BW_PASSWORD", "example-password"),
+        (_fetch_password_by_url, "list", _login_list_stdout(), "BW_PASSWORD", "example-password"),
+        (_fetch_identity, "list", _identity_list_stdout(), "first_name", "Ada"),
+        (
+            _fetch_card,
+            "get",
+            json.dumps(_cli_item(BitwardenItemType.CREDIT_CARD)),
+            "BW_CREDIT_CARD_NUMBER",
+            "4111111111111111",
+        ),
+    ],
+    ids=["password-by-id", "password-by-url", "identity", "card"],
+)
+async def test_a_slow_cold_api_key_login_and_unlock_both_fit_one_attempt(
+    monkeypatch: pytest.MonkeyPatch, fetch, read_step: str, read_stdout: str, field: str, expected: str
+) -> None:
+    """Under a batch, a cold API-key session pays a slow `bw login` and then a slow `bw unlock`; each runs
+    past a read's budget and together they run past login + read. Both get the cold budget, and the
+    attempt has room for login, unlock and the read behind them (SKY-18666)."""
+    cli = _TimedVaultCli(monkeypatch, {"login": 0.6, "unlock": 0.6, read_step: 0.15}, read_stdout)
+
+    credential = await fetch()
+
+    assert credential[field] == expected
+    assert cli.steps() == ["login", "unlock", read_step]
+    assert not any(process.killed for process in cli.processes)
+
+
+@pytest.mark.asyncio
+async def test_a_slow_read_still_fails_at_the_read_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = _TimedVaultCli(monkeypatch, {"login": 0.05, "unlock": 0.05, "get": 0.6}, json.dumps(_cli_item()))
+
+    with pytest.raises(bitwarden_module.BitwardenListItemsError, match="TimeoutError"):
+        await _fetch_password_by_id()
+
+    read = cli.processes[-1]
+    assert read.step == "get" and read.killed and read.waited
+
+
+@pytest.mark.asyncio
+async def test_the_attempt_deadline_still_ends_a_cold_api_key_session_stuck_behind_the_command_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _TimedVaultCli(monkeypatch, {"login": 0.6, "unlock": 0.6, "get": 0.15}, json.dumps(_cli_item()))
+    queue = asyncio.Semaphore(1)
+    monkeypatch.setattr(bitwarden_module, "_cli_command_semaphore", queue)
+    await queue.acquire()
+    asyncio.get_running_loop().call_later(1.0, queue.release)
+
+    with pytest.raises(bitwarden_module.BitwardenListItemsError, match="TimeoutError"):
+        await _fetch_password_by_id()
+
+    active = cli.processes[-1]
+    assert active.killed and active.waited
+    assert cli.sessions() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("email_source", ["request", "settings"])
+async def test_an_email_session_keeps_its_login_plus_read_attempt(
+    monkeypatch: pytest.MonkeyPatch, email_source: str
+) -> None:
+    """Only an API-key session has an unlock to pay for. An email session, including one whose email comes
+    from the configured fallback, keeps the login + read attempt and unlocks on the read budget."""
+    cli = _TimedVaultCli(monkeypatch, {"login": 0.75, "unlock": 0.25, "get": 0.25}, json.dumps(_cli_item()))
+    overrides: dict = {}
+    if email_source == "request":
+        overrides["email"] = "vault@example.test"
+    else:
+        monkeypatch.setattr(bitwarden_module.settings, "BITWARDEN_EMAIL", "vault@example.test")
+
+    with pytest.raises(bitwarden_module.BitwardenListItemsError, match="TimeoutError"):
+        await _fetch_password_by_id(**overrides)
+
+    assert cli.steps() == ["login", "unlock", "get"]
+    assert cli.processes[-1].killed and cli.processes[-1].waited
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_cold_unlock_propagates_without_retry_and_drops_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = _TimedVaultCli(monkeypatch, {"login": 0.0, "unlock": 10.0, "get": 0.0}, json.dumps(_cli_item()))
+    fetch = asyncio.create_task(_fetch_password_by_id(max_retries=3))
+    await asyncio.wait_for(cli.unlock_started.wait(), timeout=5)
+
+    fetch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await fetch
+
+    assert cli.steps() == ["login", "unlock"]
+    assert cli.processes[-1].killed and cli.processes[-1].waited
+    assert cli.sessions() == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_fetch_queued_for_the_cli_propagates_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = _TimedVaultCli(monkeypatch, {}, json.dumps(_cli_item()))
+    queue = asyncio.Semaphore(1)
+    monkeypatch.setattr(bitwarden_module, "_cli_command_semaphore", queue)
+    await queue.acquire()
+    fetch = asyncio.create_task(_fetch_password_by_id(max_retries=3))
+    await asyncio.sleep(0.05)
+
+    fetch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await fetch
+
+    assert cli.processes == []
+    assert cli.sessions() == 0
+    queue.release()
 
 
 @pytest.mark.asyncio
@@ -207,7 +958,9 @@ async def test_every_cli_step_receives_the_attempt_budget(monkeypatch: pytest.Mo
                 stdout='Your vault is now unlocked!\n$ export BW_SESSION="abc"', stderr="", returncode=0
             )
         if command[1] == "get":
-            item = {"id": "item-1", "login": {"username": "u", "password": "p", "totp": "", "uris": []}}
+            item = _cli_item()
+            item["id"] = command[3]
+            item["collectionIds"] = ["coll-1"]
             return RunCommandResult(stdout=json.dumps(item), stderr="", returncode=0)
         return RunCommandResult(stdout="", stderr="", returncode=0)
 
@@ -226,11 +979,11 @@ async def test_every_cli_step_receives_the_attempt_budget(monkeypatch: pytest.Mo
     )
 
     # Establishing the session and reading the item all run on the attempt's budget. No `bw logout`:
-    # the session is kept for the next run rather than torn down (SKY-14751).
+    # the session is kept for the next run rather than torn down (SKY-14751), and no `bw sync`: the
+    # login already ran a full one.
     assert budgets == {
         "bw login": 37,
         "bw unlock": 37,
-        "bw sync": 37,
         "bw get": 37,
     }
 
@@ -269,7 +1022,7 @@ async def test_secret_fetch_retries_after_a_jittered_backoff_with_a_constant_ste
 
     monkeypatch.setattr(BitwardenService, "_get_secret_value_from_url", fake_inner)
     monkeypatch.setattr(bitwarden_module, "_retry_backoff_seconds", lambda attempt: 7.5)
-    monkeypatch.setattr(bitwarden_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     result = await BitwardenService.get_secret_value_from_url(**_secret_fetch_kwargs(), max_retries=3, timeout=60)
 
@@ -292,7 +1045,7 @@ async def test_secret_fetch_gives_up_after_max_retries_with_every_reason(monkeyp
 
     monkeypatch.setattr(BitwardenService, "_get_secret_value_from_url", always_times_out)
     monkeypatch.setattr(bitwarden_module, "_retry_backoff_seconds", lambda attempt: float(attempt))
-    monkeypatch.setattr(bitwarden_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     with pytest.raises(bitwarden_module.BitwardenListItemsError) as excinfo:
         await BitwardenService.get_secret_value_from_url(**_secret_fetch_kwargs(), max_retries=3, timeout=60)
@@ -337,7 +1090,7 @@ async def test_identity_fetch_backs_off_before_its_recursive_retry(monkeypatch: 
 
     monkeypatch.setattr(BitwardenService, "_get_sensitive_information_from_identity", fake_inner)
     monkeypatch.setattr(bitwarden_module, "_retry_backoff_seconds", lambda attempt: 3.0 + attempt)
-    monkeypatch.setattr(bitwarden_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(bitwarden_module, "asyncio", ScopedAsyncio(sleep=fake_sleep))
 
     result = await BitwardenService.get_sensitive_information_from_identity(
         client_id="cid",

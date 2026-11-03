@@ -19,7 +19,13 @@ LOG = structlog.get_logger()
 
 
 class BitwardenCredentialVaultService(CredentialVaultService):
-    async def create_credential(self, organization_id: str, data: CreateCredentialRequest) -> Credential:
+    async def create_credential(
+        self,
+        organization_id: str,
+        data: CreateCredentialRequest,
+        created_by: str | None = None,
+        is_passkey_setup_pending: bool = False,
+    ) -> Credential:
         org_collection = await app.DATABASE.credentials.get_organization_bitwarden_collection(organization_id)
 
         if not org_collection:
@@ -46,6 +52,8 @@ class BitwardenCredentialVaultService(CredentialVaultService):
             data=data,
             item_id=item_id,
             vault_type=CredentialVaultType.BITWARDEN,
+            created_by=created_by,
+            is_passkey_setup_pending=is_passkey_setup_pending,
         )
 
         return credential

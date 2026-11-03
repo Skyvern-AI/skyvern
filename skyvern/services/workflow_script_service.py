@@ -13,11 +13,15 @@ from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
+from skyvern.core.script_generations.constants import engine_only_loop_child_types
 from skyvern.core.script_generations.generate_script import (
     ScriptBlockSource,
     generate_workflow_script_python_code,
 )
-from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
+from skyvern.core.script_generations.transform_workflow_run import (
+    TaskV3RunNotScriptableError,
+    transform_workflow_run_to_code_gen_input,
+)
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
@@ -65,13 +69,16 @@ def is_block_type_cacheable(block: Any) -> bool:
     block with export enabled is excluded: the generated script's cached replay
     function only carries prompt/schema/url/model (see _build_extract_statement), so
     a cached run would silently skip the Parquet export while still reporting
-    success (SKY-15396).
+    success (SKY-15396). A loop holding an engine-only child (engine_only_loop_child_types)
+    is excluded for the same reason: loop codegen emits every child in list order.
 
     Accepts either a Block model instance or its dict/model_dump form, matching the
     two shapes callers hold across script generation and workflow execution.
     """
     block_type = block.get("block_type") if isinstance(block, dict) else getattr(block, "block_type", None)
     if block_type not in BLOCK_TYPES_THAT_SHOULD_BE_CACHED:
+        return False
+    if engine_only_loop_child_types(block):
         return False
     if block_type == BlockType.EXTRACTION:
         export_enabled = (
@@ -1049,6 +1056,13 @@ async def generate_workflow_script(
             use_semantic_selectors=adaptive,
             adaptive_caching=adaptive,
         )
+    except TaskV3RunNotScriptableError:
+        LOG.info(
+            "Skipping script generation: this run executed a block on Task V3",
+            workflow_run_id=workflow_run.workflow_run_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+        )
+        return
     except Exception:
         generation_duration_ms = (time.monotonic() - generation_start) * 1000
         LOG.error(

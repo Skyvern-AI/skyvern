@@ -22,6 +22,7 @@ declare module "@novnc/novnc/lib/rfb.js" {
     shared?: boolean;
     resizeSession?: boolean;
     viewOnly?: boolean;
+    wsProtocols?: string[];
     [key: string]: unknown;
   }
 
@@ -39,6 +40,7 @@ declare module "@novnc/novnc/lib/rfb.js" {
     removeEventListener(event: string, listener: (e: RfbEvent) => void): void;
     clipboardPasteFrom(text: string): void;
     disconnect(): void;
+    focus(options?: FocusOptions): void;
     sendKey(keysym: number, code: string, down?: boolean): void;
     viewportChange(): void;
   }

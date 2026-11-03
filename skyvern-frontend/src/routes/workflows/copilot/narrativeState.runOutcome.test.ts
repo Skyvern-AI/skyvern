@@ -5,15 +5,16 @@ import { getReviewGateVerdict } from "./cards/ReviewGateCard";
 import {
   EMPTY_NARRATIVE,
   TurnNarrativeState,
-  TerminalEnvelopeFacts,
   applyNarrativeEvent,
-  awaitsUserInput,
   hydrateNarrativeFromPayload,
+  hydrateHistoryNarrative,
   isBlockOk,
   isDeadlineHalt,
   notConfirmedOutcome,
   ranCleanOnCurrentSource,
+  terminalNarrativeText,
 } from "./narrativeState";
+
 import {
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotRunOutcomeUpdate,
@@ -21,6 +22,78 @@ import {
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotTurnStartUpdate,
 } from "./workflowCopilotTypes";
+
+describe("budget expiry narrative", () => {
+  it("hydrates typed status from the terminal payload", () => {
+    const turn = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      terminal: "error",
+      budgetExpiry: {
+        budgetExpired: true,
+        source: "deadline",
+        reportProduced: false,
+        stagedDraftId: "wf_draft",
+        drainFingerprint: "drain-1",
+      },
+    });
+    expect(turn?.budgetExpiry).toEqual({
+      budgetExpired: true,
+      source: "deadline",
+      reportProduced: false,
+      stagedDraftId: "wf_draft",
+      drainFingerprint: "drain-1",
+      leftRunIds: [],
+    });
+  });
+
+  it("grafts persisted expiry facts when the narrative predates them", () => {
+    const turn = hydrateHistoryNarrative(
+      { turnId: "turn-1", terminal: "error" },
+      {
+        budget_expired: true,
+        budget_expiry_source: "max_turns",
+        budget_expiry_report_produced: false,
+        budget_expiry_staged_draft_id: "wf_draft",
+        drain_fingerprint: "drain-2",
+      },
+    );
+    expect(turn?.budgetExpiry?.source).toBe("max_turns");
+    expect(turn?.budgetExpiry?.drainFingerprint).toBe("drain-2");
+  });
+});
+
+describe("a deadline exit persisted with an empty reply", () => {
+  // Shape of a persisted assistant row whose turn hit its deadline before any
+  // report: empty content, terminal "error" payload, typed outcome beside it.
+  const persistedDeadlineRow = (stagedDraftId: string | null) =>
+    hydrateHistoryNarrative(
+      { turnId: "turn-1", terminal: "error", terminalMessage: "" },
+      {
+        budget_expired: true,
+        budget_expiry_source: "deadline",
+        budget_expiry_report_produced: false,
+        budget_expiry_staged_draft_id: stagedDraftId,
+        response_kind: "clarify",
+      },
+    );
+
+  it("renders the time-limit notice from the typed outcome, not the empty reply", () => {
+    const turn = persistedDeadlineRow(null);
+    expect(turn?.terminal).toBe("error");
+    expect(turn?.budgetExpiry?.reportProduced).toBe(false);
+    expect(isDeadlineHalt(turn!)).toBe(true);
+    expect(terminalNarrativeText(turn!)).toBe(
+      "This turn reached its time limit without producing a report.",
+    );
+  });
+
+  it("names the staged draft the outcome records", () => {
+    const turn = persistedDeadlineRow("w_draft");
+    expect(terminalNarrativeText(turn!)).toBe(
+      "This turn reached its time limit without producing a report. A draft was staged during this session.",
+    );
+  });
+});
 
 const turnStart = (): WorkflowCopilotTurnStartUpdate => ({
   type: "turn_start",
@@ -84,16 +157,6 @@ const bothBlocksRan = [
   blockProgress({ block_label: "search_person", status: "completed" }),
 ];
 
-const envelopeFacts = (
-  facts: Partial<TerminalEnvelopeFacts>,
-): TerminalEnvelopeFacts => ({
-  nextState: null,
-  renderedFromEnvelope: false,
-  runVerdict: null,
-  runDisplayReason: null,
-  ...facts,
-});
-
 describe("applyNarrativeEvent — run_outcome", () => {
   it("negative verdict withholds the success affordance from completed rows", () => {
     const s = reduce([
@@ -136,6 +199,40 @@ describe("applyNarrativeEvent — run_outcome", () => {
     }
     expect(s.lastRunOutcome?.role).toBe("interim_build_test");
     expect(notConfirmedOutcome(s)).toBeNull();
+  });
+
+  it("shows a started run's skipped rows before its first block while it runs", () => {
+    const skipped = [{ label: "load_records", kind: "reused" as const }];
+    const s = reduce([
+      turnStart(),
+      blockProgress({
+        block_label: "earlier_run",
+        status: "failed",
+        workflow_run_id: "wr_0",
+      }),
+      {
+        type: "run_started",
+        workflow_run_id: "wr_1",
+        skipped_prefix: skipped,
+        timestamp: "2026-06-10T00:00:03Z",
+      },
+      blockProgress({
+        block_label: "open_search",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+      blockProgress({
+        block_label: "search_person",
+        status: "running",
+        workflow_run_id: "wr_1",
+      }),
+    ]);
+    expect(s.blocks.map((b) => b.skippedBefore)).toEqual([
+      undefined,
+      skipped,
+      undefined,
+    ]);
+    expect(s.pendingSkippedPrefix).toEqual({});
   });
 
   it("evaluating hold withholds the success affordance until the final frame", () => {
@@ -395,144 +492,37 @@ describe("hydrateNarrativeFromPayload — outcome", () => {
     expect(isBlockOk(row)).toBe(false);
   });
 
-  it("hydrates terminal envelope run facts and leaves legacy rows null", () => {
-    const withEnvelope = hydrateNarrativeFromPayload({
+  it("ignores a saved terminal envelope and reports run facts from their own records", () => {
+    const withStaleEnvelope = hydrateNarrativeFromPayload({
       ...payload([]),
       terminalEnvelope: {
-        next_state: "stopped",
-        verified: false,
-        workflow_applied: false,
-        run_verdict: "not_demonstrated",
-        run_display_reason: "Checkout never reached confirmation.",
-        response_kind: "stopped",
-        envelope_version: 1,
-      },
-    })!;
-    expect(withEnvelope.terminalEnvelope).toEqual({
-      nextState: "stopped",
-      questionParts: [],
-      renderedFromEnvelope: false,
-      runVerdict: "not_demonstrated",
-      runDisplayReason: "Checkout never reached confirmation.",
-      runOutcomeRole: null,
-      connectFailure: null,
-    });
-
-    const question = hydrateNarrativeFromPayload({
-      ...payload([]),
-      terminalEnvelope: {
-        next_state: "awaiting_user_input",
-        response_kind: "question",
-        user_action_required: true,
+        next_state: "completed",
+        verified: true,
+        workflow_applied: true,
+        run_verdict: "demonstrated",
         rendered_from_envelope: true,
       },
     })!;
-    expect(question.terminalEnvelope).toEqual({
-      nextState: "awaiting_user_input",
-      questionParts: [],
-      renderedFromEnvelope: true,
-      runVerdict: null,
-      runDisplayReason: null,
-      runOutcomeRole: null,
-      connectFailure: null,
-    });
-    expect(awaitsUserInput(question)).toBe(true);
-    // Unstamped envelope: carried, but not display authority.
-    expect(
-      awaitsUserInput({
-        cancelled: false,
-        terminalEnvelope: {
-          ...question.terminalEnvelope!,
-          renderedFromEnvelope: false,
-        },
-      }),
-    ).toBe(false);
-    // The cancel path persists this envelope verbatim, so the stop has to win.
-    expect(
-      awaitsUserInput({
-        cancelled: true,
-        terminalEnvelope: question.terminalEnvelope,
-      }),
-    ).toBe(false);
+    const withoutEnvelope = hydrateNarrativeFromPayload(payload([]))!;
 
-    const legacy = hydrateNarrativeFromPayload(payload([]))!;
-    expect(legacy.terminalEnvelope).toBeNull();
-
-    const malformed = hydrateNarrativeFromPayload({
-      ...payload([]),
-      terminalEnvelope: { run_verdict: "maybe", run_display_reason: 7 },
-    })!;
-    expect(malformed.terminalEnvelope).toEqual({
-      nextState: null,
-      questionParts: [],
-      renderedFromEnvelope: false,
-      runVerdict: null,
-      runDisplayReason: null,
-      runOutcomeRole: null,
-      connectFailure: null,
-    });
-
-    const typedConnect = hydrateNarrativeFromPayload({
-      ...payload([]),
-      terminalEnvelope: {
-        connect_failure: {
-          state: "already_closed",
-          retry_action: "test_end_to_end",
-          browser_session_id: "pbs_1",
-        },
-      },
-    })!;
-    expect(typedConnect.terminalEnvelope?.connectFailure).toEqual({
-      state: "already_closed",
-      retryAction: "test_end_to_end",
-      workflowRunId: null,
-      workflowRunBlockId: null,
-      taskId: null,
-      browserSessionId: "pbs_1",
-    });
-
-    const futureConnectState = hydrateNarrativeFromPayload({
-      ...payload([]),
-      terminalEnvelope: {
-        connect_failure: {
-          state: "future_manager_state",
-          retry_action: "test_end_to_end",
-          browser_session_id: "pbs_2",
-        },
-      },
-    })!;
-    expect(futureConnectState.terminalEnvelope?.connectFailure).toBeNull();
-
-    const missingRetryContract = hydrateNarrativeFromPayload({
-      ...payload([]),
-      terminalEnvelope: {
-        connect_failure: {
-          state: "already_closed",
-          browser_session_id: "pbs_3",
-        },
-      },
-    })!;
-    expect(missingRetryContract.terminalEnvelope?.connectFailure).toBeNull();
+    expect(withStaleEnvelope).toEqual(withoutEnvelope);
+    expect(notConfirmedOutcome(withStaleEnvelope)).toBeNull();
   });
 });
 
-describe("notConfirmedOutcome — envelope-first", () => {
+describe("notConfirmedOutcome — recorded run facts", () => {
   const base = {
     ...EMPTY_NARRATIVE,
     lastRunOutcome: null,
     blocks: [],
   };
 
-  it("envelope not_demonstrated wins even when a later pointer says demonstrated", () => {
+  it("reports the recorded not-confirmed outcome with its own reason", () => {
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: envelopeFacts({
-        runVerdict: "not_demonstrated",
-        runDisplayReason: "Cart never showed the item.",
-      }),
       lastRunOutcome: {
-        verdict: "demonstrated",
-        displayReason: null,
+        verdict: "not_demonstrated",
+        displayReason: "Cart never showed the item.",
       },
     });
     expect(outcome).toEqual({
@@ -541,10 +531,50 @@ describe("notConfirmedOutcome — envelope-first", () => {
     });
   });
 
-  it("envelope demonstrated suppresses the block-derived not_demonstrated", () => {
+  it("a reloaded turn shows the run's recorded failure even when no block carries a reason", () => {
+    // The original incident's shape: the failure was recorded, the deadline fired before the
+    // block's evidence finished, and the assistant shipped no reply. lastRunOutcome is live-only,
+    // so on reload the card has only turnFacts to read.
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: envelopeFacts({ runVerdict: "demonstrated" }),
+      lastRunOutcome: null,
+      turnFacts: {
+        factsAvailable: true,
+        authoredBlockCount: 1,
+        matchingSourceBlockCount: 1,
+        evaluationState: "not_demonstrated",
+        runId: "wr_1",
+        runCompleted: false,
+        terminalCause: "browser_operation_failed",
+        blocksRunThisTurn: 1,
+        recordedFailure: "Browser operation timed out on line 18.",
+        ranCleanOnCurrentSource: false,
+      },
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          state: "failed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
+    });
+    expect(outcome).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Browser operation timed out on line 18.",
+      workflowRunId: "wr_1",
+    });
+  });
+
+  it("a recorded demonstrated outcome suppresses the block-derived not-confirmed", () => {
+    const outcome = notConfirmedOutcome({
+      ...base,
+      lastRunOutcome: { verdict: "demonstrated", displayReason: null },
       blocks: [
         {
           workflowRunBlockId: "wrb_1",
@@ -563,49 +593,27 @@ describe("notConfirmedOutcome — envelope-first", () => {
     expect(outcome).toBeNull();
   });
 
-  it("envelope not_evaluated suppresses not-confirmed like demonstrated does", () => {
+  it("an interim run start is not a resolved outcome and does not suppress the block-derived one", () => {
     const outcome = notConfirmedOutcome({
       ...base,
-      terminalEnvelope: envelopeFacts({ runVerdict: "not_evaluated" }),
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "Stale pointer.",
-      },
+      lastRunOutcome: null,
+      turnFacts: null,
+      blocks: [
+        {
+          workflowRunBlockId: "wrb_1",
+          label: "checkout",
+          blockType: "code",
+          outcome: "not_demonstrated",
+          outcomeReason: "The earlier run never reached the dashboard.",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      ],
     });
-    expect(outcome).toBeNull();
-  });
-
-  it("an interim run-start envelope does not suppress the recorded not-confirmed outcome", () => {
-    const outcome = notConfirmedOutcome({
-      ...base,
-      terminalEnvelope: envelopeFacts({
-        runVerdict: "not_evaluated",
-        runOutcomeRole: "interim_build_test",
-      }),
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "The earlier run never reached the dashboard.",
-      },
-    });
-    expect(outcome).toEqual({
-      verdict: "not_demonstrated",
-      displayReason: "The earlier run never reached the dashboard.",
-    });
-  });
-
-  it("envelope without a run verdict falls back to the legacy inference", () => {
-    const outcome = notConfirmedOutcome({
-      ...base,
-      terminalEnvelope: envelopeFacts({}),
-      lastRunOutcome: {
-        verdict: "not_demonstrated",
-        displayReason: "Legacy pointer reason.",
-      },
-    });
-    expect(outcome).toEqual({
-      verdict: "not_demonstrated",
-      displayReason: "Legacy pointer reason.",
-    });
+    expect(outcome).not.toBeNull();
   });
 });
 
@@ -740,28 +748,44 @@ describe("canonical turn facts — pill and prose over one bundle", () => {
     expect(pill).toBe("untested");
   });
 
-  it("settles a block still running at the deadline as stopped, not failed", () => {
-    const turn = hydrateNarrativeFromPayload({
-      ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
-        string,
-        unknown
-      >),
-      blocks: [
-        {
-          workflowRunBlockId: "wrb_1",
-          label: "append_star_count_to_sheet",
-          blockType: "code",
-          state: "running",
-          lastSeenIteration: 0,
-          activity: [],
+  it.each([
+    [false, "unfinished", "unfinished"],
+    [false, "running", "stopped"],
+    [true, "running", "stopped"],
+  ])(
+    "keeps a block saved at the deadline (cancelled: %s, saved as %s) as %s, not failed",
+    (cancelled, savedState, expected) => {
+      const turn = hydrateNarrativeFromPayload({
+        ...(bundles["deadline-after-one-clean-run"] as unknown as Record<
+          string,
+          unknown
+        >),
+        cancelled,
+        budgetExpiry: {
+          budgetExpired: true,
+          source: "deadline",
+          reportProduced: true,
+          stagedDraftId: null,
+          drainFingerprint: null,
+          leftRunIds: ["wr_left"],
         },
-      ],
-    });
-    if (!turn) throw new Error("fixture did not hydrate");
+        blocks: [
+          {
+            workflowRunBlockId: "wrb_1",
+            label: "append_star_count_to_sheet",
+            blockType: "code",
+            state: savedState,
+            lastSeenIteration: 0,
+            activity: [],
+          },
+        ],
+      });
+      if (!turn) throw new Error("fixture did not hydrate");
 
-    expect(turn.blocks.map((block) => block.state)).toEqual(["stopped"]);
-    expect(isDeadlineHalt(turn)).toBe(true);
-  });
+      expect(turn.blocks.map((block) => block.state)).toEqual([expected]);
+      expect(isDeadlineHalt(turn)).toBe(true);
+    },
+  );
 
   it("keeps a failed block a failure even when the deadline expired", () => {
     const turn = hydrateNarrativeFromPayload({
@@ -887,5 +911,99 @@ describe("canonical turn facts — pill and prose over one bundle", () => {
 
     expect(ranCleanOnCurrentSource(turn.turnFacts)).toBe(false);
     expect(getReviewGateVerdict(turn, null)).toBe("untested");
+  });
+});
+
+describe("hydrateNarrativeFromPayload -- a superseded build test", () => {
+  it("reports the recorded verdict back after a reload, from the persisted turn facts", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      turnFacts: {
+        factsAvailable: true,
+        evaluationState: "not_demonstrated",
+        runId: "wr_superseded",
+        runCompleted: false,
+        terminalCause: "occupied",
+        blocksRunThisTurn: null,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+
+    expect(hydrated).toBeDefined();
+    expect(hydrated!.turnFacts?.runId).toBe("wr_superseded");
+    expect(notConfirmedOutcome(hydrated!)?.verdict).toBe("not_demonstrated");
+  });
+
+  it("surfaces the recorded block reason behind the persisted verdict, and null when no block carries one", () => {
+    const facts = {
+      factsAvailable: true,
+      evaluationState: "not_demonstrated",
+      runId: "wr_superseded",
+      runCompleted: false,
+      terminalCause: "occupied",
+      blocksRunThisTurn: null,
+      ranCleanOnCurrentSource: false,
+    };
+    const withBlock = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [
+        {
+          label: "checkout",
+          blockType: "code",
+          state: "completed",
+          lastSeenIteration: 0,
+          activity: [],
+          startedAt: null,
+          endedAt: null,
+          outcome: "not_demonstrated",
+          outcomeReason: "Cart never showed the item.",
+        },
+      ],
+      turnFacts: facts,
+    });
+    expect(notConfirmedOutcome(withBlock!)).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: "Cart never showed the item.",
+      workflowRunId: "wr_superseded",
+    });
+
+    const withoutBlocks = hydrateNarrativeFromPayload({
+      turnId: "turn-2",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      turnFacts: facts,
+    });
+    expect(notConfirmedOutcome(withoutBlocks!)).toEqual({
+      verdict: "not_demonstrated",
+      displayReason: null,
+      workflowRunId: "wr_superseded",
+    });
+  });
+
+  it("a run start with no result behind it reports an unknown block count, never zero", () => {
+    const hydrated = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      turnFacts: {
+        factsAvailable: true,
+        evaluationState: null,
+        runId: "wr_started",
+        runCompleted: null,
+        terminalCause: null,
+        blocksRunThisTurn: null,
+        ranCleanOnCurrentSource: false,
+      },
+    });
+
+    expect(hydrated!.turnFacts?.blocksRunThisTurn).toBeNull();
+    expect(notConfirmedOutcome(hydrated!)).toBeNull();
   });
 });

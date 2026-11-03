@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import io
 import json
+import sys
+import threading
 import typing
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import psycopg.errors
 import pytest
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 from starlette.requests import ClientDisconnect, Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from skyvern.forge import api_app, request_logging
+from skyvern.forge import api_app
+from skyvern.forge import app as forge_app
+from skyvern.forge import request_logging
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.log_redaction import (
     REDACTED,
     SENSITIVE_FIELDS,
@@ -29,14 +38,37 @@ from skyvern.forge.request_logging import (
     _sanitize_body,
     _sanitize_headers,
     _sanitize_response_body,
+    get_request_principal_state,
+    integration_platform_from_user_agent,
     log_raw_request_exception,
     log_raw_request_middleware,
     set_request_organization,
 )
+from skyvern.forge.sdk.core.run_submission_gate import RunSubmissionGate
+from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.services.org_auth_service import apply_request_org_context
+
+
+class _NoRequestBodiesAgentFunction(AgentFunction):
+    def should_log_request_bodies(self, organization_id: str) -> bool:
+        assert organization_id == "o_request_log"
+        return False
+
 
 # ---------------------------------------------------------------------------
 # _client_ip_from_headers
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("path", ["/api/v1/users/me/onboarding", "/api/v1/users/me/onboarding/"])
+@pytest.mark.parametrize(
+    "body", ['{"project_owner":{"professional_email":"owner@example.com"}}', "broken owner@example.com {"]
+)
+def test_onboarding_bodies_are_opaque_even_when_malformed(method: str, path: str, body: str) -> None:
+    request = Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
+    assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+    assert _sanitize_response_body(request, body, "application/json") == REDACTED
 
 
 class TestClientIpFromHeaders:
@@ -53,6 +85,34 @@ class TestClientIpFromHeaders:
 
     def test_empty_header_returns_none(self) -> None:
         assert _client_ip_from_headers({"x-forwarded-for": ""}) is None
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "expected"),
+    [
+        ("Zapier", "zapier"),
+        ("zApIeR/1.0", "zapier"),
+        ("curl/8.0 (Zapier/1.0)", "zapier"),
+        ("zapier-evil", "other"),
+        ("n8n", "n8n"),
+        ("N8N/1.0", "n8n"),
+        ("not-n8n", "other"),
+        ("curl/8.0 build-xn8nq", "other"),
+        ("make.com", "make"),
+        ("Make/production", "make"),
+        ("Integromat", "make"),
+        ("Workato", "workato"),
+        ("wOrKaTo/1.0", "workato"),
+        ("not-workato", "other"),
+        ("Mozilla/5.0", "other"),
+        ("Power Automate", "other"),
+        ("Pipedream", "other"),
+        (None, None),
+        ("  ", None),
+    ],
+)
+def test_integration_platform_from_user_agent(user_agent: str | None, expected: str | None) -> None:
+    assert integration_platform_from_user_agent(user_agent) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +156,24 @@ class TestIsSensitiveKey:
             "Cookie",
             "x-api-key",
             "X-Api-Key",
+            "X-Copilot-Credential-Recovery-Token",
+            "credential_recovery_token",
+            "resume_token",
             # Whole header dicts, masked wholesale because their inner key names are
             # caller-chosen and therefore unmatchable.
             "extra_http_headers",
             "cdp_connect_headers",
             # One-time codes
             "cached_totp",
+            # OAuth credentials
+            "client_secret",
+            "access_token",
+            "refresh_token",
+            # Payment-provider payer details and webhook signatures
+            "billing_details",
+            "payment_method_details",
+            "receipt_email",
+            "Stripe-Signature",
         ],
     )
     def test_sensitive_keys_are_redacted(self, key: str) -> None:
@@ -372,11 +444,8 @@ class TestIsLoggableContentType:
 # ---------------------------------------------------------------------------
 
 
-def _make_request(method: str = "GET", path: str = "/api/v1/test") -> MagicMock:
-    request = MagicMock()
-    request.method = method
-    request.url.path = path
-    return request
+def _make_request(method: str = "GET", path: str = "/api/v1/test") -> Request:
+    return Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b""})
 
 
 def test_sanitize_headers_removes_posthog_attribution_but_keeps_ordinary_header() -> None:
@@ -389,6 +458,29 @@ def test_sanitize_headers_removes_posthog_attribution_but_keeps_ordinary_header(
 
 
 class TestSanitizeResponseBody:
+    @pytest.mark.parametrize("method", ["POST", "GET", "DELETE", "OPTIONS", "PATCH"])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/mcp",
+            "/mcp/",
+            "/mcp/x/browser",
+            "/mcp/x/browser/",
+            "/mcp/.well-known/oauth-protected-resource",
+            "/mcp/x/browser/.well-known/openid-configuration",
+            "/mcp/unknown\npath",
+        ],
+    )
+    def test_mcp_response_fully_redacted_before_json_parsing(
+        self, method: str, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parse = MagicMock(side_effect=AssertionError("MCP bodies must stay opaque"))
+        monkeypatch.setattr(request_logging.json, "loads", parse)
+        request = _make_request(method, path)
+        for body in ['{"result":"SYNTHETIC_SECRET"}', '[{"result":"SYNTHETIC_SECRET"}]', "{malformed"]:
+            assert _sanitize_response_body(request, body, "application/json") == REDACTED
+        parse.assert_not_called()
+
     def test_sensitive_endpoint_fully_redacted(self) -> None:
         request = _make_request("POST", "/api/v1/credentials")
         result = _sanitize_response_body(request, '{"token": "abc"}', "application/json")
@@ -477,10 +569,73 @@ class TestSanitizeResponseBody:
 
 
 class TestSanitizeBody:
+    @pytest.mark.parametrize("method", ["POST", "GET", "DELETE", "OPTIONS", "PATCH"])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/mcp",
+            "/mcp/",
+            "/mcp/x/browser",
+            "/mcp/x/browser/",
+            "/mcp/.well-known/oauth-authorization-server",
+            "/mcp/x/browser/.well-known/oauth-protected-resource",
+            "/mcp/unknown\npath",
+        ],
+    )
+    def test_mcp_request_fully_redacted_before_json_parsing(
+        self, method: str, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parse = MagicMock(side_effect=AssertionError("MCP bodies must stay opaque"))
+        monkeypatch.setattr(request_logging.json, "loads", parse)
+        request = _make_request(method, path)
+        for body in [b'{"params":"SYNTHETIC_SECRET"}', b'[{"params":"SYNTHETIC_SECRET"}]', b"{malformed"]:
+            assert _sanitize_body(request, body, "application/json") == REDACTED
+        parse.assert_not_called()
+
+    @pytest.mark.parametrize("path", ["/mcpx", "/mcpserver", "/api/v1/mcp-something", "/v1/mcp"])
+    def test_mcp_similarly_named_routes_remain_loggable(self, path: str) -> None:
+        request = _make_request("POST", path)
+        body = '{"message":"public diagnostic"}'
+        assert _sanitize_body(request, body.encode(), "application/json") == body
+        assert _sanitize_response_body(request, body, "application/json") == body
+
     def test_sensitive_endpoint_request_fully_redacted(self) -> None:
         request = _make_request("POST", "/v1/credentials")
         result = _sanitize_body(request, b'{"password": "hunter2"}', "application/json")
         assert result == REDACTED
+
+    @pytest.mark.parametrize(
+        "content_type",
+        ["application/json", "multipart/form-data; boundary=recipe-boundary"],
+    )
+    def test_recipe_apply_request_body_fully_redacted(self, content_type: str) -> None:
+        request = _make_request("POST", "/v1/recipes/jobs/apply")
+        body = b'{"username":"customer-login","2fa_identifier":"otp@example.com","password":"secret"}'
+
+        result = _sanitize_body(request, body, content_type)
+
+        assert result == REDACTED
+        assert "customer-login" not in result
+        assert "otp@example.com" not in result
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/workflow/copilot/chat-post",
+            "/v1/workflow/copilot/question-response",
+            "/v1/workflow/copilot/steer",
+            "/v1/workflow/copilot/credential-response",
+            "/v1/workflow/copilot/convert-yaml-to-blocks",
+        ],
+    )
+    def test_workflow_copilot_request_is_fully_redacted_before_semantic_screening(self, path: str) -> None:
+        request = _make_request("POST", path)
+        literal = b'{"mode":"ask","message":"password InlineSecret123!"}'
+
+        result = _sanitize_body(request, literal, "application/json")
+
+        assert result == REDACTED
+        assert "InlineSecret123" not in result
 
     @pytest.mark.parametrize(
         "path",
@@ -505,6 +660,14 @@ class TestSanitizeBody:
         request = _make_request("POST", path)
         result = _sanitize_body(request, b'{"code": "4/0Adeu...", "state": "nonce"}', "application/json")
         assert result == REDACTED
+
+    @pytest.mark.parametrize("path", ["/api/v1/skyplane/authority/session", "/api/v1/skyplane/authority/feedback"])
+    def test_skyplane_authority_request_and_response_are_fully_redacted(self, path: str) -> None:
+        request = _make_request("POST", path)
+        body = '{"job_capability":"cap-secret","summary":"customer text","details":"more customer text"}'
+
+        assert _sanitize_body(request, body.encode(), "application/json") == REDACTED
+        assert _sanitize_response_body(request, body, "application/json") == REDACTED
 
     def test_non_sensitive_endpoint_request_preserved(self) -> None:
         request = _make_request("GET", "/v1/tasks")
@@ -578,6 +741,13 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
         log_raw_request_exception(response.status_code)
         return response
 
+    @app.get("/ndjson-stream")
+    async def ndjson_stream() -> StreamingResponse:
+        async def lines() -> typing.AsyncIterator[bytes]:
+            yield b'{"task_id":"tsk_1"}\n'
+
+        return StreamingResponse(lines(), media_type="application/x-ndjson")
+
     @app.get("/heartbeat")
     async def heartbeat() -> dict:
         return {"ok": True}
@@ -590,6 +760,31 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
                 "https://api.skyvern.com/v1/artifacts/art_response/content?expiry=1800000300&kid=k1&sig=response-secret"
             ),
         }
+
+    @app.post("/_test_request_logging_org")
+    async def create_org_task(error: bool = False) -> dict:
+        set_request_organization("o_request_log")
+        if error:
+            raise HTTPException(status_code=403, detail="response value")
+        return {"accepted": True}
+
+    @app.post("/api/v1/workflows/{workflow_id}/schedules")
+    async def create_invalid_schedule(workflow_id: str) -> JSONResponse:
+        set_request_organization("o_request_log")
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Missing schedule parameters for workflow {workflow_id}: SYNTHETIC_MISSING_PARAMETER"},
+        )
+
+    @app.post("/_test_request_logging_org_boom")
+    async def create_org_task_boom() -> dict:
+        set_request_organization("o_request_log")
+        raise ValueError("request failed")
+
+    @app.post("/integration-platform")
+    async def integration_platform() -> dict:
+        identity = get_request_principal_state()
+        return {"integration_platform": identity.integration_platform if identity else None}
 
     @app.post("/v1/browser_sessions/{browser_session_id}/action_logs")
     async def create_action_logs(browser_session_id: str) -> dict:
@@ -606,6 +801,16 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
     @app.get("/payment-required")
     async def payment_required() -> dict:
         raise HTTPException(status_code=402, detail="Payment Required")
+
+    @app.post("/runs/shed")
+    async def shed_run_submission() -> dict:
+        gate = RunSubmissionGate(limit=1, wait_seconds=0.01)
+        async with gate.slot(), gate.slot():
+            return {"dispatched": True}
+
+    @app.post("/runs/unavailable")
+    async def unavailable() -> dict:
+        raise HTTPException(status_code=503, detail="Service unavailable")
 
     @app.post("/post-only")
     async def post_only() -> dict:
@@ -635,6 +840,31 @@ def _make_app(unhandled_exception_status: int = 500) -> FastAPI:
 
         return StreamingResponse(body(), media_type="text/event-stream")
 
+    @app.api_route("/mcp", methods=["POST", "GET", "DELETE", "OPTIONS"])
+    @app.api_route("/mcp/{path:path}", methods=["POST", "GET", "DELETE", "OPTIONS"])
+    async def mcp_response(request: Request) -> Response:
+        app.state.mcp_request_body = await request.body()
+        if request.query_params.get("stream"):
+
+            async def events() -> typing.AsyncIterator[bytes]:
+                yield b"data: SYNTHETIC_SECRET_RESULT\n\n"
+
+            return StreamingResponse(events(), media_type="text/event-stream", status_code=202)
+        return JSONResponse(
+            {"jsonrpc": "2.0", "result": {"content": "SYNTHETIC_SECRET_RESULT"}},
+            status_code=int(request.query_params.get("status", "200")),
+        )
+
+    return app
+
+
+@pytest.fixture(scope="module")
+def real_api_app() -> FastAPI:
+    # Tests register routes on this one app, so each route path must be unique within the module.
+    # The first create_api_app() in a process runs setup_logger(), which replaces the interpreter hooks.
+    hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
+    app = api_app.create_api_app()
+    sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
     return app
 
 
@@ -648,6 +878,108 @@ def log_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 class TestMiddlewareLogVolume:
+    @pytest.mark.parametrize("status_code", [200, 403, 500])
+    @pytest.mark.parametrize(
+        "body",
+        [
+            (
+                '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"skyvern_evaluate",'
+                '"arguments":{"expression":"() => fetch(\\"sk-test-evaluate\\")"}}}'
+            ),
+            '{"params":{"prompt":"Use SYNTHETIC_SECRET_PROMPT to continue"}}',
+            '{"params":{"arguments":{"nested":[{"value":"SYNTHETIC_SECRET_NESTED"}]}}}',
+            "{malformed SYNTHETIC_SECRET_MALFORMED",
+            '[{"params":{"prompt":"SYNTHETIC_SECRET_BATCH"}}]',
+        ],
+        ids=["evaluate", "prompt", "nested", "malformed", "batch"],
+    )
+    def test_mcp_log_payload_excludes_request_and_result_secrets(
+        self, log_mock: MagicMock, body: str, status_code: int
+    ) -> None:
+        app = _make_app()
+        response = TestClient(app).post(
+            f"/mcp/x/browser/?status={status_code}",
+            content=body,
+            headers={
+                "content-type": "application/json",
+                "authorization": "Bearer sk-test-auth",
+                "x-api-key": "sk-test-api-key",
+            },
+        )
+        assert response.status_code == status_code
+        assert response.json()["result"]["content"] == "SYNTHETIC_SECRET_RESULT"
+        assert app.state.mcp_request_body == body.encode()
+        assert len(log_mock.mock_calls) == 1
+        call = log_mock.mock_calls[0]
+        assert call[0] == ("error" if status_code >= 500 else "warning" if status_code >= 400 else "info")
+        assert call.args == ("api.raw_request",)
+        fields = call.kwargs
+        assert fields["body"] == fields["response_body"] == REDACTED
+        assert fields["error_body"] == (REDACTED if status_code >= 400 else None)
+        assert fields["method"] == "POST"
+        assert fields["path"] == "/mcp/x/browser/"
+        assert fields["status_code"] == status_code
+        assert fields["duration_seconds"] >= 0
+        assert "authorization" not in fields["headers"]
+        assert "x-api-key" not in fields["headers"]
+        assert "SYNTHETIC_SECRET" not in repr(call)
+        assert "sk-test-" not in repr(call)
+
+    def test_ndjson_stream_logs_once_without_reading_body(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)
+        read_body = AsyncMock(side_effect=AssertionError("NDJSON must not be buffered for logging"))
+        monkeypatch.setattr(request_logging, "_get_response_body_str", read_body)
+
+        response = TestClient(_make_app()).get("/ndjson-stream")
+
+        assert response.status_code == 200
+        assert response.content == b'{"task_id":"tsk_1"}\n'
+        read_body.assert_not_awaited()
+        assert log_mock.info.call_args.kwargs["response_body"] == "<streaming>"
+
+    @pytest.mark.parametrize("method", ["POST", "GET"])
+    def test_mcp_stream_logs_once_without_reading_body(
+        self, log_mock: MagicMock, method: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        read_body = AsyncMock(side_effect=AssertionError("SSE must not be buffered for logging"))
+        monkeypatch.setattr(request_logging, "_get_response_body_str", read_body)
+        response = TestClient(_make_app()).request(
+            method,
+            "/mcp/?stream=1",
+            content="SYNTHETIC_SECRET_REQUEST",
+        )
+        assert response.status_code == 202
+        assert response.content == b"data: SYNTHETIC_SECRET_RESULT\n\n"
+        read_body.assert_not_awaited()
+        assert len(log_mock.mock_calls) == 1
+        call = log_mock.info.call_args
+        assert call.args == ("api.raw_request",)
+        assert call.kwargs["body"] == REDACTED
+        assert call.kwargs["response_body"] == "<streaming>"
+        assert call.kwargs["status_code"] == 202
+        assert call.kwargs["duration_seconds"] >= 0
+        assert "SYNTHETIC_SECRET" not in repr(call)
+
+    def test_mcp_exception_logs_once_with_redacted_request(self, log_mock: MagicMock) -> None:
+        response = TestClient(_make_app(), raise_server_exceptions=False).request(
+            "GET",
+            "/mcp/boom",
+            content="SYNTHETIC_SECRET_REQUEST",
+            headers={"authorization": "Bearer sk-test-auth"},
+        )
+        assert response.status_code == 500
+        assert len(log_mock.mock_calls) == 1
+        call = log_mock.error.call_args
+        assert call.args == ("api.raw_request",)
+        assert call.kwargs["body"] == REDACTED
+        assert call.kwargs["error_type"] == "builtins.ValueError"
+        assert call.kwargs["status_code"] == 500
+        assert call.kwargs["duration_seconds"] >= 0
+        assert "SYNTHETIC_SECRET" not in repr(call)
+        assert "sk-test-auth" not in repr(call)
+
     def test_scope_rewrite_keeps_unhandled_exception_logging(self, log_mock: MagicMock) -> None:
         app = _make_app()
         app.add_middleware(_ScopeCopyingMiddleware)
@@ -660,10 +992,10 @@ class TestMiddlewareLogVolume:
         assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
 
     def test_api_app_logs_unhandled_exception_with_its_500_response(
-        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
     ) -> None:
         monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        app = real_api_app
 
         @app.get("/_test_request_logging_boom")
         async def boom() -> None:
@@ -691,7 +1023,7 @@ class TestMiddlewareLogVolume:
         monkeypatch.setattr(
             api_app,
             "start_forge_app",
-            lambda: SimpleNamespace(setup_api_app=configure_api_app),
+            lambda **_kwargs: SimpleNamespace(setup_api_app=configure_api_app),
         )
         app = api_app.create_api_app()
 
@@ -707,7 +1039,7 @@ class TestMiddlewareLogVolume:
         assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
 
     def test_authenticated_request_is_attributed_to_its_organization(
-        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
     ) -> None:
         """Per-org error-rate monitors need customer identity on every api.raw_request row.
 
@@ -715,11 +1047,20 @@ class TestMiddlewareLogVolume:
         propagate rebound ContextVars back up to the logging middleware that emits the row.
         """
         monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        app = real_api_app
 
         @app.post("/_test_request_logging_authed")
         async def authed() -> dict:
-            set_request_organization("o_385835488455492960", "Acme Corp")
+            # A same-day org is 0 days old; the record must still carry the age as a number.
+            now = datetime.now(UTC)
+            apply_request_org_context(
+                Organization(
+                    organization_id="o_385835488455492960",
+                    organization_name="Acme Corp",
+                    created_at=now,
+                    modified_at=now,
+                )
+            )
             return {"ok": True}
 
         response = TestClient(app).post("/_test_request_logging_authed")
@@ -728,12 +1069,13 @@ class TestMiddlewareLogVolume:
         logged = log_mock.info.call_args.kwargs
         assert logged["organization_id"] == "o_385835488455492960"
         assert logged["organization_name"] == "Acme Corp"
+        assert type(logged["org_age"]) is int and logged["org_age"] == 0
 
     def test_unhandled_exception_is_attributed_to_its_organization(
-        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
     ) -> None:
         monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        app = real_api_app
 
         @app.post("/_test_request_logging_authed_boom")
         async def boom() -> None:
@@ -745,13 +1087,104 @@ class TestMiddlewareLogVolume:
         assert response.status_code == 500
         assert log_mock.error.call_args.kwargs["organization_id"] == "o_385835488455492960"
 
-    def test_organization_does_not_leak_into_a_later_unauthenticated_request(
+    @pytest.mark.parametrize("allow_bodies", [False, True])
+    @pytest.mark.parametrize("error", [False, True])
+    def test_authenticated_request_bodies_follow_agent_function_policy(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, allow_bodies: bool, error: bool
+    ) -> None:
+        agent_function = AgentFunction() if allow_bodies else _NoRequestBodiesAgentFunction()
+        monkeypatch.setattr(forge_app, "AGENT_FUNCTION", agent_function)
+
+        response = TestClient(_make_app()).post(
+            "/_test_request_logging_org", params={"error": error}, json={"input": "request value"}
+        )
+
+        expected_status = 403 if error else 200
+        assert response.status_code == expected_status
+        logged = (log_mock.warning if error else log_mock.info).call_args.kwargs
+        assert logged["organization_id"] == "o_request_log"
+        assert {"method", "path", "status_code", "duration_seconds"} <= logged.keys()
+        assert ({"body", "response_body", "error_body"} <= logged.keys()) is allow_bodies
+        if allow_bodies:
+            assert agent_function.should_log_request_bodies("o_request_log") is True
+            assert "request value" in logged["body"]
+            if error:
+                assert logged["error_body"] == logged["response_body"]
+            else:
+                assert "accepted" in logged["response_body"]
+
+    @pytest.mark.parametrize("allow_bodies", [False, True])
+    def test_schedule_validation_error_has_safe_classification(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, allow_bodies: bool
+    ) -> None:
+        monkeypatch.setattr(
+            forge_app,
+            "AGENT_FUNCTION",
+            AgentFunction() if allow_bodies else _NoRequestBodiesAgentFunction(),
+        )
+
+        response = TestClient(_make_app()).post(
+            "/api/v1/workflows/wpid_test/schedules",
+            json={"SYNTHETIC_REQUEST_SECRET": "SYNTHETIC_REQUEST_VALUE"},
+        )
+
+        assert response.status_code == 400
+        logged = log_mock.warning.call_args.kwargs
+        assert logged["error_code"] == "missing_schedule_parameters"
+        assert ({"body", "response_body", "error_body"} <= logged.keys()) is allow_bodies
+        if allow_bodies:
+            assert "SYNTHETIC_MISSING_PARAMETER" in logged["error_body"]
+        else:
+            assert "SYNTHETIC_MISSING_PARAMETER" not in repr(log_mock.warning.call_args)
+            assert "SYNTHETIC_REQUEST_SECRET" not in repr(log_mock.warning.call_args)
+            assert "SYNTHETIC_REQUEST_VALUE" not in repr(log_mock.warning.call_args)
+
+    @pytest.mark.parametrize(
+        ("status_code", "response_body"),
+        [
+            (400, '{"detail":"Unknown schedule parameters for workflow wpid_test: name"}'),
+            (403, '{"detail":"Missing schedule parameters for workflow wpid_test: name"}'),
+            (400, "not json"),
+            (400, "[]"),
+        ],
+    )
+    def test_schedule_validation_error_code_ignores_other_responses(self, status_code: int, response_body: str) -> None:
+        assert request_logging._schedule_validation_error_code(status_code, response_body) is None
+
+    def test_unhandled_request_body_is_omitted_when_agent_function_disallows_it(
         self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(api_app, "LOG", MagicMock())
-        app = api_app.create_api_app()
+        monkeypatch.setattr(forge_app, "AGENT_FUNCTION", _NoRequestBodiesAgentFunction())
 
-        @app.post("/_test_request_logging_authed")
+        response = TestClient(_make_app(), raise_server_exceptions=False).post(
+            "/_test_request_logging_org_boom", json={"input": "request value"}
+        )
+
+        assert response.status_code == 500
+        logged = log_mock.error.call_args.kwargs
+        assert logged["organization_id"] == "o_request_log"
+        assert "body" not in logged
+        assert {"method", "path", "status_code", "duration_seconds"} <= logged.keys()
+
+    def test_request_without_resolved_organization_keeps_body_logging(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(forge_app, "AGENT_FUNCTION", _NoRequestBodiesAgentFunction())
+
+        response = TestClient(_make_app()).post("/tasks", json={"input": "request value"})
+
+        assert response.status_code == 200
+        logged = log_mock.info.call_args.kwargs
+        assert "organization_id" not in logged
+        assert {"body", "response_body", "error_body"} <= logged.keys()
+
+    def test_organization_does_not_leak_into_a_later_unauthenticated_request(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, real_api_app: FastAPI
+    ) -> None:
+        monkeypatch.setattr(api_app, "LOG", MagicMock())
+        app = real_api_app
+
+        @app.post("/_test_request_logging_authed_then_anonymous")
         async def authed() -> dict:
             set_request_organization("o_385835488455492960", "Acme Corp")
             return {"ok": True}
@@ -761,7 +1194,7 @@ class TestMiddlewareLogVolume:
             return {"ok": True}
 
         client = TestClient(app)
-        client.post("/_test_request_logging_authed")
+        client.post("/_test_request_logging_authed_then_anonymous")
         response = client.post("/_test_request_logging_anonymous")
 
         assert response.status_code == 200
@@ -813,11 +1246,26 @@ class TestMiddlewareLogVolume:
 
     def test_successful_post_is_logged(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
-        response = client.post("/tasks")
+        response = client.post("/tasks", headers={"user-agent": "Zapier"})
         assert response.status_code == 200
         log_mock.info.assert_called_once()
         assert log_mock.info.call_args.args[0] == "api.raw_request"
+        assert log_mock.info.call_args.kwargs["integration_platform"] == "zapier"
         assert log_mock.info.call_count + log_mock.warning.call_count + log_mock.error.call_count == 1
+
+    def test_normalized_platform_is_available_to_run_routes(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app())
+        response = client.post("/integration-platform", headers={"user-agent": "n8n"})
+
+        assert response.status_code == 200
+        assert response.json() == {"integration_platform": "n8n"}
+        assert log_mock.info.call_args_list[0].kwargs["integration_platform"] == "n8n"
+
+        missing_user_agent = client.post("/integration-platform", headers={"user-agent": ""})
+
+        assert missing_user_agent.status_code == 200
+        assert missing_user_agent.json() == {"integration_platform": None}
+        assert "integration_platform" not in log_mock.info.call_args.kwargs
 
     def test_successful_post_survives_log_failure(self, log_mock: MagicMock) -> None:
         log_mock.info.side_effect = RuntimeError("log sink unavailable")
@@ -835,6 +1283,15 @@ class TestMiddlewareLogVolume:
         log_mock.warning.assert_called_once()
         assert log_mock.warning.call_args.args[0] == "api.raw_request"
         assert log_mock.warning.call_args.kwargs["status_code"] == 403
+
+    @pytest.mark.parametrize(("path", "level"), [("/runs/shed", "warning"), ("/runs/unavailable", "error")])
+    def test_shed_run_submission_logs_at_warning_while_other_503s_stay_errors(
+        self, log_mock: MagicMock, path: str, level: str
+    ) -> None:
+        response = TestClient(_make_app()).post(path)
+
+        assert response.status_code == 503
+        assert [(call[0], call.kwargs["status_code"]) for call in log_mock.mock_calls] == [(level, 503)]
 
     def test_artifact_url_queries_are_redacted_from_logged_bodies(self, log_mock: MagicMock) -> None:
         client = TestClient(_make_app())
@@ -862,11 +1319,12 @@ class TestMiddlewareLogVolume:
         self, log_mock: MagicMock, unhandled_exception_status: int
     ) -> None:
         client = TestClient(_make_app(unhandled_exception_status), raise_server_exceptions=False)
-        response = client.get("/boom")
+        response = client.get("/boom", headers={"user-agent": "Workato"})
         assert response.status_code == unhandled_exception_status
         log_mock.error.assert_called_once()
         assert log_mock.error.call_args.args[0] == "api.raw_request"
         assert log_mock.error.call_args.kwargs["status_code"] == response.status_code
+        assert log_mock.error.call_args.kwargs["integration_platform"] == "workato"
 
     def test_exception_path_reraises_the_original_error_if_logging_fails(self, log_mock: MagicMock) -> None:
         log_mock.error.side_effect = RuntimeError("log sink unavailable")
@@ -930,6 +1388,99 @@ class TestMiddlewareLogVolume:
         log_mock.info.assert_not_called()
 
 
+# The API's container log driver splits a longer stdout line into partial records that Datadog
+# indexes as unparsed text, so the row loses @status_code and @path.
+_LOG_DRIVER_LINE_LIMIT_BYTES = 16 * 1024
+# Deep enough that the traceback alone passes the limit, as production pool-timeout errors do.
+_ROUTE_CALL_DEPTH = 25
+_TEST_ORGANIZATION_ID = "o_385835488455492960"
+
+
+def _raise_from_depth(depth: int) -> None:
+    if depth == 0:
+        raise RuntimeError("connection pool exhausted")
+    _call_deeper(depth - 1)
+
+
+def _call_deeper(depth: int) -> None:
+    # Alternating frames keep the traceback from collapsing into "[Previous line repeated]".
+    _raise_from_depth(depth)
+
+
+def _raw_request_lines(stream: io.StringIO) -> list[tuple[str, dict]]:
+    lines = [line for line in stream.getvalue().splitlines() if line]
+    records = [(line, json.loads(line)) for line in lines]
+    return [(line, record) for line, record in records if record.get("msg", "").startswith("api.raw_request")]
+
+
+@pytest.fixture(scope="module")
+def raw_request_app(real_api_app: FastAPI) -> FastAPI:
+    app = real_api_app
+
+    @app.post("/_test_raw_request/raises")
+    async def raises() -> None:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+        _raise_from_depth(_ROUTE_CALL_DEPTH)
+
+    @app.post("/_test_raw_request/database-unavailable")
+    async def database_unavailable() -> None:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+        raise OperationalError(
+            "SELECT 1", {}, psycopg.errors.ConnectionFailure("server closed the connection unexpectedly")
+        )
+
+    @app.post("/_test_raw_request/returns-500")
+    async def returns_500() -> JSONResponse:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+        return JSONResponse(status_code=500, content={"detail": "failed"})
+
+    @app.post("/_test_raw_request/stream-raises")
+    async def stream_raises() -> StreamingResponse:
+        set_request_organization(_TEST_ORGANIZATION_ID, "Test Org")
+
+        async def events() -> typing.AsyncIterator[bytes]:
+            yield b"data: first\n\n"
+            _raise_from_depth(_ROUTE_CALL_DEPTH)
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    return app
+
+
+class TestRenderedRawRequestLine:
+    """Each failed request must reach the log collector as one parseable api.raw_request line."""
+
+    @pytest.mark.parametrize(
+        ("path", "client_status", "error_type"),
+        [
+            ("/_test_raw_request/raises", 500, "builtins.RuntimeError"),
+            ("/_test_raw_request/database-unavailable", 503, None),
+            ("/_test_raw_request/returns-500", 500, None),
+            ("/_test_raw_request/stream-raises", 200, "builtins.RuntimeError"),
+        ],
+        ids=["unhandled-exception", "database-unavailable", "handled-500", "exception-after-stream-start"],
+    )
+    def test_api_app_failure_logs_one_line_the_collector_keeps_whole(
+        self,
+        rendered_log_stream: io.StringIO,
+        raw_request_app: FastAPI,
+        path: str,
+        client_status: int,
+        error_type: str | None,
+    ) -> None:
+        response = TestClient(raw_request_app, raise_server_exceptions=False).post(path)
+
+        assert response.status_code == client_status
+        [(line, record)] = _raw_request_lines(rendered_log_stream)
+        assert len(line.encode()) <= _LOG_DRIVER_LINE_LIMIT_BYTES
+        assert record["level"] == "error"
+        assert record["path"] == path
+        assert record["status_code"] == client_status
+        assert record["organization_id"] == _TEST_ORGANIZATION_ID
+        assert record["duration_seconds"] >= 0
+        assert record.get("error_type") == error_type
+
+
 class TestClientDisconnectDuringBodyRead:
     """A client closing the connection mid-body must not surface as an unhandled error."""
 
@@ -990,3 +1541,55 @@ class TestRawRequestLogLevel:
         assert log_mock.warning.call_args.args[0] == "api.raw_request"
         assert log_mock.warning.call_args.kwargs["status_code"] == status_code
         log_mock.info.assert_not_called()
+
+
+@pytest.mark.parametrize("status_code", [200, 403, 500])
+def test_copilot_recovery_capabilities_never_enter_request_logs(
+    log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)
+    app = _make_app()
+    recovery_proof = "a" * 64
+    selection_token = "synthetic-selection-capability"
+
+    @app.get("/v1/workflow/copilot/chat-history")
+    async def history() -> dict:
+        if status_code == 403:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if status_code == 500:
+            raise RuntimeError("Synthetic history failure")
+        return {"pending_credential_requests": [{"resume_token": selection_token, "turn_id": "turn"}]}
+
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/v1/workflow/copilot/chat-history",
+        headers={"X-Copilot-Credential-Recovery-Token": recovery_proof, "X-Request-ID": "request"},
+    )
+    assert response.status_code == status_code
+    logger = log_mock.info if status_code == 200 else log_mock.warning if status_code == 403 else log_mock.error
+    logger.assert_called_once()
+    fields = logger.call_args.kwargs
+    assert fields["headers"]["x-request-id"] == "request"
+    assert "x-copilot-credential-recovery-token" not in fields["headers"]
+    assert recovery_proof not in str(log_mock.mock_calls)
+    assert selection_token not in str(log_mock.mock_calls)
+    if status_code == 200:
+        assert response.json()["pending_credential_requests"][0]["resume_token"] == selection_token
+        assert json.loads(fields["response_body"])["pending_credential_requests"] == [
+            {"resume_token": REDACTED, "turn_id": "turn"}
+        ]
+
+
+def test_structured_recovery_capabilities_are_redacted_without_masking_turn_identity() -> None:
+    assert redact_sensitive_fields(
+        {
+            "headers": {"X-Copilot-Credential-Recovery-Token": "synthetic-proof"},
+            "credential_recovery_token": "synthetic-proof",
+            "resume_token": "synthetic-selection",
+            "turn_id": "turn",
+        }
+    ) == {
+        "headers": {"X-Copilot-Credential-Recovery-Token": REDACTED},
+        "credential_recovery_token": REDACTED,
+        "resume_token": REDACTED,
+        "turn_id": "turn",
+    }

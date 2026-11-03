@@ -1,6 +1,7 @@
 import os
 import re
 import tempfile
+from collections.abc import Iterator
 from typing import Any
 
 import structlog
@@ -9,22 +10,27 @@ from fastapi import HTTPException
 from skyvern.config import settings
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
+from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file
-from skyvern.schemas.workflows import WorkflowCreateYAMLRequest
+from skyvern.schemas.workflows import (
+    BLOCK_NOTE_MAX_LENGTH,
+    WorkflowCreateYAMLRequest,
+)
 
 LOG = structlog.get_logger(__name__)
 
 
 class PDFImportService:
     @staticmethod
-    def _sanitize_workflow_json(raw: dict[str, Any]) -> dict[str, Any]:
+    def _sanitize_workflow_json(raw: dict[str, Any], *, doc_editor_enabled: bool = False) -> dict[str, Any]:
         """Clean LLM JSON to match Skyvern schema conventions and avoid Jinja errors.
 
         - Replace whitespace in block labels with underscores
         - Replace Jinja refs like {{workflow.foo}} or {{parameters.foo}} with {{foo}}
         - Auto-populate block.parameter_keys with any referenced parameter keys
         - Ensure all block labels are unique by appending indices to duplicates
+        - Repair generated notes to the persisted-note contract
         """
 
         def strip_prefixes(text: str) -> tuple[str, set[str]]:
@@ -42,16 +48,51 @@ class PDFImportService:
                 used.add(base)
             return cleaned, used
 
+        def sanitize_note(value: Any) -> str | None:
+            if not isinstance(value, str):
+                return None
+            # PDF imports have no safe source for a note template. Keep the explanatory text but
+            # remove every Jinja delimiter so malformed or credential-backed expressions cannot
+            # make the imported workflow fail schema validation.
+            cleaned = value
+            for opening, closing in (("{{", "}}"), ("{%", "%}"), ("{#", "#}")):
+                cleaned = cleaned.replace(opening, "").replace(closing, "")
+            return cleaned[:BLOCK_NOTE_MAX_LENGTH]
+
+        def iter_blocks(nested_blocks: list[Any]) -> Iterator[dict[str, Any]]:
+            """Yield every block, including children in any nested block-list field."""
+            for block in nested_blocks:
+                if not isinstance(block, dict):
+                    continue
+                yield block
+                for key, value in block.items():
+                    if key.endswith("blocks") and isinstance(value, list):
+                        yield from iter_blocks(value)
+
         workflow_def = raw.get("workflow_definition", {})
         param_defs = workflow_def.get("parameters", []) or []
         param_keys = {p.get("key") for p in param_defs if isinstance(p, dict) and p.get("key")}
 
         blocks = workflow_def.get("blocks", []) or []
+        all_blocks = list(iter_blocks(blocks))
+        keep_notes = doc_editor_enabled and settings.WORKFLOW_PDF_IMPORT_NOTES_ENABLED
+        for blk in all_blocks:
+            for field in ("notes", "trailing_notes"):
+                if not keep_notes:
+                    blk.pop(field, None)
+                elif field in blk:
+                    note = sanitize_note(blk[field])
+                    if note is None:
+                        blk.pop(field)
+                    else:
+                        blk[field] = note
+        # The nested clean-up ships with the Doc editor; with the flag off only top-level blocks are cleaned, as before.
+        cleaned_blocks = [blk for blk in blocks if isinstance(blk, dict)]
+        # shortcut: nested labels are not deduplicated; upgrade when reference ownership is unambiguous.
+        label_blocks = all_blocks if doc_editor_enabled else cleaned_blocks
 
         # First pass: sanitize block labels (replace whitespace with underscores)
-        for blk in blocks:
-            if not isinstance(blk, dict):
-                continue
+        for blk in label_blocks:
             label = blk.get("label", "")
             if label:
                 # Replace any whitespace with underscores (same as frontend behavior)
@@ -67,9 +108,7 @@ class PDFImportService:
         # Second pass: deduplicate block labels
         seen_labels: dict[str, int] = {}
         deduplicated_count = 0
-        for blk in blocks:
-            if not isinstance(blk, dict):
-                continue
+        for blk in cleaned_blocks:
             label = blk.get("label", "")
             if not label:
                 continue
@@ -96,9 +135,7 @@ class PDFImportService:
                 total_deduplicated=deduplicated_count,
                 duplicate_labels=sorted([label for label, count in seen_labels.items() if count > 1]),
             )
-        for blk in blocks:
-            if not isinstance(blk, dict):
-                continue
+        for blk in cleaned_blocks:
             referenced: set[str] = set()
             # Fields that commonly contain Jinja
             for field in [
@@ -117,7 +154,7 @@ class PDFImportService:
 
             # A non-null prompt is what makes the editor render the code-first node; "" is
             # runtime-neutral (every backend prompt check is truthiness based) and leaves the
-            # Goal for the user, because a fabricated one would arm runtime self-heal.
+            # Goal for the user, because a fabricated one would arm the AI fallback.
             if blk.get("block_type") == "code" and "prompt" not in blk:
                 blk["prompt"] = ""
 
@@ -144,17 +181,12 @@ class PDFImportService:
                 if keys_to_include:
                     blk["parameter_keys"] = keys_to_include
 
-            # Ensure engine where needed
-            if blk.get("block_type") in {"navigation", "action", "extraction", "login", "file_download"}:
-                blk.setdefault("engine", "skyvern-1.0")
-
             # Ensure url exists (can be empty string)
-            if blk.get("block_type") in {"navigation", "action", "extraction", "file_download"}:
-                if blk.get("url") is None:
-                    blk["url"] = ""
-
-            # Note: parameter_keys is kept in backend format for WorkflowCreateYAMLRequest validation
-            # The sop-to-blocks endpoint transforms to frontend format separately
+            if (
+                blk.get("block_type") in {"navigation", "action", "extraction", "file_download"}
+                and blk.get("url") is None
+            ):
+                blk["url"] = ""
 
         return raw
 
@@ -192,12 +224,15 @@ class PDFImportService:
             # Clean up the temporary file
             os.unlink(temp_file_path)
 
-    async def create_workflow_from_sop_text(self, sop_text: str, organization: Organization) -> dict[str, Any]:
+    async def create_workflow_from_sop_text(
+        self, sop_text: str, organization: Organization, *, doc_editor_enabled: bool = False
+    ) -> dict[str, Any]:
         """Convert SOP text to workflow definition using LLM (does not create the workflow)."""
         # Load and render the prompt template
         prompt = prompt_engine.load_prompt(
             "build-workflow-from-pdf",
             sop_text=sop_text,
+            doc_editor_enabled=doc_editor_enabled and settings.WORKFLOW_PDF_IMPORT_NOTES_ENABLED,
         )
 
         # Use the LLM to convert SOP to workflow
@@ -222,8 +257,7 @@ class PDFImportService:
 
         LOG.info(
             "LLM response received",
-            response_type=type(response),
-            response_keys=list(response.keys()) if isinstance(response, dict) else None,
+            **llm_response_log_metadata(response),
             organization_id=organization.organization_id,
         )
 
@@ -232,8 +266,7 @@ class PDFImportService:
         if not isinstance(response, dict):
             LOG.error(
                 "LLM returned non-dict response",
-                response_type=type(response),
-                response=str(response)[:500],
+                **llm_response_log_metadata(response),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(status_code=422, detail="LLM returned invalid response format - expected JSON object")
@@ -242,7 +275,7 @@ class PDFImportService:
         if response.get("error") == "not_sop":
             LOG.info(
                 "LLM detected non-SOP content",
-                reason=response.get("reason"),
+                **llm_response_log_metadata(response),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(
@@ -256,7 +289,7 @@ class PDFImportService:
         if "workflow_definition" not in response:
             LOG.error(
                 "LLM response missing workflow_definition",
-                response_keys=list(response.keys()),
+                **llm_response_log_metadata(response),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(status_code=422, detail="LLM response missing 'workflow_definition' field")
@@ -264,29 +297,27 @@ class PDFImportService:
         if "blocks" not in response.get("workflow_definition", {}):
             LOG.error(
                 "LLM workflow_definition missing blocks",
-                workflow_def_keys=list(response.get("workflow_definition", {}).keys()),
+                workflow_def_keys_count=len(response.get("workflow_definition", {})),
                 organization_id=organization.organization_id,
             )
             raise HTTPException(status_code=422, detail="LLM workflow definition missing 'blocks' field")
 
         try:
             # Sanitize LLM output for Jinja and required fields before validation
-            response = self._sanitize_workflow_json(response)
+            response = self._sanitize_workflow_json(response, doc_editor_enabled=doc_editor_enabled)
             workflow_create_request = WorkflowCreateYAMLRequest.model_validate(response)
 
             LOG.info(
                 "Workflow JSON validated successfully",
-                title=response.get("title"),
+                **llm_response_log_metadata(response),
                 block_count=len(response.get("workflow_definition", {}).get("blocks", [])),
                 organization_id=organization.organization_id,
             )
         except Exception as e:
             LOG.error(
                 "Failed to validate workflow request",
-                error=str(e),
                 error_type=type(e).__name__,
                 organization_id=organization.organization_id,
-                exc_info=True,
             )
             raise HTTPException(
                 status_code=422,

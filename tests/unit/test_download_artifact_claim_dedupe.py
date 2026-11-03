@@ -4,41 +4,41 @@ A persistent-session download can be registered twice for one run: session-produ
 writes a DOWNLOAD row with ``browser_session_id`` set — already run-bound today, or claimed later) and
 run-scoped (the local save writes a DOWNLOAD row with ``browser_session_id`` NULL). Both are the same
 bytes, so the run-scoped read (``get_downloaded_files``) must surface one entry per distinct download.
-These tests drive the real reader on an in-memory DB (schema from the ORM), not mocks.
+These tests drive the real reader on a SQLite DB (schema from the ORM), not mocks.
 """
 
 from __future__ import annotations
 
 import datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage import base as base_module
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.db.agent_db import AgentDB, _build_engine
-from skyvern.forge.sdk.db.models import Base
+from skyvern.forge.sdk.db.models import ArtifactModel
+from tests.unit.conftest import SqliteEngineFactory
 
 _DUMMY_KEYRING_JSON = '{"current_kid": "k1", "keys": {"k1": {"secret": "deadbeef"}}}'
 _WINDOW_START = datetime.datetime.now(datetime.UTC).replace(tzinfo=None) - datetime.timedelta(days=1)
 
 
 @pytest_asyncio.fixture
-async def sqlite_engine() -> AsyncEngine:
-    engine = _build_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    return engine
+async def sqlite_engine(sqlite_engine_factory: SqliteEngineFactory) -> AsyncEngine:
+    return sqlite_engine_factory(build_engine=_build_engine)
 
 
 @pytest_asyncio.fixture
 async def sqlite_db(sqlite_engine: AsyncEngine) -> AgentDB:
-    return AgentDB("sqlite+aiosqlite:///:memory:", db_engine=sqlite_engine)
+    return AgentDB(str(sqlite_engine.url), db_engine=sqlite_engine)
 
 
 async def _make(
@@ -49,6 +49,7 @@ async def _make(
     run_id: str | None,
     browser_session_id: str | None,
     checksum: str | None,
+    timestamp: datetime.datetime | None = None,
 ) -> str:
     bucket = "skyvern-artifacts/v1/production" if browser_session_id else "skyvern-uploads/downloads/production"
     await db.artifacts.create_artifact(
@@ -61,6 +62,14 @@ async def _make(
         checksum=checksum,
         file_size=192867,
     )
+    if timestamp is not None:
+        async with db.artifacts.Session() as session:
+            await session.execute(
+                update(ArtifactModel)
+                .where(ArtifactModel.artifact_id == aid)
+                .values(created_at=timestamp, modified_at=timestamp)
+            )
+            await session.commit()
     return aid
 
 
@@ -116,6 +125,26 @@ async def test_run_scoped_read_keeps_session_download_without_run_scoped_twin(
     await _make(sqlite_db, org_id, "a_session_only", run_id=run_id, browser_session_id=session_id, checksum="c1")
 
     assert await _run_scoped_ids(sqlite_db, org_id, run_id, monkeypatch) == {"a_session_only"}
+
+
+@pytest.mark.asyncio
+async def test_session_download_claim_skips_rejected_uris(sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    org = await sqlite_db.organizations.create_organization("Test Org rejected")
+    org_id, session_id, run_id = org.organization_id, "pbs_rejected", "wr_rejected"
+    await _make(sqlite_db, org_id, "a_session_valid", run_id=None, browser_session_id=session_id, checksum="valid")
+    await _make(sqlite_db, org_id, "a_session_rejected", run_id=None, browser_session_id=session_id, checksum="bad")
+    rejected_uri = f"s3://skyvern-artifacts/v1/production/{org_id}/a_session_rejected.pdf"
+
+    claimed = await sqlite_db.artifacts.claim_session_download_artifacts_for_run(
+        run_id=run_id,
+        browser_session_id=session_id,
+        organization_id=org_id,
+        run_started_at=_WINDOW_START,
+        excluded_uris=[rejected_uri],
+    )
+
+    assert claimed == 1
+    assert await _run_scoped_ids(sqlite_db, org_id, run_id, monkeypatch) == {"a_session_valid"}
 
 
 @pytest.mark.asyncio
@@ -201,3 +230,42 @@ async def test_run_scoped_read_pairs_same_content_session_rows_one_for_one(
     assert len(visible) == 2, f"expected the run-scoped row plus exactly one session twin, got {visible}"
     assert "a_run_scoped" in visible, f"run-scoped canonical must survive, got {visible}"
     assert len(visible & {"a_session_a", "a_session_b"}) == 1, f"exactly one session twin must survive, got {visible}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_names", "expected_ids"),
+    [
+        pytest.param(("r1", "s2"), ["a_s2"], id="two-row"),
+        pytest.param(("s1", "r1", "s2"), ["a_s2"], id="three-row"),
+        pytest.param(("s1", "r1", "s2", "r2"), ["a_r2"], id="four-row"),
+        pytest.param(("s1", "r1"), [], id="stale-only"),
+    ],
+)
+async def test_current_attempt_downloads_pair_only_current_artifacts(
+    sqlite_db: AgentDB, monkeypatch: pytest.MonkeyPatch, row_names: tuple[str, ...], expected_ids: list[str]
+) -> None:
+    org = await sqlite_db.organizations.create_organization("Test")
+    org_id, session_id, run_id = org.organization_id, "pbs_retry", "wr_retry"
+    cutoff = datetime.datetime(2026, 9, 9, 12, tzinfo=datetime.UTC)
+    for row_name in row_names:
+        timestamp = cutoff + datetime.timedelta(seconds={"s1": -2, "r1": -1, "s2": 0, "r2": 1}[row_name])
+        await _make(
+            sqlite_db,
+            org_id,
+            f"a_{row_name}",
+            run_id=run_id,
+            browser_session_id=session_id if row_name.startswith("s") else None,
+            checksum="same-content",
+            timestamp=timestamp.replace(tzinfo=None),
+        )
+    storage = _install_storage(sqlite_db, monkeypatch)
+    monkeypatch.setattr(base_module, "resolve_download_attempt", AsyncMock(return_value=(run_id, 2, cutoff)))
+
+    files = await storage.get_current_attempt_downloaded_files(organization_id=org_id, run_id=run_id)
+
+    assert [file.artifact_id for file in files] == expected_ids
+    storage.async_client.list_files.assert_not_called()
+    if "r2" in row_names:
+        whole_run_files = await storage.get_downloaded_files(organization_id=org_id, run_id=run_id)
+        assert {file.artifact_id for file in whole_run_files} == {"a_r1", "a_r2"}

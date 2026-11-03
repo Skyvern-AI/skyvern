@@ -44,6 +44,10 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagVariantKey: () => undefined,
   useFeatureFlagEnabled: () => false,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagVariantKey: () => undefined,
+  usePostHogFeatureFlagEnabled: () => false,
+}));
 
 const runsQueryCalls: Array<Record<string, unknown>> = [];
 
@@ -367,5 +371,14 @@ describe("RunHistory inputs during filtering", () => {
     expect(runsQueryCalls[runsQueryCalls.length - 1]?.runTypeFilters).toEqual(
       [],
     );
+  });
+});
+
+describe("RunHistory refetch policy", () => {
+  it("leaves filtered list refreshes to the existing query policy", () => {
+    renderRunHistory();
+    expect(runsQueryCalls.length).toBeGreaterThan(0);
+    for (const options of runsQueryCalls)
+      expect(options.refetchInterval).toBeUndefined();
   });
 });

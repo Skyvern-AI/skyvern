@@ -6,7 +6,11 @@ LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE = "LLMProviderErrorRetryableTask"
 
 
 class BaseLLMError(SkyvernException):
-    pass
+    # Stamped by the handler the error escaped from. Response-shape errors are raised deep in
+    # parsing, where neither is known, so callers that only see the exception (e.g. the complete
+    # verification) can't otherwise say which model route and prompt produced it.
+    llm_key: str | None = None
+    prompt_name: str | None = None
 
 
 class MissingLLMProviderEnvVarsError(BaseLLMError):
@@ -67,9 +71,18 @@ class LLMProviderErrorRetryableTask(LLMProviderError):
 
 
 class LLMOutputTruncatedError(InvalidLLMResponseFormat):
-    def __init__(self, model: str, prompt_tokens: int, completion_tokens: int, reasoning_tokens: int) -> None:
+    def __init__(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        reasoning_tokens: int,
+        finish_reason: str | None = None,
+    ) -> None:
+        # The reason is reported, not assumed: upstreams label an answer-less reply `length` or
+        # `stop` for the same underlying spend, and the two are only tellable apart here.
         super().__init__(
-            f"LLM output truncated (finish_reason=length, content=None). "
+            f"LLM output truncated (finish_reason={finish_reason}, content=None). "
             f"model={model}, prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}, "
             f"reasoning_tokens={reasoning_tokens}"
         )
@@ -77,6 +90,19 @@ class LLMOutputTruncatedError(InvalidLLMResponseFormat):
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.reasoning_tokens = reasoning_tokens
+        self.finish_reason = finish_reason
+
+
+# A response-shape error rather than a provider error: the model answered, so callers that hold or re-ask on an
+# unusable reply keep doing that instead of treating the model as unreachable.
+class LLMContentFilteredError(InvalidLLMResponseFormat):
+    def __init__(self, llm_key: str, models: list[str]) -> None:
+        SkyvernException.__init__(
+            self,
+            f"The model refused or its content filter blocked the response on {', then '.join(models)} "
+            f"(LLM key {llm_key})",
+        )
+        self.llm_key = llm_key
 
 
 class NoProviderEnabledError(BaseLLMError):

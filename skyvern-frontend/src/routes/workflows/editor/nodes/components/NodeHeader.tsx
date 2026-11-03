@@ -1,3 +1,18 @@
+import {
+  SaveRefusedError,
+  SaveStaleError,
+  useWorkflowHasChangesStore,
+  useWorkflowSave,
+} from "@/store/WorkflowHasChangesStore";
+import {
+  isEditorMutationLocked,
+  selectEditorMutationLocked,
+  useWorkflowYamlEditorStore,
+} from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import { runIsRetryWaiting } from "@/routes/workflows/workflowRun/runRetryState";
+import { claimRunCompletionNotice } from "@/routes/workflows/workflowRun/runCompletionNotices";
+import { useRunCompletionToast } from "@/routes/workflows/workflowRun/useRunCompletionToast";
 import { AxiosError } from "axios";
 import {
   ChevronDownIcon,
@@ -7,10 +22,12 @@ import {
   StopIcon,
 } from "@radix-ui/react-icons";
 import { useEffect, useRef, useState } from "react";
+import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useReactFlow } from "@xyflow/react";
+import { usePostHog } from "posthog-js/react";
 
 import { getClient } from "@/api/AxiosClient";
 import {
@@ -60,26 +77,24 @@ import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useDebugStore } from "@/store/useDebugStore";
+import { useMissingStartUrlStore } from "@/store/MissingStartUrlStore";
+import { useReviewAnnotation } from "../../review/reviewAnnotation";
+import { ReviewBlockChanges, ReviewStatusChip } from "../../review/ReviewParts";
 import {
   RUN_APPEND_PANES,
-  STUDIO_PANES_PARAM,
   withPanesOpen,
 } from "@/routes/workflows/studio/panes";
+import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
-import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
-import { useWorkflowSave } from "@/store/WorkflowHasChangesStore";
+
 import {
   useWorkflowSettingsStore,
   type WorkflowSettingsState,
 } from "@/store/WorkflowSettingsStore";
 import { getJsonParseErrorDetail } from "@/util/jsonParseError";
 import { cn, formatDate, toDate } from "@/util/utils";
-import {
-  statusIsAFailureType,
-  statusIsFinalized,
-  statusIsRunningOrQueued,
-} from "@/routes/tasks/types";
+import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 
 import {
   Tooltip,
@@ -95,7 +110,11 @@ import { workflowBlockTitle } from "../types";
 import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
 import type { AppNode } from "..";
-import { getWorkflowErrors } from "../../workflowEditorUtils";
+import {
+  blockRunErrors,
+  isMissingRequiredStartUrl,
+} from "../../workflowEditorUtils";
+import { getNodeBrowserUrlError } from "../../browserBlockUrl";
 import { NodeGripHandle } from "./NodeGripHandle";
 import {
   getDragGateReason,
@@ -145,6 +164,9 @@ interface Props {
   disabled?: boolean;
   editable: boolean;
   extraActions?: React.ReactNode;
+  // Mounted by the Doc for a step the canvas does not render: runs and registers
+  // the play handle, and renders only the run dialogs.
+  headless?: boolean;
   // Driven by useSortable in the parent HOC; defaults to false so this
   // file ships a static affordance with no behavioural change at call sites.
   isDragging?: boolean;
@@ -245,6 +267,7 @@ function NodeHeader({
   disabled = false,
   editable,
   extraActions,
+  headless = false,
   isDragging = false,
   nodeId,
   totpIdentifier,
@@ -253,18 +276,21 @@ function NodeHeader({
   type,
 }: Props) {
   const log = useLogging();
+  const postHog = usePostHog();
   const mode = useWorkflowEditorMode();
   const workflowPermanentId = useWorkflowPermanentId();
   const { workflowRunId: activeWorkflowRunId, blockLabel: targetBlockLabel } =
     useBlockRunTarget();
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
-  const recordingStore = useRecordingStore();
   const isCollapsed = useIsBlockCollapsed(blockLabel);
   const toggleBlockCollapsed = useNodeCollapseStore((s) => s.toggleBlock);
   const isCollapsible = collapsibleWorkflowBlockTypes.has(type);
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
+  const reviewAnnotation = useReviewAnnotation();
+  const blockReview =
+    reviewAnnotation?.kind === "block" ? reviewAnnotation : null;
   const [label, setLabel] = useNodeLabelChangeHandler({
     id: nodeId,
     initialValue: blockLabel,
@@ -279,7 +305,7 @@ function NodeHeader({
   const studioEnabled = useWorkflowStudioEnabled();
   const queryClient = useQueryClient();
   const location = useLocation();
-  const { resolveLivePanes } = useStudioPanes();
+  const { resolveLivePanes, preserveNextEntry } = useStudioPanes();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const {
@@ -289,15 +315,14 @@ function NodeHeader({
   } = useWorkflowRunQuery({
     workflowRunId: activeWorkflowRunId,
   });
-  // keepPreviousData serves the last run's payload after the target run changes
-  // or clears, and clearing it also disables the query — so a retained
-  // "running" payload would otherwise keep every block's play control inert.
-  const runStateIsLive =
-    !statusUnavailable &&
-    !isPlaceholderData &&
-    workflowRun?.workflow_run_id === activeWorkflowRunId;
+  // The hook withholds another run's payload, but not one retained across an org
+  // switch — that changes the query key while the run id stays the same.
+  const runStateIsLive = !statusUnavailable && !isPlaceholderData;
   const workflowRunIsRunningOrQueued =
-    runStateIsLive && workflowRun && statusIsRunningOrQueued(workflowRun);
+    runStateIsLive &&
+    workflowRun &&
+    (statusIsRunningOrQueued(workflowRun) || runIsRetryWaiting(workflowRun));
+  useRunCompletionToast(runStateIsLive && !headless ? workflowRun : undefined);
   const { isRateLimited } = useBrowserSessionRateLimit(workflowPermanentId);
   const { data: debugSession } = useDebugSessionQuery({
     workflowPermanentId,
@@ -316,8 +341,6 @@ function NodeHeader({
 
   const thisBlockIsTargetted =
     targetBlockLabel !== undefined && targetBlockLabel === blockLabel;
-
-  const isRecording = recordingStore.isRecording;
 
   const [workflowRunStatus, setWorkflowRunStatus] = useState(
     workflowRun?.status,
@@ -344,7 +367,7 @@ function NodeHeader({
   const { getAutoplay, setAutoplay } = useAutoplayStore();
 
   useEffect(() => {
-    if (!debugSession) {
+    if (!debugSession || headless) {
       return;
     }
 
@@ -356,7 +379,7 @@ function NodeHeader({
     ) {
       setAutoplay(null, null);
       setTimeout(() => {
-        runBlock.mutateAsync({ codeGen: true });
+        runBlock.mutate({ codeGen: true });
       }, 100);
     }
 
@@ -380,45 +403,8 @@ function NodeHeader({
     }
   });
 
-  useEffect(() => {
-    if (
-      !workflowRun ||
-      !workflowPermanentId ||
-      !activeWorkflowRunId ||
-      // Only block-scoped runs toast per block; full runs report via the run
-      // surfaces (?wr= without ?bl=).
-      targetBlockLabel === undefined
-    ) {
-      return;
-    }
-
-    if (
-      activeWorkflowRunId === workflowRun?.workflow_run_id &&
-      statusIsFinalized(workflowRun)
-    ) {
-      if (statusIsAFailureType(workflowRun)) {
-        toast({
-          variant: "destructive",
-          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
-          description: `Reason: ${workflowRun.failure_reason}`,
-        });
-      } else if (statusIsFinalized(workflowRun)) {
-        toast({
-          variant: "success",
-          title: `Agent Block ${targetBlockLabel}: ${workflowRun.status}`,
-        });
-      }
-    }
-  }, [
-    queryClient,
-    targetBlockLabel,
-    navigate,
-    workflowPermanentId,
-    workflowRun,
-    activeWorkflowRunId,
-  ]);
-
   const runBlock = useMutation({
+    mutationKey: ["runBlock"],
     mutationFn: async (opts?: {
       codeGen: boolean;
       parameterOverrides?: Record<string, unknown>;
@@ -432,9 +418,24 @@ function NodeHeader({
       // one. Filter relies on the implicit contract that every validator
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
-      const allErrors = getWorkflowErrors(reactFlow.getNodes());
-      const labelPrefix = `${blockLabel}:`;
-      const blockErrors = allErrors.filter((e) => e.startsWith(labelPrefix));
+      const blockErrors = blockRunErrors(reactFlow.getNodes(), blockLabel);
+      if (
+        isMissingRequiredStartUrl(
+          reactFlow.getNodes(),
+          reactFlow.getEdges(),
+          nodeId,
+        )
+      ) {
+        useMissingStartUrlStore.getState().flag(nodeId);
+        blockErrors.push(
+          `${blockLabel}: URL is required. No earlier block opens a page, so the run would start on a blank page.`,
+        );
+      }
+      const thisNode = reactFlow.getNode(nodeId) as AppNode | undefined;
+      const urlError = thisNode ? getNodeBrowserUrlError(thisNode) : null;
+      if (urlError) {
+        blockErrors.push(`${blockLabel}: ${urlError}`);
+      }
       if (blockErrors.length > 0) {
         toast({
           variant: "destructive",
@@ -466,7 +467,7 @@ function NodeHeader({
 
       if (!debugSession) {
         // TODO: kind of redundant; investigate if this is necessary; either
-        // Sentry's log should output to the console, or Sentry should just
+        // the logging sink should output to the console, or it should just
         // gather native console.error output.
         console.error("Run block: there is no debug session, yet");
         log.error("Run block: there is no debug session, yet");
@@ -552,7 +553,12 @@ function NodeHeader({
         "/run/workflows/blocks",
         body,
       );
-      return { response, mergedParameters };
+      return {
+        response,
+        mergedParameters,
+        organizationId: workflow.organization_id,
+        blockType: type,
+      };
     },
     onSuccess: (result) => {
       if (!result?.response) {
@@ -570,7 +576,13 @@ function NodeHeader({
         return;
       }
 
-      const { response, mergedParameters } = result;
+      const { response, mergedParameters, organizationId, blockType } = result;
+
+      postHog.capture("builder.block.run", {
+        org_id: organizationId,
+        workflow_permanent_id: workflowPermanentId,
+        block_type: blockType,
+      });
 
       if (workflowPermanentId) {
         useDebuggerLastRunValuesStore
@@ -601,7 +613,7 @@ function NodeHeader({
           wr: response.data.run_id,
           bl: label,
         });
-        search.set(STUDIO_PANES_PARAM, panes.join(","));
+        preserveNextEntry(`?${search.toString()}`, panes);
         // Under the short /runs/{wr} URL the run id is the pathname, so keep it
         // and only swap the search; from the editor it is a full studio path.
         if (location.pathname.startsWith("/runs/")) {
@@ -615,10 +627,20 @@ function NodeHeader({
         );
       }
     },
-    onError: (error: AxiosError | ValidationFailureError) => {
+    onError: (
+      error:
+        | AxiosError
+        | ValidationFailureError
+        | SaveRefusedError
+        | SaveStaleError,
+    ) => {
       // The block-validation gate threw a typed error and already showed
       // its own toast; don't stack the generic "Failed to start" on top.
-      if (error instanceof ValidationFailureError) {
+      if (
+        error instanceof ValidationFailureError ||
+        error instanceof SaveRefusedError ||
+        error instanceof SaveStaleError
+      ) {
         return;
       }
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -639,6 +661,7 @@ function NodeHeader({
   });
 
   const cancelBlock = useMutation({
+    mutationKey: ["cancelBlock"],
     mutationFn: async () => {
       if (!debugSession) {
         log.error("Cancel block: missing debug session", {
@@ -668,11 +691,15 @@ function NodeHeader({
         debugSessionId: debugSession?.debug_session_id,
         browserSessionId: debugSession?.browser_session_id,
       });
-      toast({
-        variant: "success",
-        title: "Agent Canceled",
-        description: "The agent has been successfully canceled.",
-      });
+      if (activeWorkflowRunId) {
+        claimRunCompletionNotice(activeWorkflowRunId, () => {
+          toast({
+            variant: "success",
+            title: "Agent Canceled",
+            description: "The agent has been successfully canceled.",
+          });
+        });
+      }
     },
     onError: (error: AxiosError) => {
       const detail = (error.response?.data as { detail?: string })?.detail;
@@ -872,7 +899,7 @@ function NodeHeader({
 
   const isReadOnlyScope = useWorkflowScopeReadOnly();
   const isCanvasLocked = useIsCanvasLocked();
-  const dragGatedByMode = isDragGatedByMode({ isRecording, isCanvasLocked });
+  const dragGatedByMode = isDragGatedByMode({ isCanvasLocked });
   const duplicateDisabledReason = isBlockFinallyGated(
     blockLabel,
     workflowSettingsStore.finallyBlockLabel,
@@ -892,7 +919,7 @@ function NodeHeader({
       />
     );
     const dragGateReason = dragGatedByMode
-      ? getDragGateReason({ isRecording, isCanvasLocked })
+      ? getDragGateReason({ isCanvasLocked })
       : null;
     gripHandle = dragGatedByMode ? (
       <TooltipProvider delayDuration={200}>
@@ -910,17 +937,51 @@ function NodeHeader({
     );
   }
 
-  const collapseToggleGated = isCollapseGated({
-    isRecording,
-    isReadOnlyScope,
-    isCanvasLocked,
-  });
+  const mutationLocked = useWorkflowYamlEditorStore(selectEditorMutationLocked);
+  const collapseToggleGated =
+    mutationLocked ||
+    isCollapseGated({
+      isReadOnlyScope,
+      isCanvasLocked,
+    });
   const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
+  const saveBlockedReason = useWorkflowHasChangesStore(
+    (state) => state.saveBlockedReason,
+  );
+  // Running a block saves the workflow first.
   const playInert =
     workflowRunIsRunningOrQueued ||
     !workflowPermanentId ||
     debugSession === undefined ||
-    isRecording;
+    Boolean(saveBlockedReason);
+
+  const playHandlers = useRef({ play: handleOnPlay, stop: handleOnCancel });
+  playHandlers.current = { play: handleOnPlay, stop: handleOnCancel };
+  const playingNow = Boolean(thisBlockIsPlaying);
+  const registerPlay = useBlockPlayRegistry((s) => s.register);
+  const unregisterPlay = useBlockPlayRegistry((s) => s.unregister);
+  useEffect(() => {
+    if (!isDebuggable) return;
+    registerPlay(nodeId, {
+      play: () => void playHandlers.current.play(),
+      stop: () => playHandlers.current.stop(),
+      inert: playInert || runBlock.isPending,
+      playing: playingNow,
+      stopping: cancelBlock.isPending,
+      source: headless ? "doc" : "canvas",
+    });
+    return () => unregisterPlay(nodeId, headless ? "doc" : "canvas");
+  }, [
+    headless,
+    isDebuggable,
+    nodeId,
+    playInert,
+    playingNow,
+    cancelBlock.isPending,
+    registerPlay,
+    runBlock.isPending,
+    unregisterPlay,
+  ]);
 
   const collapseToggleButton =
     isCollapsible &&
@@ -938,7 +999,7 @@ function NodeHeader({
               disabled={collapseToggleGated}
               onClick={(e) => {
                 e.stopPropagation();
-                if (collapseToggleGated) return;
+                if (collapseToggleGated || isEditorMutationLocked()) return;
                 toggleBlockCollapsed(
                   workflowPermanentId ?? "__global__",
                   blockLabel,
@@ -959,6 +1020,49 @@ function NodeHeader({
         </Tooltip>
       </TooltipProvider>
     ) : null;
+
+  const runDialogs = (
+    <>
+      <BlockParametersDialog
+        open={showParamsDialog}
+        onOpenChange={setShowParamsDialog}
+        blockLabel={blockLabel}
+        parameters={parametersToPrompt}
+        initialValues={currentParamValues}
+        onSubmit={(values) => {
+          const numBlocksInWorkflow = (
+            workflow?.workflow_definition.blocks ?? []
+          ).length;
+          runBlock.mutate(
+            {
+              codeGen: numBlocksInWorkflow === 1,
+              parameterOverrides: values,
+            },
+            {
+              onSuccess: () => {
+                // Close dialog on success - navigation and last-run-value
+                // persistence happen in the mutation's onSuccess.
+                setShowParamsDialog(false);
+              },
+              // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.
+            },
+          );
+        }}
+        isLoading={runBlock.isPending}
+      />
+      <DebugSessionProfileIncompatibleDialog
+        open={profileIncompatibilityReason !== null}
+        reason={profileIncompatibilityReason}
+        onContinue={() => {
+          setProfileIncompatibilityReason(null);
+          proceedWithPlay();
+        }}
+        onCancel={() => setProfileIncompatibilityReason(null)}
+      />
+    </>
+  );
+
+  if (headless) return runDialogs;
 
   return (
     <>
@@ -1018,8 +1122,15 @@ function NodeHeader({
             <EditableNodeTitle
               value={blockLabel}
               editable={editable}
-              onChange={setLabel}
-              titleClassName="text-base"
+              onChange={(value) => {
+                // The label handler queues edits while the graph is locked.
+                useWorkflowTitleStore.getState().recordCopilotGraphEdit();
+                setLabel(value);
+              }}
+              titleClassName={cn("text-base", {
+                "text-muted-foreground line-through":
+                  blockReview?.status === "removed",
+              })}
               // A negative margin here would shrink this auto-width column's
               // measured size and clip short values via max-w-full, so the
               // padding is offset with relative/left (paint-only) instead.
@@ -1070,6 +1181,9 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {blockReview?.showStatus && blockReview.status !== "unchanged" ? (
+            <ReviewStatusChip status={blockReview.status} />
+          ) : null}
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
@@ -1100,48 +1214,55 @@ function NodeHeader({
           {(debugStore.isDebugMode || debugStore.blockRunsEnabled) &&
             isDebuggable && (
               <TooltipProvider delayDuration={300}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      aria-label="Run this block"
-                      // Must match the click guard below: any inert state the
-                      // attribute misses is a control that still takes focus
-                      // and announces as enabled while doing nothing. isPending
-                      // adds the in-flight case, where the spinner branch used
-                      // to carry no handler and a second click would re-enter.
-                      disabled={playInert || runBlock.isPending}
-                      onClick={() => {
-                        // Same inert set the icon used to express with
-                        // pointer-events-none; the click now lands on the
-                        // button (its padding was a dead zone before).
-                        if (playInert) {
-                          return;
-                        }
-                        void handleOnPlay();
-                      }}
-                      className={cn(
-                        "nodrag nopan rounded p-1 disabled:opacity-50",
-                        {
-                          "hover:bg-muted": workflowRunIsRunningOrQueued,
-                        },
-                      )}
-                    >
-                      {runBlock.isPending ? (
-                        <ReloadIcon className="size-6 animate-spin" />
-                      ) : (
-                        <PlayIcon
-                          aria-hidden
-                          className={cn("size-6", {
-                            "fill-gray-500 text-muted-foreground dark:text-gray-500":
-                              playInert,
-                          })}
-                        />
-                      )}
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent>Run this block</TooltipContent>
-                </Tooltip>
+                <ControlTooltip
+                  content="Run this block"
+                  reason={
+                    saveBlockedReason
+                      ? `Save is paused: ${saveBlockedReason}`
+                      : null
+                  }
+                  blocked={Boolean(saveBlockedReason)}
+                  side="top"
+                  wrapperClassName="nodrag nopan"
+                >
+                  <button
+                    type="button"
+                    aria-label="Run this block"
+                    // Must match the click guard below: any inert state the
+                    // attribute misses is a control that still takes focus
+                    // and announces as enabled while doing nothing. isPending
+                    // adds the in-flight case, where the spinner branch used
+                    // to carry no handler and a second click would re-enter.
+                    disabled={playInert || runBlock.isPending}
+                    onClick={() => {
+                      // Same inert set the icon used to express with
+                      // pointer-events-none; the click now lands on the
+                      // button (its padding was a dead zone before).
+                      if (playInert) {
+                        return;
+                      }
+                      void handleOnPlay();
+                    }}
+                    className={cn(
+                      "nodrag nopan rounded p-1 disabled:pointer-events-none disabled:opacity-50",
+                      {
+                        "hover:bg-muted": workflowRunIsRunningOrQueued,
+                      },
+                    )}
+                  >
+                    {runBlock.isPending ? (
+                      <ReloadIcon className="size-6 animate-spin" />
+                    ) : (
+                      <PlayIcon
+                        aria-hidden
+                        className={cn("size-6", {
+                          "fill-gray-500 text-muted-foreground dark:text-gray-500":
+                            playInert,
+                        })}
+                      />
+                    )}
+                  </button>
+                </ControlTooltip>
               </TooltipProvider>
             )}
           {collapseToggleButton}
@@ -1180,42 +1301,9 @@ function NodeHeader({
         </div>
       </header>
 
-      <BlockParametersDialog
-        open={showParamsDialog}
-        onOpenChange={setShowParamsDialog}
-        blockLabel={blockLabel}
-        parameters={parametersToPrompt}
-        initialValues={currentParamValues}
-        onSubmit={(values) => {
-          const numBlocksInWorkflow = (
-            workflow?.workflow_definition.blocks ?? []
-          ).length;
-          runBlock.mutate(
-            {
-              codeGen: numBlocksInWorkflow === 1,
-              parameterOverrides: values,
-            },
-            {
-              onSuccess: () => {
-                // Close dialog on success - navigation and last-run-value
-                // persistence happen in the mutation's onSuccess.
-                setShowParamsDialog(false);
-              },
-              // On error, dialog stays open so user can retry. Toast is shown by mutation's onError.
-            },
-          );
-        }}
-        isLoading={runBlock.isPending}
-      />
-      <DebugSessionProfileIncompatibleDialog
-        open={profileIncompatibilityReason !== null}
-        reason={profileIncompatibilityReason}
-        onContinue={() => {
-          setProfileIncompatibilityReason(null);
-          proceedWithPlay();
-        }}
-        onCancel={() => setProfileIncompatibilityReason(null)}
-      />
+      {blockReview ? <ReviewBlockChanges review={blockReview} /> : null}
+
+      {runDialogs}
     </>
   );
 }

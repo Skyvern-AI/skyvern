@@ -4,26 +4,100 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+from playwright.async_api import Page
 
+from skyvern.cli.mcp_tools import blocks
 from skyvern.cli.mcp_tools.blocks import (
+    CODE_BLOCK_RUNTIME_TOPIC,
+    NOTES_KNOWLEDGE_TOPIC,
     WORKFLOW_KNOWLEDGE_TOPIC_HEADERS,
+    _parse_knowledge_topics,
     skyvern_block_schema,
     skyvern_block_validate,
     skyvern_workflow_knowledge,
 )
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, TaskBlock
+from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    _LOCATOR_ACTION_MAP,
+    _LOCATOR_FACTORY_METHODS,
+    _PAGE_ACTION_MAP,
+)
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 
 
 @pytest.mark.asyncio
 async def test_workflow_knowledge_lists_available_topics_without_returning_the_document() -> None:
     result = await skyvern_workflow_knowledge()
+    public_topics = [topic for topic in WORKFLOW_KNOWLEDGE_TOPIC_HEADERS if topic != NOTES_KNOWLEDGE_TOPIC]
 
     assert result["ok"] is True
-    assert result["data"]["topics"] == list(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
-    assert result["data"]["count"] == len(WORKFLOW_KNOWLEDGE_TOPIC_HEADERS)
+    assert result["data"]["topics"] == [*public_topics, CODE_BLOCK_RUNTIME_TOPIC]
+    assert result["data"]["count"] == len(public_topics) + 1
     assert "A Skyvern workflow is defined" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_hides_doc_editor_topic_from_public_mcp() -> None:
+    result = await skyvern_workflow_knowledge(topics=[NOTES_KNOWLEDGE_TOPIC])
+
+    assert result["ok"] is False
+    assert NOTES_KNOWLEDGE_TOPIC not in result["error"]["hint"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_renders_the_code_block_runtime_names_from_the_executor() -> None:
+    result = await skyvern_workflow_knowledge(topics=[CODE_BLOCK_RUNTIME_TOPIC])
+
+    assert result["ok"] is True
+    content = result["data"]["sections"][CODE_BLOCK_RUNTIME_TOPIC]["content"]
+    safe_vars = CodeBlock.build_safe_vars()
+    for name in ("zip", "ValueError", "sorted"):
+        assert name in safe_vars["__builtins__"]
+        assert name in content
+    assert "open" not in safe_vars["__builtins__"]
+    assert "- datetime: UTC, date, datetime, timedelta, timezone" in content
+    assert "- html: escape" in content
+    assert "{{current_date}}" in content
+    assert "solve_captcha" in content
+
+    def segments(prefix: str) -> list[set[str]]:
+        line = next((line for line in content.splitlines() if line.startswith(prefix)), None)
+        assert line is not None, f"no line starts with {prefix!r}"
+        return [set(re.findall(r"[\w.]+", segment.split(":", 1)[1])) for segment in line.split(";")]
+
+    page_calls, page_or_locator, locator_only = segments("Recorded as timeline actions")
+    assert {f"page.{name}" for name in _PAGE_ACTION_MAP} | {"page.keyboard.press"} <= page_calls
+    for name in _LOCATOR_ACTION_MAP:
+        assert [name in page_or_locator, name in locator_only].count(True) == 1
+    assert all(hasattr(Page, name) for name in page_or_locator)
+    assert {"set_input_files", "drag_to", "press_sequentially"} <= locator_only
+    assert "inner_text" not in {*_PAGE_ACTION_MAP, *_LOCATOR_ACTION_MAP}
+    assert not any("inner_text" in segment for segment in (page_calls, page_or_locator, locator_only))
+    assert "inner_text" in content
+
+    factories_on_page, factories_on_locator = segments("Locator factories")
+    for name in {"locator", *_LOCATOR_FACTORY_METHODS}:
+        assert [name in factories_on_page, name in factories_on_locator].count(True) == 1
+    assert all(hasattr(Page, name) for name in factories_on_page)
+    assert "evaluate(js, arg=None)" in content
+
+
+@pytest.mark.asyncio
+async def test_workflow_knowledge_captcha_solver_topic_carries_the_image_form() -> None:
+    result = await skyvern_workflow_knowledge(topics=["captcha_solver"])
+
+    assert result["ok"] is True
+    content = result["data"]["sections"]["captcha_solver"]["content"]
+    assert "solve_captcha(page, image=" in content
+    assert "input=" in content
 
 
 @pytest.mark.asyncio
@@ -90,6 +164,15 @@ async def test_workflow_knowledge_rejects_an_incomplete_topic_source(
 
 
 @pytest.mark.asyncio
+async def test_block_schema_hides_internal_note_fields() -> None:
+    result = await skyvern_block_schema(block_type="navigation")
+
+    properties = result["data"]["schema"]["properties"]
+    assert "navigation_goal" in properties
+    assert not {"notes", "trailing_notes", "description"} & properties.keys()
+
+
+@pytest.mark.asyncio
 async def test_block_schema_task_redirects_to_navigation() -> None:
     """Requesting schema for 'task' should return navigation info with a deprecation warning."""
     result = await skyvern_block_schema(block_type="task")
@@ -99,6 +182,28 @@ async def test_block_schema_task_redirects_to_navigation() -> None:
     assert "navigation_goal" in result["data"]["schema"].get("properties", {})
     assert len(result["warnings"]) > 0
     assert any("deprecated" in w.lower() for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_block_schema_google_sheets_write_carries_its_knowledge_section() -> None:
+    result = await skyvern_block_schema(block_type="google_sheets_write")
+
+    assert result["ok"] is True
+    description = result["data"]["description"]
+    assert result["data"]["use_cases"]
+    for shape_token in ("[[", "column_mapping", "cells", "| tojson"):
+        assert shape_token in description
+
+
+@pytest.mark.asyncio
+async def test_block_schema_terminate_lists_the_optional_error_code_and_its_example_validates() -> None:
+    result = await skyvern_block_schema(block_type="terminate")
+
+    assert result["ok"] is True
+    assert "error_code" in result["data"]["schema"]["properties"]
+    assert "error_code" in result["data"]["example"]
+    validated = await skyvern_block_validate(block_json=json.dumps(result["data"]["example"]))
+    assert validated["ok"] is True, validated
 
 
 @pytest.mark.asyncio
@@ -184,6 +289,95 @@ async def test_block_schema_no_type_lists_all() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unavailable_powerbi_is_hidden_from_schema_and_nested_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    listed = await skyvern_block_schema()
+    specific = await skyvern_block_schema(block_type="powerbi_query")
+    nested = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "for_loop",
+                "label": "outer_loop",
+                "loop_over_parameter_key": "rows",
+                "loop_blocks": [
+                    {
+                        "block_type": "powerbi_query",
+                        "label": "read_powerbi",
+                        "connection_id": "moc_owner",
+                        "dataset_id": "{{ dataset_id }}",
+                        "query": "{{ dax_query }}",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert "powerbi_query" not in listed["data"]["block_types"]
+    assert specific["ok"] is False
+    assert "Power BI queries are not currently available." in specific["error"]["message"]
+    assert nested["ok"] is False
+    assert "Power BI queries are not currently available." in nested["error"]["message"]
+
+
+CONNECTED_ACCOUNT_MARKER = "x-skyvern-connected-account"
+CONNECTED_ACCOUNT_FIELDS = {
+    ("file_upload", "google_credential_id"),
+    ("file_download", "google_credential_id"),
+    ("send_email", "credential_id"),
+    ("google_sheets_read", "credential_id"),
+    ("email_inbox", "credential_id"),
+    ("google_sheets_write", "credential_id"),
+    ("powerbi_query", "connection_id"),
+}
+
+
+@pytest.mark.asyncio
+async def test_block_schema_marker_alone_finds_exactly_the_connected_account_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: True)
+
+    listed = await skyvern_block_schema()
+    marked: set[tuple[str, str]] = set()
+    for block_type in listed["data"]["block_types"]:
+        result = await skyvern_block_schema(block_type=block_type)
+        assert result["ok"] is True, result
+        schema = result["data"]["schema"]
+        if "$ref" in schema:
+            # Recursive loop blocks publish their own root as a $ref; other blocks nested in $defs are not walked.
+            schema = schema["$defs"][schema["$ref"].removeprefix("#/$defs/")]
+        for field, prop in schema["properties"].items():
+            if prop.get(CONNECTED_ACCOUNT_MARKER) is True:
+                marked.add((block_type, field))
+
+    assert marked == CONNECTED_ACCOUNT_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_unavailable_powerbi_does_not_match_trigger_payload_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(blocks, "_powerbi_queries_available", lambda: False)
+
+    result = await skyvern_block_validate(
+        block_json=json.dumps(
+            {
+                "block_type": "workflow_trigger",
+                "label": "trigger_workflow",
+                "workflow_permanent_id": "wpid_target",
+                "payload": {"metadata": {"block_type": "powerbi_query"}},
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["valid"] is True
+
+
+@pytest.mark.asyncio
 async def test_block_validate_pdf_fill() -> None:
     block = {
         "block_type": "pdf_fill",
@@ -245,3 +439,113 @@ async def test_block_validate_data_export() -> None:
 
     assert result["ok"] is True
     assert result["data"]["block_type"] == "data_export"
+
+
+_JINJA_EXPRESSION = re.compile(r"\{\{.*?\}\}")
+
+_BROWSER_TASK_OUTPUT = {"status": "completed", "extracted_information": {"abstract": "a study abstract"}}
+_NON_TASK_OUTPUT = {"summary": "a short summary"}
+# A direct (non-website) download records file fields with no extracted_information, so no .output alias.
+_DIRECT_FILE_DOWNLOAD_OUTPUT = {
+    "file_name": "report.pdf",
+    "downloaded_files": [{"url": "https://files.example.test/report.pdf", "filename": "report.pdf"}],
+    "downloaded_file_urls": ["https://files.example.test/report.pdf"],
+}
+_HTTP_REQUEST_OUTPUT = {
+    "status_code": 200,
+    "headers": {"Content-Type": "application/json"},
+    "body": {"metric": "30 %"},
+    "response_body": {"metric": "30 %"},
+}
+_TEMPLATING_FAMILY_OUTPUTS = {
+    "label": _BROWSER_TASK_OUTPUT,
+    "extract_items": _BROWSER_TASK_OUTPUT,
+    "get_data": _BROWSER_TASK_OUTPUT,
+    "summarize_notes": _NON_TASK_OUTPUT,
+    "fetch_report": _DIRECT_FILE_DOWNLOAD_OUTPUT,
+    "fetch_metric": _HTTP_REQUEST_OUTPUT,
+}
+
+
+def _templating_context() -> WorkflowRunContext:
+    ctx = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_kb",
+        workflow_permanent_id="wpid_kb",
+        workflow_run_id="wr_kb",
+        aws_client=MagicMock(),
+    )
+    for label, value in _TEMPLATING_FAMILY_OUTPUTS.items():
+        ctx.register_block_reference_variable(label, value)
+    return ctx
+
+
+def _refuted_expressions(line: str) -> set[str]:
+    """The section refutes a shape either as "X raises ..." or as "Y (NOT X)"."""
+    if "raises" in line:
+        return set(_JINJA_EXPRESSION.findall(line.split("raises", 1)[0]))
+    if "NOT" in line:
+        return set(_JINJA_EXPRESSION.findall(line.split("NOT", 1)[1]))
+    return set()
+
+
+def _documented_block_output_expressions() -> tuple[set[str], set[str]]:
+    section = _parse_knowledge_topics()["parameter_templating"]["content"]
+    taught: set[str] = set()
+    refuted: set[str] = set()
+    for line in section.splitlines():
+        line_refuted = _refuted_expressions(line)
+        for expression in _JINJA_EXPRESSION.findall(line):
+            if "<" in expression:
+                continue
+            root = expression.strip("{} ").split(".")[0].split("|")[0].strip()
+            if root not in _TEMPLATING_FAMILY_OUTPUTS:
+                continue
+            (refuted if expression in line_refuted else taught).add(expression)
+    return taught - refuted, refuted
+
+
+def _kb_block() -> TaskBlock:
+    return TaskBlock(
+        label="downstream",
+        title="t",
+        output_parameter=OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="downstream_output",
+            output_parameter_id="op_kb",
+            workflow_id="w_kb",
+            created_at=datetime.now(UTC),
+            modified_at=datetime.now(UTC),
+        ),
+    )
+
+
+def test_parameter_templating_block_output_examples_match_the_real_registrar() -> None:
+    taught, refuted = _documented_block_output_expressions()
+    taught_roots = {expression.strip("{} ").split(".")[0].split("|")[0].strip() for expression in taught}
+    assert taught_roots == set(_TEMPLATING_FAMILY_OUTPUTS)
+    assert len(taught) >= len(_TEMPLATING_FAMILY_OUTPUTS) + 2
+    assert refuted
+
+    ctx = _templating_context()
+    block = _kb_block()
+
+    for expression in sorted(taught):
+        assert block.format_block_parameter_template_from_workflow_run_context(expression, ctx), expression
+
+    for expression in sorted(refuted):
+        with pytest.raises((FailedToFormatJinjaStyleParameter, MissingJinjaVariables)):
+            block.format_block_parameter_template_from_workflow_run_context(expression, ctx)
+
+
+def test_parameter_templating_block_output_examples_resolve_to_the_documented_values() -> None:
+    ctx = _templating_context()
+    block = _kb_block()
+
+    def render(expression: str) -> str:
+        return block.format_block_parameter_template_from_workflow_run_context(expression, ctx)
+
+    assert render("{{ label.output }}") == render("{{ label.extracted_information }}")
+    assert "a study abstract" in render("{{ label.output }}")
+    assert "extracted_information" in render("{{ label }}")
+    assert render("{{ summarize_notes.summary }}") == "a short summary"

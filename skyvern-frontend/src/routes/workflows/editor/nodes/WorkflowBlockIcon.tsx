@@ -1,9 +1,11 @@
 import { ClickIcon } from "@/components/icons/ClickIcon";
 import { GoogleSheetsIcon } from "@/components/icons/GoogleSheetsIcon";
+import { PowerBIIcon } from "@/components/icons/PowerBIIcon";
 import { WorkflowBlockType } from "../../types/workflowTypes";
 import {
   CheckCircledIcon,
   CodeIcon,
+  CrossCircledIcon,
   CursorTextIcon,
   DownloadIcon,
   EnvelopeClosedIcon,
@@ -13,7 +15,9 @@ import {
   HandIcon,
   ListBulletIcon,
   LockOpen1Icon,
+  MagnifyingGlassIcon,
   StopwatchIcon,
+  TargetIcon,
   UpdateIcon,
   Share1Icon,
   UploadIcon,
@@ -88,6 +92,12 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "wait": {
       return <StopwatchIcon className={className} />;
     }
+    case "terminate": {
+      return <CrossCircledIcon className={className} />;
+    }
+    case "agent_step": {
+      return <TargetIcon className={className} />;
+    }
     case "pdf_parser": {
       return <FileTextIcon className={className} />;
     }
@@ -103,6 +113,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     case "goto_url": {
       return <ExternalLinkIcon className={className} />;
     }
+    case "web_search": {
+      return <MagnifyingGlassIcon className={className} />;
+    }
     case "http_request": {
       return <GlobeIcon className={className} />;
     }
@@ -117,6 +130,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "google_sheets_write": {
       return <GoogleSheetsIcon className={className} />;
+    }
+    case "powerbi_query": {
+      return <PowerBIIcon className={className} />;
     }
   }
 }

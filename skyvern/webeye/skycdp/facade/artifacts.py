@@ -3,7 +3,7 @@
 These three share a shape: production registers a listener for each and, until now, got a listener
 that never fired. That is worse than an unimplemented method -- an AttributeError stops the run and
 names itself, while a dead listener lets the run continue and quietly lose the download, the upload,
-or the console log the exfiltration channel depends on.
+or the console log.
 
 Downloads are browser-level in CDP: ``Browser.downloadWillBegin`` and ``Browser.downloadProgress``
 arrive with no session id, so they are subscribed once on the connection and routed to a page by the
@@ -114,7 +114,8 @@ class FileChooser:
         """
         return self._multiple
 
-    async def set_files(self, files: str | list[str]) -> None:
+    async def set_files(self, files: str | list[str], *, timeout: float | None = None) -> None:
+        # Playwright's signature has `timeout` and production passes it; one CDP call has nothing to time out.
         paths = [files] if isinstance(files, str) else list(files)
         missing = [path for path in paths if not Path(path).is_file()]
         if missing:

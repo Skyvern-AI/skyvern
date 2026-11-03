@@ -1,9 +1,14 @@
+import { runIsRetryWaiting } from "../workflowRun/runRetryState";
 import { useCallback } from "react";
 import { ClockIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 
 import { StreamStatusPanel } from "@/routes/streaming/StreamDiagnostics";
+import type { StreamState } from "@/routes/streaming/streamState";
+import { usePageSlots } from "@/store/PageSlots";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
+import { runStartupPlaceholder } from "./browserPaneView";
 import { HeroRecording } from "./runview/HeroRecording";
 import { HeroScreenshot } from "./runview/HeroScreenshot";
 import { RunLiveStream } from "./runview/RunLiveStream";
@@ -28,10 +33,12 @@ export function BrowserTab() {
     liveSurface,
   } = useBrowserPaneView();
   const postHog = usePostHog();
+  const { firstRunWaitCard: FirstRunWaitCard } = usePageSlots();
+  const setRunStreamState = useStudioBrowserStore((s) => s.setRunStreamState);
 
   const {
     workflowRun,
-    running,
+    executing,
     provisioning,
     isPaused,
     recordingUrls,
@@ -45,12 +52,22 @@ export function BrowserTab() {
       }
       postHog.capture("run.recording.viewed", {
         org_id: workflowRun.workflow?.organization_id,
+        workflow_permanent_id: workflowRun.workflow?.workflow_permanent_id,
         run_id: workflowRun.workflow_run_id,
         recording_index: index,
         recording_count: recordingUrls.length,
       });
     },
     [postHog, workflowRun, recordingUrls.length],
+  );
+
+  const onRunStreamStateChange = useCallback(
+    (state: StreamState) => {
+      if (runId) {
+        setRunStreamState(state, runId);
+      }
+    },
+    [runId, setRunStreamState],
   );
 
   // A running run outside the debug session streams through its own per-run
@@ -62,21 +79,32 @@ export function BrowserTab() {
     <div className="relative flex h-full min-h-0 w-full items-center justify-center overflow-hidden bg-slate-950">
       {view === "live" ? (
         showRunStream ? (
-          provisioning ? (
+          workflowRun && runIsRetryWaiting(workflowRun) ? (
+            <StreamStatusPanel
+              diagnostic={{
+                title: "Retry pending",
+                detail: "The browser reconnects when the next attempt starts.",
+                pending: true,
+              }}
+            />
+          ) : provisioning && workflowRun ? (
             // Mounting the stream while the run is still queued opens a
             // socket the backend never feeds; wait until it actually runs.
             <StreamStatusPanel
-              diagnostic={{
-                title: "Starting the browser",
-                detail: "Getting your run's browser ready…",
-                pending: true,
-              }}
+              diagnostic={runStartupPlaceholder(workflowRun)}
+              footer={
+                FirstRunWaitCard ? (
+                  <FirstRunWaitCard phase="run_provisioning" />
+                ) : undefined
+              }
             />
           ) : (
             <RunLiveStream
               workflowRunId={runId}
+              run={workflowRun}
               browserSessionId={workflowRun?.browser_session_id ?? null}
               interactive={isPaused}
+              onStreamStateChange={onRunStreamStateChange}
             />
           )
         ) : debugBrowserSessionId ? (
@@ -104,6 +132,11 @@ export function BrowserTab() {
                 "Spinning up the debug browser — this only takes a moment.",
               pending: true,
             }}
+            footer={
+              FirstRunWaitCard ? (
+                <FirstRunWaitCard phase="debug_browser_warming" />
+              ) : undefined
+            }
           />
         )
       ) : view === "recording" ? (
@@ -113,16 +146,16 @@ export function BrowserTab() {
             onPlay={onRecordingPlay}
           />
         ) : (
+          // The Recording view is only offered with URLs or an archived recording.
           <StreamStatusPanel
             diagnostic={{
-              title: "No recording for this run",
-              detail:
-                "Screenshots keep a frame for each action the run took — try that view instead.",
+              title: "Recording archived",
+              detail: "To request restoration, contact support@skyvern.com.",
             }}
           />
         )
       ) : heroSelection ? (
-        <HeroScreenshot selection={heroSelection} running={running} />
+        <HeroScreenshot selection={heroSelection} running={executing} />
       ) : visuals.finalized ? (
         <StreamStatusPanel
           diagnostic={{

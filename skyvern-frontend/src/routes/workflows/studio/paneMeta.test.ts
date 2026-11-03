@@ -14,18 +14,8 @@ describe("paneLabel", () => {
     expect(paneLabel("browser")).toBe("Browser");
   });
 
-  test("the run pane reads 'Run' when no run is inspected", () => {
+  test("the run pane label is always 'Run'", () => {
     expect(paneLabel("overview")).toBe("Run");
-    expect(paneLabel("overview", null)).toBe("Run");
-    expect(paneLabel("overview", undefined)).toBe("Run");
-  });
-
-  test("the run pane head-truncates the inspected run id", () => {
-    expect(paneLabel("overview", "wr_5538abcdef")).toBe("Run: wr_5538…");
-  });
-
-  test("a run id short enough to fit is shown without an ellipsis", () => {
-    expect(paneLabel("overview", "wr_12")).toBe("Run: wr_12");
   });
 });
 
@@ -36,10 +26,9 @@ describe("paneAccessibleName", () => {
   });
 
   test("the run pane's controls keep the stable name 'Run'", () => {
-    // The pane's own controls (region/close/drag) announce "Run", matching the
-    // "Run: wr_…" content; "Past Runs" is the idle run control's label.
+    // "Past Runs" is the idle top-bar selector label.
     expect(paneAccessibleName("overview")).toBe("Run");
-    expect(paneLabel("overview", "wr_5538abcdef")).toBe("Run: wr_5538…");
+    expect(paneLabel("overview")).toBe("Run");
   });
 });
 

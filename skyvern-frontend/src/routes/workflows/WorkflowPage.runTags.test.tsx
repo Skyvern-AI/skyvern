@@ -52,8 +52,14 @@ vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => false,
   useFeatureFlagVariantKey: () => undefined,
 }));
+vi.mock("@/hooks/usePostHogFeatureFlag", () => ({
+  usePostHogFeatureFlagEnabled: () => false,
+  usePostHogFeatureFlagVariantKey: () => undefined,
+}));
 
-const flagState = vi.hoisted(() => ({ taggingEnabled: true as boolean }));
+const flagState = vi.hoisted(() => ({
+  taggingEnabled: true as boolean | undefined,
+}));
 
 vi.mock("@/hooks/useFeatureFlag", () => ({
   useFeatureFlag: () => flagState.taggingEnabled,
@@ -276,6 +282,21 @@ describe("WorkflowPage tag filter control", () => {
 
     const lastCall = workflowRunsQueryCalls[workflowRunsQueryCalls.length - 1];
     expect(lastCall?.tags).toBeUndefined();
+  });
+
+  it("holds a ?tags= link while the tagging flag is pending", () => {
+    flagState.taggingEnabled = undefined;
+
+    renderWorkflowPage("/workflows/wpid_abc123?tags=env:prod");
+
+    // No unfiltered run list is requested or shown while the flag is pending.
+    expect(
+      workflowRunsQueryCalls.filter(
+        (call) => call.enabled !== false && !call.tags,
+      ),
+    ).toEqual([]);
+    expect(screen.getByText("Loading runs…")).toBeTruthy();
+    expect(screen.queryByText("My Run")).toBeNull();
   });
 
   it("filters by any value in a run-tag group", () => {

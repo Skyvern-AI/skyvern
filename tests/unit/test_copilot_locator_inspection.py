@@ -8,21 +8,30 @@ binding that decides which page it is read from.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
+from urllib.parse import quote
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Locator, Page, async_playwright
 
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.browser_target import resolve_browser_session_binding
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.runtime import browser_session_lock
 from skyvern.forge.sdk.copilot.secret_scrub import (
+    REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
     register_secret_scrub_value,
+    register_secret_scrub_values_from_structure,
 )
 from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS, inspect_locator_matches_tool, run_execution
 from skyvern.forge.sdk.copilot.tools.locator_inspection import (
@@ -33,11 +42,14 @@ from skyvern.forge.sdk.copilot.tools.locator_inspection import (
     TOOL_NAME,
     TOOL_SCHEMA,
     inspect_locator_matches,
+    visibility_counts,
 )
 from skyvern.forge.sdk.copilot.tools.run_execution import build_test_evidence_packet
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.schemas.workflows import BlockType
-from tests.unit.copilot_test_helpers import make_copilot_ctx
+from tests.unit.copilot_test_helpers import make_copilot_ctx, skip_no_browser
 
 STAR_BUTTON = 'button.pill:has-text("Star")'
 STAR_VALUE = 'button.pill:has-text("Star") span.n'
@@ -62,8 +74,17 @@ class _FakeMatch:
     def __init__(self, facts: dict[str, Any]) -> None:
         self._facts = facts
 
+    async def element_handle(self) -> _FakeMatch:
+        return self
+
+    async def is_visible(self) -> bool:
+        return self._facts.get("visible", True)
+
     async def evaluate(self, _expression: str) -> dict[str, Any]:
         return dict(self._facts)
+
+    async def dispose(self) -> None:
+        return None
 
 
 class _FakePage:
@@ -196,6 +217,132 @@ async def test_the_same_call_twice_returns_byte_identical_output() -> None:
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
+@skip_no_browser
+@pytest.mark.asyncio
+async def test_each_match_reports_whether_playwright_considers_it_visible() -> None:
+    # A `.first` locator resolves to the hidden responsive copy here; its text and markup match the
+    # visible one, so only the visibility fact separates them.
+    stat = '<span class="stat"><strong>23.2k</strong> stars</span>'
+    body = f'<div style="display:none">{stat}</div><div style="visibility:hidden">{stat}</div>{stat}'
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_content(f"<html><body>{body}</body></html>")
+            result = await inspect_locator_matches(page, ["span.stat"])
+        finally:
+            await browser.close()
+
+    entry = result["selectors"][0]
+    assert entry["match_count"] == 3
+    assert [match["visible"] for match in entry["matches"]] == [False, False, True]
+    assert {match["text_content"] for match in entry["matches"]} == {"23.2k stars"}
+
+
+@pytest.mark.asyncio
+async def test_the_visibility_log_carries_counts_but_no_selector_or_page_text() -> None:
+    hidden = {"tag": "strong", "text_content": "23.2k", "descendants": [], "visible": False}
+    selector = 'span:has-text("Jane Doe") strong'
+    page = _FakePage({selector: [hidden, dict(hidden, visible=True)], DEAD: []}, invalid={"span:has-text("})
+
+    counts = visibility_counts(await inspect_locator_matches(page, [selector, DEAD, "span:has-text("]))
+
+    assert [{k: v for k, v in entry.items() if k != "selector_sha256"} for entry in counts] == [
+        {"error": False, "match_count": 2, "listed_visible": 1, "first_match_visible": False},
+        {"error": False, "match_count": 0, "listed_visible": 0, "first_match_visible": None},
+        {"error": True, "match_count": None, "listed_visible": 0, "first_match_visible": None},
+    ]
+    assert "Jane" not in json.dumps(counts) and "23.2k" not in json.dumps(counts)
+
+
+class _SwapDuringRead:
+    """A real page that navigates to `next_url` once: before a match is found, after it is found, or after the
+    first read made on the found element."""
+
+    def __init__(self, page: Page, next_url: str, swap_at: str) -> None:
+        self._page = page
+        self._next_url = next_url
+        self._swap_at = swap_at
+        self._swapped = False
+
+    async def _read(self, read: Callable[[], Awaitable[object]], before: bool, after: bool) -> object:
+        swap = not self._swapped and (before or after)
+        if swap:
+            self._swapped = True
+        if swap and before:
+            await self._page.goto(self._next_url)
+        result = await read()
+        if swap and after:
+            await self._page.goto(self._next_url)
+        return result
+
+    def locator(self, selector: str) -> SimpleNamespace:
+        real = self._page.locator(selector)
+        return SimpleNamespace(count=real.count, nth=lambda index: self._match(real.nth(index)))
+
+    def _match(self, real: Locator) -> SimpleNamespace:
+        on_resolve = {"before": self._swap_at == "before_resolve", "after": self._swap_at == "after_resolve"}
+
+        async def element_handle() -> SimpleNamespace:
+            return self._handle(await self._read(real.element_handle, **on_resolve))
+
+        return SimpleNamespace(
+            element_handle=element_handle,
+            is_visible=lambda: self._read(real.is_visible, **on_resolve),
+            evaluate=lambda expression: self._read(lambda: real.evaluate(expression), **on_resolve),
+        )
+
+    def _handle(self, real: Any) -> SimpleNamespace:  # noqa: ANN401 - an ElementHandle or whatever resolve returned
+        after = self._swap_at == "between_handle_reads"
+        return SimpleNamespace(
+            is_visible=lambda: self._read(real.is_visible, before=False, after=after),
+            evaluate=lambda expression: self._read(lambda: real.evaluate(expression), before=False, after=after),
+            dispose=real.dispose,
+        )
+
+
+@skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("swap_at", "first_page"),
+    [
+        ("after_resolve", '<div style="display:none"><span class="stat">A stars</span></div>'),
+        ("before_resolve", '<div style="display:none"><span class="stat">A stars</span></div>'),
+        ("between_handle_reads", '<span class="stat">A stars</span>'),
+    ],
+)
+async def test_a_page_swap_never_pairs_one_pages_visibility_with_anothers_facts(swap_at: str, first_page: str) -> None:
+    # Visibility and DOM facts must describe the same element on the same page, or the read must fail. The
+    # last case starts on a visible copy, so a DOM read made before the visibility read would sit beside a
+    # stale False.
+    bodies = {"https://example.test/a": first_page, "https://example.test/b": '<span class="stat">B stars</span>'}
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.route(
+                "**/*",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=f"<html><body>{bodies.get(route.request.url, '')}</body></html>",
+                ),
+            )
+            await page.goto("https://example.test/a")
+            swapping = _SwapDuringRead(page, "https://example.test/b", swap_at)
+            result = await inspect_locator_matches(swapping, ["span.stat"])  # type: ignore[arg-type]
+        finally:
+            await browser.close()
+
+    match = result["selectors"][0]["matches"][0]
+    if swap_at == "before_resolve":
+        assert (match["visible"], match["text_content"]) == (True, "B stars")
+    else:
+        assert "visible" not in match and "error" in match
+
+
 def test_the_advertised_contract_is_the_tested_contract() -> None:
     # Step 5 measured this description and this schema. Shipping a paraphrase, or a schema that
     # drops the parameter descriptions, would ship a different tool than the one that was measured.
@@ -290,34 +437,165 @@ async def test_a_browser_with_no_open_page_is_reported_rather_than_given_one(
     assert created == []
 
 
-@pytest.mark.asyncio
-async def test_locator_result_is_suppressed_when_session_becomes_tainted_in_flight(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = make_copilot_ctx(browser_session_id="pbs_debug")
-    page = _star_page()
+OTP_SELECTOR = "#token"
+RUN_OTP = "424242"
 
-    async def _working_page() -> _FakePage:
-        return page
 
-    async def _taint_during_inspection(_page: _FakePage, _selectors: list[str]) -> list[dict[str, Any]]:
-        ctx.sensitive_origin_browser_session_ids.add("pbs_debug")
-        return [{"authored_selector": STAR_VALUE, "match_count": 1}]
+def _terminal_credential_run_ctx(parameters: dict[str, Any] | None = None) -> CopilotContext:
+    ctx = make_copilot_ctx(browser_session_id="pbs_run")
+    clear_session_scrub_values("pbs_run")
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_credential"
+    ctx.origin_run_redaction_registry = OriginRunRedactionRegistry(
+        workflow_run_id="wr_credential",
+        parameters=parameters or {"totp": RUN_OTP},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=True,
+    )
+    register_secret_scrub_values_from_structure(ctx, ctx.origin_run_redaction_registry.parameters)
+    return ctx
 
+
+def _authenticator_page() -> _FakePage:
+    return _FakePage(
+        {
+            OTP_SELECTOR: [
+                {
+                    "tag": "input",
+                    "text_content": f"code {RUN_OTP}",
+                    "outer_html": f'<input id="token" value="{RUN_OTP}">',
+                    "descendants": [{"index": 0, "tag": "span", "text_content": RUN_OTP}],
+                }
+            ]
+        }
+    )
+
+
+def _bind_authenticator_page(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "skyvern.forge.sdk.copilot.tools.resolve_browser_state_for_context",
-        AsyncMock(return_value=SimpleNamespace(get_working_page=_working_page)),
+        AsyncMock(return_value=SimpleNamespace(get_working_page=AsyncMock(return_value=_authenticator_page()))),
     )
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.inspect_locator_matches", _taint_during_inspection)
+
+
+@pytest.mark.asyncio
+async def test_locator_reports_from_the_page_a_terminal_credential_run_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _terminal_credential_run_ctx()
+    _bind_authenticator_page(monkeypatch)
 
     raw = await inspect_locator_matches_tool.on_invoke_tool(
-        SimpleNamespace(context=ctx), json.dumps({"target": "debug", "selectors": [STAR_VALUE]})
+        SimpleNamespace(context=ctx), json.dumps({"target": "last_run", "selectors": [OTP_SELECTOR]})
     )
 
     result = json.loads(raw)
-    assert result["ok"] is False
-    assert "specific named URL" in result["error"]
-    assert "data" not in result
+    assert result["ok"] is True
+    assert result["browser_target_workflow_run_id"] == "wr_credential"
+    entry = result["data"]["selectors"][0]
+    assert entry["selector"] == OTP_SELECTOR
+    assert entry["match_count"] == 1
+    assert RUN_OTP not in raw
+    assert REDACTED_SECRET_PLACEHOLDER in raw
+
+
+@pytest.mark.asyncio
+async def test_a_locator_read_issued_during_a_secret_run_waits_and_scrubs_what_the_run_registers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_run")
+    clear_session_scrub_values("pbs_run")
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_credential"
+    _bind_authenticator_page(monkeypatch)
+    run_lock = browser_session_lock(ctx, session_id="pbs_run")
+    await run_lock.acquire()
+
+    pending = asyncio.ensure_future(
+        inspect_locator_matches_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx), json.dumps({"target": "last_run", "selectors": [OTP_SELECTOR]})
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert not pending.done()
+
+    register_secret_scrub_value(ctx, RUN_OTP)
+    run_lock.release()
+    raw = await pending
+
+    assert json.loads(raw)["ok"] is True
+    assert RUN_OTP not in raw
+
+
+@pytest.mark.asyncio
+async def test_a_locator_read_is_withheld_while_the_run_still_owes_its_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = make_copilot_ctx(browser_session_id="pbs_run")
+    clear_session_scrub_values("pbs_run")
+    ctx.last_run_blocks_browser_session_id = "pbs_run"
+    ctx.last_run_blocks_workflow_run_id = "wr_credential"
+    _bind_authenticator_page(monkeypatch)
+    owed = OriginRunRedactionRegistry(
+        "wr_credential",
+        {},
+        contains_sensitive_values=True,
+        contains_all_sensitive_values=False,
+        awaiting_runtime_secret_values=True,
+    )
+    ctx.origin_run_redaction_registry = owed
+    ctx.awaited_run_secret_handoffs[("pbs_run", "wr_credential")] = partial(
+        run_execution._settle_awaited_run_secrets, ctx, owed, "pbs_run"
+    )
+    monkeypatch.setattr(
+        run_execution, "consume_copilot_runtime_secret_values", AsyncMock(side_effect=[None, {RUN_OTP}])
+    )
+    request = json.dumps({"target": "last_run", "selectors": [OTP_SELECTOR]})
+
+    withheld = await inspect_locator_matches_tool.on_invoke_tool(SimpleNamespace(context=ctx), request)
+    disclosed = await inspect_locator_matches_tool.on_invoke_tool(SimpleNamespace(context=ctx), request)
+
+    assert json.loads(withheld)["ok"] is False
+    assert "wr_credential" in json.loads(withheld)["error"]
+    assert RUN_OTP not in withheld
+    assert json.loads(disclosed)["ok"] is True
+    assert RUN_OTP not in disclosed
+
+
+@pytest.mark.asyncio
+async def test_locator_scrubs_encoded_forms_of_the_run_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This read never crosses the MCP adapter: the URL carries the username URL-encoded and the
+    outer HTML the password HTML-escaped, and neither form may reach the model."""
+    username, password = "demo.user@pathfold.test", "Sp1r!t&Level<2026>"
+    ctx = _terminal_credential_run_ctx({"credential": {"username": username, "password": password}})
+    page = SimpleNamespace(url=f"http://pathfold.test/app?user={quote(username, safe='')}")
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.resolve_browser_state_for_context",
+        AsyncMock(return_value=SimpleNamespace(get_working_page=AsyncMock(return_value=page))),
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.inspect_locator_matches",
+        AsyncMock(
+            return_value={
+                "selectors": [
+                    {
+                        "selector": OTP_SELECTOR,
+                        "match_count": 1,
+                        "matches": [{"tag": "input", "outer_html": f'<input value="{html.escape(password)}">'}],
+                    }
+                ]
+            }
+        ),
+    )
+
+    raw = await inspect_locator_matches_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx), json.dumps({"target": "last_run", "selectors": [OTP_SELECTOR]})
+    )
+
+    assert json.loads(raw)["ok"] is True
+    for form in (username, quote(username, safe=""), password, html.escape(password)):
+        assert form not in raw
+    assert REDACTED_SECRET_PLACEHOLDER in raw
 
 
 @pytest.mark.asyncio
@@ -472,7 +750,7 @@ async def test_a_closed_run_page_reports_nothing_rather_than_zero_matches(
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", _resolve)
 
     observed = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_gone",
         failed_block_code='page.locator("#rate").inner_text()',
     )
@@ -546,7 +824,7 @@ async def test_worker_owned_observation_types_every_selector_without_resolving_a
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", resolver)
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_worker",
         failed_block_code='page.locator("#first")\npage.locator("#first")\npage.locator("text=Second")',
         worker_owned=True,
@@ -565,7 +843,7 @@ async def test_missing_browser_and_missing_page_have_distinct_typed_reasons(monk
 
     monkeypatch.setattr(run_execution, "resolve_persistent_browser_state", AsyncMock(return_value=None))
     missing_browser = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_missing",
         failed_block_code='page.locator("#target")',
     )
@@ -575,7 +853,7 @@ async def test_missing_browser_and_missing_page_have_distinct_typed_reasons(monk
         AsyncMock(return_value=_observation_browser(None)),
     )
     missing_page = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_closed",
         failed_block_code='page.locator("#target")',
     )
@@ -602,7 +880,7 @@ async def test_resolution_and_identity_failures_never_become_zero_matches(monkey
     )
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code=('page.locator("bad engine")\npage.locator("#identity")\npage.locator("#absent")'),
     )
@@ -638,7 +916,7 @@ async def test_ordinary_observation_exception_is_typed_without_losing_the_failur
     )
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code='page.locator("#failure")\npage.locator("#absent")',
     )
@@ -670,7 +948,7 @@ async def test_observation_cancellation_is_not_converted_to_typed_absence(
 
     with pytest.raises(asyncio.CancelledError):
         await run_execution._observe_authored_locators(
-            SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+            SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
             run_session_id="pbs_1",
             failed_block_code='page.locator("#cancelled")',
         )
@@ -697,7 +975,7 @@ async def test_observation_deadline_preserves_partial_rows_and_types_every_remai
     monkeypatch.setattr(run_execution, "_OBSERVED_LOCATOR_BUDGET_SECONDS", 0.01)
 
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code='page.locator("#done")\npage.locator("#wedged")\npage.locator("#later")',
     )
@@ -723,7 +1001,7 @@ async def test_observer_packet_and_sanitizer_preserve_typed_rows_and_exact_omiss
         AsyncMock(return_value=_observation_browser(page)),
     )
     rows = await run_execution._observe_authored_locators(
-        SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+        SimpleNamespace(organization_id="org-1", attached_browser_drivers={}),  # type: ignore[arg-type]
         run_session_id="pbs_1",
         failed_block_code="\n".join(f'page.locator("{selector}")' for selector in selectors),
     )
@@ -768,6 +1046,9 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         browser_session_id="pbs_prior",
         status="failed",
         failure_reason="click failed",
+        created_at=datetime(2026, 4, 21, 12, 0),
+        trigger_type=None,
+        workflow_definition_sha256=None,
     )
     now = datetime.now(UTC)
     block = WorkflowRunBlock(
@@ -784,15 +1065,26 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         modified_at=now,
     )
     workflow = SimpleNamespace(
-        workflow_definition={
-            "blocks": [
-                {
-                    "label": "click_submit",
-                    "block_type": "code",
-                    "code": 'await page.locator("#submit").click()',
-                }
+        workflow_id="w_prior",
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        version=1,
+        created_by=None,
+        modified_at=datetime(2026, 4, 21, 12, 0),
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                CodeBlock(
+                    label="click_submit",
+                    code='await page.locator("#submit").click()',
+                    output_parameter=OutputParameter(
+                        output_parameter_id="op_click_submit",
+                        key="click_submit_output",
+                        workflow_id="w_prior",
+                        created_at=now,
+                        modified_at=now,
+                    ),
+                )
             ]
-        }
+        ),
     )
     database = SimpleNamespace(
         workflow_runs=SimpleNamespace(get_workflow_run=AsyncMock(return_value=run)),
@@ -809,7 +1101,12 @@ async def test_prior_run_result_uses_its_exact_failed_row_and_workflow_for_typed
         AsyncMock(return_value=False),
     )
 
-    async def _attach_trace(_blocks: list[object], results: list[dict[str, object]], _organization_id: str) -> None:
+    async def _attach_trace(
+        _blocks: list[object],
+        results: list[dict[str, object]],
+        _organization_id: str,
+        include_completed: bool = False,
+    ) -> None:
         results[0]["action_trace"] = [{"action": "NULL_ACTION", "status": "failed", "code_line": 4}]
 
     monkeypatch.setattr(run_execution, "_attach_action_traces", _attach_trace)

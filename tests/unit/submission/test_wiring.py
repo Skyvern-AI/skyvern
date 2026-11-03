@@ -64,7 +64,9 @@ async def test_workflow_debug_artifacts_use_step_archive_when_hmac_signing_is_co
 
         await service.persist_debug_artifacts(browser_state, last_task, workflow, workflow_run)
 
-    persist_archive.assert_awaited_once_with(browser_state, last_step, workflow, workflow_run)
+    persist_archive.assert_awaited_once_with(
+        browser_state, last_step, workflow, workflow_run, browser_session_id=None, attempt_number=None
+    )
 
 
 def test_submission_signal_shadow_setting_defaults_off() -> None:

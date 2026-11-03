@@ -1,7 +1,14 @@
 import type { Edge } from "@xyflow/react";
 import { describe, expect, test } from "vitest";
+import { parse, stringify } from "yaml";
 
 import { ProxyLocation } from "@/api/types";
+import {
+  applySettingsPatch,
+  buildWorkflowSaveRequest,
+  buildWorkflowYamlDocument,
+} from "../workflowYamlDocument";
+import { yamlCommitInputs } from "../workflowVersionFromSaveData";
 
 import type { AppNode } from "../nodes";
 import {
@@ -11,18 +18,156 @@ import {
   getWorkflowSettings,
 } from "../workflowEditorUtils";
 import {
+  type AWSSecretParameter,
   type CodeBlock,
   type EmailInboxBlock,
+  type ForLoopBlock,
   type OutputParameter,
+  type PowerBIQueryBlock,
+  type SendEmailBlock,
   type WorkflowBlock,
   type WorkflowApiResponse,
   type WorkflowParameter,
   type WorkflowSettings,
 } from "../../types/workflowTypes";
-import type { CodeBlockYAML } from "../../types/workflowYamlTypes";
+import type {
+  CodeBlockYAML,
+  WorkflowCreateYAMLRequest,
+} from "../../types/workflowYamlTypes";
 
 import { rewireBlockDropInScope } from "./rewire";
 import { TOP_LEVEL_SCOPE } from "./scope";
+
+describe("send email SMTP round trip", () => {
+  test.each([
+    { kind: "placeholders", placeholder: true },
+    { kind: "declared secrets", placeholder: false },
+  ])("clearing a custom host handles $kind", ({ placeholder }) => {
+    const smtpParameter = (name: string): AWSSecretParameter => ({
+      parameter_type: "aws_secret",
+      key: placeholder ? name : `existing_${name}`,
+      description: null,
+      aws_key: placeholder ? "UNUSED_CUSTOM_SMTP_PLACEHOLDER" : name,
+      aws_secret_parameter_id: `secret_${name}`,
+      workflow_id: "wf-fixture",
+      created_at: "2026-04-20T00:00:00Z",
+      modified_at: "2026-04-20T00:00:00Z",
+      deleted_at: null,
+    });
+    const block: SendEmailBlock = {
+      block_type: "send_email",
+      label: "send_email",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("send_email"),
+      sender: "sender@example.com",
+      recipients: ["recipient@example.com"],
+      subject: "Workflow complete",
+      body: "<p>Workflow complete</p>",
+      body_format: "html",
+      file_attachments: [],
+      custom_smtp_host: "smtp.example.com",
+      custom_smtp_port: 587,
+      smtp_host: smtpParameter("smtp_host"),
+      smtp_port: smtpParameter("smtp_port"),
+      smtp_username: smtpParameter("smtp_username"),
+      smtp_password: smtpParameter("smtp_password"),
+    };
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const emailNode = nodes.find((node) => node.type === "sendEmail");
+    if (!emailNode || emailNode.type !== "sendEmail") {
+      throw new Error("Send Email node was not loaded");
+    }
+    emailNode.data.customSmtpHost = "";
+
+    const [savedFromEditor] = getWorkflowBlocks(nodes, edges);
+    const [savedFromDefinition] = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [{ ...block, custom_smtp_host: "" }],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks;
+    for (const saved of [savedFromEditor, savedFromDefinition]) {
+      expect(saved).toMatchObject({
+        block_type: "send_email",
+        custom_smtp_host: "",
+        custom_smtp_port: 587,
+        body_format: "html",
+        smtp_host_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_host",
+        smtp_port_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_port",
+        smtp_username_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_username",
+        smtp_password_secret_parameter_key: placeholder
+          ? undefined
+          : "existing_smtp_password",
+      });
+    }
+  });
+});
+
+describe("send email Gmail round trip", () => {
+  test("the editor and the definition save the same Gmail fields and keep a template with commas as one entry", () => {
+    const placeholder = (name: string): AWSSecretParameter => ({
+      parameter_type: "aws_secret",
+      key: `gmail-unused-${name}`,
+      description: null,
+      aws_key: "UNUSED_CUSTOM_SMTP_PLACEHOLDER",
+      aws_secret_parameter_id: `placeholder_${name}`,
+      workflow_id: "",
+      created_at: "2026-04-20T00:00:00Z",
+      modified_at: "2026-04-20T00:00:00Z",
+      deleted_at: null,
+    });
+    const entries = [
+      "{{ addresses | join(',') }}",
+      "{% for address in [primary, backup] %}{{ address }};{% endfor %}",
+      "second@example.com",
+    ];
+    const gmailFields = {
+      block_type: "send_email" as const,
+      transport: "gmail" as const,
+      credential_id: "goac_send",
+      sender: "",
+      recipients: entries,
+      cc: entries,
+      bcc: ["bcc@example.com"],
+      subject: "Report {{ current_value }}",
+      body: "<p>Done</p>",
+      body_format: "html" as const,
+      file_attachments: ["{{ reports | join(',') }}"],
+    };
+    const block: SendEmailBlock = {
+      ...gmailFields,
+      label: "send_email",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("send_email"),
+      smtp_host: placeholder("smtp_host"),
+      smtp_port: placeholder("smtp_port"),
+      smtp_username: placeholder("smtp_username"),
+      smtp_password: placeholder("smtp_password"),
+    };
+
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const [savedFromEditor] = getWorkflowBlocks(nodes, edges);
+    const [savedFromDefinition] = convert({
+      workflow_definition: { version: 2, parameters: [], blocks: [block] },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks;
+
+    for (const saved of [savedFromEditor, savedFromDefinition]) {
+      expect(saved).toMatchObject(gmailFields);
+    }
+  });
+});
 
 /**
  * M1 round-trip regression: mirrors the full reorder → save → reload path
@@ -46,6 +191,10 @@ import { TOP_LEVEL_SCOPE } from "./scope";
 const DEFAULT_SETTINGS: WorkflowSettings = {
   proxyLocation: ProxyLocation.Residential,
   webhookCallbackUrl: null,
+  totpVerificationUrl: null,
+  totpIdentifier: null,
+  adaptiveCaching: false,
+  generateScriptOnTerminal: false,
   persistBrowserSession: false,
   reuseBrowserSession: false,
   pinSavedSessionIp: false,
@@ -60,13 +209,13 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   codeVersion: 2,
   scriptCacheKey: null,
   aiFallback: true,
-  enableSelfHealing: false,
   maskSecrets: false,
   runSequentially: false,
   sequentialKey: null,
   finallyBlockLabel: null,
   workflowSystemPrompt: null,
   errorCodeMapping: null,
+  retryPolicy: null,
 };
 
 function makeOutputParameter(label: string): OutputParameter {
@@ -134,7 +283,28 @@ function makeEmailInboxBlock(
     newer_than_days: null,
     max_results: 25,
     include_body: true,
+    download_attachments: false,
     parameters,
+  };
+}
+
+function makePowerBIQueryBlock(): PowerBIQueryBlock {
+  return {
+    label: "Power BI Query",
+    block_type: "powerbi_query",
+    continue_on_failure: false,
+    model: null,
+    next_block_label: null,
+    output_parameter: makeOutputParameter("powerbi_query"),
+    connection_id: "{{ powerbi_connection_id }}",
+    dataset_id: "{{ dataset_id }}",
+    query: `EVALUATE FILTER('Orders', 'Orders'[Region] = "{{ region }}")`,
+    max_rows: 250,
+    parameters: [
+      makeWorkflowParameter("powerbi_connection_id"),
+      makeWorkflowParameter("dataset_id"),
+      makeWorkflowParameter("region"),
+    ],
   };
 }
 
@@ -267,6 +437,176 @@ function reloadFromSavedYaml(
 }
 
 describe("round-trip reorder → save → reload (M1 top-level)", () => {
+  test("Power BI preserves connection, DAX, dataset, row cap, and bindings", () => {
+    const block = makePowerBIQueryBlock();
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const node = nodes.find((candidate) => candidate.type === "powerBIQuery");
+
+    expect(node?.data).toMatchObject({
+      connectionId: block.connection_id,
+      datasetId: block.dataset_id,
+      query: block.query,
+      maxRows: 250,
+      parameterKeys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const savedFromEditor = getWorkflowBlocks(nodes, edges)[0];
+    expect(savedFromEditor).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: block.connection_id,
+      dataset_id: block.dataset_id,
+      query: block.query,
+      max_rows: 250,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+    expect(savedFromEditor).not.toHaveProperty("credential_id");
+
+    const savedFromDefinition = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [block],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(savedFromDefinition).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: block.connection_id,
+      dataset_id: block.dataset_id,
+      query: block.query,
+      max_rows: 250,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const reloaded = getElements([block], DEFAULT_SETTINGS, true).nodes.find(
+      (candidate) => candidate.type === "powerBIQuery",
+    );
+    expect(reloaded?.data).toMatchObject({
+      connectionId: block.connection_id,
+      datasetId: block.dataset_id,
+      query: block.query,
+      maxRows: 250,
+      parameterKeys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+  });
+
+  test("Power BI defaults omitted max_rows to 1000 on API import", () => {
+    const block = {
+      ...makePowerBIQueryBlock(),
+      max_rows: undefined,
+    } as unknown as PowerBIQueryBlock;
+    const { nodes, edges } = getElements([block], DEFAULT_SETTINGS, true);
+    const node = nodes.find((candidate) => candidate.type === "powerBIQuery");
+
+    expect(node?.data).toMatchObject({ maxRows: 1000 });
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject({
+      max_rows: 1000,
+    });
+
+    const exported = convert({
+      workflow_definition: { version: 2, parameters: [], blocks: [block] },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(exported).toMatchObject({ max_rows: 1000 });
+  });
+
+  test("nested Power BI API blocks load and preserve fields through YAML save", () => {
+    const queryBlock = {
+      ...makePowerBIQueryBlock(),
+      label: "Nested Power BI Query",
+    };
+    const loop: ForLoopBlock = {
+      label: "For each item",
+      block_type: "for_loop",
+      continue_on_failure: false,
+      model: null,
+      next_block_label: null,
+      output_parameter: makeOutputParameter("for_each_item"),
+      loop_over: makeWorkflowParameter("items"),
+      loop_blocks: [queryBlock],
+      loop_variable_reference: "item",
+      complete_if_empty: false,
+      data_schema: null,
+    };
+    const { nodes, edges } = getElements([loop], DEFAULT_SETTINGS, true);
+    const loopNode = nodes.find(
+      (node) => node.type === "loop" && node.data.label === loop.label,
+    );
+    const queryNode = nodes.find((node) => node.type === "powerBIQuery");
+
+    expect(queryNode?.parentId).toBe(loopNode?.id);
+    expect(queryNode?.data).toMatchObject({
+      connectionId: queryBlock.connection_id,
+      datasetId: queryBlock.dataset_id,
+      query: queryBlock.query,
+      maxRows: queryBlock.max_rows,
+      parameterKeys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const exportedFromDefinition = convert({
+      workflow_definition: {
+        version: 2,
+        parameters: [],
+        blocks: [loop],
+      },
+    } as unknown as WorkflowApiResponse).workflow_definition.blocks[0];
+    expect(exportedFromDefinition).toMatchObject({
+      block_type: "for_loop",
+      loop_blocks: [
+        {
+          block_type: "powerbi_query",
+          connection_id: queryBlock.connection_id,
+          dataset_id: queryBlock.dataset_id,
+          query: queryBlock.query,
+          max_rows: queryBlock.max_rows,
+          parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+        },
+      ],
+    });
+
+    const savedBlocks = getWorkflowBlocks(nodes, edges);
+    const savedLoop = savedBlocks[0];
+    if (!savedLoop || savedLoop.block_type !== "for_loop") {
+      throw new Error("Nested loop did not save as a for_loop block");
+    }
+    expect(savedLoop.loop_blocks[0]).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: queryBlock.connection_id,
+      dataset_id: queryBlock.dataset_id,
+      query: queryBlock.query,
+      max_rows: queryBlock.max_rows,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+
+    const yaml = stringify(
+      buildWorkflowYamlDocument({
+        workflow: {
+          status: "published",
+          is_saved_task: false,
+        } as WorkflowApiResponse,
+        settings: DEFAULT_SETTINGS,
+        title: "Nested Power BI query",
+        description: null,
+        blocks: savedBlocks,
+        parameters: [],
+        definitionVersion: 2,
+      }),
+    );
+    const committed = yamlCommitInputs<
+      WorkflowCreateYAMLRequest["workflow_definition"]
+    >(parse(yaml), yaml);
+    const yamlLoop = committed.definition.blocks[0];
+    if (!yamlLoop || yamlLoop.block_type !== "for_loop") {
+      throw new Error("Nested loop did not survive YAML save");
+    }
+    expect(yamlLoop.loop_blocks[0]).toMatchObject({
+      block_type: "powerbi_query",
+      connection_id: queryBlock.connection_id,
+      dataset_id: queryBlock.dataset_id,
+      query: queryBlock.query,
+      max_rows: queryBlock.max_rows,
+      parameter_keys: ["powerbi_connection_id", "dataset_id", "region"],
+    });
+  });
+
   test("email inbox preserves parameter keys across load and save", () => {
     const credentialParameter = makeWorkflowParameter(
       "microsoft_credential_id",
@@ -280,6 +620,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     const emailNode = nodes.find((node) => node.type === "emailInbox");
     expect(emailNode?.data).toMatchObject({
       parameterKeys: ["microsoft_credential_id"],
+      downloadAttachments: false,
     });
 
     const saved = getWorkflowBlocks(nodes, edges);
@@ -287,6 +628,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
     expect(saved[0]).toMatchObject({
       block_type: "email_inbox",
       parameter_keys: ["microsoft_credential_id"],
+      download_attachments: false,
     });
   });
 
@@ -338,6 +680,7 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
 
   test("nested loop code manifest survives save and reload", () => {
     const nestedCode = makeCodeBlock("Nested Guard", null);
+    nestedCode.parameters = [makeWorkflowParameter("items")];
     nestedCode.error_code_mapping = {
       nested_lowercase: "when the nested condition occurs",
     };
@@ -363,6 +706,38 @@ describe("round-trip reorder → save → reload (M1 top-level)", () => {
       nestedCode.error_code_mapping,
     );
     expect(firstSaved.loop_blocks[0]).not.toHaveProperty("error_code");
+
+    const input = {
+      workflow: {
+        status: "published",
+        is_saved_task: false,
+      } as WorkflowApiResponse,
+      settings: DEFAULT_SETTINGS,
+      title: "Loop workflow",
+      description: null,
+      blocks: getWorkflowBlocks(first.nodes, first.edges),
+      parameters: [],
+      definitionVersion: 2,
+    };
+    const yaml = stringify(buildWorkflowYamlDocument(input));
+    const committed = yamlCommitInputs<
+      WorkflowCreateYAMLRequest["workflow_definition"]
+    >(parse(yaml), yaml);
+    const saved = parse(
+      stringify(
+        buildWorkflowSaveRequest({
+          ...input,
+          blocks: committed.definition.blocks,
+          parameters: committed.definition.parameters,
+          settings: applySettingsPatch(input.settings, committed.settingsPatch),
+          workflowDefinitionVersion: 2,
+        }),
+      ),
+    );
+    expect(saved.workflow_definition.blocks).toEqual(input.blocks);
+    expect(
+      saved.workflow_definition.blocks[0].loop_blocks[0].parameter_keys,
+    ).toEqual(["items"]);
   });
 
   test("drag B3 above B1 persists as B3 → B1 → B2 → B4 → B5 chain", () => {
@@ -686,5 +1061,23 @@ describe("login block configuration round trip", () => {
         }
       ).include_action_history_in_verification,
     ).toBe(true);
+  });
+});
+
+test("workflow export includes error mapping, CDP headers, and TOTP identifier", () => {
+  const workflow = {
+    cdp_connect_headers: { "X-Test": "value" },
+    totp_identifier: "identifier",
+    workflow_definition: {
+      version: 2,
+      parameters: [],
+      blocks: [],
+      error_code_mapping: { RETRY: "Retry the request" },
+    },
+  } as unknown as WorkflowApiResponse;
+  expect(convert(workflow)).toMatchObject({
+    cdp_connect_headers: { "X-Test": "value" },
+    totp_identifier: "identifier",
+    workflow_definition: { error_code_mapping: { RETRY: "Retry the request" } },
   });
 });

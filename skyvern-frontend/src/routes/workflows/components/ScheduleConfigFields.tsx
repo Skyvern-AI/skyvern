@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   CaretSortIcon,
   CheckIcon,
@@ -52,12 +52,29 @@ import {
   type ScheduleBuilderState,
   type ScheduleFrequency,
 } from "@/routes/workflows/editor/panels/schedulePanel/scheduleBuilder";
+import {
+  DEFAULT_INTERVAL_DRAFT,
+  formatInterval,
+  formatIntervalDuration,
+  getIntervalRuns,
+  intervalDraftErrors,
+  intervalDraftSeconds,
+  upcomingFirstRun,
+  zonedWallTimeToDate,
+  type IntervalDraft,
+  type IntervalUnit,
+} from "@/routes/workflows/editor/panels/schedulePanel/scheduleCadence";
 
 type Props = {
   cronExpression: string;
   timezone: string;
   onCronChange: (cronExpression: string) => void;
   onTimezoneChange: (timezone: string) => void;
+  // A non-null interval puts the fields in fixed-interval mode; omit onIntervalChange to offer cron only.
+  interval?: IntervalDraft | null;
+  onIntervalChange?: (interval: IntervalDraft | null) => void;
+  // The stored anchor when editing, kept by the server if the first-run field is left empty.
+  intervalAnchor?: string | null;
   size?: "default" | "compact";
   disabled?: boolean;
 };
@@ -81,10 +98,19 @@ function ScheduleConfigFields({
   timezone,
   onCronChange,
   onTimezoneChange,
+  interval = null,
+  onIntervalChange,
+  intervalAnchor = null,
   size = "default",
   disabled = false,
 }: Readonly<Props>) {
   const compact = size === "compact";
+  const fieldId = useId();
+  const everyId = `${fieldId}-every`;
+  const everyErrorId = `${fieldId}-every-error`;
+  const firstRunId = `${fieldId}-first-run`;
+  const firstRunHintId = `${fieldId}-first-run-hint`;
+  const firstRunErrorId = `${fieldId}-first-run-error`;
   const controlClass = compact ? "h-8 text-xs" : "h-9 text-sm";
   const labelClass = compact ? "text-xs" : undefined;
 
@@ -115,10 +141,43 @@ function ScheduleConfigFields({
   }, [isCustom]);
 
   const allTimezones = useMemo(() => getTimezones(), []);
+  const cronMode = interval === null;
   const valid = isValidCron(cronExpression);
   const intervalTooShort = valid && !meetsMinCronInterval(cronExpression);
-  const humanReadable = valid ? cronToHumanReadable(cronExpression) : null;
-  const nextRuns = valid ? getNextRuns(cronExpression, timezone, 5) : [];
+  const intervalErrors = interval
+    ? intervalDraftErrors(interval, timezone)
+    : null;
+  const intervalSeconds = interval ? intervalDraftSeconds(interval) : 0;
+  let humanReadable: string | null = null;
+  let nextRuns: Date[] = [];
+  if (interval && intervalErrors) {
+    if (!intervalErrors.every) {
+      humanReadable = formatInterval(intervalSeconds);
+    }
+    if (!intervalErrors.every && !intervalErrors.firstFireAt) {
+      const anchor = interval.firstFireAt
+        ? zonedWallTimeToDate(interval.firstFireAt, timezone)
+        : intervalAnchor
+          ? new Date(intervalAnchor)
+          : null;
+      if (anchor) {
+        nextRuns = getIntervalRuns(intervalSeconds, anchor, 5);
+      } else {
+        humanReadable = `${humanReadable}. First run ${formatIntervalDuration(intervalSeconds)} after saving.`;
+      }
+    }
+  } else if (valid) {
+    humanReadable = cronToHumanReadable(cronExpression);
+    nextRuns = getNextRuns(cronExpression, timezone, 5);
+  }
+
+  const upcomingAnchor = upcomingFirstRun(intervalAnchor);
+  let firstRunHint = "Leave empty to start one interval after saving.";
+  if (upcomingAnchor) {
+    firstRunHint = `Leave empty to keep the current first run (${formatNextRun(upcomingAnchor, timezone)}).`;
+  } else if (intervalAnchor) {
+    firstRunHint = "Leave empty to keep the current run times.";
+  }
 
   const { hour12, meridiem } = to12Hour(builder.hour);
 
@@ -128,7 +187,12 @@ function ScheduleConfigFields({
   }
 
   function handleFrequencyChange(value: string) {
+    if (value === "interval") {
+      onIntervalChange?.(DEFAULT_INTERVAL_DRAFT);
+      return;
+    }
     if (value === "custom") return;
+    if (interval) onIntervalChange?.(null);
     const frequency = value as ScheduleFrequency;
     const next: ScheduleBuilderState = { ...builder, frequency };
     if (frequency === "weekly" && next.daysOfWeek.length === 0) {
@@ -153,7 +217,9 @@ function ScheduleConfigFields({
       <div className="space-y-2">
         <Label className={labelClass}>Repeat</Label>
         <Select
-          value={isCustom ? "custom" : builder.frequency}
+          value={
+            interval ? "interval" : isCustom ? "custom" : builder.frequency
+          }
           onValueChange={handleFrequencyChange}
           disabled={disabled}
         >
@@ -171,11 +237,109 @@ function ScheduleConfigFields({
                 Custom
               </SelectItem>
             )}
+            {onIntervalChange && (
+              <SelectItem value="interval">Fixed interval</SelectItem>
+            )}
           </SelectContent>
         </Select>
       </div>
 
-      {!isCustom && builder.frequency === "hourly" && (
+      {interval && (
+        <>
+          <div className="space-y-2">
+            <Label htmlFor={everyId} className={labelClass}>
+              Every
+            </Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id={everyId}
+                type="number"
+                min={1}
+                aria-invalid={intervalErrors?.every ? true : undefined}
+                aria-describedby={
+                  intervalErrors?.every ? everyErrorId : undefined
+                }
+                value={interval.every}
+                onChange={(e) =>
+                  onIntervalChange?.({
+                    ...interval,
+                    every: e.target.value,
+                  })
+                }
+                disabled={disabled}
+                className={cn(
+                  "w-24",
+                  controlClass,
+                  intervalErrors?.every && "border-destructive",
+                )}
+              />
+              <Select
+                value={interval.unit}
+                onValueChange={(value) =>
+                  onIntervalChange?.({
+                    ...interval,
+                    unit: value as IntervalUnit,
+                  })
+                }
+                disabled={disabled}
+              >
+                <SelectTrigger
+                  aria-label="Interval unit"
+                  className={cn("w-28", controlClass)}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="minutes">minutes</SelectItem>
+                  <SelectItem value="hours">hours</SelectItem>
+                  <SelectItem value="days">days</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {intervalErrors?.every && (
+              <p id={everyErrorId} className="text-xs text-destructive">
+                {intervalErrors.every}
+              </p>
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor={firstRunId} className={labelClass}>
+              First run (optional)
+            </Label>
+            <Input
+              id={firstRunId}
+              type="datetime-local"
+              aria-invalid={intervalErrors?.firstFireAt ? true : undefined}
+              aria-describedby={
+                intervalErrors?.firstFireAt
+                  ? `${firstRunHintId} ${firstRunErrorId}`
+                  : firstRunHintId
+              }
+              value={interval.firstFireAt}
+              onChange={(e) =>
+                onIntervalChange?.({ ...interval, firstFireAt: e.target.value })
+              }
+              disabled={disabled}
+              className={cn(
+                controlClass,
+                "[color-scheme:light] dark:[color-scheme:dark]",
+                intervalErrors?.firstFireAt && "border-destructive",
+              )}
+            />
+            <p id={firstRunHintId} className="text-xs text-muted-foreground">
+              {firstRunHint} Runs stay exactly one interval apart, including
+              across daylight saving changes. Entered in {timezone}.
+            </p>
+            {intervalErrors?.firstFireAt && (
+              <p id={firstRunErrorId} className="text-xs text-destructive">
+                {intervalErrors.firstFireAt}
+              </p>
+            )}
+          </div>
+        </>
+      )}
+
+      {cronMode && !isCustom && builder.frequency === "hourly" && (
         <div className="space-y-2">
           <Label className={labelClass}>Minute past the hour</Label>
           <Select
@@ -199,7 +363,7 @@ function ScheduleConfigFields({
         </div>
       )}
 
-      {!isCustom && builder.frequency === "weekly" && (
+      {cronMode && !isCustom && builder.frequency === "weekly" && (
         <div className="space-y-2">
           <Label className={labelClass}>On these days</Label>
           <div className="flex flex-wrap gap-1.5">
@@ -225,7 +389,7 @@ function ScheduleConfigFields({
         </div>
       )}
 
-      {!isCustom && builder.frequency === "monthly" && (
+      {cronMode && !isCustom && builder.frequency === "monthly" && (
         <div className="space-y-2">
           <Label className={labelClass}>On day of month</Label>
           <Select
@@ -249,7 +413,7 @@ function ScheduleConfigFields({
         </div>
       )}
 
-      {!isCustom && showTimeOfDay && (
+      {cronMode && !isCustom && showTimeOfDay && (
         <div className="space-y-2">
           <Label className={labelClass}>At</Label>
           <div className="flex items-center gap-2">
@@ -376,39 +540,43 @@ function ScheduleConfigFields({
         </p>
       )}
 
-      <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-        <CollapsibleTrigger asChild>
-          <button
-            type="button"
-            className="group flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-          >
-            <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
-            Advanced (cron expression)
-          </button>
-        </CollapsibleTrigger>
-        <CollapsibleContent className="space-y-1.5 pt-2">
-          <Input
-            value={cronExpression}
-            onChange={(e) => onCronChange(e.target.value)}
-            placeholder="* * * * *"
-            disabled={disabled}
-            className={cn(
-              controlClass,
-              cronExpression &&
-                (!valid || intervalTooShort) &&
-                "border-destructive",
+      {cronMode && (
+        <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+          <CollapsibleTrigger asChild>
+            <button
+              type="button"
+              className="group flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            >
+              <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
+              Advanced (cron expression)
+            </button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="space-y-1.5 pt-2">
+            <Input
+              value={cronExpression}
+              onChange={(e) => onCronChange(e.target.value)}
+              placeholder="* * * * *"
+              disabled={disabled}
+              className={cn(
+                controlClass,
+                cronExpression &&
+                  (!valid || intervalTooShort) &&
+                  "border-destructive",
+              )}
+            />
+            {!valid && cronExpression && (
+              <p className="text-xs text-destructive">
+                Invalid cron expression
+              </p>
             )}
-          />
-          {!valid && cronExpression && (
-            <p className="text-xs text-destructive">Invalid cron expression</p>
-          )}
-          {intervalTooShort && (
-            <p className="text-xs text-destructive">
-              Schedule runs must be at least 5 minutes apart.
-            </p>
-          )}
-        </CollapsibleContent>
-      </Collapsible>
+            {intervalTooShort && (
+              <p className="text-xs text-destructive">
+                Schedule runs must be at least 5 minutes apart.
+              </p>
+            )}
+          </CollapsibleContent>
+        </Collapsible>
+      )}
 
       {nextRuns.length > 0 && (
         <div className="space-y-2">

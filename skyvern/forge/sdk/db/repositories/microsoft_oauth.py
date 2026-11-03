@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -18,6 +18,14 @@ STATE_PENDING_CONSENT = "pending_consent"
 STATE_ACTIVE = "active"
 STATE_REVOKED = "revoked"
 STATE_ERROR = "error"
+
+
+def _has_scope(scopes: list[str] | None, expected: str) -> bool:
+    return any(isinstance(scope, str) and scope.rsplit("/", 1)[-1] == expected for scope in scopes or [])
+
+
+def _is_powerbi_connection(scopes_requested: list[str] | None, scopes_granted: list[str] | None) -> bool:
+    return _has_scope(scopes_requested, "Dataset.Read.All") or _has_scope(scopes_granted, "Dataset.Read.All")
 
 
 class InvalidConsentNonceError(ValueError):
@@ -36,18 +44,50 @@ class PendingConsentContext:
 @dataclass(frozen=True)
 class ActiveCredentialCiphertext:
     encrypted_refresh_token: str
-    encrypted_method: EncryptMethod
+    encrypted_method: str | None
     scopes_granted: list[str]
+    scopes_requested: list[str] = field(default_factory=list)
+    initiating_user_id: str | None = None
+    connection_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ActiveCredentialAccess:
+    scopes_requested: list[str]
+    scopes_granted: list[str]
+    initiating_user_id: str | None
+    connection_id: str | None
 
 
 @dataclass(frozen=True)
 class RevocableCiphertext:
     exists: bool
     encrypted_refresh_token: str | None = None
-    encrypted_method: EncryptMethod | None = None
+    encrypted_method: str | None = None
+
+
+@dataclass(frozen=True)
+class ActiveCustodyConnection:
+    scopes_granted: list[str]
+    tenant_id: str | None
+    object_id: str | None
+    initiating_user_id: str | None
+    connection_id: str | None
+    custody_mode: str | None
+    modified_at: datetime.datetime
 
 
 class MicrosoftOAuthRepository(BaseRepository):
+    @db_operation("get_credential_state")
+    async def get_credential_state(self, organization_id: str, credential_id: str) -> str | None:
+        async with self.Session() as session:
+            return await session.scalar(
+                select(MicrosoftOAuthCredentialModel.state).where(
+                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                    MicrosoftOAuthCredentialModel.id == credential_id,
+                )
+            )
+
     @db_operation("insert_pending_credential")
     async def insert_pending_credential(
         self,
@@ -121,6 +161,9 @@ class MicrosoftOAuthRepository(BaseRepository):
         encrypted_refresh_token: str,
         encrypted_method: EncryptMethod,
         scopes_granted: list[str],
+        initiating_user_id: str | None,
+        tenant_id: str | None,
+        object_id: str | None,
         now: datetime.datetime,
     ) -> MicrosoftOAuthCredentialBase:
         async with self.Session() as session:
@@ -137,6 +180,10 @@ class MicrosoftOAuthRepository(BaseRepository):
                     encrypted_refresh_token=encrypted_refresh_token,
                     encrypted_method=encrypted_method.value,
                     scopes_granted=scopes_granted,
+                    tenant_id=tenant_id or MicrosoftOAuthCredentialModel.tenant_id,
+                    object_id=object_id or MicrosoftOAuthCredentialModel.object_id,
+                    initiating_user_id=initiating_user_id or MicrosoftOAuthCredentialModel.initiating_user_id,
+                    connection_id=MicrosoftOAuthCredentialModel.id,
                     consent_nonce=None,
                     consent_redirect_uri=None,
                     consent_expires_at=None,
@@ -173,7 +220,9 @@ class MicrosoftOAuthRepository(BaseRepository):
             return result
 
     @db_operation("list_active_for_org")
-    async def list_active_for_org(self, organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
+    async def list_active_for_org(
+        self, organization_id: str, user_id: str | None = None
+    ) -> list[MicrosoftOAuthCredentialBase]:
         async with self.Session() as session:
             stmt = (
                 select(MicrosoftOAuthCredentialModel)
@@ -181,6 +230,23 @@ class MicrosoftOAuthRepository(BaseRepository):
                     MicrosoftOAuthCredentialModel.organization_id == organization_id,
                     MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
                 )
+                .order_by(MicrosoftOAuthCredentialModel.created_at.desc())
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [
+                MicrosoftOAuthCredentialBase.model_validate(row, from_attributes=True)
+                for row in rows
+                if not _is_powerbi_connection(row.scopes_requested, row.scopes_granted)
+                or (user_id is not None and user_id != f"{organization_id}_user" and row.initiating_user_id == user_id)
+            ]
+
+    @db_operation("list_for_org")
+    async def list_for_org(self, organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
+        """Return every credential row for the organization, regardless of state."""
+        async with self.Session() as session:
+            stmt = (
+                select(MicrosoftOAuthCredentialModel)
+                .where(MicrosoftOAuthCredentialModel.organization_id == organization_id)
                 .order_by(MicrosoftOAuthCredentialModel.created_at.desc())
             )
             rows = (await session.execute(stmt)).scalars().all()
@@ -197,6 +263,9 @@ class MicrosoftOAuthRepository(BaseRepository):
                 MicrosoftOAuthCredentialModel.encrypted_refresh_token,
                 MicrosoftOAuthCredentialModel.encrypted_method,
                 MicrosoftOAuthCredentialModel.scopes_granted,
+                MicrosoftOAuthCredentialModel.scopes_requested,
+                MicrosoftOAuthCredentialModel.initiating_user_id,
+                MicrosoftOAuthCredentialModel.connection_id,
             ).where(
                 MicrosoftOAuthCredentialModel.id == credential_id,
                 MicrosoftOAuthCredentialModel.organization_id == organization_id,
@@ -205,13 +274,111 @@ class MicrosoftOAuthRepository(BaseRepository):
             row = (await session.execute(stmt)).one_or_none()
             if row is None:
                 return None
-            ciphertext, method, scopes = row
-            if not ciphertext or not method:
+            ciphertext, method, scopes, requested_scopes, initiating_user_id, connection_id = row
+            if not ciphertext:
                 return None
             return ActiveCredentialCiphertext(
                 encrypted_refresh_token=ciphertext,
-                encrypted_method=EncryptMethod(method),
+                encrypted_method=method,
                 scopes_granted=list(scopes or []),
+                scopes_requested=list(requested_scopes or []),
+                initiating_user_id=initiating_user_id,
+                connection_id=connection_id,
+            )
+
+    @db_operation("load_active_access_metadata")
+    async def load_active_access_metadata(
+        self,
+        organization_id: str,
+        credential_id: str,
+    ) -> ActiveCredentialAccess | None:
+        async with self.Session() as session:
+            row = await session.execute(
+                select(
+                    MicrosoftOAuthCredentialModel.scopes_requested,
+                    MicrosoftOAuthCredentialModel.scopes_granted,
+                    MicrosoftOAuthCredentialModel.initiating_user_id,
+                    MicrosoftOAuthCredentialModel.connection_id,
+                ).where(
+                    MicrosoftOAuthCredentialModel.id == credential_id,
+                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                    MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
+                    MicrosoftOAuthCredentialModel.encrypted_refresh_token.is_not(None),
+                    MicrosoftOAuthCredentialModel.encrypted_refresh_token != "",
+                )
+            )
+            values = row.one_or_none()
+            if values is None:
+                return None
+            requested, granted, initiating_user_id, connection_id = values
+            return ActiveCredentialAccess(
+                scopes_requested=list(requested or []),
+                scopes_granted=list(granted or []),
+                initiating_user_id=initiating_user_id,
+                connection_id=connection_id,
+            )
+
+    @db_operation("can_manage_credential")
+    async def can_manage_credential(
+        self,
+        organization_id: str,
+        credential_id: str,
+        user_id: str | None,
+    ) -> bool:
+        async with self.Session() as session:
+            row = await session.execute(
+                select(
+                    MicrosoftOAuthCredentialModel.scopes_requested,
+                    MicrosoftOAuthCredentialModel.scopes_granted,
+                    MicrosoftOAuthCredentialModel.initiating_user_id,
+                ).where(
+                    MicrosoftOAuthCredentialModel.id == credential_id,
+                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                    MicrosoftOAuthCredentialModel.state != STATE_REVOKED,
+                )
+            )
+            values = row.one_or_none()
+            if values is None:
+                return False
+            requested, granted, owner_user_id = values
+            return not _is_powerbi_connection(requested, granted) or (
+                user_id is not None and user_id != f"{organization_id}_user" and user_id == owner_user_id
+            )
+
+    @db_operation("load_active_custody_connection")
+    async def load_active_custody_connection(
+        self, organization_id: str, connection_id: str
+    ) -> ActiveCustodyConnection | None:
+        async with self.Session() as session:
+            row = await session.execute(
+                select(
+                    MicrosoftOAuthCredentialModel.scopes_granted,
+                    MicrosoftOAuthCredentialModel.tenant_id,
+                    MicrosoftOAuthCredentialModel.object_id,
+                    MicrosoftOAuthCredentialModel.initiating_user_id,
+                    MicrosoftOAuthCredentialModel.connection_id,
+                    MicrosoftOAuthCredentialModel.custody_mode,
+                    MicrosoftOAuthCredentialModel.modified_at,
+                ).where(
+                    MicrosoftOAuthCredentialModel.id == connection_id,
+                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
+                    MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
+                )
+            )
+            values = row.one_or_none()
+            if values is None:
+                return None
+            scopes, tenant_id, object_id, initiator, bound_connection, custody_mode, modified_at = values
+            if bound_connection not in (None, connection_id) or custody_mode not in (None, "cloud_held"):
+                return None
+            return ActiveCustodyConnection(
+                scopes_granted=list(scopes or []),
+                tenant_id=tenant_id,
+                object_id=object_id,
+                initiating_user_id=initiator,
+                connection_id=bound_connection,
+                custody_mode=custody_mode,
+                modified_at=modified_at,
             )
 
     @db_operation("load_ciphertext_for_revoke")
@@ -233,12 +400,12 @@ class MicrosoftOAuthRepository(BaseRepository):
             if row is None:
                 return RevocableCiphertext(exists=False)
             ciphertext, method = row
-            if not ciphertext or not method:
+            if not ciphertext:
                 return RevocableCiphertext(exists=True)
             return RevocableCiphertext(
                 exists=True,
                 encrypted_refresh_token=ciphertext,
-                encrypted_method=EncryptMethod(method),
+                encrypted_method=method,
             )
 
     @db_operation("rename_active")
@@ -273,26 +440,63 @@ class MicrosoftOAuthRepository(BaseRepository):
         *,
         organization_id: str,
         credential_id: str,
-        encrypted_refresh_token: str,
-        encrypted_method: EncryptMethod,
+        encrypted_refresh_token: str | None = None,
+        encrypted_method: EncryptMethod | None = None,
+        tenant_id: str | None = None,
+        object_id: str | None = None,
+        initiating_user_id: str | None = None,
+        connection_id: str | None = None,
+        custody_mode: str | None = None,
         now: datetime.datetime,
-    ) -> None:
-        async with self.Session() as session:
-            stmt = (
-                update(MicrosoftOAuthCredentialModel)
-                .where(
-                    MicrosoftOAuthCredentialModel.id == credential_id,
-                    MicrosoftOAuthCredentialModel.organization_id == organization_id,
-                    MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
-                )
-                .values(
-                    encrypted_refresh_token=encrypted_refresh_token,
-                    encrypted_method=encrypted_method.value,
-                    modified_at=now,
+        touch_modified_at: bool = True,
+        expected_encrypted_refresh_token: str | None = None,
+    ) -> bool:
+        values: dict[str, object] = {"modified_at": now} if touch_modified_at else {}
+        if encrypted_refresh_token is not None:
+            if encrypted_method is None:
+                raise ValueError("encrypted method is required with a refresh token")
+            if expected_encrypted_refresh_token is None:
+                raise ValueError("expected encrypted refresh token is required for token updates")
+            if not touch_modified_at:
+                raise ValueError("token updates must advance modified_at")
+            values.update(
+                encrypted_refresh_token=encrypted_refresh_token,
+                encrypted_method=encrypted_method.value,
+            )
+        metadata = (
+            ("tenant_id", tenant_id),
+            ("object_id", object_id),
+            ("initiating_user_id", initiating_user_id),
+            ("connection_id", connection_id),
+            ("custody_mode", custody_mode),
+        )
+        for name, value in metadata:
+            if value is not None:
+                values[name] = func.coalesce(getattr(MicrosoftOAuthCredentialModel, name), value)
+        if not touch_modified_at and not any(value is not None for _, value in metadata):
+            return False
+        conditions = [
+            MicrosoftOAuthCredentialModel.id == credential_id,
+            MicrosoftOAuthCredentialModel.organization_id == organization_id,
+            MicrosoftOAuthCredentialModel.state == STATE_ACTIVE,
+        ]
+        if not touch_modified_at:
+            conditions.append(
+                or_(
+                    *(
+                        getattr(MicrosoftOAuthCredentialModel, name).is_(None)
+                        for name, value in metadata
+                        if value is not None
+                    )
                 )
             )
-            await session.execute(stmt)
+        if expected_encrypted_refresh_token is not None:
+            conditions.append(MicrosoftOAuthCredentialModel.encrypted_refresh_token == expected_encrypted_refresh_token)
+        async with self.Session() as session:
+            stmt = update(MicrosoftOAuthCredentialModel).where(*conditions).values(**values)
+            result = await session.execute(stmt)
             await session.commit()
+            return result.rowcount > 0
 
     @db_operation("update_email_address")
     async def update_email_address(

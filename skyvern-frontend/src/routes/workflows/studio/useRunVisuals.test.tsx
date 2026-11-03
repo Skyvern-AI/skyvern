@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
-import { renderHook } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { type ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 
 import { Status } from "@/api/types";
 import { useRunViewStore } from "@/store/RunViewStore";
@@ -12,24 +13,64 @@ import type {
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
 import { useRunVisuals } from "./useRunVisuals";
+import {
+  resolveBrowserPaneView,
+  resolveReplayAvailability,
+} from "./browserPaneView";
 
-const mocks = vi.hoisted(() => ({
-  workflowRun: undefined as unknown,
-  timeline: undefined as unknown,
+const { mocks, getClientMock } = vi.hoisted(() => ({
+  mocks: {
+    workflowRun: undefined as unknown,
+    timeline: undefined as unknown,
+    timelinePlaceholder: false,
+    timelineFetching: false,
+    // The identity cases below need the real queries; the projection cases above
+    // them only need a payload, so they keep the cheaper stub.
+    useRealQueries: false,
+  },
+  getClientMock: vi.fn(),
 }));
 
-vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", () => ({
-  useWorkflowRunWithWorkflowQuery: () => ({
-    data: mocks.workflowRun,
-    isLoading: false,
-  }),
+vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
+vi.mock("@/hooks/useCredentialGetter", () => ({
+  useCredentialGetter: () => undefined,
 }));
-vi.mock("../hooks/useWorkflowRunTimelineQuery", () => ({
-  useWorkflowRunTimelineQuery: () => ({
-    data: mocks.timeline,
-    isLoading: false,
-  }),
+vi.mock("../hooks/useGlobalWorkflowsQuery", () => ({
+  useGlobalWorkflowsQuery: () => ({ data: [] }),
 }));
+vi.mock("../hooks/useWorkflowRunWithWorkflowQuery", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("../hooks/useWorkflowRunWithWorkflowQuery")
+    >();
+  return {
+    useWorkflowRunWithWorkflowQuery: (
+      options?: Parameters<typeof actual.useWorkflowRunWithWorkflowQuery>[0],
+    ) =>
+      mocks.useRealQueries
+        ? actual.useWorkflowRunWithWorkflowQuery(options)
+        : { data: mocks.workflowRun, isLoading: false },
+  };
+});
+vi.mock("../hooks/useWorkflowRunTimelineQuery", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("../hooks/useWorkflowRunTimelineQuery")
+    >();
+  return {
+    useWorkflowRunTimelineQuery: (
+      options?: Parameters<typeof actual.useWorkflowRunTimelineQuery>[0],
+    ) =>
+      mocks.useRealQueries
+        ? actual.useWorkflowRunTimelineQuery(options)
+        : {
+            data: mocks.timeline,
+            isLoading: false,
+            isPlaceholderData: mocks.timelinePlaceholder,
+            isFetching: mocks.timelineFetching,
+          },
+  };
+});
 
 function buildBlock(
   overrides: Partial<WorkflowRunBlock> = {},
@@ -114,21 +155,98 @@ function seedLoopRun() {
   };
 }
 
-function wrapper({ children }: { children: ReactNode }) {
-  return (
-    <MemoryRouter initialEntries={["/?active=wrb_loop"]}>
-      {children}
-    </MemoryRouter>
-  );
+function mockedQueryWrapper(initialEntries?: string[]) {
+  return function MockedQueryWrapper({ children }: { children: ReactNode }) {
+    const [client] = useState(
+      () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+    );
+    return (
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
+      </QueryClientProvider>
+    );
+  };
 }
+
+const wrapper = mockedQueryWrapper(["/?active=wrb_loop"]);
 
 afterEach(() => {
   mocks.workflowRun = undefined;
   mocks.timeline = undefined;
+  mocks.timelinePlaceholder = false;
+  mocks.timelineFetching = false;
+  mocks.useRealQueries = false;
+  getClientMock.mockReset();
 });
 beforeEach(() => useRunViewStore.getState().reset());
 
 describe("useRunVisuals loop-iteration threading", () => {
+  test("keeps the auto browser pane live across a retry delay until the run is final", () => {
+    seedLoopRun();
+    // The final attempt captured a screenshot, so its replay has a surface.
+    mocks.timeline = [
+      {
+        ...buildBlockItem(
+          buildBlock({
+            actions: [
+              {
+                action_id: "act_1",
+                step_id: "step_1",
+                action_order: 0,
+                screenshot_artifact_id: "art_1",
+              } as NonNullable<WorkflowRunBlock["actions"]>[number],
+            ],
+          }),
+        ),
+        attempt: 2,
+      },
+    ];
+    mocks.workflowRun = { status: Status.Running };
+    const { result, rerender } = renderHook(
+      () => {
+        const visuals = useRunVisuals("wr_1");
+        return {
+          ...visuals,
+          view: resolveBrowserPaneView({
+            intent: "auto",
+            recording: false,
+            scrubbing: visuals.scrubbing,
+            inspectingRun: true,
+            blockRunInDebugSession: false,
+            systemFocused: false,
+            copilotBrowserFocused: false,
+            runInDebugSession: false,
+            running: visuals.running,
+            hasRecording: visuals.recordingUrls.length > 0,
+            ...resolveReplayAvailability(visuals),
+            hasDebugSession: true,
+            failed: visuals.failed,
+          }),
+        };
+      },
+      { wrapper: mockedQueryWrapper() },
+    );
+
+    expect(result.current.view).toBe("live");
+
+    mocks.workflowRun = { status: Status.Failed, retry_pending: true };
+    rerender();
+    expect(result.current.view).toBe("live");
+    expect(result.current.running).toBe(true);
+    expect(result.current.finalized).toBe(false);
+
+    mocks.workflowRun = { status: Status.Running, attempt: 2 };
+    rerender();
+    expect(result.current.running).toBe(true);
+    expect(result.current.view).toBe("live");
+
+    mocks.workflowRun = { status: Status.Failed, attempt: 2 };
+    rerender();
+    expect(result.current.running).toBe(false);
+    expect(result.current.finalized).toBe(true);
+    expect(result.current.view).toBe("screenshots");
+  });
+
   test("resolves a selected container without an iteration to its first leaf", () => {
     seedLoopRun();
     const { result } = renderHook(() => useRunVisuals("wr_1"), { wrapper });
@@ -148,5 +266,137 @@ describe("useRunVisuals loop-iteration threading", () => {
       kind: "block",
       workflowRunBlockId: "wrb_iter1",
     });
+  });
+});
+
+const RUN_A_ID = "wr_visuals_a";
+const RUN_B_ID = "wr_visuals_b";
+
+function realQueryWrapper(client: QueryClient) {
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/agents/wpid_1/studio"]}>
+          {children}
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+  };
+}
+
+describe("useRunVisuals identity", () => {
+  test("reports no timeline, filmstrip or hero for a run other than the one requested", async () => {
+    mocks.useRealQueries = true;
+    const runA = {
+      workflow_run_id: RUN_A_ID,
+      status: Status.Running,
+      workflow: {
+        workflow_permanent_id: "wpid_1",
+        workflow_definition: { blocks: [], finally_block_label: null },
+      },
+    };
+    const timelineA = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_run_a",
+          workflow_run_id: RUN_A_ID,
+          label: "run-a-block",
+        }),
+      ),
+    ];
+    getClientMock.mockResolvedValue({
+      get: (url: string) => {
+        if (!url.includes(RUN_A_ID)) {
+          return new Promise(() => {});
+        }
+        return Promise.resolve({
+          data: url.endsWith("/timeline") ? timelineA : runA,
+        });
+      },
+    });
+
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string | undefined }) => useRunVisuals(id),
+      {
+        wrapper: realQueryWrapper(client),
+        initialProps: { id: RUN_A_ID as string | undefined },
+      },
+    );
+
+    await waitFor(() => {
+      expect(result.current.workflowRun?.workflow_run_id).toBe(RUN_A_ID);
+      expect(result.current.timeline).toHaveLength(1);
+    });
+
+    rerender({ id: RUN_B_ID });
+
+    expect(result.current.workflowRun).toBeUndefined();
+    expect(result.current.timeline).toBeUndefined();
+    expect(result.current.heroSelection).toBeNull();
+    expect(result.current.hasScreenshots).toBe(false);
+
+    rerender({ id: undefined });
+
+    expect(result.current.workflowRun).toBeUndefined();
+    expect(result.current.timeline).toBeUndefined();
+    expect(result.current.heroSelection).toBeNull();
+  });
+});
+
+describe("useRunVisuals same-run refetch", () => {
+  test("keeps a run's timeline while its own status change refetches it, but not another run's", () => {
+    mocks.workflowRun = { workflow_run_id: RUN_A_ID, status: Status.Running };
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_id: RUN_A_ID,
+          actions: [
+            {
+              action_id: "act_1",
+              step_id: "step_1",
+              action_order: 0,
+              screenshot_artifact_id: "art_1",
+            },
+          ] as WorkflowRunBlock["actions"],
+        }),
+      ),
+    ];
+    mocks.timelinePlaceholder = false;
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useRunVisuals(id),
+      {
+        wrapper: mockedQueryWrapper(),
+        initialProps: { id: RUN_A_ID },
+      },
+    );
+    expect(result.current.hasScreenshots).toBe(true);
+
+    mocks.timelinePlaceholder = true;
+    rerender({ id: RUN_A_ID });
+    expect(result.current.timeline).toHaveLength(1);
+    expect(result.current.hasScreenshots).toBe(true);
+
+    rerender({ id: RUN_B_ID });
+    expect(result.current.timeline).toBeUndefined();
+    expect(result.current.hasScreenshots).toBe(false);
+  });
+
+  test("treats screenshots as pending only while the timeline is actually loading", () => {
+    mocks.workflowRun = { workflow_run_id: RUN_A_ID, status: Status.Completed };
+    mocks.timeline = undefined;
+    mocks.timelineFetching = true;
+    const { result, rerender } = renderHook(() => useRunVisuals(RUN_A_ID), {
+      wrapper: mockedQueryWrapper(),
+    });
+    expect(result.current.screenshotsPending).toBe(true);
+
+    // A failed fetch leaves no timeline; the view must not wait on it forever.
+    mocks.timelineFetching = false;
+    rerender();
+    expect(result.current.screenshotsPending).toBe(false);
+    expect(result.current.hasScreenshots).toBe(false);
   });
 });

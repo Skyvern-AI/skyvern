@@ -23,7 +23,11 @@ import structlog
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    AddressablePersistentBrowserSession,
+    is_external_cdp_session,
+    is_final_status,
+)
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.browser_session_timeouts import MAX_LIFETIME_SECONDS, session_is_active
@@ -56,7 +60,8 @@ async def verify_browser_session(
         )
         return None
 
-    if is_final_status(browser_session.status):
+    # A registered external browser has no live view; the fallback below would stream Skyvern's own browser.
+    if is_final_status(browser_session.status) or is_external_cdp_session(browser_session):
         return None
 
     started_at = browser_session.started_at
@@ -70,12 +75,15 @@ async def verify_browser_session(
             (current_time - last_activity_at).total_seconds() if last_activity_at is not None else None
         )
 
+        # A session this server owns can always be given longer; on cloud, a vendor row's stream is
+        # gated by the session router's own connect rule before it reaches the browser.
         if not session_is_active(
             seconds_since_start=(current_time - started_at).total_seconds(),
             base_timeout_seconds=base_timeout_seconds,
             seconds_since_last_activity=seconds_since_last_activity,
             idle_timeout_seconds=base_timeout_seconds,
             max_lifetime_seconds=MAX_LIFETIME_SECONDS,
+            budget_may_lift_cap=True,
         ):
             LOG.info(
                 "Browser session invalid, as it has timed out, but is still in a non-final status. This is likely a bug!",
@@ -272,7 +280,10 @@ async def verify_workflow_run(
     return workflow_run, addressable_browser_session
 
 
-async def loop_verify_browser_session(verifiable: MessageChannel | VncChannel) -> None:
+async def loop_verify_browser_session(
+    verifiable: MessageChannel | VncChannel,
+    on_session: t.Callable[[AddressablePersistentBrowserSession | None], None] | None = None,
+) -> None:
     """
     Loop until the browser session is cleared or the websocket is closed.
     """
@@ -284,6 +295,8 @@ async def loop_verify_browser_session(verifiable: MessageChannel | VncChannel) -
         )
 
         verifiable.browser_session = browser_session
+        if on_session is not None:
+            on_session(browser_session)
 
         await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 

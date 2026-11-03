@@ -24,7 +24,7 @@ from ._common import ErrorCode, make_error, make_result
 from .trajectory import skyvern_trajectory_get
 
 PARAMETER_WIRING_HINT = (
-    "Non-credential workflow parameters are auto-wired into code blocks on code-only create/update "
+    "Non-credential workflow parameters are auto-wired into code blocks on create/update "
     "when a block omits parameter_keys; pass explicit parameter_keys to wire anything else, or [] to opt out."
 )
 
@@ -72,7 +72,10 @@ async def skyvern_code_block_lint(
     code_safety_errors = _code_safety_errors(code)
     security_errors = author_time_code_security_errors(label=label, code=code)
     preflight = preflight_code_block(code, parameter_keys=keys)
-    author_time = [*author_time_code_block_diagnostics(code), *await scanner_advisory_diagnostics(code)]
+    author_time = [
+        *author_time_code_block_diagnostics(code, parameter_keys=keys),
+        *await scanner_advisory_diagnostics(code),
+    ]
 
     # Author-time diagnostics stay advisory and are deliberately excluded from ok.
     ok = not (code_safety_errors or security_errors or preflight)

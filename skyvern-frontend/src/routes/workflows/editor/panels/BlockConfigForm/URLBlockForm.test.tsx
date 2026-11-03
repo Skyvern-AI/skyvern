@@ -26,6 +26,8 @@ vi.mock("@xyflow/react", async () => {
     await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
   return {
     ...actual,
+    useNodes: () => [...mockNodes.values()],
+    useEdges: () => [],
     useReactFlow: () => ({
       getNode: (id: string) => mockNodes.get(id),
       updateNodeData,

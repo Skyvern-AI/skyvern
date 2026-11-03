@@ -207,6 +207,7 @@ async def get_spreadsheet_dimensions(
     sheet_title: Annotated[str, Query(description="Tab title; query param so titles containing '/' work")],
     credential_id: Annotated[str, Query(description="Stored Google OAuth credential id")],
     current_org: Annotated[Organization, Depends(org_auth_service.get_current_org)],
+    include_merges: Annotated[bool, Query(description="Include all merged ranges in the tab")] = False,
 ) -> GetSheetDimensionsResponse:
     """Return the named tab's grid size + row-1 headers so the editor can preview the destination."""
     access_token = await _mint_access_token(current_org.organization_id, credential_id)
@@ -215,6 +216,7 @@ async def get_spreadsheet_dimensions(
             access_token=access_token,
             spreadsheet_id=spreadsheet_id,
             sheet_title=sheet_title,
+            include_merges=include_merges,
         )
         if grid is None:
             # Don't echo `sheet_title` back: the dimensions endpoint is org-auth-gated
@@ -237,6 +239,8 @@ async def get_spreadsheet_dimensions(
         row_count=grid.row_count,
         last_column_letter=column_index_to_letter(last_index),
         headers=[SheetHeader(letter=h.letter, name=h.name) for h in rows],
+        merges=grid.merges,
+        merges_complete=grid.merges_complete,
     )
 
 

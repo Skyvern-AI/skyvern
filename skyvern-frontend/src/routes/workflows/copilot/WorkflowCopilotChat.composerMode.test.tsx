@@ -8,10 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  FeatureFlagContext,
-  FeatureFlagValueContext,
-} from "@/hooks/useFeatureFlag";
+import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
 
 type StreamBody = {
   message: string;
@@ -126,38 +123,40 @@ const saveData = {
   workflowDefinitionVersion: 1,
 };
 
-vi.mock("@/store/WorkflowHasChangesStore", () => ({
-  useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
-}));
+vi.mock("@/store/WorkflowHasChangesStore", () => {
+  const state = { getSaveData: () => saveData, setSaveBlockedReason: () => {} };
+  return {
+    useWorkflowHasChangesStore: Object.assign(() => state, {
+      getState: () => state,
+    }),
+  };
+});
 
 // Unrelated to this file's tests; the real hook needs a QueryClientProvider
 // this harness doesn't set up.
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
-import { WorkflowCopilotChat } from "./WorkflowCopilotChat";
+import {
+  WorkflowCopilotChat,
+  canonicalRecoveriesByWorkflow,
+} from "./WorkflowCopilotChat";
 
 type FlagConfig = {
-  copilotV2?: boolean;
   codeBlockMode?: boolean;
-  defaultMode?: string;
 };
 
 async function renderChat(flags: FlagConfig) {
   const booleanFlags: Record<string, boolean> = {
-    ENABLE_WORKFLOW_COPILOT_V2: flags.copilotV2 ?? false,
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: flags.codeBlockMode ?? false,
     CODE_BLOCK_ACCESS: flags.codeBlockMode ?? false,
   };
-  const valueFlags: Record<string, string | undefined> = {
-    WORKFLOW_COPILOT_DEFAULT_MODE: flags.defaultMode,
-  };
   const view = render(
     <FeatureFlagContext.Provider value={(name) => booleanFlags[name]}>
-      <FeatureFlagValueContext.Provider value={(name) => valueFlags[name]}>
-        <WorkflowCopilotChat />
-      </FeatureFlagValueContext.Provider>
+      <WorkflowCopilotChat />
     </FeatureFlagContext.Provider>,
   );
   await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
@@ -172,19 +171,6 @@ async function submit(value: string) {
   fireEvent.change(textarea(), { target: { value } });
   await act(async () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
-  });
-}
-
-async function selectMode(label: "Ask" | "Build" | "Build with code") {
-  await act(async () => {
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-  });
-  const item = await screen.findByRole("menuitem", { name: label });
-  await act(async () => {
-    fireEvent.click(item);
   });
 }
 
@@ -204,74 +190,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-});
-
-describe("WorkflowCopilotChat — unflagged composer default", () => {
-  it("defaults to Build with code when code-first is accessible", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("ignores the retired default-mode variant", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: true,
-      defaultMode: "ask",
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("sends code_block=null when Ask is selected", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
-    await selectMode("Ask");
-    await submit("answer a question");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("ask");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-  });
-
-  it("lands on code ON when selecting Build with code", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
-    await selectMode("Ask");
-    await selectMode("Build with code");
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(true);
-  });
-
-  it("turns code OFF when selecting plain Build", async () => {
-    await renderChat({ copilotV2: true, codeBlockMode: true });
-    await selectMode("Build");
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(false);
-  });
-
-  it("sends code_block=null when code-first is inaccessible", async () => {
-    await renderChat({
-      copilotV2: true,
-      codeBlockMode: false,
-      defaultMode: "build_no_code",
-    });
-    await submit("build me a workflow");
-    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
-
-    expect(streamCalls[0]?.body.mode).toBe("build");
-    expect(streamCalls[0]?.body.code_block).toBe(null);
-  });
+  canonicalRecoveriesByWorkflow.clear();
 });
 
 describe("WorkflowCopilotChat — canvas selection context", () => {
@@ -281,7 +200,7 @@ describe("WorkflowCopilotChat — canvas selection context", () => {
 
   it("sends the canvas selection as selected_block_label", async () => {
     window.history.pushState(null, "", "/?selected-block=login");
-    await renderChat({ copilotV2: true });
+    await renderChat({});
     await submit("why is this block failing?");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
@@ -289,7 +208,7 @@ describe("WorkflowCopilotChat — canvas selection context", () => {
   });
 
   it("sends null without a selection", async () => {
-    await renderChat({ copilotV2: true });
+    await renderChat({});
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 

@@ -2,7 +2,11 @@ import { arrayMove } from "@dnd-kit/sortable";
 
 import { sanitizePaneWidth, type PaneWidths } from "@/store/paneWidths";
 
-import { STUDIO_PANE_MIN_WIDTH, type StudioPaneId } from "./panes";
+import {
+  STUDIO_PANE_MIN_WIDTH,
+  STUDIO_STAGE_GAP_PX,
+  type StudioPaneId,
+} from "./panes";
 
 // Re-exported for the shell: pinned widths ride along with the layout math.
 export type { PaneWidths };
@@ -11,10 +15,20 @@ export type { PaneWidths };
 // rest of the row.
 export const STUDIO_PANE_DEFAULT_WIDTH = 300;
 
-// The unpinned side pane of ANY two-pane row with a greedy pane opens at this
-// share, so the greedy pane keeps ~65% — mirrors the legacy split on the
-// factory defaults (editor+browser, browser+overview).
-export const STUDIO_TWO_PANE_SIDE_BASIS = "35%";
+export type PaneBounds = Pick<DOMRect, "left" | "top" | "width" | "height">;
+
+export function paneExpansionKeyframes(
+  from: PaneBounds,
+  to: PaneBounds,
+): Keyframe[] {
+  return [
+    {
+      transform: `translate(${from.left - to.left}px, ${from.top - to.top}px) scale(${from.width / to.width}, ${from.height / to.height})`,
+      transformOrigin: "top left",
+    },
+    { transform: "none", transformOrigin: "top left" },
+  ];
+}
 
 // The browser is the best consumer of free space; the canvas takes over when
 // the browser is closed. With neither open, every open pane flexes equally.
@@ -67,11 +81,24 @@ export function paneFlex(
     // Without a greedy pane, unpinned panes share the free space equally.
     return `1 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`;
   }
-  // Any two-pane row gives the unpinned side pane ~35% (the greedy pane keeps
-  // ~65%); 3+ panes keep the fixed default so the greedy pane isn't starved.
-  return panes.length === 2
-    ? `0 1 ${STUDIO_TWO_PANE_SIDE_BASIS}`
-    : `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`;
+  // Percentages apply to the content box minus the fixed-width dividers.
+  // Browser remains greedy so pinned widths and minimums take precedence.
+  let share: number;
+  if (panes.length === 2) {
+    share = id === "copilot" && greedy === "browser" ? 30 : 35;
+  } else if (
+    panes.length === 3 &&
+    panes.includes("copilot") &&
+    panes.includes("browser") &&
+    panes.includes("editor")
+  ) {
+    share = id === "copilot" ? 25 : 30;
+  } else {
+    return `0 1 ${STUDIO_PANE_DEFAULT_WIDTH}px`;
+  }
+  const separatorShare =
+    (STUDIO_STAGE_GAP_PX * (panes.length - 1) * share) / 100;
+  return `0 1 calc(${share}% - ${separatorShare}px)`;
 }
 
 // Clamp a divider drag so neither neighbor goes under its min width. The

@@ -96,10 +96,10 @@ function useWorkflowRowActions(workflow: WorkflowApiResponse) {
   });
 
   function clone() {
-    const clonedWorkflow = convert({
-      ...workflow,
-      title: `Copy of ${workflow.title}`,
-    });
+    const clonedWorkflow = convert(
+      { ...workflow, title: `Copy of ${workflow.title}` },
+      { asNewWorkflow: true },
+    );
     createWorkflowMutation.mutate(clonedWorkflow);
   }
 

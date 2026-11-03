@@ -121,7 +121,7 @@ async def skyvern_state_save(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check file path is valid and writable"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check file path is valid and writable", exc=e),
             )
         except Exception as e:
             LOG.exception("state_save failed", error=str(e))
@@ -130,7 +130,7 @@ async def skyvern_state_save(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Unexpected error during state save"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Unexpected error during state save", exc=e),
             )
 
 
@@ -187,7 +187,7 @@ async def skyvern_state_load(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check file path and file format"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Check file path and file format", exc=e),
             )
         except Exception as e:
             LOG.exception("state_load failed", error=str(e))
@@ -196,5 +196,5 @@ async def skyvern_state_load(
                 ok=False,
                 browser_context=ctx,
                 timing_ms=timer.timing_ms,
-                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Unexpected error during state load"),
+                error=make_error(ErrorCode.ACTION_FAILED, str(e), "Unexpected error during state load", exc=e),
             )
