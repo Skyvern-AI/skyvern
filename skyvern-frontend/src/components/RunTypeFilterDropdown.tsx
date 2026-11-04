@@ -29,7 +29,6 @@ export const runTypeGroupToRunTypes: Record<
     TaskRunType.OpenaiCua,
     TaskRunType.AnthropicCua,
     TaskRunType.UiTars,
-    TaskRunType.YutoriNavigator,
   ],
 };
 
