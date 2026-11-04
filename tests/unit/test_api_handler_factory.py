@@ -3985,8 +3985,7 @@ def test_router_caches_rebuild_when_the_registered_config_object_changes(monkeyp
     from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # local import
 
     llm_key = "TEST_ROUTER_CACHE_CONFIG_IDENTITY"
-    # Builds a real litellm Router; a redis_host would make it import the redis package, which the OSS install lacks.
-    first = dataclasses.replace(_make_three_tier_router_config(fallback_groups=["fallback-group"]), redis_host=None)
+    first = _make_three_tier_router_config(fallback_groups=["fallback-group"])
     _stub_for_router_test(monkeypatch, llm_key=llm_key, config=first)
     api_handler_factory._LLMCALLER_ROUTER_CACHE.pop(llm_key, None)
     try:

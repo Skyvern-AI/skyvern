@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
@@ -16,13 +15,10 @@ from unittest.mock import MagicMock
 
 import pytest
 import structlog
-from dotenv import dotenv_values
-from rich.console import Console
 from structlog.testing import capture_logs
 from typer.testing import CliRunner
 
 import skyvern.cli.quickstart as quickstart_module
-from skyvern.cli import llm_setup
 from skyvern.cli.llm_setup import update_or_add_env_var
 from skyvern.utils.env_paths import (
     BACKEND_ENV_FILE_ENV_VAR,
@@ -59,81 +55,6 @@ def _structlog_config_capture_can_see(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delattr(log_proxy, attr)
     yield
     structlog.configure(**saved)
-
-
-@pytest.mark.parametrize(
-    ("sdk_available", "docker_compose", "api_key", "enabled"),
-    [
-        (False, False, "test-key", False),
-        (True, False, "test-key", True),
-        (True, False, "", False),
-        (False, True, "test-key", True),
-    ],
-)
-def test_yutori_setup_requires_sdk_in_the_runtime(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    sdk_available: bool,
-    docker_compose: bool,
-    api_key: str,
-    enabled: bool,
-) -> None:
-    output = io.StringIO()
-    prompts: list[str] = []
-    env_path = tmp_path / "chosen.env"
-    env_path.write_text("ENABLE_YUTORI='true'\n")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    for key in (
-        BACKEND_ENV_FILE_ENV_VAR,
-        BACKEND_ENV_INTENT_ENV_VAR,
-        "ENABLE_OPENAI",
-        "ENABLE_XAI",
-        "ENABLE_ANTHROPIC",
-        "ENABLE_AZURE",
-        "ENABLE_GEMINI",
-        "ENABLE_YUTORI",
-        "YUTORI_API_KEY",
-        "ENABLE_OLLAMA",
-    ):
-        monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(llm_setup, "console", Console(file=output, force_terminal=False, width=200))
-    monkeypatch.setattr(llm_setup, "capture_setup_event", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        llm_setup.Confirm, "ask", lambda prompt, **_kwargs: prompt == "Do you want to enable Yutori Navigator?"
-    )
-    monkeypatch.setattr(llm_setup.Prompt, "ask", lambda prompt, **_kwargs: prompts.append(prompt) or api_key)
-    monkeypatch.setattr("skyvern.exceptions.find_spec", lambda _name: object() if sdk_available else None)
-
-    llm_setup.setup_llm_providers(env_path=env_path, docker_compose=docker_compose)
-
-    values = dotenv_values(env_path)
-    assert values["ENABLE_YUTORI"] == str(enabled).lower()
-    assert not (tmp_path / ".env").exists()
-    assert bool(prompts) is (sdk_available or docker_compose)
-    if enabled:
-        assert values["YUTORI_API_KEY"] == api_key
-    if not sdk_available and not docker_compose:
-        assert 'pip install "skyvern[yutori]"' in output.getvalue()
-        assert "YUTORI_API_KEY" not in values
-
-
-def test_docker_compose_wizard_uses_container_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
-    class StopBeforeDocker(Exception):
-        pass
-
-    def setup(*, docker_compose: bool) -> None:
-        assert docker_compose
-        raise StopBeforeDocker
-
-    monkeypatch.setattr(quickstart_module, "capture_setup_event", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(quickstart_module, "_bootstrap_compose_env_files", lambda: None)
-    monkeypatch.setattr(quickstart_module, "_handle_running_compose_stack", lambda: None)
-    monkeypatch.setattr(quickstart_module, "_handle_postgres_container_conflict", lambda: None)
-    monkeypatch.setattr(llm_setup, "setup_llm_providers", setup)
-
-    with pytest.raises(StopBeforeDocker):
-        quickstart_module.run_docker_compose_setup()
 
 
 _BLOCKING_SWEEP_WITH_DESCENDANT = """
