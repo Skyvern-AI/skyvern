@@ -1975,6 +1975,8 @@ async def test_declared_inputs_keep_their_payload_and_win_over_a_referenced_name
 async def test_fallback_never_receives_a_referenced_value_carrying_a_secret(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], secret: str
 ) -> None:
+    # Keep the unrelated screenshot duration deterministic without weakening the log scan.
+    monkeypatch.setattr("skyvern.webeye.utils.page._monotonic", lambda: 0.0)
     ai_fallback_flag("o_test")
     context = _make_context()
     if secret.startswith(RANDOM_SECRET_ID_PREFIX):
@@ -1991,6 +1993,7 @@ async def test_fallback_never_receives_a_referenced_value_carrying_a_secret(
     )
 
     assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+    assert any(log.get("event") == "Screenshot request failed" and log.get("elapsed_ms") == 0.0 for log in logs)
     assert secret not in json.dumps(create_kwargs, default=str, ensure_ascii=False)
     assert secret not in json.dumps(logs, default=str, ensure_ascii=False)
 

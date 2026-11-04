@@ -577,6 +577,7 @@ async def test_a_run_naming_no_session_launches_a_managed_browser_and_leaves_reg
     task = MagicMock(
         task_id="tsk_1",
         workflow_run_id=None,
+        requested_by=None,
         organization_id=ORG_A,
         browser_session_id=None,
         browser_address=None,
@@ -1010,6 +1011,7 @@ async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_an
     launch = AsyncMock()
     rbm_app = MagicMock(PERSISTENT_SESSIONS_MANAGER=stack.manager)
     rbm_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
+    rbm_app.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
     unreachable = AsyncMock(side_effect=ExternalBrowserUnavailable("connection failed"))
 
     with (
@@ -1033,7 +1035,7 @@ async def test_the_next_step_after_losing_a_registration_fails_with_that_fact_an
         if run_type == "task":
             # A task inside a workflow reuses the workflow's lease, so it reaches the launch lookup without a begin.
             inside_workflow = run_id if loss == "vanished" else None
-            task = MagicMock(task_id=run_id, workflow_run_id=inside_workflow, organization_id=ORG_A)
+            task = MagicMock(task_id=run_id, workflow_run_id=inside_workflow, requested_by=None, organization_id=ORG_A)
             await browser_manager.get_or_create_for_task(task, browser_session_id=session_id)
         else:
             workflow_run = MagicMock(workflow_run_id=run_id, parent_workflow_run_id=None, organization_id=ORG_A)
@@ -1071,11 +1073,13 @@ async def test_a_task_whose_registration_drops_between_steps_still_gives_its_lea
         runnable_generation_id=generation,
     )
     context.browser.is_connected.return_value = False
-    task = MagicMock(task_id="tsk_1", workflow_run_id=None, organization_id=ORG_A)
+    task = MagicMock(task_id="tsk_1", workflow_run_id=None, requested_by=None, organization_id=ORG_A)
     unreachable = AsyncMock(side_effect=ExternalBrowserUnavailable("connection failed"))
+    browser_app = MagicMock(PERSISTENT_SESSIONS_MANAGER=stack.manager)
+    browser_app.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
 
     with (
-        patch.object(real_browser_manager_mod, "app", MagicMock(PERSISTENT_SESSIONS_MANAGER=stack.manager)),
+        patch.object(real_browser_manager_mod, "app", browser_app),
         patch.object(manager_mod, "attach_registered_cdp_browser", unreachable),
     ):
         with pytest.raises(ExternalBrowserUnavailable):
@@ -1142,6 +1146,7 @@ async def test_a_later_task_block_on_a_lost_registration_fails_with_its_fact_and
 
     browser_app = MagicMock(PERSISTENT_SESSIONS_MANAGER=stack.manager)
     browser_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
+    browser_app.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
     with (
         mock_block_execute_deps(working_page_url="https://example.test/") as deps,
         patch.object(real_browser_manager_mod, "app", browser_app),

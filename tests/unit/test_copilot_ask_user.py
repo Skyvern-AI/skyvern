@@ -611,8 +611,11 @@ async def test_long_wait_reply_cannot_be_recovered_before_delivery_and_redaction
             assert "fixture-secret-value" not in response.text
             history = await client.get("/history", params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id})
             assert history.json()["question_interactions"][0]["status"] == "resolved"
-            assert not await repo.claim_pending_copilot_turn(
-                "org", ctx.workflow_copilot_chat_id, "turn", datetime.now(UTC) - timedelta(minutes=5)
+            assert (
+                await repo.claim_pending_copilot_turn(
+                    "org", ctx.workflow_copilot_chat_id, "turn", datetime.now(UTC) - timedelta(minutes=5)
+                )
+                == "refused"
             )
             result = await asyncio.wait_for(task, 5)
             assert result["text"].startswith("CSV;")

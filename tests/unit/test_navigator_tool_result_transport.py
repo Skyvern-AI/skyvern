@@ -7,6 +7,9 @@ Navigator) must be told the action did NOT run and the page must be re-observed 
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import (
@@ -55,10 +58,14 @@ def _flushed_text(caller: YutoriNavigatorLLMCaller) -> str:
     return content[0]["text"] if isinstance(content, list) else content
 
 
-def test_flush_uses_explicit_stale_result_not_clicked_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    import skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller as yutori_module
+def _stub_screenshot_encoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules, "yutori.navigator", SimpleNamespace(screenshot_to_data_url=lambda _b: "data:image/png;base64,Zm8=")
+    )
 
-    monkeypatch.setattr(yutori_module, "screenshot_to_data_url", lambda _b: "data:image/png;base64,Zm8=")
+
+def test_flush_uses_explicit_stale_result_not_clicked_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_screenshot_encoder(monkeypatch)
     caller = _caller_with_pending(STALE_TARGET_TOOL_RESULT)
     caller.flush_pending_tool_results(b"x", "https://example.test/x")
 
@@ -70,9 +77,7 @@ def test_flush_uses_explicit_stale_result_not_clicked_fallback(monkeypatch: pyte
 def test_flush_without_result_still_falls_back_to_clicked(monkeypatch: pytest.MonkeyPatch) -> None:
     # Contrast / guard: a None pending result (the pre-fix stale shape) is exactly what produced the
     # false "Clicked 1x with left" -- so the derivation must never return None for a stale abort.
-    import skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller as yutori_module
-
-    monkeypatch.setattr(yutori_module, "screenshot_to_data_url", lambda _b: "data:image/png;base64,Zm8=")
+    _stub_screenshot_encoder(monkeypatch)
     caller = _caller_with_pending(None)
     caller.flush_pending_tool_results(b"x", "https://example.test/x")
 

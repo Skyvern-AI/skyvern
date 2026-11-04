@@ -658,6 +658,7 @@ async def test_browser_session_response_preserves_empty_downloads_on_timeout_by_
     with patch("skyvern.webeye.schemas.app") as app_mock:
         app_mock.AGENT_FUNCTION.select_browser_session_recordings = selector
         app_mock.AGENT_FUNCTION.resolve_browser_session_connect_url = AsyncMock(return_value=None)
+        app_mock.AGENT_FUNCTION.can_access_browser_session_artifacts = AsyncMock(return_value=True)
         response = await BrowserSessionResponse.from_browser_session(browser_session, storage)
 
     assert response.downloaded_files == []

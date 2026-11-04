@@ -225,7 +225,9 @@ async def test_browser_runtime_task_pbs_boundary_preserves_owner_log(
     runtime_logs: list[dict], workflow_owned: bool
 ) -> None:
     owner = SkyvernContext(workflow_run_id="workflow-owner" if workflow_owned else None, task_id="task-owner")
-    task = MagicMock(task_id=owner.task_id, workflow_run_id=owner.workflow_run_id, organization_id="org-owner")
+    task = MagicMock(
+        task_id=owner.task_id, workflow_run_id=owner.workflow_run_id, requested_by=None, organization_id="org-owner"
+    )
 
     async def acquire(session_id: str, **kwargs: object) -> None:
         with log_browser_acquisition_failure(
