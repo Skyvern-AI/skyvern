@@ -1024,8 +1024,16 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
-    async def nango_powerbi_available(self, organization_id: str) -> bool:
+    async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
         return False
+
+    async def prepare_powerbi_query_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
+        return None
+
+    async def get_powerbi_query_hop_tokens(
+        self, *, organization_id: str, workflow_run_id: str, block_labels: list[str]
+    ) -> dict[str, str]:
+        return {}
 
     async def ensure_email_forwarding_available(
         self, organization_id: str | None = None, *, fresh: bool = True
@@ -2625,6 +2633,8 @@ class AgentFunction:
         workflow_run_id: str,
         workflow_run_block_id: str,
         connection_id: str,
+        hop_token: str | None = None,
+        credential_source: Literal["nango"] = "nango",
         dataset_id: str,
         query: str,
         max_rows: int = 1_000,
@@ -2632,7 +2642,7 @@ class AgentFunction:
         """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
-    async def ensure_powerbi_queries_available(self) -> None:
+    async def ensure_powerbi_queries_available(self, organization_id: str) -> None:
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
     async def get_google_workspace_credentials(

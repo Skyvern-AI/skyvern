@@ -165,7 +165,6 @@ from skyvern.forge.sdk.experimentation.workflow_block_engine import (
     unset_engine_routes_as_v1,
 )
 from skyvern.forge.sdk.forge_log import exception_log_fields
-from skyvern.forge.sdk.integrations.catalog import integration_is_live
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.browser_profiles import BrowserProfile
 from skyvern.forge.sdk.schemas.credentials import Credential, credential_auto_profile_disabled
@@ -1286,7 +1285,10 @@ async def _validate_powerbi_workflow_save(
     workflow_id: str | None = None,
     workflow_permanent_id: str | None = None,
 ) -> None:
-    powerbi_live = integration_is_live("powerbi")
+    try:
+        powerbi_live = await app.AGENT_FUNCTION.nango_powerbi_catalog_available(organization_id)
+    except Exception:  # noqa: BLE001 - fail closed when checking nested Power BI workflow sources.
+        powerbi_live = False
 
     if powerbi_live and workflow_permanent_id is None and workflow_id is not None:
         if any(isinstance(block, WorkflowTriggerBlock) for block in get_all_blocks(workflow_definition.blocks)):
@@ -1339,7 +1341,7 @@ async def _validate_powerbi_workflow_save(
             error_code="invalid_powerbi_connection_id",
         )
     try:
-        await app.AGENT_FUNCTION.ensure_powerbi_queries_available()
+        await app.AGENT_FUNCTION.ensure_powerbi_queries_available(organization_id)
     except NotImplementedError as exc:
         raise SkyvernHTTPException(
             "Power BI queries are not supported in this runtime.",

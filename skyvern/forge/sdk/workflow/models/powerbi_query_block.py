@@ -21,6 +21,7 @@ class PowerBIQueryBlock(Block):
     block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
 
     connection_id: str
+    credential_source: Literal["nango"] = "nango"
     dataset_id: str
     query: str
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
@@ -68,6 +69,22 @@ class PowerBIQueryBlock(Block):
         )
 
     async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: Any,
+    ) -> BlockResult:
+        return await self._execute_powerbi_query(
+            workflow_run_id,
+            workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
+
+    async def _execute_powerbi_query(
         self,
         workflow_run_id: str,
         workflow_run_block_id: str,
@@ -145,6 +162,8 @@ class PowerBIQueryBlock(Block):
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 connection_id=self.connection_id,
+                hop_token=workflow_run_context.get_powerbi_hop_token(self.label),
+                credential_source=self.credential_source,
                 dataset_id=self.dataset_id,
                 query=self.query,
                 max_rows=self.max_rows,
@@ -177,7 +196,16 @@ class PowerBIQueryBlock(Block):
                     error_code="copilot_test_run_unsupported",
                     failure_reason="Power BI blocks can't run in Copilot test runs yet; run the saved workflow instead.",
                 )
-            if exc.code == "integration_unavailable":
+            if exc.code == "row_limit_exceeded":
+                return await self._failure(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=effective_org_id,
+                    error_code="row_limit_exceeded",
+                    failure_reason="Power BI query exceeded the row limit.",
+                )
+            if exc.code in {"integration_unavailable", "invalid_credential_source"}:
                 return await self._failure(
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,

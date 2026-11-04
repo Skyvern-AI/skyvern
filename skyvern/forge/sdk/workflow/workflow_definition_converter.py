@@ -1085,6 +1085,7 @@ def block_yaml_to_block(
         return PowerBIQueryBlock(
             **base_kwargs,
             connection_id=block_yaml.connection_id,
+            credential_source=block_yaml.credential_source,
             dataset_id=block_yaml.dataset_id,
             query=block_yaml.query,
             max_rows=block_yaml.max_rows,

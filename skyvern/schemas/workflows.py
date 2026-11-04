@@ -1845,9 +1845,10 @@ class PowerBIQueryBlockYAML(BlockYAML):
     block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
     connection_id: str = Field(
         min_length=1,
-        description="Microsoft OAuth credential ID for this user.",
+        description="Power BI connection ID for this user.",
         json_schema_extra={"x-skyvern-connected-account": True},
     )
+    credential_source: Literal["nango"] = "nango"
     dataset_id: str = Field(min_length=1)
     query: str = Field(min_length=1, description="A single read-only DAX query.")
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
