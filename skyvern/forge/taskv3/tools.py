@@ -46,7 +46,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
+from skyvern.forge.sdk.core.skyvern_context import (
+    URL_IN_TEXT,
+    canonical_url,
+    mask_opaque_urls_in_text,
+    opaque_url_echo_window,
+)
 from skyvern.forge.sdk.services.credentials import (
     is_totp_sentinel,
     is_unresolved_totp_placeholder,
@@ -161,6 +166,7 @@ from skyvern.webeye.utils.page import (
     OTP_INPUT_PRIVACY_JS,
     OTP_SAFE_ELEMENT_HTML_JS,
     SkyvernFrame,
+    apply_secret_visual_mask_to_locator,
     mask_otp_values_in_html,
 )
 
@@ -1212,6 +1218,73 @@ def _model_text(text: object, cap: int) -> str:
     if ctx is not None:
         shown = ctx.hide_from_model(shown)
     return shown[:cap]
+
+
+# The most of a covering layer's own text a covered refusal quotes.
+_LAYER_TEXT_MAX = 400
+
+
+def _without_split_hidden_tail(text: str, tidy: Callable[[str], str] | None = None) -> str:
+    """`text` less any tail that begins a hidden value (or, given `tidy`, its tidied form). A read the page script cut
+    short can end inside one, where the whole-value mask cannot see it; cutting that tail can split another value in
+    turn, so it repeats."""
+    ctx = skyvern_context.current()
+    values = [value for value in (ctx.model_hidden_values if ctx is not None else ()) if value]
+    values += [tidied for value in values if tidy is not None and (tidied := tidy(value)) and tidied != value]
+    trimmed = True
+    while trimmed:
+        trimmed = False
+        for value in values:
+            for k in range(min(len(value) - 1, len(text)), 0, -1):
+                if text.endswith(value[:k]):
+                    text, trimmed = text[:-k], True
+                    break
+    return text
+
+
+# Removed from a quoted layer's text after it is masked: the page script's label set, plus the marks below.
+_FORGEABLE_TEXT = re.compile(
+    "[\x00-\x08\x0e-\x1f\x7f\u0085\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069"
+    # Default-ignorable marks a page can hide inside a value: they render as nothing but split it for the mask.
+    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180e\u2060\ufeff\uffa0\ufe00-\ufe0f"
+    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+)
+
+
+def _tidied_layer_text(text: str) -> str:
+    return " ".join(_FORGEABLE_TEXT.sub("", text).split())
+
+
+def _layer_text_clause(occluder: dict[str, Any] | None, layer_selector: str | None) -> str:
+    """The sentence quoting what a layer named only by its own text says, or "" when the probe read none."""
+    nodes = (occluder or {}).get("text")
+    if not isinstance(nodes, list) or not all(isinstance(node, str) for node in nodes):
+        return ""
+    text = "".join(nodes)
+    if not text.strip():
+        return ""
+    cut = (occluder or {}).get("textCut") is True
+    if cut:
+        text = _without_split_hidden_tail(text)
+    # Masked as the page holds it, then again after tidying, which can join what the first pass could not match.
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        text = ctx.hide_from_model(text)
+        if cut:
+            # The cut can end inside a payload signed URL, which only the cut-aware mask drops.
+            text = mask_opaque_urls_in_text(text, ctx.opaque_url_refs, cut=True)
+    text = _tidied_layer_text(text)
+    if cut:
+        # Tidying can rejoin the start of a hidden value the raw cut left broken up by a formatting character.
+        text = _without_split_hidden_tail(text, tidy=_tidied_layer_text)
+        if ctx is not None:
+            text = mask_opaque_urls_in_text(text, ctx.opaque_url_refs, cut=True)
+    shown = _model_text(text, _LAYER_TEXT_MAX + 1)
+    quoted = json.dumps(shown[:_LAYER_TEXT_MAX], ensure_ascii=False)
+    if cut or len(shown) > _LAYER_TEXT_MAX:
+        rest = f"get_html of {layer_selector}" if layer_selector else "get_html"
+        return f' It reads, cut short ({rest} with format "text" reads all of it): {quoted}.'
+    return f" It reads: {quoted}."
 
 
 def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
@@ -6654,7 +6727,36 @@ _TYPE_TARGET_PROBE_JS = (
       if (dialog) layerName = ownName(dialog) || headingNameOf(dialog);
     }
     if (!layerName) layerName = headingNameOf(layer);
-    if (!layerName) layerName = boundedClean(layer.textContent, 60);
+    // A layer named only by the start of its own text may be the page's reply to the last action, and that start
+    // can stop before the part that matters. Its raw visible text outside its controls, fields, templates, scripts and
+    // invisible boxes rides beside the name, uncleaned and unjoined so the mask in Python sees what the page holds.
+    const layerText = [];
+    let layerTextCut = false;
+    if (!layerName) {
+      layerName = boundedClean(layer.textContent, 60);
+      if (layerName && layerKind === 'qualified') {
+        const shownBy = new Map();
+        let read = 0;
+        let nodes = 0;
+        const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+        for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+          if (++nodes > 5000) { layerTextCut = true; break; }
+          const p = t.parentElement;
+          const v = t.nodeValue;
+          if (!p || !v) continue;
+          if (p.closest('script,style,template,noscript,textarea,select,option,datalist,'
+            + '[contenteditable]:not([contenteditable="false"]),button,a[href],[role="button"],[role="link"],'
+            + '[role="checkbox"],[role="radio"],[role="option"],[role="menuitem"],[role="menuitemcheckbox"],'
+            + '[role="menuitemradio"],[role="switch"],[role="tab"]')) continue;
+          let seen = shownBy.get(p);
+          if (seen === undefined) { seen = visible(p, true); shownBy.set(p, seen); }
+          if (!seen) continue;
+          if (read + v.length > 2000) { layerText.push(v.slice(0, 2000 - read)); layerTextCut = true; break; }
+          layerText.push(v);
+          read += v.length;
+        }
+      }
+    }
     if (!layerName) layerName = layer.tagName ? layer.tagName.toLowerCase() : 'layer';
     const layerSelector = idSelector(layer) || markerSelector(layer);
     const allControls = [];
@@ -6730,6 +6832,7 @@ _TYPE_TARGET_PROBE_JS = (
       .concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    if (layerText.join('').trim()) { out.occluder.text = layerText; out.occluder.textCut = layerTextCut; }
     out.occluder.layerKind = layerKind;
     // Which layer node this is, and the state of its controls, kept only in a realm the page cannot read or patch
     // (the same trust allowOwnLabel grants): a page that could reach the table could make one layer pass for another.
@@ -13740,6 +13843,17 @@ def build_browser_tools(
             await _check_credential_release(
                 resolved, operation=operation, page=page, selector=selector, url_is_target=url_is_target
             )
+            ctx = skyvern_context.current()
+            if (
+                not url_is_target
+                and selector
+                and settings.ENABLE_SECRET_VISUAL_MASKING
+                and ctx is not None
+                and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(ctx.workflow_run_id, text)
+            ):
+                # Every tool that writes a resolved value into a field comes through here, so this one
+                # mask covers them all. It is CSS-only and ignores the Mask Secrets opt-in for card data.
+                await apply_secret_visual_mask_to_locator(page.locator(selector).first, timeout=_ACTION_TIMEOUT_MS)
         return resolved
 
     # INVARIANT: holds at most one page, written by the preflight wrapper (or, ahead of it, the
@@ -15460,7 +15574,8 @@ def build_browser_tools(
         # recorded -- it is page text, and these names carry personal data.
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
-        _record_covered(occluder, branch, controls=[] if branch == "own_container" else parts)
+        said = _layer_text_clause(occluder, layer_selector) if branch == "named" else ""
+        _record_covered(occluder, "quoted" if said else branch, controls=[] if branch == "own_container" else parts)
         blocker = _blocking_layer(occluder, branch) if verb == "typed into" else None
         # The probe walks only the hit element and its ancestors, so this claims nothing about other layers.
         unqualified = (
@@ -15554,6 +15669,23 @@ def build_browser_tools(
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. {unqualified} "
                 f"{found} Re-observe and reach {selector} another way or act on a different control.",
+                error_class="covered",
+            )
+        # A layer that is quoted is reported, not prescribed for: its text may be the page answering the last action,
+        # which closing it and retrying the same field does not address.
+        if said and not parts:
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} The probe found no "
+                f"named controls on it; one without a label (an icon or an ×) would show in get_html of "
+                f"{layer_selector or 'the layer'}.",
+                data=blocker,
+                error_class="covered",
+            )
+        if said:
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} Its controls: "
+                f"{controls_desc}.",
+                data=blocker,
                 error_class="covered",
             )
         if not parts:

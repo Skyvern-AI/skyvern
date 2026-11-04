@@ -1256,7 +1256,8 @@ class BitwardenGetItemError(BitwardenBaseError):
 
 
 class BitwardenListItemsError(BitwardenBaseError):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, missing_item: bool = False) -> None:
+        self.missing_item = missing_item
         super().__init__(f"Error listing items in Bitwarden: {message}")
 
 

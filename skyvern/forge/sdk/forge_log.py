@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import logging
 import math
@@ -1036,21 +1037,40 @@ def _short_value_scrubber(values: frozenset[str], placeholder: str) -> Callable[
     return scrub
 
 
+# The fallback below cannot import, because this processor also runs while the interpreter is tearing
+# down and `sys.meta_path` is gone. Mirrors secret_scrub.REDACTED_SECRET_PLACEHOLDER, which a test pins.
+_FALLBACK_REDACTED_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
+_SecretScrubSymbols = tuple[str, Callable[[str], list[str]], Callable[[], tuple[list[str], frozenset[str]]]]
+_secret_scrub_symbols_cache: _SecretScrubSymbols | None = None
+
+
+def _secret_scrub_symbols() -> _SecretScrubSymbols:
+    """Resolve the scrub registry's holder and helpers once, then serve them from this cache.
+
+    Logging starts before the application exists, so the import stays deferred; it never initializes
+    the app or logs from a processor. Caching it keeps a record emitted during interpreter exit — when
+    no import can succeed — on the same scrubbing path as every other record.
+    """
+    global _secret_scrub_symbols_cache  # noqa: PLW0603
+    if _secret_scrub_symbols_cache is None:
+        from skyvern.forge.sdk.copilot.secret_scrub import (
+            REDACTED_SECRET_PLACEHOLDER,
+            encoded_secret_variants,
+            log_scrub_values,
+        )
+
+        _secret_scrub_symbols_cache = (REDACTED_SECRET_PLACEHOLDER, encoded_secret_variants, log_scrub_values)
+    return _secret_scrub_symbols_cache
+
+
 def _registered_secret_scrubber(
     *, logging_envelope: bool = False, protocol_level: str | None = None
 ) -> Callable[[Any, int], Any] | None:
-    # Logging starts before the application exists. Import only the holder and the
-    # existing scrub helpers; never initialize the app or log from this processor.
-    from skyvern.forge.sdk.copilot.secret_scrub import (
-        REDACTED_SECRET_PLACEHOLDER,
-        encoded_secret_variants,
-        log_scrub_values,
-    )
-
+    placeholder, encoded_secret_variants, log_scrub_values = _secret_scrub_symbols()
     copilot_values, short_values = log_scrub_values()
     copilot_variants = set(copilot_values)
     # The line's own values are already replaced as text by then, so this pass needs no exclusion for them.
-    short_scrub = _short_value_scrubber(short_values, REDACTED_SECRET_PLACEHOLDER)
+    short_scrub = _short_value_scrubber(short_values, placeholder)
     registered: set[str] = set()
     context = skyvern_context.current()
     if context is not None:
@@ -1091,10 +1111,10 @@ def _registered_secret_scrubber(
         if remaining < 0:
             raise ValueError("Log redaction node limit exceeded")
         if depth > 20:
-            return REDACTED_SECRET_PLACEHOLDER
+            return placeholder
         if isinstance(node, str):
             for secret in secrets:
-                node = node.replace(secret, REDACTED_SECRET_PLACEHOLDER)
+                node = node.replace(secret, placeholder)
             return node if short_scrub is None else short_scrub(node)
         if node is None or isinstance(node, bool):
             return node
@@ -1105,12 +1125,12 @@ def _registered_secret_scrubber(
             if not forms.isdisjoint(copilot_variants) or any(
                 secret in form for form in forms for secret in run_variants
             ):
-                return REDACTED_SECRET_PLACEHOLDER
+                return placeholder
             return node
 
         marker = id(node)
         if marker in seen:
-            return REDACTED_SECRET_PLACEHOLDER
+            return placeholder
         seen.add(marker)
         if isinstance(node, Mapping):
             result = {}
@@ -1172,16 +1192,18 @@ def redact_registered_log_payload(body: Any, attributes: Mapping[str, Any]) -> t
 
 
 def redact_registered_secrets(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
-    """Copy and scrub normalized diagnostics using existing registrations, regardless of artifact policy."""
-    from skyvern.forge.sdk.copilot.secret_scrub import REDACTED_SECRET_PLACEHOLDER
+    """Copy and scrub normalized diagnostics using existing registrations, regardless of artifact policy.
 
-    # Only a known logging method establishes severity provenance. Caller data
-    # under a nested "level" key (or an unexpected root value) is still scrubbed.
+    Total by construction: a record emitted while the interpreter tears down still reaches a handler,
+    and anything this processor lets escape turns that one record into logging's ~26-line
+    ``--- Logging error ---`` dump on stderr.
+    """
     protocol_level = None
-    if method_name in ("debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "notset"):
-        protocol_level = structlog.stdlib.add_log_level(logger, method_name, {})["level"]
-
     try:
+        # Only a known logging method establishes severity provenance. Caller data
+        # under a nested "level" key (or an unexpected root value) is still scrubbed.
+        if method_name in ("debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "notset"):
+            protocol_level = structlog.stdlib.add_log_level(logger, method_name, {})["level"]
         scrub = _registered_secret_scrubber(logging_envelope=True, protocol_level=protocol_level)
         return event_dict if scrub is None else scrub(event_dict, 0)
     except Exception:
@@ -1190,7 +1212,7 @@ def redact_registered_secrets(logger: logging.Logger, method_name: str, event_di
         # "event" even when a caller also supplied "msg". Severity comes only from
         # the logging method, never from the failed traversal's data.
         message_keys = [key for key in ("event", "msg") if key in event_dict] or ["event"]
-        fallback = dict.fromkeys(message_keys, REDACTED_SECRET_PLACEHOLDER)
+        fallback = dict.fromkeys(message_keys, _FALLBACK_REDACTED_SECRET_PLACEHOLDER)
         if "level" in event_dict and protocol_level is not None:
             fallback["level"] = protocol_level
         return fallback
@@ -1440,8 +1462,6 @@ def _generate_exception_hash(exc_type: type, tb: TracebackType) -> str:
     Excludes dynamic data like error messages to ensure the same
     error from the same location always produces the same hash.
     """
-    import hashlib  # noqa: PLC0415
-
     hasher = hashlib.sha256()
 
     hasher.update(f"{exc_type.__module__}.{exc_type.__name__}".encode())

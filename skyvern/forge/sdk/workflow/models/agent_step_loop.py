@@ -49,6 +49,7 @@ from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
+from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     DEDICATED_BLOCK_TOOLS,
@@ -110,6 +111,7 @@ class _RunState:
     run_context: WorkflowRunContext
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
+    workflow_system_prompt: str | None = None
     tools: list[str] | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
     # The report each child block returned, by label, so read_run_data can page the text the model was shown.
@@ -216,7 +218,11 @@ class _LoopHooks(RunHooks[Any]):
 
 def _record_call(state: _RunState, written: object, **call: str) -> None:
     arguments = redact_secrets_from_text(
-        json.dumps(written, default=str), Block._registered_secret_values(state.run_context)
+        json.dumps(
+            state.run_context.mask_platform_smtp_for_agent(written),
+            default=lambda value: state.run_context.mask_platform_smtp_for_agent(str(value)),
+        ),
+        state.run_context.agent_redactable_secret_values(),
     )
     state.calls.append({**call, "arguments": arguments})
 
@@ -345,8 +351,13 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
 
 
 def _masked_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str:
+    data = run_context.mask_secrets_in_data(
+        run_context.mask_platform_smtp_for_agent(report),
+        excluded_secret_ids=run_context.agent_unmasked_platform_secret_ids(),
+    )
     return redact_secrets_from_text(
-        json.dumps(run_context.mask_secrets_in_data(report), default=str), Block._registered_secret_values(run_context)
+        json.dumps(data, default=lambda value: run_context.mask_platform_smtp_for_agent(str(value))),
+        run_context.agent_redactable_secret_values(),
     )
 
 
@@ -380,7 +391,10 @@ def _run_tool(
         except json.JSONDecodeError as e:
             return f"Arguments are not valid JSON ({e})."
         try:
+            state.run_context.reject_platform_smtp_references(written)
             report = {"status": "completed", "output": await run(state, **written), "error": None}
+        except InvalidWorkflowDefinition:
+            raise
         except Exception as e:
             report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
         _record_call(state, written, tool=name, status=report["status"])
@@ -405,10 +419,11 @@ def _run_tool(
 
 async def _read_run_data(state: _RunState, name: str | None = None) -> object:
     run_context = state.run_context
+    platform_keys = run_context.platform_smtp_parameter_keys()
     parameters = {
         key: parameter
         for key, parameter in run_context.parameters.items()
-        if parameter.parameter_type != ParameterType.OUTPUT
+        if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys
     }
     if name in run_context.workflow_run_outputs:
         outcome = run_context.get_block_outcome(name)
@@ -516,7 +531,13 @@ async def _page_extract(
     state: _RunState, prompt: str, schema: dict[str, Any] | None = None
 ) -> dict[str, Any] | list | str | None:
     # The page's AI has no block label, so an omitted system prompt resolves to the run-wide one.
-    opt_out = {"system_prompt": None} if state.ignore_workflow_system_prompt else {}
+    opt_out: dict[str, str | None] = (
+        {"system_prompt": None}
+        if state.ignore_workflow_system_prompt
+        else {"system_prompt": state.workflow_system_prompt}
+        if state.workflow_system_prompt is not None
+        else {}
+    )
     async with _run_page(state) as page:
         return await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
 
@@ -570,6 +591,7 @@ async def _run_child_block(
     try:
         if not isinstance(written, dict):
             raise ValueError("arguments must be a JSON object.")
+        state.run_context.reject_platform_smtp_references(written)
         block_yaml = tool.yaml_class(
             **_yaml_arguments(tool, written, state),
             label=label,
@@ -578,6 +600,8 @@ async def _run_child_block(
         # The send-email converter adds the platform SMTP parameters to this dict.
         parameters = {**state.run_context.parameters, output_parameter.key: output_parameter}
         child = block_yaml_to_block(block_yaml, parameters)  # type: ignore[arg-type]
+    except InvalidWorkflowDefinition:
+        raise
     except Exception as e:
         report = {
             "status": "invalid_arguments",
@@ -593,20 +617,26 @@ async def _run_child_block(
         }
     else:
         # A run resolves its secret parameters when it starts, before the converter added these.
-        temporary_smtp_keys: list[str] = []
-        scope_platform_smtp: bool | None = None
+        temporary_smtp_keys = [
+            parameter.key
+            for parameter in parameters.values()
+            if isinstance(parameter, AWSSecretParameter)
+            and _is_platform_smtp_aws_key(parameter.aws_key)
+            and not state.run_context.has_parameter(parameter.key)
+        ]
         try:
             for parameter in parameters.values():
-                if isinstance(parameter, AWSSecretParameter) and not state.run_context.has_parameter(parameter.key):
-                    is_platform_smtp = _is_platform_smtp_aws_key(parameter.aws_key)
-                    if is_platform_smtp and scope_platform_smtp is None:
-                        scope_platform_smtp = bool(
-                            state.organization_id
-                            and await app.AGENT_FUNCTION.platform_smtp_scoping_required(state.organization_id)
+                if not isinstance(parameter, AWSSecretParameter):
+                    continue
+                if _is_platform_smtp_aws_key(parameter.aws_key) and state.run_context.has_parameter(parameter.key):
+                    if block_type == BlockType.SEND_EMAIL and not state.run_context._platform_smtp_only_usage(
+                        parameter, child
+                    ):
+                        raise InvalidWorkflowDefinition(
+                            "Platform-managed secrets are restricted to platform email delivery."
                         )
+                elif not state.run_context.has_parameter(parameter.key):
                     await state.run_context.register_aws_secret_parameter_value(parameter, platform_smtp_block=child)
-                    if is_platform_smtp and scope_platform_smtp:
-                        temporary_smtp_keys.append(parameter.key)
             report = await _execute_child(child, written, state)
         finally:
             for key in temporary_smtp_keys:
@@ -618,6 +648,7 @@ async def _run_child_block(
 
 
 async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+    child._agent_smtp_isolation = True
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
     with copilot_usage_observer(None):
@@ -660,6 +691,7 @@ async def run_agent_step(
         run_context=run_context,
         credential_keys=_credential_keys(block.parameters),
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
+        workflow_system_prompt=block.workflow_system_prompt,
         tools=block.tools,
     )
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
@@ -802,7 +834,7 @@ async def run_agent_step(
     return await block.build_block_result(
         success=status == BlockStatus.completed,
         failure_reason=failure_reason
-        and redact_secrets_from_text(failure_reason, Block._registered_secret_values(run_context)),
+        and redact_secrets_from_text(failure_reason, run_context.agent_redactable_secret_values()),
         output_parameter_value=value,
         status=status,
         workflow_run_block_id=workflow_run_block_id,

@@ -1,9 +1,10 @@
 import asyncio
+from collections.abc import Set as AbstractSet
 
 from fastapi import HTTPException
 from onepassword import ItemFieldType
 from onepassword.client import Client as OnePasswordClient
-from onepassword.types import Item
+from onepassword.types import Item, ItemField
 
 from skyvern.exceptions import CredentialItemNotFoundError, CredentialSourceNotConfiguredError
 from skyvern.forge import app
@@ -38,9 +39,23 @@ def _normalize_field_name(value: str | None) -> str:
     return "".join(character for character in (value or "").casefold() if character.isalnum())
 
 
+_CARD_NUMBER_FIELD_NAMES = frozenset({"number", "cardnumber", "ccnum"})
+_CARD_CVV_FIELD_NAMES = frozenset({"cvv", "cvc", "securitycode"})
+
+
+def is_onepassword_card_secret_field(item: Item, field: ItemField) -> bool:
+    """Whether a field holds a card number or CVV, matched the way a card credential is read below."""
+    if field.field_type == ItemFieldType.CREDITCARDNUMBER:
+        return True
+    names = {_normalize_field_name(field.id), _normalize_field_name(field.title)}
+    return bool(names & (_CARD_NUMBER_FIELD_NAMES | _CARD_CVV_FIELD_NAMES)) and (
+        onepassword_item_credential_type(item) == CredentialType.CREDIT_CARD
+    )
+
+
 def _field_value(
     item: Item,
-    names: set[str],
+    names: AbstractSet[str],
     field_type: ItemFieldType | None = None,
 ) -> str | None:
     if field_type is not None:
@@ -75,7 +90,7 @@ def _credential_from_item(db_credential: Credential, item: Item) -> CredentialIt
             expiration_parts = [expiration[4:], expiration[:4]]
         else:
             expiration_parts = expiration.split("/", maxsplit=1) if expiration else []
-        card_number = _field_value(item, {"number", "cardnumber", "ccnum"}, ItemFieldType.CREDITCARDNUMBER)
+        card_number = _field_value(item, _CARD_NUMBER_FIELD_NAMES, ItemFieldType.CREDITCARDNUMBER)
         expiration_month = _field_value(item, {"expirationmonth", "expmonth", "month"}) or (
             expiration_parts[0].strip() if len(expiration_parts) == 2 else ""
         )
@@ -86,7 +101,7 @@ def _credential_from_item(db_credential: Credential, item: Item) -> CredentialIt
             raise CredentialItemNotFoundError("1Password item is missing required credit-card fields")
         data = CreditCardCredential(
             card_number=card_number,
-            card_cvv=_field_value(item, {"cvv", "cvc", "securitycode"}) or "",
+            card_cvv=_field_value(item, _CARD_CVV_FIELD_NAMES) or "",
             card_exp_month=expiration_month,
             card_exp_year=expiration_year,
             card_brand=_field_value(item, {"type", "brand", "cardtype"}, ItemFieldType.CREDITCARDTYPE)

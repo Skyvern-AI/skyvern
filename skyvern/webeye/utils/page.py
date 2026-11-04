@@ -204,40 +204,96 @@ _SECRET_VISUAL_MASK_BODY = f"""
     const elementTagName = element.tagName ? element.tagName.toLowerCase() : "";
     if (elementTagName !== "input" && elementTagName !== "textarea") {{
         element.style.filter = {json.dumps(SECRET_VISUAL_MASK_BLUR_FILTER)};
+    }} else {{
+        // Also set through the CSSOM, which a CSP that refuses the injected <style> does not block.
+        element.style.setProperty("-webkit-text-security", "disc", "important");
     }}
 """
 
 SECRET_VISUAL_MASK_SCRIPT = f"""
     (element) => {{
+        // Text aimed at a label, or at something inside one, lands in the control the label names.
+        if (!element.isContentEditable && !["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName)) {{
+            const label = element.closest ? element.closest("label") : null;
+            if (label && label.control) {{
+                element = label.control;
+            }}
+        }}
         {_SECRET_VISUAL_MASK_BODY}
     }}
 """
 
+# A focused element inside an open shadow root leaves only its host active in the document.
+_FOCUSED_ELEMENT_JS = """
+        let element = document.activeElement;
+        while (element && element.shadowRoot && element.shadowRoot.activeElement) {
+            element = element.shadowRoot.activeElement;
+        }
+"""
+
+_FOCUSED_ELEMENT_SCRIPT = f"() => {{ {_FOCUSED_ELEMENT_JS} return element; }}"
+
 _SECRET_VISUAL_MASK_ACTIVE_ELEMENT_SCRIPT = f"""
     () => {{
-        const element = document.activeElement;
+        {_FOCUSED_ELEMENT_JS}
         if (!element) {{
-            return;
+            return false;
         }}
 
         const activeElementTagName = element.tagName ? element.tagName.toLowerCase() : "";
+        // With nothing focused the body is active, and a frame element is active while focus is inside
+        // it: masking either would blur the whole page or frame instead of a field.
+        if (["body", "html", "iframe", "frame"].includes(activeElementTagName)) {{
+            return false;
+        }}
         if (
             activeElementTagName === "input"
             && String(element.getAttribute("type") || "").toLowerCase() === "password"
         ) {{
-            return;
+            return true;
         }}
 
         {_SECRET_VISUAL_MASK_BODY}
+        return true;
     }}
 """
 
 
 async def apply_secret_visual_mask_to_active_element(page: Page) -> None:
     try:
-        await SkyvernFrame.evaluate(page, expression=_SECRET_VISUAL_MASK_ACTIVE_ELEMENT_SCRIPT)
+        # A focused field inside a frame leaves only the frame element active in the parent document, so follow
+        # focus down to the document that holds the field. Each step enters a child frame, so the walk ends.
+        frame = page.main_frame
+        while True:
+            active = await frame.evaluate_handle(_FOCUSED_ELEMENT_SCRIPT)
+            element = active.as_element()
+            child = await element.content_frame() if element is not None else None
+            await active.dispose()
+            if child is None:
+                break
+            frame = child
+        if not await SkyvernFrame.evaluate(frame=frame, expression=_SECRET_VISUAL_MASK_ACTIVE_ELEMENT_SCRIPT):
+            LOG.info("Secret visual mask found no focused field to mask")
     except Exception:
         LOG.warning("Failed to apply secret visual mask to active element", exc_info=True)
+
+
+_SECRET_VISUAL_MASK_TIMEOUT_MS = 2000
+
+
+async def apply_secret_visual_mask_to_locator(locator: Locator, *, timeout: float) -> None:
+    # Waits for the field as long as the write that follows would, so a late render cannot outlast the mask and
+    # take the value unmasked; a field that never comes raises here, as the write would have.
+    await locator.wait_for(state="attached", timeout=timeout)
+    # A field that detaches or re-renders mid-evaluation fails the first attempt; the retry re-resolves the
+    # locator to the element the write will also reach. Each attempt is capped, since the field has attached.
+    for attempt in range(2):
+        try:
+            await locator.evaluate(SECRET_VISUAL_MASK_SCRIPT, timeout=_SECRET_VISUAL_MASK_TIMEOUT_MS)
+            return
+        except Exception:
+            if attempt:
+                LOG.warning("Failed to apply secret visual mask", exc_info=True)
 
 
 _SCREENSHOT_TARGET_CLOSED_MESSAGE = "Target page, context or browser has been closed"

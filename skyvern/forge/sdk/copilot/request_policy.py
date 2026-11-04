@@ -1184,6 +1184,19 @@ class RequestPolicy:
             if ref in urls:
                 urls[credential_id] = urls.pop(ref)
 
+    def credential_intended_url(self, credential_id: str) -> str | None:
+        admitted_url = self.live_page_admitted_urls.get(credential_id)
+        if admitted_url:
+            return admitted_url
+        return next(
+            (
+                credential.tested_url
+                for credential in self.resolved_credentials
+                if credential.credential_id == credential_id and credential.tested_url
+            ),
+            None,
+        )
+
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
 

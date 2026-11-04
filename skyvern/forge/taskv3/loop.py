@@ -233,6 +233,8 @@ ToolOkClass = Literal[
 CoveredBranch = Literal[
     # The layer was named and its controls enumerated into the message.
     "named",
+    # A layer named only by its own text was quoted, with its controls, instead of told to be dismissed and retried.
+    "quoted",
     # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
     "challenge",
     # The walk qualified nothing, the hit was the field's OWN container, AND an ancestor was found

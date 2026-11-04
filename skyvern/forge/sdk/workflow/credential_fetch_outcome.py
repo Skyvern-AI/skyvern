@@ -105,8 +105,10 @@ def _link_outcome(error: BaseException, *, customer_owned: bool) -> CredentialFe
         return "customer_config"
     if isinstance(error, _PROVIDER_ERRORS):
         return "provider_error"
-    if isinstance(error, (HttpException, HTTPException, SkyvernHTTPException)):
+    if isinstance(error, (HttpException, HTTPException)):
         return _status_outcome(error.status_code, customer_owned=customer_owned)
+    if isinstance(error, SkyvernHTTPException) and error.status_code >= 500:
+        return "provider_error"
     if isinstance(error, aiohttp.ClientResponseError):
         return _status_outcome(error.status, customer_owned=customer_owned)
     if isinstance(error, ClientAuthenticationError):

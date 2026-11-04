@@ -90,8 +90,13 @@ class AgentStepBlock(Block):
             workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, prompt=self.prompt
         )
         try:
+            run_context.reject_platform_smtp_references(self.model_dump())
             prompt = self.render_templatable_field("prompt", self.prompt, run_context)
             self._apply_workflow_system_prompt(run_context)
+            prompt = run_context.mask_platform_smtp_for_agent(prompt)
+            if self.workflow_system_prompt is not None:
+                self.workflow_system_prompt = run_context.mask_platform_smtp_for_agent(self.workflow_system_prompt)
+                run_context.record_block_workflow_system_prompt(self.label, self.workflow_system_prompt)
         except Exception as e:
             return await self._template_format_failure_result(
                 e,

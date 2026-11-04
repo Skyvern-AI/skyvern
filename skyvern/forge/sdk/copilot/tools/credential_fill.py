@@ -400,20 +400,6 @@ def _credential_fill_authority_error(copilot_ctx: AgentContext, credential_id: s
     return None
 
 
-def _resolved_credential_intended_url(policy: RequestPolicy, credential_id: str) -> str | None:
-    admitted_url = policy.live_page_admitted_urls.get(credential_id)
-    if admitted_url:
-        return admitted_url
-    return next(
-        (
-            credential.tested_url
-            for credential in policy.resolved_credentials
-            if credential.credential_id == credential_id and credential.tested_url
-        ),
-        None,
-    )
-
-
 async def _vault_named_sites(copilot_ctx: AgentContext, credential_id: str) -> list[LoginSite]:
     return await _read_vault_named_sites(copilot_ctx, credential_id) or []
 
@@ -1041,7 +1027,7 @@ async def _credential_fill_origin_grant(
     if not authority_error:
         if not isinstance(policy, RequestPolicy):
             return None, _missing_credential_origin_error(credential_id, None)
-        intended_url = _resolved_credential_intended_url(policy, credential_id)
+        intended_url = policy.credential_intended_url(credential_id)
         if intended_url:
             _log_fill_grant("admitted_or_tested", intended_url, credential_id)
             return _CredentialFillOriginGrant(intended_url), None
