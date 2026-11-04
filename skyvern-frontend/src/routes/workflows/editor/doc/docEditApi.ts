@@ -3,6 +3,7 @@ import { createBranchCondition } from "../nodes/ConditionalNode/types";
 import { nanoid } from "nanoid";
 import { toast } from "@/components/ui/use-toast";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { stripJinjaReferences } from "./docTextUtils";
 import { showDropBlockedToast } from "../sortable/dropBlockedToast";
@@ -14,8 +15,12 @@ import {
 } from "../nodes";
 import { availableNodeLibraryItems } from "../panels/nodeLibraryItems";
 import type { AddNodeProps } from "../Workspace";
-import { getUpdatedParametersAfterLabelUpdateForSourceParameterKey } from "../workflowEditorUtils";
+import {
+  getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
+  inferBranchCriteriaTypeFromExpression,
+} from "../workflowEditorUtils";
 import type { DocItem } from "./buildDocTree";
+import { withLineSetting } from "./docLineSettings";
 import {
   addBranch,
   checkLabel,
@@ -193,29 +198,195 @@ export function createDocEditApi({
       useLocateBlockStore.getState().requestLocate(id, parentId);
     return true;
   };
+  const noteKey = (placement: DocNoteRef["placement"]) =>
+    placement === "above" ? "notes" : "trailingNotes";
+  const noteText = (id: string, placement: DocNoteRef["placement"]) => {
+    const value = (
+      nodes.find((n) => n.id === id)?.data as Record<string, unknown>
+    )?.[noteKey(placement)];
+    return typeof value === "string" ? value : "";
+  };
+  // The loop, or the shown branch of the If, a line can move into.
+  const innerScope = (container: AppNode | undefined): DocScopeRef | null => {
+    if (container?.type === "loop")
+      return { parentId: container.id, conditionalBranchId: null };
+    if (container?.type === "conditional") {
+      const branchId =
+        selectedBranch(container.id) ?? container.data.branches[0]?.id;
+      return branchId
+        ? { parentId: container.id, conditionalBranchId: branchId }
+        : null;
+    }
+    return null;
+  };
+  const moveNoteText = (
+    from: DocNoteRef,
+    to: DocNoteRef,
+    toFront: boolean,
+  ): DocNoteRef | null => {
+    const moving = noteText(from.ownerNodeId, from.placement).trim();
+    if (moving) {
+      const existing = noteText(to.ownerNodeId, to.placement).trim();
+      const joined = [toFront ? moving : existing, toFront ? existing : moving]
+        .filter(Boolean)
+        .join("\n");
+      if (joined.length > NOTE_MAX_LENGTH) {
+        refuse(
+          `The notes together would be over ${NOTE_MAX_LENGTH.toLocaleString("en-US")} characters. Shorten one first.`,
+        );
+        return null;
+      }
+      let next = setStepField(
+        nodes,
+        from.ownerNodeId,
+        noteKey(from.placement),
+        "",
+      );
+      next = setStepField(next, to.ownerNodeId, noteKey(to.placement), joined);
+      edits.apply({ nodes: next, edges });
+    }
+    return to;
+  };
+  const insertStep = (place: DocPlace, nodeType: NodeType): string | null => {
+    const point = insertionPoint(graph, place.scope, place.index, finallyId);
+    if (!point) return null;
+    const added = edits.addStep({
+      nodeType,
+      ...point,
+      label: newStepLabel(
+        nodes,
+        availableNodeLibraryItems().find((i) => i.nodeType === nodeType)
+          ?.title ?? nodeType,
+        useWorkflowParametersStore
+          .getState()
+          .parameters.map((parameter) => parameter.key),
+      ),
+      select: false,
+    });
+    if (added) edits.update((current) => clearLongDefaultText(current, added));
+    return added;
+  };
+
   return {
     setText: (id: string, key: string, value: string) =>
-      edits.update((current) => setStepField(current, id, key, value)),
-    insertStep: (place: DocPlace, nodeType: NodeType): string | null => {
-      const point = insertionPoint(graph, place.scope, place.index, finallyId);
-      if (!point) return null;
-      const added = edits.addStep({
-        nodeType,
-        ...point,
-        label: newStepLabel(
-          nodes,
-          availableNodeLibraryItems().find((i) => i.nodeType === nodeType)
-            ?.title ?? nodeType,
-          useWorkflowParametersStore
-            .getState()
-            .parameters.map((parameter) => parameter.key),
+      edits.update((current) => {
+        const before = current.find((n) => n.id === id)?.data as
+          | Record<string, unknown>
+          | undefined;
+        // A build in flight carries the Goal it started with, so a later edit would be lost to it (the Visual editor disables the field).
+        if (key === "prompt" && typeof before?.label === "string") {
+          const { generatingBlockLabel, queuedBuilds } =
+            useCopilotActionStore.getState();
+          if (
+            current.find((n) => n.id === id)?.type === "codeBlock" &&
+            (generatingBlockLabel === before.label ||
+              queuedBuilds.some((queued) => queued.blockLabel === before.label))
+          )
+            return current;
+        }
+        const previous =
+          typeof before?.[key] === "string" ? (before[key] as string) : "";
+        return setStepField(current, id, key, value).map((n) =>
+          n.id === id ? withLineSetting(n, key, previous) : n,
+        );
+      }),
+    // The If line is the branch's condition. Its check follows what was typed, as the save reads it.
+    setCondition: (conditionalId: string, branchId: string, value: string) =>
+      edits.update((current) =>
+        current.map((n) =>
+          n.id === conditionalId && n.type === "conditional"
+            ? ({
+                ...n,
+                data: {
+                  ...n.data,
+                  branches: n.data.branches.map((branch) =>
+                    branch.id === branchId && branch.criteria
+                      ? {
+                          ...branch,
+                          criteria: {
+                            ...branch.criteria,
+                            expression: value,
+                            criteria_type:
+                              inferBranchCriteriaTypeFromExpression(value),
+                          },
+                        }
+                      : branch,
+                  ),
+                },
+              } as AppNode)
+            : n,
         ),
-        select: false,
-      });
-      if (added)
-        edits.update((current) => clearLongDefaultText(current, added));
-      return added;
+      ),
+    stepBefore: (id: string): string | null => {
+      const node = nodes.find((n) => n.id === id);
+      const chain = node
+        ? (readChain(graph, scopeOfNode(node), finallyId)?.ids ?? [])
+        : [];
+      return chain[chain.indexOf(id) - 1] ?? null;
     },
+    // Tab moves a note into the loop or If above it, after its last step; Shift+Tab moves the note after
+    // the last step of a loop or branch out, under the loop or If. Null when there is nowhere to go.
+    // A loop or branch with no step yet has nothing to hold a note, so the note becomes its first step.
+    nestNote: (
+      note: DocNoteRef,
+      outdent: boolean,
+    ): DocNoteRef | { stepId: string } | null => {
+      const owner = nodes.find((n) => n.id === note.ownerNodeId);
+      if (!owner) return null;
+      const ownerScope = scopeOfNode(owner);
+      const chain = readChain(graph, ownerScope, finallyId)?.ids ?? [];
+      if (outdent) {
+        const parent = nodes.find((n) => n.id === owner.parentId);
+        if (
+          !parent ||
+          note.placement !== "trailing" ||
+          chain[chain.length - 1] !== owner.id
+        )
+          return null;
+        return moveNoteText(
+          note,
+          { ownerNodeId: parent.id, placement: "trailing" },
+          true,
+        );
+      }
+      const container =
+        note.placement === "trailing"
+          ? owner
+          : nodes.find((n) => n.id === chain[chain.indexOf(owner.id) - 1]);
+      const scope = innerScope(container);
+      if (!scope) return null;
+      const inside = readChain(graph, scope, finallyId)?.ids ?? [];
+      const last = inside[inside.length - 1];
+      if (!last) {
+        const text = noteText(note.ownerNodeId, note.placement).trim();
+        // A Browser Task is the step whose main text is an instruction, as the Doc's "/" menu offers it.
+        // No immediate capture here: the new step's layout passes land after it, and only the history's debounce
+        // folds them, the step and the note's move into one undo entry.
+        const stepId = insertStep({ scope, index: 0 }, "navigation");
+        if (!stepId) return null;
+        if (text)
+          edits.update((current) =>
+            setStepField(
+              setStepField(
+                current,
+                note.ownerNodeId,
+                noteKey(note.placement),
+                "",
+              ),
+              stepId,
+              "navigationGoal",
+              text,
+            ),
+          );
+        return { stepId };
+      }
+      return moveNoteText(
+        note,
+        { ownerNodeId: last, placement: "trailing" },
+        false,
+      );
+    },
+    insertStep,
     duplicate: (id: string) => edits.duplicate(id),
     remove: (id: string) => {
       if (refuseIfFeedsInputs([id])) return;

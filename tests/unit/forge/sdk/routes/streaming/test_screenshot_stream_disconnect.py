@@ -88,6 +88,8 @@ async def test_workflow_run_streaming_stops_sending_once_the_client_is_gone(
         "AGENT_FUNCTION",
         SimpleNamespace(
             mark_streaming_viewer_active=AsyncMock(),
+            browser_session_stream_reauthorization_required=AsyncMock(return_value=False),
+            browser_session_stream_enforcement_monitor_required=AsyncMock(return_value=False),
             enforce_folder_access=AsyncMock(),
             enforce_browser_session_credential_use=AsyncMock(),
             enforce_workflow_run_credential_use=AsyncMock(),
@@ -193,6 +195,8 @@ def run_stream(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Awaitable[_Watc
         "AGENT_FUNCTION",
         SimpleNamespace(
             mark_streaming_viewer_active=AsyncMock(),
+            browser_session_stream_reauthorization_required=AsyncMock(return_value=False),
+            browser_session_stream_enforcement_monitor_required=AsyncMock(return_value=False),
             enforce_folder_access=AsyncMock(),
             enforce_browser_session_credential_use=AsyncMock(),
             enforce_workflow_run_credential_use=AsyncMock(),

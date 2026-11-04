@@ -1730,12 +1730,9 @@ class WorkflowParametersRepository(BaseRepository):
         workflow_copilot_chat_id: str,
         turn_id: str,
         claim_before: datetime,
-    ) -> bool:
-        """Stamp ``recovering_at`` on one pending turn, returning whether this caller won it.
-
-        A recovery that itself crashes leaves the stamp behind; a later reader
-        reclaims it once the stamp predates ``claim_before``.
-        """
+    ) -> Literal["claimed", "recovering", "refused"]:
+        """Stamp ``recovering_at`` on one pending turn; "recovering" means another reader's stamp is newer than
+        ``claim_before``. An older stamp, such as one a crashed recovery left behind, is reclaimed."""
         async with self.Session() as session:
             chat = (
                 await session.scalars(
@@ -1746,33 +1743,33 @@ class WorkflowParametersRepository(BaseRepository):
                 )
             ).first()
             if chat is None:
-                return False
+                return "refused"
             pending = dict(chat.pending_turns or {})
             entry = pending.get(turn_id)
             if not isinstance(entry, dict):
-                return False
+                return "refused"
             question_turn = CopilotPendingTurn.model_validate(entry)
             if any(item.status == "pending" for item in question_turn.question_interactions) and question_wait_is_live(
                 question_turn.question_heartbeat_at, datetime.now(timezone.utc)
             ):
-                return False
+                return "refused"
             if any(
                 item.last_activity_at is not None and item.last_activity_at > claim_before
                 for item in question_turn.question_interactions
             ):
-                return False
+                return "refused"
             recovering_at = _parse_pending_turn_timestamp(entry.get("recovering_at"))
             if recovering_at is not None and recovering_at > claim_before:
-                return False
+                return "recovering"
             if await _turn_finalisation_held(session, _turn_finalisation_lock_key(workflow_copilot_chat_id, turn_id)):
-                return False
+                return "refused"
             credential_resumed_at = _parse_pending_turn_timestamp(entry.get("credential_resumed_at"))
             if credential_resumed_at is not None and credential_resumed_at > claim_before:
-                return False
+                return "refused"
             pending[turn_id] = {**entry, "recovering_at": datetime.now(timezone.utc).isoformat()}
             chat.pending_turns = pending
             await session.commit()
-            return True
+            return "claimed"
 
     @db_operation("record_pending_copilot_turn_credential_resume")
     async def record_pending_copilot_turn_credential_resume(
@@ -2080,6 +2077,37 @@ class WorkflowParametersRepository(BaseRepository):
             if not isinstance(entry, dict):
                 return
             pending[turn_id] = {**entry, "canonical_write_fingerprint": fingerprint}
+            chat.pending_turns = pending
+            await session.commit()
+
+    @db_operation("record_pending_copilot_turn_draft", log_errors=False)
+    async def record_pending_copilot_turn_draft(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        turn_id: str,
+        draft: dict[str, Any],
+        drafted_at: datetime,
+    ) -> None:
+        async with self.Session() as session:
+            chat = (
+                await session.scalars(
+                    select(WorkflowCopilotChatModel)
+                    .where(WorkflowCopilotChatModel.organization_id == organization_id)
+                    .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                    .with_for_update()
+                )
+            ).first()
+            if chat is None:
+                return
+            pending = dict(chat.pending_turns or {})
+            entry = pending.get(turn_id)
+            if not isinstance(entry, dict):
+                return
+            stored_at = _parse_pending_turn_timestamp(entry.get("latest_draft_at"))
+            if stored_at is not None and stored_at >= drafted_at:
+                return
+            pending[turn_id] = {**entry, "latest_draft": draft, "latest_draft_at": drafted_at.isoformat()}
             chat.pending_turns = pending
             await session.commit()
 

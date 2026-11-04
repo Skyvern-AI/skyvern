@@ -727,10 +727,14 @@ EMAIL = {"sender": "agent@example.com", "subject": "Report", "body": "Done."}
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("offline_address_validation")
+@pytest.mark.parametrize("scope_platform_smtp", [False, True])
 async def test_a_send_email_child_sends_through_the_platform_smtp_secrets(
-    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, scope_platform_smtp: bool
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "platform_smtp_scoping_required", AsyncMock(return_value=scope_platform_smtp)
+    )
     platform_secrets = {
         PLATFORM_SMTP_AWS_KEYS["smtp_host"]: "smtp.example.com",
         PLATFORM_SMTP_AWS_KEYS["smtp_port"]: "587",
@@ -752,6 +756,8 @@ async def test_a_send_email_child_sends_through_the_platform_smtp_secrets(
     rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
     children = [(row.block_type, row.status) for row in rows if row.parent_workflow_run_block_id]
     assert children == [(BlockType.SEND_EMAIL, "completed")]
+    retained = set(PLATFORM_SMTP_AWS_KEYS) & app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters.keys()
+    assert retained == (set() if scope_platform_smtp else set(PLATFORM_SMTP_AWS_KEYS))
     assert smtp.call_args.args[0] == "smtp.example.com"
     assert "smtp-password" not in json.dumps(model.inputs, default=str)
 

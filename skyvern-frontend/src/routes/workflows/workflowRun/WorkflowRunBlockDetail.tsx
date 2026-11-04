@@ -265,6 +265,7 @@ function renderBodyForBlock(
       }
       return (
         <CodeBlockParameters
+          key={block.workflow_run_block_id}
           code={definition.code}
           prompt={definition.prompt}
           steps={definition.steps}

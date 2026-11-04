@@ -363,7 +363,6 @@ describe("RunHistory inputs during filtering", () => {
       TaskRunType.OpenaiCua,
       TaskRunType.AnthropicCua,
       TaskRunType.UiTars,
-      TaskRunType.YutoriNavigator,
     ]);
 
     fireEvent.click(screen.getByTestId("run-type-filter"));

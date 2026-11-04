@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import re
 from collections.abc import Callable
@@ -37,7 +38,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     _get_block_schema_post_hook,
     _get_workflow_knowledge_post_hook,
 )
-from skyvern.schemas.workflows import CodeBlockYAML
+from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, CodeBlockYAML
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 
@@ -182,6 +183,48 @@ async def test_choosing_a_block_carries_the_family_rule_only_when_both_families_
     )
     assert code_only["data"]["sections"]["choosing_a_block"]["content"] == "all block types"
     assert "active_policy_note" not in code_only["data"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_step", [True, False])
+async def test_agent_step_capability_reaches_choosing_a_block_and_descriptions_only_when_available(
+    agent_step: bool,
+) -> None:
+    capability = dataclasses.replace(ALL_BLOCK_FAMILIES, agent_step=agent_step)
+    rendered = await _get_workflow_knowledge_post_hook(
+        {"ok": True, "data": {"sections": {"choosing_a_block": {"content": "all block types"}}}},
+        {},
+        SimpleNamespace(authoring_capability=capability),
+    )
+    choosing = rendered["data"]["sections"]["choosing_a_block"]["content"]
+    overlays = _build_skyvern_mcp_overlays(capability)
+    surfaces = {
+        "choosing_a_block": choosing,
+        "get_workflow_knowledge": overlays["get_workflow_knowledge"].description_suffix or "",
+        "get_block_schema": overlays["get_block_schema"].description_suffix or "",
+    }
+
+    assert {name: AGENT_STEP_BLOCK_SUMMARY in text for name, text in surfaces.items()} == dict.fromkeys(
+        surfaces, agent_step
+    )
+    assert choosing.startswith(AUTHORING_FAMILY_GUIDANCE)
+    assert choosing.endswith("all block types")
+
+
+@pytest.mark.asyncio
+async def test_repeat_knowledge_calls_do_not_stack_prefixes_on_the_cached_section() -> None:
+    cached = _parse_knowledge_topics()["choosing_a_block"]
+    original = cached["content"]
+    ctx = SimpleNamespace(authoring_capability=dataclasses.replace(ALL_BLOCK_FAMILIES, agent_step=True))
+    for _ in range(2):
+        rendered = await _get_workflow_knowledge_post_hook(
+            {"ok": True, "data": {"sections": {"choosing_a_block": cached}}}, {}, ctx
+        )
+    content = rendered["data"]["sections"]["choosing_a_block"]["content"]
+
+    assert cached["content"] == original
+    assert content.count(AGENT_STEP_BLOCK_SUMMARY) == 1
+    assert content.count(AUTHORING_FAMILY_GUIDANCE) == 1
 
 
 def _knowledge_ctx(*, doc_editor_enabled: bool) -> CopilotContext:

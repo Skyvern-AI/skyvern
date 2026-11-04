@@ -18,6 +18,8 @@ export const WorkflowDocActionsContext = createContext<{
   selectBranch: (conditionalId: string, branchId: string) => void;
   loopOpen: (loopId: string) => boolean;
   toggleLoop: (loopId: string) => void;
+  conditionalOpen: (conditionalId: string) => boolean;
+  toggleConditional: (conditionalId: string) => void;
   // Null when the doc is read-only (flag on but locked, a run going, or a read-only scope).
   edit: DocEditApi | null;
   destinations: () => DocDestination[];
@@ -25,6 +27,8 @@ export const WorkflowDocActionsContext = createContext<{
     id: string,
   ) => Array<{ id: string; label: string; text: string }>;
   missingReference: (reference: string) => boolean;
+  // Adds a Text input from the "@" menu and opens it at the top; false when the name can't be used.
+  createInput: ((key: string) => boolean) | null;
   focusId: string | null;
   setFocusId: (id: string | null) => void;
   pendingNote: DocPendingNote | null;
@@ -43,10 +47,13 @@ export const WorkflowDocActionsContext = createContext<{
   selectBranch: () => {},
   loopOpen: () => true,
   toggleLoop: () => {},
+  conditionalOpen: () => true,
+  toggleConditional: () => {},
   edit: null,
   destinations: () => [],
   outputUsers: () => [],
   missingReference: () => false,
+  createInput: null,
   focusId: null,
   setFocusId: () => {},
   pendingNote: null,

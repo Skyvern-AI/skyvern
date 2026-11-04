@@ -73,9 +73,12 @@ async def _execute(
     block: PowerBIQueryBlock,
     *,
     context: FakeWorkflowRunContext | None = None,
+    with_hop_token: bool = True,
 ) -> BlockResult:
     context = context or FakeWorkflowRunContext(values={})
     context.organization_id = "org_test"
+    if with_hop_token:
+        context._powerbi_hop_tokens[block.label] = "test-hop-token"
 
     async def build_result(self: PowerBIQueryBlock, **kwargs: object) -> BlockResult:
         return _block_result(self, **kwargs)
@@ -92,6 +95,30 @@ async def _execute(
         )
 
 
+def _install_persisted_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    block: PowerBIQueryBlock,
+    parameter: WorkflowParameter,
+    *,
+    other_parameters: list[WorkflowParameter] | None = None,
+    other_blocks: list[object] | None = None,
+) -> AsyncMock:
+    workflow = SimpleNamespace(
+        organization_id="org_test",
+        workflow_id="wf_test",
+        workflow_definition=SimpleNamespace(
+            parameters=[parameter, *(other_parameters or [])], blocks=[block, *(other_blocks or [])]
+        ),
+    )
+    run_parameter = SimpleNamespace(
+        workflow_run_id="wr_test", workflow_parameter_id=parameter.workflow_parameter_id, value=_DATASET
+    )
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_for_workflow_run", AsyncMock(return_value=workflow))
+    read_parameters = AsyncMock(return_value=[(parameter, run_parameter)])
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run_parameters", read_parameters)
+    return read_parameters
+
+
 def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -> None:
     definition = WorkflowDefinitionYAML.model_validate(
         {
@@ -101,6 +128,7 @@ def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -
                     "block_type": "powerbi_query",
                     "label": "query_sales",
                     "connection_id": "conn_test",
+                    "credential_source": "nango",
                     "dataset_id": _DATASET,
                     "query": "EVALUATE VALUES('Sales')",
                 }
@@ -115,6 +143,7 @@ def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -
     block_yaml = definition.blocks[0]
     assert isinstance(block_yaml, PowerBIQueryBlockYAML)
     assert block_yaml.block_type == BlockType.POWERBI_QUERY
+    assert block_yaml.credential_source == "nango"
     assert block_yaml.max_rows == 1_000
     assert block_yaml.model_dump(mode="json")["connection_id"] == "conn_test"
 
@@ -122,9 +151,32 @@ def test_powerbi_query_yaml_round_trips_through_workflow_union_and_converter() -
     runtime_block = block_yaml_to_block(block_yaml, {output.key: output})
     assert isinstance(runtime_block, PowerBIQueryBlock)
     assert runtime_block.connection_id == "conn_test"
+    assert runtime_block.credential_source == "nango"
     assert runtime_block.dataset_id == _DATASET
     assert runtime_block.query == "EVALUATE VALUES('Sales')"
     assert runtime_block.max_rows == 1_000
+
+
+def test_powerbi_query_credential_source_defaults_to_nango_and_rejects_native() -> None:
+    block_yaml = PowerBIQueryBlockYAML(
+        label="query_sales",
+        connection_id="conn_test",
+        dataset_id=_DATASET,
+        query="EVALUATE VALUES('Sales')",
+    )
+
+    assert block_yaml.credential_source == "nango"
+    assert _block().credential_source == "nango"
+    with pytest.raises(ValidationError):
+        PowerBIQueryBlockYAML(
+            label="query_sales",
+            connection_id="conn_test",
+            credential_source="native",  # type: ignore[arg-type]
+            dataset_id=_DATASET,
+            query="EVALUATE VALUES('Sales')",
+        )
+    with pytest.raises(ValidationError):
+        _block(credential_source="native")
 
 
 @pytest.mark.parametrize("max_rows", [0, 100_001, True, 1.0, "1000", "{{ row_cap }}"])
@@ -242,7 +294,9 @@ def test_workflow_yaml_allows_parameter_defaults_that_resolve_to_caller_inputs()
 
 
 @pytest.mark.asyncio
-async def test_powerbi_query_renders_fields_and_returns_direct_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_powerbi_query_resolves_persisted_dataset_and_returns_direct_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     context = FakeWorkflowRunContext(
         values={
             "dataset": _DATASET,
@@ -259,24 +313,128 @@ async def test_powerbi_query_renders_fields_and_returns_direct_rows(monkeypatch:
     block = _block(
         connection_id="conn_test",
         dataset_id="{{ dataset }}",
-        query="{{ dax_query }}",
+        query="EVALUATE VALUES('Sales')\r\n",
         max_rows=20,
         parameters=[_workflow_parameter()],
     )
+    _install_persisted_inputs(monkeypatch, block, _workflow_parameter("dataset"))
 
     result = await _execute(block, context=context)
 
     assert result.success is True
     assert result.output_parameter_value == _ROWS
+    assert context.get_powerbi_hop_token("query_sales") == "test-hop-token"
     run_query.assert_awaited_once_with(
         organization_id="org_test",
         workflow_run_id="wr_test",
         workflow_run_block_id="wfrb_test",
         connection_id="conn_test",
+        hop_token="test-hop-token",
+        credential_source="nango",
         dataset_id=_DATASET,
         query="EVALUATE VALUES('Sales')",
         max_rows=20,
     )
+
+
+@pytest.mark.asyncio
+async def test_powerbi_does_not_compile_an_unrelated_parameter_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _block(dataset_id="{{ dataset }}")
+    dangerous = _workflow_parameter("unrelated", "{{ 'x' * 1000000000 }}")
+    _install_persisted_inputs(monkeypatch, block, _workflow_parameter("dataset"), other_parameters=[dangerous])
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    with patch("jinja2.Environment.compile", side_effect=AssertionError("must not compile unrelated defaults")):
+        result = await _execute(block)
+
+    assert result.success is True
+    assert run_query.await_args.kwargs["dataset_id"] == _DATASET
+
+
+@pytest.mark.asyncio
+async def test_powerbi_rejects_repeated_editor_output_interpolations_without_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = FakeWorkflowRunContext(values={"p_output": "x" * 4096})
+    context.carried_block_labels = {"p"}
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+    read_workflow = AsyncMock(side_effect=AssertionError("invalid expressions must not be resolved"))
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_for_workflow_run", read_workflow)
+
+    with patch("jinja2.Environment.compile", side_effect=AssertionError("must not render repeated interpolation")):
+        result = await _execute(_block(dataset_id="{{p_output}}" * 170), context=context)
+
+    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    read_workflow.assert_not_awaited()
+    run_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_powerbi_rejects_dataset_input_named_after_saved_block_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    block = _block(dataset_id="{{ p_output }}")
+    prior = SimpleNamespace(label="p", block_type=BlockType.POWERBI_QUERY)
+    _install_persisted_inputs(monkeypatch, block, _workflow_parameter("p_output"), other_blocks=[prior])
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(block)
+
+    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    run_query.assert_not_awaited()
+    app.DATABASE.workflow_runs.get_workflow_run_parameters.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing", "wrong_run", "templated_default", "lookup_failure"])
+async def test_powerbi_rejects_unverified_dataset_inputs(monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    block = _block(dataset_id="{{ dataset }}")
+    parameter = _workflow_parameter("dataset", "{{ other }}" if case == "templated_default" else None)
+    read_parameters = _install_persisted_inputs(monkeypatch, block, parameter)
+    if case == "missing":
+        read_parameters.return_value = []
+    elif case == "wrong_run":
+        read_parameters.return_value[0][1].workflow_run_id = "wr_other"
+    elif case == "lookup_failure":
+        read_parameters.side_effect = RuntimeError("database unavailable")
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(block)
+
+    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    run_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dataset_id", [_DATASET[:-1] + "g", "x" * 256])
+async def test_powerbi_rejects_resolved_dataset_that_is_not_a_uuid(
+    monkeypatch: pytest.MonkeyPatch, dataset_id: str
+) -> None:
+    block = _block(dataset_id="{{ dataset }}")
+    read_parameters = _install_persisted_inputs(monkeypatch, block, _workflow_parameter("dataset"))
+    read_parameters.return_value[0][1].value = dataset_id
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(block)
+
+    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    assert result.failure_reason == "Power BI dataset_id must resolve to a UUID from a workflow input or literal."
+    run_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_powerbi_query_keeps_capability_for_loop_iterations(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = FakeWorkflowRunContext(values={}, block_metadata={"query_sales": {"current_index": 0}})
+    run_query = AsyncMock(return_value=_ROWS)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(_block(), context=context)
+
+    assert result.success is True
+    assert context.get_powerbi_hop_token("query_sales") == "test-hop-token"
 
 
 @pytest.mark.asyncio
@@ -362,7 +520,7 @@ async def test_powerbi_runtime_reports_malformed_template_as_safe_block_failure(
 
 
 @pytest.mark.asyncio
-async def test_powerbi_render_failure_names_its_cause(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_powerbi_rejects_templated_query_without_rendering(monkeypatch: pytest.MonkeyPatch) -> None:
     context = FakeWorkflowRunContext(values={"dax_query": "EVALUATE VALUES('Private_Sales_Table')"})
     context.parameters = {"dax_query": _workflow_parameter("dax_query")}
     run_query = AsyncMock(return_value=_ROWS)
@@ -370,13 +528,46 @@ async def test_powerbi_render_failure_names_its_cause(monkeypatch: pytest.Monkey
 
     result = await _execute(_block(query="{{ dax_query + 1 }}", parameters=[_workflow_parameter()]), context=context)
 
-    assert result.failure_reason == (
-        "Could not render Power BI query fields. Wrong value type in `dax_query + ...` (field query, line 1)."
-    )
-    assert result.output_parameter_value == {
-        "error": "template_format_failed",
-        "render_failure": {"kind": "Wrong value type", "field": "query", "expression": "dax_query + ...", "line": 1},
-    }
+    assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+    run_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("values", "invalid_shape"),
+    [
+        ({"query": "{{ dax_query }}"}, True),
+        ({"query": "{% if true %}EVALUATE 1{% endif %}"}, True),
+        ({"query": "{# comment #}EVALUATE 1"}, True),
+        ({"dataset_id": "{{ dataset.value }}"}, True),
+        ({"dataset_id": "{{ dataset }} suffix"}, True),
+        ({"dataset_id": "not-a-uuid"}, True),
+        ({}, False),
+        ({"dataset_id": "{{ dataset }}"}, False),
+    ],
+)
+async def test_powerbi_input_shape_is_checked_before_missing_capability(
+    monkeypatch: pytest.MonkeyPatch, values: dict[str, str], invalid_shape: bool
+) -> None:
+    read_workflow = AsyncMock()
+    read_parameters = AsyncMock()
+    run_query = AsyncMock()
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_for_workflow_run", read_workflow)
+    monkeypatch.setattr(app.DATABASE.workflow_runs, "get_workflow_run_parameters", read_parameters)
+    monkeypatch.setattr(app, "AGENT_FUNCTION", SimpleNamespace(execute_powerbi_query_for_run=run_query))
+
+    result = await _execute(_block(**values), with_hop_token=False)
+
+    if invalid_shape:
+        assert result.output_parameter_value == {"error": "unsafe_query_input_source"}
+        assert (
+            result.failure_reason == "Power BI dataset_id and query may use only workflow input parameters or literals."
+        )
+    else:
+        assert result.output_parameter_value == {"error": "integration_unavailable"}
+        assert result.failure_reason == "Power BI queries are not currently available."
+    read_workflow.assert_not_awaited()
+    read_parameters.assert_not_awaited()
     run_query.assert_not_awaited()
 
 
@@ -436,6 +627,7 @@ async def test_powerbi_query_failures_are_safe_and_oss_hook_fails_closed(monkeyp
             "trigger_chain_owner_required",
             "Power BI queries require every triggering workflow to be saved by the connection owner.",
         ),
+        ("row_limit_exceeded", "row_limit_exceeded", "Power BI query exceeded the row limit."),
         ("integration_unavailable", "integration_unavailable", "Power BI queries are not currently available."),
         (
             "workflow_owner_resave_required",

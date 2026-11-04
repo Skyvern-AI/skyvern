@@ -9,6 +9,7 @@ run-scoped and the listener logs the real run identity.
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,9 +18,13 @@ import pytest
 import pytest_asyncio
 from structlog.testing import capture_logs
 
+from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import TaskRequest
 from skyvern.forge.sdk.workflow.models.block import Block, CodeBlock, PrintPageBlock
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_factory import (
@@ -31,6 +36,7 @@ from skyvern.webeye.browser_factory import (
 )
 from skyvern.webeye.native_downloads import NativeDownloads
 from skyvern.webeye.real_browser_manager import RealBrowserManager
+from tests.unit.helpers import make_organization, make_step, make_task
 
 
 @pytest_asyncio.fixture
@@ -597,6 +603,60 @@ async def test_listener_reads_the_task_download_timeout_when_the_download_starts
             run_context=run_context,
             context_timeout_after_registration=task_timeout,
         )
+
+    assert download.cancel.await_count == (1 if cancelled else 0)
+
+
+class _DownloadStarted(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("explicit", "cancelled"), [(5.0, False), (None, True)], ids=["explicit", "default"])
+async def test_standalone_task_request_timeout_reaches_the_browser_listener(
+    explicit: float | None, cancelled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    template = make_task(now, organization)
+    request = TaskRequest(url=template.url, download_timeout=explicit)
+    context = SkyvernContext(download_timeout=7.0)
+    agent = ForgeAgent()
+    download = MagicMock()
+
+    async def slow_path() -> Path:
+        await asyncio.sleep(0.05)
+        return Path("not-on-disk")
+
+    async def initialize(*_args: object, **_kwargs: object) -> None:
+        await _run_listener(download, run_context=context, context_timeout_after_registration=context.download_timeout)
+        raise _DownloadStarted()
+
+    download.path = AsyncMock(side_effect=slow_path)
+    download.cancel = AsyncMock()
+    monkeypatch.setattr(agent, "initialize_execution_state", AsyncMock(side_effect=initialize))
+    with (
+        patch("skyvern.forge.agent.app") as mock_app,
+        patch("skyvern.forge.agent.get_download_retry_started_at", AsyncMock(return_value=None)),
+        patch("skyvern.webeye.browser_factory.BROWSER_DOWNLOAD_TIMEOUT", 0.001),
+    ):
+        mock_app.DATABASE.tasks.create_task = AsyncMock(
+            side_effect=lambda **kwargs: template.model_copy(
+                update={"download_timeout": kwargs.get("download_timeout")}
+            )
+        )
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
+        mock_app.DATABASE.tasks.update_task = AsyncMock()
+        mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+        task = await agent.create_task(request, organization.organization_id)
+        step = make_step(now, task, step_id="step-download", status=StepStatus.created, order=0, output=None)
+        skyvern_context.set(context)
+        try:
+            with pytest.raises(_DownloadStarted):
+                await agent.execute_step(organization, task, step, download_baseline_files=[])
+            assert context.download_timeout == 7.0
+        finally:
+            skyvern_context.reset()
 
     assert download.cancel.await_count == (1 if cancelled else 0)
 

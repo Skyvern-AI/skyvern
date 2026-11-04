@@ -122,6 +122,8 @@ async def _filter_credential_inaccessible_sessions(
     if not sessions:
         return []
     principal = get_request_principal()
+    if await app.AGENT_FUNCTION.redact_inaccessible_browser_session_artifacts(principal, organization_id):
+        return sessions
     profile_ids = {session.browser_profile_id for session in sessions if session.browser_profile_id}
     try:
         profile_accessible_ids = {session.persistent_browser_session_id for session in sessions}

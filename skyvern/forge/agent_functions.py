@@ -100,7 +100,12 @@ from skyvern.utils.url_validators import pinned_ip_client
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_engine import UNSET_SELECTION, BrowserEngineSelection, resolve_engine_selection_for_task
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
+from skyvern.webeye.scraper.scraped_page import (
+    ELEMENT_NODE_ATTRIBUTES,
+    CleanupElementTreeFunc,
+    ScrapedPage,
+    json_to_html,
+)
 from skyvern.webeye.utils.challenge_signature import ChallengeVendor
 from skyvern.webeye.utils.challenge_solve_record import ChallengeSolveRecord
 from skyvern.webeye.utils.dom import SkyvernElement
@@ -1024,8 +1029,41 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
-    async def nango_powerbi_available(self, organization_id: str) -> bool:
+    async def nango_gmail_catalog_available(self, organization_id: str) -> bool:
         return False
+
+    async def prepare_gmail_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
+        return None
+
+    async def execute_gmail_inbox_for_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        connection_id: str,
+        hop_token: str | None,
+        folder: str,
+        sender: str | None,
+        subject: str | None,
+        newer_than_days: int | None,
+        max_results: int,
+        include_body: bool,
+    ) -> list[dict[str, object]]:
+        from skyvern.services.email import GmailAPIError
+
+        raise GmailAPIError(status=404, code="integration_unavailable", message="Gmail integration unavailable")
+
+    async def nango_powerbi_catalog_available(self, organization_id: str) -> bool:
+        return False
+
+    async def prepare_powerbi_query_hop_tokens(self, *, workflow_run: WorkflowRun, workflow: Workflow) -> None:
+        return None
+
+    async def get_powerbi_query_hop_tokens(
+        self, *, organization_id: str, workflow_run_id: str, block_labels: list[str]
+    ) -> dict[str, str]:
+        return {}
 
     async def ensure_email_forwarding_available(
         self, organization_id: str | None = None, *, fresh: bool = True
@@ -1079,6 +1117,30 @@ class AgentFunction:
     ) -> set[str]:
         """Return sessions whose associated workflow credentials are usable; OSS has no credential-folder ACLs."""
         return browser_session_ids
+
+    async def redact_inaccessible_browser_session_artifacts(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        return False
+
+    async def should_check_browser_session_artifacts(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        return False
+
+    async def can_access_browser_session_artifacts(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+    ) -> bool:
+        return True
+
+    async def can_access_sessionless_artifacts(
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+        workflow_run_id: str | None,
+        runnable_ids: list[str],
+    ) -> bool:
+        return True
 
     async def browser_session_ids_authorized_for_connect(
         self, principal: RequestPrincipal | None, organization_id: str, browser_session_ids: set[str]
@@ -1143,6 +1205,24 @@ class AgentFunction:
         """Cloud raises 403 when a credential folder denies the action on any referenced credential or folder."""
         return None
 
+    async def enforce_workflow_context_credential_use(
+        self,
+        organization_id: str,
+        workflow_run_id: str,
+        *,
+        credential_ids: set[str],
+        vault_item_ids: set[tuple[str, str | None, str]],
+        refresh: bool,
+        unresolved_vault_item: bool = False,
+        deny_platform_smtp: bool = False,
+    ) -> set[str]:
+        """Cloud enforces RBAC and credential-folder access; OSS has no RBAC policy."""
+        return set(credential_ids)
+
+    async def platform_smtp_scoping_required(self, organization_id: str) -> bool:
+        """Cloud scopes platform SMTP parameters when RBAC enforcement is active."""
+        return False
+
     async def enforce_credential_use(
         self,
         organization_id: str,
@@ -1153,6 +1233,16 @@ class AgentFunction:
         requested_by: str | None = None,
     ) -> None:
         """Cloud checks folder use before releasing a credential secret; OSS has no credential-folder ACLs."""
+
+    async def enforce_platform_azure_vault_item_ownership(
+        self, organization_id: str, vault_name: str, item_ids: set[str], azure_client_factory: AzureClientFactory
+    ) -> None:
+        return None
+
+    async def enforce_platform_aws_secret_ownership(
+        self, organization_id: str | None, aws_key: str, *, bitwarden: bool = False
+    ) -> str:
+        return aws_key
 
     async def enforce_scoped_credential_use(
         self,
@@ -1180,6 +1270,14 @@ class AgentFunction:
     ) -> None:
         """Cloud checks the credential linked to a saved profile before session access; OSS has no folder ACLs."""
 
+    async def enforce_task_totp_credential_use(
+        self, principal: RequestPrincipal | None, organization_id: str, totp_identifier: str
+    ) -> None:
+        """Cloud checks a standalone task's TOTP identifier against linked credentials."""
+
+    async def enforce_task_credential_use(self, task: Task, browser_session_id: str | None) -> None:
+        """Cloud revalidates a standalone task's recorded requester before browser access."""
+
     async def enforce_workflow_run_credential_use(
         self,
         principal: RequestPrincipal | None,
@@ -1189,6 +1287,7 @@ class AgentFunction:
         browser_profile_id: str | None = None,
         browser_session_id: str | None = None,
         requested_by: str | None = None,
+        as_viewer: bool = False,
     ) -> None:
         """Cloud checks credentials attached to run browser state; OSS has no credential-folder ACLs."""
 
@@ -1230,6 +1329,14 @@ class AgentFunction:
         """Runs inside auth, before the handler; action is None when the route recorded none. Raising rejects."""
         return None
 
+    async def enforce_stream_request_role(
+        self,
+        principal: RequestPrincipal,
+        action: str | None,
+        bearer_identity_status: BearerIdentityStatus | None,
+    ) -> None:
+        await self.enforce_request_role(principal, action, bearer_identity_status)
+
     async def should_redact_organization_credential_secrets(
         self,
         principal: RequestPrincipal | None,
@@ -1256,10 +1363,27 @@ class AgentFunction:
         return False
 
     async def reauthorize_browser_session_stream(
-        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+        browser_session_id: str,
+        *,
+        action: str = "browser_session.connect",
+        folder_action: str = "workflow_run.run",
     ) -> bool:
         """Recheck a stream when its session state changes; OSS retains its allow-by-default behavior."""
         return await self.authorize_browser_session_stream(principal, organization_id, browser_session_id)
+
+    async def reauthorize_workflow_run_stream(
+        self,
+        principal: RequestPrincipal | None,
+        organization_id: str,
+        workflow_run_id: str,
+        action: str,
+        *,
+        folder_action: str | None = None,
+    ) -> bool:
+        return True
 
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.
@@ -1567,14 +1691,6 @@ class AgentFunction:
         overrides this to opt runs into an elevated resolution behind a feature flag.
         """
         return RecordingVideoSizeResolution(current_size, current_size)
-
-    async def should_keep_code_mode_for_workflow_run(
-        self,
-        *,
-        workflow: Workflow,
-        workflow_run: WorkflowRun,
-    ) -> bool:
-        return True
 
     async def should_upgrade_to_code_mode(
         self,
@@ -2334,6 +2450,15 @@ class AgentFunction:
         """Wait for a cloud-managed challenge solver if one is attached to the page."""
         return None
 
+    async def on_step_scrape_persisted(self, task: Task, step: Step, scraped_page: ScrapedPage) -> None:
+        """Called once a step's scrape artifacts are persisted; must not raise or block the step."""
+        return None
+
+    def should_capture_scrape_origin(self, url: str) -> bool:
+        """Whether a scrape of the page at ``url`` also captures its origin for on_step_scrape_persisted: a DOM change
+        witness, the html read with its tree and the origin binding. Only True opts in; must not block."""
+        return False
+
     async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
         """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
         return False
@@ -2625,6 +2750,8 @@ class AgentFunction:
         workflow_run_id: str,
         workflow_run_block_id: str,
         connection_id: str,
+        hop_token: str | None = None,
+        credential_source: Literal["nango"] = "nango",
         dataset_id: str,
         query: str,
         max_rows: int = 1_000,
@@ -2632,7 +2759,7 @@ class AgentFunction:
         """Power BI reads require Cloud's persisted-run identity and audited execution facade."""
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
-    async def ensure_powerbi_queries_available(self) -> None:
+    async def ensure_powerbi_queries_available(self, organization_id: str) -> None:
         raise NotImplementedError("Power BI workflow queries are only supported in Skyvern Cloud")
 
     async def get_google_workspace_credentials(
@@ -3278,7 +3405,7 @@ class AgentFunction:
         del organization_id
         return None if settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE else False
 
-    async def copilot_agent_step_enabled(self, organization_id: str | None) -> bool:
+    async def agent_step_enabled(self, organization_id: str | None) -> bool:
         del organization_id
         return False
 
@@ -3325,7 +3452,7 @@ class AgentFunction:
         if config is None:
             return None
         try:
-            agent_step_enabled = await self.copilot_agent_step_enabled(organization_id)
+            agent_step_enabled = await self.agent_step_enabled(organization_id)
         except Exception:
             LOG.warning(
                 "Failed to resolve Copilot agent_step access; leaving it unavailable",

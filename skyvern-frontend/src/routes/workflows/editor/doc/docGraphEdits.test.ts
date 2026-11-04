@@ -4,6 +4,14 @@ import type { WorkflowBlock } from "../../types/workflowTypes";
 import type { BlockYAML } from "../../types/workflowYamlTypes";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { getElements, getWorkflowBlocks } from "../workflowEditorUtils";
+import {
+  docStepProducesData,
+  getDocMissingSettings,
+  getDocProseFields,
+  docStepFilter,
+  loopLineLeadsIn,
+} from "./docStepRegistry";
+import { docOutlineEntries } from "./docOutlineEntries";
 import { buildDocTree } from "./buildDocTree";
 import {
   addBranch,
@@ -23,6 +31,7 @@ import {
   contextInputsFedBy,
   type DocGraph,
 } from "./docGraphEdits";
+import { withLineSetting } from "./docLineSettings";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 
 function graphOf(blocks: WorkflowBlock[], finallyLabel: string | null = null) {
@@ -602,6 +611,210 @@ describe("note text", () => {
     expect(getWorkflowBlocks(nodes, graph.edges)[0]).not.toHaveProperty(
       "notes",
     );
+  });
+});
+
+describe("typing in a step's main line", () => {
+  const data = (nodes: AppNode[], id: string) =>
+    nodes.find((n) => n.id === id)!.data as Record<string, unknown>;
+
+  test("sets the companion fields the visual editor sets", () => {
+    const graph = graphOf([
+      code("py", "sheet", { code: "x = 1", prompt: "Old goal" }),
+      block("google_sheets_read", "sheet", "each", {
+        spreadsheet_url: "https://docs.google.com/spreadsheets/d/AAA/edit",
+        sheet_name: "Tab1",
+        range: "",
+        credential_id: null,
+        has_header_row: true,
+        parameters: [],
+      }),
+      forLoop("each", null, [], { loop_over: { key: "items" } }),
+    ]);
+    const goal = setStepField(
+      graph.nodes,
+      idOf(graph, "py"),
+      "prompt",
+      "New goal",
+    );
+    expect(data(goal, idOf(graph, "py"))).toMatchObject({
+      prompt: "New goal",
+      userOwnedGoal: true,
+      goalNeedsRegeneration: true,
+    });
+    const sheet = setStepField(
+      graph.nodes,
+      idOf(graph, "sheet"),
+      "spreadsheetUrl",
+      "https://docs.google.com/spreadsheets/d/BBB/edit",
+    );
+    expect(data(sheet, idOf(graph, "sheet")).sheetName).toBe("");
+    const sameSheet = setStepField(
+      graph.nodes,
+      idOf(graph, "sheet"),
+      "spreadsheetUrl",
+      "https://docs.google.com/spreadsheets/d/AAA/edit#gid=1",
+    );
+    expect(data(sameSheet, idOf(graph, "sheet")).sheetName).toBe("Tab1");
+    const loop = setStepField(
+      graph.nodes,
+      idOf(graph, "each"),
+      "whileConditionExpression",
+      "the page still has a next button",
+    );
+    expect(data(loop, idOf(graph, "each")).whileConditionCriteriaType).toBe(
+      "prompt",
+    );
+  });
+
+  test("a for-each loop line is free text; only a list picked on it becomes the source, in the field that holds it", () => {
+    const graph = graphOf([
+      forLoop("old", null, [], {
+        loop_over: { key: "page_urls" },
+        loop_variable_reference: null,
+      }),
+      forLoop("keyOnly", null, [], {
+        loop_over: { key: "items" },
+        loop_variable_reference: "",
+      }),
+    ]);
+    const old = graph.nodes.find(
+      (n) => isWorkflowBlockNode(n) && n.data.label === "old",
+    )!;
+    expect(getDocProseFields(old)).toEqual([]);
+    // The loader copies loop_over's key into loopVariableReference, which wins at run time.
+    expect(data(graph.nodes, old.id)).toMatchObject({
+      loopVariableReference: "page_urls",
+      loopValue: "page_urls",
+    });
+    const apply = (nodes: AppNode[], id: string, line: string) => {
+      const before = data(nodes, id).description as string | undefined;
+      return setStepField(nodes, id, "description", line).map((n) =>
+        n.id === id ? withLineSetting(n, "description", before ?? "") : n,
+      );
+    };
+    // Prose on the line never reaches the source.
+    const prose = apply(graph.nodes, old.id, "page_urls pages, compare");
+    expect(data(prose, old.id).loopVariableReference).toBe("page_urls");
+    // A list picked on the line replaces the source; editing the prose around it does not.
+    const picked = apply(prose, old.id, "page_urls pages, compare {{ other }}");
+    expect(data(picked, old.id).loopVariableReference).toBe("{{ other }}");
+    const reworded = apply(picked, old.id, "each page vs {{ other }}");
+    expect(data(reworded, old.id).loopVariableReference).toBe("{{ other }}");
+    const keyOnly = graph.nodes.find(
+      (n) => isWorkflowBlockNode(n) && n.data.label === "keyOnly",
+    )!;
+    const second = apply(graph.nodes, keyOnly.id, "go over {{ rows }}");
+    expect(data(second, keyOnly.id)).toMatchObject({
+      loopValue: "rows",
+      loopVariableReference: "",
+    });
+    // Removing the reference from the line clears the saved list, whichever field held it.
+    const cleared = apply(second, keyOnly.id, "go over the rows");
+    expect(data(cleared, keyOnly.id)).toMatchObject({
+      loopValue: "",
+      loopVariableReference: "",
+    });
+    const clearedRef = apply(picked, old.id, "each page");
+    expect(data(clearedRef, old.id)).toMatchObject({
+      loopValue: "",
+      loopVariableReference: "",
+    });
+    // A derived reference can't be an input name, so it goes where references are read.
+    const derived = apply(
+      graph.nodes,
+      keyOnly.id,
+      "go over {{ customer.items }}",
+    );
+    expect(data(derived, keyOnly.id)).toMatchObject({
+      loopValue: "items",
+      loopVariableReference: "{{ customer.items }}",
+    });
+  });
+});
+
+describe("which steps name an output", () => {
+  test("only steps that hand data on say what they save", () => {
+    const graph = graphOf([
+      block("goto_url", "open", "extract", { url: "https://example.com" }),
+      block("extraction", "extract", "stop", {
+        data_extraction_goal: "titles",
+      }),
+      block("terminate", "stop", null, { reason: "done" }),
+    ]);
+    const produces = (label: string) =>
+      docStepProducesData(
+        graph.nodes.find(
+          (n) => isWorkflowBlockNode(n) && n.data.label === label,
+        )!,
+      );
+    expect(produces("extract")).toBe(true);
+    expect(produces("open")).toBe(false);
+    expect(produces("stop")).toBe(false);
+  });
+});
+
+describe("finding and reading Loop and If steps", () => {
+  test("the words the Doc shows find the step in the Add a step menu", () => {
+    const rank = (title: string, q: string, desc = "") =>
+      docStepFilter(title, q, [desc]);
+    for (const q of ["for", "for each", "repeat"])
+      expect(rank("Loop Block", q)).toBeGreaterThan(
+        rank("Wait Block", q, "Pause for a while"),
+      );
+    for (const q of ["if", "branch"])
+      expect(rank("Conditional Block", q)).toBeGreaterThan(
+        rank("Go to URL Block", q, "Open a page if needed"),
+      );
+  });
+
+  test("a loop line that starts For each drops the fixed lead-in", () => {
+    expect(loopLineLeadsIn("For each book in {{ rows }}")).toBe(true);
+    expect(loopLineLeadsIn("  for each")).toBe(true);
+    expect(loopLineLeadsIn("{{ rows }}")).toBe(false);
+    expect(loopLineLeadsIn("Foreach row")).toBe(false);
+    expect(loopLineLeadsIn(null)).toBe(false);
+  });
+
+  test("steps shown as unplaced are in the outline and search", () => {
+    const graph = graphOf([
+      block("goto_url", "open", null, { url: "https://example.com" }),
+    ]);
+    const node = graph.nodes.find((n) => isWorkflowBlockNode(n))!;
+    const byId = new Map([[node.id, node]]);
+    expect(
+      docOutlineEntries([{ kind: "unplaced", nodeIds: [node.id] }], byId).map(
+        (e) => e.id,
+      ),
+    ).toEqual([node.id]);
+  });
+});
+
+describe("a Wait's line sets its time", () => {
+  test("the amount on the line is the wait, and a bad value is flagged", () => {
+    const graph = graphOf([block("wait", "pause", null, { wait_sec: 1 })]);
+    const pause = graph.nodes.find(
+      (n) => isWorkflowBlockNode(n) && n.data.label === "pause",
+    )!;
+    const typed = (line: string) => {
+      const next = setStepField(graph.nodes, pause.id, "description", line).map(
+        (n) => (n.id === pause.id ? withLineSetting(n, "description", "") : n),
+      );
+      return next.find((n) => n.id === pause.id)!;
+    };
+    expect(typed("wait 10 seconds").data).toMatchObject({
+      waitInSeconds: "10",
+    });
+    expect(typed("pause 2 min").data).toMatchObject({ waitInSeconds: "120" });
+    expect(typed("wait 99 hours").data).toMatchObject({
+      waitInSeconds: "1800",
+    });
+    expect(typed("let the page settle").data).toMatchObject({
+      waitInSeconds: "1",
+    });
+    const zero = { ...pause, data: { ...pause.data, waitInSeconds: "0" } };
+    expect(getDocMissingSettings(zero)).toEqual(["Seconds"]);
+    expect(getDocMissingSettings(pause)).toEqual([]);
   });
 });
 

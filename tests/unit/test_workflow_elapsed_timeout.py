@@ -41,6 +41,8 @@ def _workflow_run(
         organization_id="org_1",
         browser_session_id=None,
         browser_profile_id="bp_1",
+        browser_seed_source=None,
+        browser_sink_profile_id=None,
         browser_address=None,
         extra_http_headers=None,
         cdp_connect_headers=None,

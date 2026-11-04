@@ -1049,11 +1049,13 @@ async def test_get_task_v2_caps_output_for_the_app_only(monkeypatch: pytest.Monk
     task_v2 = SimpleNamespace(
         observer_cruise_id="tsk_v2_1",
         browser_session_id=None,
+        workflow_run_id=None,
         browser_address=None,
         output=stored_output,
         model_copy=lambda update: SimpleNamespace(
             observer_cruise_id="tsk_v2_1",
             browser_session_id=None,
+            workflow_run_id=None,
             browser_address=None,
             output=update["output"],
             model_dump=lambda by_alias: {"output": update["output"]},

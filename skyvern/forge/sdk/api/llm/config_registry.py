@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import litellm
@@ -127,6 +128,24 @@ def _build_xai_grok_4_5_config() -> LLMConfig:
 class LLMConfigRegistry:
     _configs: dict[str, LLMRouterConfig | LLMConfig] = {}
     _config_issues: dict[str, LLMConfigRegistrationIssue] = {}
+    _config_transforms: list[Callable[[LLMRouterConfig | LLMConfig], LLMRouterConfig | LLMConfig]] = []
+
+    @classmethod
+    def add_config_transform(
+        cls, transform: Callable[[LLMRouterConfig | LLMConfig], LLMRouterConfig | LLMConfig]
+    ) -> None:
+        """Apply `transform` to configs already registered, to every later registration, and to configs get_config
+        synthesizes for unknown keys. Registered configs are transformed once, so lookups keep returning the same
+        object (the handler cache depends on that identity). Handlers built before this call keep the old config."""
+        cls._config_transforms.append(transform)
+        for llm_key, config in list(cls._configs.items()):
+            cls._configs[llm_key] = transform(config)
+
+    @classmethod
+    def _apply_config_transforms(cls, config: LLMRouterConfig | LLMConfig) -> LLMRouterConfig | LLMConfig:
+        for transform in cls._config_transforms:
+            config = transform(config)
+        return config
 
     @staticmethod
     def is_router_config(llm_key: str) -> bool:
@@ -157,7 +176,7 @@ class LLMConfigRegistry:
             return
 
         cls._config_issues.pop(llm_key, None)
-        cls._configs[llm_key] = config
+        cls._configs[llm_key] = cls._apply_config_transforms(config)
 
     @classmethod
     def record_config_issue(cls, llm_key: str, missing_env_vars: list[str], detail: str) -> None:
@@ -201,6 +220,13 @@ class LLMConfigRegistry:
 
     @classmethod
     def get_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
+        config = cls._lookup_config(llm_key)
+        if llm_key in cls._configs:
+            return config
+        return cls._apply_config_transforms(config)
+
+    @classmethod
+    def _lookup_config(cls, llm_key: str) -> LLMRouterConfig | LLMConfig:
         if issue := cls.get_config_issue(llm_key):
             raise InvalidLLMConfigError(issue.detail)
 
@@ -1437,18 +1463,6 @@ if settings.ENABLE_VOLCENGINE:
             ),
             supports_vision=True,
             add_assistant_prefix=False,
-        ),
-    )
-
-if settings.ENABLE_YUTORI:
-    _register_builtin_config(
-        "YUTORI_NAVIGATOR",
-        LLMConfig(
-            settings.YUTORI_MODEL,
-            ["YUTORI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=4096,
         ),
     )
 

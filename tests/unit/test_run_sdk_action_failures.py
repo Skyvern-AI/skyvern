@@ -21,6 +21,7 @@ from skyvern.exceptions import (
     ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
     SkyvernActionFailed,
+    SkyvernHTTPException,
     TaskTerminationError,
 )
 from skyvern.forge import app as forge_app
@@ -890,3 +891,16 @@ async def test_credit_refusal_creates_no_task(mock_request: Any, mock_organizati
 
     assert exc_info.value.status_code == 402
     mock_app.DATABASE.tasks.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_context_authorization_failure_marks_inline_task_failed(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context = AsyncMock(
+        side_effect=SkyvernHTTPException("Credential not accessible", status_code=403)
+    )
+    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app):
+        with pytest.raises(SkyvernHTTPException):
+            await run_sdk_action(mock_request, organization=mock_organization)
+    assert mock_app.DATABASE.tasks.update_task.await_args.kwargs["status"] == TaskStatus.failed

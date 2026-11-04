@@ -180,7 +180,11 @@ from skyvern.forge.sdk.api.llm.schema_validator import (
     resolve_schema_type,
     validate_schema,
 )
-from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
+from skyvern.forge.sdk.api.llm.utils import (
+    llm_error_log_metadata,
+    llm_prompt_log_metadata,
+    llm_response_log_metadata,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.copilot.code_block_security import SlottedReference, is_inert_slot, slot_template
@@ -2174,11 +2178,7 @@ class Block(BaseModel, abc.ABC):
         try:
             if isinstance(self, BaseTaskBlock):
                 engine = self.resolve_engine(workflow_run_id)
-                if (
-                    engine == RunEngine.skyvern_v3
-                    and download_timeout_context is not None
-                    and not download_timeout_context.script_mode
-                ):
+                if download_timeout_context is not None and not download_timeout_context.script_mode:
                     download_timeout_context.download_timeout = self.download_timeout
 
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
@@ -11704,8 +11704,8 @@ class TextPromptBlock(Block):
 
         LOG.info(
             "TextPromptBlock Sending prompt to LLM",
-            prompt=prompt,
             llm_key=self.llm_key,
+            **llm_prompt_log_metadata(prompt),
         )
         response: dict[str, Any] | list | str | None = None
         for attempt in range(TEXT_PROMPT_MAX_ATTEMPTS):
@@ -11726,7 +11726,7 @@ class TextPromptBlock(Block):
                         "TextPromptBlock LLM call failed after all retries",
                         block_label=self.label,
                         attempts=attempt + 1,
-                        error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
+                        **llm_error_log_metadata(e),
                     )
                     raise
                 backoff_time = 0.2 * (2**attempt)
@@ -11736,7 +11736,7 @@ class TextPromptBlock(Block):
                     attempt=attempt + 1,
                     max_attempts=TEXT_PROMPT_MAX_ATTEMPTS,
                     backoff_time=backoff_time,
-                    error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
+                    **llm_error_log_metadata(e),
                 )
                 await asyncio.sleep(backoff_time)
 
@@ -11817,7 +11817,10 @@ class TextPromptBlock(Block):
                 attempt=attempt + 1,
                 max_attempts=self.schema_validation_max_attempts,
                 will_retry=will_retry,
-                failure_reason=schema_validation_failure,
+                failure_class=_classify_schema_validation_failure(
+                    schema_validation_failure, response, json_schema or {}
+                ),
+                failure_text_length=len(schema_validation_failure),
                 schema_type=json_schema.get("type") if json_schema is not None else None,
             )
             if not will_retry:
@@ -11923,11 +11926,12 @@ class TextPromptBlock(Block):
                 resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
             except Exception:
                 resolved_llm_key = self.llm_key
-            LOG.exception(
+            LOG.error(
                 "TextPromptBlock LLM call failed",
                 block_label=self.label,
                 workflow_run_id=workflow_run_id,
                 llm_key=resolved_llm_key,
+                **llm_error_log_metadata(e),
             )
             return await self.build_block_result(
                 success=False,

@@ -6,7 +6,11 @@ from fastapi import Depends
 from starlette.requests import HTTPConnection
 
 from skyvern.forge import app
-from skyvern.forge.sdk.services.request_principal import get_request_principal, pending_route_action
+from skyvern.forge.sdk.services.request_principal import (
+    get_request_principal,
+    pending_route_action,
+    pending_stream_authorization,
+)
 
 LOG = structlog.get_logger()
 
@@ -359,9 +363,21 @@ async def observe_request_authorization(connection: HTTPConnection) -> AsyncIter
     except Exception:  # noqa: BLE001 - observation failures are logged after the handler, never raised here.
         action = None
     token = pending_route_action.set(action)
+    endpoint = getattr(connection.scope.get("route"), "endpoint", None)
+    # Task screenshots do not yet reauthorize, so they retain the ordinary role check.
+    task_screenshot = (
+        getattr(endpoint, "__module__", None) == "skyvern.forge.sdk.routes.streaming.screenshot"
+        and getattr(endpoint, "__name__", None) == "task_stream"
+    )
+    stream_token = pending_stream_authorization.set(
+        connection.scope.get("type") == "websocket"
+        and action in {"browser_session.connect", "stream.connect"}
+        and not task_screenshot
+    )
     try:
         yield
     finally:
+        pending_stream_authorization.reset(stream_token)
         pending_route_action.reset(token)
         await _authorize_connection(connection)
 

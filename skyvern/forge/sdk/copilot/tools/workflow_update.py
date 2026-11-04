@@ -12,7 +12,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any, Literal, NamedTuple, cast, get_args
+from typing import Annotated, Any, Literal, NamedTuple, cast
 
 import structlog
 import yaml
@@ -159,6 +159,7 @@ from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_art
 from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
 from skyvern.schemas.workflows import (
+    BLOCK_TYPE_MAP,
     BLOCK_YAML_SUBCLASSES,
     BlockType,
     CodeBlockYAML,
@@ -846,14 +847,11 @@ def _changed_code_blocks(
 
 
 _NON_EDIT_BLOCK_KEYS = frozenset({"label", "next_block_label", "loop_blocks", *CODE_BLOCK_NON_IDENTITY_KEYS})
-_BLOCK_YAML_MODELS_BY_TYPE: dict[str, type[BaseModel]] = {
-    to_jsonable_python(model.model_fields["block_type"].default): model for model in get_args(BLOCK_YAML_SUBCLASSES)
-}
 _NO_DECLARED_DEFAULT = object()
 
 
 def _declared_block_default(block_type: str | None, key: str) -> object:
-    model = _BLOCK_YAML_MODELS_BY_TYPE.get(block_type) if isinstance(block_type, str) else None
+    model = BLOCK_TYPE_MAP.get(block_type) if isinstance(block_type, str) else None
     field = model.model_fields.get(key) if model is not None else None
     if field is None or field.is_required():
         return _NO_DECLARED_DEFAULT

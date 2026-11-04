@@ -60,7 +60,7 @@ The goal or task description for Skyvern to accomplish
 </ParamField>
 
 <ParamField path={"engine"} type={"RunEngine"}>
-The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` and `yutori_navigator` are also accepted.
+The engine that runs the task. Defaults to `skyvern_v1` (`"skyvern-1.0"`), suited to simple, single-goal tasks. `skyvern_v3` (`"skyvern-3.0"`) is the newest engine; the REST API and the Python SDK accept it, but the published TypeScript client's type does not list it yet. `skyvern_v2` remains for existing 2.0 runs. `openai_cua` and `anthropic_cua` use OpenAI's and Anthropic's computer-use models; `ui_tars` is also accepted.
 
 Default: `RunEngine.skyvern_v1`
 </ParamField>
