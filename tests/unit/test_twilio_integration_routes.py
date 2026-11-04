@@ -1283,7 +1283,9 @@ async def test_login_route_parameters_reach_converter(
         run_blocks,
         "app",
         SimpleNamespace(
-            WORKFLOW_SERVICE=workflow_service, RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock())
+            WORKFLOW_SERVICE=workflow_service,
+            RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False)),
         ),
     )
     run_result = object()

@@ -37,7 +37,10 @@ async def test_org_email_bitwarden_auth_falls_back_to_global_credentials(
 
     fake_app = SimpleNamespace(
         DATABASE=FakeDatabase(),
-        AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+        AGENT_FUNCTION=SimpleNamespace(
+            enforce_workflow_context_credential_use=AsyncMock(),
+            enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False),
+        ),
     )
     monkeypatch.setattr(cm, "app", fake_app)
 
@@ -154,7 +157,10 @@ async def test_bitwarden_login_error_includes_resolved_collection_and_item_ids(
         "app",
         SimpleNamespace(
             DATABASE=FakeDatabase(),
-            AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(
+                enforce_workflow_context_credential_use=AsyncMock(),
+                enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False),
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -249,7 +255,10 @@ async def test_bitwarden_sensitive_information_resolves_collection_and_identity_
         "app",
         SimpleNamespace(
             DATABASE=FakeDatabase(),
-            AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(
+                enforce_workflow_context_credential_use=AsyncMock(),
+                enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False),
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -348,7 +357,10 @@ async def test_bitwarden_credit_card_resolves_collection_and_item_parameters(
         "app",
         SimpleNamespace(
             DATABASE=FakeDatabase(),
-            AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(
+                enforce_workflow_context_credential_use=AsyncMock(),
+                enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False),
+            ),
         ),
     )
     monkeypatch.setattr(
