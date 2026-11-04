@@ -86,7 +86,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.page_derived_templates import RootClass, classify_roots
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.utils.phone_validation import looks_like_phone_identifier, normalize_identifier
 from skyvern.utils.secret_redaction import (
     MIN_NUMERIC_SECRET_LENGTH,
@@ -473,6 +473,7 @@ class WorkflowRunContext:
         attempt_number: int = 1,
         parent_workflow_run_id: str | None = None,
         requested_by: str | None = None,
+        powerbi_hop_tokens: Mapping[str, str] | None = None,
     ) -> Self:
         # key is label name
         workflow_run_context = cls(
@@ -487,6 +488,7 @@ class WorkflowRunContext:
             attempt_number=attempt_number,
             parent_workflow_run_id=parent_workflow_run_id,
             requested_by=requested_by,
+            powerbi_hop_tokens=powerbi_hop_tokens,
         )
 
         if context := skyvern_context.current():
@@ -595,6 +597,7 @@ class WorkflowRunContext:
         attempt_number: int = 1,
         parent_workflow_run_id: str | None = None,
         requested_by: str | None = None,
+        powerbi_hop_tokens: Mapping[str, str] | None = None,
     ) -> None:
         self.workflow_title = workflow_title
         self.workflow_id = workflow_id
@@ -602,6 +605,7 @@ class WorkflowRunContext:
         self.workflow_run_id = workflow_run_id
         self.parent_workflow_run_id = parent_workflow_run_id
         self.requested_by = requested_by
+        self._powerbi_hop_tokens = dict(powerbi_hop_tokens or {})
         self.attempt_number = attempt_number
         self.workflow = workflow
         self.mask_secrets: bool = mask_secrets
@@ -774,6 +778,11 @@ class WorkflowRunContext:
 
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
+
+    def get_powerbi_hop_token(self, block_label: str) -> str | None:
+        """Return the run capability kept outside workflow values and template data."""
+        token = self._powerbi_hop_tokens.get(block_label)
+        return token if isinstance(token, str) else None
 
     def get_value(self, key: str) -> Any:
         """
@@ -2556,6 +2565,21 @@ class WorkflowContextManager:
         parent_workflow_run_id: str | None = None,
         requested_by: str | None = None,
     ) -> WorkflowRunContext:
+        powerbi_hop_tokens: Mapping[str, str] = {}
+        if workflow is not None:
+            from skyvern.forge.sdk.workflow.models.block import get_all_blocks
+
+            powerbi_block_labels = [
+                block.label
+                for block in get_all_blocks(workflow.workflow_definition.blocks)
+                if block.block_type == BlockType.POWERBI_QUERY
+            ]
+            if powerbi_block_labels:
+                powerbi_hop_tokens = await app.AGENT_FUNCTION.get_powerbi_query_hop_tokens(
+                    organization_id=organization.organization_id,
+                    workflow_run_id=workflow_run_id,
+                    block_labels=powerbi_block_labels,
+                )
         workflow_run_context = await WorkflowRunContext.init(
             self.aws_client,
             organization,
@@ -2574,6 +2598,7 @@ class WorkflowContextManager:
             attempt_number=attempt_number,
             parent_workflow_run_id=parent_workflow_run_id,
             requested_by=requested_by,
+            powerbi_hop_tokens=powerbi_hop_tokens,
         )
         self.workflow_run_contexts[workflow_run_id] = workflow_run_context
         return workflow_run_context
