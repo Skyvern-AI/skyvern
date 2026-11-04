@@ -685,7 +685,7 @@ def run_docker_compose_setup() -> None:
 
     # Configure LLM provider
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
-    setup_llm_providers(docker_compose=True)
+    setup_llm_providers()
     _configure_local_browser_streaming_defaults()
 
     # Run docker compose up

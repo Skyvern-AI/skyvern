@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol
 
 import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
-if TYPE_CHECKING:
-    from yutori import AsyncYutoriClient
-
 from skyvern.config import Settings
-from skyvern.exceptions import require_yutori_extra_modules
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_openai_client import ForgeAsyncHttpxClientWrapper
@@ -83,7 +79,6 @@ class ForgeApp:
     OPENAI_CUA_MODEL: str
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
-    YUTORI_CLIENT: AsyncYutoriClient | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
     GCP_CLIENT_FACTORY: GcpClientFactory
     SECONDARY_LLM_API_HANDLER: LLMAPIHandler
@@ -122,17 +117,6 @@ class ForgeApp:
     api_app_startup_event: Callable[[FastAPI], Awaitable[None]] | None
     api_app_shutdown_event: Callable[[], Awaitable[None]] | None
     agent: ForgeAgent
-
-    def get_yutori_client(self) -> AsyncYutoriClient | None:
-        require_yutori_extra_modules()
-        if self.YUTORI_CLIENT is None and self.SETTINGS_MANAGER.ENABLE_YUTORI:
-            from yutori import AsyncYutoriClient
-
-            self.YUTORI_CLIENT = AsyncYutoriClient(
-                api_key=self.SETTINGS_MANAGER.YUTORI_API_KEY,
-                base_url=self.SETTINGS_MANAGER.YUTORI_API_BASE,
-            )
-        return self.YUTORI_CLIENT
 
 
 def create_forge_app() -> ForgeApp:
@@ -196,8 +180,6 @@ def create_forge_app() -> ForgeApp:
             base_url=settings.VOLCENGINE_API_BASE,
             http_client=ForgeAsyncHttpxClientWrapper(),
         )
-
-    app.YUTORI_CLIENT = None
 
     app.SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
         settings.SECONDARY_LLM_KEY if settings.SECONDARY_LLM_KEY else settings.LLM_KEY

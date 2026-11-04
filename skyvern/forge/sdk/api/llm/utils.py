@@ -20,6 +20,7 @@ from skyvern.forge.sdk.api.llm.exceptions import (
     InvalidLLMResponseType,
     LLMOutputTruncatedError,
 )
+from skyvern.forge.sdk.forge_log import exception_log_fields
 from skyvern.schemas.llm import LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
@@ -275,6 +276,19 @@ def _reassemble_list_response(response: list[Any], allow_action_list_wrap: bool)
         return {"actions": _dedupe_consecutive_dicts(dicts)}
 
     return None
+
+
+def llm_prompt_log_metadata(prompt: str) -> dict[str, int]:
+    """Return content-free metadata suitable for logging an LLM prompt."""
+    return {"prompt_length": len(prompt)}
+
+
+def llm_error_log_metadata(error: BaseException) -> dict[str, str]:
+    """Return content-free metadata suitable for logging an LLM call error."""
+    metadata = exception_log_fields(error)
+    if error.__cause__ is not None:
+        metadata["cause_type"] = type(error.__cause__).__name__
+    return metadata
 
 
 def llm_response_log_metadata(response: Any) -> dict[str, str | int]:
