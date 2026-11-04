@@ -1239,6 +1239,21 @@ class AgentFunction:
     ) -> None:
         return None
 
+    async def enforce_platform_bitwarden_item_ownership(
+        self,
+        organization_id: str,
+        item_ids: set[str],
+        collection_ids: set[str],
+        *,
+        allow_own_token: bool = False,
+    ) -> bool:
+        """Return whether collection searches must be restricted to the validated collection."""
+        return False
+
+    def bitwarden_refetch_email(self, selected_email: str | None) -> str | None:
+        """Keep the legacy self-hosted refetch behavior."""
+        return None
+
     async def enforce_platform_aws_secret_ownership(
         self, organization_id: str | None, aws_key: str, *, bitwarden: bool = False
     ) -> str:
