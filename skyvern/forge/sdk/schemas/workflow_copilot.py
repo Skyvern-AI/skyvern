@@ -192,6 +192,16 @@ class CopilotPendingTurn(BaseModel):
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
     superseded_build_test_run_ids: list[str] = Field(default_factory=list)
     steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
+    # Each draft frame overwrites this, never appends, so an entry holds at most one workflow.
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
+
+
+class CopilotInFlightTurn(BaseModel):
+    turn_id: str
+    cancel_token: str | None = None
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -1191,6 +1201,7 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
         None, description="Turn matched by request_cancel_token when recovery requests provide one"
     )
     request_browser_allocations: CopilotRequestBrowserAllocations | None = None
+    in_flight_turn: CopilotInFlightTurn | None = None
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     accepted_turn_ids: list[str] = Field(
         default_factory=list, description="Turns whose manual Accept completed on the server"

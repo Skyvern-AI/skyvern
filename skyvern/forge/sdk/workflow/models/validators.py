@@ -36,6 +36,10 @@ RESERVED_TAG_VALUE_OTHER = "__other__"
 RESERVED_TAG_VALUES = frozenset({RESERVED_TAG_VALUE_UNTAGGED, RESERVED_TAG_VALUE_OTHER})
 
 
+def normalize_blank_totp_identifier(value: str | None) -> str | None:
+    return None if value is not None and not value.strip() else value
+
+
 def normalize_run_with(v: str | None) -> str:
     """Normalize null and legacy values to valid run_with values.
 

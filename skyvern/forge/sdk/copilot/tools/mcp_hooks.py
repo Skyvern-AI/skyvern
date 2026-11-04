@@ -96,7 +96,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
-from skyvern.schemas.workflows import AgentStepBlockYAML, TaskBlockYAML
+from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, AgentStepBlockYAML, TaskBlockYAML
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
@@ -111,7 +111,6 @@ from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
     _TASK_V3_ENGINE,
     AGENT_FAMILY_BLOCK_SUMMARIES,
-    AGENT_STEP_BLOCK_SUMMARY,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     _authoring_violation_reject_message,
@@ -461,7 +460,7 @@ async def _block_schema_pre_hook_result(
                 "block_type": "task",
                 "summary": AGENT_FAMILY_BLOCK_SUMMARIES["task"],
                 "schema": _task_v3_pure_schema(TaskBlockYAML.model_json_schema()),
-                "agent_block_guidance": _agent_block_schema_guidance(),
+                "browser_task_guidance": _task_v3_block_schema_guidance(),
             },
         }
     if normalized == "agent_step" and normalized not in _copilot_banned_block_types(ctx):
@@ -705,7 +704,7 @@ async def _get_block_schema_post_hook(
             and isinstance(data.get("schema"), dict)
         ):
             data["schema"] = _task_v3_pure_schema(data["schema"])
-            data["agent_block_guidance"] = _agent_block_schema_guidance()
+            data["browser_task_guidance"] = _task_v3_block_schema_guidance()
         if capability.code_blocks and block_type == "code":
             schema = data.get("schema")
             if isinstance(schema, dict):
@@ -797,12 +796,13 @@ def _task_v3_pure_schema(schema: dict[str, JsonValue]) -> dict[str, JsonValue]:
 
 
 _ENGINE_FIELD_DESCRIPTION = (
-    f"Omit on a new block: Copilot-authored agent blocks run on the {_TASK_V3_ENGINE} engine and it is filled in. "
-    "A saved block keeps the engine it has unless the user asks to change it."
+    f"Omit on a new block: Copilot-authored Browser Task blocks run on the {_TASK_V3_ENGINE} engine and it is "
+    "filled in. A saved block keeps the engine it has unless the user asks to change it."
 )
+_AGENT_STEP_CHOOSING_ENTRY = f"`agent_step`: {AGENT_STEP_BLOCK_SUMMARY}."
 
 
-def _agent_block_schema_guidance() -> list[str]:
+def _task_v3_block_schema_guidance() -> list[str]:
     return [
         _ENGINE_FIELD_DESCRIPTION,
         "Use engine-less blocks for orchestration, integrations, direct navigation, waits, files, and human interaction.",
@@ -876,12 +876,16 @@ async def _get_workflow_knowledge_post_hook(
             sections[NOTES_KNOWLEDGE_TOPIC] = copy.deepcopy(notes_section)
     if not isinstance(sections, dict):
         return result
+    # Section dicts are the knowledge tool's cached objects; edit copies so repeat calls start clean.
     for_loop = sections.get("for_loop_block")
     if isinstance(for_loop, dict):
-        for_loop["content"] = _FOR_LOOP_GUIDANCE
-    if capability.code_blocks and capability.agent_blocks:
-        choosing = sections.get("choosing_a_block")
-        if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
+        sections["for_loop_block"] = {**for_loop, "content": _FOR_LOOP_GUIDANCE}
+    choosing = sections.get("choosing_a_block")
+    if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
+        choosing = sections["choosing_a_block"] = dict(choosing)
+        if "agent_step" not in _copilot_banned_block_types(ctx):
+            choosing["content"] = f"{_AGENT_STEP_CHOOSING_ENTRY}\n\n{choosing['content']}"
+        if capability.code_blocks and capability.agent_blocks:
             choosing["content"] = f"{AUTHORING_FAMILY_GUIDANCE}\n\n{choosing['content']}"
     if not copilot_sees_notes(ctx):
         sections.pop(NOTES_KNOWLEDGE_TOPIC, None)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -102,6 +103,7 @@ from skyvern.forge.sdk.copilot.context import (
     SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP,
     UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
     AgentResult,
+    ChatHistoryRow,
     CodeAuthoringRepairContext,
     CopilotContext,
     HistoricalNarrativeTurnFacts,
@@ -761,7 +763,11 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
         role = chat_history_role(msg.sender)
         questions = msg.narrative_payload.get("questionInteractions", []) if msg.narrative_payload is not None else []
         for raw in questions:
-            interaction = QuestionInteraction.model_validate(raw)
+            try:
+                interaction = QuestionInteraction.model_validate(raw)
+            except ValidationError:
+                lines.append("user question interaction: unreadable")
+                continue
             if interaction.account_group_review is not None or interaction.account_group_cancel is not None:
                 summary = (
                     interaction.tool_result()
@@ -797,6 +803,57 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
         if expiry is not None:
             lines.append(f"turn_outcome: {expiry}")
     return "\n".join(lines)
+
+
+def _chat_history_message_for_prompt(msg: WorkflowCopilotChatHistoryMessage) -> str:
+    return redact_raw_secrets_for_prompt(_format_chat_history([msg]))
+
+
+def _chat_history_text_for_prompt(
+    window: Sequence[WorkflowCopilotChatHistoryMessage],
+    earlier: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> str:
+    text = "\n".join(_chat_history_message_for_prompt(msg) for msg in window)
+    if not earlier:
+        return text
+    oldest_shown_id = window[0].workflow_copilot_chat_message_id
+    return f"earlier_messages_not_shown: {len(earlier)}; oldest_shown_message_id: {oldest_shown_id}\n{text}"
+
+
+def _earlier_chat_history(
+    window: Sequence[WorkflowCopilotChatHistoryMessage],
+    full_chat: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> list[WorkflowCopilotChatHistoryMessage] | None:
+    """Rows of ``full_chat`` before ``window``, or None when ``window`` is not exactly its id-bearing tail."""
+    window_start = len(full_chat) - len(window)
+    window_ids = [msg.workflow_copilot_chat_message_id for msg in window]
+    earlier = list(full_chat[: max(window_start, 0)])
+    tail_ids = [msg.workflow_copilot_chat_message_id for msg in full_chat[max(window_start, 0) :]]
+    ids_present = not earlier or (
+        bool(window_ids) and all([window_ids[0], *(msg.workflow_copilot_chat_message_id for msg in earlier)])
+    )
+    if window_start >= 0 and tail_ids == window_ids and ids_present:
+        return earlier
+    if window_start > 0:
+        LOG.warning(
+            "Chat history window is not the tail of the chat; earlier messages withheld",
+            window_count=len(window),
+            chat_count=len(full_chat),
+        )
+    return None
+
+
+def _chat_history_rows(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> tuple[ChatHistoryRow, ...]:
+    return tuple(
+        ChatHistoryRow(
+            message_id=msg.workflow_copilot_chat_message_id,
+            sender=msg.sender,
+            created_at=msg.created_at.isoformat(),
+            text=_chat_history_message_for_prompt(msg),
+        )
+        for msg in messages
+        if msg.workflow_copilot_chat_message_id
+    )
 
 
 def _build_block_goal_main_goal(
@@ -5468,8 +5525,8 @@ async def _run_copilot_turn_impl(
     # server-owned evidence that the corresponding user turn must never re-enter a model prompt.
     safe_chat_history_messages = redact_refused_secret_turns(chat_history)
     safe_prior_user_messages = redact_refused_secret_turns(list(prior_user_messages))
-    chat_history_text = _format_chat_history(safe_chat_history_messages)
-    safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
+    earlier_chat_history = _earlier_chat_history(safe_chat_history_messages, safe_prior_user_messages)
+    safe_chat_history_text = _chat_history_text_for_prompt(safe_chat_history_messages, earlier_chat_history or [])
     safe_global_llm_context = build_model_safe_global_llm_context(global_llm_context)
     previous_user_messages = [msg.content for msg in safe_chat_history_messages if msg.sender in TURN_OPENER_SENDERS]
     previous_user_message = previous_user_messages[-1] if previous_user_messages else None
@@ -5515,6 +5572,11 @@ async def _run_copilot_turn_impl(
 
     ctx = CopilotContext(
         organization_id=organization_id,
+        earlier_chat_history_rows=functools.cache(functools.partial(_chat_history_rows, earlier_chat_history or [])),
+        earlier_chat_history_unavailable=earlier_chat_history is None,
+        chat_history_oldest_shown_id=(
+            safe_chat_history_messages[0].workflow_copilot_chat_message_id if earlier_chat_history else None
+        ),
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_yaml=chat_request.workflow_yaml or "",

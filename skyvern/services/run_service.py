@@ -11,6 +11,7 @@ from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNo
 from skyvern.forge import app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.services.browser_session_artifacts import browser_session_artifact_read_scope
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.response_value_caps import (
@@ -49,8 +50,8 @@ _IN_FLIGHT: dict[tuple[Hashable, ...], asyncio.Task[Any]] = {}
 async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *args: *Ts) -> T:
     """Overlapping calls of one build with equal arguments await a single run of it, and a finished result is never
     reused. A caller that joins an in-flight build can get a result older than its own request."""
-    # The key is the whole call, so the build must take everything that changes its result as an argument.
-    key = (build, *args)
+    # A signed response must never be shared across callers with different artifact permissions.
+    key = (build, browser_session_artifact_read_scope(), *args)
     task = _IN_FLIGHT.get(key)
     if task is None or task.done():
         task = asyncio.create_task(build(*args))

@@ -26,8 +26,9 @@ from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.services.browser_session_artifacts import browser_session_artifact_read
 from skyvern.forge.sdk.services.browser_session_redaction import redact_browser_session_addresses
-from skyvern.forge.sdk.services.request_principal import RequestPrincipal
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRun,
     WorkflowRunResponseBase,
@@ -227,7 +228,9 @@ async def build_run_preview(
     organization_id: str, run_id: str, principal: RequestPrincipal | None = None
 ) -> RunWebhookPreviewResponse:
     """Return the payload and headers that would be used for a replay."""
-    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id, principal=principal)
+    principal = principal or get_request_principal()
+    with browser_session_artifact_read(principal):
+        payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id, principal=principal)
     api_key = await _get_api_key(organization_id=organization_id)
     signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=api_key)
     return RunWebhookPreviewResponse(
@@ -272,7 +275,9 @@ async def replay_run_webhook(
                 status_code=status.HTTP_409_CONFLICT,
             )
 
-    payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id, principal=principal)
+    principal = principal or get_request_principal()
+    with browser_session_artifact_read(principal):
+        payload = await _build_webhook_payload(organization_id=organization_id, run_id=run_id, principal=principal)
     signing_key = api_key if api_key else await _get_api_key(organization_id=organization_id)
     signed_data = generate_skyvern_webhook_signature(payload=payload.payload, api_key=signing_key)
 

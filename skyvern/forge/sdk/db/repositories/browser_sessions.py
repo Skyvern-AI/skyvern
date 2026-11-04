@@ -926,6 +926,24 @@ class BrowserSessionsRepository(BaseRepository):
             return None
 
     @read_retry()
+    @db_operation("get_persistent_browser_session_ids_by_runnable_ids", log_errors=False)
+    async def get_persistent_browser_session_ids_by_runnable_ids(
+        self, runnable_ids: set[str], organization_id: str
+    ) -> set[str]:
+        if not runnable_ids:
+            return set()
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(PersistentBrowserSessionModel.persistent_browser_session_id).where(
+                    PersistentBrowserSessionModel.runnable_id.in_(runnable_ids),
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                    PersistentBrowserSessionModel.completed_at.is_(None),
+                )
+            )
+            return set(rows)
+
+    @read_retry()
     @db_operation("get_persistent_browser_session", log_errors=False)
     async def get_persistent_browser_session(
         self,

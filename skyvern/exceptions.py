@@ -131,6 +131,10 @@ def require_server_extra_modules(feature: str, module_names: tuple[str, ...] = (
     _require_extra_modules(feature, "server", _SERVER_EXTRA_SENTINELS, module_names)
 
 
+def require_yutori_extra_modules() -> None:
+    _require_extra_modules("Yutori Navigator", "yutori", ("yutori",), ())
+
+
 class SkyvernClientException(SkyvernException):
     def __init__(self, message: str | None = None, status_code: int | None = None):
         self.status_code = status_code

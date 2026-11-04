@@ -450,6 +450,7 @@ async def run_workflow_returning_owned_workflow(
         if not skip_executor:
             if workflow is not None:
                 await app.AGENT_FUNCTION.prepare_powerbi_query_hop_tokens(workflow_run=workflow_run, workflow=workflow)
+                await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=workflow)
             await AsyncExecutorFactory.get_executor().execute_workflow(
                 request=request,
                 background_tasks=background_tasks,

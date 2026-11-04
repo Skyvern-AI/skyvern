@@ -1055,6 +1055,8 @@ def block_yaml_to_block(
         return EmailInboxBlock(
             **base_kwargs,
             email_client=block_yaml.email_client,
+            credential_source=block_yaml.credential_source,
+            connection_id=block_yaml.connection_id,
             credential_id=block_yaml.credential_id,
             folder=block_yaml.folder,
             prompt=block_yaml.prompt,

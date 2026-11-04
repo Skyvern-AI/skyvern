@@ -35,6 +35,7 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import FORCED_WORKFLOW_SESSION_RUNNABLE_TYPE
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.services.browser_session_artifacts import browser_session_artifact_system_read
 from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import (
@@ -1033,7 +1034,8 @@ class BackgroundTaskExecutor(AsyncExecutor):
                     task_v2 = (
                         await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id) or task_v2
                     )
-                    await task_v2_service.send_task_v2_webhook(task_v2)
+                    with browser_session_artifact_system_read():
+                        await task_v2_service.send_task_v2_webhook(task_v2)
                 release_hold()
                 return
 
