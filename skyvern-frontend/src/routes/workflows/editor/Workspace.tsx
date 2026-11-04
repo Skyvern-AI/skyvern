@@ -737,6 +737,7 @@ function Workspace({
     undo: applyUndo,
     redo: applyRedo,
     captureImmediately: captureWorkflowEditImmediately,
+    captureNextAsUserEdit: captureNextWorkflowEditAsUserEdit,
     canUndo: canUndoWorkflowEdit,
     canRedo: canRedoWorkflowEdit,
     historyApplyTrigger,
@@ -2168,6 +2169,7 @@ function Workspace({
         ),
       );
       updateEdges(elements.edges);
+      if (options?.midTurnDraft) captureNextWorkflowEditAsUserEdit();
       useWorkflowParametersStore
         .getState()
         .setParameters(getInitialParameters(workflowData), options);

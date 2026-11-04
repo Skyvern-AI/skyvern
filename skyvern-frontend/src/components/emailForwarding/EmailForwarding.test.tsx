@@ -7,7 +7,12 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  focusManager,
+  onlineManager,
+  QueryClient,
+  QueryClientProvider,
+} from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReactNode, useState } from "react";
@@ -73,9 +78,12 @@ function mount(
   initialEntries: string[] = ["/"],
 ) {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    defaultOptions: {
+      queries: { retry: false, retryDelay: 0 },
+      mutations: { retry: false },
+    },
   });
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={initialEntries}>
         <CloudContext.Provider value={isCloud}>
@@ -84,6 +92,7 @@ function mount(
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...result, client };
 }
 
 function mountWithForwardingAllowed(
@@ -129,7 +138,10 @@ function mountWithForwardingAllowed(
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  focusManager.setFocused(undefined);
+});
 beforeEach(() => {
   vi.resetAllMocks();
   api.getAvailability.mockResolvedValue({ data: { available: true } });
@@ -139,6 +151,18 @@ beforeEach(() => {
 function AvailabilityProbe() {
   const available = useEmailForwardingAvailable();
   return <span>{available ? "Available" : "Unavailable"}</span>;
+}
+
+function SettingsNavigation() {
+  const [visible, setVisible] = useState(true);
+  return (
+    <>
+      <button onClick={() => setVisible(!visible)}>
+        {visible ? "Leave settings" : "Return to settings"}
+      </button>
+      {visible && <EmailForwardingSettings />}
+    </>
+  );
 }
 
 describe("email forwarding", () => {
@@ -185,6 +209,100 @@ describe("email forwarding", () => {
     ).toBeNull();
     expect(api.get).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["a network failure", { isAxiosError: true }],
+    ["a server error", { isAxiosError: true, response: { status: 503 } }],
+  ])(
+    "shows settings after %s is followed by a successful request",
+    async (_, error) => {
+      api.getAvailability.mockRejectedValueOnce(error);
+      mount(<EmailForwardingSettings />);
+
+      expect(
+        screen.queryByRole("button", { name: "Generate address" }),
+      ).toBeNull();
+      expect(
+        await screen.findByRole("button", { name: "Generate address" }),
+      ).toBeTruthy();
+    },
+  );
+
+  it("recovers on remount after transient retries are exhausted", async () => {
+    api.getAvailability.mockRejectedValue({
+      isAxiosError: true,
+      response: { status: 503 },
+    });
+    const { client } = mount(<SettingsNavigation />);
+    await waitFor(() =>
+      expect(
+        client.getQueryState(["emailForwarding", undefined, "availability"])
+          ?.status,
+      ).toBe("error"),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Generate address" }),
+    ).toBeNull();
+
+    api.getAvailability.mockResolvedValue({ data: { available: true } });
+    fireEvent.click(screen.getByRole("button", { name: "Leave settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Return to settings" }));
+    expect(
+      await screen.findByRole("button", { name: "Generate address" }),
+    ).toBeTruthy();
+  });
+
+  it.each([
+    [
+      "role denial",
+      {
+        status: 403,
+        data: { detail: { error_code: "organization_admin_required" } },
+      },
+    ],
+    [
+      "billing role denial",
+      {
+        status: 403,
+        data: {
+          detail: {
+            error_code: "billing_admin_not_allowed",
+            reason_kind: "role",
+          },
+        },
+      },
+    ],
+    ["missing route", { status: 404 }],
+  ])(
+    "keeps settings hidden and does not retry an unavailable response (%s)",
+    async (_, response) => {
+      api.getAvailability.mockRejectedValueOnce({
+        isAxiosError: true,
+        response,
+      });
+      mount(<SettingsNavigation />);
+
+      await waitFor(() => expect(api.getAvailability).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Leave settings" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Return to settings" }),
+      );
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(
+        screen.queryByRole("button", { name: "Generate address" }),
+      ).toBeNull();
+      expect(api.getAvailability).toHaveBeenCalledTimes(1);
+      expect(api.get).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails closed on availability errors and does not request forwarding data", async () => {
     api.getAvailability.mockRejectedValue(new Error("Route unavailable"));
@@ -908,89 +1026,76 @@ describe("email forwarding", () => {
     expect(screen.queryByText("Previously generated address")).toBeNull();
   });
 
-  it("continues past a short filtered page and stops after an empty later page", async () => {
+  it("renders a full inbox page before searching a long hidden tail", async () => {
+    const email = (id: string, subject: string) => ({
+      inbound_email_id: id,
+      from_address: "otp@provider.test",
+      subject,
+      body_text: "Your code is 123456",
+      links: [],
+      category: "otp",
+      created_at: "2026-08-01T00:00:00",
+    });
+    const offsets: string[] = [];
     api.get.mockImplementation(
-      async (_url: string, options: { params: { offset: number } }) => ({
-        data:
-          options.params.offset === 20
-            ? [
-                {
-                  inbound_email_id: "older",
-                  from_address: "old@example.test",
-                  subject: "Older email",
-                  body_text: "old",
-                  links: [],
-                  category: "otp",
-                  created_at: "2026-08-01T00:00:00",
-                },
-              ]
-            : options.params.offset === 0
-              ? Array.from({ length: 19 }, (_, i) => ({
-                  inbound_email_id: `ibe_${i}`,
-                  from_address: "new@example.test",
-                  subject: `Email ${i}`,
-                  body_text: "new",
-                  links: [],
-                  category: "otp",
-                  created_at: "2026-09-01T00:00:00",
-                }))
-              : [],
-        headers: {
-          "x-has-more": String(options.params.offset < 40),
-        },
-      }),
-    );
-    mount(<ForwardingInbox addressId="fea_test" />);
-    await screen.findByText("Email 0");
-    const older = screen.getByRole("button", { name: "Older" });
-    expect(older.hasAttribute("disabled")).toBe(false);
-    fireEvent.click(older);
-    await screen.findByText("Older email");
-    fireEvent.click(older);
-    await screen.findByText(/No emails on this page/);
-    expect(older.hasAttribute("disabled")).toBe(true);
-    let newer = screen.getByRole("button", { name: "Newer" });
-    await waitFor(() => expect(newer.hasAttribute("disabled")).toBe(false));
-    fireEvent.click(newer);
-    await screen.findByText("Older email");
-    newer = screen.getByRole("button", { name: "Newer" });
-    await waitFor(() => expect(newer.hasAttribute("disabled")).toBe(false));
-    fireEvent.click(newer);
-    await screen.findByText("Email 0");
-  });
-
-  it("allows skipping an empty first page with filtered messages", async () => {
-    api.get.mockImplementation(
-      async (_url: string, options: { params: { offset: number } }) => ({
-        data:
-          options.params.offset === 0
-            ? []
-            : [
-                {
-                  inbound_email_id: "older",
-                  from_address: "old@example.test",
-                  subject: "Older email",
-                  body_text: "old",
-                  links: [],
-                  category: "otp",
-                  created_at: "2026-08-01T00:00:00",
-                },
-              ],
-        headers: {
-          "x-has-more": String(options.params.offset === 0),
-        },
-      }),
+      async (_url: string, options: { params: { offset: string } }) => {
+        const offset = options.params.offset;
+        offsets.push(offset);
+        if (offset === "0") {
+          return {
+            data: Array.from({ length: 20 }, (_, i) =>
+              email(`first-${i}`, `First email ${i}`),
+            ),
+            headers: { "x-has-more": "true", "x-next-cursor": "200" },
+          };
+        }
+        if (["200", "400", "600"].includes(offset)) {
+          return {
+            data: [],
+            headers: {
+              "x-has-more": "true",
+              "x-next-cursor": String(Number(offset) + 200),
+            },
+          };
+        }
+        if (offset === "800") {
+          return {
+            data: [email("last", "Last email")],
+            headers: { "x-has-more": "false" },
+          };
+        }
+        throw new Error(`Unexpected offset: ${offset}`);
+      },
     );
     mount(<ForwardingInbox addressId="fea_test" />);
 
-    await screen.findByText(/No emails on this page/);
-    const older = screen.getByRole("button", { name: "Older" });
-    expect(older.hasAttribute("disabled")).toBe(false);
-    fireEvent.click(older);
-    await screen.findByText("Older email");
+    await screen.findByText("First email 0");
+    expect(offsets).toEqual(["0"]);
+    fireEvent.click(screen.getByRole("button", { name: "Older" }));
+    await screen.findByRole("button", { name: "Continue searching" });
+    expect(offsets).toEqual(["0", "200", "400", "600"]);
+    expect(screen.getByText("First email 0")).toBeTruthy();
+    expect(screen.queryByText(/No received emails/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue searching" }));
+    await screen.findByText("Last email");
+    expect(screen.getByText("Page 2")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("button", { name: "Continue searching" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Newer" }).hasAttribute("disabled"),
+      ).toBe(false),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Newer" }));
+    await screen.findByText("First email 0");
   });
 
-  it("continues past an empty filtered intermediate inbox page", async () => {
+  it("keeps later-window results when opening a searched inbox page", async () => {
+    let accessChanged = false;
     const email = (id: string, subject: string) => ({
       inbound_email_id: id,
       from_address: "otp@provider.test",
@@ -1001,32 +1106,322 @@ describe("email forwarding", () => {
       created_at: "2026-08-01T00:00:00",
     });
     api.get.mockImplementation(
-      async (_url: string, options: { params: { offset: number } }) => ({
-        data:
-          options.params.offset === 0
-            ? [email("newest", "Visible first page")]
-            : options.params.offset === 20
-              ? []
-              : [email("oldest", "Visible after filtered page")],
+      async (_url: string, options: { params: { offset: string } }) => {
+        const offset = options.params.offset;
+        if (offset === "0") {
+          return {
+            data: Array.from({ length: 20 }, (_, i) =>
+              email(`first-${i}`, `First email ${i}`),
+            ),
+            headers: { "x-has-more": "true", "x-next-cursor": "200" },
+          };
+        }
+        if (offset === "200") {
+          return {
+            data: [],
+            headers: { "x-has-more": "true", "x-next-cursor": "400" },
+          };
+        }
+        if (offset === "400") {
+          if (accessChanged) {
+            return {
+              data: [email("new-access", "Newly accessible search result")],
+              headers: { "x-has-more": "false" },
+            };
+          }
+          return {
+            data: [email("older-1", "Older first")],
+            headers: { "x-has-more": "true", "x-next-cursor": "600" },
+          };
+        }
+        return {
+          data: [email("older-2", "Older second")],
+          headers: { "x-has-more": "false" },
+        };
+      },
+    );
+    mount(<ForwardingInbox addressId="fea_test" />);
+    await screen.findByText("First email 0");
+    fireEvent.click(screen.getByRole("button", { name: "Older" }));
+    await screen.findByText("Older first");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Newer" }).hasAttribute("disabled"),
+      ).toBe(false),
+    );
+    expect(screen.getByText("Older second")).toBeTruthy();
+    accessChanged = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await screen.findByText("First email 0");
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Older" }).hasAttribute("disabled"),
+      ).toBe(false),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Older" }));
+    await screen.findByText("Newly accessible search result");
+    expect(screen.queryByText("Older first")).toBeNull();
+  });
+
+  it("polls the newest window without repeating continuation scans", async () => {
+    vi.useFakeTimers();
+    const offsets: string[] = [];
+    api.get.mockImplementation(
+      async (_url: string, options: { params: { offset: string } }) => {
+        const offset = options.params.offset;
+        offsets.push(offset);
+        if (offset === "600") {
+          return {
+            data: [
+              {
+                inbound_email_id: "older",
+                from_address: "otp@provider.test",
+                subject: "Older after poll",
+                body_text: "Your code is 123456",
+                links: [],
+                category: "otp",
+                created_at: "2026-08-01T00:00:00",
+              },
+            ],
+            headers: { "x-has-more": "false" },
+          };
+        }
+        return {
+          data:
+            offset === "0"
+              ? [
+                  {
+                    inbound_email_id: "recent",
+                    from_address: "otp@provider.test",
+                    subject: "Recent email",
+                    body_text: "Your code is 123456",
+                    links: [],
+                    category: "otp",
+                    created_at: "2026-08-01T00:00:00",
+                  },
+                ]
+              : [],
+          headers: {
+            "x-has-more": "true",
+            "x-next-cursor": String(Number(offset) + 200),
+          },
+        };
+      },
+    );
+    try {
+      mount(<ForwardingInbox addressId="fea_test" />);
+      for (let i = 0; i < 10 && !screen.queryByText("Recent email"); i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+      }
+      expect(screen.getByText("Recent email")).toBeTruthy();
+      expect(
+        screen.getByRole("button", { name: "Continue searching" }),
+      ).toBeTruthy();
+      expect(offsets).toEqual(["0", "200", "400"]);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(offsets).toEqual(["0", "200", "400", "0"]);
+      expect(screen.getByText("Recent email")).toBeTruthy();
+      fireEvent.click(
+        screen.getByRole("button", { name: "Continue searching" }),
+      );
+      for (let i = 0; i < 10 && !screen.queryByText("Older after poll"); i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+      }
+      expect(screen.getByText("Older after poll")).toBeTruthy();
+      expect(offsets[4]).toBe("600");
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("pauses polling for multi-window results and refreshes from the newest page", async () => {
+    vi.useFakeTimers();
+    const offsets: string[] = [];
+    let refreshed = false;
+    const email = (id: string, subject: string) => ({
+      inbound_email_id: id,
+      from_address: "otp@provider.test",
+      subject,
+      body_text: "Your code is 123456",
+      links: [],
+      category: "otp",
+      created_at: "2026-08-01T00:00:00",
+    });
+    api.get.mockImplementation(
+      async (_url: string, options: { params: { offset: string } }) => {
+        const offset = options.params.offset;
+        offsets.push(offset);
+        if (offset === "200" && refreshed) {
+          return {
+            data: [email("fresh", "Refreshed message")],
+            headers: { "x-has-more": "false" },
+          };
+        }
+        if (offset === "600") {
+          return {
+            data: [email("older", "Older page")],
+            headers: { "x-has-more": "false" },
+          };
+        }
+        return {
+          data:
+            offset === "0"
+              ? [email("recent", "Newest email")]
+              : offset === "200"
+                ? [email("later", "Later email")]
+                : [],
+          headers: {
+            "x-has-more": "true",
+            "x-next-cursor": String(Number(offset) + 200),
+          },
+        };
+      },
+    );
+    try {
+      mount(<ForwardingInbox addressId="fea_test" />);
+      for (let i = 0; i < 10 && !screen.queryByText("Later email"); i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+      }
+      expect(screen.getByText("Later email")).toBeTruthy();
+      expect(offsets).toEqual(["0", "200", "400"]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(offsets).toEqual(["0", "200", "400"]);
+      await act(async () => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      expect(offsets).toEqual(["0", "200", "400"]);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Continue searching" }),
+      );
+      for (let i = 0; i < 10 && !screen.queryByText("Older page"); i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+      }
+      expect(screen.getByText("Page 2")).toBeTruthy();
+      refreshed = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      for (let i = 0; i < 10 && !screen.queryByText("Refreshed message"); i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+      }
+      expect(screen.getByText("Refreshed message")).toBeTruthy();
+      expect(screen.getByText("Page 1")).toBeTruthy();
+      expect(screen.queryByText("Older page")).toBeNull();
+      expect(screen.queryByText("Later email")).toBeNull();
+    } finally {
+      cleanup();
+      focusManager.setFocused(undefined);
+      onlineManager.setOnline(true);
+      vi.useRealTimers();
+    }
+  });
+
+  it("continues searching when the first bounded scan finds no visible emails", async () => {
+    api.get.mockImplementation(
+      async (_url: string, options: { params: { offset: string } }) => {
+        const offset = options.params.offset;
+        return offset === "600"
+          ? {
+              data: [
+                {
+                  inbound_email_id: "older",
+                  from_address: "otp@provider.test",
+                  subject: "Older visible email",
+                  body_text: "Your code is 123456",
+                  links: [],
+                  category: "otp",
+                  created_at: "2026-08-01T00:00:00",
+                },
+              ],
+              headers: { "x-has-more": "false" },
+            }
+          : {
+              data: [],
+              headers: {
+                "x-has-more": "true",
+                "x-next-cursor": String(Number(offset) + 200),
+              },
+            };
+      },
+    );
+    mount(<ForwardingInbox addressId="fea_test" />);
+
+    await screen.findByText(/No visible emails found yet/);
+    expect(screen.queryByText(/No received emails/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Continue searching" }));
+    await screen.findByText("Older visible email");
+    expect(screen.getByText("Page 1")).toBeTruthy();
+  });
+
+  it("rechecks later windows on an explicit refresh of the newest page", async () => {
+    let accessChanged = false;
+    const email = (id: string, subject: string) => ({
+      inbound_email_id: id,
+      from_address: "otp@provider.test",
+      subject,
+      body_text: "Your code is 123456",
+      links: [],
+      category: "otp",
+      created_at: "2026-08-01T00:00:00",
+    });
+    api.get.mockImplementation(
+      async (_url: string, options: { params: { offset: string } }) =>
+        options.params.offset === "0"
+          ? {
+              data: [email("recent", "Newest email")],
+              headers: { "x-has-more": "true", "x-next-cursor": "200" },
+            }
+          : {
+              data: accessChanged
+                ? [email("new-access", "Newly accessible email")]
+                : [email("old-access", "Previously accessible email")],
+              headers: { "x-has-more": "false" },
+            },
+    );
+    mount(<ForwardingInbox addressId="fea_test" />);
+
+    await screen.findByText("Previously accessible email");
+    accessChanged = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await screen.findByText("Newly accessible email");
+    expect(screen.queryByText("Previously accessible email")).toBeNull();
+  });
+
+  it("stops on a cycling inbox continuation", async () => {
+    api.get.mockImplementation(
+      async (_url: string, options: { params: { offset: string } }) => ({
+        data: [],
         headers: {
-          "x-has-more": String(options.params.offset < 40),
+          "x-has-more": "true",
+          "x-next-cursor": options.params.offset === "0" ? "200" : "0",
         },
       }),
     );
     mount(<ForwardingInbox addressId="fea_test" />);
 
-    await screen.findByText("Visible first page");
-    fireEvent.click(screen.getByRole("button", { name: "Older" }));
-    await screen.findByText(/No emails on this page/);
-    expect(
-      screen.getByRole("button", { name: "Older" }).hasAttribute("disabled"),
-    ).toBe(false);
-
-    fireEvent.click(screen.getByRole("button", { name: "Older" }));
-    await screen.findByText("Visible after filtered page");
-    expect(
-      screen.getByRole("button", { name: "Older" }).hasAttribute("disabled"),
-    ).toBe(true);
+    expect(await screen.findByRole("alert")).toBeTruthy();
   });
 
   it("lets a Builder rotate a managed address without listing admin-only configs", async () => {

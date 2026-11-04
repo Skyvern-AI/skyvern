@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
+import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import {
   act,
   cleanup,
   fireEvent,
   render,
   screen,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -15,9 +17,10 @@ import { MemoryRouter } from "react-router-dom";
 import { ProxyLocation, Status } from "@/api/types";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
-import type {
-  WorkflowBlock,
-  WorkflowSettings,
+import {
+  WorkflowParameterValueType,
+  type WorkflowBlock,
+  type WorkflowSettings,
 } from "../../types/workflowTypes";
 import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
@@ -104,6 +107,7 @@ describe("WorkflowDocEditor navigation", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -172,6 +176,61 @@ describe("WorkflowDocEditor navigation", () => {
     );
   });
 
+  test.each([
+    [
+      "code",
+      { code: "", parameters: [] },
+      "Run Python code",
+      "prompt",
+      "Get the top five posts",
+    ],
+    ["goto_url", { url: "" }, "Go to a URL", "url", "https://example.com/"],
+    [
+      "email_inbox",
+      { prompt: "" },
+      "Find an email",
+      "prompt",
+      "Latest invoice",
+    ],
+  ])(
+    "typing in a %s step's line edits the field that drives it, not its description",
+    (blockType, extra, placeholder, key, typed) => {
+      const edits: DocGraphEdits = {
+        apply: vi.fn(),
+        update: vi.fn(),
+        addStep: vi.fn(),
+        duplicate: vi.fn(),
+      };
+      const nodes = renderDoc(
+        [block(blockType, "the_step", null, extra)],
+        edits,
+      );
+      expect(screen.getByText(placeholder)).toBeTruthy();
+      const name = `the_step ${key}`;
+      fireEvent.focus(screen.getByRole("textbox", { name }));
+      const box = screen.getByRole("textbox", { name });
+      // jsdom has no innerText; the line reads it on input.
+      Object.defineProperty(box, "innerText", {
+        value: typed,
+        configurable: true,
+      });
+      fireEvent.input(box);
+
+      const updater = vi.mocked(edits.update).mock.calls[0]![0];
+      const data = updater(nodes).find(isWorkflowBlockNode)!.data as Record<
+        string,
+        unknown
+      >;
+      expect(data[key]).toBe(typed);
+      expect(data.description).not.toBe(typed);
+    },
+  );
+
+  test("a Go to URL step with no URL shows a required chip", () => {
+    renderDoc([block("goto_url", "open_site", null, { url: "" })]);
+    expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
+  });
+
   test("Locate on a step inside a collapsed loop reopens the loop and consumes the request", () => {
     const nodes = renderDoc();
     const inner = nodes.find((n) => n.data.label === "inner_step")!;
@@ -193,6 +252,50 @@ describe("WorkflowDocEditor navigation", () => {
       document.querySelector(`[data-doc-node-id="${inner.id}"]`),
     ).not.toBeNull();
     expect(useLocateBlockStore.getState().request).toBeNull();
+  });
+
+  test("opens step search from Ctrl+K anywhere in the document", () => {
+    renderDoc([
+      block("goto_url", "find_by_label", null, {
+        description: "Open the internal portal",
+        url: "https://example.test/unique-path",
+      }),
+    ]);
+    fireEvent.keyDown(
+      screen.getByRole("region", { name: "Workflow document" }),
+      {
+        key: "k",
+        ctrlKey: true,
+      },
+    );
+
+    const input = screen.getByPlaceholderText("Search steps…");
+    fireEvent.change(input, { target: { value: "find_by_label" } });
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+  });
+
+  test("collapse all closes loops and conditionals", () => {
+    const nodes = renderDoc([
+      forLoop("each_row", "route", [code("inner_loop", null)]),
+      conditional("route", null, [
+        { id: "yes", next: "inner_branch", when: "found" },
+        { id: "otherwise", next: null },
+      ]),
+      code("inner_branch", null),
+    ]);
+    const loopChild = nodes.find((node) => node.data.label === "inner_loop")!;
+    const branchChild = nodes.find(
+      (node) => node.data.label === "inner_branch",
+    )!;
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all" }));
+
+    expect(
+      document.querySelector(`[data-doc-node-id="${loopChild.id}"]`),
+    ).toBeNull();
+    expect(
+      document.querySelector(`[data-doc-node-id="${branchChild.id}"]`),
+    ).toBeNull();
   });
 
   test("counts server validation problems in the edit bar", async () => {
@@ -237,6 +340,40 @@ describe("WorkflowDocEditor navigation", () => {
     }
   });
 
+  test("a credential named in a note holds Run even though the server sends it as a warning", async () => {
+    vi.useFakeTimers();
+    const post = vi.fn().mockResolvedValue({
+      data: {
+        problems: [
+          {
+            code: "credential_in_note",
+            severity: "warning",
+            block_label: "inner_step",
+            field: "notes",
+            message: "Notes can't use a credential input.",
+          },
+        ],
+      },
+    });
+    vi.spyOn(axiosClientModule, "getClient").mockResolvedValue({
+      post,
+    } as never);
+    const getSaveData = useWorkflowHasChangesStore.getState().getSaveData;
+    useWorkflowHasChangesStore.setState({ getSaveData: () => ({}) as never });
+    try {
+      renderDoc();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+    } finally {
+      useWorkflowHasChangesStore.setState({ getSaveData });
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      cleanup();
+    }
+  });
+
   test("shows a 413 validation failure without dropping the previous credential warning", async () => {
     vi.useFakeTimers();
     const post = vi
@@ -273,6 +410,7 @@ describe("WorkflowDocEditor navigation", () => {
         await vi.advanceTimersByTimeAsync(1000);
       });
       expect(screen.getByText("1 problem")).toBeTruthy();
+      expect(useRunValidationStore.getState().docProblemCount).toBe(1);
       act(() => useWorkflowParametersStore.setState({ parameters: [] }));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
@@ -281,6 +419,8 @@ describe("WorkflowDocEditor navigation", () => {
         "Couldn't check this workflow: Workflow validation drafts must be at most 100000 bytes.",
       );
       expect(screen.getByText("2 problems")).toBeTruthy();
+      // The earlier check's warning describes an older draft, so it no longer holds the run.
+      expect(useRunValidationStore.getState().docProblemCount).toBe(0);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
       vi.useRealTimers();
@@ -319,6 +459,41 @@ describe("WorkflowDocEditor navigation", () => {
         "Workflow validation supports at most 500 blocks.",
       );
       expect(screen.getByText("1 problem")).toBeTruthy();
+    } finally {
+      useWorkflowHasChangesStore.setState({ getSaveData });
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      cleanup();
+    }
+  });
+
+  test("a warning-only validation response shows the problem but doesn't hold Run", async () => {
+    vi.useFakeTimers();
+    const post = vi.fn().mockResolvedValue({
+      data: {
+        valid: true,
+        problems: [
+          {
+            block_label: null,
+            code: "unknown_loop_source",
+            severity: "warning",
+            message: "The loop source isn't a known input.",
+          },
+        ],
+      },
+    });
+    vi.spyOn(axiosClientModule, "getClient").mockResolvedValue({
+      post,
+    } as never);
+    const getSaveData = useWorkflowHasChangesStore.getState().getSaveData;
+    useWorkflowHasChangesStore.setState({ getSaveData: () => ({}) as never });
+    try {
+      renderDoc();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.getByText("1 problem")).toBeTruthy();
+      expect(useRunValidationStore.getState().docProblemCount).toBe(0);
     } finally {
       useWorkflowHasChangesStore.setState({ getSaveData });
       vi.useRealTimers();
@@ -445,4 +620,152 @@ test("a step that reads an output only some branches produce shows the warning u
     vi.restoreAllMocks();
     cleanup();
   }
+});
+
+describe("Doc inputs", () => {
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "query",
+          parameterType: "workflow",
+          dataType: WorkflowParameterValueType.String,
+          description: null,
+          defaultValue: "cats",
+        },
+      ],
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  test("an input added, renamed and deleted in the Doc is the workflow's parameter and its mentions follow", () => {
+    let graph = getElements(
+      [
+        block("text_prompt", "summarize", "each_result", {
+          prompt: "Search for {{ query }}",
+          parameters: [{ key: "query" }],
+        }),
+        forLoop("each_result", null, [code("open_result", null)], {
+          loop_over: { key: "query" },
+          loop_variable_reference: "query",
+        }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const client = new QueryClient();
+    const edits: DocGraphEdits = {
+      apply: () => {},
+      update: (change) => {
+        graph = { ...graph, nodes: change(graph.nodes) };
+      },
+      addStep: () => null,
+      duplicate: () => {},
+    };
+    const view = () => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <WorkflowDocEditor {...graph} edits={edits} />
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const rendered = render(view());
+    const inPopover = (name: string) =>
+      within(screen.getByRole("dialog")).getByRole("button", { name });
+    const keys = () =>
+      useWorkflowParametersStore.getState().parameters.map((p) => p.key);
+    const loopSource = () =>
+      (
+        graph.nodes.find((n) => n.type === "loop")!.data as {
+          loopValue: string;
+        }
+      ).loopValue;
+    const prompt = () =>
+      graph.nodes.find((n) => n.data.label === "summarize")!.data as {
+        prompt: string;
+        parameterKeys: string[] | null;
+      };
+
+    useWorkflowHasChangesStore.getState().setHasChanges(false);
+    fireEvent.click(screen.getByRole("button", { name: "+ Input" }));
+    expect(keys()).toContain("new_input");
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    // Closing an untouched new input leaves the agent as it was.
+    expect(keys()).toEqual(["query"]);
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "+ Input" }));
+    expect(screen.getByText("Edit Input")).toBeTruthy();
+    fireEvent.change(
+      within(screen.getByRole("dialog")).getAllByRole("textbox")[0]!,
+      {
+        target: { value: "topic" },
+      },
+    );
+    fireEvent.click(inPopover("Save"));
+    expect(useWorkflowParametersStore.getState().parameters[1]).toEqual({
+      key: "topic",
+      parameterType: "workflow",
+      dataType: WorkflowParameterValueType.String,
+      description: "",
+      defaultValue: null,
+    });
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: /^Input query/ }));
+    fireEvent.change(
+      within(screen.getByRole("dialog")).getAllByRole("textbox")[0]!,
+      {
+        target: { value: "search" },
+      },
+    );
+    fireEvent.click(inPopover("Save"));
+    expect(keys()).toEqual(["search", "topic"]);
+    expect(prompt().prompt).toBe("Search for {{ search }}");
+    expect(prompt().parameterKeys).toEqual(["search"]);
+    expect(loopSource()).toBe("search");
+
+    fireEvent.click(screen.getByRole("button", { name: "+ Context input" }));
+    expect(screen.getByText("Add Context Input")).toBeTruthy();
+    fireEvent.change(
+      within(screen.getByRole("dialog")).getAllByRole("textbox")[0]!,
+      { target: { value: "derived" } },
+    );
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("combobox"));
+    fireEvent.click(screen.getByRole("option", { name: "search" }));
+    fireEvent.click(inPopover("Save"));
+    expect(keys()).toEqual(["search", "topic", "derived"]);
+    expect(screen.getByRole("button", { name: /^Input derived/ })).toBeTruthy();
+
+    rendered.rerender(view());
+    fireEvent.click(screen.getByRole("button", { name: /^Input search/ }));
+    fireEvent.click(inPopover("Delete input"));
+    expect(keys()).toEqual(["search", "topic", "derived"]);
+    fireEvent.click(screen.getByRole("button", { name: /^Input derived/ }));
+    fireEvent.click(inPopover("Delete input"));
+    fireEvent.click(screen.getByRole("button", { name: /^Input search/ }));
+    fireEvent.click(inPopover("Delete input"));
+    expect(keys()).toEqual(["topic"]);
+    expect(prompt().prompt).toBe("Search for {{ search }}");
+    expect(prompt().parameterKeys).toEqual([]);
+    rendered.rerender(view());
+    expect(screen.getByTitle("{{ search }}: missing reference")).toBeTruthy();
+  });
 });

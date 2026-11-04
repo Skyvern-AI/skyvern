@@ -29,6 +29,7 @@ import {
   freshGoalSuggestion,
   goalChangeIsPending,
   goalChangeUndoPatch,
+  goalTextEditPatch,
   keepCodeWithGoalPatch,
 } from "@/routes/workflows/editor/workflowEditorUtils";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
@@ -241,36 +242,10 @@ function CodeBlockEditorBody({
         name="prompt"
         nodeId={blockId}
         onChange={(value) => {
-          if (value === (data.prompt ?? "")) {
-            return;
+          const patch = goalTextEditPatch(data, value);
+          if (patch) {
+            update(patch);
           }
-          if (undoPatch && value === (data.goalBeforeEdit?.prompt ?? "")) {
-            update(undoPatch);
-            return;
-          }
-          if (value.trim().length > 0) {
-            update({
-              prompt: value,
-              userOwnedGoal: true,
-              goalNeedsRegeneration: true,
-              ...(!goalChangePending && {
-                goalBeforeEdit: {
-                  prompt: data.prompt,
-                  userOwnedGoal: data.userOwnedGoal,
-                  goalNeedsRegeneration: data.goalNeedsRegeneration,
-                },
-              }),
-            });
-            return;
-          }
-          update({
-            prompt: value,
-            ...(data.userOwnedGoal === true && { userOwnedGoal: false }),
-            ...(goalChangePending && {
-              goalNeedsRegeneration: false,
-              goalBeforeEdit: null,
-            }),
-          });
         }}
         value={data.prompt ?? ""}
         // The build in flight carries the Goal it was started with; a later edit would be lost to it.

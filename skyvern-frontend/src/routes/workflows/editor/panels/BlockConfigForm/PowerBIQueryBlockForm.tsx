@@ -24,10 +24,24 @@ function PowerBIQueryBlockFormBody({
   blockId: string;
   node: PowerBIQueryNode;
 }) {
-  const { connectionId, datasetId, query, maxRows, parameterKeys } = node.data;
+  const {
+    credentialSource,
+    connectionId,
+    datasetId,
+    query,
+    maxRows,
+    parameterKeys,
+  } = node.data;
   const value = useMemo(
-    () => ({ connectionId, datasetId, query, maxRows, parameterKeys }),
-    [connectionId, datasetId, query, maxRows, parameterKeys],
+    () => ({
+      credentialSource,
+      connectionId,
+      datasetId,
+      query,
+      maxRows,
+      parameterKeys,
+    }),
+    [credentialSource, connectionId, datasetId, query, maxRows, parameterKeys],
   );
   const { commit } = useDebouncedSidebarSave({ blockId, value });
 

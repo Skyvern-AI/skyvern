@@ -37,6 +37,7 @@ type PillsProps = {
   needsReconnect?: boolean;
   pendingAction?: GmailCapability | "reconnect" | null;
   disabled?: boolean;
+  disabledCapabilities?: Partial<Record<GmailCapability, boolean>>;
   onEnable: (capability: GmailCapability) => void;
   onReconnect?: () => void;
 };
@@ -46,6 +47,7 @@ function GmailCapabilityPills({
   needsReconnect = false,
   pendingAction = null,
   disabled = false,
+  disabledCapabilities,
   onEnable,
   onReconnect,
 }: PillsProps) {
@@ -105,7 +107,9 @@ function GmailCapabilityPills({
                 ? "Reconnect this account before enabling sending."
                 : undefined
             }
-            disabled={isBusy || needsReconnectFirst}
+            disabled={
+              isBusy || needsReconnectFirst || disabledCapabilities?.[id]
+            }
             onClick={() => onEnable(id)}
             className={cn(
               PILL,

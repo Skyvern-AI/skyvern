@@ -20,6 +20,19 @@ export type FirstRunWaitCardProps = Readonly<{
   phase: "run_provisioning" | "debug_browser_warming";
 }>;
 
+type BrokerCredentialSelectorBase = Readonly<{
+  credentialSource: "native" | "nango";
+  connectionId: string;
+  disabled: boolean;
+  onChange: (source: "native" | "nango", id: string) => void;
+}>;
+
+export type BrokerCredentialSelectorProps = BrokerCredentialSelectorBase &
+  (
+    | Readonly<{ provider: "powerbi" }>
+    | Readonly<{ provider: "gmail"; nodeId: string; credentialId: string }>
+  );
+
 export type PermissionCapability = Readonly<{
   capability: string;
   allowed: boolean;
@@ -48,6 +61,7 @@ export type PermissionsState =
   | Readonly<{ status: "ready"; data: PermissionsResponse }>;
 
 export type PageSlots = {
+  brokerCredentialSelector?: React.ComponentType<BrokerCredentialSelectorProps>;
   workflowFindingsScope?: React.ComponentType<
     Readonly<{
       workflowPermanentIds: readonly string[];

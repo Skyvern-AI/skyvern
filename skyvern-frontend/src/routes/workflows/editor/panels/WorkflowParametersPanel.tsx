@@ -24,8 +24,8 @@ import {
   getLabelForWorkflowParameterType,
   removeJinjaReferenceFromNodes,
   removeKeyFromNodesParameterKeys,
-  replaceJinjaReferenceInNodes,
 } from "../workflowEditorUtils";
+import { renameParameterInNodes, replaceParameter } from "../parameterEdits";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "../AffectedBlocksNotice";
 import { inputDeleteTarget } from "../jinjaReferences";
@@ -262,73 +262,21 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                   onSave={(editedParameter) => {
                     if (refuseMutationDuringYamlCommit()) return;
                     setHasChanges(true);
+                    const oldKey = operationPanelState.parameter?.key ?? "";
                     setWorkflowParameters(
-                      workflowParameters.map((parameter) => {
-                        if (
-                          parameter.key === operationPanelState.parameter?.key
-                        ) {
-                          return editedParameter;
-                        }
-                        if (
-                          parameter.parameterType === "context" &&
-                          parameter.sourceParameterKey ===
-                            operationPanelState.parameter?.key
-                        ) {
-                          return {
-                            ...parameter,
-                            sourceParameterKey: editedParameter.key,
-                          };
-                        }
-                        return parameter;
-                      }),
+                      replaceParameter(
+                        workflowParameters,
+                        oldKey,
+                        editedParameter,
+                      ),
                     );
-                    setNodes((nodes) => {
-                      const oldKey = operationPanelState.parameter?.key;
-                      const newKey = editedParameter.key;
-                      const keyChanged = oldKey && newKey && oldKey !== newKey;
-
-                      // Step 1: Update inline {{ old_key }} references to {{ new_key }}
-                      const nodesWithUpdatedRefs = keyChanged
-                        ? replaceJinjaReferenceInNodes(nodes, oldKey, newKey)
-                        : nodes;
-
-                      // Step 2: Update parameterKeys arrays
-                      return nodesWithUpdatedRefs.map((node) => {
-                        // All node types that have parameterKeys
-                        if (
-                          node.type === "task" ||
-                          node.type === "textPrompt" ||
-                          node.type === "agentStep" ||
-                          node.type === "login" ||
-                          node.type === "navigation" ||
-                          node.type === "extraction" ||
-                          node.type === "fileDownload" ||
-                          node.type === "action" ||
-                          node.type === "http_request" ||
-                          node.type === "web_search" ||
-                          node.type === "validation" ||
-                          node.type === "codeBlock" ||
-                          node.type === "printPage"
-                        ) {
-                          const parameterKeys = node.data
-                            .parameterKeys as Array<string> | null;
-                          return {
-                            ...node,
-                            data: {
-                              ...node.data,
-                              parameterKeys:
-                                parameterKeys?.map((key) => {
-                                  if (key === oldKey) {
-                                    return newKey;
-                                  }
-                                  return key;
-                                }) ?? null,
-                            },
-                          };
-                        }
-                        return node;
-                      });
-                    });
+                    setNodes((nodes) =>
+                      renameParameterInNodes(
+                        nodes,
+                        oldKey,
+                        editedParameter.key,
+                      ),
+                    );
                     setOperationPanelState({
                       active: false,
                       operation: "edit",
