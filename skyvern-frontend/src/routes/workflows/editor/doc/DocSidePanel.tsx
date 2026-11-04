@@ -74,15 +74,23 @@ export function DocSidePanel({
                   className="size-4 shrink-0"
                 />
               )}
-              <span className="shrink-0">
-                {blockType ? workflowBlockTitle[blockType] : selectedStep.type}
-              </span>
-              <span
-                className="min-w-0 truncate font-mono text-xs text-muted-foreground"
-                title={selectedStep.data.label}
-              >
-                {selectedStep.data.label}
-              </span>
+              {selectedStep.type === "start" ? (
+                <span className="shrink-0">Agent settings</span>
+              ) : (
+                <>
+                  <span className="shrink-0">
+                    {blockType
+                      ? workflowBlockTitle[blockType]
+                      : selectedStep.type}
+                  </span>
+                  <span
+                    className="min-w-0 truncate font-mono text-xs text-muted-foreground"
+                    title={selectedStep.data.label}
+                  >
+                    {selectedStep.data.label}
+                  </span>
+                </>
+              )}
             </div>
           )}
           {selectedStepId && editable ? (
@@ -90,7 +98,9 @@ export function DocSidePanel({
           ) : (
             <p className="text-sm text-muted-foreground">
               {selectedStepId
-                ? "Open Visual to inspect this step’s settings."
+                ? selectedStep?.type === "start"
+                  ? "Open Visual to inspect the agent’s settings."
+                  : "Open Visual to inspect this step’s settings."
                 : "Choose a step to edit its settings."}
             </p>
           )}

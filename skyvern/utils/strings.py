@@ -32,6 +32,17 @@ def is_uuid(string: str) -> bool:
         return False
 
 
+def canonical_uuid_or_original(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return value
+
+
+def normalize_dns_name(value: str) -> str:
+    return value.rstrip(".").casefold()
+
+
 def sanitize_identifier(value: str, default: str = "identifier") -> str:
     """Sanitizes a string to be a valid Python/Jinja2 identifier.
 

@@ -1107,3 +1107,33 @@ async def test_identity_fetch_backs_off_before_its_recursive_retry(monkeypatch: 
 
     assert result == {"first_name": "A"}
     assert slept == [3.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["item", "url", "identity"])
+async def test_selected_bitwarden_item_identity_survives_secret_fetch(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    item = _cli_item()
+    item["fields"] = [{"name": "first_name", "value": "Ada", "type": 0}]
+    _TimedVaultCli(monkeypatch, {}, json.dumps(item if kind == "item" else [item]))
+    if kind == "item":
+        secret = await _fetch_password_by_id()
+    elif kind == "url":
+        secret = await _fetch_password_by_url()
+    else:
+        secret = await _fetch_identity()
+    assert isinstance(secret, bitwarden_module.BitwardenItemSecret)
+    assert secret.item_id == _ITEM_ID
+
+
+@pytest.mark.asyncio
+async def test_url_selection_carries_the_matched_item_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    first = _cli_item()
+    first["login"]["username"] = "not-an-email"
+    second = _cli_item()
+    second["id"] = "22222222-2222-2222-2222-222222222222"
+    _TimedVaultCli(monkeypatch, {}, json.dumps([first, second]))
+    secret = await _fetch_password_by_url()
+    assert isinstance(secret, bitwarden_module.BitwardenItemSecret)
+    assert secret.item_id == second["id"]

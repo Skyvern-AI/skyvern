@@ -311,12 +311,20 @@ export interface WorkflowCopilotChatHistoryMessage {
   narrative_payload?: Record<string, unknown> | null;
 }
 
+export interface CopilotInFlightTurn {
+  turn_id: string;
+  cancel_token?: string | null;
+  latest_draft?: WorkflowApiResponse | null;
+  latest_draft_at?: string | null;
+}
+
 export interface WorkflowCopilotChatHistoryResponse {
   pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
   request_turn_id?: string | null;
+  in_flight_turn?: CopilotInFlightTurn | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   accepted_turn_ids?: string[];
   proposed_workflow?: WorkflowApiResponse | null;

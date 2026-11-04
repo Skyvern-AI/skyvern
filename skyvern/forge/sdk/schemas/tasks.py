@@ -337,6 +337,7 @@ class Task(TaskBase):
     attempt_number: int | None = None
     workflow_permanent_id: str | None = None
     browser_session_id: str | None = None
+    requested_by: str | None = Field(default=None, exclude=True)
     order: int | None = None
     retry: int | None = None
     max_steps_per_run: int | None = None

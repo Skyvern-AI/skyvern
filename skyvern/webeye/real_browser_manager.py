@@ -1410,6 +1410,8 @@ class RealBrowserManager(BrowserManager):
                 organization_id=task.organization_id,
                 browser_session_id=browser_session_id,
             )
+        elif task.requested_by and (browser_session_id or task.totp_identifier):
+            await app.AGENT_FUNCTION.enforce_task_credential_use(task, browser_session_id)
 
         browser_state = self.get_for_task(task_id=task.task_id, workflow_run_id=task.workflow_run_id)
         lost_external_browser = False

@@ -1,7 +1,10 @@
 import asyncio
 import copy
+import inspect
 import json
+import secrets
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -23,6 +26,7 @@ from skyvern.exceptions import (
     UnknownElementTreeFormat,
 )
 from skyvern.experimentation.wait_utils import empty_page_retry_wait
+from skyvern.forge import app
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.browser_action_preflight import advance_observation_epoch
 from skyvern.forge.sdk.core import skyvern_context
@@ -531,6 +535,64 @@ def _should_use_page_ready_wait() -> bool:
     return bool(context and context.enable_page_ready_wait)
 
 
+# A same-document update keeps the loader id, so only this shows the element tree and the html came from one DOM. It is
+# armed when a tree read starts; the scraper's own id and OTP stamps are not page changes. A page holds one witness, and
+# each acquisition's token names it: a later arm replaces it, and a read with another token is unknown and leaves it be.
+_ARM_DOM_CHANGE_WITNESS = """(token) => {
+    const ignored = (record) =>
+        record.type === "attributes" &&
+        (record.attributeName === "unique_id" || record.attributeName === "data-skyvern-otp-box");
+    window.__scrapeDomWitness?.observer.disconnect();
+    const witness = { token, changed: false, ignored };
+    witness.observer = new MutationObserver((records) => {
+        if (!records.every(ignored)) witness.changed = true;
+    });
+    witness.observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    window.__scrapeDomWitness = witness;
+}"""
+_READ_DOM_CHANGE_WITNESS = """(token) => {
+    const witness = window.__scrapeDomWitness;
+    if (!witness || witness.token !== token) return null;
+    const pending = witness.observer.takeRecords();
+    witness.observer.disconnect();
+    delete window.__scrapeDomWitness;
+    return !witness.changed && pending.every(witness.ignored);
+}"""
+
+
+def _captures_origin(url: str) -> bool:
+    """Whether the agent function opts this page into origin capture. Anything but True, including an error, is no."""
+    try:
+        decision = app.AGENT_FUNCTION.should_capture_scrape_origin(url)
+    except Exception:
+        return False
+    if inspect.iscoroutine(decision):
+        decision.close()
+    return decision is True
+
+
+async def _arm_dom_change_witness(page: Page, engine_selection: "BrowserEngineSelection | None") -> str:
+    token = secrets.token_hex(8)
+    try:
+        await SkyvernFrame.evaluate(
+            frame=page, expression=_ARM_DOM_CHANGE_WITNESS, arg=token, engine_selection=engine_selection
+        )
+    except Exception:
+        LOG.debug("Could not arm the scrape DOM change witness", exc_info=True)
+    return token
+
+
+async def _dom_unchanged_since_armed(page: Page, token: str, engine_selection: "BrowserEngineSelection | None") -> bool:
+    """False when the DOM changed, the witness is gone or another acquisition's, or it cannot be read."""
+    try:
+        result = await SkyvernFrame.evaluate(
+            frame=page, expression=_READ_DOM_CHANGE_WITNESS, arg=token, engine_selection=engine_selection
+        )
+    except Exception:
+        return False
+    return result is True
+
+
 async def _prepare_scrape_frame(
     browser_state: BrowserState, page: Page, navigation_deadline: float | None, support_empty_page: bool
 ) -> tuple[SkyvernFrame, str]:
@@ -672,7 +734,17 @@ async def scrape_web_unsafe(
 
     document_loader_id_before = await get_main_document_loader_id(page)
 
+    # Each tree read decides from the page it reads whether the scrape captures an origin; only the final read counts.
+    witness_token = ""
+    witness_url: str | None = None
+
     async def read_tree() -> tuple[list[dict], list[dict], dict[str, dict], FlutterSemanticsState]:
+        nonlocal witness_token, witness_url
+        witness_token, witness_url = "", None
+        read_url = page.url
+        if _captures_origin(read_url):
+            witness_token = await _arm_dom_change_witness(page, browser_state.engine_selection)
+            witness_url = read_url
         flutter_state = FlutterSemanticsState()
         elements, element_tree, destinations = await get_interactable_element_tree(
             page,
@@ -712,6 +784,25 @@ async def scrape_web_unsafe(
 
     element_tree = await cleanup_element_tree(page, url, _deepcopy_element_tree(element_tree))
     element_tree_trimmed = trim_element_tree(_deepcopy_element_tree(element_tree))
+
+    # The scrape's origin html, read with the final tree before screenshots: their scrolling and Skyvern's own
+    # rendering around them (caret hiding, the cursor overlay) are not part of the DOM state the tree describes. The
+    # public html is still read after the screenshots, where late content has had time to land.
+    source_html: str | None = None
+    source_read_at: datetime | None = None
+    source_read_url: str | None = None
+    dom_unchanged = False
+    if witness_token and witness_url == url:
+        try:
+            source_frame = await SkyvernFrame.create_instance(
+                frame=page, engine_selection=browser_state.engine_selection
+            )
+            source_html = await source_frame.get_content()
+            source_read_at = datetime.now(UTC)
+            source_read_url = page.url
+            dom_unchanged = await _dom_unchanged_since_armed(page, witness_token, browser_state.engine_selection)
+        except Exception:
+            LOG.debug("Could not read the scrape's origin html", exc_info=True)
 
     screenshots = []
     if take_screenshots:
@@ -839,7 +930,7 @@ async def scrape_web_unsafe(
             if document_loader_id_before is not None and document_loader_id_before == document_loader_id_after
             else None
         )
-        return ScrapedPage(
+        scraped_page = ScrapedPage(
             elements=elements,
             id_to_css_dict=id_to_css_dict,
             id_to_element_dict=id_to_element_dict,
@@ -858,6 +949,17 @@ async def scrape_web_unsafe(
             _scrape_exclude=scrape_exclude,
             _document_loader_id=document_loader_id,
         )
+        # Only a capture that stayed on one unchanged document at one URL, from before its tree was read until after
+        # its html was, has an origin: a navigation or DOM update in between pairs one state's tree with another's html.
+        if (
+            source_html is not None
+            and source_read_at is not None
+            and document_loader_id is not None
+            and source_read_url == url
+            and dom_unchanged
+        ):
+            scraped_page.bind_origin(page, source_read_at, source_html)
+        return scraped_page
     except Exception:
         raise
 

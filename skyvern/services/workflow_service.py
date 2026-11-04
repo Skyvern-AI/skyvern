@@ -448,6 +448,9 @@ async def run_workflow_returning_owned_workflow(
         # not show it. In both cases the executor reads the row itself.
         hand_off_run = not existing_workflow_run and not workflow_run.row_write_unconfirmed
         if not skip_executor:
+            if workflow is not None:
+                await app.AGENT_FUNCTION.prepare_powerbi_query_hop_tokens(workflow_run=workflow_run, workflow=workflow)
+                await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=workflow)
             await AsyncExecutorFactory.get_executor().execute_workflow(
                 request=request,
                 background_tasks=background_tasks,

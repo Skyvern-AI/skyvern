@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.config import settings
@@ -15,8 +17,52 @@ from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParame
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import TaskRequest
+from skyvern.forge.sdk.services import request_principal
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.schemas.runs import RunEngine
 from skyvern.services.task_v1_service import InvalidTaskV1ModelError, generate_task, run_task
+
+
+@pytest.mark.asyncio
+async def test_session_credential_denial_precedes_task_creation(monkeypatch: pytest.MonkeyPatch) -> None:
+    principal = RequestPrincipal("org_test", AuthKind.bearer, "member", "org:member")
+    monkeypatch.setattr(request_principal, "get_request_principal", lambda: principal)
+    enforce = AsyncMock(side_effect=PermissionError("credential not accessible"))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_browser_session_credential_use", enforce)
+    create_task = AsyncMock(side_effect=AssertionError("task created before credential check"))
+    monkeypatch.setattr(app.agent, "create_task", create_task)
+    now = datetime.now(timezone.utc)
+    organization = Organization(organization_id="org_test", organization_name="Test", created_at=now, modified_at=now)
+    with pytest.raises(HTTPException) as exc:
+        await run_task(
+            TaskRequest(url="https://example.com", browser_session_id="pbs_test"),
+            organization,
+        )
+    assert exc.value.status_code == 403
+    enforce.assert_awaited_once_with(principal, "pbs_test")
+    create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_submission_rejects_a_principal_from_another_organization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        request_principal,
+        "get_request_principal",
+        lambda: RequestPrincipal("other_org", AuthKind.api_key),
+    )
+    enforce = AsyncMock()
+    create_task = AsyncMock()
+    monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_browser_session_credential_use", enforce)
+    monkeypatch.setattr(app.agent, "create_task", create_task)
+    now = datetime.now(timezone.utc)
+    organization = Organization(organization_id="org_test", organization_name="Test", created_at=now, modified_at=now)
+    with pytest.raises(HTTPException) as exc:
+        await run_task(TaskRequest(url="https://example.com", browser_session_id="pbs_test"), organization)
+    assert exc.value.status_code == 403
+    enforce.assert_not_awaited()
+    create_task.assert_not_awaited()
 
 
 @pytest_asyncio.fixture

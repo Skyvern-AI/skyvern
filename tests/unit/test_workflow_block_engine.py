@@ -531,12 +531,12 @@ async def test_execute_safe_persists_the_resolved_engine(scoped_context: Skyvern
     [
         (RunEngine.skyvern_v3, False, False, 30.0),
         (RunEngine.skyvern_v3, False, True, 30.0),
-        (None, False, False, 7.0),
+        (None, False, False, 30.0),
         (RunEngine.skyvern_v3, True, False, 7.0),
     ],
-    ids=["v3_block", "v3_block_that_fails", "v1_block_unchanged", "script_mode_unchanged"],
+    ids=["v3_block", "v3_block_that_fails", "v1_block", "script_mode_unchanged"],
 )
-async def test_a_v3_block_scopes_its_download_timeout_to_the_whole_block(
+async def test_a_block_scopes_its_download_timeout_to_the_whole_block_regardless_of_engine(
     scoped_context: SkyvernContext,
     override: RunEngine | None,
     script_mode: bool,

@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol
 
 import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
-
-if TYPE_CHECKING:
-    from yutori import AsyncYutoriClient
 
 from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
@@ -87,7 +84,6 @@ class ForgeApp:
     OPENAI_CUA_MODEL: str
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
-    YUTORI_CLIENT: AsyncYutoriClient | None
     NACE_CLIENT: NaceDecisionClient | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
     GCP_CLIENT_FACTORY: GcpClientFactory
@@ -190,15 +186,6 @@ def create_forge_app() -> ForgeApp:
             api_key=settings.VOLCENGINE_API_KEY,
             base_url=settings.VOLCENGINE_API_BASE,
             http_client=ForgeAsyncHttpxClientWrapper(),
-        )
-
-    app.YUTORI_CLIENT = None
-    if settings.ENABLE_YUTORI:
-        from yutori import AsyncYutoriClient
-
-        app.YUTORI_CLIENT = AsyncYutoriClient(
-            api_key=settings.YUTORI_API_KEY,
-            base_url=settings.YUTORI_API_BASE,
         )
 
     # Nace Drex Max answers only the bounded-choice prompts (see nace_decision_llm_caller); when

@@ -661,6 +661,7 @@ _DRAIN_KEPT_NATIVE_TOOLS = {
     "list_integrations",
     "list_workflow_triggers",
     "read_attached_pdf",
+    "read_chat_history",
     "read_google_sheet",
     "reply",
     "request_credential",

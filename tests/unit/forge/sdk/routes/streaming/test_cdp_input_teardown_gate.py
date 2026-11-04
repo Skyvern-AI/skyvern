@@ -325,7 +325,7 @@ async def test_workflow_run_route_authorizes_only_resolved_persistent_sessions(
     workflow_run_id = "wr_session_auth"
     browser_session_id = "pbs_run"
     has_initial_session = association == "initial"
-    expects_reauthorization = association in {"initial", "late"}
+    expects_reauthorization = True
     principal = object()
     disconnect = asyncio.Event()
     close_calls: list[tuple[int, str]] = []
@@ -333,6 +333,7 @@ async def test_workflow_run_route_authorizes_only_resolved_persistent_sessions(
         authorize_browser_session_stream=AsyncMock(return_value=True),
         browser_session_stream_reauthorization_required=AsyncMock(return_value=True),
         reauthorize_browser_session_stream=AsyncMock(return_value=False),
+        reauthorize_workflow_run_stream=AsyncMock(return_value=False),
     )
 
     async def close(*, code: int = 1000, reason: str = "") -> None:
@@ -402,12 +403,14 @@ async def test_workflow_run_route_authorizes_only_resolved_persistent_sessions(
     else:
         agent_functions.authorize_browser_session_stream.assert_not_awaited()
     agent_functions.browser_session_stream_reauthorization_required.assert_awaited_once_with(principal, "org_stream")
-    if expects_reauthorization:
-        agent_functions.reauthorize_browser_session_stream.assert_awaited_once_with(principal, "org_stream", "pbs_run")
-        assert (4403, "browser-session-access-denied") in close_calls
-    else:
+    if association == "ephemeral":
         agent_functions.reauthorize_browser_session_stream.assert_not_awaited()
-        assert not close_calls
+        agent_functions.reauthorize_workflow_run_stream.assert_awaited_once_with(
+            principal, "org_stream", workflow_run_id, "workflow_run.execute"
+        )
+    else:
+        agent_functions.reauthorize_browser_session_stream.assert_awaited_once_with(principal, "org_stream", "pbs_run")
+    assert (4403, "browser-session-access-denied") in close_calls
     if association == "late":
         assert lookup_count == 2
     if association == "initial":

@@ -173,6 +173,11 @@ from .browser_code import (
 from .browser_session_extension import TOOL_DESCRIPTION as SESSION_EXTENSION_TOOL_DESCRIPTION
 from .browser_session_extension import TOOL_NAME as SESSION_EXTENSION_TOOL_NAME
 from .browser_session_extension import extend_browser_session
+from .chat_history import DEFAULT_LIMIT as CHAT_HISTORY_DEFAULT_LIMIT
+from .chat_history import EARLIER_UNAVAILABLE_ERROR as CHAT_HISTORY_UNAVAILABLE_ERROR
+from .chat_history import TOOL_DESCRIPTION as CHAT_HISTORY_TOOL_DESCRIPTION
+from .chat_history import TOOL_NAME as CHAT_HISTORY_TOOL_NAME
+from .chat_history import read_chat_history
 from .completion import _build_run_evidence_snapshot as _build_run_evidence_snapshot
 from .completion import _completion_verification_handler as _completion_verification_handler
 from .completion import _is_outcome_evidence_candidate as _is_outcome_evidence_candidate
@@ -2186,6 +2191,35 @@ async def read_attached_pdf_tool(ctx: RunContextWrapper, file_id: str, offset: i
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=CHAT_HISTORY_TOOL_NAME,
+    description_override=CHAT_HISTORY_TOOL_DESCRIPTION,
+)
+async def read_chat_history_tool(
+    ctx: RunContextWrapper, cursor: str | None = None, limit: int = CHAT_HISTORY_DEFAULT_LIMIT
+) -> str:
+    authority_error = _authority_tool_error(ctx.context, CHAT_HISTORY_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, CHAT_HISTORY_TOOL_NAME, authority_error)
+    rows = ctx.context.earlier_chat_history_rows()
+    result: dict[str, Any] = (
+        {"ok": False, "error": CHAT_HISTORY_UNAVAILABLE_ERROR}
+        if ctx.context.earlier_chat_history_unavailable
+        else read_chat_history(rows, cursor, limit, ctx.context.chat_history_oldest_shown_id)
+    )
+    LOG.info(
+        "copilot_chat_history_read",
+        ok=result["ok"],
+        snapshot_rows=len(rows),
+        returned_rows=len(result.get("messages", [])),
+        with_cursor=cursor is not None,
+        turn_id=ctx.context.turn_id,
+    )
+    record_tool_step_result_for_ctx(ctx.context, CHAT_HISTORY_TOOL_NAME, {"cursor": cursor, "limit": limit}, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@function_tool(
     failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
 )
 async def inspect_page_for_composition_tool(
@@ -2519,6 +2553,7 @@ NATIVE_TOOLS = [
     extend_browser_session_tool,
     upload_attached_file_tool,
     read_attached_pdf_tool,
+    read_chat_history_tool,
     run_workflow_for_accounts_tool,
     get_account_group_status_tool,
     cancel_account_group_tool,

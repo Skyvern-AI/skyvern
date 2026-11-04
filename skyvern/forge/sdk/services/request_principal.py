@@ -90,6 +90,8 @@ class RequestPrincipal:
 
 
 _SCOPED_API_KEY_ACTOR_PREFIX = "scoped_api_key:"
+_MEMBER_API_KEY_ACTOR_PREFIX = "member_api_key:"
+UNATTRIBUTED_TASK_ACTOR = "unattributed_task_actor"
 
 
 def scoped_api_key_actor_id(token_id: str, user_id: str | None = None) -> str:
@@ -135,6 +137,7 @@ _request_principal: ContextVar[tuple[_ResolutionKey, RequestPrincipal, BearerIde
 
 # Set by the route authorization dependency, which FastAPI resolves before the route's auth dependency.
 pending_route_action: ContextVar[str | None] = ContextVar("pending_route_action", default=None)
+pending_stream_authorization: ContextVar[bool] = ContextVar("pending_stream_authorization", default=False)
 
 
 def get_request_principal() -> RequestPrincipal | None:
@@ -290,7 +293,10 @@ async def resolve_request_principal(
         api_key_profile_resolved=api_key_profile_resolved,
         bearer_token=bearer_token,
     )
-    await app.AGENT_FUNCTION.enforce_request_role(principal, pending_route_action.get(), _bearer_identity_status())
+    role_check = app.AGENT_FUNCTION.enforce_request_role
+    if pending_stream_authorization.get():
+        role_check = getattr(app.AGENT_FUNCTION, "enforce_stream_request_role", role_check)
+    await role_check(principal, pending_route_action.get(), _bearer_identity_status())
     return principal
 
 
@@ -400,6 +406,27 @@ def api_key_actor_id(organization_id: str) -> str | None:
         if principal.auth_kind in {AuthKind.api_key, AuthKind.api_key_and_bearer}
         else None
     )
+
+
+def task_requester_id(organization_id: str) -> str:
+    principal = get_request_principal()
+    if principal is None or principal.organization_id != organization_id:
+        return UNATTRIBUTED_TASK_ACTOR
+    if principal.api_key_access_mode == "scoped" and not principal.api_key_token_id:
+        return UNATTRIBUTED_TASK_ACTOR
+    if principal.auth_kind == AuthKind.member_api_key:
+        return (
+            f"{_MEMBER_API_KEY_ACTOR_PREFIX}{principal.api_key_token_id}"
+            if principal.api_key_token_id
+            else UNATTRIBUTED_TASK_ACTOR
+        )
+    return api_key_actor_id(organization_id) or trigger_owner_id(principal, organization_id) or UNATTRIBUTED_TASK_ACTOR
+
+
+def member_api_key_id_from_actor(actor_id: str) -> str | None:
+    if not actor_id.startswith(_MEMBER_API_KEY_ACTOR_PREFIX):
+        return None
+    return actor_id.removeprefix(_MEMBER_API_KEY_ACTOR_PREFIX) or None
 
 
 def trigger_owner_id(principal: RequestPrincipal | None, organization_id: str) -> str | None:

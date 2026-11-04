@@ -29,6 +29,8 @@ import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useIntegrationCatalogQuery } from "@/hooks/useIntegrationCatalogQuery";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { AGENT_BLOCK_FLAG } from "@/util/featureFlags";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import { cn } from "@/util/utils";
@@ -41,6 +43,7 @@ import type { DocReferenceGroup } from "./docGraphEdits";
 import { docStepChoices } from "./docStepChoices";
 import { docStepFilter } from "./docStepRegistry";
 import { DocText } from "./DocText";
+import { describeSaveFailure, releaseUnansweredSave } from "./docSaveState";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
 // Menus anchored to a Doc line stay between the Doc pane's top and bottom and inside the window, cap their
@@ -79,13 +82,31 @@ export function DocStepPicker({
 }) {
   const agentBlockEnabled = useFeatureFlag(AGENT_BLOCK_FLAG) === true;
   const { data: integrationCatalog } = useIntegrationCatalogQuery();
-  const groups = useMemo(
+  const [search, setSearch] = useState("");
+  const choices = useMemo(
     () => docStepChoices({ agentBlockEnabled, integrationCatalog }),
     [agentBlockEnabled, integrationCatalog],
   );
+  // cmdk ranks items inside a group but never moves a group, so the group holding the best match is put first here.
+  const groups = useMemo(() => {
+    if (!search.trim()) return choices;
+    const best = (group: (typeof choices)[number]) =>
+      Math.max(
+        0,
+        ...group.items.map((item) =>
+          docStepFilter(item.title, search, [item.description, item.nodeType]),
+        ),
+      );
+    return [...choices].sort((a, b) => best(b) - best(a));
+  }, [choices, search]);
   return (
     <Command loop filter={docStepFilter} className="min-h-0">
-      <CommandInput autoFocus placeholder={placeholder} />
+      <CommandInput
+        autoFocus
+        placeholder={placeholder}
+        value={search}
+        onValueChange={setSearch}
+      />
       <CommandList className="max-h-[min(340px,50vh)]">
         <CommandEmpty>No step matches.</CommandEmpty>
         {groups.map((group) => (
@@ -250,6 +271,17 @@ export function DocEditableLine({
   const [referenceGroups, setReferenceGroups] = useState<
     DocReferenceGroup[] | null
   >(null);
+  const [referenceQuery, setReferenceQuery] = useState("");
+  const { createInput } = useContext(WorkflowDocActionsContext);
+  const typedKey = referenceQuery.trim();
+  const newInputKey =
+    createInput &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(typedKey) &&
+    !(referenceGroups ?? []).some((group) =>
+      group.items.some((item) => item.key === typedKey),
+    )
+      ? typedKey
+      : null;
   // The caret when "@" was typed; the menu takes focus, so the line keeps editing until it closes.
   const caret = useRef<Range | null>(null);
   // The caret when "/" opened the step picker, which also takes focus.
@@ -274,8 +306,13 @@ export function DocEditableLine({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!editing || !el) return;
-    // Outside changes (undo, rename) replace the text; the person's own typing doesn't.
-    if (el.innerText !== value && emitted.current !== value)
+    // Outside changes (undo, rename) replace the text; the person's own typing doesn't. A stored value
+    // that only lost a trailing space is still the typing: resetting would drop the space and the caret.
+    const typed: string | undefined = el.innerText;
+    if (
+      (typed === undefined || typed.trimEnd() !== value.trimEnd()) &&
+      emitted.current !== value
+    )
       el.innerText = value;
     emitted.current = value;
   }, [value, editing]);
@@ -365,6 +402,7 @@ export function DocEditableLine({
         caret.current.selectNodeContents(ref.current);
         caret.current.collapse(false);
       }
+      setReferenceQuery("");
       setReferenceGroups(references());
       return;
     }
@@ -418,7 +456,8 @@ export function DocEditableLine({
     <Popover
       key="edit"
       open={referenceGroups !== null}
-      onOpenChange={(open) => !open && closeReferences("@")}
+      // Leaving the menu types nothing: the "@" only opened it.
+      onOpenChange={(open) => !open && closeReferences("")}
     >
       <PopoverAnchor asChild ref={anchorRef}>
         <span
@@ -475,9 +514,18 @@ export function DocEditableLine({
         onCloseAutoFocus={(e) => e.preventDefault()}
       >
         <Command loop className="min-h-0">
-          <CommandInput autoFocus placeholder="Insert a reference…" />
+          <CommandInput
+            autoFocus
+            placeholder="Insert a reference…"
+            value={referenceQuery}
+            onValueChange={setReferenceQuery}
+          />
           <CommandList className="max-h-[min(300px,45vh)]">
-            <CommandEmpty>Nothing to reference here.</CommandEmpty>
+            <CommandEmpty>
+              {createInput
+                ? "Nothing to reference yet. Type a name to create an input."
+                : "Nothing to reference here."}
+            </CommandEmpty>
             {(referenceGroups ?? []).map((group) => (
               <CommandGroup key={group.name} heading={group.name}>
                 {group.items.map((item) => (
@@ -497,6 +545,25 @@ export function DocEditableLine({
                 ))}
               </CommandGroup>
             ))}
+            {newInputKey && (
+              <CommandGroup heading="New">
+                <CommandItem
+                  value={`create input ${newInputKey}`}
+                  onSelect={() => {
+                    if (createInput?.(newInputKey))
+                      closeReferences(`{{ ${newInputKey} }}`);
+                  }}
+                  className="flex flex-col items-start gap-0"
+                >
+                  <span className="text-[13px]">
+                    Create input "{newInputKey}"
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    Adds it to the inputs at the top
+                  </span>
+                </CommandItem>
+              </CommandGroup>
+            )}
           </CommandList>
         </Command>
       </PopoverContent>
@@ -698,15 +765,13 @@ export function DocMoveToDialog({
   );
 }
 
-/** Unsaved marker, problem count, undo/redo and Save. Each shows only when it applies. */
+/** Unsaved marker, undo/redo and Save. Each shows only when it applies. */
 // `reserve` keeps the bar's row when it has nothing to show, so the doc doesn't jump on the first edit or on Save.
 // While a Copilot proposal is pending its Accept / Reject bar is the one decision, so this bar steps aside.
 export function DocEditBar({
-  problems,
   reserve = false,
   proposalPending = false,
 }: {
-  problems: number;
   reserve?: boolean;
   proposalPending?: boolean;
 }) {
@@ -716,33 +781,49 @@ export function DocEditBar({
   const { undoShortcutLabel, redoShortcutLabel } = useUndoRedoShortcutLabels();
   const save = useSaveWorkflow();
   const [saving, setSaving] = useState(false);
+  const [saveFailure, setSaveFailure] = useState<string | null>(null);
+  // The studio's own dirty check: the draft is back to the saved baseline after a user edit.
+  const matchesSaved = useWorkflowSnapshotStore(
+    (s) => s.snapshot !== null && s.userHasEdited && !s.contentDirty,
+  );
   const pendingGoalChangeCount = useCopilotActionStore(
     (state) => state.pendingGoalChanges.length,
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const runSave = () => {
     setSaving(true);
-    // A failed save is already toasted and keeps the unsaved marker.
+    setSaveFailure(null);
+    // The save that fails is the one started here, even if the editor has moved on to another workflow by then.
+    const owner = useWorkflowYamlEditorStore.getState().editorOwner;
     void save()
-      .catch(() => {})
+      .catch((error: unknown) => {
+        releaseUnansweredSave(error, owner);
+        setSaveFailure(describeSaveFailure(error));
+      })
       .finally(() => setSaving(false));
   };
-  if (
-    proposalPending ||
-    (!hasChanges && !canUndo && !canRedo && problems === 0)
-  )
+  useEffect(() => {
+    if (hasChanges && matchesSaved && !saving) {
+      useWorkflowHasChangesStore.getState().setHasChanges(false);
+    }
+  }, [hasChanges, matchesSaved, saving]);
+  useEffect(() => {
+    if (!hasChanges) setSaveFailure(null);
+  }, [hasChanges]);
+  if (proposalPending || (!hasChanges && !canUndo && !canRedo))
     return reserve ? <div aria-hidden className="mb-3 h-[28px]" /> : null;
   return (
     <div className="mb-3 flex min-h-[28px] flex-wrap items-center gap-x-2.5 gap-y-1.5 text-[12.5px] text-muted-foreground">
-      {hasChanges && (
-        <span className="font-medium text-[#B45B0A] dark:text-[#E79A55]">
+      {hasChanges && saveFailure && !saving ? (
+        <span role="alert" className="text-xs font-normal text-destructive">
+          Couldn't save: {saveFailure}
+        </span>
+      ) : hasChanges ? (
+        <span className="text-xs font-normal text-[#B45B0A] dark:text-[#E79A55]">
           Unsaved changes
         </span>
-      )}
-      {problems > 0 && (
-        <span>
-          {problems} problem{problems === 1 ? "" : "s"}
-        </span>
+      ) : (
+        <span>Saved</span>
       )}
       <span className="flex-1" />
       {canUndo && (
@@ -783,7 +864,7 @@ export function DocEditBar({
             runSave();
           }}
         >
-          {saving ? "Saving…" : "Save"}
+          {saving ? "Saving…" : saveFailure ? "Try again" : "Save"}
         </Button>
       )}
       <PendingGoalChangesDialog

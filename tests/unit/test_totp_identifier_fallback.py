@@ -60,6 +60,7 @@ async def test_register_credential_parameter_uses_db_totp_identifier(monkeypatch
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
         AGENT_FUNCTION=SimpleNamespace(
             enforce_credential_use=AsyncMock(),
+            enforce_workflow_context_credential_use=AsyncMock(),
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             process_registered_credential_item=process_item,
         ),
@@ -128,6 +129,7 @@ async def _register_with_credential(
         CREDENTIAL_VAULT_SERVICES={CredentialVaultType.BITWARDEN: FakeCredentialService()},
         AGENT_FUNCTION=SimpleNamespace(
             enforce_credential_use=AsyncMock(),
+            enforce_workflow_context_credential_use=AsyncMock(),
             parse_enterprise_totp_secret=AsyncMock(return_value=None),
             process_registered_credential_item=process_item,
         ),

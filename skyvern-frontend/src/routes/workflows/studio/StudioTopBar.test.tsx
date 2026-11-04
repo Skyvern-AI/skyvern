@@ -79,6 +79,7 @@ import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
 import { taskNodeDefaultData } from "../editor/nodes/TaskNode/types";
 
+import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
 import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
 
 // jsdom lacks ResizeObserver, which Radix's tooltip popper constructs once a
@@ -1038,5 +1039,31 @@ describe("RunStopButton on an agent with no blocks", () => {
     fireEvent.click(runButton);
     expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+  });
+});
+
+describe("RunStopButton while the Doc lists problems", () => {
+  afterEach(() => {
+    useRunValidationStore.setState({
+      docProblemCount: 0,
+      docShowFirstProblem: null,
+    });
+  });
+
+  test("Run stays enabled; a click says what to fix, jumps to it and starts nothing", () => {
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+    const showFirstProblem = vi.fn();
+    useRunValidationStore.setState({
+      docProblemCount: 2,
+      docShowFirstProblem: showFirstProblem,
+    });
+    renderAt("/workflows/wpid_1/studio");
+
+    const runButton = screen.getByRole("button", { name: "Run" });
+    expect(runButton.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(runButton);
+
+    expect(showFirstProblem).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("location")).toBeNull();
   });
 });

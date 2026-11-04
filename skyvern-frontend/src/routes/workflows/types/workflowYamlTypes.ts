@@ -590,6 +590,8 @@ export type EmailInboxBlockYAML = BlockYAMLBase & {
   block_type: "email_inbox";
   email_client: "gmail" | "outlook";
   credential_id: string | null;
+  credential_source?: "native" | "nango";
+  connection_id?: string | null;
   folder: string;
   prompt: string;
   sender: string | null;
@@ -626,6 +628,7 @@ export type GoogleSheetsWriteBlockYAML = BlockYAMLBase & {
 
 export type PowerBIQueryBlockYAML = BlockYAMLBase & {
   block_type: "powerbi_query";
+  credential_source?: "native" | "nango";
   connection_id: string;
   dataset_id: string;
   query: string;

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -34,7 +35,10 @@ async def test_org_email_bitwarden_auth_falls_back_to_global_credentials(
         def __init__(self) -> None:
             self.organizations = FakeOrganizationsRepo()
 
-    fake_app = SimpleNamespace(DATABASE=FakeDatabase())
+    fake_app = SimpleNamespace(
+        DATABASE=FakeDatabase(),
+        AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+    )
     monkeypatch.setattr(cm, "app", fake_app)
 
     fake_settings = SimpleNamespace(
@@ -145,7 +149,14 @@ async def test_bitwarden_login_error_includes_resolved_collection_and_item_ids(
         def __init__(self) -> None:
             self.organizations = FakeOrganizationsRepo()
 
-    monkeypatch.setattr(cm, "app", SimpleNamespace(DATABASE=FakeDatabase()))
+    monkeypatch.setattr(
+        cm,
+        "app",
+        SimpleNamespace(
+            DATABASE=FakeDatabase(),
+            AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+        ),
+    )
     monkeypatch.setattr(
         cm,
         "settings",
@@ -233,7 +244,14 @@ async def test_bitwarden_sensitive_information_resolves_collection_and_identity_
         def __init__(self) -> None:
             self.organizations = FakeOrganizationsRepo()
 
-    monkeypatch.setattr(cm, "app", SimpleNamespace(DATABASE=FakeDatabase()))
+    monkeypatch.setattr(
+        cm,
+        "app",
+        SimpleNamespace(
+            DATABASE=FakeDatabase(),
+            AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+        ),
+    )
     monkeypatch.setattr(
         cm,
         "settings",
@@ -325,7 +343,14 @@ async def test_bitwarden_credit_card_resolves_collection_and_item_parameters(
         def __init__(self) -> None:
             self.organizations = FakeOrganizationsRepo()
 
-    monkeypatch.setattr(cm, "app", SimpleNamespace(DATABASE=FakeDatabase()))
+    monkeypatch.setattr(
+        cm,
+        "app",
+        SimpleNamespace(
+            DATABASE=FakeDatabase(),
+            AGENT_FUNCTION=SimpleNamespace(enforce_workflow_context_credential_use=AsyncMock()),
+        ),
+    )
     monkeypatch.setattr(
         cm,
         "settings",

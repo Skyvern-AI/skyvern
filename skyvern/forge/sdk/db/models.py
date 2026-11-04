@@ -134,6 +134,7 @@ class TaskModel(Base):
     task_id = Column(String, primary_key=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     browser_session_id = Column(String, nullable=True, index=True)
+    requested_by = Column(String, nullable=True)
     status = Column(String, index=True)
     webhook_callback_url = Column(String)
     webhook_failure_reason = Column(String, nullable=True)
