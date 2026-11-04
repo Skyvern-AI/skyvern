@@ -997,7 +997,6 @@ export const TaskRunType = {
   OpenaiCua: "openai_cua",
   AnthropicCua: "anthropic_cua",
   UiTars: "ui_tars",
-  YutoriNavigator: "yutori_navigator",
 } as const;
 
 export type TaskRunType = (typeof TaskRunType)[keyof typeof TaskRunType];
@@ -1379,7 +1378,6 @@ export const RunEngine = {
   SkyvernV3: "skyvern-3.0",
   OpenaiCua: "openai-cua",
   AnthropicCua: "anthropic-cua",
-  YutoriNavigator: "yutori-navigator",
 } as const;
 
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];

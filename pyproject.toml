@@ -165,11 +165,9 @@ server = [
     "starlette>=1.3.1",
     "aiosqlite>=0.21.0,<0.23",
 ]
-yutori = ["yutori>=0.8.1"]
 
 [dependency-groups]
 cloud = [
-    "yutori>=0.8.1",
     # Remote-browser vendor SDKs used only by cloud-side factories.
     "browser-use-sdk>=3.11.0,<4",
     "anchorbrowser>=0.11,<0.12",
@@ -277,8 +275,6 @@ override-dependencies = [
     # An override replaces every package's openai requirement, the SDK's and LiteLLM's
     # included, so it carries openai-agents 0.19's floor and LiteLLM's <3 cap itself.
     "openai>=2.45.0,<3",
-    # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
-    "httpx[socks]>=0.26.0",
     # litellm exact-pins aiohttp; relax so the security-patched
     # 3.14.x resolves for cloud/source installs (plain pip keeps litellm's pin).
     "aiohttp>=3.14.0",

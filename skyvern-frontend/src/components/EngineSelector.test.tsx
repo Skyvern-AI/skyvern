@@ -52,24 +52,6 @@ vi.mock("./ui/select", () => {
 });
 
 describe("RunEngineSelector", () => {
-  test("hides Yutori Navigator by default", () => {
-    render(<RunEngineSelector value={null} onChange={() => {}} />);
-
-    expect(screen.queryByText("Yutori Navigator")).toBeNull();
-  });
-
-  test("keeps selected Yutori Navigator visible as deprecated", () => {
-    render(
-      <RunEngineSelector
-        value={RunEngine.YutoriNavigator}
-        onChange={() => {}}
-      />,
-    );
-
-    expect(screen.getAllByText("Yutori Navigator").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Deprecated").length).toBeGreaterThan(0);
-  });
-
   test.each([
     [RunEngine.OpenaiCua, "OpenAI CUA"],
     [RunEngine.AnthropicCua, "Anthropic CUA"],

@@ -100,7 +100,6 @@ async def get_run_response(
         or run.task_run_type == RunType.openai_cua
         or run.task_run_type == RunType.anthropic_cua
         or run.task_run_type == RunType.ui_tars
-        or run.task_run_type == RunType.yutori_navigator
         or run.task_run_type == RunType.task_v3
     ):
         # fetch task v1 from db and transform to task run response
@@ -117,8 +116,6 @@ async def get_run_response(
             run_engine = RunEngine.anthropic_cua
         elif run.task_run_type == RunType.ui_tars:
             run_engine = RunEngine.ui_tars
-        elif run.task_run_type == RunType.yutori_navigator:
-            run_engine = RunEngine.yutori_navigator
         elif run.task_run_type == RunType.task_v3:
             run_engine = RunEngine.skyvern_v3
 
@@ -361,7 +358,6 @@ async def cancel_run(
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
-        RunType.yutori_navigator,
         RunType.task_v3,
     ]:
         await cancel_task_v1(

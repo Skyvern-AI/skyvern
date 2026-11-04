@@ -885,6 +885,121 @@ async def test_text_prompt_response_log_omits_llm_output(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_text_prompt_logs_omit_rendered_prompt_and_retry_error_text(monkeypatch):
+    from structlog.testing import capture_logs
+
+    sentinel = "private-workflow-document-sentinel"
+    sent_prompts: list[str] = []
+
+    async def flaky(*, prompt, **kwargs):
+        sent_prompts.append(prompt)
+        if len(sent_prompts) == 1:
+            raise block_module.LLMProviderErrorRetryableTask("test-key", Exception(f"echoed: {sentinel}"))
+        return {"llm_response": "ok"}
+
+    _patch_send_prompt_deps(monkeypatch, handler=flaky)
+    block = _make_text_prompt_block(prompt=f"Summarize this document: {sentinel}")
+
+    with capture_logs() as events:
+        await block.send_prompt(block.prompt, workflow_run_id="wr_qa", organization_id="o_qa")
+
+    assert sentinel in sent_prompts[0]
+    assert all(sentinel not in repr(event) for event in events)
+    send_log = next(event for event in events if event["event"] == "TextPromptBlock Sending prompt to LLM")
+    assert send_log["prompt_length"] == len(sent_prompts[0])
+    assert "llm_key" in send_log
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_execute_failure_logs_omit_provider_error_text(monkeypatch):
+    from structlog.testing import capture_logs
+
+    sentinel = "private-provider-echo-sentinel"
+
+    async def always_fails(**kwargs):
+        cause = ValueError(f"provider echoed: {sentinel}")
+        raise block_module.LLMProviderErrorRetryableTask("test-key", cause=cause) from cause
+
+    _patch_send_prompt_deps(monkeypatch, handler=always_fails)
+    block = _make_text_prompt_block(prompt="Summarize status.")
+    workflow_run_context = _make_workflow_run_context()
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "get_workflow_run_context",
+        staticmethod(lambda workflow_run_id: workflow_run_context),
+    )
+
+    with capture_logs() as events:
+        result = await block.execute(
+            workflow_run_id="workflow-run",
+            workflow_run_block_id="workflow-run-block",
+            organization_id="org-1",
+        )
+
+    assert result.success is False
+    assert result.failure_reason is not None
+    assert sentinel in result.failure_reason
+    assert all(sentinel not in repr(event) for event in events)
+    error_logs = [
+        event for event in events if str(event.get("error_type", "")).endswith(".LLMProviderErrorRetryableTask")
+    ]
+    assert {event["event"] for event in error_logs} == {
+        "Transient TextPromptBlock LLM/DB failure, retrying",
+        "TextPromptBlock LLM call failed after all retries",
+        "TextPromptBlock LLM call failed",
+    }
+    assert all(event["cause_type"] == "ValueError" for event in error_logs)
+    assert all("error_category" in event for event in error_logs)
+    block_logs = [event for event in events if "TextPromptBlock" in event["event"]]
+    assert all("exc_info" not in event for event in block_logs)
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_schema_failure_logs_omit_validator_text_but_retry_prompt_keeps_it(monkeypatch):
+    from structlog.testing import capture_logs
+
+    sentinel = "private_schema_field_sentinel"
+    sent_prompts: list[str] = []
+
+    async def missing_field(*, prompt, **kwargs):
+        sent_prompts.append(prompt)
+        return {}
+
+    _patch_send_prompt_deps(monkeypatch, handler=missing_field)
+    block = _make_text_prompt_block(
+        prompt="Summarize status.",
+        json_schema={"type": "object", "properties": {sentinel: {"type": "string"}}, "required": [sentinel]},
+    )
+    workflow_run_context = _make_workflow_run_context()
+    monkeypatch.setattr(
+        TextPromptBlock,
+        "get_workflow_run_context",
+        staticmethod(lambda workflow_run_id: workflow_run_context),
+    )
+
+    with capture_logs() as events:
+        result = await block.execute(
+            workflow_run_id="workflow-run",
+            workflow_run_block_id="workflow-run-block",
+            organization_id="org-1",
+        )
+
+    validator_text = f"missing required property {sentinel}"
+    assert result.success is False
+    assert result.failure_reason is not None
+    assert validator_text in result.failure_reason
+    assert len(sent_prompts) == block.schema_validation_max_attempts
+    assert validator_text not in sent_prompts[0]
+    assert f"Validation error: {result.failure_reason}" in sent_prompts[1]
+    assert all(sentinel not in repr(event) for event in events)
+    schema_log = next(
+        event for event in events if event["event"] == "TextPromptBlock LLM response failed schema validation"
+    )
+    assert schema_log["failure_class"] == "missing_required_defined"
+    assert schema_log["failure_text_length"] == len(result.failure_reason)
+
+
+@pytest.mark.asyncio
 async def test_text_prompt_block_retries_transient_llm_provider_error(monkeypatch):
     """A transient provider error retries with backoff and recovers instead of failing."""
     block = _make_text_prompt_block(prompt="Summarize status.")

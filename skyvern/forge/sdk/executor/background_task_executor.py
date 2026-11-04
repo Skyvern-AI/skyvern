@@ -780,8 +780,6 @@ class BackgroundTaskExecutor(AsyncExecutor):
                 engine = RunEngine.anthropic_cua
             elif run_obj and run_obj.task_run_type == RunType.ui_tars:
                 engine = RunEngine.ui_tars
-            elif run_obj and run_obj.task_run_type == RunType.yutori_navigator:
-                engine = RunEngine.yutori_navigator
             elif run_obj and run_obj.task_run_type == RunType.task_v3:
                 engine = RunEngine.skyvern_v3
 

@@ -157,8 +157,6 @@ async def run_task(
         run_type = RunType.anthropic_cua
     elif engine == RunEngine.ui_tars:
         run_type = RunType.ui_tars
-    elif engine == RunEngine.yutori_navigator:
-        run_type = RunType.yutori_navigator
     elif engine == RunEngine.skyvern_v3:
         run_type = RunType.task_v3
     await app.DATABASE.tasks.create_task_run(

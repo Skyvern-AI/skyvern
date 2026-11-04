@@ -643,18 +643,11 @@ class Settings(BaseSettings):
     VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
     VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
 
-    # Yutori Navigator
-    ENABLE_YUTORI: bool = False
-    YUTORI_API_KEY: str | None = None
     SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
     EXA_API_KEY: str | None = Field(default=None, repr=False)
     # Lets the search_web helper and Copilot tool spend the Search block's keys above. Off by default so
     # keys set only for the Search block are not spent by code blocks and the Copilot.
     ENABLE_SEARCH_WEB: bool = False
-    YUTORI_API_BASE: str = "https://api.yutori.com/v1"
-    YUTORI_MODEL: str = "n1.5-latest"
-    YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
-    YUTORI_TOOL_SET: str = ""
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None

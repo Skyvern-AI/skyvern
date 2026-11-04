@@ -6,7 +6,6 @@ from dotenv import load_dotenv, set_key
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
-from skyvern.exceptions import SkyvernExtraNotInstalled, require_yutori_extra_modules
 from skyvern.utils.env_paths import EnvIntent, EnvScope, resolve_backend_env_path
 
 from .console import console
@@ -87,7 +86,7 @@ def update_or_add_env_var(
     os.environ[key] = value
 
 
-def setup_llm_providers(env_path: Path | str | None = None, *, docker_compose: bool = False) -> None:
+def setup_llm_providers(env_path: Path | str | None = None) -> None:
     """Configure Large Language Model (LLM) Providers."""
 
     def set_env_var(key: str, value: str) -> None:
@@ -207,27 +206,6 @@ def setup_llm_providers(env_path: Path | str | None = None, *, docker_compose: b
             )
     else:
         set_env_var("ENABLE_GEMINI", "false")
-
-    console.print("\n[bold blue]--- Yutori Navigator Configuration ---[/bold blue]")
-    console.print("To enable Yutori Navigator, you must have a Yutori API key.")
-    enable_yutori = Confirm.ask("Do you want to enable Yutori Navigator?")
-    if enable_yutori and not docker_compose:
-        try:
-            require_yutori_extra_modules()
-        except SkyvernExtraNotInstalled as exc:
-            console.print(f"{exc} Yutori Navigator will not be enabled.", style="red", markup=False)
-            enable_yutori = False
-    if enable_yutori:
-        yutori_api_key = Prompt.ask("Enter your Yutori API key", password=True)
-        if not yutori_api_key:
-            console.print("[red]Error: Yutori API key is required. Yutori Navigator will not be enabled.[/red]")
-            set_env_var("ENABLE_YUTORI", "false")
-        else:
-            set_env_var("YUTORI_API_KEY", yutori_api_key)
-            set_env_var("ENABLE_YUTORI", "true")
-            enabled_providers.append("yutori_navigator")
-    else:
-        set_env_var("ENABLE_YUTORI", "false")
 
     console.print("\n[bold blue]--- Ollama / Local LLM Configuration ---[/bold blue]")
     console.print("Use any locally-running model via Ollama (e.g. gemma4, qwen3, deepseek-r1).")

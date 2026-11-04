@@ -3,8 +3,6 @@
 import typing
 
 RunEngine = typing.Union[
-    typing.Literal[
-        "skyvern-1.0", "skyvern-2.0", "skyvern-3.0", "openai-cua", "anthropic-cua", "ui-tars", "yutori-navigator"
-    ],
+    typing.Literal["skyvern-1.0", "skyvern-2.0", "skyvern-3.0", "openai-cua", "anthropic-cua", "ui-tars"],
     typing.Any,
 ]

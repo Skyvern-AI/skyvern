@@ -42,11 +42,9 @@ from skyvern.config import settings
 from skyvern.exceptions import (
     DisabledBlockExecutionError,
     MissingBrowserAddressError,
-    SkyvernExtraNotInstalled,
     SkyvernHTTPException,
     WorkflowNotFound,
     get_user_facing_exception_message,
-    require_yutori_extra_modules,
 )
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AuditEvent, record_request_audit_event
@@ -461,12 +459,6 @@ async def run_task(
         model=run_request.model,
     )
 
-    if run_request.engine == RunEngine.yutori_navigator:
-        try:
-            require_yutori_extra_modules()
-        except SkyvernExtraNotInstalled as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     if run_request.engine in CUA_ENGINES or run_request.engine in (RunEngine.skyvern_v1, RunEngine.skyvern_v3):
         # The V1 / CUA task engines build a legacy TaskRequest that carries no browser-memory controls,
         # so these run-level fields would silently no-op. Reject them explicitly rather than accept-and-
@@ -549,8 +541,6 @@ async def run_task(
             run_type = RunType.anthropic_cua
         elif resolved_engine == RunEngine.ui_tars:
             run_type = RunType.ui_tars
-        elif resolved_engine == RunEngine.yutori_navigator:
-            run_type = RunType.yutori_navigator
         elif resolved_engine == RunEngine.skyvern_v3:
             run_type = RunType.task_v3
         _schedule_task_run_created(

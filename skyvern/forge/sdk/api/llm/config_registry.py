@@ -1466,18 +1466,6 @@ if settings.ENABLE_VOLCENGINE:
         ),
     )
 
-if settings.ENABLE_YUTORI:
-    _register_builtin_config(
-        "YUTORI_NAVIGATOR",
-        LLMConfig(
-            settings.YUTORI_MODEL,
-            ["YUTORI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-            max_completion_tokens=4096,
-        ),
-    )
-
 if settings.ENABLE_GEMINI:
     _register_builtin_config(
         "GEMINI_FLASH_2_0",
