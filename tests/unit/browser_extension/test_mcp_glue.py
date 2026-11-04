@@ -699,22 +699,12 @@ def test_default_extension_pair_exposes_cancel_pending() -> None:
     assert "--cancel-pending" in registered_options
 
 
-def test_extension_broker_commands_are_registered_unconditionally() -> None:
-    environment = os.environ.copy()
-    environment["SKYVERN_BROWSER_EXTENSION_BROKER"] = "0"
-    script = (
-        "import json; "
-        "from skyvern.cli.commands.browser import browser_app; "
-        "print(json.dumps(sorted(command.name for command in browser_app.registered_commands if command.name)))"
-    )
+def test_extension_broker_commands_are_registered_unconditionally(
+    extension_pair_runs: dict[str, subprocess.CompletedProcess[str]],
+) -> None:
+    completed = extension_pair_runs["registration"]
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     registered = set(json.loads(completed.stdout.splitlines()[-1]))
     broker_commands = {
         "extension-broker-enable",
@@ -726,6 +716,16 @@ def test_extension_broker_commands_are_registered_unconditionally() -> None:
 
     assert broker_commands.issubset(registered)
 
+
+# The prelude imported the command module with the opt-out unset, and registration happens while the module runs,
+# so the scenario sets the opt-out in its own environment and then runs the module again.
+_BROKER_COMMANDS_SCRIPT = """
+import importlib, json
+from skyvern.cli.commands import browser as commands
+
+commands = importlib.reload(commands)
+print(json.dumps(sorted(command.name for command in commands.browser_app.registered_commands if command.name)))
+"""
 
 _EXTENSION_PAIR_SCRIPT = """
 from typer.testing import CliRunner
@@ -761,6 +761,7 @@ def extension_pair_runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, s
         scenarios[env_location] = Scenario(
             _EXTENSION_PAIR_SCRIPT, env={"HOME": str(home_directory)}, cwd=working_directory
         )
+    scenarios["registration"] = Scenario(_BROKER_COMMANDS_SCRIPT, env={"SKYVERN_BROWSER_EXTENSION_BROKER": "0"})
     import_directory = root / "import" / "project"
     import_home = root / "import" / "home"
     import_directory.mkdir(parents=True)

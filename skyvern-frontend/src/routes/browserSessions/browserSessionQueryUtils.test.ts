@@ -28,6 +28,16 @@ describe("getBrowserSessionRefetchIntervalMs", () => {
     ).toBe(5000);
   });
 
+  it("polls at the normal interval when a running session address is redacted", () => {
+    expect(
+      getBrowserSessionRefetchIntervalMs({
+        status: "running",
+        browser_address: null,
+        browser_address_redacted: true,
+      }),
+    ).toBe(5000);
+  });
+
   it("stops polling for terminal statuses", () => {
     expect(getBrowserSessionRefetchIntervalMs({ status: "completed" })).toBe(
       false,

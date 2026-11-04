@@ -1024,6 +1024,9 @@ OnePasswordTelemetryErrorClass = Literal["invalid_token", "rate_limited", "timeo
 
 
 class AgentFunction:
+    async def nango_powerbi_available(self, organization_id: str) -> bool:
+        return False
+
     async def ensure_email_forwarding_available(
         self, organization_id: str | None = None, *, fresh: bool = True
     ) -> bool:
@@ -1076,6 +1079,18 @@ class AgentFunction:
     ) -> set[str]:
         """Return sessions whose associated workflow credentials are usable; OSS has no credential-folder ACLs."""
         return browser_session_ids
+
+    async def browser_session_ids_authorized_for_connect(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_ids: set[str]
+    ) -> set[str]:
+        """Return sessions whose client address may include a connect token; OSS has no RBAC enforcement."""
+        return browser_session_ids
+
+    async def should_redact_unresolved_browser_session_address(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        """Return whether an unresolvable address must be withheld; OSS has no RBAC enforcement."""
+        return False
 
     async def enforce_folder_access(
         self, principal: RequestPrincipal | None, action: str, resource: Mapping[str, object]
@@ -1222,6 +1237,29 @@ class AgentFunction:
     ) -> bool:
         # OSS has no cloud role policy; preserve its existing response behavior.
         return False
+
+    async def authorize_browser_session_stream(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+    ) -> bool:
+        """Cloud enforces connect permission and origin-folder access; OSS preserves existing stream behavior."""
+        return True
+
+    async def browser_session_stream_reauthorization_required(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        """OSS has no dynamic browser-session stream authorization to recheck."""
+        return False
+
+    async def browser_session_stream_enforcement_monitor_required(
+        self, principal: RequestPrincipal | None, organization_id: str
+    ) -> bool:
+        return False
+
+    async def reauthorize_browser_session_stream(
+        self, principal: RequestPrincipal | None, organization_id: str, browser_session_id: str
+    ) -> bool:
+        """Recheck a stream when its session state changes; OSS retains its allow-by-default behavior."""
+        return await self.authorize_browser_session_stream(principal, organization_id, browser_session_id)
 
     # OSS default honors the requested engine; cloud overrides to A/B-route eligible
     # traffic onto the native task_v3 engine.

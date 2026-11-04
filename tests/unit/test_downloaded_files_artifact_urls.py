@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+import skyvern.forge.sdk.api.files as files_module
 import skyvern.forge.sdk.artifact.manager as manager_module
 import skyvern.forge.sdk.artifact.storage.azure as azure_module
 import skyvern.forge.sdk.artifact.storage.base as base_module
@@ -1269,6 +1270,7 @@ def test_local_snapshot_aliases_consume_primary_before_live_baseline_and_preserv
 @pytest.mark.parametrize("signed", [False, True])
 @pytest.mark.parametrize("run_id", ["wr_1", "tsk_1"])
 async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkeypatch, backend, signed, run_id):
+    monkeypatch.setattr(files_module, "PENDING_EXTENSION_RENAME_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON if signed else None)
     storage = {
         "local": lambda: LocalStorage(str(tmp_path / "artifacts")),

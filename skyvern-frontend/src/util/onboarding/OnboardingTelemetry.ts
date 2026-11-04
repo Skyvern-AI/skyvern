@@ -89,6 +89,28 @@ function dropOff(surface: Surface, step: string): void {
   capture("onboarding.drop_off", { surface, step });
 }
 
+function cardStepViewed(organizationId: string): void {
+  capture("billing.card_step.viewed", {
+    organization_id: organizationId,
+    $groups: { organization: organizationId },
+  });
+}
+
+function cardStepReturned(
+  outcome: "success" | "cancel",
+  organizationId?: string,
+): void {
+  capture("billing.card_step.returned", {
+    outcome,
+    ...(organizationId
+      ? {
+          organization_id: organizationId,
+          $groups: { organization: organizationId },
+        }
+      : {}),
+  });
+}
+
 // -- Tour events --
 
 function tourStarted(surface: Surface): void {
@@ -264,6 +286,8 @@ function hintDismissed(surface: Surface, hintId: string): void {
 export const OnboardingTelemetry = {
   flowCompleted,
   dropOff,
+  cardStepViewed,
+  cardStepReturned,
   tourStarted,
   tourStepViewed,
   tourCompleted,

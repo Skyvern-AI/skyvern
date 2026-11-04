@@ -9937,6 +9937,8 @@ async def test_terminal_frame_is_still_sent_when_the_run_read_fails(monkeypatch:
 async def test_terminal_frame_is_still_sent_when_the_run_read_outlasts_its_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(workflow_copilot_route, "TERMINAL_RUN_FACTS_TIMEOUT_SECONDS", 0.05)
+
     async def never_answers(workflow_run_id: str, organization_id: str) -> None:
         await asyncio.Event().wait()
 

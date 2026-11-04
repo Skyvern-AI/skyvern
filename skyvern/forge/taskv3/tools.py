@@ -434,6 +434,8 @@ _OPAQUE_ID_RUN_RE = re.compile(
 # that way, while a natural `[name="first name"]` keeps its single round trip.
 _TV3_QUOTED_VALUE_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 _TV3_ANCHORED_SELECTOR_RE = re.compile(r"^\S+\s+\S.*$")
+# observe never writes an engine prefix, so the space in a model's `text=Pay my bill` is part of its text.
+_ENGINE_SELECTOR_RE = re.compile(r"^(?:[A-Za-z][\w:-]*=|//)")
 
 
 # Relies on observe emitting a combinator only from hostAnchored; every natural selector is one
@@ -514,6 +516,10 @@ _SELECTOR_GUARD_TOOL_NAMES = frozenset(
 # file_upload is absent for a different reason: set_input_files drives a hidden <input type=file>,
 # which is how essentially every site ships one, so a hidden target is the normal case there.
 _INERT_DIAGNOSIS_TOOL_NAMES = frozenset({"click", "hover", "type", "select_combobox"})
+
+# Above this, a model-authored selector names a whole class of elements rather than one control the
+# page happens to duplicate, so `_rendered_target` stops paying a visibility round trip per match.
+_RENDERED_TARGET_MATCH_CAP = 12
 
 
 def _inert_target_error(selector: str) -> ToolResult:
@@ -2415,6 +2421,65 @@ _WITH_POINTER_ROOTS_JS = (
       }
     }
   } catch (e) {}
+  // The visibility gates a pointer root must pass, shared by the scan and by a dropped control's label election.
+  const rootable = (el, r) => r.width > 0 && r.height > 0 && getComputedStyle(el).visibility === 'visible'
+    && !offCanvas(el, r) && painted(el, r) && !offRight(el, r);
+  const nameOf = (el) => {
+    let name = '';
+    if (hasTextDescendant.has(el)) {
+      try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
+    }
+    if (!name) name = String(getAttr.call(el, 'aria-label') || getAttr.call(el, 'title') || '').trim();
+    // innerText stops at a <slot>, so a component's wrapper is named by the rendered text slotted in.
+    if (!name) {
+      for (const slot of qsa.call(el, 'slot')) {
+        for (const n of slot.assignedNodes({ flatten: true })) {
+          if (n.nodeType === 3) name += ' ' + String(n.textContent || '');
+          // innerText of an unrendered element falls back to its textContent, so it is skipped.
+          else if (n.nodeType === 1 && (!n.checkVisibility || n.checkVisibility())) {
+            try { name += ' ' + String(innerTextOf.call(n) || ''); } catch (e) { /* unnamed */ }
+          }
+        }
+      }
+      name = name.trim();
+    }
+    if (!name) {
+      for (const img of qsa.call(el, 'img[alt]')) {
+        name = String(getAttr.call(img, 'alt') || '').trim();
+        if (name) break;
+      }
+    }
+    return name;
+  };
+  // A pointer can land on the label: its centre hit-tests to it. A point outside the viewport cannot be tested here,
+  // and the click scrolls it in first, so it is not held against the label.
+  const hitsItself = (l, r) => {
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return true;
+    const hit = l.getRootNode().elementFromPoint(x, y);
+    return !!hit && (hit === l || l.contains(hit));
+  };
+  // Every label of a dropped control performs the same click, so only its most-named label a pointer can land on is
+  // a root; the rest would spend the pointer-root cap on duplicates of one action. A box under 2px a side is unseen,
+  // as _unseen holds, so a screen-reader-only label never wins. No eligible label leaves every label to the gates.
+  const spokesmen = new WeakMap();
+  const otherLabelSpeaks = (el) => {
+    const ctl = el.control;
+    if (!spokesmen.has(ctl)) {
+      let best = null, bestLen = 0;
+      for (const l of Array.from(ctl.labels || [])) {
+        try {
+          const r = bcr.call(l);
+          if (!isPointer(l) || r.width < 2 || r.height < 2 || !rootable(l, r) || !hitsItself(l, r)) continue;
+          const len = nameOf(l).length;
+          if (len > bestLen) { best = l; bestLen = len; }
+        } catch (e) { /* not eligible */ }
+      }
+      spokesmen.set(ctl, best);
+    }
+    const best = spokesmen.get(ctl);
+    return best !== null && best !== el;
+  };
   // A failure here costs the pointer roots only, never the semantic list merged below.
   try {
     for (const el of all) {
@@ -2434,8 +2499,13 @@ _WITH_POINTER_ROOTS_JS = (
         const holds = hasListableDescendant.has(el);
         if (inListable(parentOf.call(el)) || (sr && sr.nodeType === 11 && (holds || anyListable(fragQsa.call(sr, q))))
           || heldBySlot(el)
-          // A label bound to a control names that control, which is listed (or skinned) on its own.
-          || (tag === 'label' && el.control)) { state.covered.add(el); continue; }
+          // A label bound to a control the reading keeps names that control; one whose control was dropped
+          // (a display:none submit drawn by its labels) is the only thing a person can click, so it stays a root.
+          // A disabled control's label does nothing on click, as v1 holds (domUtils.js isInteractable).
+          || (tag === 'label' && el.control && (listable(el.control) || el.control.disabled || otherLabelSpeaks(el)))) {
+          state.covered.add(el);
+          continue;
+        }
         // A row or card that also carries a button is not listed (its centre may land on the button);
         // its first named control-free pointer child stands for it instead, for as many holders as the
         // cap could ever list. Past that a holder is covered, so a long list costs no more work than before.
@@ -2447,9 +2517,7 @@ _WITH_POINTER_ROOTS_JS = (
         // An icon in a pointer card is its own control (the card's trash), not a stand-in for the card, so a card
         // already represented still lists it.
         const r = bcr.call(el);
-        if (!(r.width > 0 && r.height > 0)) continue;
-        if (getComputedStyle(el).visibility !== 'visible' || offCanvas(el, r)) continue;
-        if (!painted(el, r) || offRight(el, r)) continue;
+        if (!rootable(el, r)) continue;
         const kind = iconKind(el, r);
         const directPointer = kind === 'graphic' || ownPointerCursor(el);
         const iconInCard = holder !== null && (kind === 'graphic' || (kind === 'css' && directPointer)) && !textOf(el);
@@ -2459,30 +2527,7 @@ _WITH_POINTER_ROOTS_JS = (
         }
         // A decorative child (an icon font's ligature) does not name the row.
         if (holder && closest.call(el, '[aria-hidden="true"]')) continue;
-        let name = '';
-        if (hasTextDescendant.has(el)) {
-          try { name = String(innerTextOf.call(el) || '').trim(); } catch (e) { name = ''; }
-        }
-        if (!name) name = String(getAttr.call(el, 'aria-label') || getAttr.call(el, 'title') || '').trim();
-        // innerText stops at a <slot>, so a component's wrapper is named by the rendered text slotted in.
-        if (!name) {
-          for (const slot of qsa.call(el, 'slot')) {
-            for (const n of slot.assignedNodes({ flatten: true })) {
-              if (n.nodeType === 3) name += ' ' + String(n.textContent || '');
-              // innerText of an unrendered element falls back to its textContent, so it is skipped.
-              else if (n.nodeType === 1 && (!n.checkVisibility || n.checkVisibility())) {
-                try { name += ' ' + String(innerTextOf.call(n) || ''); } catch (e) { /* unnamed */ }
-              }
-            }
-          }
-          name = name.trim();
-        }
-        if (!name) {
-          for (const img of qsa.call(el, 'img[alt]')) {
-            name = String(getAttr.call(img, 'alt') || '').trim();
-            if (name) break;
-          }
-        }
+        const name = nameOf(el);
         const iconCandidate = !name && (kind === 'graphic' || (kind === 'css' && (holder === null || directPointer)))
           && !hasNamedDescendant.has(el);
         const icon = iconCandidate && state.iconCount < state.ceiling;
@@ -5374,6 +5419,20 @@ _NATIVE_PROXY_JS = r"""
   };
 """
 
+
+# Whether a visible label (or aria-labelledby proxy) of this hidden element reaches it while the rendered
+# match is not that label: click's label path would act on this element, not on the rendered one.
+_LABEL_REACHES_OTHER_THAN_JS = (
+    r"""(el, rendered) => {
+  const arg = {};
+"""
+    + _NATIVE_LABEL_JS
+    + _NATIVE_PROXY_JS
+    + r"""
+  const proxy = _nativeProxy(el);
+  return !!proxy && proxy !== rendered && !nativeLabelsOf(el).includes(rendered);
+}"""
+)
 
 # The label is a timeline nicety on the critical path of every click/type/hover, so the probe gets a
 # hard budget the ACTION never pays for: the isolated world shares the page's JS thread, and a
@@ -15721,6 +15780,84 @@ def build_browser_tools(
         except Exception:
             return 1
 
+    async def _rendered_target(target: Any, selector: str, *, mirrored: bool = False) -> str:
+        """For a model-written selector naming several elements, the single one the page renders.
+
+        `_require_single_target` counts only what observe minted, so a selector the model wrote reaches a
+        non-strict driver action that takes the first match in document order; when that match has no box
+        (a `display:none` row template whose submit carries the row's text as its `value`) the call spends
+        the whole actionability wait failing. The selector is returned untouched whenever the
+        choice is not forced: nothing rendered, several rendered, the rendered one already first, or a hidden
+        match a visible label of its own still reaches, which click's label path acts on.
+        """
+        if _TV3_MARKER_ANYWHERE_RE.search(selector) or (
+            _is_host_anchored_selector(selector) and not _ENGINE_SELECTOR_RE.match(selector.strip())
+        ):
+            return selector
+        handles: list[Any] = []
+        try:
+            handles = await target.locator(selector).element_handles()
+            if not 2 <= len(handles) <= _RENDERED_TARGET_MATCH_CAP:
+                return selector
+            rendered: Any = None
+            hidden: list[Any] = []
+            for handle in handles:
+                if not await handle.is_visible():
+                    hidden.append(handle)
+                elif rendered is not None:
+                    return selector
+                else:
+                    rendered = handle
+            # Rendered first is what the driver takes anyway; a token on that one node would only add a way
+            # to go stale when the page replaces it before the action lands. A selector the guard counts would
+            # be refused as ambiguous instead, so it still narrows.
+            if rendered is None or (rendered is handles[0] and not _is_host_anchored_selector(selector)):
+                return selector
+            for handle in hidden:
+                if await handle.evaluate(_LABEL_REACHES_OTHER_THAN_JS, rendered):
+                    return selector
+            # A shadow host and the control it mirrors both answer the host's `#id`, and the host is the
+            # rendered one; the handler's own rewrite has to reach the control instead.
+            if mirrored and await _resolve_mirrored_host_control(target, selector) != selector:
+                return selector
+            act_selector = await _resolve_handle_selector(target, rendered)
+        except Exception:
+            return selector
+        finally:
+            for handle in handles:
+                with contextlib.suppress(Exception):
+                    await handle.dispose()
+        if act_selector is None:
+            return selector
+        LOG.info(
+            "taskv3 narrowed a multi-match selector to the one element the page renders",
+            selector=selector,
+            matches=len(handles),
+            act_selector=act_selector,
+        )
+        return act_selector
+
+    def _with_rendered_target(handler: ToolHandler, *, mirrored: bool) -> ToolHandler:
+        # Outside the target-label probe, so the label, the action and the inert diagnosis all read the
+        # element the call lands on; the answer audit narrows the same way in `_answer_target`.
+        async def wrapped(args: dict[str, Any]) -> ToolResult:
+            selector = args.get("selector")
+            if not isinstance(selector, str) or not selector or not _prefetched_page:
+                return await handler(args)
+            realm = _acted_realm[0] if _acted_realm else _prefetched_page[0]
+            narrowed = await _rendered_target(realm, selector, mirrored=mirrored)
+            if narrowed == selector:
+                return await handler(args)
+            try:
+                return await handler({**args, "selector": narrowed})
+            except Exception:
+                # Only a raise reaches the guard's inert diagnosis, which looks the caller's selector up here;
+                # the handler's own `_resolve_page` clears this map, so it cannot be written before the call.
+                _acted_selector[selector] = _acted_selector.get(narrowed, narrowed)
+                raise
+
+        return wrapped
+
     # What the last menu-open note reported, for the click's call record; reset before each reaction read.
     menu_note_census: dict[str, Any] = {}
     menu_pick: dict[str, str] = {}
@@ -17849,9 +17986,12 @@ def build_browser_tools(
                     await _discard_live_row_offer(field)
                 return error
             selector = args.get("selector")
-            target = (
-                await _resolve_mirrored_host_control(page, selector) if isinstance(selector, str) and selector else None
-            )
+            target = None
+            if isinstance(selector, str) and selector:
+                # Narrowed as the tool's own seam narrows it, so an offer keyed by the narrowed field still matches.
+                if tool_name in _INERT_DIAGNOSIS_TOOL_NAMES:
+                    selector = await _rendered_target(page, selector, mirrored=True)
+                target = await _resolve_mirrored_host_control(page, selector)
             on_field: list[tuple[str, _LiveRowOffer]] = []
             released_input = False
             for field, offer in list(_live_row_offers.items()):
@@ -23454,9 +23594,8 @@ def build_browser_tools(
         page, error = await _resolve_page()
         if error is not None:
             return error
-        raw = await asyncio.wait_for(
-            _evaluate_isolated(page, _TARGET_NAME_JS, str(args.get("selector") or "")), _TARGET_NAME_TIMEOUT_SECONDS
-        )
+        selector = await _rendered_target(page, str(args.get("selector") or ""), mirrored=True)
+        raw = await asyncio.wait_for(_evaluate_isolated(page, _TARGET_NAME_JS, selector), _TARGET_NAME_TIMEOUT_SECONDS)
         return ToolResult.ok("", data=raw if isinstance(raw, dict) else {})
 
     _resolve_answer_target = _with_act_by_mark(
@@ -23741,6 +23880,10 @@ def build_browser_tools(
             # Innermost of the selector wrappers: outside it the selector may still be a mark=N/ref=N
             # handle or an unnormalized `#id`, neither of which the probe can resolve.
             _tool_spec.handler = _with_target_label(_tool_spec.handler)
+        if _tool_spec.name in _INERT_DIAGNOSIS_TOOL_NAMES:
+            _tool_spec.handler = _with_rendered_target(
+                _tool_spec.handler, mirrored=_tool_spec.name in ("type", "select_combobox")
+            )
         if _tool_spec.name in PREFLIGHT_TOOL_NAMES:
             _tool_spec.handler = _with_preflight(_tool_spec.name, _tool_spec.handler, page_provider, _prefetched_page)
         if (

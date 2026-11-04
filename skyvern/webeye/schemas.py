@@ -58,6 +58,9 @@ class BrowserSessionResponse(BaseModel):
         description="Url for connecting to the browser",
         examples=["http://localhost:9222", "https://3.12.10.11/browser/123456"],
     )
+    browser_address_redacted: bool = Field(
+        False, description="Whether the browser address was withheld because this caller cannot connect"
+    )
     app_url: str | None = Field(
         None,
         description="Url for the browser session page",

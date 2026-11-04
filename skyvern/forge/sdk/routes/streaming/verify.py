@@ -282,7 +282,7 @@ async def verify_workflow_run(
 
 async def loop_verify_browser_session(
     verifiable: MessageChannel | VncChannel,
-    on_session: t.Callable[[AddressablePersistentBrowserSession | None], None] | None = None,
+    on_session: t.Callable[[AddressablePersistentBrowserSession | None], t.Awaitable[None]] | None = None,
 ) -> None:
     """
     Loop until the browser session is cleared or the websocket is closed.
@@ -296,12 +296,15 @@ async def loop_verify_browser_session(
 
         verifiable.browser_session = browser_session
         if on_session is not None:
-            on_session(browser_session)
+            await on_session(browser_session)
 
         await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 
 
-async def loop_verify_task(vnc_channel: VncChannel) -> None:
+async def loop_verify_task(
+    vnc_channel: VncChannel,
+    on_session: t.Callable[[AddressablePersistentBrowserSession | None], t.Awaitable[None]] | None = None,
+) -> None:
     """
     Loop until the task is cleared or the websocket is closed.
     """
@@ -314,11 +317,16 @@ async def loop_verify_task(vnc_channel: VncChannel) -> None:
 
         vnc_channel.task = task
         vnc_channel.browser_session = browser_session
+        if on_session is not None:
+            await on_session(browser_session)
 
         await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 
 
-async def loop_verify_workflow_run(verifiable: MessageChannel | VncChannel) -> None:
+async def loop_verify_workflow_run(
+    verifiable: MessageChannel | VncChannel,
+    on_session: t.Callable[[AddressablePersistentBrowserSession | None], t.Awaitable[None]] | None = None,
+) -> None:
     """
     Loop until the workflow run is cleared or the websocket is closed.
     """
@@ -331,6 +339,8 @@ async def loop_verify_workflow_run(verifiable: MessageChannel | VncChannel) -> N
 
         verifiable.workflow_run = workflow_run
         verifiable.browser_session = browser_session
+        if on_session is not None:
+            await on_session(browser_session)
 
         await asyncio.sleep(Constants.POLL_INTERVAL_FOR_VERIFICATION_SECONDS)
 
