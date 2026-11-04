@@ -577,7 +577,7 @@ export function DocOutputName({ id, label }: { id: string; label: string }) {
   const [draft, setDraft] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const pill =
-    "inline-block max-w-full rounded bg-muted px-[5px] text-left font-medium leading-[1.25] [overflow-wrap:anywhere]";
+    "inline-block max-w-full truncate whitespace-nowrap rounded bg-muted px-[5px] text-left align-bottom font-medium leading-[1.25]";
   if (!edit)
     return (
       <span className={pill} title={`${label}_output`}>

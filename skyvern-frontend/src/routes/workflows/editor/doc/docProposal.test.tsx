@@ -52,7 +52,14 @@ vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 
 vi.mock("./useDocRun", () => {
   const blocksByLabel = new Map();
-  return { useDocRun: () => ({ runId: null, blocksByLabel, live: false }) };
+  return {
+    useDocRun: () => ({
+      runId: null,
+      blocksByLabel,
+      live: false,
+      unknownLabels: new Set(),
+    }),
+  };
 });
 
 async function renderInStudio(ui: ReactElement) {

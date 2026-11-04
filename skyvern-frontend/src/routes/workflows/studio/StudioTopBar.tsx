@@ -39,6 +39,10 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
@@ -75,11 +79,14 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
 import { getRerunNavigationState } from "../utils";
 import { ControlTooltip } from "./ControlTooltip";
 import { PaneHeaderDivider } from "./PaneHeaderDivider";
+import { useStudioNarrow } from "./useStudioNarrow";
 import { StudioPaneToggles } from "./StudioPaneToggles";
 import { isAuthoringLayout } from "./panes";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunId } from "./useStudioRunId";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+import { DocRunButton } from "../editor/doc/DocRunButton";
+import { useDocRunOwnsTopBar } from "../editor/doc/useDocRunOwnsTopBar";
 
 export function TitleSection({ editable = true }: { editable?: boolean }) {
   const title = useWorkflowTitleStore((state) => state.title);
@@ -314,6 +321,9 @@ function PanelToggle({
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const close = useWorkflowPanelStore((s) => s.closeWorkflowPanel);
   const isOpen = state.active && state.content === content;
+  // Folded into the More actions menu at phone width (PhoneTopBarItems).
+  const narrow = useStudioNarrow();
+  if (narrow) return null;
   return (
     <ControlTooltip content={label}>
       <Button
@@ -346,6 +356,8 @@ export function InputsToggle() {
   const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
   const count = useWorkflowParametersStore((s) => s.parameters.length);
   const isOpen = state.active && state.content === "parameters";
+  const narrow = useStudioNarrow();
+  if (narrow) return null;
   return (
     <ControlTooltip content="Placeholder values you can link in any block, and fill in before each run">
       <Button
@@ -365,6 +377,45 @@ export function InputsToggle() {
         <InputsCountBadge count={count} />
       </Button>
     </ControlTooltip>
+  );
+}
+
+// The top bar's secondary controls as More actions items at phone width, so
+// the title and Run keep their room.
+function PhoneTopBarItems({ triggers }: { triggers: boolean }) {
+  const narrow = useStudioNarrow();
+  const setState = useWorkflowPanelStore((s) => s.setWorkflowPanelState);
+  const count = useWorkflowParametersStore((s) => s.parameters.length);
+  if (!narrow) return null;
+  return (
+    <>
+      <DropdownMenuItem
+        onSelect={() => setState({ active: true, content: "parameters" })}
+      >
+        <InputIcon className="mr-2 size-4" aria-hidden />
+        Inputs
+        {count > 0 ? (
+          <span className="ml-auto pl-3 text-xs text-muted-foreground">
+            {count}
+          </span>
+        ) : null}
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        onSelect={() => setState({ active: true, content: "schedules" })}
+      >
+        <CalendarIcon className="mr-2 size-4" aria-hidden />
+        Schedule
+      </DropdownMenuItem>
+      {triggers ? (
+        <DropdownMenuItem
+          onSelect={() => setState({ active: true, content: "triggers" })}
+        >
+          <LightningBoltIcon className="mr-2 size-4" aria-hidden />
+          Triggers
+        </DropdownMenuItem>
+      ) : null}
+      <DropdownMenuSeparator />
+    </>
   );
 }
 
@@ -586,6 +637,26 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   );
 }
 
+// The Doc's Run only while the Doc is on screen. A live block run keeps the shared control, which
+// offers a full run next to Stop.
+export function TopBarRunControl() {
+  const docShowing = useDocRunOwnsTopBar();
+  const { panes } = useStudioPanes();
+  const [searchParams] = useSearchParams();
+  const runId = useStudioRunId();
+  const isBlockRun = searchParams.has("bl");
+  const { data: run, isPlaceholderData } = useWorkflowRunWithWorkflowQuery({
+    workflowRunId: isBlockRun ? runId : undefined,
+  });
+  const blockRunGoing =
+    isBlockRun && !isPlaceholderData && Boolean(run && runIsCancellable(run));
+  return docShowing && panes.includes("editor") && !blockRunGoing ? (
+    <DocRunButton />
+  ) : (
+    <RunStopButton />
+  );
+}
+
 export function StudioTopBar() {
   const workflowPermanentId = useWorkflowPermanentId();
   const workflowTitle = useWorkflowTitleStore((state) => state.title);
@@ -611,7 +682,7 @@ export function StudioTopBar() {
     toggleHistoryPanel();
   };
   return (
-    <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4">
+    <div className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-slate-elevation2 px-4 max-[719px]:gap-2 max-[719px]:px-3">
       <TitleSection editable={!isGlobalWorkflow && !workflowDeletedAt} />
       {!isGlobalWorkflow && !workflowDeletedAt && workflowPermanentId ? (
         <WorkflowFindingsButton
@@ -662,6 +733,11 @@ export function StudioTopBar() {
                       triggerClassName="h-8 w-8 rounded-md border-0 bg-transparent text-muted-foreground hover:bg-accent hover:text-accent-foreground"
                       onVersionHistory={openVersionHistory}
                       embedded
+                      leadingItems={
+                        <PhoneTopBarItems
+                          triggers={Boolean(workflowTriggersPanel)}
+                        />
+                      }
                     />
                   </>
                 ) : null}
@@ -671,7 +747,7 @@ export function StudioTopBar() {
           ) : null}
           <div className="flex items-center gap-2">
             {authoring ? <InputsToggle /> : null}
-            <RunStopButton />
+            <TopBarRunControl />
           </div>
         </div>
       )}

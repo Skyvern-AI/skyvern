@@ -1,4 +1,5 @@
 import { graphNoteReadings } from "./noteSequences";
+import { useSearchParams } from "react-router-dom";
 import {
   type HTMLAttributes,
   type Ref,
@@ -57,6 +58,7 @@ import {
 } from "./WorkflowDocActionsContext";
 import { docBranchSelection } from "./docBranchSelection";
 import { useDocRun } from "./useDocRun";
+import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
 import { DocStepSearch } from "./DocStepSearch";
@@ -203,7 +205,12 @@ export function WorkflowDocEditor({
   const parameters = proposal?.parameters ?? liveParameters;
   const nodes = proposal?.nodes ?? liveNodes;
   const edges = proposal?.edges ?? liveEdges;
-  const editable = !scopeReadOnly && !locked && !proposal;
+  const docRun = useDocRun();
+  const { blocksByLabel } = docRun;
+  const [searchParams] = useSearchParams();
+  // A full run from the Doc holds the doc still (no adding or inserting); a one-step run doesn't.
+  const fullRunGoing = docRun.live && docRun.owned && !searchParams.has("bl");
+  const editable = !scopeReadOnly && !locked && !proposal && !fullRunGoing;
   const showingProposal = proposal !== null;
   // Workspace's undo shortcut listens on the document, so this holds wherever focus is: undo
   // would change the live graph hidden behind the read-only proposal.
@@ -331,7 +338,6 @@ export function WorkflowDocEditor({
       )?.id ?? null,
     [nodes, finallyBlockLabel],
   );
-  const { blocksByLabel } = useDocRun();
   const branchSelections = useMemo(() => {
     const selected = new Map<string, string>();
     const visit = (items: DocItem[]) => {
@@ -693,6 +699,64 @@ export function WorkflowDocEditor({
         useRunValidationStore.getState().setDocShowFirstProblem(null);
     };
   }, []);
+  const runInputs = useMemo<DocRunInput[]>(() => {
+    const used = new Set(
+      inputs.filter((input) => !input.unused).map((input) => input.key),
+    );
+    return parameters.flatMap((p) => {
+      // The editor keeps a credential_id run input as a Skyvern "credential" parameter; the server
+      // still takes it as a run input, with its saved credential as the default.
+      // A fixed credential (no dataType) is not a run input.
+      if (
+        p.parameterType === "credential" &&
+        "credentialId" in p &&
+        (p as { dataType?: string }).dataType ===
+          WorkflowParameterValueType.CredentialId
+      ) {
+        const required = !p.credentialId;
+        if (!used.has(p.key) && !required) return [];
+        return [
+          {
+            key: p.key,
+            type: WorkflowParameterValueType.CredentialId,
+            defaultValue: p.credentialId || null,
+            required,
+          },
+        ];
+      }
+      if (p.parameterType !== "workflow") return [];
+      const required =
+        p.defaultValue === null ||
+        p.defaultValue === undefined ||
+        p.defaultValue === "";
+      // The server refuses a run missing any input without a default, used or not.
+      if (!used.has(p.key) && !required) return [];
+      return [
+        {
+          key: p.key,
+          type: p.dataType,
+          defaultValue: p.defaultValue,
+          required,
+        },
+      ];
+    });
+  }, [inputs, parameters]);
+  useEffect(() => {
+    useDocRunStore.getState().publish({
+      inputs: proposal ? [] : runInputs,
+      stepCount,
+      mounted: true,
+    });
+  }, [runInputs, stepCount, proposal]);
+  useEffect(
+    () => () =>
+      useDocRunStore.getState().publish({
+        inputs: [],
+        stepCount: 0,
+        mounted: false,
+      }),
+    [],
+  );
   useEffect(() => {
     if (!locateRequest) return;
     if (
@@ -826,7 +890,7 @@ export function WorkflowDocEditor({
     <WorkflowDocActionsContext.Provider
       value={{
         editable,
-        runControlsVisible: !scopeReadOnly && !proposal,
+        runControlsVisible: !scopeReadOnly && !proposal && !fullRunGoing,
         openSettings: (id) => {
           panelOpener.current = document.activeElement as HTMLElement;
           setSelectedStepId(id);
@@ -954,6 +1018,14 @@ export function WorkflowDocEditor({
               reserve={Boolean(edit)}
               proposalPending={Boolean(proposal)}
             />
+            {docRun.earlierVersion && docRun.runId && (
+              <div
+                className="mb-3 text-[13px] text-muted-foreground"
+                data-testid="doc-earlier-version-note"
+              >
+                Results from the last run (an earlier version)
+              </div>
+            )}
             <div className="mb-[26px] flex flex-wrap items-center gap-1.5 border-b border-border pb-[18px]">
               <span className="mr-1 text-[12.5px] text-[hsl(0_0%_60%)] dark:text-[hsl(215_14%_52%)]">
                 Inputs

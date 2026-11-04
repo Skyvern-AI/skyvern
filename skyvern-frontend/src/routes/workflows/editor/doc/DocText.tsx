@@ -29,7 +29,7 @@ export function DocText({
                 : `{{ ${part.ref} }}`
             }
             className={cn(
-              "inline-block max-w-full rounded bg-muted px-[5px] font-[520] leading-[1.25] text-foreground",
+              "inline-block max-w-full truncate whitespace-nowrap rounded bg-muted px-[5px] align-bottom font-[520] leading-[1.25] text-foreground",
               missingReference(part.ref) &&
                 "bg-destructive/10 text-destructive",
             )}

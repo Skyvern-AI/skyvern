@@ -15,11 +15,13 @@ import { StudioShell } from "../studio/StudioShell";
 import { Workspace } from "./Workspace";
 import { ProductTour } from "@/components/onboarding/ProductTour";
 import { useProductTourShortcut } from "@/hooks/useProductTourShortcut";
+import { useFillViewportBelow } from "@/hooks/useFillViewportBelow";
 import { useMountEffect } from "@/hooks/useMountEffect";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
 import { useViaEntryPointCapture } from "../hooks/useViaEntryPointCapture";
 
 function WorkflowEditor() {
+  const fill = useFillViewportBelow<HTMLDivElement>();
   const workflowPermanentId = useWorkflowPermanentId();
   const studioEnabled = useWorkflowStudioEnabled();
   const {
@@ -106,7 +108,11 @@ function WorkflowEditor() {
   );
 
   return (
-    <div className="relative flex h-screen w-full flex-col">
+    <div
+      ref={fill.ref}
+      style={fill.style}
+      className="relative flex h-screen w-full flex-col"
+    >
       {elements.validationError ? (
         <div
           role="alert"

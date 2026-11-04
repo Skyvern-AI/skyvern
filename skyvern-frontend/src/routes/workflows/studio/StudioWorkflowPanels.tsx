@@ -37,11 +37,11 @@ export function StudioWorkflowPanels() {
           <WorkflowParametersPanel />
         </div>
       ) : content === "schedules" ? (
-        <div className="absolute right-3 top-3 z-40 max-h-[calc(100%-1.5rem)] overflow-y-auto">
+        <div className="absolute right-3 top-3 z-40 max-h-[calc(100%-1.5rem)] max-w-[calc(100%-1.5rem)] overflow-y-auto [&>*]:max-w-full">
           <WorkflowSchedulePanel onClose={close} />
         </div>
       ) : (
-        <div className="absolute right-3 top-3 z-40 max-h-[calc(100%-1.5rem)] overflow-y-auto">
+        <div className="absolute right-3 top-3 z-40 max-h-[calc(100%-1.5rem)] max-w-[calc(100%-1.5rem)] overflow-y-auto [&>*]:max-w-full">
           {WorkflowTriggersPanel ? (
             <WorkflowTriggersPanel
               workflowPermanentId={workflowPermanentId ?? ""}

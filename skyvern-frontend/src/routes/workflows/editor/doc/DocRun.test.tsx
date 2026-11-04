@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,7 +16,14 @@ import { DocStepResult } from "./DocStepResult";
 import { DocScope } from "./DocScope";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
-vi.mock("./useDocRun", () => ({ useDocRun: () => docRun.current }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({
+    loopsByLabel: new Map(),
+    blockRun: false,
+    unknownLabels: new Set<string>(),
+    ...docRun.current,
+  }),
+}));
 
 function block(overrides: Partial<WorkflowRunBlock>): WorkflowRunBlock {
   return {
@@ -55,6 +62,45 @@ afterEach(() => {
 });
 
 describe("DocStepResult", () => {
+  it("shows nothing for a step an earlier run cannot speak for, even if that run failed it", () => {
+    renderResult(block({ status: Status.Failed, failure_reason: "old error" }));
+    expect(screen.getByTestId("doc-step-result")).toBeTruthy();
+    cleanup();
+    docRun.current = {
+      ...docRun.current,
+      unknownLabels: new Set(["get_invoices"]),
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="get_invoices" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId("doc-step-result")).toBeNull();
+  });
+
+  it("shows a Stop step that stopped the run as done, not failed", () => {
+    renderResult(
+      block({
+        block_type: "terminate",
+        label: "stop_here",
+        status: Status.Terminated,
+        failure_reason:
+          "terminate block terminated. Reason: Nothing more to do",
+        output: null,
+      }),
+    );
+    const line = screen.getByText(/^Stopped/);
+    expect(line.className).not.toContain("text-destructive");
+  });
+
+  it("draws a step of a run still going elsewhere as running, not stopped", () => {
+    renderResult(block({ status: Status.Running }), true);
+    expect(screen.queryByText(/^Stopped/)).toBeNull();
+    expect(screen.queryByText(/Not reached/)).toBeNull();
+  });
+
   it("states the outcome with its duration, links to the real run page and expands to the output", () => {
     renderResult(block({}));
     expect(screen.getByText("Found 3 items · 9s")).toBeTruthy();

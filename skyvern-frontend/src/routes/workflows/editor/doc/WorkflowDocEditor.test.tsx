@@ -31,7 +31,9 @@ import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
-vi.mock("./useDocRun", () => ({ useDocRun: () => docRun.current }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({ unknownLabels: new Set(), ...docRun.current }),
+}));
 import type { DocGraph } from "./docGraphEdits";
 import * as axiosClientModule from "@/api/AxiosClient";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";

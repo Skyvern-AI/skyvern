@@ -30,6 +30,8 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "../AffectedBlocksNotice";
 import { inputDeleteTarget } from "../jinjaReferences";
 import { AppNode } from "../nodes";
+import { cn } from "@/util/utils";
+import { useStudioNarrow } from "../../studio/useStudioNarrow";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -66,6 +68,8 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
   });
   const nodes = useNodes<AppNode>();
   const { setNodes } = useReactFlow();
+  // A phone has no room beside the panel, so the form opens over it.
+  const narrow = useStudioNarrow();
 
   const parameterToDelete = workflowParameters.find(
     (p) => p.key === deleteDialogState.parameterKey,
@@ -96,7 +100,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
 
   return (
     <div
-      className="relative z-10 w-[25rem] rounded-xl border border-border bg-background p-5 shadow-xl"
+      className="relative z-10 w-[min(25rem,calc(100vw-2.5rem))] rounded-xl border border-border bg-background p-5 shadow-xl"
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
       <div className="space-y-4">
@@ -223,13 +227,23 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
       {operationPanelState.active && (
         <div
           className="absolute"
-          style={{
-            top: 0,
-            left: -1 * (WORKFLOW_EDIT_PANEL_WIDTH + WORKFLOW_EDIT_PANEL_GAP),
-          }}
+          style={
+            narrow
+              ? { top: 0, left: 0, right: 0 }
+              : {
+                  top: 0,
+                  left:
+                    -1 * (WORKFLOW_EDIT_PANEL_WIDTH + WORKFLOW_EDIT_PANEL_GAP),
+                }
+          }
         >
           {operationPanelState.operation === "add" && (
-            <div className="w-80 rounded-xl border border-border bg-background p-5 px-2 shadow-xl">
+            <div
+              className={cn(
+                "rounded-xl border border-border bg-background p-5 px-2 shadow-xl",
+                narrow ? "w-full" : "w-80",
+              )}
+            >
               <WorkflowParameterEditPanel
                 type={operationPanelState.type}
                 onSave={(parameter) => {
@@ -254,7 +268,12 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           )}
           {operationPanelState.operation === "edit" &&
             operationPanelState.parameter && (
-              <div className="w-80 rounded-xl border border-border bg-background p-5 px-2 shadow-xl">
+              <div
+                className={cn(
+                  "rounded-xl border border-border bg-background p-5 px-2 shadow-xl",
+                  narrow ? "w-full" : "w-80",
+                )}
+              >
                 <WorkflowParameterEditPanel
                   key={operationPanelState.parameter?.key}
                   type={operationPanelState.type}

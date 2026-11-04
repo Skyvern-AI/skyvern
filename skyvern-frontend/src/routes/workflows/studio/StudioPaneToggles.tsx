@@ -27,6 +27,7 @@ import { cn } from "@/util/utils";
 
 import { ControlTooltip } from "./ControlTooltip";
 import { PastRunsList } from "./PastRunsList";
+import { StudioPaneAttentionDot } from "./StudioPaneAttentionDot";
 import { studioPanelId, studioTabId } from "./constants";
 import { STUDIO_PANE_META, railLabel } from "./paneMeta";
 import {
@@ -34,9 +35,13 @@ import {
   WORKFLOW_AUTHORING_PANES,
   type StudioPaneId,
 } from "./panes";
+import { useStudioNarrow } from "./useStudioNarrow";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioRunSignals } from "./useStudioRunSignals";
-import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+import {
+  useStudioShellContext,
+  useStudioWorkflowDeletedAt,
+} from "./StudioShellContext";
 
 // Terminal-only by design: finalizedRunStatus (below) only resolves once a run
 // is done, so running/queued/created/paused runs render no dot at all — the
@@ -92,6 +97,7 @@ function useLabelsCollapsed(): boolean {
 export function StudioPaneToggles() {
   const { panes, togglePane, openPane } = useStudioPanes();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
+  const { isPaneFolded } = useStudioShellContext();
   const hasUnseenBrowserActivity = useStudioBrowserStore(
     (s) => s.hasUnseenActivity,
   );
@@ -100,6 +106,12 @@ export function StudioPaneToggles() {
 
   const { runId, runStatus } = useStudioRunSignals();
   const labelsCollapsed = useLabelsCollapsed();
+  // At phone width the pane switch under the stage picks panes; only the run
+  // control (it holds Past Runs) stays up here.
+  const narrow = useStudioNarrow();
+  const paneIds = narrow
+    ? STUDIO_PANE_IDS.filter((id) => id === "overview")
+    : STUDIO_PANE_IDS;
   const [runsSelectorOpen, setRunsSelectorOpen] = useState(false);
 
   // Picking a run in the selector opens/retargets the run pane. The row's own
@@ -114,7 +126,12 @@ export function StudioPaneToggles() {
     if (id === "browser" && !panes.includes("browser")) {
       clearBrowserActivity();
     }
-    togglePane(id);
+    // An open pane can be off screen: behind the shown pane at phone width, or
+    // folded into a strip for the Doc. The control shows it; the pane's own
+    // close button closes it. A closed pane can fold as it opens, so opening
+    // also asks to show it.
+    if (narrow || !panes.includes(id) || isPaneFolded?.(id)) openPane(id);
+    else togglePane(id);
   };
 
   const paneBlockedByDeletion = (id: StudioPaneId) =>
@@ -123,15 +140,13 @@ export function StudioPaneToggles() {
   type StudioControlId = StudioPaneId | "past-runs" | "copy-run-link";
   // Visual order, which is also the arrow-key order: run toggle, selector
   // chevron, copy link.
-  const controlIds: StudioControlId[] = STUDIO_PANE_IDS.flatMap((id) =>
+  const controlIds: StudioControlId[] = paneIds.flatMap((id) =>
     id === "overview" && runId ? [id, "past-runs", "copy-run-link"] : [id],
   );
 
   // Roving tabindex (WAI-ARIA toolbar): the cluster is one tab stop; arrow
   // keys move focus across the enabled toggles, Enter/Space toggles/opens.
-  const [focusedId, setFocusedId] = useState<StudioControlId>(
-    STUDIO_PANE_IDS[0]!,
-  );
+  const [focusedId, setFocusedId] = useState<StudioControlId>(paneIds[0]!);
   const enabledIds = controlIds.filter(
     (id) =>
       id === "past-runs" ||
@@ -169,7 +184,7 @@ export function StudioPaneToggles() {
       className="flex shrink-0 items-center gap-1.5"
       onKeyDown={onKeyDown}
     >
-      {STUDIO_PANE_IDS.map((id) => {
+      {paneIds.map((id) => {
         const { icon: Icon } = STUDIO_PANE_META[id];
         // The top-bar run control names the inspected run; it falls back to
         // "Past Runs" when there is no URL-addressed run.
@@ -178,8 +193,9 @@ export function StudioPaneToggles() {
         const blockedByDeletion = paneBlockedByDeletion(id);
         const isRunControl = id === "overview";
         const disabled = blockedByDeletion;
+        const folded = open && Boolean(isPaneFolded?.(id));
         const showActivityDot =
-          id === "browser" && hasUnseenBrowserActivity && !open;
+          id === "browser" && hasUnseenBrowserActivity && (!open || folded);
         // Shown even with the pane open: the request can still be off-screen behind other panes.
         const awaiting = id === "copilot" ? copilotAttention : null;
         const showRunStatusDot = isRunControl && Boolean(runStatus);
@@ -195,23 +211,15 @@ export function StudioPaneToggles() {
             <Icon className="size-3.5" aria-hidden />
             <span className="hidden xl:inline">{label}</span>
             {showActivityDot ? (
-              <span
-                aria-hidden
+              <StudioPaneAttentionDot
+                tone="activity"
                 title="New browser activity"
-                className="absolute -right-0.5 -top-0.5 flex size-2"
-              >
-                <span className="absolute inline-flex h-full w-full rounded-full bg-primary opacity-75 motion-safe:animate-ping" />
-                <span className="relative inline-flex size-2 rounded-full bg-primary" />
-              </span>
+              />
             ) : awaiting ? (
-              <span
-                aria-hidden
+              <StudioPaneAttentionDot
+                tone="waiting"
                 title={`Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`}
-                className="absolute -right-0.5 -top-0.5 flex size-2"
-              >
-                <span className="absolute inline-flex h-full w-full rounded-full bg-amber-500 opacity-75 motion-safe:animate-ping" />
-                <span className="relative inline-flex size-2 rounded-full bg-amber-500" />
-              </span>
+              />
             ) : showRunStatusDot && runStatus ? (
               <span
                 aria-hidden
@@ -350,7 +358,7 @@ export function StudioPaneToggles() {
 
         const tip = blockedByDeletion
           ? "Source agent deleted"
-          : `${open ? "Close" : "Open"} ${label}`;
+          : `${folded ? "Show" : open ? "Close" : "Open"} ${label}`;
         const button = (
           <button
             key={id}

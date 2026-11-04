@@ -36,6 +36,17 @@ const catalogState = vi.hoisted(() => ({
     | undefined,
 }));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({
+    runId: undefined,
+    run: undefined,
+    blocksByLabel: new Map(),
+    loopsByLabel: new Map(),
+    live: false,
+    blockRun: false,
+    unknownLabels: new Set(),
+  }),
+}));
 vi.mock("@/hooks/useIntegrationCatalogQuery", () => ({
   useIntegrationCatalogQuery: () => ({ data: catalogState.data }),
 }));

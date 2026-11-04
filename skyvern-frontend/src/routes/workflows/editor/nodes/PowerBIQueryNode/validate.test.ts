@@ -47,7 +47,7 @@ describe("Power BI query block validation", () => {
     expect(
       validatePowerBIQueryNode(queryNode({ credentialSource: "native" })),
     ).toContain(
-      "Query sales: Select a verified Nango Power BI connection; native connections are no longer supported.",
+      "Query sales: Select a verified Power BI connection; native connections are no longer supported.",
     );
   });
 
