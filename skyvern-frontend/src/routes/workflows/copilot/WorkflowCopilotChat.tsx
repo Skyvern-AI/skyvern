@@ -101,6 +101,7 @@ import {
   CopilotAttachedFile,
   WorkflowCopilotCancelRequest,
   CopilotProposalMetadata,
+  CopilotInFlightTurn,
   CopilotProposalRunFacts,
   WorkflowCopilotCancelSource,
   WorkflowCopilotChatHistoryMessage,
@@ -416,6 +417,7 @@ async function settledWithin(
 
 const RECOVERY_POLL_DELAYS_MS = [2_000, 3_000, 5_000, 8_000, 12_000, 20_000];
 const RECOVERY_POLL_STEADY_MS = 30_000;
+const IN_FLIGHT_DRAFT_POLL_MS = 5_000;
 // The server's RECONCILE_ABANDON_AFTER_SECONDS is 1_320_000ms. The margin holds
 // several 30s reads past it, so a turn whose reply was never persisted reaches
 // both the read that produces its interrupted row and the later one that picks
@@ -426,6 +428,14 @@ const CANONICAL_READ_TIMEOUT_MS = 5_000;
 const REGISTRATION_SAVE_WINDOW_MS = 120_000;
 const REGISTRATION_SAVE_POLL_MS = 2_000;
 const INTERRUPTED_TERMINAL_REASON = "interrupted";
+// Taking the Copilot lock under a save, YAML commit or Accept would toast.
+const editorBusyForCopilotLock = (
+  state: ReturnType<typeof useWorkflowYamlEditorStore.getState>,
+) =>
+  state.commitInProgress ||
+  state.authoringInProgress ||
+  state.copilotAcceptance !== null;
+
 // Only an older backend writes an interrupted row a late reply may still replace.
 const isReplaceableInterruptedRow = (
   outcome: WorkflowCopilotChatHistoryMessage["turn_outcome"],
@@ -2093,6 +2103,8 @@ export function WorkflowCopilotChat({
     reject: () => void;
     reload?: () => void;
     cancelling?: boolean;
+    followingDraft?: boolean;
+    draftApplied?: boolean;
     conflict?: { keep: () => void; discard: () => void };
   } | null>(null);
   // A turn resumed from saved human input has no live SSE controller, but it
@@ -2106,6 +2118,19 @@ export function WorkflowCopilotChat({
       ) => Promise<boolean | undefined>)
     | null
   >(null);
+  const applyInFlightDraftRef = useRef<
+    | ((
+        draft: WorkflowApiResponse,
+        turnId: string,
+        reservation: symbol | undefined,
+        recovery: CanonicalRecovery | null,
+      ) => boolean)
+    | null
+  >(null);
+  const deferredInFlightTurn = useRef<{
+    chatId: string;
+    turn: CopilotInFlightTurn;
+  } | null>(null);
   const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
     string | null
   >(null);
@@ -3453,6 +3478,7 @@ export function WorkflowCopilotChat({
     for (const poll of new Set(recoveryPolls.current.values())) {
       if (!poll.isReserved?.()) poll.stop();
     }
+    deferredInFlightTurn.current = null;
     recoveredTurnOwnerRef.current = null;
   }, []);
 
@@ -3580,6 +3606,9 @@ export function WorkflowCopilotChat({
       let retryRequested = false;
       let rejecting = false;
       let deadlineReached = false;
+      let followingDraft = false;
+      let awaitingUser = false;
+      let appliedDraftAt = Number.NEGATIVE_INFINITY;
 
       const clearTimer = () => {
         if (timer !== null) {
@@ -3721,6 +3750,8 @@ export function WorkflowCopilotChat({
         setRecoveryControls({
           retry,
           cancelling: canonicalRecovery.cancellationRequested,
+          followingDraft,
+          draftApplied: appliedDraftAt > Number.NEGATIVE_INFINITY,
           ...(deadlineReached ? { reload: retry } : {}),
           ...(canonicalRecovery.localDraftConflict
             ? {
@@ -3835,7 +3866,9 @@ export function WorkflowCopilotChat({
         const delay =
           retryRequested || (canonicalRecovery?.acceptChatId && step === 0)
             ? 0
-            : (RECOVERY_POLL_DELAYS_MS[step] ?? RECOVERY_POLL_STEADY_MS);
+            : followingDraft && !awaitingUser
+              ? IN_FLIGHT_DRAFT_POLL_MS
+              : (RECOVERY_POLL_DELAYS_MS[step] ?? RECOVERY_POLL_STEADY_MS);
         retryRequested = false;
         step += 1;
         timer = setTimeout(() => {
@@ -3968,19 +4001,21 @@ export function WorkflowCopilotChat({
               response.data.pending_question_cancel_token ?? null,
             );
           }
-          // The backend can persist the pause before its SSE frame reaches the
-          // browser. Once history proves this poll owns a credential wait, it
-          // must block another turn just like a poll armed from the live frame.
-          if (
-            !ownsTurn &&
+          awaitingUser =
             turnId !== null &&
             (pendingCredentialRequests.some(
               (item) => item.turn_id === turnId,
             ) ||
-              response.data.question_interactions?.some(
-                (item) => item.turn_id === turnId && item.status === "pending",
-              ))
-          ) {
+              Boolean(
+                response.data.question_interactions?.some(
+                  (item) =>
+                    item.turn_id === turnId && item.status === "pending",
+                ),
+              ));
+          // The backend can persist the pause before its SSE frame reaches the
+          // browser. Once history proves this poll owns a credential wait, it
+          // must block another turn just like a poll armed from the live frame.
+          if (!ownsTurn && awaitingUser) {
             if (!claimRecovery()) {
               schedule();
               return;
@@ -3991,6 +4026,43 @@ export function WorkflowCopilotChat({
               recoveredTurnOwnerRef.current = turnId;
               setIsLoading(true);
             }
+          }
+          const inFlightTurn = response.data.in_flight_turn;
+          const wasFollowingDraft = followingDraft;
+          followingDraft =
+            ownsTurn &&
+            holdingReservation &&
+            turnId !== null &&
+            inFlightTurn?.turn_id === turnId;
+          if (followingDraft !== wasFollowingDraft) installRecoveryControls();
+          // An attach right after a chat switch can run before the chat id is presented.
+          if (
+            followingDraft &&
+            isPresented() &&
+            recoveredTurnOwnerRef.current !== turnId
+          ) {
+            recoveredTurnOwnerRef.current = turnId;
+            setIsLoading(true);
+          }
+          const draftAt = parseServerStamp(inFlightTurn?.latest_draft_at ?? "");
+          if (
+            followingDraft &&
+            turnId !== null &&
+            inFlightTurn?.latest_draft &&
+            draftAt > appliedDraftAt &&
+            isPresented() &&
+            !inFlightRef.current &&
+            sendEpoch.current === sendEpochBeforeRead &&
+            applyInFlightDraftRef.current?.(
+              inFlightTurn.latest_draft,
+              turnId,
+              reservation,
+              canonicalRecovery,
+            )
+          ) {
+            const firstDraft = appliedDraftAt === Number.NEGATIVE_INFINITY;
+            appliedDraftAt = draftAt;
+            if (firstDraft) installRecoveryControls();
           }
           const pendingQuestion = response.data.question_interactions?.find(
             (item) => item.turn_id === turnId && item.status === "pending",
@@ -4297,6 +4369,31 @@ export function WorkflowCopilotChat({
             setIsLoading(true);
           }
         }
+        // An answer re-adopts the poll that backed off while the turn waited, so return to the draft cadence now.
+        if (followingDraft) {
+          if (awaitingUser) {
+            awaitingUser = false;
+            if (timer !== null) schedule();
+          }
+        }
+        const deferred = deferredInFlightTurn.current;
+        if (
+          deferred &&
+          holdingReservation &&
+          (recoveryPolls.current.get(deferred.turn.turn_id) === operation ||
+            (deferred.turn.cancel_token != null &&
+              recoveryPolls.current.get(deferred.turn.cancel_token) ===
+                operation))
+        ) {
+          deferredInFlightTurn.current = null;
+          queueMicrotask(() => {
+            if (inFlightRef.current) return;
+            adopt(deferred.chatId, deferred.turn.turn_id, {
+              requestId: deferred.turn.cancel_token ?? deferred.turn.turn_id,
+              ownsTurn: true,
+            });
+          });
+        }
         return true;
       };
       const operation: RecoveryPoll = {
@@ -4437,6 +4534,48 @@ export function WorkflowCopilotChat({
       startRecoveryPoll(snapshot.chatId, null, undefined, reservation);
   };
 
+  const attachInFlightTurn = useCallback(
+    (chatId: string, turn: CopilotInFlightTurn) => {
+      deferredInFlightTurn.current = null;
+      if (inFlightRef.current) return;
+      const turnPoll =
+        recoveryPolls.current.get(turn.turn_id) ??
+        (turn.cancel_token
+          ? recoveryPolls.current.get(turn.cancel_token)
+          : undefined);
+      // The lock may be held by this same turn's poll, which adopts the turn instead of waiting on itself.
+      if (
+        !turnPoll?.isReserved?.() &&
+        editorBusyForCopilotLock(useWorkflowYamlEditorStore.getState())
+      ) {
+        deferredInFlightTurn.current = { chatId, turn };
+        return;
+      }
+      startRecoveryPoll(
+        chatId,
+        turn.turn_id,
+        turn.cancel_token ?? undefined,
+        undefined,
+        true,
+      );
+    },
+    [startRecoveryPoll],
+  );
+
+  useEffect(
+    () =>
+      useWorkflowYamlEditorStore.subscribe((state) => {
+        const deferred = deferredInFlightTurn.current;
+        if (!deferred || editorBusyForCopilotLock(state)) return;
+        deferredInFlightTurn.current = null;
+        if (workflowCopilotChatIdRef.current !== deferred.chatId) return;
+        queueMicrotask(() =>
+          attachInFlightTurn(deferred.chatId, deferred.turn),
+        );
+      }),
+    [attachInFlightTurn],
+  );
+
   const adoptRecoveredTurns = useCallback(
     (
       data: WorkflowCopilotChatHistoryResponse,
@@ -4455,6 +4594,10 @@ export function WorkflowCopilotChat({
             : [],
         ),
       );
+      if (!pending && data.in_flight_turn && data.workflow_copilot_chat_id) {
+        attachInFlightTurn(data.workflow_copilot_chat_id, data.in_flight_turn);
+        return;
+      }
       if (
         !pending &&
         data.workflow_copilot_chat_id &&
@@ -4497,7 +4640,7 @@ export function WorkflowCopilotChat({
           setIsLoading(false);
       }
     },
-    [startRecoveryPoll],
+    [attachInFlightTurn, startRecoveryPoll],
   );
 
   const loadChatInPlace = useCallback(
@@ -5395,6 +5538,34 @@ export function WorkflowCopilotChat({
     ],
   );
   reconcileCanonicalWorkflowRef.current = reconcileCanonicalWorkflow;
+  // The canvas is snapshotted before the first draft lands so a failed or rejected turn restores it.
+  applyInFlightDraftRef.current = (draft, turnId, reservation, recovery) => {
+    if (recovery && !recovery.rollback) {
+      const saveData = saveDataGetter.current();
+      recovery.rollback = {
+        snapshot: captureCopilotEditorState(editorSnapshotCaptureRef.current),
+        settings: structuredClone(saveData?.settings),
+        reviewBaseline: saveData
+          ? reviewBaselineFromSaveData(saveData)
+          : undefined,
+        hadStagedDraft: false,
+        workflowPersisted: false,
+        titlePersisted: false,
+      };
+      turnSnapshots.current.set(turnId, recovery.rollback);
+    }
+    if (
+      !applyWorkflowUpdate(
+        draft,
+        { midTurnDraft: true },
+        reservation,
+        recovery?.preservedSettings,
+      )
+    )
+      return false;
+    if (recovery?.rollback) recovery.rollback.hadStagedDraft = true;
+    return true;
+  };
 
   useEffect(
     () =>
@@ -7067,6 +7238,8 @@ export function WorkflowCopilotChat({
               : item,
           ),
         );
+        // A history read that started before the ack still carries the question as pending.
+        answerEpochRef.current += 1;
         setIsLoading(true);
         if (!streamingAbortController.current) {
           startRecoveryPoll(
@@ -9918,7 +10091,11 @@ export function WorkflowCopilotChat({
             ? "Cancelling the Copilot turn. Checking for saved changes before restoring your draft."
             : recoveryControls.reload
               ? "Could not confirm whether Copilot saved changes. Save is blocked. Retry or reload the saved workflow to check again."
-              : "Copilot is checking for saved changes. Your draft is retained. Reject requests cancellation; changes already saved will be kept."}
+              : recoveryControls.followingDraft
+                ? recoveryControls.draftApplied
+                  ? "The canvas shows Copilot's latest draft and is read-only while the turn runs. Reject cancels the turn and restores your workflow."
+                  : "Copilot is still working on this turn. The canvas is read-only and updates when Copilot saves a draft. Reject cancels the turn and restores your workflow."
+                : "Copilot is checking for saved changes. Your draft is retained. Reject requests cancellation; changes already saved will be kept."}
       </p>
       <div className="flex gap-2">
         {recoveryControls.conflict ? (

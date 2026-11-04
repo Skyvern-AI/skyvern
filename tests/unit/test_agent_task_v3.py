@@ -4930,7 +4930,7 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
 
     async def fake_create_step(**kwargs: Any) -> Any:
         created.append(kwargs)
-        return SimpleNamespace(step_id=f"turn-{kwargs['order']}")
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", order=kwargs["order"], created_at=datetime.now(UTC))
 
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
     finish_turn = AsyncMock()
@@ -4942,7 +4942,14 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         click = RoundAction("click", {"selector": "#go"}, True, billable=True)
         await kwargs["on_action_round"]([click], "clicking", round_done=True)
         await kwargs["on_turn_end"](
-            TurnRecord(turn=1, llm_seconds=1.5, tool_calls=[StepToolCall(tool="click", status="ok", billable=True)])
+            TurnRecord(
+                turn=1,
+                llm_seconds=1.5,
+                tool_calls=[
+                    StepToolCall(tool="click", status="ok", billable=True, duration_seconds=0.75),
+                    StepToolCall(tool="type", status="skipped"),
+                ],
+            )
         )
         steps_by_turn.append(await kwargs["on_turn_start"](2))
         await kwargs["on_turn_end"](
@@ -4950,13 +4957,14 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         )
 
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    step, _task, _loop_mock, post_step = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        on_loop_async=drive_turns,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
+    with capture_logs() as logs:
+        step, _task, _loop_mock, post_step = await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            on_loop_async=drive_turns,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
 
     assert [(c["order"], c["retry_index"], c["status"], c["created_by"]) for c in created] == [
         (1, step.retry_index, StepStatus.running, TASK_V3_TURN_STEP_CREATED_BY),
@@ -4967,7 +4975,17 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         (c.kwargs["step_id"], c.kwargs["status"], [t.tool for t in c.kwargs["output"].tool_calls])
         for c in finish_turn.await_args_list
     ]
-    assert finished == [("turn-1", StepStatus.completed, ["click"]), ("turn-2", StepStatus.completed, ["finish"])]
+    assert finished == [
+        ("turn-1", StepStatus.completed, ["click", "type"]),
+        ("turn-2", StepStatus.completed, ["finish"]),
+    ]
+    # Each finished turn writes its own timing line: a call the loop never dispatched counts, but adds no time.
+    timings = [log for log in logs if log["event"] == "Task V3 turn duration metrics"]
+    assert [
+        (t["turn"], t["turn_step_id"], t["step_status"], t["llm_seconds"], t["tool_seconds"], t["tool_call_count"])
+        for t in timings
+    ] == [(1, "turn-1", StepStatus.completed, 1.5, 0.75, 2), (2, "turn-2", StepStatus.completed, None, 0, 1)]
+    assert all(t["duration_seconds"] >= 0 for t in timings)
     # The click row and the finish decision sit on their turns' steps, still stamped with the round index.
     rows = [c.kwargs["action"] for c in agent_module.app.DATABASE.workflow_params.create_action.await_args_list]
     assert [(row.step_id, row.step_order) for row in rows] == [("turn-1", 0), ("turn-2", 0)]

@@ -28,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import (
+    normalize_blank_totp_identifier,
     normalize_run_metadata,
     normalize_run_with,
 )
@@ -522,6 +523,8 @@ class WorkflowRunRequest(BaseModel):
         description=RUN_FILE_IDS_DOC_STRING,
         examples=[["file_123456789"]],
     )
+
+    _normalize_totp_identifier = field_validator("totp_identifier")(normalize_blank_totp_identifier)
 
     @field_validator("run_with", mode="before")
     @classmethod

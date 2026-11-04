@@ -48,7 +48,7 @@ from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     DEDICATED_BLOCK_TOOLS,
@@ -593,10 +593,25 @@ async def _run_child_block(
         }
     else:
         # A run resolves its secret parameters when it starts, before the converter added these.
-        for parameter in parameters.values():
-            if isinstance(parameter, AWSSecretParameter) and not state.run_context.has_parameter(parameter.key):
-                await state.run_context.register_aws_secret_parameter_value(parameter)
-        report = await _execute_child(child, written, state)
+        temporary_smtp_keys: list[str] = []
+        scope_platform_smtp: bool | None = None
+        try:
+            for parameter in parameters.values():
+                if isinstance(parameter, AWSSecretParameter) and not state.run_context.has_parameter(parameter.key):
+                    is_platform_smtp = _is_platform_smtp_aws_key(parameter.aws_key)
+                    if is_platform_smtp and scope_platform_smtp is None:
+                        scope_platform_smtp = bool(
+                            state.organization_id
+                            and await app.AGENT_FUNCTION.platform_smtp_scoping_required(state.organization_id)
+                        )
+                    await state.run_context.register_aws_secret_parameter_value(parameter, platform_smtp_block=child)
+                    if is_platform_smtp and scope_platform_smtp:
+                        temporary_smtp_keys.append(parameter.key)
+            report = await _execute_child(child, written, state)
+        finally:
+            for key in temporary_smtp_keys:
+                state.run_context.parameters.pop(key, None)
+                state.run_context.values.pop(key, None)
     _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
     state.results[label] = report
     return _window(_masked_text(report, state.run_context), 0, label)

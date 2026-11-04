@@ -83,6 +83,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotToolResultUpdate,
     WorkflowCopilotTurnStartUpdate,
     WorkflowCopilotWorkflowDraftUpdate,
+    client_visible_proposed_workflow,
 )
 
 if TYPE_CHECKING:
@@ -96,6 +97,8 @@ LOG = structlog.get_logger()
 # One budget for a whole batch: the save runs inside the stream consumer, so slow storage would
 # otherwise hold back every later frame.
 _CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS = 5.0
+# The draft write waits on a chat-row lock that heartbeats also take; past this budget the draft is dropped.
+_PENDING_TURN_DRAFT_SAVE_TIMEOUT_SECONDS = 2.0
 
 _OBSERVATION_TOOLS = {
     "evaluate",
@@ -1170,14 +1173,29 @@ async def emit_workflow_draft(
             workflow_dump = workflow.model_dump(mode="json")
         except Exception as dump_err:
             LOG.warning("copilot_workflow_draft_serialization_failed", error=str(dump_err))
+    drafted_at = datetime.now(timezone.utc)
     await stream.send(
         WorkflowCopilotWorkflowDraftUpdate(
             block_count=block_count,
             block_labels=block_labels,
             summary=None,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=drafted_at,
             workflow=workflow_dump,
             code_diffs=[dict(diff) for diff in code_diffs] if code_diffs else None,
             tool_call_id=tool_call_id,
         )
     )
+    if workflow_dump is not None and ctx.workflow_copilot_chat_id:
+        draft = client_visible_proposed_workflow(workflow_dump)
+        # A lost draft only costs a reloaded editor its mid-turn canvas, so it must never fail the turn.
+        try:
+            async with asyncio.timeout(_PENDING_TURN_DRAFT_SAVE_TIMEOUT_SECONDS):
+                await app.DATABASE.workflow_params.record_pending_copilot_turn_draft(
+                    organization_id=ctx.organization_id,
+                    workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+                    turn_id=ctx.turn_id,
+                    draft=draft,
+                    drafted_at=drafted_at,
+                )
+        except Exception:
+            LOG.warning("copilot_pending_turn_draft_save_failed", turn_id=ctx.turn_id, exc_info=True)

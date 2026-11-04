@@ -908,6 +908,18 @@ class ObserverRepository(BaseRepository):
             ).first()
             return found is not None
 
+    @db_operation("get_child_workflow_run_ids")
+    async def get_child_workflow_run_ids(self, workflow_run_id: str, organization_id: str) -> set[str]:
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(WorkflowRunBlockModel.block_workflow_run_id).where(
+                    WorkflowRunBlockModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunBlockModel.organization_id == organization_id,
+                    WorkflowRunBlockModel.block_workflow_run_id.is_not(None),
+                )
+            )
+            return {run_id for run_id in rows if run_id is not None}
+
     @db_operation("get_workflow_run_blocks")
     async def get_workflow_run_blocks(
         self,

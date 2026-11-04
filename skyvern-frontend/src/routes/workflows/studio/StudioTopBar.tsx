@@ -384,6 +384,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const credentialGetter = useCredentialGetter();
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const hasBlockingBlocks = blockingBlocks.length > 0;
+  const docProblemCount = useRunValidationStore((s) => s.docProblemCount);
   const {
     data: retainedRun,
     isError: statusUnavailable,
@@ -403,12 +404,23 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   const hasNoBlocks = useWorkflowHasChangesStore(
     (s) => s.editorHasBlocks === false,
   );
-  const runBlocked = hasNoBlocks || hasBlockingBlocks;
+  // While the Doc lists problems Run stays normal: a click explains and jumps to the first one.
+  const docHasProblems = docProblemCount > 0;
+  const runBlocked = hasNoBlocks || (hasBlockingBlocks && !docHasProblems);
   const runBlockedReason = hasBlockingBlocks
     ? getRunBlockingTooltipText(blockingBlocks)
     : hasNoBlocks
       ? NO_BLOCKS_RUN_TOOLTIP
       : "Run workflow";
+  const showDocProblems = (event?: { preventDefault: () => void }) => {
+    if (runBlocked || !docHasProblems) return false;
+    event?.preventDefault();
+    toast({
+      title: `Fix ${docProblemCount} problem${docProblemCount === 1 ? "" : "s"} before running`,
+    });
+    useRunValidationStore.getState().docShowFirstProblem?.();
+    return true;
+  };
   const rerunEligible = Boolean(
     workflowRun &&
     runIsLogicallyFinal(workflowRun) &&
@@ -516,6 +528,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
                 size="default"
                 className="h-8 border border-transparent px-3 disabled:pointer-events-none"
                 disabled={runBlocked}
+                onClick={showDocProblems}
               >
                 <PlayIcon className="mr-2 size-4" /> Run
               </Button>
@@ -550,7 +563,7 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
   return (
     <ControlTooltip
       content={
-        hasBlockingBlocks || hasNoBlocks
+        runBlocked
           ? runBlockedReason
           : rerunEligible
             ? "Re-run with this run's inputs (opens the run form pre-filled)"
@@ -562,7 +575,9 @@ export function RunStopButton({ stopOnly = false }: { stopOnly?: boolean }) {
         size="default"
         className="h-8 border border-transparent px-3 disabled:pointer-events-none"
         disabled={runBlocked}
-        onClick={startFullRun}
+        onClick={() => {
+          if (!showDocProblems()) startFullRun();
+        }}
       >
         <PlayIcon className="mr-2 size-4" />
         {rerunEligible ? "Re-run" : "Run"}

@@ -2347,6 +2347,9 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return (
             f"Read characters {result.get('offset')}-{end} of {result.get('total_chars')} from {result.get('filename')}"
         )
+    if tool_name == "read_chat_history":
+        messages = result.get("messages")
+        return f"Read {len(messages) if isinstance(messages, list) else 0} earlier message(s) in this chat"
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0
@@ -2404,6 +2407,8 @@ def summarize_tool_result_detail(
     """
     if result.get("ok", False) if success is None else success:
         return None
+    if tool_name == "read_chat_history":
+        return _USER_FACING_CHAT_HISTORY_FAILURE
     structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
     if structured is not None:
         return structured
@@ -2441,6 +2446,7 @@ _INTERNAL_VALIDATION_MARKERS: tuple[str, ...] = (INTERNAL_VALIDATION_FAILURE_PRE
 
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
 _USER_FACING_GENERIC_FAILURE = _STRUCTURED_UNSAFE_FALLBACK
+_USER_FACING_CHAT_HISTORY_FAILURE = "Could not read earlier messages in this chat"
 
 _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
     {
@@ -2489,6 +2495,8 @@ def format_tool_result_for_user(
     if _is_unconfirmed_extension(result):
         return summarize_tool_result(tool_name, result, for_display=True)
     if not result.get("ok", False):
+        if tool_name == "read_chat_history":
+            return _USER_FACING_CHAT_HISTORY_FAILURE
         structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
         if structured is not None:
             return structured

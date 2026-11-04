@@ -6927,7 +6927,6 @@ local = [
     { name = "tornado" },
     { name = "urllib3" },
     { name = "websockets" },
-    { name = "yutori" },
     { name = "zstandard" },
 ]
 server = [
@@ -7001,8 +7000,10 @@ server = [
     { name = "urllib3" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
-    { name = "yutori" },
     { name = "zstandard" },
+]
+yutori = [
+    { name = "yutori" },
 ]
 
 [package.dev-dependencies]
@@ -7033,6 +7034,7 @@ cloud = [
     { name = "stripe" },
     { name = "temporalio", extra = ["opentelemetry"] },
     { name = "xlsxwriter" },
+    { name = "yutori" },
 ]
 dev = [
     { name = "aiosqlite" },
@@ -7209,12 +7211,11 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.44.0" },
     { name = "websockets", marker = "extra == 'local'", specifier = ">=14.0,<15.1" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=14.0,<15.1" },
-    { name = "yutori", marker = "extra == 'local'", specifier = ">=0.8.1" },
-    { name = "yutori", marker = "extra == 'server'", specifier = ">=0.8.1" },
+    { name = "yutori", marker = "extra == 'yutori'", specifier = ">=0.8.1" },
     { name = "zstandard", marker = "extra == 'local'", specifier = ">=0.25.0" },
     { name = "zstandard", marker = "extra == 'server'", specifier = ">=0.25.0" },
 ]
-provides-extras = ["local", "server"]
+provides-extras = ["local", "server", "yutori"]
 
 [package.metadata.requires-dev]
 cloud = [
@@ -7245,6 +7246,7 @@ cloud = [
     { name = "temporalio", specifier = ">=1.6.0,<2" },
     { name = "temporalio", extras = ["opentelemetry"], specifier = ">=1.6.0,<2" },
     { name = "xlsxwriter", specifier = ">=3.2.9,<4" },
+    { name = "yutori", specifier = ">=0.8.1" },
 ]
 dev = [
     { name = "aiosqlite", specifier = ">=0.21.0,<0.23" },

@@ -6,8 +6,7 @@ import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTexta
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { MicrosoftOAuthCredentialSelector } from "@/routes/workflows/components/MicrosoftOAuthCredentialSelector";
-import { MICROSOFT_POWERBI_REQUIRED_SCOPES } from "@/util/microsoftScopes";
+import { CredentialSourceSelector } from "@/routes/workflows/components/CredentialSourceSelector";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 
@@ -62,17 +61,18 @@ function PowerBIQueryEditorBody({
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label className="text-xs text-tertiary-foreground">
-            Microsoft Power BI connection
+            Power BI account
           </Label>
-          <HelpTooltip content="Choose an active Microsoft connection with Power BI dataset-read access." />
+          <HelpTooltip content="Choose a connected Power BI account with dataset-read access." />
         </div>
-        <MicrosoftOAuthCredentialSelector
-          nodeId={blockId}
-          value={data.connectionId}
-          onChange={(connectionId) => update({ connectionId })}
-          editable={canEdit}
-          integrationName="Power BI"
-          requiredScopes={MICROSOFT_POWERBI_REQUIRED_SCOPES}
+        <CredentialSourceSelector
+          provider="powerbi"
+          credentialSource={data.credentialSource ?? "native"}
+          connectionId={data.connectionId}
+          disabled={!canEdit}
+          onChange={(credentialSource, connectionId) =>
+            update({ credentialSource, connectionId })
+          }
         />
       </div>
 

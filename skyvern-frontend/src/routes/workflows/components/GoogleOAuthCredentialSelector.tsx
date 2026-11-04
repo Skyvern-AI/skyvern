@@ -26,6 +26,14 @@ type Props = {
   onChange: (value: string) => void;
   requiredScopes: readonly string[];
   optional?: boolean;
+  disabled?: boolean;
+  ariaLabel?: string;
+  showEmail?: boolean;
+  additionalAccounts?: {
+    options: Array<{ id: string; label: string; disabled?: boolean }>;
+    selectedId?: string;
+    onSelect: (id: string) => void;
+  };
   // Offer only accounts the server reports as able to send mail, and never pick one for the user.
   gmailSendOnly?: boolean;
 };
@@ -33,6 +41,8 @@ type Props = {
 const ADVANCED_OPTION = "__advanced__";
 const SETTINGS_OPTION = "__settings__";
 const NONE_OPTION = "__none__";
+const NATIVE_PREFIX = "__google_account__:";
+const ADDITIONAL_PREFIX = "__connected_account__:";
 
 function GoogleOAuthCredentialSelector({
   nodeId,
@@ -41,12 +51,16 @@ function GoogleOAuthCredentialSelector({
   requiredScopes,
   optional = false,
   gmailSendOnly = false,
+  disabled = false,
+  ariaLabel,
+  showEmail = false,
+  additionalAccounts,
 }: Readonly<Props>) {
   const {
     credentials: allCredentials,
     isLoading,
     isFetching,
-  } = useGoogleOAuthCredentials();
+  } = useGoogleOAuthCredentials({ includeEmail: showEmail });
   const canAuthorize = useHasCapability("google_oauth.authorize");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const credentials = allCredentials.filter(
@@ -58,7 +72,11 @@ function GoogleOAuthCredentialSelector({
 
   // If the value looks like a Jinja template, default to advanced mode
   const isTemplateValue = value.includes("{{") || value.includes("{%");
-  const useAdvanced = !gmailSendOnly && (showAdvanced || isTemplateValue);
+  const hasAdditionalSelection = additionalAccounts?.selectedId !== undefined;
+  const useAdvanced =
+    !gmailSendOnly &&
+    !hasAdditionalSelection &&
+    (showAdvanced || isTemplateValue);
 
   const hasCredentials = credentials.length > 0;
   const isKnownCredential = credentials.some((c) => c.id === value);
@@ -79,7 +97,13 @@ function GoogleOAuthCredentialSelector({
       (c) => c.id === value && isGoogleOAuthCredentialActive(c),
     );
   const firstValidId = getDefaultGoogleOAuthCredentialId(credentials);
-  const needsAutoFill = !optional && !gmailSendOnly && !value;
+  const needsAutoFill =
+    !disabled &&
+    !optional &&
+    !gmailSendOnly &&
+    !showAdvanced &&
+    !hasAdditionalSelection &&
+    !value;
 
   useOAuthCredentialAutoFill({
     nodeId,
@@ -93,12 +117,14 @@ function GoogleOAuthCredentialSelector({
   });
 
   const handlePickerValueChange = (selected: string) => {
+    if (disabled) return;
     if (selected === NONE_OPTION) {
       onChange("");
       return;
     }
     if (selected === ADVANCED_OPTION) {
       setShowAdvanced(true);
+      if (hasAdditionalSelection) onChange("");
       return;
     }
 
@@ -107,7 +133,15 @@ function GoogleOAuthCredentialSelector({
       return;
     }
 
-    onChange(selected);
+    if (additionalAccounts && selected.startsWith(ADDITIONAL_PREFIX)) {
+      additionalAccounts.onSelect(selected.slice(ADDITIONAL_PREFIX.length));
+      return;
+    }
+    onChange(
+      additionalAccounts && selected.startsWith(NATIVE_PREFIX)
+        ? selected.slice(NATIVE_PREFIX.length)
+        : selected,
+    );
   };
 
   const handleUseAccountPicker = () => {
@@ -134,9 +168,12 @@ function GoogleOAuthCredentialSelector({
             onChange={onChange}
             placeholder="{{ google_credential_id }}"
             className="nopan text-xs"
+            disabled={disabled}
+            aria-label={ariaLabel}
           />
           <button
             type="button"
+            disabled={disabled}
             onClick={handleUseAccountPicker}
             className="text-xs text-muted-foreground underline hover:text-tertiary-foreground"
           >
@@ -178,24 +215,56 @@ function GoogleOAuthCredentialSelector({
             </p>
           ) : null}
 
-          <Select value={value} onValueChange={handlePickerValueChange}>
-            <SelectTrigger className="nopan text-xs">
+          <Select
+            value={
+              hasAdditionalSelection
+                ? `${ADDITIONAL_PREFIX}${additionalAccounts.selectedId}`
+                : additionalAccounts && value
+                  ? `${NATIVE_PREFIX}${value}`
+                  : value
+            }
+            onValueChange={handlePickerValueChange}
+            disabled={disabled}
+          >
+            <SelectTrigger className="nopan text-xs" aria-label={ariaLabel}>
               <SelectValue placeholder="Select a Google account" />
             </SelectTrigger>
-            <SelectContent>
+            <SelectContent
+              className={showEmail ? "ph-no-capture" : undefined}
+              data-private={showEmail ? "" : undefined}
+            >
               {optional || gmailSendOnly ? (
                 <SelectItem value={NONE_OPTION}>No Google account</SelectItem>
               ) : null}
 
               {credentials.map((cred) => (
-                <CustomSelectItem key={cred.id} value={cred.id}>
+                <CustomSelectItem
+                  key={cred.id}
+                  value={
+                    additionalAccounts ? `${NATIVE_PREFIX}${cred.id}` : cred.id
+                  }
+                >
                   <div className="space-y-0.5">
                     <p className="text-sm font-medium">
-                      <SelectItemText>{cred.credential_name}</SelectItemText>
+                      <SelectItemText>
+                        {showEmail
+                          ? cred.email_address || cred.credential_name
+                          : cred.credential_name}
+                      </SelectItemText>
                     </p>
                     <p className="text-xs text-muted-foreground">{cred.id}</p>
                   </div>
                 </CustomSelectItem>
+              ))}
+
+              {additionalAccounts?.options.map((account) => (
+                <SelectItem
+                  key={account.id}
+                  value={`${ADDITIONAL_PREFIX}${account.id}`}
+                  disabled={account.disabled}
+                >
+                  {account.label}
+                </SelectItem>
               ))}
 
               <SelectItem value={SETTINGS_OPTION} disabled={!canAuthorize}>

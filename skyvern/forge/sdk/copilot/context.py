@@ -388,6 +388,7 @@ if TYPE_CHECKING:
         DeliveredOutputFile,
         TurnOutcome,
     )
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatSender
 
 
 class UrlVisit(BaseModel):
@@ -1257,6 +1258,14 @@ class AgentResult:
 
 
 @dataclass(frozen=True)
+class ChatHistoryRow:
+    message_id: str
+    sender: WorkflowCopilotChatSender
+    created_at: str
+    text: str
+
+
+@dataclass(frozen=True)
 class InFlightStreamToolCall:
     call_id: str
     tool_name: str
@@ -1326,6 +1335,10 @@ class CopilotContext(AgentContext):
     selected_block_label: str | None = None
     doc_editor_enabled: bool = False
     turn_context_packet: TurnContextPacket | None = None
+    # Renders this chat's rows older than the chat_history window, oldest first, only when first called.
+    earlier_chat_history_rows: Callable[[], tuple[ChatHistoryRow, ...]] = tuple
+    chat_history_oldest_shown_id: str | None = None
+    earlier_chat_history_unavailable: bool = False
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged Google
     # connection that has no run authority. This never grants authority itself.

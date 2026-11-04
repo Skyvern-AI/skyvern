@@ -20,6 +20,7 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration, TaskGenerationBase
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
+from skyvern.forge.sdk.services import request_principal
 from skyvern.schemas.runs import RunEngine, RunStatus, RunType
 from skyvern.services import uploaded_file_service
 from skyvern.utils.url_validators import validate_fetch_url
@@ -119,6 +120,21 @@ async def run_task(
     ab_routing_eligible: bool = True,
     file_ids: list[str] | None = None,
 ) -> tuple[Task, RunEngine]:
+    if task.totp_identifier is not None and not task.totp_identifier.strip():
+        task.totp_identifier = None
+    if task.browser_session_id or task.totp_identifier:
+        principal = request_principal.get_request_principal()
+        if principal is not None and principal.organization_id != organization.organization_id:
+            raise HTTPException(status_code=403, detail="Credential not accessible")
+        try:
+            if task.browser_session_id:
+                await app.AGENT_FUNCTION.enforce_browser_session_credential_use(principal, task.browser_session_id)
+            if task.totp_identifier:
+                await app.AGENT_FUNCTION.enforce_task_totp_credential_use(
+                    principal, organization.organization_id, task.totp_identifier
+                )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail="Credential not accessible") from exc
     if engine == RunEngine.ui_tars and not settings.ENABLE_VOLCENGINE:
         raise InvalidTaskV1ModelError("The ui-tars engine is not enabled on this server")
     await _validate_task_v1_model_for_org(organization, task.model)

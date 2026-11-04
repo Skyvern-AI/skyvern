@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
 import structlog
-from yutori.navigator import format_stop_and_summarize, screenshot_to_data_url
 
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.models import Step
@@ -150,6 +149,8 @@ class YutoriNavigatorLLMCaller(LLMCaller):
         if not self._pending_tool_calls:
             return
 
+        from yutori.navigator import screenshot_to_data_url
+
         data_url = screenshot_to_data_url(screenshot_bytes)
         image_content = {"type": "image_url", "image_url": {"url": data_url}}
 
@@ -184,6 +185,8 @@ class YutoriNavigatorLLMCaller(LLMCaller):
         if self.message_history:
             return  # Already initialized
 
+        from yutori.navigator import screenshot_to_data_url
+
         data_url = screenshot_to_data_url(screenshot_bytes)
         user_content: list[dict[str, Any]] = []
         if self._task:
@@ -201,6 +204,8 @@ class YutoriNavigatorLLMCaller(LLMCaller):
             self.add_initial_message(screenshot_bytes)
         if self._pending_tool_calls:
             self.flush_pending_tool_results(screenshot_bytes, current_url)
+
+        from yutori.navigator import format_stop_and_summarize, screenshot_to_data_url
 
         task_goal = self._task.navigation_goal if self._task else "the given task"
         data_url = screenshot_to_data_url(screenshot_bytes)

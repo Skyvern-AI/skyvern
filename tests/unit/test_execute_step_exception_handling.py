@@ -46,6 +46,7 @@ from skyvern.exceptions import (
     InvalidTaskStatusTransition,
     MissingBrowserStatePage,
     ScrapingFailed,
+    SkyvernExtraNotInstalled,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
@@ -61,6 +62,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.schemas.runs import RunEngine
 from skyvern.webeye.browser_errors import BrowserTargetClosedError
 from skyvern.webeye.browser_state import BROWSER_CONNECTION_LOST_USER_MESSAGE
 from tests.unit._external_cdp_fakes import external_session_row
@@ -116,6 +118,7 @@ async def _drive_execute_step(
     browser_session_id: str | None = None,
     workflow_run_id: str | None = None,
     agent: ForgeAgent | None = None,
+    engine: RunEngine = RunEngine.skyvern_v1,
 ) -> ExecuteStepOutcome:
     """Run ``execute_step`` so that ``exc`` is raised at the first in-``try`` await."""
     agent = agent or ForgeAgent()
@@ -155,6 +158,7 @@ async def _drive_execute_step(
             api_key="api-key",
             download_baseline_files=[],
             browser_session_id=browser_session_id,
+            engine=engine,
         )
     except BaseException as caught:  # noqa: BLE001 - we characterize which exceptions propagate
         raised = caught
@@ -167,6 +171,19 @@ async def _drive_execute_step(
         fail_task=fail_task_mock,
         clean_up_task=clean_up_task_mock,
     )
+
+
+@pytest.mark.asyncio
+async def test_missing_yutori_fails_and_cleans_up_the_selected_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("skyvern.exceptions.find_spec", lambda _name: None)
+    outcome = await _drive_execute_step(
+        monkeypatch, RuntimeError("must not reach validation"), engine=RunEngine.yutori_navigator
+    )
+
+    assert outcome.raised is None
+    assert outcome.fail_task_called and outcome.cleanup_called
+    assert isinstance(outcome.fail_task.await_args.kwargs["exception"], SkyvernExtraNotInstalled)
+    assert 'pip install "skyvern[yutori]"' in outcome.fail_task.await_args.args[2]
 
 
 @dataclass(frozen=True)

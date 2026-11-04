@@ -28,7 +28,7 @@ from skyvern.forge.sdk.routes.streaming.screencast import (
     wait_for_browser_state,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
-from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
 from skyvern.forge.sdk.streaming.registries import (
     add_cdp_input_channel,
     del_cdp_input_channel,
@@ -841,7 +841,19 @@ async def cdp_input_stream(
                     nonlocal last_browser_session_id
                     browser_session_id = await resolve_browser_session_id()
                     if browser_session_id is None:
-                        return last_browser_session_id is None
+                        if last_browser_session_id is not None:
+                            return False
+                        if isinstance(principal, RequestPrincipal) and principal.api_key_access_mode == "scoped":
+                            return await app.AGENT_FUNCTION.reauthorize_workflow_run_stream(
+                                principal,
+                                organization_id,
+                                workflow_run_id,
+                                "browser_session.connect",
+                                folder_action="workflow_run.execute",
+                            )
+                        return await app.AGENT_FUNCTION.reauthorize_workflow_run_stream(
+                            principal, organization_id, workflow_run_id, "workflow_run.execute"
+                        )
                     authorized = await app.AGENT_FUNCTION.reauthorize_browser_session_stream(
                         principal, organization_id, browser_session_id
                     )

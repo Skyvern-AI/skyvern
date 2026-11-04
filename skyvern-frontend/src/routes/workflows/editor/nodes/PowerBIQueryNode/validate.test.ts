@@ -27,7 +27,8 @@ function queryNode(
 }
 
 describe("Power BI query block validation", () => {
-  it("defaults to 1000 rows and requires connection, dataset, and query", () => {
+  it("defaults to Nango and 1000 rows and requires connection, dataset, and query", () => {
+    expect(powerBIQueryNodeDefaultData.credentialSource).toBe("nango");
     expect(powerBIQueryNodeDefaultData.maxRows).toBe(
       POWERBI_QUERY_DEFAULT_MAX_ROWS,
     );
@@ -40,6 +41,14 @@ describe("Power BI query block validation", () => {
       "Query sales: Dataset ID is required.",
       "Query sales: DAX query is required.",
     ]);
+  });
+
+  it("requires explicit migration from a saved native connection", () => {
+    expect(
+      validatePowerBIQueryNode(queryNode({ credentialSource: "native" })),
+    ).toContain(
+      "Query sales: Select a verified Nango Power BI connection; native connections are no longer supported.",
+    );
   });
 
   it.each([0, -1, 1.5, POWERBI_QUERY_MAX_ROWS + 1, Number.NaN])(

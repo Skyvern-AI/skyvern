@@ -2174,11 +2174,7 @@ class Block(BaseModel, abc.ABC):
         try:
             if isinstance(self, BaseTaskBlock):
                 engine = self.resolve_engine(workflow_run_id)
-                if (
-                    engine == RunEngine.skyvern_v3
-                    and download_timeout_context is not None
-                    and not download_timeout_context.script_mode
-                ):
+                if download_timeout_context is not None and not download_timeout_context.script_mode:
                     download_timeout_context.download_timeout = self.download_timeout
 
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(

@@ -1218,13 +1218,17 @@ def _build_litellm_router(llm_config: LLMRouterConfig) -> litellm.Router:
 # used by both the step engine and LLMCaller currently has two Router instances (two redis pools,
 # independent cooldown state). Accepted at current v3 volume; unifying the two is a follow-up.
 _LLMCALLER_ROUTER_CACHE: dict[str, litellm.Router] = {}
+# The config each cached router was built from: a config replaced after the router was cached (for example by a
+# registry config transform) gets a new router instead of the stale one.
+_LLMCALLER_ROUTER_CONFIGS: dict[str, LLMRouterConfig] = {}
 
 
 def _get_or_build_cached_router(llm_key: str, llm_config: LLMRouterConfig) -> litellm.Router:
     cached = _LLMCALLER_ROUTER_CACHE.get(llm_key)
-    if cached is None:
+    if cached is None or _LLMCALLER_ROUTER_CONFIGS.get(llm_key) is not llm_config:
         cached = _build_litellm_router(llm_config)
         _LLMCALLER_ROUTER_CACHE[llm_key] = cached
+        _LLMCALLER_ROUTER_CONFIGS[llm_key] = llm_config
     return cached
 
 
@@ -1232,6 +1236,8 @@ class LLMAPIHandlerFactory:
     _custom_handlers: dict[str, LLMAPIHandler] = {}
     _handler_cache: dict[str, tuple[LLMConfig, LLMAPIHandler]] = {}
     _router_handler_cache: dict[str, LLMAPIHandler] = {}
+    # Config each cached router handler was built from; see _LLMCALLER_ROUTER_CONFIGS.
+    _router_handler_configs: dict[str, LLMRouterConfig] = {}
 
     @staticmethod
     def _strip_static_prompt_from_messages(messages: list[dict[str, Any]], static_prompt: str) -> bool:
@@ -2039,10 +2045,10 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def get_llm_api_handler_with_router(llm_key: str) -> LLMAPIHandler:
-        if llm_key in LLMAPIHandlerFactory._router_handler_cache:
-            return LLMAPIHandlerFactory._router_handler_cache[llm_key]
-
         llm_config = LLMConfigRegistry.get_config(llm_key)
+        cached = LLMAPIHandlerFactory._router_handler_cache.get(llm_key)
+        if cached is not None and LLMAPIHandlerFactory._router_handler_configs.get(llm_key) is llm_config:
+            return cached
         if not isinstance(llm_config, LLMRouterConfig):
             raise InvalidLLMConfigError(llm_key)
 
@@ -2893,6 +2899,7 @@ class LLMAPIHandlerFactory:
 
         llm_api_handler_with_router_and_fallback.llm_key = llm_key  # type: ignore[attr-defined]
         LLMAPIHandlerFactory._router_handler_cache[llm_key] = llm_api_handler_with_router_and_fallback
+        LLMAPIHandlerFactory._router_handler_configs[llm_key] = llm_config
         return llm_api_handler_with_router_and_fallback
 
     @staticmethod
@@ -4835,10 +4842,11 @@ class LLMCaller:
         **active_parameters: dict[str, Any],
     ) -> ModelResponse:
         """Call the Yutori Navigator API via the Yutori SDK client."""
-        from yutori.navigator import estimate_messages_size_bytes, trimmed_messages_to_fit
-
-        if not app.YUTORI_CLIENT:
+        yutori_client = app.get_yutori_client()
+        if not yutori_client:
             raise ValueError("YUTORI_CLIENT not initialized. Ensure ENABLE_YUTORI=true and YUTORI_API_KEY is set.")
+
+        from yutori.navigator import estimate_messages_size_bytes, trimmed_messages_to_fit
 
         # Trim old screenshots if payload exceeds size limit
         max_bytes = 9_500_000
@@ -4858,7 +4866,7 @@ class LLMCaller:
             messages_length=len(messages),
         )
 
-        completion = await app.YUTORI_CLIENT.chat.completions.create(
+        completion = await yutori_client.chat.completions.create(
             model=model_name,
             messages=messages,
             max_completion_tokens=max_tokens,

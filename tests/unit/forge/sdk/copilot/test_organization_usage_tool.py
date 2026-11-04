@@ -81,6 +81,7 @@ CATALOG_WITHOUT_THIS_TOOL = [
     "extend_browser_session",
     "upload_attached_file",
     "read_attached_pdf",
+    "read_chat_history",
     "reply",
 ]
 

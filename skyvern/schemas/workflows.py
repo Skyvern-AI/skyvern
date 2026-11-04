@@ -6,7 +6,7 @@ import textwrap
 import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Annotated, Any, Literal, Protocol, TypeVar
+from typing import Annotated, Any, Literal, Protocol, TypeVar, get_args
 
 import structlog
 from jsonschema import Draft202012Validator
@@ -24,6 +24,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from pydantic_core import to_jsonable_python
 
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
@@ -1524,6 +1525,18 @@ class TerminateBlockYAML(BlockYAML):
         return value
 
 
+AGENT_STEP_LLM_FLAG = "AGENT_BLOCK_LLM_NAME"
+AGENT_STEP_NOT_ENABLED_MESSAGE = (
+    f"The agent_step block requires {AGENT_STEP_LLM_FLAG} to be enabled for this organization, and it could not be "
+    "confirmed. Remove the block or ask for the flag to be enabled."
+)
+AGENT_STEP_BLOCK_SUMMARY = (
+    "one model-driven step that decides and acts with this run's blocks, with or without the browser, "
+    "so it can look things up across sites, branch on what it finds and write the answer. It returns fields "
+    "matching its data_schema. The editor labels it the Agent block (block type `agent_step`)"
+)
+
+
 class AgentStepBlockYAML(BlockYAML):
     block_type: Literal[BlockType.AGENT_STEP] = BlockType.AGENT_STEP  # type: ignore
 
@@ -1812,6 +1825,8 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
 class EmailInboxBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
     email_client: Literal["gmail", "outlook"]
+    credential_source: Literal["native", "nango"] = "native"
+    connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     folder: str | None = None
     prompt: str | None = None
@@ -1914,6 +1929,9 @@ BLOCK_YAML_SUBCLASSES = (
     | PowerBIQueryBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
+BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
+    to_jsonable_python(model.model_fields["block_type"].default): model for model in get_args(BLOCK_YAML_SUBCLASSES)
+}
 
 
 def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASSES]) -> bool:

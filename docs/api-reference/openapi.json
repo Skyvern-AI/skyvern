@@ -11336,7 +11336,7 @@
           "degraded_fresh"
         ],
         "title": "BrowserSeedSource",
-        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved once at run setup, before any browser creation, for all run types (C-semantics).\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
+        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved at run setup, before any browser creation, for all run types (C-semantics). A\nserialized Save & Reuse run re-resolves once more after the sequential wait, so a profile an\nearlier run in its lane saved while it was queued becomes own_memory rather than a stale pick.\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -14713,6 +14713,26 @@
             ],
             "title": "Email Client"
           },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "credential_id": {
             "anyOf": [
               {
@@ -14920,6 +14940,27 @@
               "outlook"
             ],
             "title": "Email Client"
+          },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id",
+            "x-skyvern-connected-account": true
           },
           "credential_id": {
             "anyOf": [

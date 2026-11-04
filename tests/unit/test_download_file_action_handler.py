@@ -18,7 +18,12 @@ from structlog.testing import capture_logs
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOAD_TIMEOUT, BROWSER_DOWNLOADING_SUFFIX
-from skyvern.errors.errors import UserDefinedError
+from skyvern.errors.errors import (
+    BROWSER_DOWNLOAD_FAILED_CODE,
+    BROWSER_DOWNLOAD_FAILED_REASON,
+    BROWSER_DOWNLOAD_LIMIT_EXCEEDED_CODE,
+    UserDefinedError,
+)
 from skyvern.exceptions import BROWSER_CONNECTION_LOST_ERROR_CODE, BlockedHost, MissingBrowserState
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -8006,6 +8011,47 @@ async def test_successful_download_never_stamps_observed_failure_status() -> Non
     assert results[-1].download_triggered is True
     assert results[-1].downloaded_files == action.downloaded_files == ["local.pdf"]
     assert results[-1].download_failure_status is None
+
+
+@pytest.mark.asyncio
+async def test_capture_failure_alongside_a_saved_file_keeps_the_action_failure() -> None:
+    # The action layer has no persistence verdict, so a refused capture stays an action failure even when a
+    # file landed; the saved file is still recorded for the complete-on-download seam to verify.
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([]))
+    with patch(
+        "skyvern.webeye.actions.handler.finish_requested_download_for_context",
+        return_value={
+            "error_code": BROWSER_DOWNLOAD_FAILED_CODE,
+            "reasoning": BROWSER_DOWNLOAD_FAILED_REASON,
+            "error_type": "SYSTEM_DEFINED_ERROR",
+        },
+    ):
+        results, action = await _run_download_action_with_provider_source(
+            source, inner=lambda run_dir: (run_dir / "local.pdf").write_bytes(b"local")
+        )
+
+    assert isinstance(results[-1], ActionFailure)
+    assert action.downloaded_files == ["local.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_cap_breach_alongside_a_saved_file_still_fails_the_action() -> None:
+    # A cap breach drops a file the caller asked for, so a sibling file that did land does not make the
+    # action whole and the failure must survive.
+    source = _ActionDownloadSource(_FakeActionDownloadObservation([]))
+    with patch(
+        "skyvern.webeye.actions.handler.finish_requested_download_for_context",
+        return_value={
+            "error_code": BROWSER_DOWNLOAD_LIMIT_EXCEEDED_CODE,
+            "reasoning": "The requested browser download exceeded the configured limit.",
+            "error_type": "SYSTEM_DEFINED_ERROR",
+        },
+    ):
+        results, _action = await _run_download_action_with_provider_source(
+            source, inner=lambda run_dir: (run_dir / "local.pdf").write_bytes(b"local")
+        )
+
+    assert isinstance(results[-1], ActionFailure)
 
 
 async def _run_download_click_with_status_published_during_teardown(

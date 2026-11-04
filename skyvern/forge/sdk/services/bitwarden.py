@@ -706,11 +706,19 @@ class BitwardenConstants(StrEnum):
     SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET = "SKYVERN_AUTH_BITWARDEN_CLIENT_SECRET"
 
 
-class BitwardenLoginSecret(dict[str, str]):
+class BitwardenItemSecret(dict[str, str]):
+    """Vault fields with the identity of the selected item."""
+
+    def __init__(self, fields: dict[str, str], item_id: str | None) -> None:
+        super().__init__(fields)
+        self.item_id = item_id
+
+
+class BitwardenLoginSecret(BitwardenItemSecret):
     """A login's fields, carrying the sites its item is saved for."""
 
-    def __init__(self, fields: dict[str, str], login_sites: list[LoginSite]) -> None:
-        super().__init__(fields)
+    def __init__(self, fields: dict[str, str], login_sites: list[LoginSite], item_id: str | None = None) -> None:
+        super().__init__(fields, item_id)
         self.login_sites = login_sites
 
 
@@ -718,9 +726,10 @@ class BitwardenQueryResult(BaseModel):
     credential: dict[str, str]
     uris: list[str]
     login_sites: list[LoginSite]
+    item_id: str | None = None
 
     def secret(self) -> BitwardenLoginSecret:
-        return BitwardenLoginSecret(self.credential, self.login_sites)
+        return BitwardenLoginSecret(self.credential, self.login_sites, self.item_id)
 
 
 class RunCommandResult(BaseModel):
@@ -1309,6 +1318,7 @@ class BitwardenService:
                         BitwardenConstants.TOTP: totp,
                     },
                     _connected_vault_login_sites(login),
+                    item_id,
                 )
             elif not url:
                 # if item_id is not provided, we need a url to search for items
@@ -1373,6 +1383,7 @@ class BitwardenService:
                         },
                         uris=[uri.get("uri") for uri in login.get("uris") or [] if uri.get("uri")],
                         login_sites=_connected_vault_login_sites(login),
+                        item_id=item.get("id"),
                     )
                 )
 
@@ -1534,7 +1545,7 @@ class BitwardenService:
                 ):
                     sensitive_information[field] = identity_item["identity"][field]
 
-            return sensitive_information
+            return BitwardenItemSecret(sensitive_information, identity_item.get("id"))
 
         identity = _VaultIdentity.resolve(client_id, client_secret, email, master_password)
         return await BitwardenService._with_cli_session(

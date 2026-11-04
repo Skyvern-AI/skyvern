@@ -11,6 +11,32 @@ type WorkflowPresentationStore = {
   setPresentation: (presentation: WorkflowPresentation) => void;
 };
 
+const storageKey = (workflowPermanentId: string) =>
+  `skyvern.workflowPresentation.${workflowPermanentId}`;
+
+function readStored(workflowPermanentId: string | null): WorkflowPresentation {
+  if (!workflowPermanentId) return "visual";
+  try {
+    return localStorage.getItem(storageKey(workflowPermanentId)) === "doc"
+      ? "doc"
+      : "visual";
+  } catch {
+    return "visual";
+  }
+}
+
+function writeStored(
+  workflowPermanentId: string | null,
+  presentation: WorkflowPresentation,
+) {
+  if (!workflowPermanentId) return;
+  try {
+    localStorage.setItem(storageKey(workflowPermanentId), presentation);
+  } catch {
+    // A choice that can't be remembered still applies to this tab.
+  }
+}
+
 // YAML owns its transaction and active state. Presentation is its return target.
 export const useWorkflowPresentationStore = create<WorkflowPresentationStore>(
   (set, get) => ({
@@ -28,15 +54,16 @@ export const useWorkflowPresentationStore = create<WorkflowPresentationStore>(
       set({
         workflowPermanentId,
         enabled,
-        presentation: "visual",
+        // Only an agent whose Doc is available reopens in the Doc; with the flag off it is always Visual.
+        presentation: enabled ? readStored(workflowPermanentId) : "visual",
         generation: state.generation + 1,
       });
     },
     setPresentation: (presentation) => {
-      set({
-        presentation:
-          presentation === "doc" && !get().enabled ? "visual" : presentation,
-      });
+      const { enabled, workflowPermanentId } = get();
+      const next = presentation === "doc" && !enabled ? "visual" : presentation;
+      set({ presentation: next });
+      if (enabled) writeStored(workflowPermanentId, next);
     },
   }),
 );

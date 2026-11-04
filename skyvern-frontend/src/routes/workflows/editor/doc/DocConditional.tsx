@@ -3,6 +3,7 @@ import {
   ArrowRightIcon,
   CheckIcon,
   ChevronDownIcon,
+  ChevronRightIcon,
   CodeIcon,
   DotsHorizontalIcon,
   MagicWandIcon,
@@ -24,7 +25,7 @@ import { DocStepResult } from "./DocStepResult";
 import { DocSettingsButton, DocTag, type DocStepPlace } from "./DocStep";
 import type { DocScopeRef } from "./docGraphEdits";
 import { DocText } from "./DocText";
-import { DocDeleteConfirm } from "./DocEditing";
+import { DocDeleteConfirm, DocEditableLine } from "./DocEditing";
 import { useDocRun } from "./useDocRun";
 import { docBranchSelection, selectedStepIds } from "./docBranchSelection";
 
@@ -153,6 +154,7 @@ export function DocConditional({
   editable,
   showRunControl = editable,
   place,
+  onEnter,
   renderChildren,
 }: {
   node: WorkflowBlockNode;
@@ -161,6 +163,8 @@ export function DocConditional({
   editable: boolean;
   showRunControl?: boolean;
   place?: DocStepPlace;
+  // Enter on the If line starts the line after the conditional.
+  onEnter?: () => void;
   renderChildren: (
     children: DocItem[],
     scope?: DocScopeRef,
@@ -168,6 +172,7 @@ export function DocConditional({
   ) => ReactNode;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
+  const open = actions.conditionalOpen(node.id);
   const conditions = item.branches.filter((b) => b.kind !== "otherwise");
   const otherwise = item.branches.find((b) => b.kind === "otherwise");
   const { blocksByLabel } = useDocRun();
@@ -186,10 +191,15 @@ export function DocConditional({
       visible.push(selected);
     overflow = conditions.filter((b) => !visible.includes(b));
   }
-  const select = (branch: DocBranch) =>
-    actions.selectBranch(node.id, branch.branchId);
-  const empty = selected.children.length === 0 && !selected.jumpTo;
   const branchEdits = editable && !item.readOnlyReason ? actions.edit : null;
+  const conditionEditable =
+    Boolean(branchEdits) && selected.kind !== "otherwise";
+  const select = (branch: DocBranch) => {
+    // Clicking the open branch again goes to its condition line.
+    if (branch === selected && conditionEditable) actions.setFocusId(node.id);
+    actions.selectBranch(node.id, branch.branchId);
+  };
+  const empty = selected.children.length === 0 && !selected.jumpTo;
   const [confirmingRemove, setConfirmingRemove] = useState(false);
   const conditionIndex = conditions.indexOf(selected);
   // Steps outside the branch that use outputs of steps inside it.
@@ -215,6 +225,19 @@ export function DocConditional({
         )}
       >
         <DocTag node={node} place={editable ? place : undefined} />
+        <button
+          type="button"
+          aria-label={`${open ? "Collapse" : "Expand"} ${docStepTitle(node)}`}
+          aria-expanded={open}
+          onClick={() => actions.toggleConditional(node.id)}
+          className="grid size-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {open ? (
+            <ChevronDownIcon className="size-3.5" />
+          ) : (
+            <ChevronRightIcon className="size-3.5" />
+          )}
+        </button>
         <span className="text-[12.5px] text-muted-foreground">
           {conditions.length} condition{conditions.length === 1 ? "" : "s"} +
           Otherwise · checked left to right
@@ -231,194 +254,227 @@ export function DocConditional({
           )}
         </span>
       </div>
-      <DocStepResult label={node.data.label} />
-      {typeof node.data.description === "string" &&
-        node.data.description.trim() && (
-          <p className="mb-1.5 text-base font-medium leading-[1.55]">
-            <DocText value={node.data.description} />
-          </p>
-        )}
-      <div
-        role="tablist"
-        aria-label={`Branches of ${node.data.label}`}
-        className="mb-1.5 flex flex-wrap gap-1 border-b border-border pb-1.5"
-      >
-        {visible.map((branch) => (
-          <BranchTab
-            key={branch.branchId}
-            branch={branch}
-            selected={branch === selected}
-            ran={branch === ranBranch}
-            onSelect={() => select(branch)}
-          />
-        ))}
-        {overflow.length > 0 && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-dashed border-border px-2 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {overflow.length} more
-                <ChevronDownIcon className="size-3" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="max-w-[320px]">
-              {overflow.map((branch) => (
-                <DropdownMenuItem
-                  key={branch.branchId}
-                  onSelect={() => select(branch)}
-                  className="gap-1.5 text-[13px]"
-                >
-                  <span className="font-semibold text-[#8456A8] dark:text-[#B793DA]">
-                    {kindLabel[branch.kind]}
-                  </span>
-                  <span className="min-w-0 truncate">
-                    {shortLabel(branch.condition)}
-                  </span>
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
-        {otherwise && (
-          <BranchTab
-            branch={otherwise}
-            selected={otherwise === selected}
-            ran={otherwise === ranBranch}
-            onSelect={() => select(otherwise)}
-          />
-        )}
-        {branchEdits && (
-          <>
-            {selected.kind !== "otherwise" && (
-              <DocDeleteConfirm
-                id={confirmingRemove ? selected.branchId : null}
-                onClose={() => setConfirmingRemove(false)}
-                title="Remove this branch?"
-                confirmLabel="Remove"
-                users={confirmingRemove ? outsideUsers() : []}
-                remove={() =>
-                  branchEdits.removeBranch(node.id, selected.branchId)
-                }
-              >
-                <span className="inline-flex">
-                  <DropdownMenu modal={false}>
-                    <DropdownMenuTrigger asChild>
-                      <button
-                        type="button"
-                        aria-label={`Branch actions for ${kindLabel[selected.kind]} ${shortLabel(selected.condition)}`}
-                        className="grid size-[26px] place-items-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        <DotsHorizontalIcon className="size-3.5" />
-                      </button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="start">
-                      {conditionIndex > 0 && (
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            branchEdits.moveBranch(
-                              node.id,
-                              selected.branchId,
-                              -1,
-                            )
-                          }
-                        >
-                          Move earlier
-                        </DropdownMenuItem>
-                      )}
-                      {conditionIndex < conditions.length - 1 && (
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            branchEdits.moveBranch(
-                              node.id,
-                              selected.branchId,
-                              1,
-                            )
-                          }
-                        >
-                          Move later
-                        </DropdownMenuItem>
-                      )}
-                      {conditions.length > 1 && (
-                        <DropdownMenuItem
-                          className="text-destructive focus:text-destructive"
-                          onSelect={() => setTimeout(removeSelected, 0)}
-                        >
-                          Remove
-                        </DropdownMenuItem>
-                      )}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </span>
-              </DocDeleteConfirm>
+      {open && (
+        <>
+          <DocStepResult label={node.data.label} />
+          {typeof node.data.description === "string" &&
+            node.data.description.trim() && (
+              <p className="mb-1.5 text-base font-medium leading-[1.55]">
+                <DocText value={node.data.description} />
+              </p>
             )}
-            <button
-              type="button"
-              onClick={() => branchEdits.addBranch(node.id)}
-              className="rounded-md px-2 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              + Branch
-            </button>
-          </>
-        )}
-      </div>
-      <div role="tabpanel" data-doc-branch-id={selected.branchId}>
-        <p className="text-base font-medium leading-[1.55]">
-          {selected.kind === "otherwise" ? (
-            "Otherwise"
-          ) : (
-            <>
-              {kindLabel[selected.kind]}{" "}
-              {selected.condition ? (
-                <DocText value={selected.condition} />
+          <div
+            role="tablist"
+            aria-label={`Branches of ${node.data.label}`}
+            className="mb-1.5 flex flex-wrap gap-1 border-b border-border pb-1.5"
+          >
+            {visible.map((branch) => (
+              <BranchTab
+                key={branch.branchId}
+                branch={branch}
+                selected={branch === selected}
+                ran={branch === ranBranch}
+                onSelect={() => select(branch)}
+              />
+            ))}
+            {overflow.length > 0 && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-dashed border-border px-2 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    {overflow.length} more
+                    <ChevronDownIcon className="size-3" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="max-w-[320px]">
+                  {overflow.map((branch) => (
+                    <DropdownMenuItem
+                      key={branch.branchId}
+                      onSelect={() => select(branch)}
+                      className="gap-1.5 text-[13px]"
+                    >
+                      <span className="font-semibold text-[#8456A8] dark:text-[#B793DA]">
+                        {kindLabel[branch.kind]}
+                      </span>
+                      <span className="min-w-0 truncate">
+                        {shortLabel(branch.condition)}
+                      </span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+            {otherwise && (
+              <BranchTab
+                branch={otherwise}
+                selected={otherwise === selected}
+                ran={otherwise === ranBranch}
+                onSelect={() => select(otherwise)}
+              />
+            )}
+            {branchEdits && (
+              <>
+                {selected.kind !== "otherwise" && (
+                  <DocDeleteConfirm
+                    id={confirmingRemove ? selected.branchId : null}
+                    onClose={() => setConfirmingRemove(false)}
+                    title="Remove this branch?"
+                    confirmLabel="Remove"
+                    users={confirmingRemove ? outsideUsers() : []}
+                    remove={() =>
+                      branchEdits.removeBranch(node.id, selected.branchId)
+                    }
+                  >
+                    <span className="inline-flex">
+                      <DropdownMenu modal={false}>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            aria-label={`Branch actions for ${kindLabel[selected.kind]} ${shortLabel(selected.condition)}`}
+                            className="grid size-[26px] place-items-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            <DotsHorizontalIcon className="size-3.5" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                          {conditionIndex > 0 && (
+                            <DropdownMenuItem
+                              onSelect={() =>
+                                branchEdits.moveBranch(
+                                  node.id,
+                                  selected.branchId,
+                                  -1,
+                                )
+                              }
+                            >
+                              Move earlier
+                            </DropdownMenuItem>
+                          )}
+                          {conditionIndex < conditions.length - 1 && (
+                            <DropdownMenuItem
+                              onSelect={() =>
+                                branchEdits.moveBranch(
+                                  node.id,
+                                  selected.branchId,
+                                  1,
+                                )
+                              }
+                            >
+                              Move later
+                            </DropdownMenuItem>
+                          )}
+                          {conditions.length > 1 && (
+                            <DropdownMenuItem
+                              className="text-destructive focus:text-destructive"
+                              onSelect={() => setTimeout(removeSelected, 0)}
+                            >
+                              Remove
+                            </DropdownMenuItem>
+                          )}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </span>
+                  </DocDeleteConfirm>
+                )}
+                <button
+                  type="button"
+                  onClick={() => branchEdits.addBranch(node.id)}
+                  className="rounded-md px-2 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  + Branch
+                </button>
+              </>
+            )}
+          </div>
+          <div role="tabpanel" data-doc-branch-id={selected.branchId}>
+            <p className="text-base font-medium leading-[1.55]">
+              {selected.kind === "otherwise" ? (
+                "Otherwise"
               ) : (
-                <span className="font-normal italic text-[#B45B0A] dark:text-[#E79A55]">
-                  no condition
-                </span>
+                <>
+                  {kindLabel[selected.kind]}{" "}
+                  {conditionEditable && branchEdits ? (
+                    <span className="inline-block min-w-[12ch] align-top">
+                      <DocEditableLine
+                        key={selected.branchId}
+                        value={selected.condition}
+                        editable
+                        autoFocus={actions.focusId === node.id}
+                        placeholder="write the condition, or use @"
+                        label={`${node.data.label} condition`}
+                        references={() =>
+                          branchEdits.references(node.id, false)
+                        }
+                        onChange={(value) =>
+                          branchEdits.setCondition(
+                            node.id,
+                            selected.branchId,
+                            value,
+                          )
+                        }
+                        onEnter={onEnter}
+                        onDone={() => {
+                          if (actions.focusId === node.id)
+                            actions.setFocusId(null);
+                        }}
+                      />
+                    </span>
+                  ) : selected.condition ? (
+                    <DocText value={selected.condition} />
+                  ) : (
+                    <span className="font-normal italic text-[#B45B0A] dark:text-[#E79A55]">
+                      no condition
+                    </span>
+                  )}
+                </>
               )}
-            </>
-          )}
-        </p>
-        <div className="my-0.5 flex items-center gap-[5px] text-xs leading-[1.55] text-muted-foreground">
-          {selected.kind === "otherwise" ? (
-            "Runs when no condition before it matches."
-          ) : selected.check === "exact" ? (
-            <>
-              <CodeIcon className="size-[11px]" />
-              Exact check, no AI
-            </>
-          ) : selected.check === "ai" ? (
-            <>
-              <MagicWandIcon className="size-[11px]" />
-              Checked by AI
-            </>
-          ) : null}
-        </div>
-        <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
-          {renderChildren(
-            selected.children,
-            selected.synthetic || selected.jumpTo
-              ? undefined
-              : { parentId: node.id, conditionalBranchId: selected.branchId },
-            selected.branchId,
-          )}
-          {selected.jumpTo && (
-            <DocJump
-              targetId={selected.jumpTo}
-              byId={byId}
-              verb="Then continue at"
-            />
-          )}
-          {empty && (branchEdits ? selected.synthetic : true) && (
-            <p className="my-1 text-[13px] text-muted-foreground">
-              {selected.kind === "otherwise"
-                ? "No steps. Goes straight to the step after the conditional."
-                : "No steps in this branch."}
             </p>
-          )}
-        </div>
-      </div>
+            <div className="my-0.5 flex items-center gap-[5px] text-xs leading-[1.55] text-muted-foreground">
+              {selected.kind === "otherwise" ? (
+                "Runs when no condition before it matches."
+              ) : selected.check === "exact" ? (
+                <>
+                  <CodeIcon className="size-[11px]" />
+                  Exact check, no AI
+                </>
+              ) : selected.check === "ai" ? (
+                <>
+                  <MagicWandIcon className="size-[11px]" />
+                  Checked by AI
+                </>
+              ) : null}
+            </div>
+            <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
+              {renderChildren(
+                selected.children,
+                selected.synthetic || selected.jumpTo
+                  ? undefined
+                  : {
+                      parentId: node.id,
+                      conditionalBranchId: selected.branchId,
+                    },
+                selected.branchId,
+              )}
+              {selected.jumpTo && (
+                <DocJump
+                  targetId={selected.jumpTo}
+                  byId={byId}
+                  verb="Then continue at"
+                />
+              )}
+              {empty && (branchEdits ? selected.synthetic : true) && (
+                <p className="my-1 text-[13px] text-muted-foreground">
+                  {selected.kind === "otherwise"
+                    ? "No steps. Goes straight to the step after the conditional."
+                    : "No steps in this branch."}
+                </p>
+              )}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

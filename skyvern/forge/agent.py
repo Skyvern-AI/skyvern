@@ -25,7 +25,6 @@ from openai.types.responses.response import Response as OpenAIResponse
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import BrowserContext, Page
-from yutori.navigator.tools import GET_ELEMENT_BY_REF_SCRIPT, evaluate_tool_script
 
 from skyvern import analytics
 from skyvern.config import settings
@@ -44,6 +43,7 @@ from skyvern.constants import (
     ScrapeType,
 )
 from skyvern.errors.errors import (
+    BROWSER_DOWNLOAD_FAILED_REASON,
     GetTOTPVerificationCodeError,
     MissingTOTPSourceError,
     OTPOutcomeUnconfirmedError,
@@ -52,6 +52,7 @@ from skyvern.errors.errors import (
     SkyvernDefinedError,
     TimeoutGetTOTPVerificationCodeError,
     UserDefinedError,
+    drop_requested_download_failure_reasons,
     filter_to_user_defined_codes,
     resolve_error_code_mapping_key,
 )
@@ -86,6 +87,7 @@ from skyvern.exceptions import (
     ScrapingFailedBlankPage,
     ScreenshotTargetClosed,
     SkyvernException,
+    SkyvernExtraNotInstalled,
     SkyvernPageAnalysisTimeout,
     StepTerminationError,
     StepUnableToExecuteError,
@@ -96,6 +98,7 @@ from skyvern.exceptions import (
     UnsupportedActionType,
     UnsupportedTaskType,
     get_user_facing_exception_message,
+    require_yutori_extra_modules,
 )
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
@@ -116,6 +119,7 @@ from skyvern.forge.sdk.api.files import (
     list_downloading_files_in_directory,
     list_files_in_directory,
     normalize_download_identity,
+    parse_uri_to_path,
     recover_download_extension,
     rename_file,
     resolve_run_download_id,
@@ -202,8 +206,12 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    browser_session_artifact_access,
+    browser_session_artifact_system_read,
+)
 from skyvern.forge.sdk.services.credentials import parse_totp_config
-from skyvern.forge.sdk.services.request_principal import RequestPrincipal
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, task_requester_id
 from skyvern.forge.sdk.submission import shadow as submission_shadow
 from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced, traced_span
 from skyvern.forge.sdk.workflow.context_manager import NON_SECRET_CREDENTIAL_FIELDS, WorkflowRunContext
@@ -217,6 +225,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.validators import normalize_blank_totp_identifier
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.page_derived_templates import NO_RENDER_RECORD, UNVERIFIED_ROOT_CLASSES
 from skyvern.forge.taskv3 import input_dispatch
@@ -2257,7 +2266,7 @@ class ForgeAgent:
         if not files_to_rename:
             return []
         if validate_claimed_type:
-            requested_download_failure_reason = "The requested browser download could not be saved."
+            requested_download_failure_reason = BROWSER_DOWNLOAD_FAILED_REASON
             valid_files_to_rename = []
             for file in files_to_rename:
                 if file.startswith(("s3://", "gs://")):
@@ -2724,7 +2733,7 @@ class ForgeAgent:
             title=task_block.title or task_block.label,
             webhook_callback_url=None,
             totp_verification_url=task_block.totp_verification_url,
-            totp_identifier=task_block.totp_identifier,
+            totp_identifier=normalize_blank_totp_identifier(task_block.totp_identifier),
             navigation_goal=task_block.navigation_goal,
             data_extraction_goal=task_block.data_extraction_goal,
             navigation_payload=navigation_payload,
@@ -2889,7 +2898,9 @@ class ForgeAgent:
             extra_http_headers=task_request.extra_http_headers,
             cdp_connect_headers=task_request.cdp_connect_headers,
             browser_session_id=task_request.browser_session_id,
+            requested_by=task_requester_id(organization_id),
             browser_address=task_request.browser_address,
+            download_timeout=task_request.download_timeout,
             include_extracted_text=task_request.include_extracted_text,
         )
         LOG.info(
@@ -3648,6 +3659,22 @@ class ForgeAgent:
             if v3_turn_step is None or not v3_turn_step_open:
                 return
             v3_turn_step_open = False
+            with contained_effect("task_v3 turn duration log", task_id=task.task_id):
+                LOG.info(
+                    "Task V3 turn duration metrics",
+                    duration_seconds=(datetime.now(UTC) - v3_turn_step.created_at.replace(tzinfo=UTC)).total_seconds(),
+                    llm_seconds=record.llm_seconds if record else None,
+                    tool_seconds=(
+                        sum(call.duration_seconds for call in record.tool_calls if call.duration_seconds is not None)
+                        if record
+                        else None
+                    ),
+                    tool_call_count=len(record.tool_calls) if record else None,
+                    step_status=status,
+                    turn=v3_turn_step.order,
+                    turn_step_id=v3_turn_step.step_id,
+                    organization_id=task.organization_id,
+                )
             with contained_effect("task_v3 turn step finish", task_id=task.task_id, step_id=v3_turn_step.step_id):
                 async with asyncio.timeout(_TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS):
                     await app.DATABASE.tasks.finish_step(
@@ -4831,9 +4858,11 @@ class ForgeAgent:
         # Set before the browser is acquired so a download the task's first navigation starts is covered too.
         download_timeout_context = context
         prev_download_timeout = download_timeout_context.download_timeout
-        if engine == RunEngine.skyvern_v3:
-            download_timeout_context.download_timeout = task.download_timeout
+        download_timeout_context.download_timeout = task.download_timeout
         try:
+            if engine == RunEngine.yutori_navigator:
+                require_yutori_extra_modules()
+
             if download_baseline_files is None and task.workflow_run_id:
                 list_files_before = list_files_in_directory(
                     get_path_for_workflow_download_directory(
@@ -5112,6 +5141,7 @@ class ForgeAgent:
                 )
 
                 rejected_downloads: list[str] = []
+                recorded_downloads: list[str] = []
                 files_to_rename = await self._finalize_downloaded_files_for_task(
                     task,
                     organization_id=organization.organization_id,
@@ -5119,6 +5149,7 @@ class ForgeAgent:
                     list_files_before=list_files_before,
                     randomize_if_missing=True,
                     attempt_started_at=attempt_started_at,
+                    recorded_into=recorded_downloads,
                     rejected_into=rejected_downloads,
                 )
                 if files_to_rename or rejected_downloads:
@@ -5148,6 +5179,7 @@ class ForgeAgent:
                         download_completion_pending=True,
                         completion_extracted_information=task.extracted_information,
                         download_rejections=rejected_downloads,
+                        download_completion_files=recorded_downloads,
                     )
                     return last_step, detailed_output, None
 
@@ -5631,9 +5663,12 @@ class ForgeAgent:
                 cleanup_skipped_by_handler = True
             return step, detailed_output, None
         except Exception as e:
-            LOG.exception("Got an unexpected exception in step, marking task as failed")
-
-            failure_reason = get_user_facing_exception_message(e)
+            if isinstance(e, SkyvernExtraNotInstalled) and e.extra == "yutori":
+                LOG.warning("Yutori Navigator dependency is missing")
+                failure_reason = str(e)
+            else:
+                LOG.exception("Got an unexpected exception in step, marking task as failed")
+                failure_reason = get_user_facing_exception_message(e)
 
             is_task_marked_as_failed = await self.fail_task(task, step, failure_reason, browser_state, exception=e)
             if is_task_marked_as_failed:
@@ -7496,6 +7531,8 @@ class ForgeAgent:
         scraped_page: ScrapedPage,
         llm_caller: LLMCaller,
     ) -> list[Action]:
+        from yutori.navigator.tools import GET_ELEMENT_BY_REF_SCRIPT, evaluate_tool_script
+
         if not isinstance(llm_caller, YutoriNavigatorLLMCaller):
             raise ValueError(f"Expected YutoriNavigatorLLMCaller, got {type(llm_caller)}")
         if not scraped_page.screenshots:
@@ -9029,6 +9066,11 @@ class ForgeAgent:
             if failures:
                 raise failures[0][1]
 
+        try:
+            await app.AGENT_FUNCTION.on_step_scrape_persisted(task, step, scraped_page)
+        except Exception as error:
+            LOG.warning("Step scrape hook failed", step_id=step.step_id, error_type=type(error).__name__)
+
     @staticmethod
     def _build_extract_action_cache_variant(
         verification_code_check: bool,
@@ -10074,6 +10116,7 @@ class ForgeAgent:
         download_tally_baseline: DownloadTally | None = None,
         validate_claimed_type: bool = True,
         download_rejections: list[str] | None = None,
+        download_completion_files: list[str] | None = None,
     ) -> Task:
         cleanup_context = skyvern_context.current()
         try:
@@ -10095,6 +10138,7 @@ class ForgeAgent:
                 download_tally_baseline=download_tally_baseline,
                 validate_claimed_type=validate_claimed_type,
                 download_rejections=download_rejections,
+                download_completion_files=download_completion_files,
             )
         finally:
             if cleanup_context is not None:
@@ -10124,12 +10168,16 @@ class ForgeAgent:
         download_tally_baseline: DownloadTally | None = None,
         validate_claimed_type: bool = True,
         download_rejections: list[str] | None = None,
+        download_completion_files: list[str] | None = None,
     ) -> Task:
         # Keep the capture window alive through settle/finalize; only durable credit permits closing reservations.
         # The outer finally releases ownership on every terminal exit.
         _claim_context = skyvern_context.current()
         _download_popup_state_taken = False
         rejected_downloads = list(download_rejections or [])
+        # Files the caller's complete-on-download seam already finalized; cleanup adds its own below.
+        materialized_download_files = list(download_completion_files or [])
+        registered_download_names: set[str] = set()
 
         def _take_download_popup_state() -> tuple[list[Page], list[Page]]:
             """Exactly-once: detach the task listener and pop this task's strong claims + late candidates."""
@@ -10235,6 +10283,7 @@ class ForgeAgent:
                             attempt_started_at = await get_download_retry_started_at(
                                 task.organization_id, finalization_run_id
                             )
+                            cleanup_recorded_files: list[str] = []
                             cleanup_finalized_files = await self._finalize_downloaded_files_for_task(
                                 task,
                                 organization_id=task.organization_id,
@@ -10242,6 +10291,7 @@ class ForgeAgent:
                                 list_files_before=list_files_before,
                                 randomize_if_missing=False,
                                 attempt_started_at=attempt_started_at,
+                                recorded_into=cleanup_recorded_files,
                                 validate_claimed_type=validate_claimed_type and download_completion_pending,
                                 rejected_into=rejected_downloads,
                             )
@@ -10250,6 +10300,7 @@ class ForgeAgent:
                             # any marker joining during settle/finalize has been recorded by the still-armed
                             # listener) and close the popups the download action opened.
                             if cleanup_finalized_files:
+                                materialized_download_files.extend(cleanup_recorded_files)
                                 cleanup_claims, cleanup_late_candidates = _take_download_popup_state()
                                 await self._close_claimed_download_popups(
                                     task,
@@ -10319,6 +10370,16 @@ class ForgeAgent:
                                     organization_id=task.organization_id,
                                     artifact_type=ArtifactType.DOWNLOAD,
                                 )
+                                # Local storage percent-encodes its file URIs; object-store URIs keep the raw key.
+                                registered_download_names = {
+                                    Path(
+                                        parse_uri_to_path(artifact.uri)
+                                        if artifact.uri.startswith("file://")
+                                        else artifact.uri
+                                    ).name
+                                    for artifact in download_artifacts
+                                    if artifact.uri
+                                }
                                 if download_artifact_baseline_count is None:
                                     artifact_outcome = artifact_outcome if artifact_outcome != "unknown" else "failed"
                                     artifact_error = artifact_error or "artifact_baseline_lookup_failed"
@@ -10395,6 +10456,23 @@ class ForgeAgent:
             download_context.consume_download_failures(task.task_id) if download_context is not None else []
         )
         if download_completion_pending and task.status == TaskStatus.running:
+            # A finalized name proves only that the file existed then; the waiver needs that file's
+            # registered artifact, so a deliverable lost before the storage scan keeps the failure.
+            retained_failure_reasons = drop_requested_download_failure_reasons(
+                download_failure_reasons,
+                materialized_a_file=any(
+                    Path(file).name in registered_download_names for file in materialized_download_files
+                ),
+            )
+            if len(retained_failure_reasons) != len(download_failure_reasons):
+                LOG.warning(
+                    "Dropped requested-download capture failures because a file landed for the same request",
+                    task_id=task.task_id,
+                    workflow_run_id=task.workflow_run_id,
+                    materialized_file_count=len(materialized_download_files),
+                    dropped_count=len(download_failure_reasons) - len(retained_failure_reasons),
+                )
+            download_failure_reasons = retained_failure_reasons
             if artifact_outcome == "partial":
                 if artifact_error == "artifact_count_mismatch":
                     download_failure_reasons.append(
@@ -10516,7 +10594,8 @@ class ForgeAgent:
         if need_call_webhook:
             with traced_span(_tracer, "skyvern.agent.cleanup.webhook") as _cl_wh_span:
                 apply_context_attrs(_cl_wh_span)
-                await self.execute_task_webhook(task=task, api_key=api_key)
+                with browser_session_artifact_system_read():
+                    await self.execute_task_webhook(task=task, api_key=api_key)
         if diagnostic_cancelled:
             raise asyncio.CancelledError
 
@@ -10647,12 +10726,23 @@ class ForgeAgent:
         need_browser_log: bool = False,
         step_count: int | None = None,
     ) -> TaskResponse:
+        access = await browser_session_artifact_access(
+            task.organization_id,
+            session_ids=[task.browser_session_id],
+            workflow_run_id=task.workflow_run_id,
+            runnable_ids=[task.task_id],
+        )
+        artifacts_accessible = access.allowed
         # no last step means the task didn't start, so we don't have any other artifacts
         if last_step is None:
-            return task.to_task_response(
-                failure_reason=failure_reason,
-                step_count=step_count,
-            )
+            if not artifacts_accessible:
+                task = task.model_copy(
+                    update={"extracted_information": access.redact_output(task.extracted_information)}
+                )
+            response = task.to_task_response(failure_reason=failure_reason, step_count=step_count)
+            if not artifacts_accessible:
+                response.errors = task.errors
+            return response
 
         screenshot_url = None
         recording_url = None
@@ -10662,19 +10752,20 @@ class ForgeAgent:
         downloaded_files: list[FileInfo] | None = None
 
         # get the artifact of the screenshot and get the screenshot_url
-        screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
-            task_id=task.task_id,
-            step_id=last_step.step_id,
-            artifact_type=ArtifactType.SCREENSHOT_FINAL,
-            organization_id=task.organization_id,
-        )
-        if screenshot_artifact:
-            screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
+        if artifacts_accessible:
+            screenshot_artifact = await app.DATABASE.artifacts.get_artifact(
+                task_id=task.task_id,
+                step_id=last_step.step_id,
+                artifact_type=ArtifactType.SCREENSHOT_FINAL,
+                organization_id=task.organization_id,
+            )
+            if screenshot_artifact:
+                screenshot_url = await app.ARTIFACT_MANAGER.get_share_link(screenshot_artifact)
 
         # Get recording url from browser session first,
         # if not found, get the recording url from the first step
         recording_artifact = None
-        if task.browser_session_id:
+        if artifacts_accessible and task.browser_session_id:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     recordings = await app.STORAGE.get_shared_recordings_in_browser_session(
@@ -10686,7 +10777,7 @@ class ForgeAgent:
             except asyncio.TimeoutError:
                 LOG.warning("Timeout getting recordings", browser_session_id=task.browser_session_id)
 
-        if recording_url is None:
+        if artifacts_accessible and recording_url is None:
             first_step = await app.DATABASE.tasks.get_first_step(
                 task_id=task.task_id, organization_id=task.organization_id
             )
@@ -10703,20 +10794,21 @@ class ForgeAgent:
                         recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
-        latest_action_screenshot_artifacts = await app.DATABASE.artifacts.get_latest_n_artifacts(
-            task_id=task.task_id,
-            organization_id=task.organization_id,
-            artifact_types=[ArtifactType.SCREENSHOT_ACTION],
-            n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
-        )
-        if latest_action_screenshot_artifacts:
-            raw_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(
-                latest_action_screenshot_artifacts
+        if artifacts_accessible:
+            latest_action_screenshot_artifacts = await app.DATABASE.artifacts.get_latest_n_artifacts(
+                task_id=task.task_id,
+                organization_id=task.organization_id,
+                artifact_types=[ArtifactType.SCREENSHOT_ACTION],
+                n=settings.TASK_RESPONSE_ACTION_SCREENSHOT_COUNT,
             )
-            filtered_urls = [url for url in raw_urls if url is not None]
-            latest_action_screenshot_urls = filtered_urls if filtered_urls else None
+            if latest_action_screenshot_artifacts:
+                raw_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(
+                    latest_action_screenshot_artifacts
+                )
+                filtered_urls = [url for url in raw_urls if url is not None]
+                latest_action_screenshot_urls = filtered_urls if filtered_urls else None
 
-        if task.organization_id:
+        if artifacts_accessible and task.organization_id:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
                     context = skyvern_context.current()
@@ -10738,7 +10830,7 @@ class ForgeAgent:
                     workflow_run_id=task.workflow_run_id,
                 )
 
-        if need_browser_log:
+        if need_browser_log and artifacts_accessible:
             browser_console_log = await app.DATABASE.artifacts.get_latest_artifact(
                 task_id=task.task_id,
                 artifact_types=[ArtifactType.BROWSER_CONSOLE_LOG],
@@ -10753,8 +10845,14 @@ class ForgeAgent:
             LOG.error("Failed to get task from db when sending task response")
             raise TaskNotFound(task_id=task.task_id)
 
-        task = task_from_db
-        return task.to_task_response(
+        task = (
+            task_from_db
+            if artifacts_accessible
+            else task_from_db.model_copy(
+                update={"extracted_information": access.redact_output(task_from_db.extracted_information)}
+            )
+        )
+        response = task.to_task_response(
             action_screenshot_urls=latest_action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
@@ -10764,6 +10862,9 @@ class ForgeAgent:
             failure_reason=failure_reason,
             step_count=step_count,
         )
+        if not artifacts_accessible:
+            response.errors = task.errors
+        return response
 
     async def cleanup_browser_and_create_artifacts(
         self,

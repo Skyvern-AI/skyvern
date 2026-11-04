@@ -7,13 +7,6 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from yutori.navigator import denormalize_coordinates, map_key_to_playwright, map_keys_individual
-from yutori.navigator.tools import (
-    EXECUTE_JS_SCRIPT,
-    EXTRACT_ELEMENTS_SCRIPT,
-    FIND_SCRIPT,
-    SET_ELEMENT_VALUE_SCRIPT,
-)
 
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import NavigatorResponse
 from skyvern.webeye.actions.actions import (
@@ -135,6 +128,8 @@ def _parse_coordinate(args: dict, viewport_width: int, viewport_height: int) -> 
     raw = args.get("coordinates") or args.get("coordinate")
     if raw is None:
         return None
+    from yutori.navigator import denormalize_coordinates
+
     return denormalize_coordinates(raw, viewport_width, viewport_height)
 
 
@@ -148,6 +143,14 @@ def _convert_tool_call(
     action_order: int = 0,
     tool_call_id: str | None = None,
 ) -> Action | None:
+    from yutori.navigator import denormalize_coordinates, map_key_to_playwright, map_keys_individual
+    from yutori.navigator.tools import (
+        EXECUTE_JS_SCRIPT,
+        EXTRACT_ELEMENTS_SCRIPT,
+        FIND_SCRIPT,
+        SET_ELEMENT_VALUE_SCRIPT,
+    )
+
     try:
         action_type = YutoriNavigatorActionType(name)
     except ValueError:

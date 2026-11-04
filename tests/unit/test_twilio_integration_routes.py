@@ -1326,7 +1326,9 @@ async def _register(
             get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="service-account-token"))
         )
         credentials = SimpleNamespace(get_onepassword_credentials=AsyncMock(return_value=[]))
-        agent_function = SimpleNamespace(enforce_credential_use=AsyncMock())
+        agent_function = SimpleNamespace(
+            enforce_credential_use=AsyncMock(), enforce_workflow_context_credential_use=AsyncMock()
+        )
         monkeypatch.setattr(
             cm,
             "app",
