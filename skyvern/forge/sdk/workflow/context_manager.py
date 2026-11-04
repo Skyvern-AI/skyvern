@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Literal, Self, overload
 
 import structlog
@@ -31,6 +32,7 @@ from skyvern.exceptions import (
     InvalidCredentialId,
     RuntimeSequentialCredentialUnsupported,
     SkyvernException,
+    SkyvernHTTPException,
     WorkflowRunContextNotInitialized,
     sanitize_credential_for_error,
 )
@@ -772,6 +774,8 @@ class WorkflowRunContext:
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
+        self._bitwarden_email: str | None = None
+        self._bitwarden_resolved_collection_id: str | None = None
         self.workflow_run_outputs: dict[str, Any] = {}
         self.carried_block_labels: set[str] = set()
         # Blocks whose loop iterates page-derived values: their current_value/current_item came from a page.
@@ -1470,6 +1474,7 @@ class WorkflowRunContext:
         if self.organization_id is None:
             raise PermissionError("credential not accessible")
         item_id = self.secrets[BitwardenConstants.BW_ITEM_ID]
+        collection_id = self.secrets[BitwardenConstants.BW_COLLECTION_ID]
         await self._enforce_context_credential_use(
             self.organization_id,
             vault_item_ids=(
@@ -1482,16 +1487,37 @@ class WorkflowRunContext:
             ),
             unresolved_vault_item=not item_id,
         )
-        secret_credentials = await BitwardenService.get_secret_value_from_url(
-            url=self.secrets[BitwardenConstants.URL],
-            client_secret=self.secrets[BitwardenConstants.CLIENT_SECRET],
-            client_id=self.secrets[BitwardenConstants.CLIENT_ID],
-            master_password=self.secrets[BitwardenConstants.MASTER_PASSWORD],
-            bw_organization_id=self.secrets[BitwardenConstants.BW_ORGANIZATION_ID],
-            bw_collection_ids=self.secrets[BitwardenConstants.BW_COLLECTION_IDS],
-            collection_id=self.secrets[BitwardenConstants.BW_COLLECTION_ID],
-            item_id=self.secrets[BitwardenConstants.BW_ITEM_ID],
-        )
+        scoped = False
+        email = app.AGENT_FUNCTION.bitwarden_refetch_email(self._bitwarden_email)
+        if email is None and (self._bitwarden_email is None or settings.BITWARDEN_EMAIL):
+            scoped = await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+                self.organization_id,
+                {item_id} if item_id else set(),
+                {self._bitwarden_resolved_collection_id} if self._bitwarden_resolved_collection_id else set(),
+            )
+            if scoped:
+                collection_id = self._bitwarden_resolved_collection_id
+        try:
+            secret_credentials = await BitwardenService.get_secret_value_from_url(
+                url=self.secrets[BitwardenConstants.URL],
+                client_secret=self.secrets[BitwardenConstants.CLIENT_SECRET],
+                client_id=self.secrets[BitwardenConstants.CLIENT_ID],
+                master_password=self.secrets[BitwardenConstants.MASTER_PASSWORD],
+                bw_organization_id=None
+                if scoped and collection_id and not item_id
+                else self.secrets[BitwardenConstants.BW_ORGANIZATION_ID],
+                bw_collection_ids=self.secrets[BitwardenConstants.BW_COLLECTION_IDS],
+                collection_id=collection_id,
+                item_id=item_id,
+                email=email,
+            )
+        except BitwardenBaseError as error:
+            if scoped:
+                LOG.warning("Platform Bitwarden operation failed", error_type=type(error).__name__)
+                raise SkyvernHTTPException(
+                    "Credential not accessible", status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                ) from None
+            raise
         return secret_credentials
 
     @staticmethod
@@ -2141,7 +2167,10 @@ class WorkflowRunContext:
         parameter: BitwardenLoginCredentialParameter
         | BitwardenSensitiveInformationParameter
         | BitwardenCreditCardDataParameter,
-        operation: Callable[[str | None, str | None, str, str | None], Awaitable[Any]],
+        operation: Callable[[str | None, str | None, str, str | None, bool], Awaitable[Any]],
+        *,
+        item_id: str | None = None,
+        collection_id: str | None = None,
     ) -> tuple[Any, BitwardenCredentials]:
         candidates = await self._get_bitwarden_credential_candidates(organization, parameter)
         last_error: BitwardenBaseError | None = None
@@ -2152,9 +2181,21 @@ class WorkflowRunContext:
             assert master_password
 
             try:
-                result = await operation(client_id, client_secret, master_password, email)
+                scoped = False
+                if email is None:
+                    scoped = await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+                        organization.organization_id,
+                        {item_id} if item_id else set(),
+                        {collection_id} if collection_id else set(),
+                    )
+                result = await operation(client_id, client_secret, master_password, email, scoped)
                 return result, credentials
             except BitwardenBaseError as error:
+                if scoped:
+                    LOG.warning("Platform Bitwarden operation failed", error_type=type(error).__name__)
+                    raise SkyvernHTTPException(
+                        "Credential not accessible", status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                    ) from None
                 last_error = error
                 has_fallback = index + 1 < len(candidates)
                 if email and has_fallback and self._should_retry_bitwarden_with_global_credentials(error):
@@ -2207,12 +2248,13 @@ class WorkflowRunContext:
             client_secret: str | None,
             master_password: str,
             email: str | None,
+            scoped: bool,
         ) -> dict[str, str]:
             return await BitwardenService.get_secret_value_from_url(
                 client_id,
                 client_secret,
                 master_password,
-                organization.bw_organization_id,
+                None if scoped and collection_id and not item_id else organization.bw_organization_id,
                 organization.bw_collection_ids,
                 url,
                 collection_id=collection_id,
@@ -2225,6 +2267,8 @@ class WorkflowRunContext:
                 organization,
                 parameter,
                 fetch_secret_credentials,
+                item_id=item_id,
+                collection_id=collection_id,
             )
             client_id, client_secret, master_password, email = credentials
             if secret_credentials and not item_id:
@@ -2243,6 +2287,8 @@ class WorkflowRunContext:
                     organization.organization_id, vault_item_ids=vault_item_ids, unresolved_vault_item=not item_id
                 )
             if secret_credentials:
+                self._bitwarden_email = email
+                self._bitwarden_resolved_collection_id = collection_id
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
                 self.secrets[BitwardenConstants.URL] = url
@@ -2388,12 +2434,13 @@ class WorkflowRunContext:
             client_secret: str | None,
             master_password: str,
             email: str | None,
+            scoped: bool,
         ) -> dict[str, str]:
             return await BitwardenService.get_sensitive_information_from_identity(
                 client_id,
                 client_secret,
                 master_password,
-                organization.bw_organization_id,
+                None if scoped else organization.bw_organization_id,
                 organization.bw_collection_ids,
                 collection_id,
                 bitwarden_identity_key,
@@ -2406,6 +2453,7 @@ class WorkflowRunContext:
                 organization,
                 parameter,
                 fetch_sensitive_values,
+                collection_id=collection_id,
             )
             client_id, client_secret, master_password, email = credentials
             if sensitive_values:
@@ -2424,6 +2472,8 @@ class WorkflowRunContext:
                     ),
                     unresolved_vault_item=not item_id,
                 )
+                self._bitwarden_email = email
+                self._bitwarden_resolved_collection_id = collection_id
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
                 self.secrets[BitwardenConstants.IDENTITY_KEY] = bitwarden_identity_key
@@ -2478,6 +2528,7 @@ class WorkflowRunContext:
             client_secret: str | None,
             master_password: str,
             email: str | None,
+            _scoped: bool,
         ) -> dict[str, str]:
             return await BitwardenService.get_credit_card_data(
                 client_id,
@@ -2495,11 +2546,14 @@ class WorkflowRunContext:
                 organization,
                 parameter,
                 fetch_credit_card_data,
+                item_id=item_id,
+                collection_id=collection_id,
             )
             client_id, client_secret, master_password, email = credentials
             if not credit_card_data:
                 raise CredentialItemNotFoundError(f"Credit card data not found in Bitwarden. {lookup_context}")
 
+            self._bitwarden_email = email
             self.secrets[BitwardenConstants.CLIENT_ID] = client_id
             self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
             self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password

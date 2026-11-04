@@ -281,6 +281,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     CredentialParameter,
     OnePasswordCredentialParameter,
     OutputParameter,
+    Parameter,
     ParameterType,
     WorkflowParameter,
     WorkflowParameterType,
@@ -4168,6 +4169,48 @@ class WorkflowService:
         if isinstance(error, IntegrityError):
             return "value cannot be null"
         return "database error while saving parameter value"
+
+    async def _validate_bitwarden_ownership_on_save(
+        self, organization_id: str, parameters: Sequence[Parameter]
+    ) -> None:
+        keys = {parameter.key for parameter in parameters}
+        item_ids: set[str] = set()
+        collection_ids: set[str] = set()
+        unscoped = False
+        for parameter in parameters:
+            if not isinstance(
+                parameter,
+                (
+                    BitwardenLoginCredentialParameter,
+                    BitwardenCreditCardDataParameter,
+                    BitwardenSensitiveInformationParameter,
+                ),
+            ):
+                continue
+            item_id = (
+                parameter.bitwarden_item_id
+                if isinstance(parameter, (BitwardenLoginCredentialParameter, BitwardenCreditCardDataParameter))
+                else None
+            )
+            collection_id = parameter.bitwarden_collection_id
+            if not item_id and not collection_id:
+                unscoped = True
+            for value, target in ((item_id, item_ids), (collection_id, collection_ids)):
+                if (
+                    value
+                    and value not in keys
+                    and not value.endswith("_output")
+                    and not any(marker in value for marker in ("{{", "{%", "{#"))
+                ):
+                    target.add(value)
+        if unscoped:
+            await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+                organization_id, set(), set(), allow_own_token=True
+            )
+        if item_ids or collection_ids:
+            await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+                organization_id, item_ids, collection_ids, allow_own_token=True
+            )
 
     async def _validate_bitwarden_item_ids(self, workflow: Workflow, parameter_values: dict[str, Any]) -> None:
         # BitwardenService rejects non-UUID item IDs, so a value already known at run creation and
@@ -11690,6 +11733,7 @@ class WorkflowService:
         await self._validate_aws_secret_parameters(workflow_definition.parameters, organization_id)
         pinned_v1_blocks = self._pinned_v1_blocks_to_check(workflow_definition)
         try:
+            await self._validate_bitwarden_ownership_on_save(organization_id, workflow_definition.parameters)
             self._validate_code_block_templates(workflow_definition)
             self._validate_block_engines(workflow_definition)
             if encrypt_secrets:
@@ -12364,6 +12408,25 @@ class WorkflowService:
             await self._read_overwritten_workflow(workflow_id, organization_id) if pinned_v1_blocks else None
         )
         if workflow_definition is not None:
+            if organization_id is None and any(
+                isinstance(
+                    parameter,
+                    (
+                        BitwardenLoginCredentialParameter,
+                        BitwardenCreditCardDataParameter,
+                        BitwardenSensitiveInformationParameter,
+                    ),
+                )
+                for parameter in workflow_definition.parameters
+            ):
+                existing_workflow = await app.DATABASE.workflows.get_workflow(workflow_id=workflow_id)
+                if existing_workflow is None:
+                    raise SkyvernHTTPException("Credential not accessible", status_code=HTTPStatus.FORBIDDEN)
+                await self._validate_bitwarden_ownership_on_save(
+                    existing_workflow.organization_id, workflow_definition.parameters
+                )
+            elif organization_id is not None:
+                await self._validate_bitwarden_ownership_on_save(organization_id, workflow_definition.parameters)
             await _validate_powerbi_workflow_save(organization_id or "", workflow_definition, workflow_id=workflow_id)
             await _validate_agent_step_workflow_save(
                 organization_id or "",
