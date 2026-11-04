@@ -91,6 +91,18 @@ async def test_card_number_and_cvv_are_still_masked(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+async def test_only_the_card_number_and_cvv_are_recorded_for_unconditional_visual_masking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """These ids drive a mask that ignores the workflow's Mask Secrets opt-in, so the set has to stay
+    exactly the two charge-authorizing fields -- an expiry or billing id here would mask far more of
+    the page than intended, and a missing one leaves a card legible in the run's screenshots."""
+    context, values = await _register(monkeypatch)
+
+    assert context.card_secret_ids == {values["card_number"], values["card_cvv"]}
+
+
+@pytest.mark.asyncio
 async def test_a_registered_brand_no_longer_corrupts_unrelated_output(monkeypatch: pytest.MonkeyPatch) -> None:
     context, _ = await _register(monkeypatch)
 

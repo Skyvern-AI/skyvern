@@ -440,3 +440,62 @@ def test_unserializable_value_falls_back_to_repr_instead_of_raising() -> None:
     )
 
     assert json.loads(rendered)["obj"] == "<opaque>"
+
+
+_UNCLOSED_SESSION_MESSAGE = "Unclosed client session\nclient_session: <aiohttp.client.ClientSession object at 0x7f0>"
+
+
+def _stop_every_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for interpreter exit, when `sys.meta_path` is gone and no import can succeed.
+
+    Real teardown raises a bare ImportError from `_find_spec`; a None entry raises
+    ModuleNotFoundError from the same statement. Both are ImportError, and one reversible key beats
+    clearing `sys.meta_path`, which would break every other test sharing the process.
+    """
+    monkeypatch.setitem(sys.modules, "skyvern.forge.sdk.copilot.secret_scrub", None)
+
+
+def test_exit_time_foreign_record_stays_legible_and_scrubbed(
+    json_stream: io.StringIO,
+    registered_credential: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """aiohttp reports an unclosed session from `__del__` as the interpreter tears down, so the
+    redaction processor runs where no import can succeed. Importing the holder there raised, and
+    logging turned that one-line report into its ~26-line `--- Logging error ---` stderr dump.
+    """
+    # A worker logs for its whole lifetime before it exits, so the holder is long since resolved.
+    forge_log._secret_scrub_symbols()
+    _stop_every_import(monkeypatch)
+
+    logging.getLogger("asyncio").error(f"{_UNCLOSED_SESSION_MESSAGE} opened for {registered_credential}")
+
+    record = _sole_record(json_stream, lambda r: "Unclosed client session" in str(r.get("msg", "")))
+    assert "--- Logging error ---" not in capsys.readouterr().err
+    assert registered_credential not in json_stream.getvalue()
+    assert REDACTED_SECRET_PLACEHOLDER in record["msg"]
+    assert record["level"] == "error"
+
+
+def test_exit_time_record_survives_a_holder_import_that_never_succeeded(
+    json_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With nothing having resolved the holder yet, the record takes the fallback arm instead: it
+    loses its text, because an unreachable registry cannot vouch that the text carries no secret,
+    but it still reaches a handler as one record rather than a dump."""
+    monkeypatch.setattr(forge_log, "_secret_scrub_symbols_cache", None)
+    _stop_every_import(monkeypatch)
+
+    logging.getLogger("asyncio").error(_UNCLOSED_SESSION_MESSAGE)
+
+    record = _sole_record(json_stream, lambda r: r.get("msg") == REDACTED_SECRET_PLACEHOLDER)
+    assert "--- Logging error ---" not in capsys.readouterr().err
+    assert record["level"] == "error"
+
+
+def test_fallback_placeholder_matches_the_registry_holder() -> None:
+    """The fallback arm cannot import the holder, so its literal must not drift away from it."""
+    assert forge_log._FALLBACK_REDACTED_SECRET_PLACEHOLDER == REDACTED_SECRET_PLACEHOLDER

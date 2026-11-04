@@ -14,36 +14,11 @@ from unittest.mock import MagicMock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import HttpRequestBlock, NavigationBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class FakeWorkflowRunContext:
-    """Lightweight stand-in for tests that don't need the real WorkflowRunContext."""
-
-    def __init__(
-        self,
-        *,
-        values: dict | None = None,
-        browser_session_id: str | None = None,
-    ) -> None:
-        self.values = dict(values or {})
-        self.secrets = {}
-        self.include_secrets_in_templates = False
-        self.workflow_title = "wf-title"
-        self.workflow_id = "wf-id"
-        self.workflow_permanent_id = "wf-perm-id"
-        self.workflow_run_id = "wr_test123"
-        self.workflow_run_outputs = {}
-        self.browser_session_id = browser_session_id
-
-    def get_block_metadata(self, label: str) -> dict:
-        return {}
-
-    def build_workflow_run_summary(self) -> str:
-        return ""
 
 
 def _make_output_parameter() -> OutputParameter:
@@ -99,7 +74,8 @@ class TestBrowserSessionIdTemplateInjection:
     def test_workflow_parameter_takes_precedence(self) -> None:
         """If a workflow parameter named browser_session_id exists, it should win over the context attribute."""
         block = _make_http_block()
-        ctx = FakeWorkflowRunContext(values={"browser_session_id": "pbs_from_param"}, browser_session_id="pbs_from_ctx")
+        ctx = FakeWorkflowRunContext(values={"browser_session_id": "pbs_from_param"})
+        ctx.browser_session_id = "pbs_from_ctx"
         result = block.format_block_parameter_template_from_workflow_run_context("{{ browser_session_id }}", ctx)
         assert result == "pbs_from_param"
 

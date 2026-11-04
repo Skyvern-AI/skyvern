@@ -63,7 +63,9 @@ _FAKE_JWT = ".".join(
 )
 
 
-def _credential(credential_id: str = "cred_safe", tested_url: str = "https://login.example.test/login") -> object:
+def _credential(
+    credential_id: str = "cred_safe", tested_url: str | None = "https://login.example.test/login"
+) -> SimpleNamespace:
     return SimpleNamespace(credential_id=credential_id, name="Saved Login", tested_url=tested_url)
 
 
@@ -834,6 +836,44 @@ def test_rejects_existing_workflow_credential_id_without_prior_origin_scope() ->
     )
 
     assert not verdict.allowed
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+def test_existing_workflow_credential_with_known_prior_origin_ignores_current_resolution() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[_credential(tested_url="https://login.example.test/signin")],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={"cred_safe": ["https://portal.example.test"]},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
+    )
+
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("resolved_credentials", "admitted_urls"),
+    [
+        pytest.param([_credential("cred_other", "https://login.example.test/signin")], {}, id="other-id-resolved"),
+        pytest.param([], {"cred_safe": "https://login.example.test/a"}, id="admitted-but-unresolved"),
+    ],
+)
+def test_existing_workflow_credential_scope_without_prior_origin_refuses_other_authority(
+    resolved_credentials: list[SimpleNamespace], admitted_urls: dict[str, str]
+) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=resolved_credentials,
+            live_page_admitted_urls=admitted_urls,
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
+    )
+
     assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
 
 

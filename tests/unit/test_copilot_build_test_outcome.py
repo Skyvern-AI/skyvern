@@ -5450,6 +5450,12 @@ async def _execute_code_block(monkeypatch: pytest.MonkeyPatch, code: str) -> dic
         workflow_run_outputs: list[object] = []
         workflow = None
 
+        reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+        agent_unmasked_platform_secret_ids = staticmethod(set)
+
+        def __init__(self) -> None:
+            self.parameters: dict[str, object] = {}
+
         def get_block_metadata(self, label: str | None) -> dict[str, object]:
             return {}
 

@@ -76,6 +76,9 @@ def create_forge_stub_app() -> ForgeApp:
     # making every wr_ alias read as a live sharer. Default to "no run is live" so tests must opt a run
     # into liveness explicitly (non-PBS ownership signal).
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = MagicMock(return_value=False)
+    # Sync card-provenance predicate — an auto-mocked AsyncMock is truthy and would read every typed
+    # secret as card data.
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_SERVICE = _LazyNamespace()
     fake_app_module.BROWSER_MANAGER = _LazyNamespace()
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace

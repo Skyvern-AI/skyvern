@@ -34,7 +34,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
 from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
 from skyvern.forge.sdk.copilot.tools.credential_fill import (
     _request_settled_credential,
-    _resolved_credential_intended_url,
 )
 from skyvern.forge.sdk.copilot.tools.credentials import (
     _list_credentials,
@@ -1196,7 +1195,7 @@ async def test_a_carried_approval_stays_pinned_to_the_page_that_vouched_for_it()
     await _seed_prior_approved_credentials(later, organization_id="org-1", global_llm_context=recorded)
 
     assert later.live_page_admitted_urls[credential.credential_id] == _ADMITTED_URL
-    assert _resolved_credential_intended_url(later, credential.credential_id) == _ADMITTED_URL
+    assert later.credential_intended_url(credential.credential_id) == _ADMITTED_URL
 
 
 def test_a_credential_the_user_named_carries_no_origin_into_durable_approval() -> None:
@@ -1323,7 +1322,7 @@ async def test_naming_a_carried_credential_for_another_site_releases_its_carried
         cited = await credentials_module._resolve_exact_credential(credential.name, ctx)
 
     assert cited["data"]["status"] == "resolved"
-    assert _resolved_credential_intended_url(policy, credential.credential_id) is None
+    assert policy.credential_intended_url(credential.credential_id) is None
 
 
 @pytest.mark.asyncio
@@ -1342,7 +1341,7 @@ async def test_a_live_page_origin_survives_the_user_naming_that_credential() -> 
     with patch.object(credentials_module, "load_credentials", AsyncMock(return_value=[credential])):
         await credentials_module._resolve_exact_credential(credential.name, ctx)
 
-    assert _resolved_credential_intended_url(policy, credential.credential_id) == _ADMITTED_URL
+    assert policy.credential_intended_url(credential.credential_id) == _ADMITTED_URL
 
 
 def test_the_proposal_stops_carrying_once_the_conversation_has_moved_on() -> None:
