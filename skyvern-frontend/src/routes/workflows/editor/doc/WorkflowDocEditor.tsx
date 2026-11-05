@@ -14,6 +14,7 @@ import type { Edge } from "@xyflow/react";
 import { GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 import { cn } from "@/util/utils";
+import { Status } from "@/api/types";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -50,8 +51,9 @@ import {
   saveDocInput,
 } from "./docInputs";
 import { DocInputEditor } from "./DocInputEditor";
+import { takeReferenceLine } from "./docKeys";
 import type { ParametersState } from "../types";
-import { toast } from "@/components/ui/use-toast";
+import { toast, useToast } from "@/components/ui/use-toast";
 import {
   WorkflowDocActionsContext,
   type DocPendingNote,
@@ -83,8 +85,8 @@ import {
   DocKeyHints,
   DocStarterNote,
   DocTip,
-  type DocStarterProgress,
 } from "./DocStarter";
+import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import {
   DocProposalCard,
@@ -215,6 +217,11 @@ export function WorkflowDocEditor({
   const fullRunGoing = docRun.live && docRun.owned && !searchParams.has("bl");
   const editable = !scopeReadOnly && !locked && !proposal && !fullRunGoing;
   const showingProposal = proposal !== null;
+  const setDocMounted = useWorkflowPresentationStore((s) => s.setDocMounted);
+  useEffect(() => {
+    setDocMounted(true);
+    return () => setDocMounted(false);
+  }, [setDocMounted]);
   // Workspace's undo shortcut listens on the document, so this holds wherever focus is: undo
   // would change the live graph hidden behind the read-only proposal.
   useEffect(() => {
@@ -240,6 +247,8 @@ export function WorkflowDocEditor({
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const panelOpener = useRef<HTMLElement | null>(null);
+  // The step whose settings opened the panel, so Esc can put the caret back in its text.
+  const panelStepId = useRef<string | null>(null);
   const learnButtonRef = useRef<HTMLButtonElement>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelTab, setPanelTab] = useState("learn");
@@ -254,6 +263,7 @@ export function WorkflowDocEditor({
   const locateRequest = useLocateBlockStore((s) => s.request);
   const clearLocate = useLocateBlockStore((s) => s.clearLocate);
   const [wide, setWide] = useState(false);
+  const toastShowing = useToast().toasts.some((t) => t.open !== false);
   const [focusId, setFocusId] = useState<string | null>(null);
   const focusIdRef = useRef(focusId);
   focusIdRef.current = focusId;
@@ -264,6 +274,25 @@ export function WorkflowDocEditor({
     type: "workflow" | "context";
     isNew?: boolean;
   } | null>(null);
+  // Closing the input editor that "@ > Create input" opened puts the caret back in the line the "@" came from.
+  const inputEditorWasOpen = useRef(false);
+  useEffect(() => {
+    const open = editingInput !== null;
+    const closed = inputEditorWasOpen.current && !open;
+    inputEditorWasOpen.current = open;
+    if (!closed) return;
+    const frame = requestAnimationFrame(() => {
+      const line = takeReferenceLine();
+      const active = document.activeElement;
+      if (!line || (active && active !== document.body)) return;
+      Array.from(
+        rootRef.current?.querySelectorAll<HTMLElement>("[data-doc-line]") ?? [],
+      )
+        .filter((el) => el.getAttribute("aria-label") === line.label)
+        [line.index]?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [editingInput]);
   // Inputs deleted here: their mentions stay in the text and show as missing.
   const [removedInputs, setRemovedInputs] = useState<Set<string>>(
     () => new Set(),
@@ -369,6 +398,7 @@ export function WorkflowDocEditor({
     setBranches((current) => ({ ...current, [conditionalId]: branchId }));
   const openStepSettings = (id: string) => {
     panelOpener.current = document.activeElement as HTMLElement;
+    panelStepId.current = id;
     setSelectedStepId(id);
     setPanelTab("settings");
     setPanelOpen(true);
@@ -614,8 +644,14 @@ export function WorkflowDocEditor({
       (node) => node.type === "loop" || node.type === "conditional",
     ),
     problems,
-    ran: blocksByLabel.size > 0,
+    ran:
+      docRun.run?.status === Status.Completed &&
+      !docRun.blockRun &&
+      !docRun.earlierVersion,
   };
+  // One onboarding aid at a time: the checklist waits while a tip is showing.
+  const showTip =
+    starter.active && docTipIndex(starterProgress, starter.seenTips) >= 0;
   const reached = docStarterDone(starterProgress);
   const { markDone } = starter;
   useEffect(() => {
@@ -698,9 +734,10 @@ export function WorkflowDocEditor({
   useEffect(() => {
     rootRef.current?.focus();
     const root = rootRef.current;
-    const observer = new ResizeObserver(() =>
-      setWide((root?.clientWidth ?? 0) >= OUTLINE_MIN_WIDTH),
-    );
+    const observer = new ResizeObserver(() => {
+      const width = root?.clientWidth ?? 0;
+      setWide(width >= OUTLINE_MIN_WIDTH);
+    });
     if (root) observer.observe(root);
     return () => {
       observer.disconnect();
@@ -715,9 +752,19 @@ export function WorkflowDocEditor({
 
   const closePanel = () => {
     setPanelOpen(false);
+    // The step's line was replaced when it lost focus, so look it up again.
+    const stepLine =
+      panelStepId.current && rootRef.current
+        ? Array.from(
+            rootRef.current.querySelectorAll<HTMLElement>("[data-doc-node-id]"),
+          )
+            .find((el) => el.dataset.docNodeId === panelStepId.current)
+            ?.querySelector<HTMLElement>("[data-doc-line]")
+        : null;
+    panelStepId.current = null;
     (panelOpener.current?.isConnected
       ? panelOpener.current
-      : learnButtonRef.current
+      : (stepLine ?? learnButtonRef.current)
     )?.focus();
   };
   const goTo = (id: string) => {
@@ -1233,6 +1280,7 @@ export function WorkflowDocEditor({
                   }
                   onClick={() => {
                     panelOpener.current = document.activeElement as HTMLElement;
+                    panelStepId.current = null;
                     setSelectedStepId(startId);
                     setPanelTab("settings");
                     setPanelOpen(true);
@@ -1304,6 +1352,7 @@ export function WorkflowDocEditor({
                 aria-expanded={panelOpen && panelTab === "learn"}
                 onClick={() => {
                   panelOpener.current = learnButtonRef.current;
+                  panelStepId.current = null;
                   setPanelTab("learn");
                   setPanelOpen(true);
                 }}
@@ -1356,18 +1405,11 @@ export function WorkflowDocEditor({
                     label="Add step"
                   />
                   <DocKeyHints />
-                  {starter.active && (
+                  {showTip && (
                     <DocTip
                       progress={starterProgress}
                       seen={starter.seenTips}
                       onSeen={starter.seeTip}
-                    />
-                  )}
-                  {starter.active && (
-                    <DocGettingStarted
-                      progress={starterProgress}
-                      kept={starter.done}
-                      onHide={starter.hide}
                     />
                   )}
                 </div>
@@ -1375,6 +1417,16 @@ export function WorkflowDocEditor({
             </DocProposalProvider>
           </div>
         </div>
+        {edit && starter.active && !showTip && !(panelOpen && !wide) && (
+          <DocGettingStarted
+            progress={starterProgress}
+            kept={starter.done}
+            onHide={starter.hide}
+            raised={toastShowing}
+            compact={!wide}
+            clearOfPanel={panelOpen}
+          />
+        )}
         {wide && !panelOpen && (
           <DocOutline items={tree.items} byId={byId} scrollRef={scrollRef} />
         )}

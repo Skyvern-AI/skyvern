@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { DOC_RUN_AGENT_EVENT } from "./docKeys";
 import { PlayIcon, ReloadIcon, StopIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -190,6 +191,7 @@ export function DocRunButton() {
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [needed, setNeeded] = useState<Set<string>>(new Set());
   const fields = useRef(new Map<string, HTMLElement | null>());
+  const submitRef = useRef<HTMLButtonElement>(null);
 
   const stayInDoc = (search: string) => {
     preserveNextEntry(search, resolveLivePanes());
@@ -393,6 +395,18 @@ export function DocRunButton() {
     if (urlRunId) stayInDoc(searchWithoutRun(liveSearch(location.search)));
   };
 
+  const runShortcut = useRef<() => void>(() => {});
+  runShortcut.current = () => {
+    if (open) run_();
+    else if (!start.isPending && !runBlocked && !(live && owned && runId))
+      openPopover();
+  };
+  useEffect(() => {
+    const onRun = () => runShortcut.current();
+    window.addEventListener(DOC_RUN_AGENT_EVENT, onRun);
+    return () => window.removeEventListener(DOC_RUN_AGENT_EVENT, onRun);
+  }, []);
+
   if (live && owned && runId)
     return (
       <Button
@@ -458,6 +472,10 @@ export function DocRunButton() {
             if (target) {
               event.preventDefault();
               target.focus();
+            } else {
+              // No inputs: Enter should run, not press whichever button comes first.
+              event.preventDefault();
+              submitRef.current?.focus();
             }
           }}
         >
@@ -510,7 +528,7 @@ export function DocRunButton() {
               >
                 Cancel
               </Button>
-              <Button type="submit" className="h-8 px-3">
+              <Button type="submit" ref={submitRef} className="h-8 px-3">
                 Run
               </Button>
             </div>

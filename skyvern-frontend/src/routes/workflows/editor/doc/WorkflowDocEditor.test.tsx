@@ -127,6 +127,92 @@ describe("WorkflowDocEditor navigation", () => {
     vi.unstubAllGlobals();
   });
 
+  describe("keyboard-first editing", () => {
+    const editsWithAdd = (): DocGraphEdits => ({
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(() => "new_step"),
+      duplicate: vi.fn(),
+    });
+    // Opens the line and puts the caret `at` characters in; jsdom has no innerText, so the text is set both ways.
+    const openLine = (name: string, text: string, at: number) => {
+      fireEvent.focus(screen.getByRole("textbox", { name }));
+      const box = screen.getByRole("textbox", { name });
+      Object.defineProperty(box, "innerText", {
+        value: text,
+        configurable: true,
+      });
+      box.textContent = text;
+      const range = document.createRange();
+      if (box.firstChild) range.setStart(box.firstChild, at);
+      else range.setStart(box, 0);
+      range.collapse(true);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      return box;
+    };
+    const prompt = () =>
+      block("text_prompt", "write_it", null, { prompt: "Do the next thing" });
+
+    test("Enter at the end of a step adds a step of the same type below", () => {
+      const edits = editsWithAdd();
+      const nodes = renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 17);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(edits.addStep).mock.calls[0]![0].nodeType).toBe(
+        nodes.find(isWorkflowBlockNode)!.type,
+      );
+    });
+
+    test("Enter in the middle of a step splits its text between the two steps", () => {
+      const edits = editsWithAdd();
+      const nodes = renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 6);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).toHaveBeenCalledTimes(1);
+      const updates = vi.mocked(edits.update).mock.calls;
+      const last = updates[updates.length - 1]![0];
+      const first = last(nodes).find(isWorkflowBlockNode)!.data as Record<
+        string,
+        unknown
+      >;
+      expect(first.prompt).toBe("Do the");
+    });
+
+    test("Shift+Enter is a line break inside the step, not a new step", () => {
+      const edits = editsWithAdd();
+      renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 17);
+      const proceeded = fireEvent.keyDown(box, {
+        key: "Enter",
+        shiftKey: true,
+      });
+
+      expect(proceeded).toBe(true);
+      expect(edits.addStep).not.toHaveBeenCalled();
+    });
+
+    test("Tab on a note under an empty loop opens the step menu and picks no type", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [
+          forLoop("books", null, [], {
+            trailing_notes: "Open each book page",
+          }),
+        ],
+        edits,
+      );
+      const box = openLine("Note", "Open each book page", 19);
+      fireEvent.keyDown(box, { key: "Tab" });
+
+      expect(screen.getByPlaceholderText("Add a step…")).toBeTruthy();
+      expect(edits.addStep).not.toHaveBeenCalled();
+    });
+  });
+
   test("Tab nests into the run branch displayed on screen without a manual selection", () => {
     docRun.current = {
       runId: "wr_1",

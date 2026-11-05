@@ -56,6 +56,7 @@ import {
   DocStepPicker,
 } from "./DocEditing";
 import { useDocStepPending } from "./DocProposalView";
+import { takeCaretAtStart, type LineSplit, type PickerOpener } from "./docKeys";
 
 /** Where a step sits, for the moves its tag menu offers. Absent when the step's place can't be edited. */
 export type DocStepPlace = DocPlace & { count: number; isFinally: boolean };
@@ -466,13 +467,18 @@ export function DocStepBody({
   onSlash,
   onTab,
   onBackspaceAtStart,
+  onMove,
+  onRunStep,
 }: {
   node: WorkflowBlockNode;
   editable?: boolean;
-  onEnter?: () => void;
-  onSlash?: (finish: (keepSlash: boolean) => void) => void;
+  // Enter; `key` is the field the caret was in, and the split is null outside the step's main text.
+  onEnter?: (split: LineSplit | null, key: string) => void;
+  onSlash?: PickerOpener;
   onTab?: (outdent: boolean) => boolean;
   onBackspaceAtStart?: () => boolean;
+  onMove?: (delta: -1 | 1) => boolean;
+  onRunStep?: () => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const data = node.data as Record<string, unknown>;
@@ -553,12 +559,28 @@ export function DocStepBody({
       }
       onTab={key === mainKey ? onTab : undefined}
       onBackspaceAtStart={key === mainKey ? onBackspaceAtStart : undefined}
+      onMove={onMove}
+      onRunStep={onRunStep}
+      onSettings={
+        actions.edit ? () => actions.openSettings(node.id) : undefined
+      }
+      caretAtStart={
+        key === mainKey ? () => takeCaretAtStart(node.id) : undefined
+      }
       multiline
       onChange={(v) => {
         if (!v.trim() && !kept.includes(key)) setKept([...kept, key]);
         actions.edit?.setText(node.id, key, v);
       }}
-      onEnter={onEnter}
+      onEnter={
+        onEnter
+          ? (split) => {
+              if (key === mainKey) return onEnter(split, key);
+              // A secondary line has no twin to split into: Enter at its end adds the step below, mid-text does nothing.
+              if (!split?.after.trim()) onEnter(null, key);
+            }
+          : undefined
+      }
       onSlash={onSlash}
       onDone={() => {
         if (kept.includes(key)) setKept(kept.filter((k) => k !== key));

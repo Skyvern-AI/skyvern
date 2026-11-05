@@ -11,6 +11,7 @@ import {
 } from "react";
 import { ResetIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
+import { caretOnEdge, splitAtCaret } from "./docCaret";
 import {
   Command,
   CommandDialog,
@@ -42,6 +43,14 @@ import type { DocDestination, NodeType } from "./docEditApi";
 import type { DocReferenceGroup } from "./docGraphEdits";
 import { docStepChoices } from "./docStepChoices";
 import { docStepFilter } from "./docStepRegistry";
+import {
+  DOC_RUN_AGENT_EVENT,
+  armNextCaretAtStart,
+  rememberReferenceLine,
+  takeNextCaretAtStart,
+  type LineSplit,
+  type PickerOpener,
+} from "./docKeys";
 import { DocText } from "./DocText";
 import { describeSaveFailure, releaseUnansweredSave } from "./docSaveState";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
@@ -191,31 +200,6 @@ export function DocInsertPopover({
   );
 }
 
-// The line's text on each side of the caret, with line breaks; null when the caret is elsewhere.
-function splitAtCaret(el: HTMLElement): [string, string] | null {
-  const selection = window.getSelection();
-  if (!selection?.rangeCount) return null;
-  const caret = selection.getRangeAt(0);
-  if (!el.contains(caret.startContainer)) return null;
-  const read = (range: Range) => {
-    let out = "";
-    const walk = (node: Node) => {
-      if (node.nodeType === Node.TEXT_NODE) out += node.nodeValue ?? "";
-      else if (node.nodeName === "BR") out += "\n";
-      else node.childNodes.forEach(walk);
-    };
-    walk(range.cloneContents());
-    return out;
-  };
-  const before = document.createRange();
-  before.selectNodeContents(el);
-  before.setEnd(caret.startContainer, caret.startOffset);
-  const after = document.createRange();
-  after.selectNodeContents(el);
-  after.setStart(caret.endContainer, caret.endOffset);
-  return [read(before), read(after)];
-}
-
 const runHistory = (redo: boolean) => {
   const history = useWorkflowHistoryAccessStore.getState();
   // undo() flushes a pending debounced edit itself, so don't gate on canUndo here.
@@ -242,6 +226,10 @@ export function DocEditableLine({
   references,
   onTab,
   onBackspaceAtStart,
+  onMove,
+  onSettings,
+  onRunStep,
+  caretAtStart,
   maxLength,
 }: {
   value: string;
@@ -252,15 +240,22 @@ export function DocEditableLine({
   multiline?: boolean;
   label: string;
   onChange: (value: string) => void;
-  onEnter?: () => void;
+  // Enter, with the text on each side of the caret.
+  onEnter?: (split: LineSplit | null) => void;
   // Opens the step picker. The line stays open until finish: true types the "/" after all, false closes the line.
-  onSlash?: (finish: (keepSlash: boolean) => void) => void;
+  onSlash?: PickerOpener;
   onDone?: (value: string) => void;
   // What "@" offers here; no "@" menu without it.
   references?: () => DocReferenceGroup[];
-  // Both return false when they did nothing, so the key keeps its usual meaning.
-  onTab?: (outdent: boolean) => boolean;
+  // Both return false when they did nothing, so the key keeps its usual meaning. Tab can instead ask for the step picker.
+  onTab?: (outdent: boolean) => boolean | PickerOpener;
   onBackspaceAtStart?: () => boolean;
+  // Moves the step this line belongs to up (-1) or down (1).
+  onMove?: (delta: -1 | 1) => boolean;
+  onSettings?: () => void;
+  onRunStep?: () => void;
+  // True when entering the line should put the caret at its start.
+  caretAtStart?: () => boolean;
   maxLength?: number;
 }) {
   const [editing, setEditing] = useState(autoFocus);
@@ -302,6 +297,12 @@ export function DocEditableLine({
     }
     // insertText fires the input event, so the change reaches onChange and the browser's caret moves past it.
     document.execCommand("insertText", false, insert);
+    const label = el.getAttribute("aria-label");
+    const same = Array.from(
+      el.closest(IN_DOC)?.querySelectorAll<HTMLElement>("[data-doc-line]") ??
+        [],
+    ).filter((line) => line.getAttribute("aria-label") === label);
+    rememberReferenceLine(label ? { label, index: same.indexOf(el) } : null);
   };
   useLayoutEffect(() => {
     const el = ref.current;
@@ -323,7 +324,8 @@ export function DocEditableLine({
     el.focus();
     const range = document.createRange();
     range.selectNodeContents(el);
-    range.collapse(false);
+    const atStart = caretAtStart?.() ?? false;
+    range.collapse(takeNextCaretAtStart() || atStart);
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
     // Only on entering edit mode.
@@ -351,6 +353,7 @@ export function DocEditableLine({
     return (
       <span
         key="view"
+        data-doc-line
         role="textbox"
         tabIndex={0}
         aria-label={label}
@@ -368,6 +371,39 @@ export function DocEditableLine({
         )}
       </span>
     );
+
+  // Opens the step picker for this line. The line stays open until the picker finishes: it can type the "/" after all,
+  // return to the line typing nothing, or close the line.
+  const openPicker = (
+    opener: PickerOpener,
+    [before, after]: [string, string],
+  ) => {
+    const selection = window.getSelection();
+    const at = selection?.rangeCount
+      ? selection.getRangeAt(0).cloneRange()
+      : null;
+    slashAt.current = at;
+    opener((keepLine, typeSlash = keepLine) => {
+      if (slashAt.current !== at) return;
+      slashAt.current = null;
+      const el = ref.current;
+      if (!keepLine) {
+        setEditing(false);
+        setOverLimit(false);
+        onDone?.(el?.innerText ?? value);
+        return;
+      }
+      if (el?.isConnected && at) {
+        // Type the "/" into the line, so the DOM, the caret and onChange agree.
+        el.focus();
+        window.getSelection()?.removeAllRanges();
+        window.getSelection()?.addRange(at);
+        if (typeSlash) document.execCommand("insertText", false, "/");
+        return;
+      }
+      if (typeSlash) onChange(`${before}/${after}`);
+    });
+  };
 
   const onKeyDown = (event: KeyboardEvent<HTMLSpanElement>) => {
     // Keys that confirm an IME candidate belong to the IME.
@@ -387,9 +423,60 @@ export function DocEditableLine({
       ref.current?.blur();
       return;
     }
+    if (event.key === "Enter" && mod) {
+      event.preventDefault();
+      if (event.shiftKey) window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+      else onRunStep?.();
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey && (onEnter || !multiline)) {
       event.preventDefault();
-      onEnter?.();
+      onEnter?.(split ? { before: split[0], after: split[1] } : null);
+      return;
+    }
+    if (mod && event.key === "." && onSettings) {
+      event.preventDefault();
+      onSettings();
+      return;
+    }
+    if (
+      (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+      ((mod && !event.shiftKey && !event.altKey) ||
+        (event.altKey && event.shiftKey && !mod)) &&
+      onMove
+    ) {
+      if (onMove(event.key === "ArrowUp" ? -1 : 1)) event.preventDefault();
+      return;
+    }
+    if (
+      (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+      !mod &&
+      !event.shiftKey &&
+      !event.altKey &&
+      ref.current &&
+      caretOnEdge(ref.current, event.key === "ArrowUp" ? "first" : "last")
+    ) {
+      const lines = Array.from(
+        ref.current
+          .closest(IN_DOC)
+          ?.querySelectorAll<HTMLElement>("[data-doc-line]") ?? [],
+      );
+      const next =
+        lines[lines.indexOf(ref.current) + (event.key === "ArrowUp" ? -1 : 1)];
+      if (next) {
+        event.preventDefault();
+        if (event.key === "ArrowDown" && !next.isContentEditable)
+          armNextCaretAtStart();
+        next.focus();
+        // A line already open keeps its caret where it was; put it at the edge the arrow came from.
+        if (next.isContentEditable) {
+          const range = document.createRange();
+          range.selectNodeContents(next);
+          range.collapse(event.key === "ArrowDown");
+          window.getSelection()?.removeAllRanges();
+          window.getSelection()?.addRange(range);
+        }
+      }
       return;
     }
     if (event.key === "@" && references && ref.current && atWordStart) {
@@ -407,7 +494,10 @@ export function DocEditableLine({
       return;
     }
     if (event.key === "Tab" && onTab && !mod && !event.altKey) {
-      if (onTab(event.shiftKey)) event.preventDefault();
+      const handled = onTab(event.shiftKey);
+      if (handled) event.preventDefault();
+      if (typeof handled === "function")
+        openPicker(handled, split ?? [ref.current?.innerText ?? "", ""]);
       return;
     }
     if (event.key === "Backspace" && onBackspaceAtStart && !mod) {
@@ -420,35 +510,14 @@ export function DocEditableLine({
       return;
     }
     if (event.key === "/" && onSlash && !mod) {
-      const [before, after] = split ?? [ref.current?.innerText ?? "", ""];
-      const lineSoFar = before.slice(before.lastIndexOf("\n") + 1);
+      const sides: [string, string] = split ?? [
+        ref.current?.innerText ?? "",
+        "",
+      ];
+      const lineSoFar = sides[0].slice(sides[0].lastIndexOf("\n") + 1);
       if (!lineSoFar.trim()) {
         event.preventDefault();
-        const selection = window.getSelection();
-        const at = selection?.rangeCount
-          ? selection.getRangeAt(0).cloneRange()
-          : null;
-        slashAt.current = at;
-        onSlash((keepSlash) => {
-          if (slashAt.current !== at) return;
-          slashAt.current = null;
-          const el = ref.current;
-          if (!keepSlash) {
-            setEditing(false);
-            setOverLimit(false);
-            onDone?.(el?.innerText ?? value);
-            return;
-          }
-          if (el?.isConnected && at) {
-            // Type the "/" into the line, so the DOM, the caret and onChange agree.
-            el.focus();
-            window.getSelection()?.removeAllRanges();
-            window.getSelection()?.addRange(at);
-            document.execCommand("insertText", false, "/");
-            return;
-          }
-          onChange(`${before}/${after}`);
-        });
+        openPicker(onSlash, sides);
       }
     }
   };
@@ -464,6 +533,7 @@ export function DocEditableLine({
           ref={ref}
           role="textbox"
           aria-label={label}
+          data-doc-line
           aria-multiline={multiline}
           contentEditable="plaintext-only"
           suppressContentEditableWarning
@@ -791,6 +861,34 @@ export function DocEditBar({
     (state) => state.pendingGoalChanges.length,
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const saveNow = () => {
+    // Same check as the studio Save: a new Goal whose code isn't regenerated is applied or undone first.
+    if (pendingGoalChangeCount > 0) {
+      setGoalDialogOpen(true);
+      return;
+    }
+    runSave();
+  };
+  const saveShortcut = useRef<() => void>(() => {});
+  saveShortcut.current = () => {
+    if (!proposalPending && hasChanges && !saving) saveNow();
+  };
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.isComposing ||
+        event.altKey ||
+        !(event.metaKey || event.ctrlKey) ||
+        event.key.toLowerCase() !== "s"
+      )
+        return;
+      // The browser's own "save page" has no meaning in the Doc.
+      event.preventDefault();
+      saveShortcut.current();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
   const runSave = () => {
     setSaving(true);
     setSaveFailure(null);
@@ -867,14 +965,7 @@ export function DocEditBar({
           size="sm"
           className="h-7 shrink-0 px-3"
           disabled={saving}
-          onClick={() => {
-            // Same check as the studio Save: a new Goal whose code isn't regenerated is applied or undone first.
-            if (pendingGoalChangeCount > 0) {
-              setGoalDialogOpen(true);
-              return;
-            }
-            runSave();
-          }}
+          onClick={saveNow}
         >
           {saving ? "Saving…" : saveFailure ? "Try again" : "Save"}
         </Button>

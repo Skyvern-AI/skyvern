@@ -20,6 +20,11 @@ import {
   inferBranchCriteriaTypeFromExpression,
 } from "../workflowEditorUtils";
 import type { DocItem } from "./buildDocTree";
+import {
+  docMainIsSetting,
+  docStepIsNoteOnly,
+  getDocProseFields,
+} from "./docStepRegistry";
 import { withLineSetting } from "./docLineSettings";
 import {
   addBranch,
@@ -326,11 +331,12 @@ export function createDocEditApi({
     },
     // Tab moves a note into the loop or If above it, after its last step; Shift+Tab moves the note after
     // the last step of a loop or branch out, under the loop or If. Null when there is nowhere to go.
-    // A loop or branch with no step yet has nothing to hold a note, so the note becomes its first step.
+    // A loop or branch with no step yet has nothing to hold a note: the answer is its scope, for the caller to open the
+    // "/" step menu there. No step type is picked for the person.
     nestNote: (
       note: DocNoteRef,
       outdent: boolean,
-    ): DocNoteRef | { stepId: string } | null => {
+    ): DocNoteRef | { pickIn: DocScopeRef } | null => {
       const owner = nodes.find((n) => n.id === note.ownerNodeId);
       if (!owner) return null;
       const ownerScope = scopeOfNode(owner);
@@ -357,34 +363,100 @@ export function createDocEditApi({
       if (!scope) return null;
       const inside = readChain(graph, scope, finallyId)?.ids ?? [];
       const last = inside[inside.length - 1];
-      if (!last) {
-        const text = noteText(note.ownerNodeId, note.placement).trim();
-        // A Browser Task is the step whose main text is an instruction, as the Doc's "/" menu offers it.
-        // No immediate capture here: the new step's layout passes land after it, and only the history's debounce
-        // folds them, the step and the note's move into one undo entry.
-        const stepId = insertStep({ scope, index: 0 }, "navigation");
-        if (!stepId) return null;
-        if (text)
-          edits.update((current) =>
-            setStepField(
-              setStepField(
-                current,
-                note.ownerNodeId,
-                noteKey(note.placement),
-                "",
-              ),
-              stepId,
-              "navigationGoal",
-              text,
-            ),
-          );
-        return { stepId };
-      }
+      if (!last) return { pickIn: scope };
       return moveNoteText(
         note,
         { ownerNodeId: last, placement: "trailing" },
         false,
       );
+    },
+    // The picked type is the person's choice; the note's text becomes the new step's main text.
+    adoptNote: (
+      note: DocNoteRef,
+      scope: DocScopeRef,
+      nodeType: NodeType,
+    ): string | null => {
+      const text = noteText(note.ownerNodeId, note.placement).trim();
+      // No immediate capture: the new step's layout passes land after it, and only the history's debounce
+      // folds them, the step and the note's move into one undo entry.
+      const stepId = insertStep({ scope, index: 0 }, nodeType);
+      // A loop or If takes its list or condition from its own fields, and a step with no instruction field (Wait,
+      // Print Page, ...) keeps its description as a note the agent never reads. The note stays where it is for both,
+      // so the workflow's runtime context does not change.
+      if (stepId && text)
+        edits.update((current) => {
+          const added = current.find((n) => n.id === stepId);
+          if (
+            !added ||
+            docStepIsNoteOnly(added) ||
+            added.type === "loop" ||
+            added.type === "conditional"
+          )
+            return current;
+          const key =
+            (!docMainIsSetting(added) && getDocProseFields(added)[0]?.key) ||
+            "description";
+          return setStepField(
+            setStepField(
+              current,
+              note.ownerNodeId,
+              noteKey(note.placement),
+              "",
+            ),
+            stepId,
+            key,
+            text,
+          ).map((n) => (n.id === stepId ? withLineSetting(n, key, "") : n));
+        });
+      return stepId;
+    },
+    // Enter in a step: a step of the same type goes below it, and the text after the caret moves into it.
+    splitStep: (
+      place: DocPlace,
+      id: string,
+      split: { key: string; before: string; after: string } | null,
+    ): string | null => {
+      const node = nodes.find((n) => n.id === id);
+      if (!node || !isWorkflowBlockNode(node)) return null;
+      // A URL or file is not split between two steps: Enter just adds the step below.
+      if (docMainIsSetting(node)) split = null;
+      // Enter with the caret at the very start of a step's text adds an empty step above and leaves the text, with
+      // the step's settings, where it is. The caret stays in the original step.
+      if (split && !split.before && split.after) {
+        const above = insertStep(
+          { scope: place.scope, index: place.index },
+          node.type,
+        );
+        return above ? id : null;
+      }
+      const added = insertStep(
+        { scope: place.scope, index: place.index + 1 },
+        node.type,
+      );
+      // The original keeps only what is before the caret, even when a selection to the end leaves nothing after it.
+      if (added && split)
+        edits.update((current) => {
+          // A new step can use another field for its text than the one split (engine defaults differ).
+          const created = current.find((n) => n.id === added);
+          const addedKey =
+            (created && getDocProseFields(created)[0]?.key) || split.key;
+          const previous = String(
+            (node.data as Record<string, unknown>)[split.key] ?? "",
+          );
+          return setStepField(
+            setStepField(current, id, split.key, split.before),
+            added,
+            addedKey,
+            split.after,
+          ).map((n) =>
+            n.id === id
+              ? withLineSetting(n, split.key, previous)
+              : n.id === added
+                ? withLineSetting(n, addedKey, "")
+                : n,
+          );
+        });
+      return added;
     },
     insertStep,
     duplicate: (id: string) => edits.duplicate(id),

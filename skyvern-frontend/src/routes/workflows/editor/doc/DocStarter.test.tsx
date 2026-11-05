@@ -1,6 +1,13 @@
-import { act, render, renderHook, screen } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+} from "@testing-library/react";
 import { describe, expect, test } from "vitest";
 import { DocGettingStarted, DocTip } from "./DocStarter";
+import { docTipIndex } from "./docStarterTips";
 import { useDocStarter } from "./useDocStarter";
 
 const fresh = {
@@ -47,6 +54,29 @@ describe("doc starter", () => {
       />,
     );
     expect(screen.getByText(/Backspace at the start/)).toBeTruthy();
+  });
+});
+
+describe("doc starter placement", () => {
+  test("a narrow pane shows a pill that opens the card", () => {
+    render(<DocGettingStarted progress={fresh} onHide={() => {}} compact />);
+    expect(screen.queryByRole("complementary")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Getting started/ }));
+    expect(screen.getByText("0 of 4")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse checklist" }));
+    expect(screen.queryByText("0 of 4")).toBeNull();
+  });
+
+  test("the checklist makes room for a toast", () => {
+    const { container } = render(
+      <DocGettingStarted progress={fresh} onHide={() => {}} raised />,
+    );
+    expect(container.querySelector("aside")?.className).toContain("bottom-36");
+  });
+
+  test("a tip is pending until seen, so the checklist can wait for it", () => {
+    expect(docTipIndex(fresh, [])).toBe(0);
+    expect(docTipIndex(fresh, ["slash"])).toBe(-1);
   });
 });
 
