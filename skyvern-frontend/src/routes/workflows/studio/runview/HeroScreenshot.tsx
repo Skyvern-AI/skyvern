@@ -35,10 +35,12 @@ export function HeroScreenshot({
   selection,
   running,
   unavailableText = "Screenshot unavailable.",
+  onUnavailable,
 }: {
   selection: HeroSelection | null;
   running: boolean;
   unavailableText?: string;
+  onUnavailable?: (unavailable: boolean) => void;
 }) {
   const [zoomed, setZoomed] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -85,6 +87,14 @@ export function HeroScreenshot({
   useEffect(() => {
     setZoomed(false);
   }, [primaryId]);
+
+  const unavailable =
+    Boolean(selection) &&
+    !(isLoading && !screenshot) &&
+    (!screenshot || screenshot.archived || (imageFailed && !primaryFailed));
+  useEffect(() => {
+    onUnavailable?.(unavailable);
+  }, [unavailable, onUnavailable]);
 
   // Start each view at the top; when zoomed, center horizontally too (margin-auto
   // resolves to 0 once the image overflows, so the scroll would default to left).

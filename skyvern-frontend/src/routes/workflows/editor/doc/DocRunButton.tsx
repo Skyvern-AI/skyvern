@@ -20,6 +20,7 @@ import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
+import { useDocUnfinishedStore } from "./docUnfinished";
 import { isMaskedHeaders } from "@/util/secretHeaders";
 import { cn } from "@/util/utils";
 
@@ -180,7 +181,11 @@ export function DocRunButton() {
   const inputs = useDocRunStore((s) => s.inputs);
   const blockingBlocks = useRunValidationStore((s) => s.blockingBlocks);
   const docProblemCount = useRunValidationStore((s) => s.docProblemCount);
-  const runBlocked = blockingBlocks.length > 0 && docProblemCount === 0;
+  // A step still being set up does not hold Run: pressing it reveals the problem instead.
+  const unfinishedIds = useDocUnfinishedStore((s) => s.ids);
+  const runBlocked =
+    blockingBlocks.some((block) => !unfinishedIds.has(block.id)) &&
+    docProblemCount === 0;
   const [open, setOpen] = useState(false);
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [needed, setNeeded] = useState<Set<string>>(new Set());

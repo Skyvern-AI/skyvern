@@ -26,6 +26,7 @@ import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
+import { useDocUnfinishedStore } from "./docUnfinished";
 import { block, conditional, forLoop, settings } from "./docTestBlocks";
 import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
@@ -642,6 +643,117 @@ test("a step that reads an output only some branches produce shows the warning u
     vi.restoreAllMocks();
     cleanup();
   }
+});
+
+describe("a step that was just added", () => {
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+  });
+  afterEach(() => {
+    cleanup();
+    useDocUnfinishedStore.getState().clear();
+    vi.unstubAllGlobals();
+  });
+
+  test("shows its missing setting once, and only after the user leaves it", () => {
+    const nodes = renderDoc([block("login", "sign_in", null, { url: "" })]);
+    const login = nodes.find((n) => isWorkflowBlockNode(n))!;
+    act(() => useDocUnfinishedStore.getState().add(login.id));
+    expect(document.querySelector("[data-doc-step-fix]")).toBeNull();
+    expect(document.querySelector("[data-doc-problems]")).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+
+    fireEvent.pointerDown(document.body);
+
+    expect(
+      screen.getAllByText("Choose a saved credential in this step's settings"),
+    ).toHaveLength(1);
+    expect(document.querySelector("[data-doc-problems]")?.textContent).toBe(
+      "1 problem",
+    );
+    expect(screen.queryByText(/need.* fixing/)).toBeNull();
+  });
+
+  test("a click inside a floating menu does not count as leaving the new step", () => {
+    const nodes = renderDoc([block("login", "sign_in", null, { url: "" })]);
+    const login = nodes.find((n) => isWorkflowBlockNode(n))!;
+    act(() => useDocUnfinishedStore.getState().add(login.id));
+    const option = document.body.appendChild(document.createElement("div"));
+    option.setAttribute("role", "listbox");
+    fireEvent.pointerDown(option);
+    expect(document.querySelector("[data-doc-problems]")).toBeNull();
+    option.remove();
+  });
+});
+
+describe("A Browser Action that needs several actions", () => {
+  const actionStep = {
+    label: "search_step",
+    block_type: "action",
+    next_block_label: null,
+    continue_on_failure: false,
+    model: null,
+    output_parameter: output("search_step"),
+    url: "",
+    navigation_goal: "Search for apple stock and get its price",
+    parameters: [],
+  } as unknown as WorkflowBlock;
+
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  test("offers to turn into a Browser Task before running, keeping the text", () => {
+    const apply = vi.fn();
+    renderDoc([actionStep], {
+      apply,
+      update: vi.fn(),
+      addStep: vi.fn(() => null),
+      duplicate: vi.fn(),
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Turn into Browser Task" }),
+    );
+
+    const turned = apply.mock.calls[0]![0].nodes.find(
+      (node: { data: { label?: string } }) => node.data.label === "search_step",
+    );
+    expect(turned.type).toBe("navigation");
+    expect(turned.data.navigationGoal).toBe(
+      "Search for apple stock and get its price",
+    );
+  });
 });
 
 describe("Doc inputs", () => {
