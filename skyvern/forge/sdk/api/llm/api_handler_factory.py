@@ -1076,7 +1076,7 @@ def _normalize_llm_model(model: str | None) -> str | None:
     # LiteLLM's response.model can include a provider prefix
     # (e.g. "vertex_ai/gemini-3-flash-preview", "openai/gpt-4.1-mini") while
     # config-side fallbacks tend to use the bare model name. Strip the
-    # prefix so dbt aggregates the same model under one bucket.
+    # prefix so downstream cost aggregation buckets the same model once.
     if not model:
         return model
     return model.split("/")[-1]
@@ -1089,7 +1089,7 @@ def _assert_step_thought_block_exclusive(
 ) -> None:
     # Each LLM call writes cost to exactly one of: steps.step_cost,
     # observer_thoughts.thought_cost, workflow_run_blocks.llm_cost.
-    # Both the run-level SUM and the int_org_llm_costs dbt model rely on
+    # Both the run-level SUM and the downstream per-org cost rollups rely on
     # this exclusivity to avoid double-counting.
     set_count = sum(1 for x in (step, thought, workflow_run_block_id) if x is not None)
     if set_count > 1:
@@ -2697,7 +2697,7 @@ class LLMAPIHandlerFactory:
                 # router group name (e.g. "GEMINI_3_0_FLASH_WITH_FALLBACK") when the router
                 # falls back. Mirrors the pattern in llm_api_handler/call.
                 # Phase 1 tradeoff: last_llm_model records the most recent model used in
-                # the step. dbt attributes the full step_cost to it, which is accurate
+                # the step. Downstream cost models attribute the full step_cost to it, which is accurate
                 # only for single-model steps. For multi-model steps (router fallback,
                 # secondary LLM) the attribution is lossy — resolved in Phase 2 by a
                 # per-call tracking table.

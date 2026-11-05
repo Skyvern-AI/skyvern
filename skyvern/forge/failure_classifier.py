@@ -595,7 +595,7 @@ def classify_from_failure_reason(
 # ── Infra-failure attribution (SKY-16588) ─────────────────────────────────────
 # Derives one bounded internal attribution document from the typed failure_category
 # above; introduces no second classifier. Persisted to workflow_runs.failure_attribution
-# for internal warehouse analysis only — never exposed to customers, never carrying raw
+# for internal reliability analysis only — never exposed to customers, never carrying raw
 # failure text.
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
