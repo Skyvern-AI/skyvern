@@ -54,7 +54,10 @@ import {
   TakeControlButton,
 } from "@/routes/streaming/StreamControlBar";
 import { useRecordingMessageChannel } from "@/routes/streaming/useRecordingMessageChannel";
-import { useWebSocketParams } from "@/routes/streaming/webSocketParams";
+import {
+  generateClientId,
+  useWebSocketParams,
+} from "@/routes/streaming/webSocketParams";
 
 import "./browser-stream.css";
 
@@ -272,7 +275,8 @@ function BrowserStream({
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
   const logging = useLogging();
-  const getWebSocketParams = useWebSocketParams();
+  const [clientId] = useState(generateClientId);
+  const getWebSocketParams = useWebSocketParams(clientId);
   const isBrowserSessionAvailable =
     entity !== "browserSession" || hasBrowserSession;
   const isBrowserSessionBackendReady =
@@ -324,6 +328,7 @@ function BrowserStream({
         ? `${wssBaseUrl}/stream/messages/workflow_run/${runId}`
         : undefined;
   const { isMessageConnected, sendCommand } = useRecordingMessageChannel({
+    clientId,
     browserSessionId: runId,
     enabled:
       showStream &&

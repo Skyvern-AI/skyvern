@@ -50,7 +50,6 @@ from skyvern.forge.sdk.streaming.registries import (
     get_message_channel,
     get_vnc_channel,
 )
-from skyvern.forge.sdk.utils.aio import collect
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.cdp_connection import redact_cdp_url
 from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_PREFIX
@@ -389,6 +388,10 @@ class VncChannel:
         if self.websocket.client_state != WebSocketState.CONNECTED:
             return False
 
+        # A server-side close leaves client_state CONNECTED until the peer's close frame is read.
+        if self.websocket.application_state != WebSocketState.CONNECTED:
+            return False
+
         if not self.task and not self.workflow_run and not self.browser_session:
             return False
 
@@ -622,7 +625,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     LOG.debug(f"{class_name} Frontend closed the vnc channel cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
-                    pass
+                    data = None
                 except Exception:
                     vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(f"{class_name} An unexpected exception occurred.", **vnc_channel.identity)
@@ -682,7 +685,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     LOG.debug(f"{class_name} Browser closed the vnc channel session cleanly.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed-ok")
                 except asyncio.CancelledError:
-                    pass
+                    data = None
                 except Exception:
                     vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(
@@ -696,7 +699,10 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     continue
 
                 try:
-                    if vnc_channel.websocket.client_state != WebSocketState.CONNECTED:
+                    if (
+                        vnc_channel.websocket.client_state != WebSocketState.CONNECTED
+                        or vnc_channel.websocket.application_state != WebSocketState.CONNECTED
+                    ):
                         continue
                     await vnc_channel.websocket.send_bytes(data)
                     # The first relayed message is the display server's handshake: the browser is on the wire.
@@ -728,7 +734,18 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         ]
 
         try:
-            await collect(loops)
+            # Either loop returning normally (e.g. its channel was displaced) must close the viewer socket so the
+            # viewer redials.
+            done, pending = await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
+            vnc_channel.live_stream.end_first("stream_error")
+            await vnc_channel.close(reason="vnc-relay-loop-exited")
+            await novnc_ws.close()
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                if exc := task.exception():
+                    raise exc
         except WebSocketDisconnect:
             pass
         except ConnectionClosedOK:

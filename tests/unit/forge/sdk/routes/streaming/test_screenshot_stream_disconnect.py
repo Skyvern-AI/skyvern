@@ -552,6 +552,7 @@ class _VncViewer:
         client_message_ready: asyncio.Event | None = None,
     ) -> None:
         self.client_state = WebSocketState.CONNECTED
+        self.application_state = WebSocketState.CONNECTED
         self._leaves = leaves
         self._client_message = client_message
         self._client_message_ready = client_message_ready
@@ -579,6 +580,7 @@ class _VncViewer:
     async def close(self, code: int = 1000, reason: str | None = None) -> None:
         self.close_codes.append(code)
         self.client_state = WebSocketState.DISCONNECTED
+        self.application_state = WebSocketState.DISCONNECTED
         self._closed.set()
 
 

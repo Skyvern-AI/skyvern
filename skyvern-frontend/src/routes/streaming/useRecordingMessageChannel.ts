@@ -9,6 +9,7 @@ import { useWebSocketParams } from "./webSocketParams";
 export type RecordingClipboardMode = "vnc" | "message" | "none";
 
 export interface UseRecordingMessageChannelOptions {
+  clientId: string;
   browserSessionId: string | null;
   /** socket lifecycle gate: open the message WS while true */
   enabled: boolean;
@@ -259,7 +260,7 @@ export function useRecordingMessageChannel(
   const [messageSocket, setMessageSocket] = useState<WebSocket | null>(null);
   const [isMessageConnected, setIsMessageConnected] = useState(false);
   const messageSocketRef = useRef<WebSocket | null>(null);
-  const getWebSocketParams = useWebSocketParams();
+  const getWebSocketParams = useWebSocketParams(options.clientId);
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
@@ -349,7 +350,13 @@ export function useRecordingMessageChannel(
     // NOTE: adding getWebSocketParams causes constant reconnects of message channel when,
     // for instance, take-control or cede-control is clicked
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [browserSessionId, enabled, reconnectTrigger, socketUrl]);
+  }, [
+    browserSessionId,
+    enabled,
+    reconnectTrigger,
+    socketUrl,
+    options.clientId,
+  ]);
 
   const sendCommand = useCallback((command: Command) => {
     const socket = messageSocketRef.current;
