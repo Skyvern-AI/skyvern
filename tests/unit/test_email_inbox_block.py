@@ -10,6 +10,7 @@ import pytest
 
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import Block
 from skyvern.forge.sdk.workflow.models.email_inbox_block import EmailInboxBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -22,9 +23,13 @@ _NOW = datetime.now(UTC)
 
 
 class _FakeContextForTest:
+    reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+    agent_unmasked_platform_secret_ids = staticmethod(set)
+
     def __init__(self, organization_id: str) -> None:
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
+        self.parameters: dict[str, Any] = {}
         self.include_secrets_in_templates = False
         self.workflow_title = "wf-title"
         self.workflow_id = "wf-id"

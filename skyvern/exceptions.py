@@ -1256,7 +1256,8 @@ class BitwardenGetItemError(BitwardenBaseError):
 
 
 class BitwardenListItemsError(BitwardenBaseError):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, missing_item: bool = False) -> None:
+        self.missing_item = missing_item
         super().__init__(f"Error listing items in Bitwarden: {message}")
 
 
@@ -2080,7 +2081,10 @@ class BrowserSessionStartupTimeout(SkyvernHTTPException):
 
 
 class TooManyStartingBrowserSessions(SkyvernHTTPException):
-    def __init__(self, retry_after_seconds: int) -> None:
+    def __init__(self, retry_after_seconds: int, *, starting_sessions: int, max_starting_sessions: int) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        self.starting_sessions = starting_sessions
+        self.max_starting_sessions = max_starting_sessions
         super().__init__(
             "Too many browser sessions are starting for this organization at once. "
             f"Retry in {retry_after_seconds} seconds.",

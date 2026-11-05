@@ -239,7 +239,8 @@ type BuildTestConnectFailureState =
   | "provisioning_unavailable"
   | "cdp_connect_failed"
   | "occupied"
-  | "billing_credit_admission_refusal";
+  | "billing_credit_admission_refusal"
+  | "browser_start_capacity";
 
 export function isBuildTestConnectFailureState(
   value: unknown,
@@ -249,7 +250,8 @@ export function isBuildTestConnectFailureState(
     value === "provisioning_unavailable" ||
     value === "cdp_connect_failed" ||
     value === "occupied" ||
-    value === "billing_credit_admission_refusal"
+    value === "billing_credit_admission_refusal" ||
+    value === "browser_start_capacity"
   );
 }
 

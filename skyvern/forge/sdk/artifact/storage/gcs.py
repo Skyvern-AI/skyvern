@@ -2,8 +2,9 @@ import asyncio
 import os
 import shutil
 import uuid
+from collections.abc import AsyncIterator, Awaitable
 from datetime import datetime, timezone
-from typing import BinaryIO
+from typing import BinaryIO, TypeVar
 
 import structlog
 
@@ -26,6 +27,8 @@ from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     SENSITIVE_SHARE_URL_EXPIRY_HOURS,
     BaseStorage,
+    StoredObjectVersion,
+    StreamingArtifactStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
@@ -40,6 +43,7 @@ from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_PATH_SEGMENT,
     sync_run_recording_clips,
 )
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import settle
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -68,7 +72,34 @@ async def _get_object_info_safe(storage: "GcsStorage", uri: str) -> dict | None:
         return None
 
 
-class GcsStorage(BaseStorage):
+_T = TypeVar("_T")
+
+
+async def _settled(work: Awaitable[_T]) -> _T:
+    # A cancelled to_thread keeps its worker running, so the SDK call is awaited before the cancellation propagates.
+    task = asyncio.ensure_future(work)
+    try:
+        return await asyncio.shield(task)
+    except BaseException:
+        await settle(task)
+        raise
+
+
+class _GcsObjectStream:
+    def __init__(self, client: RealAsyncGcsStorageClient, uri: str, size: int, generation: int) -> None:
+        self._client, self._uri, self._generation = client, uri, generation
+        self.content_length = size
+
+    async def iter_chunks(self, chunk_size: int) -> AsyncIterator[bytes]:
+        for start in range(0, self.content_length, chunk_size):
+            end = min(start + chunk_size, self.content_length) - 1
+            yield await _settled(self._client.download_range(self._uri, start, end, self._generation))
+
+    async def aclose(self) -> None:
+        return None
+
+
+class GcsStorage(BaseStorage, StreamingArtifactStorage):
     _PATH_VERSION = "v1"
 
     def __init__(
@@ -163,6 +194,29 @@ class GcsStorage(BaseStorage):
 
     async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
         return {}
+
+    def can_stream_artifact(self, artifact: Artifact) -> bool:
+        # Content comparison reads pinned whole objects only; the content route serves retrieved bytes.
+        return False
+
+    def can_verify_artifact(self, artifact: Artifact) -> bool:
+        return not artifact.bundle_key
+
+    async def stat_artifact(self, artifact: Artifact) -> StoredObjectVersion | None:
+        info = await _settled(self.async_client.get_object_info(artifact.uri, bounded=True))
+        if not info or info.get("Generation") is None:
+            return None
+        return StoredObjectVersion(size=info["ContentLength"], etag=str(info["Generation"]))
+
+    async def open_artifact_stream(
+        self, artifact: Artifact, *, byte_range: tuple[int, int] | None = None, etag: str | None = None
+    ) -> _GcsObjectStream | None:
+        if etag is None or byte_range is not None:
+            return None
+        version = await self.stat_artifact(artifact)
+        if version is None or version.etag != etag:
+            return None
+        return _GcsObjectStream(self.async_client, artifact.uri, version.size, int(etag))
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await self.async_client.download_file(artifact.uri)

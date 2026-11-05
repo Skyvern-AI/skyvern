@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -59,6 +60,7 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.library.skyvern import Skyvern
 from skyvern.library.skyvern_browser_page import SkyvernBrowserPage
 from skyvern.services import script_service
+from skyvern.services.script_reviewer_v3.skills.interact import _handler_live_get_dom
 from skyvern.webeye import navigation as navigation_module
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.handler import ActionHandler
@@ -66,6 +68,7 @@ from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionS
 from skyvern.webeye.skycdp.facade.page import Frame as CdpFrame
 from skyvern.webeye.utils.page import SkyvernFrame
 from tests.unit._task_block_fakes import run_bound_browser_state
+from tests.unit.conftest import CARD_SECRET_RUN_ID
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -1068,6 +1071,196 @@ async def test_fill_value_none_proactive_unchanged(mock_scraped_page, mock_ai):
 
         assert result == "ai_value"
         script_page._input_text.assert_called_once()
+
+
+class _FillablePageStub(_PageStub):
+    """A page with one field that records what the script does to it, in order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[str] = []
+        self.field = MagicMock()
+        self.field.wait_for = AsyncMock()
+        self.field.evaluate = AsyncMock(side_effect=lambda *_args, **_kwargs: self.events.append("mask"))
+        self.field.fill = AsyncMock(side_effect=lambda *_args, **_kwargs: self.events.append("fill"))
+
+    def locator(self, _selector: str) -> SimpleNamespace:
+        return SimpleNamespace(first=self.field)
+
+
+class _LateFieldPageStub(_FillablePageStub):
+    """A field that renders only once something waits for it, so both bounded mask attempts find nothing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rendered = False
+
+        async def wait_for(**_kwargs: Any) -> None:
+            self.rendered = True
+
+        async def evaluate(*_args: Any, **_kwargs: Any) -> None:
+            if not self.rendered:
+                raise PlaywrightTimeoutError("waiting for the field")
+            self.events.append("mask")
+
+        self.field.wait_for = wait_for
+        self.field.evaluate = evaluate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["_input_text", "fill_autocomplete"])
+async def test_cached_card_fill_masks_a_field_that_renders_late(
+    card_secret_run: dict[str, str], mock_scraped_page, mock_ai, entry: str
+) -> None:
+    """A card field that renders after both bounded mask attempts, but within the write's own wait, must still be
+    masked before the write reaches it."""
+    page = _LateFieldPageStub()
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(scraped_page=mock_scraped_page, page=page, ai=mock_ai)
+    script_page._do_autocomplete = AsyncMock(side_effect=lambda **_kwargs: page.events.append("fill"))
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
+        if entry == "_input_text":
+            await script_page._input_text("#card", card_secret_run["card_number"], _skip_element_prep=True)
+        else:
+            await script_page.fill_autocomplete(selector="#card", value=card_secret_run["card_number"])
+
+    assert page.events == ["mask", "fill"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "events"), [("card_number", ["mask", "fill"]), ("card_holder_name", ["fill"])])
+async def test_cached_fill_masks_a_vault_card_field_before_writing_it(
+    card_secret_run: dict[str, str], mock_scraped_page, mock_ai, field: str, events: list[str]
+) -> None:
+    """A cached script fills by selector without the action handler and stores a screenshot right after, so
+    the fill itself has to mask card data when the workflow has not opted into Mask Secrets (SKY-19351)."""
+    page = _FillablePageStub()
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(scraped_page=mock_scraped_page, page=page, ai=mock_ai)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
+        await script_page._input_text("#field", card_secret_run[field], _skip_element_prep=True)
+
+    assert page.events == events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["_input_text", "fill_autocomplete"])
+async def test_cached_fill_fallback_gets_the_card_placeholder_not_the_card_number(
+    card_secret_run: dict[str, str], mock_scraped_page, mock_ai, entry: str
+) -> None:
+    """When the cached selector fails, the AI fallback puts the value in an LLM payload and types the model's
+    answer. Handed the resolved number, the handler sees no placeholder and types the card unmasked."""
+    placeholder = card_secret_run["card_number"]
+    page = _FillablePageStub()
+    page.field.fill = AsyncMock(side_effect=RuntimeError("the field re-mounted"))
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(scraped_page=mock_scraped_page, page=page, ai=mock_ai)
+    script_page._do_autocomplete = AsyncMock(side_effect=RuntimeError("the field re-mounted"))
+    script_page._ai.ai_input_text = AsyncMock(return_value="filled")
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
+        if entry == "_input_text":
+            await script_page._input_text(
+                "#card", placeholder, intention="Fill the card number", _skip_element_prep=True
+            )
+        else:
+            await script_page.fill_autocomplete(selector="#card", value=placeholder, prompt="Fill the card number")
+
+    fallback = script_page._ai.ai_input_text.await_args.kwargs
+    assert fallback["value"] == placeholder
+    assert fallback["value_is_sensitive"] is True
+    assert "4111111111111111" not in repr(fallback)
+
+
+@pytest.mark.asyncio
+async def test_cached_fill_fallback_takes_a_non_string_value(
+    card_secret_run: dict[str, str], mock_scraped_page, mock_ai
+) -> None:
+    """A script can pass a number from its parameters; the card check on the way to the fallback must not raise."""
+    page = _FillablePageStub()
+    page.field.fill = AsyncMock(side_effect=RuntimeError("the field re-mounted"))
+    with patch("skyvern.core.script_generations.skyvern_page.Page.__init__", return_value=None):
+        script_page = ScriptSkyvernPage(scraped_page=mock_scraped_page, page=page, ai=mock_ai)
+    script_page._ai.ai_input_text = AsyncMock(return_value="filled")
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
+        await script_page._input_text("#qty", 5, intention="Set the quantity", _skip_element_prep=True)
+
+    assert script_page._ai.ai_input_text.await_args.kwargs["value"] == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["_input_text", "fill_autocomplete"])
+async def test_cached_fill_fallback_keeps_a_polled_otp_code(mock_scraped_page, mock_ai, entry: str) -> None:
+    """A value the selector path swapped for an externally polled code has no placeholder to resolve again, so
+    the fallback must still receive the code itself."""
+    script_page = _make_script_page(mock_scraped_page, mock_ai)
+    script_page.get_actual_value = AsyncMock(return_value="654321")
+    script_page._wait_for_selector_with_retry = AsyncMock(side_effect=RuntimeError("the field re-mounted"))
+    script_page._do_autocomplete = AsyncMock(side_effect=RuntimeError("the field re-mounted"))
+    script_page._ai.ai_input_text = AsyncMock(return_value="filled")
+
+    if entry == "_input_text":
+        await script_page._input_text("#otp", "code", intention="Enter the code", totp_identifier="user@example.com")
+    else:
+        await script_page.fill_autocomplete(
+            selector="#otp", value="code", prompt="Enter the code", totp_identifier="user@example.com"
+        )
+
+    assert script_page._ai.ai_input_text.await_args.kwargs["value"] == "654321"
+
+
+@pytest.mark.asyncio
+async def test_ai_fill_fallback_redacts_the_card_number_its_placeholder_stands_for(
+    card_secret_run: dict[str, str], mock_scraped_page
+) -> None:
+    """The fallback receives a placeholder, but the number may already be on the page: the v3 mid-run reviewer
+    reads that page and the stored episode records it, so both must redact the resolved value."""
+    placeholder = card_secret_run["card_number"]
+    page = MagicMock(url="https://pay.example.com")
+    page.evaluate = AsyncMock(return_value='<input id="card" value="4111111111111111">')
+    page_ai = RealSkyvernPageAi(mock_scraped_page, page)
+    page_ai._refresh_scraped_page = AsyncMock()
+    page_ai._record_element_fallback_episode = AsyncMock()
+    reviewer_dom_reads: list[Any] = []
+
+    async def review_in_flight(failure_context: Any) -> Any:
+        reviewer_dom_reads.append(await _handler_live_get_dom({"selector": "#card"}, failure_context))
+        return SimpleNamespace(decision=SimpleNamespace(is_midrun_class_a=lambda: False))
+
+    module = "skyvern.core.script_generations.real_skyvern_page_ai"
+    with (
+        patch(f"{module}.is_v3_cohort", AsyncMock(return_value=True)),
+        patch(f"{module}.v3_review_in_flight", review_in_flight),
+        patch(f"{module}._get_element_id_by_selector", AsyncMock(return_value="CARD")),
+        patch(
+            f"{module}._resolve_assist_llm_handler",
+            AsyncMock(return_value=AsyncMock(return_value={"answer": placeholder})),
+        ),
+        patch(f"{module}.handle_input_text_action_direct", AsyncMock(return_value=[ActionSuccess()])),
+        skyvern_context.scoped(
+            SkyvernContext(
+                workflow_run_id=CARD_SECRET_RUN_ID,
+                workflow_permanent_id="wpid_card",
+                organization_id="o_card",
+                task_id="tsk_card",
+                step_id="stp_card",
+                code_version=2,
+            )
+        ),
+    ):
+        await page_ai.ai_input_text(
+            selector="#card",
+            value=placeholder,
+            intention="Fill the card number",
+            failed_selector="#card",
+            value_is_sensitive=True,
+        )
+
+    assert "4111111111111111" not in reviewer_dom_reads[0].data["html"]
+    assert page_ai._record_element_fallback_episode.await_args.kwargs["sensitive_value"] == "4111111111111111"
 
 
 # =============================================================================

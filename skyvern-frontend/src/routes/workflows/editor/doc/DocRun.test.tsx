@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,13 +10,21 @@ import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import type { WorkflowBlockNode } from "../nodes";
 import { getDocStepSummary } from "./docStepRegistry";
 import { DocConditional } from "./DocConditional";
+import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import type { DocItem } from "./buildDocTree";
 import { DocRunStepButton } from "./DocRunStepButton";
 import { DocStepResult } from "./DocStepResult";
 import { DocScope } from "./DocScope";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
-vi.mock("./useDocRun", () => ({ useDocRun: () => docRun.current }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({
+    loopsByLabel: new Map(),
+    blockRun: false,
+    unknownLabels: new Set<string>(),
+    ...docRun.current,
+  }),
+}));
 
 function block(overrides: Partial<WorkflowRunBlock>): WorkflowRunBlock {
   return {
@@ -55,6 +63,45 @@ afterEach(() => {
 });
 
 describe("DocStepResult", () => {
+  it("shows nothing for a step an earlier run cannot speak for, even if that run failed it", () => {
+    renderResult(block({ status: Status.Failed, failure_reason: "old error" }));
+    expect(screen.getByTestId("doc-step-result")).toBeTruthy();
+    cleanup();
+    docRun.current = {
+      ...docRun.current,
+      unknownLabels: new Set(["get_invoices"]),
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="get_invoices" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId("doc-step-result")).toBeNull();
+  });
+
+  it("shows a Stop step that stopped the run as done, not failed", () => {
+    renderResult(
+      block({
+        block_type: "terminate",
+        label: "stop_here",
+        status: Status.Terminated,
+        failure_reason:
+          "terminate block terminated. Reason: Nothing more to do",
+        output: null,
+      }),
+    );
+    const line = screen.getByText(/^Stopped/);
+    expect(line.className).not.toContain("text-destructive");
+  });
+
+  it("draws a step of a run still going elsewhere as running, not stopped", () => {
+    renderResult(block({ status: Status.Running }), true);
+    expect(screen.queryByText(/^Stopped/)).toBeNull();
+    expect(screen.queryByText(/Not reached/)).toBeNull();
+  });
+
   it("states the outcome with its duration, links to the real run page and expands to the output", () => {
     renderResult(block({}));
     expect(screen.getByText("Found 3 items · 9s")).toBeTruthy();
@@ -205,7 +252,17 @@ describe("DocConditional on a run", () => {
     nodeId: "c1",
     branches: [branch("b_if", "if"), branch("b_else", "otherwise")],
   } as unknown as Extract<DocItem, { kind: "conditional" }>;
-  const renderConditional = (executed: string | null | undefined) => {
+  const renderConditional = (
+    executed: string | null | undefined,
+    openBranch?: string,
+    opts: { skippedSteps?: number; edited?: boolean } = {},
+  ) => {
+    const shown = {
+      ...item,
+      branches: item.branches.map((b) =>
+        b.kind === "if" ? { ...b, stepCount: opts.skippedSteps ?? 0 } : b,
+      ),
+    } as typeof item;
     docRun.current = {
       runId: executed === undefined ? null : "wr_1",
       blocksByLabel:
@@ -222,17 +279,26 @@ describe("DocConditional on a run", () => {
               ],
             ]),
       live: false,
+      unknownLabels: new Set(opts.edited ? ["check_box"] : []),
     };
     return render(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
-          <DocConditional
-            node={conditional}
-            item={item}
-            byId={new Map()}
-            editable={false}
-            renderChildren={() => null}
-          />
+          <WorkflowDocActionsContext.Consumer>
+            {(actions) => (
+              <WorkflowDocActionsContext.Provider
+                value={{ ...actions, selectedBranch: () => openBranch }}
+              >
+                <DocConditional
+                  node={conditional}
+                  item={shown}
+                  byId={new Map()}
+                  editable={false}
+                  renderChildren={() => null}
+                />
+              </WorkflowDocActionsContext.Provider>
+            )}
+          </WorkflowDocActionsContext.Consumer>
         </MemoryRouter>
       </QueryClientProvider>,
     );
@@ -244,6 +310,23 @@ describe("DocConditional on a run", () => {
     expect(tab(/otherwise/i).getAttribute("aria-selected")).toBe("true");
     expect(tab(/otherwise/i).textContent).toMatch(/ran/);
     expect(tab(/^if/i).textContent).not.toMatch(/ran/);
+  });
+
+  it("says in plain words which branch was taken and that the other's steps were skipped", () => {
+    renderConditional("b_else", "b_if", { skippedSteps: 2 });
+    expect(screen.getByTestId("doc-step-result").textContent).toMatch(
+      /Took Otherwise/,
+    );
+    expect(screen.getByTestId("doc-branch-skipped").textContent).toBe(
+      "No, so these steps were skipped",
+    );
+  });
+
+  it("drops the ran badge and both plain-words lines once the conditional is edited since the run", () => {
+    renderConditional("b_else", "b_if", { skippedSteps: 2, edited: true });
+    expect(screen.queryByTestId("doc-step-result")).toBeNull();
+    expect(screen.queryByTestId("doc-branch-skipped")).toBeNull();
+    expect(screen.queryByText("ran")).toBeNull();
   });
 
   it("finds the branch by the steps that ran when the run predates a save", () => {

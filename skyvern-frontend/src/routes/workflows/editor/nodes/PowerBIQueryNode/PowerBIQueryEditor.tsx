@@ -1,13 +1,16 @@
 import { useEdges, useNodes, useNodesData } from "@xyflow/react";
+import { useState } from "react";
 import { useUpdate } from "../../useUpdate";
 
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { CredentialSourceSelector } from "@/routes/workflows/components/CredentialSourceSelector";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
+import { usePageSlots } from "@/store/PageSlots";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 
 import { type AppNode } from "..";
@@ -45,6 +48,10 @@ function PowerBIQueryEditorBody({
     editable: data.editable,
   });
   const scopeReadOnly = useWorkflowScopeReadOnly();
+  const { powerBIDatasetPicker: DatasetPicker } = usePageSlots();
+  const [showTemplate, setShowTemplate] = useState(
+    () => data.datasetId.includes("{{") || data.datasetId.includes("{%"),
+  );
   const canEdit = data.editable && !scopeReadOnly;
   const availableOutputParameterKeys = getAvailableOutputParameterKeys(
     nodes,
@@ -77,21 +84,45 @@ function PowerBIQueryEditorBody({
       </div>
 
       <div className="space-y-2">
-        <div className="flex gap-2">
-          <Label className="text-xs text-tertiary-foreground">
-            Dataset / model ID
-          </Label>
-          <HelpTooltip content="The Power BI dataset (semantic model) ID. Templates are resolved when the workflow runs; datasets are not discovered in the editor." />
-        </div>
-        <WorkflowBlockInputTextarea
-          name="datasetId:powerbi"
-          nodeId={blockId}
-          value={data.datasetId}
-          onChange={(datasetId) => update({ datasetId })}
-          disabled={!canEdit}
-          placeholder="Dataset ID or {{ dataset_id }}"
-          className="nopan text-xs"
-        />
+        <Label className="text-xs text-tertiary-foreground">
+          Dataset / semantic model
+        </Label>
+        {DatasetPicker ? (
+          <DatasetPicker
+            connectionId={
+              data.credentialSource === "nango" ? data.connectionId : ""
+            }
+            value={data.datasetId}
+            disabled={!canEdit}
+            onChange={(datasetId) => update({ datasetId })}
+          />
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Power BI dataset selection is unavailable.
+            {data.datasetId ? ` Saved dataset: ${data.datasetId}` : ""}
+          </p>
+        )}
+        <Button
+          type="button"
+          variant="link"
+          className="h-auto p-0 text-xs"
+          aria-expanded={showTemplate}
+          onClick={() => setShowTemplate(!showTemplate)}
+        >
+          Use a workflow parameter
+        </Button>
+        {showTemplate ? (
+          <WorkflowBlockInputTextarea
+            aria-label="Dataset workflow parameter"
+            name="datasetId:powerbi"
+            nodeId={blockId}
+            value={data.datasetId}
+            onChange={(datasetId) => update({ datasetId })}
+            disabled={!canEdit}
+            placeholder="{{ dataset_id }}"
+            className="nopan text-xs"
+          />
+        ) : null}
       </div>
 
       <div className="space-y-2">

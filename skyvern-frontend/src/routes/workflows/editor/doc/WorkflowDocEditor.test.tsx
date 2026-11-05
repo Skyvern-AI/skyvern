@@ -31,7 +31,9 @@ import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
-vi.mock("./useDocRun", () => ({ useDocRun: () => docRun.current }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({ unknownLabels: new Set(), ...docRun.current }),
+}));
 import type { DocGraph } from "./docGraphEdits";
 import * as axiosClientModule from "@/api/AxiosClient";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -226,6 +228,13 @@ describe("WorkflowDocEditor navigation", () => {
     },
   );
 
+  test("a read-only doc reserves no empty row above Inputs", () => {
+    renderDoc([block("goto_url", "open_site", null, { url: "x" })]);
+    expect(document.querySelector('[aria-hidden="true"].h-\\[28px\\]')).toBe(
+      null,
+    );
+  });
+
   test("a Go to URL step with no URL shows a required chip", () => {
     renderDoc([block("goto_url", "open_site", null, { url: "" })]);
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
@@ -252,6 +261,19 @@ describe("WorkflowDocEditor navigation", () => {
       document.querySelector(`[data-doc-node-id="${inner.id}"]`),
     ).not.toBeNull();
     expect(useLocateBlockStore.getState().request).toBeNull();
+  });
+
+  test("jumping to a step flashes it", async () => {
+    const animate = vi.fn();
+    HTMLElement.prototype.animate = animate;
+    vi.stubGlobal("matchMedia", () => ({ matches: false }));
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => cb());
+    const nodes = renderDoc();
+    const inner = nodes.find((n) => n.data.label === "inner_step")!;
+    act(() => useLocateBlockStore.getState().requestLocate(inner.id));
+    expect(animate).toHaveBeenCalledTimes(1);
+    // @ts-expect-error cleanup of the jsdom stub
+    delete HTMLElement.prototype.animate;
   });
 
   test("opens step search from Ctrl+K anywhere in the document", () => {
@@ -712,7 +734,11 @@ describe("Doc inputs", () => {
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "+ Input" }));
-    expect(screen.getByText("Edit Input")).toBeTruthy();
+    // A just-created placeholder is still an Add: not titled "Edit", and no "changing the type" warning.
+    expect(screen.getByText("Add Input")).toBeTruthy();
+    expect(screen.getByRole("dialog").getAttribute("aria-label")).toBe(
+      "Add input",
+    );
     fireEvent.change(
       within(screen.getByRole("dialog")).getAllByRole("textbox")[0]!,
       {

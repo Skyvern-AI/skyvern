@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
 
+from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
@@ -437,7 +438,7 @@ def _apply_credential_policy(
 
     proposed_origins = workflow_credential_origins_from_parsed(parsed_workflow)
     if _workflow_broadens_credential_scope(parsed_workflow, request_policy) or (
-        _existing_workflow_broadens_credential_scope(proposed_origins, request_policy)
+        _existing_workflow_broadens_credential_scope(parsed_workflow, proposed_origins, request_policy)
     ):
         verdict.add(OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED)
 
@@ -447,6 +448,7 @@ def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]
 
 
 def _existing_workflow_broadens_credential_scope(
+    parsed_workflow: dict[str, Any],
     proposed_origins: dict[str, set[str]],
     request_policy: RequestPolicy,
 ) -> bool:
@@ -465,14 +467,37 @@ def _existing_workflow_broadens_credential_scope(
         new_origins = proposed_origins.get(credential_id, set())
         if not new_origins:
             continue
-        allowed_origins = prior_origins.get(credential_id, set())
+        allowed_origins = prior_origins.get(credential_id)
         if not allowed_origins:
-            # Existing workflow credentials without a known prior origin cannot
-            # safely authorize a newly introduced URL.
-            return True
+            if not _blocks_stay_on_intended_origin(parsed_workflow, credential_id, request_policy):
+                return True
+            continue
         if any(origin not in allowed_origins for origin in new_origins):
             return True
     return False
+
+
+def _blocks_stay_on_intended_origin(
+    parsed_workflow: dict[str, Any], credential_id: str, request_policy: RequestPolicy
+) -> bool:
+    # With no prior origin, only the one origin the fill seam would fill can authorize a block URL;
+    # discovered credentials never do.
+    if not any(c.credential_id == credential_id for c in request_policy.resolved_credentials):
+        return False
+    intended_origin = canonicalize_origin(request_policy.credential_intended_url(credential_id))
+    if intended_origin is None:
+        return False
+    workflow_definition = parsed_workflow.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return False
+    credential_params_by_key = credential_param_ids(workflow_definition.get("parameters"))
+    for block in workflow_blocks(parsed_workflow):
+        if credential_id not in block_credential_ids(block, credential_params_by_key):
+            continue
+        block_url = block.get("url")
+        if isinstance(block_url, str) and block_url.strip() and canonicalize_origin(block_url) != intended_origin:
+            return False
+    return True
 
 
 def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request_policy: RequestPolicy) -> bool:

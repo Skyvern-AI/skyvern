@@ -5,6 +5,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from skyvern.forge.sdk.encrypt import aes as aes_module
 from skyvern.forge.sdk.encrypt.aes import AES
+from skyvern.forge.sdk.encrypt.aes_gcm import AESGCMEncryptor
 from skyvern.forge.sdk.encrypt.base import TokenDecryptionError
 
 SECRET = "test-secret-key"
@@ -116,3 +117,16 @@ async def test_derives_each_salt_key_once_and_still_reads_existing_ciphertext(mo
         assert await aes.decrypt(await aes.encrypt("round trip")) == "round trip"
 
     assert len(derived_salts) == 2, "PBKDF2 must run once per salt per process, not on every encrypt/decrypt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ciphertext", ["not base64 at all!", "rvmea7ou1gzyata3OwKEQg==", "AAAA"])
+async def test_decrypt_failures_hide_the_underlying_cause(ciphertext: str) -> None:
+    for encryptor in (
+        AES(secret_key="other-key", salt=PRIMARY_SALT, iv=PRIMARY_IV),
+        AESGCMEncryptor(secret_key=SECRET, salt=None),
+    ):
+        with pytest.raises(TokenDecryptionError, match="^Failed to decrypt token$") as excinfo:
+            await encryptor.decrypt(ciphertext)
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__

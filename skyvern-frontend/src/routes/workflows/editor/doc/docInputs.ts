@@ -13,16 +13,6 @@ import {
 } from "../parameterEdits";
 import { removeKeyFromNodesParameterKeys } from "../workflowEditorUtils";
 
-// Credentials need the vault pickers, so they are still added from the Inputs panel.
-export const DOC_INPUT_TYPES: Array<{ value: ValueType; label: string }> = [
-  { value: WorkflowParameterValueType.String, label: "Text" },
-  { value: WorkflowParameterValueType.Integer, label: "Integer" },
-  { value: WorkflowParameterValueType.Float, label: "Decimal" },
-  { value: WorkflowParameterValueType.Boolean, label: "Yes / No" },
-  { value: WorkflowParameterValueType.FileURL, label: "File" },
-  { value: WorkflowParameterValueType.JSON, label: "JSON" },
-];
-
 export type WorkflowParameter = Extract<
   ParametersState[number],
   { parameterType: "workflow" }

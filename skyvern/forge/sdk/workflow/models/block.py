@@ -24,6 +24,7 @@ import ssl
 import sys
 import tempfile
 import textwrap
+import threading
 import traceback
 import unicodedata
 import uuid
@@ -187,6 +188,7 @@ from skyvern.forge.sdk.api.llm.utils import (
 )
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
 from skyvern.forge.sdk.copilot.code_block_security import SlottedReference, is_inert_slot, slot_template
 from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions, code_typed_values
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -552,6 +554,10 @@ class DownloadClaimOutcomeRecorder:
 
     def record(self, outcome: DownloadClaimOutcome) -> None:
         self.outcome = outcome
+
+
+def _is_run_download_dir(path: str, run_id: str | None) -> bool:
+    return bool(run_id) and Path(path).resolve() == get_path_for_workflow_download_directory(run_id).resolve()
 
 
 def bind_downloaded_files_to_output(result: Any, downloaded_files: list[FileInfo]) -> Any:
@@ -1240,6 +1246,7 @@ class Block(BaseModel, abc.ABC):
     _prerendered_fields: frozenset[str] = PrivateAttr(default=frozenset())
     # An inline block a cached step's script starts (ai_validate, ai_prompt) reads that step's notes.
     _notes_label: str | None = PrivateAttr(default=None)
+    _agent_smtp_isolation: bool = PrivateAttr(default=False)
 
     # Fields this class renders as Jinja. Declared per class; the effective set is the
     # union over the MRO, so a subclass never shadows what its base renders.
@@ -1384,13 +1391,31 @@ class Block(BaseModel, abc.ABC):
             rendered_description = self.render_templatable_field(
                 "error_code_mapping", error_description, workflow_run_context
             )
-            rendered_description = self._redact_registered_secrets(rendered_description, workflow_run_context)
-            secret_bearing_key = (
-                self._contains_registered_secret(rendered_code, workflow_run_context)
-                if for_generated_code
-                else self._contains_registered_secret_floored(rendered_code, workflow_run_context)
-            )
-            if secret_bearing_key or workflow_run_context.mask_secrets_in_data(rendered_code) != rendered_code:
+            if self._agent_smtp_isolation:
+                secrets = workflow_run_context.agent_redactable_secret_values()
+                for secret in sorted(secrets, key=len, reverse=True):
+                    rendered_description = rendered_description.replace(secret, "[redacted]")
+                secret_bearing_key = any(
+                    secret in rendered_code
+                    for secret in secrets
+                    if for_generated_code
+                    or (
+                        len(secret) >= MIN_SECRET_LENGTH
+                        and not (secret.isdigit() and len(secret) < MIN_NUMERIC_SECRET_LENGTH)
+                    )
+                )
+                masked_code = workflow_run_context.mask_secrets_in_data(
+                    rendered_code, excluded_secret_ids=workflow_run_context.agent_unmasked_platform_secret_ids()
+                )
+            else:
+                rendered_description = self._redact_registered_secrets(rendered_description, workflow_run_context)
+                secret_bearing_key = (
+                    self._contains_registered_secret(rendered_code, workflow_run_context)
+                    if for_generated_code
+                    else self._contains_registered_secret_floored(rendered_code, workflow_run_context)
+                )
+                masked_code = workflow_run_context.mask_secrets_in_data(rendered_code)
+            if secret_bearing_key or masked_code != rendered_code:
                 dropped_reasons.append("error code keys must not contain a registered secret")
                 continue
             key_reason = error_code_key_error(rendered_code)
@@ -1758,6 +1783,7 @@ class Block(BaseModel, abc.ABC):
         if not potential_template:
             return potential_template
 
+        workflow_run_context.reject_platform_smtp_template_references(potential_template)
         render_env = env or jinja_sandbox_env
         try:
             template = render_env.from_string(potential_template)
@@ -1773,6 +1799,8 @@ class Block(BaseModel, abc.ABC):
             # A field-specific binding only fills a gap: a workflow that already has a parameter
             # under the same key keeps rendering its own value.
             template_data = {**extra_template_data, **template_data}
+            if self.block_type == BlockType.AGENT_STEP or self._agent_smtp_isolation:
+                template_data = workflow_run_context.mask_platform_smtp_for_agent(template_data)
 
         # A caller whose environment decides for itself what an absent binding means renders instead of
         # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
@@ -1819,7 +1847,12 @@ class Block(BaseModel, abc.ABC):
         except Exception as exc:
             raise format_failure(exc) from exc
         register_secret_derived_output(
-            workflow_run_context.secrets, template, potential_template, template_data, rendered
+            workflow_run_context.secrets,
+            template,
+            potential_template,
+            template_data,
+            rendered,
+            excluded_secret_ids=workflow_run_context.agent_unmasked_platform_secret_ids(),
         )
         if page_derived_capture is not None:
             page_derived_capture(env or jinja_sandbox_env, template_data, rendered)
@@ -1845,6 +1878,9 @@ class Block(BaseModel, abc.ABC):
         if copy_block_metadata:
             block_reference_data = block_reference_data.copy()
         template_data = workflow_run_context.values.copy()
+        if self.block_type == BlockType.AGENT_STEP or self._agent_smtp_isolation:
+            for key in workflow_run_context.platform_smtp_parameter_keys():
+                template_data.pop(key, None)
 
         include_secrets = workflow_run_context.include_secrets_in_templates or force_include_secrets
 
@@ -1900,6 +1936,8 @@ class Block(BaseModel, abc.ABC):
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         if include_workflow_run_summary:
             template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
+        if self.block_type == BlockType.AGENT_STEP or self._agent_smtp_isolation:
+            template_data = workflow_run_context.mask_platform_smtp_for_agent(template_data)
         return template_data
 
     def _apply_workflow_system_prompt(
@@ -1928,6 +1966,8 @@ class Block(BaseModel, abc.ABC):
         prompt and any inherited prompt from parent workflows.
         """
         notes_section = workflow_run_context.resolve_block_notes_section(self._notes_label or self.label)
+        if self._agent_smtp_isolation and notes_section is not None:
+            notes_section = workflow_run_context.mask_platform_smtp_for_agent(notes_section)
         if self.ignore_workflow_system_prompt:
             # Record the opt-out so the script path (``ai_extract``) reads the
             # same decision instead of re-resolving the flag from the
@@ -1962,6 +2002,8 @@ class Block(BaseModel, abc.ABC):
             ) from exc
         if notes_section:
             resolved = "\n\n".join(part for part in (resolved, notes_section) if part)
+        if self._agent_smtp_isolation and resolved is not None:
+            resolved = workflow_run_context.mask_platform_smtp_for_agent(resolved)
         if resolved is not None:
             self.workflow_system_prompt = resolved
         workflow_run_context.record_block_workflow_system_prompt(self.label, resolved)
@@ -12207,6 +12249,11 @@ class UploadToS3Block(Block):
                         LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
                     file_paths.append(file_path)
+                if _is_run_download_dir(
+                    resolved_path, resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+                ):
+                    listed = file_paths
+                    file_paths = await run_stoppable_comparison(lambda stop: unique_pdf_paths(listed, stop))
                 if len(file_paths) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file_path in file_paths:
@@ -12857,12 +12904,18 @@ class FileDestinationBlock(Block):
             candidate_run_ids.append(context.task_id)
         return candidate_run_ids
 
+    def _selects_files_by_prompt(self) -> bool:
+        # A prompt picks files by name, so every copy stays a candidate; without one the whole directory is sent.
+        return bool(self.prompt and self.prompt.strip())
+
     def _get_files_to_upload_from_download_dir(
         self,
         *,
         download_files_path: str,
         max_file_count: int,
         attempt_started_at: datetime | None = None,
+        unique_pdfs: bool = True,
+        stop: threading.Event | None = None,
     ) -> list[str]:
         files_to_upload = []
         if os.path.isdir(download_files_path):
@@ -12877,6 +12930,8 @@ class FileDestinationBlock(Block):
                     LOG.warning("FileUploadBlock Skipping directory", file=file)
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
+            if unique_pdfs:
+                files_to_upload = unique_pdf_paths(files_to_upload, stop)
             if len(files_to_upload) > max_file_count:
                 raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
         return files_to_upload
@@ -13009,6 +13064,7 @@ class FileDestinationBlock(Block):
         download_files_path: str,
         max_file_count: int,
         attempt_started_at: datetime | None = None,
+        stop: threading.Event | None = None,
     ) -> tuple[list[str] | None, str]:
         """Return alternate local files plus a failure-reason count label.
 
@@ -13027,6 +13083,8 @@ class FileDestinationBlock(Block):
                     download_files_path=candidate_download_files_path,
                     max_file_count=max_file_count,
                     attempt_started_at=attempt_started_at,
+                    unique_pdfs=not self._selects_files_by_prompt(),
+                    stop=stop,
                 )
             except ValueError:
                 LOG.warning(
@@ -13234,10 +13292,14 @@ class FileUploadBlock(FileDestinationBlock):
             attempt_started_at = await get_download_retry_started_at(
                 organization_id or workflow_run_context.organization_id, run_download_id
             )
-            files_to_upload = self._get_files_to_upload_from_download_dir(
-                download_files_path=download_files_path,
-                max_file_count=max_file_count,
-                attempt_started_at=attempt_started_at,
+            files_to_upload = await run_stoppable_comparison(
+                lambda stop: self._get_files_to_upload_from_download_dir(
+                    download_files_path=download_files_path,
+                    max_file_count=max_file_count,
+                    attempt_started_at=attempt_started_at,
+                    unique_pdfs=not self._selects_files_by_prompt(),
+                    stop=stop,
+                )
             )
 
             if not files_to_upload and not self.continue_on_empty:
@@ -13246,14 +13308,16 @@ class FileUploadBlock(FileDestinationBlock):
                     browser_session_downloaded_files,
                     registered_downloaded_files,
                 ) = await asyncio.gather(
-                    asyncio.to_thread(
-                        self._get_files_in_alternate_candidate_download_dirs,
-                        context=context,
-                        workflow_run_id=workflow_run_id,
-                        run_download_id=run_download_id,
-                        download_files_path=download_files_path,
-                        max_file_count=max_file_count,
-                        attempt_started_at=attempt_started_at,
+                    run_stoppable_comparison(
+                        lambda stop: self._get_files_in_alternate_candidate_download_dirs(
+                            context=context,
+                            workflow_run_id=workflow_run_id,
+                            run_download_id=run_download_id,
+                            download_files_path=download_files_path,
+                            max_file_count=max_file_count,
+                            attempt_started_at=attempt_started_at,
+                            stop=stop,
+                        )
                     ),
                     self._get_browser_session_downloaded_files_for_empty_scan(
                         organization_id=organization_id or workflow_run_context.organization_id,
@@ -13771,14 +13835,10 @@ class SendEmailBlock(Block):
             )
 
     def _decrypt_smtp_parameters(self, workflow_run_context: WorkflowRunContext) -> tuple[str, int, str, str]:
-        obfuscated_smtp_host_value = workflow_run_context.get_value_or_none(self.smtp_host.key)
-        obfuscated_smtp_port_value = workflow_run_context.get_value_or_none(self.smtp_port.key)
-        obfuscated_smtp_username_value = workflow_run_context.get_value_or_none(self.smtp_username.key)
-        obfuscated_smtp_password_value = workflow_run_context.get_value_or_none(self.smtp_password.key)
-        smtp_host_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_host_value)
-        smtp_port_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_port_value)
-        smtp_username_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_username_value)
-        smtp_password_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_password_value)
+        smtp_host_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_host)
+        smtp_port_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_port)
+        smtp_username_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_username)
+        smtp_password_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_password)
 
         email_config_problems = []
         if smtp_host_value is None:
@@ -13861,6 +13921,7 @@ class SendEmailBlock(Block):
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         attempt_started_at: datetime | None = None,
+        stop: threading.Event | None = None,
     ) -> list[str]:
         file_paths = []
         context = skyvern_context.current()
@@ -13897,6 +13958,7 @@ class SendEmailBlock(Block):
             # if the file path is a directory, add all files in the directory, skip directories, limit to 10 files
             if os.path.exists(path):
                 if os.path.isdir(path):
+                    directory_files = []
                     for file in os.listdir(path):
                         if attempt_started_at is not None and not is_file_from_retry_attempt(
                             os.path.join(path, file), attempt_started_at
@@ -13905,8 +13967,11 @@ class SendEmailBlock(Block):
                         if os.path.isdir(os.path.join(path, file)):
                             LOG.warning("SendEmailBlock Skipping directory", file=file)
                             continue
-                        file_path = os.path.join(path, file)
-                        file_paths.append(file_path)
+                        directory_files.append(os.path.join(path, file))
+                    # Only the run's own download directory is an automatic collection; other entries are chosen files.
+                    if _is_run_download_dir(path, run_id):
+                        directory_files = unique_pdf_paths(directory_files, stop)
+                    file_paths.extend(directory_files)
                 else:
                     # covers the case where the file path is a single file
                     file_paths.append(path)
@@ -13962,7 +14027,10 @@ class SendEmailBlock(Block):
             organization_id or workflow_run_context.organization_id,
             resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id),
         )
-        for filename in self._get_file_paths(workflow_run_context, workflow_run_id, attempt_started_at):
+        file_paths = await run_stoppable_comparison(
+            lambda stop: self._get_file_paths(workflow_run_context, workflow_run_id, attempt_started_at, stop)
+        )
+        for filename in file_paths:
             if filename.startswith(("s3://", "gs://", "azure://", "http://", "https://")):
                 path = await download_file(filename, organization_id=organization_id)
             else:
@@ -17340,6 +17408,10 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             if not files_to_upload:
                 return result
 
+            if not (self.prompt and self.prompt.strip()):
+                # Automatic delivery sends each PDF content once; a prompt's explicit selection keeps duplicates.
+                scoped_files = files_to_upload
+                files_to_upload = await run_stoppable_comparison(lambda stop: unique_pdf_paths(scoped_files, stop))
             if len(files_to_upload) > max_file_count:
                 raise ValueError(f"Too many scoped downloaded files to upload. Max: {max_file_count}")
 
@@ -17888,7 +17960,7 @@ class HttpRequestBlock(Block):
                 # the template, is what says which credential this field carries.
                 if field != "download_filename":
                     self._confine_placeholder_owner(field, entry, token, workflow_run_context)
-                secret_value = str(workflow_run_context.secrets[token])
+                secret_value = str(workflow_run_context.get_original_secret_value_or_none(token))
                 rendered = re.sub(
                     re.escape(token) + r"(?![A-Za-z0-9_])",
                     secret_value.replace("\\", "\\\\"),

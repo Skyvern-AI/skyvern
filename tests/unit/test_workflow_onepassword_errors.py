@@ -262,6 +262,33 @@ async def test_onepassword_totp_field_name_matches_by_id_when_title_is_missing(
 
 
 @pytest.mark.asyncio
+async def test_onepassword_card_fields_under_other_ids_are_card_secrets(mocked_app_database, patched_settings_token):
+    """Only the template ids ccnum and cvv are renamed to card keys. A card item whose number and CVV use
+    other ids must still record them as card data, or they type unmasked when Mask Secrets is off."""
+    ctx = _make_context()
+    fake_item = SimpleNamespace(
+        category=SimpleNamespace(value="CreditCard"),
+        fields=[
+            _make_field("number", "Number", "4111111111111111", ItemFieldType.CREDITCARDNUMBER),
+            _make_field("securitycode", "Security code", "587", ItemFieldType.CONCEALED),
+            _make_field("cardholder", "Cardholder name", "Test Holder", ItemFieldType.TEXT),
+        ],
+        notes=None,
+    )
+    fake_client = MagicMock()
+    fake_client.items.get = AsyncMock(return_value=fake_item)
+    with patch(
+        "skyvern.forge.sdk.services.credentials.OnePasswordClient.authenticate",
+        new_callable=AsyncMock,
+        return_value=fake_client,
+    ):
+        await ctx.register_onepassword_credential_parameter_value(_make_parameter(), _make_organization())
+
+    values = ctx.values["op_cred"]
+    assert ctx.card_secret_ids == {values["number"], values["securitycode"]}
+
+
+@pytest.mark.asyncio
 async def test_onepassword_unmatched_totp_field_name_falls_back_to_plain_field(
     mocked_app_database, patched_settings_token
 ):

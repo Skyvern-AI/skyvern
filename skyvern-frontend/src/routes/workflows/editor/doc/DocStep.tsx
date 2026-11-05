@@ -3,7 +3,14 @@ import { stripJinjaReferences } from "./docTextUtils";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
-import { ChevronRightIcon, GearIcon } from "@radix-ui/react-icons";
+import {
+  CheckIcon,
+  ChevronRightIcon,
+  ClockIcon,
+  Cross2Icon,
+  GearIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -37,6 +44,8 @@ import {
   docStepCanRun,
 } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
+import { docTagState, type DocTagState } from "./docRunState";
+import { useDocRun } from "./useDocRun";
 import { DocText } from "./DocText";
 import type { DocPlace } from "./docEditApi";
 import {
@@ -51,16 +60,65 @@ import { useDocStepPending } from "./DocProposalView";
 /** Where a step sits, for the moves its tag menu offers. Absent when the step's place can't be edited. */
 export type DocStepPlace = DocPlace & { count: number; isFinally: boolean };
 
+const tagStateClasses: Partial<Record<DocTagState, string>> = {
+  succeeded:
+    "bg-[#EAF3EC] text-[#3F7A57] dark:bg-[rgba(108,191,140,.14)] dark:text-[#6CBF8C]",
+  failed:
+    "bg-[#FBEAE8] text-[#C0392B] dark:bg-[rgba(240,138,126,.15)] dark:text-[#F08A7E]",
+  waiting:
+    "bg-[#FBEEE2] text-[#B45B0A] dark:bg-[rgba(231,154,85,.15)] dark:text-[#E79A55]",
+  // The dark block-type colours would outrank plain utilities, so dark restates the grey.
+  notReached:
+    "bg-muted text-muted-foreground dark:bg-[rgba(255,255,255,.04)] dark:text-muted-foreground",
+};
+
+const tagStateNames: Record<DocTagState, string> = {
+  running: "running",
+  succeeded: "done",
+  failed: "failed",
+  waiting: "waiting for you",
+  notReached: "not reached",
+};
+
 const tagClass = (
   blockType: ReturnType<typeof docBlockType>,
   pending = false,
+  state: DocTagState | null = null,
 ) =>
   cn(
     "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded pl-[5px] pr-[7px] text-[12.5px] font-semibold",
     docTagClasses[docTagColor(blockType)],
     pending &&
       "border border-dashed border-current bg-transparent pl-1 pr-1.5 opacity-80 dark:bg-transparent",
+    state && tagStateClasses[state],
   );
+
+/** The step's state in the Doc's run, for its tag. */
+function useDocTagState(label: string): DocTagState | null {
+  const { runId, blocksByLabel, live, blockRun, unknownLabels } = useDocRun();
+  const block = blocksByLabel.get(label);
+  if (unknownLabels.has(label)) return null;
+  if (blockRun && !block) return null;
+  return docTagState(block, live, Boolean(runId));
+}
+
+function DocTagIcon({
+  blockType,
+  state,
+}: {
+  blockType: ReturnType<typeof docBlockType>;
+  state: DocTagState | null;
+}) {
+  const icon = "size-3 shrink-0";
+  if (state === "running")
+    return <ReloadIcon aria-hidden className={cn(icon, "animate-spin")} />;
+  if (state === "succeeded") return <CheckIcon aria-hidden className={icon} />;
+  if (state === "failed") return <Cross2Icon aria-hidden className={icon} />;
+  if (state === "waiting") return <ClockIcon aria-hidden className={icon} />;
+  return blockType ? (
+    <WorkflowBlockIcon workflowBlockType={blockType} className={icon} />
+  ) : null;
+}
 
 function DocStepMenu({
   node,
@@ -77,6 +135,7 @@ function DocStepMenu({
   const [confirming, setConfirming] = useState(false);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
+  const state = useDocTagState(node.data.label);
   const container = node.type === "loop" || node.type === "conditional";
   const topLevel = place.scope.parentId === null;
   const destinations = moveOpen
@@ -128,18 +187,15 @@ function DocStepMenu({
               place.isFinally ? undefined : "Click for actions, drag to move"
             }
             aria-label={`${blockType ? workflowBlockTitle[blockType] : node.type} step ${node.data.label}, actions`}
+            data-doc-tag-state={state}
             className={cn(
-              tagClass(blockType, pending),
+              tagClass(blockType, pending, state),
               "outline-none hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring",
             )}
           >
-            {blockType && (
-              <WorkflowBlockIcon
-                workflowBlockType={blockType}
-                className="size-3"
-              />
-            )}
+            <DocTagIcon blockType={blockType} state={state} />
             {blockType ? workflowBlockTitle[blockType] : node.type}
+            {state && <span className="sr-only">, {tagStateNames[state]}</span>}
           </button>
           <DropdownMenu
             modal={false}
@@ -286,13 +342,16 @@ export function DocTag({
   const actions = useContext(WorkflowDocActionsContext);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
+  const state = useDocTagState(node.data.label);
   if (actions.edit && place) return <DocStepMenu node={node} place={place} />;
   return (
-    <span className={tagClass(blockType, pending)}>
-      {blockType && (
-        <WorkflowBlockIcon workflowBlockType={blockType} className="size-3" />
-      )}
+    <span
+      className={tagClass(blockType, pending, state)}
+      data-doc-tag-state={state}
+    >
+      <DocTagIcon blockType={blockType} state={state} />
       {blockType ? workflowBlockTitle[blockType] : node.type}
+      {state && <span className="sr-only">, {tagStateNames[state]}</span>}
     </span>
   );
 }

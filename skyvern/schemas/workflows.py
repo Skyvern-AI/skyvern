@@ -38,7 +38,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
-from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES
+from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES, current_tool_names
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
@@ -1575,6 +1575,7 @@ class AgentStepBlockYAML(BlockYAML):
     def validate_tools(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
+        value = current_tool_names(value)
         if unknown := sorted(set(value) - AGENT_STEP_TOOL_NAMES):
             raise ValueError(f"Unknown tools {unknown}. Valid tools: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.")
         return value

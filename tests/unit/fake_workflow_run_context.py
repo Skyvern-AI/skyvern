@@ -24,6 +24,7 @@ class FakeWorkflowRunContext:
     ) -> None:
         self.values = dict(values)
         self.secrets = secrets or {}
+        self._platform_smtp_secret_ids: dict[str, str] = {}
         self.include_secrets_in_templates = include_secrets_in_templates
         self._blocks_metadata: dict[str, dict[str, Any]] = {
             label: dict(meta) for label, meta in (block_metadata or {}).items()
@@ -87,5 +88,9 @@ class FakeWorkflowRunContext:
 
     # Borrow the real implementations so scoping and outcome behavior cannot drift from production.
     credential_template_entries = WorkflowRunContext.credential_template_entries
+    platform_smtp_parameter_keys = WorkflowRunContext.platform_smtp_parameter_keys
+    platform_smtp_placeholders = WorkflowRunContext.platform_smtp_placeholders
+    agent_unmasked_platform_secret_ids = WorkflowRunContext.agent_unmasked_platform_secret_ids
+    reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
     record_block_outcome = WorkflowRunContext.record_block_outcome
     get_block_outcome = WorkflowRunContext.get_block_outcome

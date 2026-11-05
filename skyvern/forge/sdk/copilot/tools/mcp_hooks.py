@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Mapping
 from contextvars import ContextVar
 from enum import StrEnum
-from typing import Any
+from typing import Any, get_args
 
 import structlog
 import yaml
@@ -96,6 +96,7 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
+from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
 from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, AgentStepBlockYAML, TaskBlockYAML
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
@@ -199,6 +200,9 @@ async def _tab_switch_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    # A demonstrated switch is a recorded fact; the live tab list may have changed since.
+    if current_demonstrated_action() is not None:
+        return None
     raw_index = params.get("index")
     index: int | None = None
     if isinstance(raw_index, int):
@@ -667,6 +671,40 @@ def _apply_for_loop_schema_guidance(data: dict[str, Any]) -> None:
     data["example"] = copy.deepcopy(_FOR_LOOP_EXAMPLE)
 
 
+_WEB_SEARCH_BLOCK_OUTPUT: dict[str, JsonValue] = {
+    "referenced_as": "<label> or <label>_output",
+    "fields": {
+        "query": "the rendered query that was searched",
+        "provider": f"the provider that answered, one of {list(get_args(SearchProvider))}",
+        "results": {"item_keys": list(SearchResult.__annotations__)},
+        "total_count": "number of items in results",
+        "prompt_output": (
+            "null when the block has neither prompt nor json_schema; the json_schema-shaped answer when "
+            "json_schema is set; the prompt's plain answer when prompt is set without json_schema"
+        ),
+        "raw_response": {"pages": "the provider's unprocessed response pages"},
+    },
+    "when_not_completed": (
+        "the same fields plus status, failure_reason, errors and failure_category, and available_keys "
+        "or render_failure when the failure produced them"
+    ),
+    "example_with_json_schema": SearchResponse(
+        query="example official site",
+        provider="google",
+        results=[
+            SearchResult(
+                title="Example A",
+                link="https://a.example.test/",
+                snippet="The official site is https://b.example.test/.",
+                display_link="a.example.test",
+                position=1,
+            )
+        ],
+        prompt_output={"official_url": "https://b.example.test/"},
+    ).output(),
+}
+
+
 async def _get_block_schema_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -679,6 +717,8 @@ async def _get_block_schema_post_hook(
     if isinstance(data, dict):
         if data.get("block_type") == "for_loop":
             _apply_for_loop_schema_guidance(data)
+        if data.get("block_type") == "web_search":
+            data["block_output"] = copy.deepcopy(_WEB_SEARCH_BLOCK_OUTPUT)
         block_types = data.get("block_types")
         if isinstance(block_types, dict):
             # The server's hint names its own tool and a block type this turn may not author.

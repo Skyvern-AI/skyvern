@@ -36,6 +36,17 @@ const catalogState = vi.hoisted(() => ({
     | undefined,
 }));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({
+    runId: undefined,
+    run: undefined,
+    blocksByLabel: new Map(),
+    loopsByLabel: new Map(),
+    live: false,
+    blockRun: false,
+    unknownLabels: new Set(),
+  }),
+}));
 vi.mock("@/hooks/useIntegrationCatalogQuery", () => ({
   useIntegrationCatalogQuery: () => ({ data: catalogState.data }),
 }));
@@ -48,6 +59,15 @@ afterEach(() => {
   useWorkflowHistoryAccessStore.getState().reset();
   useWorkflowSnapshotStore.getState().clearSnapshot();
   useWorkflowHasChangesStore.setState({ hasChanges: false });
+});
+
+describe("Doc edit bar row", () => {
+  test("an idle bar reserves its phone row only when it floats", () => {
+    const { container, rerender } = render(<DocEditBar floating />);
+    expect(container.querySelector('[aria-hidden="true"]')).toBeTruthy();
+    rerender(<DocEditBar />);
+    expect(container.querySelector('[aria-hidden="true"]')).toBe(null);
+  });
 });
 
 describe("Doc Save", () => {
@@ -130,7 +150,7 @@ describe("Doc Save", () => {
       contentDirty: false,
     });
     useWorkflowHistoryAccessStore.setState({ canRedo: true });
-    render(<DocEditBar reserve />);
+    render(<DocEditBar floating />);
 
     await waitFor(() => expect(screen.getByText("Saved")).toBeTruthy());
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);

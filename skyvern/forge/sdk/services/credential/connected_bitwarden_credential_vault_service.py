@@ -98,6 +98,7 @@ class ConnectedBitwardenCredentialVaultService(CredentialVaultService):
             max_retries=1,
             timeout=CONNECTED_BITWARDEN_TIMEOUT_SECONDS,
             email=str(token.credential.email),
+            include_passkeys=True,
         )
         totp = secret.get(BitwardenConstants.TOTP) or None
         return CredentialItem(
@@ -112,4 +113,5 @@ class ConnectedBitwardenCredentialVaultService(CredentialVaultService):
             ),
             # A read that lost its site list names no checkable site, so a release refuses the login.
             login_sites=secret.login_sites if isinstance(secret, BitwardenLoginSecret) else [],
+            passkeys=secret.passkeys if isinstance(secret, BitwardenLoginSecret) else [],
         )
