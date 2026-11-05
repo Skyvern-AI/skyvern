@@ -21,6 +21,8 @@ from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.storage.azure import AzureStorage
+from skyvern.forge.sdk.artifact.storage.gcs import GcsStorage
 from skyvern.forge.sdk.artifact.storage.s3 import S3Storage
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.routes.agent_protocol import _parse_range_header
@@ -175,6 +177,22 @@ class TestArtifactContentRangeRequests:
 
         assert response.status_code == 416
         assert response.headers["content-range"] == f"bytes */{len(CONTENT)}"
+
+    @pytest.mark.parametrize("backend", ["azure", "gcs"])
+    @pytest.mark.parametrize(
+        ("range_header", "status", "body"),
+        [(None, 200, CONTENT), ("bytes=10-19", 206, CONTENT[10:20]), ("bytes=5000-6000", 416, b"")],
+    )
+    def test_azure_and_gcs_serve_whole_and_range_content(
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, range_header: str | None, status: int, body: bytes
+    ) -> None:
+        client = _build_client(monkeypatch)
+        storage = AzureStorage("c", "acct", "a2V5") if backend == "azure" else GcsStorage("b", "project")
+        storage.async_client = None  # type: ignore[assignment]  # the route must not reach the provider SDK
+        monkeypatch.setattr(forge_app, "STORAGE", storage)
+        response = client.get("/v1/artifacts/a_42/content", headers={"Range": range_header} if range_header else {})
+
+        assert (response.status_code, response.content) == (status, body)
 
     def test_invalid_range_falls_through_to_200(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Per RFC 7233 §3.1, unparseable Range headers MUST be ignored.

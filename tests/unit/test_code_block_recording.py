@@ -838,6 +838,125 @@ async def test_real_chromium_sink_capture_does_not_fast_forward_a_running_transi
         assert await page.evaluate("window.transitionEnded === true") is False
 
 
+_PRE_ACTION_RGB = (30, 60, 220)
+_NEXT_ACTION_RGB = (200, 30, 160)
+_PAINT = "rgb => { document.documentElement.style.background = document.body.style.background = `rgb(${rgb})`; }"
+
+
+def _observe_rescue_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[float], list[set[asyncio.Task[Any]]]]:
+    returned: list[float] = []
+    left_running: list[set[asyncio.Task[Any]]] = []
+    rescue = page_module._cdp_rescue_screenshot
+
+    async def observed_rescue(*args: Any, **kwargs: Any) -> Any:
+        existing = asyncio.all_tasks()
+        try:
+            return await rescue(*args, **kwargs)
+        finally:
+            returned.append(time.monotonic())
+            left_running.append(asyncio.all_tasks() - existing)
+
+    monkeypatch.setattr(page_module, "_cdp_rescue_screenshot", observed_rescue)
+    return returned, left_running
+
+
+def _post_capture_ms(capture_returned: list[float], rescue_returned: list[float]) -> int | None:
+    if not capture_returned or not rescue_returned:
+        return None
+    return round((rescue_returned[-1] - capture_returned[-1]) * 1000)
+
+
+@pytest.mark.asyncio
+@requires_chromium
+@pytest.mark.parametrize(
+    ("held_ms", "kept", "detach_failures"),
+    [(2600, True, []), (2900, False, []), (None, False, [("detach", "timeout")])],
+    ids=["answers_inside_the_bound", "answers_past_the_bound", "wedged_after_geometry"],
+)
+async def test_real_chromium_sink_capture_held_after_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
+    held_ms: int | None,
+    kept: bool,
+    detach_failures: list[tuple[str, str]],
+) -> None:
+    sent: list[dict[str, str | bool]] = []
+    capture_returned: list[float] = []
+    rescue_returned, rescue_left_running = _observe_rescue_returns(monkeypatch)
+    sink_started = 0.0
+    async with chromium_context() as context:
+        page = await open_marker_page(context, _PRE_ACTION_RGB, "http://capture.test/")
+        pre_action_png = await page.screenshot()
+        await page.evaluate(_PAINT, list(MARKER_RGB))
+        new_cdp_session = context.new_cdp_session
+
+        async def held_session(target: Page) -> CDPSession:
+            session = await new_cdp_session(target)
+            send = session.send
+
+            # The browser answers with this action's pixels; the page then moves on while the answer is held back.
+            async def held_send(method: str, params: dict | None = None) -> dict:
+                if method != "Page.captureScreenshot":
+                    return await send(method, params)
+                sent.append(dict(params or {}))
+                if held_ms is None:
+                    await page.evaluate("setTimeout(() => { while (true) {} }, 0)")
+                    return await send(method, params)
+                result = await send(method, params)
+                await page.evaluate(_PAINT, list(_NEXT_ACTION_RGB))
+                await asyncio.sleep(max(0.0, sink_started + held_ms / 1000 - time.monotonic()))
+                capture_returned.append(time.monotonic())
+                return result
+
+            monkeypatch.setattr(session, "send", held_send)
+            return session
+
+        monkeypatch.setattr(context, "new_cdp_session", held_session)
+        with capture_logs() as logs:
+            sink_started = time.monotonic()
+            data, elapsed_ms, health_calls, artifact_id = await _sink_upload(page)
+        next_action_png = None if held_ms is None else await page.screenshot()
+        engine = context.browser.browser_type.name if context.browser else None
+        viewport = page.viewport_size
+    rescue_logs = [log for log in logs if log["event"].startswith("Raw CDP rescue screenshot")]
+    record_property("engine", engine)
+    record_property("viewport", viewport)
+    record_property("stage", [(log.get("screenshot.stage"), log.get("screenshot.outcome")) for log in rescue_logs])
+    record_property("elapsed_ms", round(elapsed_ms))
+    record_property("artifact_id", artifact_id)
+    record_property("capture_params", sent)
+    detached = [
+        (log["screenshot.stage"], log["screenshot.outcome"])
+        for log in rescue_logs
+        if log["event"] == "Raw CDP rescue screenshot detach failed"
+    ]
+    record_property("detach_failures", detached)
+    record_property("leftover_tasks", [len(tasks) for tasks in rescue_left_running])
+    record_property("post_capture_ms", _post_capture_ms(capture_returned, rescue_returned))
+    assert sent == [{"format": "png", "captureBeyondViewport": False, "optimizeForSpeed": True}]
+    assert detached == detach_failures
+    assert [len(tasks) for tasks in rescue_left_running] == [0]
+    assert png_background_colors(pre_action_png) == {_PRE_ACTION_RGB}
+    if next_action_png is not None:
+        assert png_background_colors(next_action_png) == {_NEXT_ACTION_RGB}
+    assert health_calls == []
+    assert elapsed_ms < settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS
+    if kept:
+        assert data is not None
+        assert png_background_colors(data) == {MARKER_RGB}
+        assert artifact_id == "a_1"
+        assert [log["event"] for log in rescue_logs] == ["Raw CDP rescue screenshot captured"]
+    else:
+        assert data is None
+        assert artifact_id is None
+        failed = next(log for log in rescue_logs if log["event"] == "Raw CDP rescue screenshot failed")
+        assert (failed["screenshot.stage"], failed["screenshot.outcome"]) == ("capture", "timeout")
+        if held_ms is not None:
+            assert all(log["event"] != "Raw CDP rescue screenshot detach failed" for log in rescue_logs)
+
+
 _NOISE_CANVAS = """() => {
     const canvas = document.createElement("canvas");
     canvas.width = window.innerWidth - 20;
@@ -883,6 +1002,8 @@ async def test_real_chromium_sink_lands_a_responsive_page_whose_default_png_enco
 ) -> None:
     width, height = 6400, 3600
     sent: list[dict[str, str | bool]] = []
+    capture_returned: list[float] = []
+    rescue_returned, _ = _observe_rescue_returns(monkeypatch)
     async with chromium_context({"width": width, "height": height}) as context:
         page = await open_marker_page(context, MARKER_RGB, "http://capture.test/")
         await page.evaluate(_NOISE_CANVAS)
@@ -897,9 +1018,12 @@ async def test_real_chromium_sink_lands_a_responsive_page_whose_default_png_enco
             send = session.send
 
             async def recorded_send(method: str, params: dict | None = None) -> dict:
-                if method == "Page.captureScreenshot":
-                    sent.append(dict(params or {}))
-                return await send(method, params)
+                if method != "Page.captureScreenshot":
+                    return await send(method, params)
+                sent.append(dict(params or {}))
+                result = await send(method, params)
+                capture_returned.append(time.monotonic())
+                return result
 
             monkeypatch.setattr(session, "send", recorded_send)
             return session
@@ -917,6 +1041,7 @@ async def test_real_chromium_sink_lands_a_responsive_page_whose_default_png_enco
     record_property("calibrated_fast_ms", round(fast_ms))
     record_property("elapsed_ms", round(elapsed_ms))
     record_property("renderer_max_gap_ms", round(renderer_gap_ms))
+    record_property("post_capture_ms", _post_capture_ms(capture_returned, rescue_returned))
     record_property(
         "rescue_logs",
         [
@@ -930,7 +1055,7 @@ async def test_real_chromium_sink_lands_a_responsive_page_whose_default_png_enco
         record_property("png_sha256", hashlib.sha256(data).hexdigest())
         record_property("png_path", str(tmp_path / "capture.png"))
     raw_window_ms = settings.CODE_BLOCK_RECORDING_SCREENSHOT_TIMEOUT_MS - 1000 * (
-        page_module._CDP_RESCUE_DEADLINE_MARGIN_SECONDS + page_module._CDP_RESCUE_RAW_FIRST_DETACH_RESERVE_SECONDS
+        page_module._CDP_RESCUE_DEADLINE_MARGIN_SECONDS + page_module._CDP_RESCUE_RAW_FIRST_SUCCESS_RESERVE_SECONDS
     )
     residual_reproduced = default_ms > raw_window_ms
     timing_asserted = residual_reproduced and fast_ms <= 1200

@@ -308,7 +308,9 @@ async def test_a_cell_whose_browser_cannot_be_entered_returns_the_acquisition_fa
 
     manager = MagicMock()
     manager.get_browser_state = AsyncMock(side_effect=BrowserCdpConnectionError("CDP connection failed"))
-    monkeypatch.setattr(runtime_module, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime_module, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
     ctx = make_copilot_context()
     ctx.api_key = "sk-test"
@@ -337,7 +339,9 @@ async def test_an_unclassified_acquisition_failure_is_named_by_type_not_by_its_o
 
     manager = MagicMock()
     manager.get_browser_state = AsyncMock(side_effect=RuntimeError("connect ws://10.1.2.3:9222/devtools refused"))
-    monkeypatch.setattr(runtime_module, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime_module, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
     ctx = make_copilot_context()
     ctx.api_key = "sk-test"

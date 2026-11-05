@@ -1,13 +1,19 @@
+import pickle
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import SecretStr
 
 from skyvern.forge.sdk.schemas.credentials import (
+    CredentialItem,
+    CredentialType,
     CreditCardBillingAddress,
     CreditCardCredential,
     PasswordCredential,
+    VaultPasskey,
 )
+from skyvern.forge.sdk.services.bitwarden import BitwardenLoginSecret
 from skyvern.forge.sdk.workflow import context_manager as context_manager_module
 from skyvern.forge.sdk.workflow.context_manager import RANDOM_SECRET_ID_PREFIX, WorkflowRunContext
 
@@ -88,6 +94,18 @@ async def test_card_number_and_cvv_are_still_masked(monkeypatch: pytest.MonkeyPa
         assert str(values[field]).startswith(RANDOM_SECRET_ID_PREFIX)
     assert "4111111111111111" in context.secrets.values()
     assert "587" in context.secrets.values()
+
+
+@pytest.mark.asyncio
+async def test_only_the_card_number_and_cvv_are_recorded_for_unconditional_visual_masking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """These ids drive a mask that ignores the workflow's Mask Secrets opt-in, so the set has to stay
+    exactly the two charge-authorizing fields -- an expiry or billing id here would mask far more of
+    the page than intended, and a missing one leaves a card legible in the run's screenshots."""
+    context, values = await _register(monkeypatch)
+
+    assert context.card_secret_ids == {values["card_number"], values["card_cvv"]}
 
 
 @pytest.mark.asyncio
@@ -225,3 +243,31 @@ async def test_only_a_logins_username_slot_is_recorded_as_an_identifier(monkeypa
 
     card_context, _ = await _register(monkeypatch)
     assert card_context.login_identifier_secret_ids == set()
+
+
+def test_vault_passkeys_never_serialize() -> None:
+    carrier = VaultPasskey(
+        rp_id="example.com",
+        credential_id="Y3JlZGVudGlhbA",
+        private_key=SecretStr("private-key-sentinel"),
+        user_handle="dXNlcg",
+        counter=0,
+        discoverable=True,
+    )
+    item = CredentialItem(
+        item_id="item",
+        name="login",
+        credential_type=CredentialType.PASSWORD,
+        credential=PasswordCredential(username="user", password=""),
+        passkeys=[carrier],
+    )
+    secret = BitwardenLoginSecret({}, [], passkeys=[carrier])
+    assert "passkeys" not in item.model_dump()
+    for output in (item.model_dump_json(), repr(item), repr(secret), repr(carrier)):
+        assert "private-key-sentinel" not in output
+        assert "Y3JlZGVudGlhbA" not in output or output == repr(carrier)
+    for value in (item, secret):
+        payload = pickle.dumps(value)
+        assert b"private-key-sentinel" not in payload
+        assert b"Y3JlZGVudGlhbA" not in payload
+        assert pickle.loads(payload).passkeys == []

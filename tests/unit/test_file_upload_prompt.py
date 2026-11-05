@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import libcst as cst
@@ -18,11 +20,14 @@ from skyvern.core.script_generations.generate_script import _build_file_upload_s
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory
 from skyvern.forge.sdk.artifact.models import ArtifactType
+from skyvern.forge.sdk.artifact.storage import unique_pdfs
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import FileUploadBlock, UnsupportedStorageTypeError
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
 from skyvern.schemas.workflows import BlockStatus, FileStorageType, FileUploadBlockYAML
+from tests.unit.helpers import make_pdf
 
 
 def _output_parameter() -> OutputParameter:
@@ -644,3 +649,140 @@ async def test_upload_ignores_files_from_previous_attempts(tmp_path: Path, attem
     assert (download_dir / "report.pdf").exists()
     if attempt == "lookup_failure":
         assert any(row["log_level"] == "warning" and "attempt" in row["event"] for row in logs)
+
+
+def _write_equal_pdfs(directory: Path) -> None:
+    directory.mkdir()
+    for name in ("invoice.pdf", "invoice (1).pdf"):
+        (directory / name).write_bytes(make_pdf("Invoice 1001"))
+    (directory / "report.csv").write_text("report")
+
+
+@pytest.mark.asyncio
+async def test_prompt_can_select_both_byte_identical_pdf_copies(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_equal_pdfs(download_dir)
+    response = {
+        "reasoning": "Both invoice copies were requested.",
+        "files_to_upload": ["invoice.pdf", "invoice (1).pdf"],
+    }
+
+    execution = await _execute_file_upload(
+        _file_upload_block("Upload invoice.pdf and invoice (1).pdf."), download_dir, llm_response=response
+    )
+
+    assert execution.result.success is True
+    candidates = execution.handler.await_args.kwargs["prompt"]
+    assert "invoice.pdf" in candidates and "invoice (1).pdf" in candidates
+    assert sorted(Path(call.kwargs["file_path"]).name for call in execution.upload.await_args_list) == [
+        "invoice (1).pdf",
+        "invoice.pdf",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_prompt_uploads_one_copy_of_byte_identical_pdfs(tmp_path: Path) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_equal_pdfs(download_dir)
+
+    execution = await _execute_file_upload(_file_upload_block(None), download_dir)
+
+    uploaded = sorted(Path(call.kwargs["file_path"]).name for call in execution.upload.await_args_list)
+    assert uploaded in (["invoice (1).pdf", "report.csv"], ["invoice.pdf", "report.csv"])
+    assert sorted(p.name for p in download_dir.iterdir()) == ["invoice (1).pdf", "invoice.pdf", "report.csv"]
+    execution.handler.assert_not_awaited()
+
+
+class _HeldComparison:
+    """Holds the upload scan's first PDF content read until released or ``hold_seconds`` pass, counting reads."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, hold_seconds: float = 2.0) -> None:
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.held = self.finished = False
+        self.reads = 0
+        read, compare = unique_pdfs._PdfDigest.update, block_module.unique_pdf_paths
+
+        def update(digest: unique_pdfs._PdfDigest, chunk: bytes) -> None:
+            self.reads += 1
+            if self.reads == 1:
+                self.held = True
+                self.entered.set()
+                self.release.wait(hold_seconds)
+                self.held = False
+            read(digest, chunk)
+
+        def compare_paths(*args: Any, **kwargs: Any) -> list[str]:
+            try:
+                return compare(*args, **kwargs)
+            finally:
+                self.finished = True
+
+        monkeypatch.setattr(unique_pdfs, "_CHUNK_BYTES", 64)
+        monkeypatch.setattr(unique_pdfs._PdfDigest, "update", update)
+        monkeypatch.setattr(block_module, "unique_pdf_paths", compare_paths)
+
+
+def _uploaded(execution: SimpleNamespace) -> list[str]:
+    return sorted(Path(call.kwargs["file_path"]).name for call in execution.upload.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_upload_scan_compares_pdf_contents_without_blocking_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_equal_pdfs(download_dir)
+    held = _HeldComparison(monkeypatch)
+    upload = asyncio.ensure_future(_execute_file_upload(_file_upload_block(None), download_dir))
+
+    await asyncio.to_thread(held.entered.wait, 5)
+    beats_while_held = 0
+    for _ in range(5):
+        await asyncio.sleep(0)
+        beats_while_held += held.held
+    held.release.set()
+    execution = await upload
+
+    assert beats_while_held == 5
+    assert execution.result.success is True
+    assert _uploaded(execution) in (["invoice (1).pdf", "report.csv"], ["invoice.pdf", "report.csv"])
+
+
+@pytest.mark.asyncio
+async def test_cancelling_an_upload_stops_its_pdf_comparison_before_the_cancellation_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_equal_pdfs(download_dir)
+    held = _HeldComparison(monkeypatch)
+    upload = asyncio.ensure_future(_execute_file_upload(_file_upload_block(None), download_dir))
+
+    await asyncio.to_thread(held.entered.wait, 5)
+    comparing_when_cancelled = held.held
+    upload.cancel()
+    # Let the cancellation reach the upload before the held read finishes, so only the stop can end the comparison.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    held.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await upload
+
+    assert comparing_when_cancelled
+    assert held.finished, "the comparison thread settles before the cancelled upload returns"
+    assert held.reads <= 2, f"the comparison stopped instead of reading every chunk ({held.reads} reads)"
+
+
+@pytest.mark.asyncio
+async def test_a_pdf_comparison_past_its_deadline_uploads_every_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    download_dir = tmp_path / "downloads"
+    _write_equal_pdfs(download_dir)
+    monkeypatch.setattr(unique_pdfs, "GET_DOWNLOADED_FILES_TIMEOUT", 0.05)
+    held = _HeldComparison(monkeypatch, hold_seconds=0.5)
+
+    execution = await _execute_file_upload(_file_upload_block(None), download_dir)
+
+    assert execution.result.success is True
+    assert _uploaded(execution) == ["invoice (1).pdf", "invoice.pdf", "report.csv"]
+    assert held.finished

@@ -122,7 +122,10 @@ async def test_workflow_run_listing_respects_connect_authorization(
     monkeypatch.setattr(
         app_instance,
         "AGENT_FUNCTION",
-        SimpleNamespace(browser_session_ids_authorized_for_connect=authorization),
+        SimpleNamespace(
+            browser_session_ids_authorized_for_connect=authorization,
+            should_check_browser_session_artifacts=AsyncMock(return_value=False),
+        ),
     )
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
     principal = SimpleNamespace(organization_id=ORG_ID, api_key_access_mode="member")
@@ -361,3 +364,95 @@ async def test_task_export_applies_filters_and_builds_batches_off_the_event_loop
     *exported, trailer = (json.loads(line) for line in response.text.splitlines())
     assert sorted(task["task_id"] for task in exported) == sorted(task_ids[1:])
     assert trailer == {"export_complete": True, "task_count": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["list", "export"])
+async def test_task_listing_checks_descendants_once_per_run_per_request(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, endpoint: str
+) -> None:
+    from fastapi import HTTPException
+
+    import skyvern.forge.agent as agent_module
+    from skyvern.forge.sdk.services import browser_session_artifacts as artifacts
+    from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
+
+    task_ids = await _seed_tasks_with_timestamp_ties(monkeypatch, sqlite_engine, count=12)
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    db = app_instance.DATABASE
+    async with db.Session() as session:
+        for index, task_id in enumerate(task_ids):
+            await session.execute(
+                update(TaskModel)
+                .where(TaskModel.task_id == task_id)
+                .values(
+                    workflow_run_id="wr_a" if index < 6 else "wr_b",
+                    browser_session_id="pbs_denied" if index == 0 else "pbs_both_denied" if index == 6 else None,
+                    extracted_information={"downloaded_file_urls": ["file:///tmp/private.pdf"]},
+                )
+            )
+        await session.commit()
+
+    async def children(parent_id: str, *, organization_id: str) -> list[SimpleNamespace]:
+        await asyncio.sleep(0.01)
+        return [SimpleNamespace(workflow_run_id="wr_hidden")] if parent_id == "wr_b" else []
+
+    async def folder_access(principal: RequestPrincipal, action: str, resource: dict[str, object]) -> None:
+        if principal.user_id == "viewer":
+            raise HTTPException(status_code=403)
+
+    async def task_access(
+        _org: str, *, session_ids: list[str | None], **_kwargs: object
+    ) -> artifacts.BrowserSessionArtifactAccess:
+        return artifacts.BrowserSessionArtifactAccess(
+            "pbs_denied" not in session_ids
+            and not ("pbs_both_denied" in session_ids and principal["value"].user_id == "viewer")
+        )
+
+    lookup = AsyncMock(side_effect=children)
+    root_access = AsyncMock(side_effect=task_access)
+    monkeypatch.setattr(db.workflow_runs, "get_workflow_runs_by_parent_workflow_run_id", lookup)
+    monkeypatch.setattr(db.observer, "get_child_workflow_run_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(
+        app_instance.AGENT_FUNCTION, "should_check_browser_session_artifacts", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(app_instance.AGENT_FUNCTION, "enforce_folder_access", folder_access)
+    monkeypatch.setattr(agent_module, "browser_session_artifact_access", root_access)
+    monkeypatch.setattr(
+        artifacts,
+        "browser_session_artifact_access",
+        AsyncMock(return_value=artifacts.BrowserSessionArtifactAccess(True)),
+    )
+    monkeypatch.setattr(app_instance, "agent", ForgeAgent())
+    monkeypatch.setattr(agent_protocol, "TASK_EXPORT_BATCH_SIZE", 3)
+    principal = {"value": RequestPrincipal(ORG_ID, AuthKind.bearer, user_id="viewer")}
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: principal["value"])
+
+    def rows(response: httpx.Response) -> list[dict[str, Any]]:
+        if endpoint == "list":
+            return response.json()
+        return [row for line in response.text.splitlines() if "task_id" in (row := json.loads(line))]
+
+    path = "/api/v1/tasks" if endpoint == "list" else "/api/v1/tasks/export"
+    async with _client(shared_route_app(monkeypatch)) as client:
+        denied = await client.get(path, params={"page_size": 100} if endpoint == "list" else None)
+        assert denied.status_code == 200, denied.text
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_a") == 1
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_b") == 1
+        assert root_access.await_count == len(task_ids)
+        denied_by_id = {row["task_id"]: row for row in rows(denied)}
+        assert denied_by_id[task_ids[0]]["extracted_information"]["downloaded_file_urls"] is None
+        assert denied_by_id[task_ids[1]]["extracted_information"]["downloaded_file_urls"]
+        assert denied_by_id[task_ids[6]]["extracted_information"] == "[redacted]"
+
+        lookup.reset_mock()
+        root_access.reset_mock()
+        principal["value"] = RequestPrincipal(ORG_ID, AuthKind.bearer, user_id="editor")
+        allowed = await client.get(path, params={"page_size": 100} if endpoint == "list" else None)
+        assert allowed.status_code == 200, allowed.text
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_a") == 1
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_b") == 1
+        assert root_access.await_count == len(task_ids)
+        allowed_by_id = {row["task_id"]: row for row in rows(allowed)}
+        assert allowed_by_id[task_ids[0]]["extracted_information"]["downloaded_file_urls"] is None
+        assert allowed_by_id[task_ids[6]]["extracted_information"]["downloaded_file_urls"]

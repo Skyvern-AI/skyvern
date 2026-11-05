@@ -3721,7 +3721,7 @@ async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
 
     page.goto = _goto  # type: ignore[method-assign]
     page.click = _click  # type: ignore[method-assign]
-    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "never"})]]
+    script = [[("navigate", {"url": task_url})], [("finish", {"status": "completed", "reason": "saw the 404"})]]
     if via_click:
         script[:0] = [[("click", {"selector": "#go"})], [("navigate", {"url": "https://example.test/other"})]]
     with capture_logs() as logs:
@@ -3732,9 +3732,10 @@ async def test_engine_logs_a_dead_end_provenance_through_the_real_navigate_tool(
             task_target_urls=frozenset() if via_click else caller_known_published_urls(task_url, keep_query=True),
         )
 
-    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    assert (outcome.status, outcome.reason) == ("completed", "saw the 404")
     (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
     assert line["provenance"] == ("previously_visited" if via_click else "task_supplied")
+    assert line["returned_to_model"] is True
 
 
 _JUSTIFY_CRITERIA = ("", "the record is not listed")

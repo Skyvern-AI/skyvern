@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
@@ -66,6 +67,9 @@ def _conditional_block(
 
 
 class DummyContext:
+    reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+    agent_unmasked_platform_secret_ids = staticmethod(set)
+
     def __init__(self, workflow_run_id: str) -> None:
         self.blocks_metadata: dict[str, dict] = {}
         self.values: dict[str, object] = {}
