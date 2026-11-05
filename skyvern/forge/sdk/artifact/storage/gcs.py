@@ -38,6 +38,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     presign_with_sensitive_cap,
     resolve_download_attempt_fail_open,
 )
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import extract_profile_archive, write_profile_archive
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
     RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
     RUN_RECORDING_PATH_SEGMENT,
@@ -318,7 +319,8 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to GCS."""
         temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
+        zip_file_path = f"{temp_zip_file.name}.zip"
+        write_profile_archive(directory, zip_file_path, organization_id=organization_id, profile_id=profile_id)
         profile_uri = (
             f"gs://{settings.GCS_BUCKET_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         )
@@ -351,7 +353,7 @@ class GcsStorage(BaseStorage, StreamingArtifactStorage):
         downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_profile_")
+        return extract_profile_archive(downloaded_zip_bytes, organization_id=organization_id, profile_id=profile_id)
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Non-destructive existence check via object metadata — avoids downloading the whole archive."""
