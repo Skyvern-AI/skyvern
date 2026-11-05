@@ -63,6 +63,36 @@ afterEach(() => {
 });
 
 describe("DocStepResult", () => {
+  it("says a step of a live run is waiting, and draws no screenshot box before a capture exists", () => {
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map([
+        [
+          "running_step",
+          block({ label: "running_step", status: Status.Running }),
+        ],
+      ]),
+      live: true,
+    };
+    const ui = (label: string) => (
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label={label} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const waiting = render(ui("later_step"));
+    expect(screen.getByText("Waiting to run")).toBeTruthy();
+    waiting.unmount();
+    const running = render(ui("running_step"));
+    expect(screen.getByText("Running…")).toBeTruthy();
+    const box = running.container.querySelector<HTMLElement>(
+      "[data-testid=doc-step-live-thumbnail]",
+    );
+    expect(box === null || box.hidden).toBe(true);
+  });
+
   it("shows nothing for a step an earlier run cannot speak for, even if that run failed it", () => {
     renderResult(block({ status: Status.Failed, failure_reason: "old error" }));
     expect(screen.getByTestId("doc-step-result")).toBeTruthy();
