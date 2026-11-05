@@ -2173,14 +2173,16 @@ async def upload_attached_file_tool(ctx: RunContextWrapper, file_id: str, select
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override=READ_PDF_TOOL_NAME)
 async def read_attached_pdf_tool(ctx: RunContextWrapper, file_id: str, offset: int = 0) -> str:
-    """Return the text of a PDF the user attached to this chat (`file_id` exactly as listed in the attached files),
-    without a browser or a workflow run, and without adding anything to the workflow. Long text comes back in windows:
-    `total_chars` is the length of the whole document's text, and passing `next_offset` as `offset` reads the next
-    window (null when this window reaches the end). Any other `offset` is moved back to the start of the window that
-    contains it. Pages past the first 256,000 tokens of a document's text are not
-    extracted, so `total_chars` stops there. Passwords, keys and other secrets in the text read
+    """Return the text of a PDF or Word .docx document the user attached to this chat (`file_id` exactly as listed in
+    the attached files), without a browser or a workflow run, and without adding anything to the workflow. Long text
+    comes back in windows: `total_chars` is the length of the whole document's text, and passing `next_offset` as
+    `offset` reads the next window (null when this window reaches the end). Any other `offset` is moved back to the
+    start of the window that contains it. Text past the first 256,000 tokens of a document is not extracted, so
+    `total_chars` stops there. A .docx comes back as its paragraphs and table rows (cells joined by ` | `) in
+    document order. Passwords, keys and other secrets in the text read
     `[REDACTED_SECRET]`. `text_layer_warning` is present when the PDF's embedded font maps characters wrongly, so
-    letters and digits in `text` may not match the page. A PDF whose pages are only images has no text to return."""
+    letters and digits in `text` may not match the page. Images inside the file are not read, so a PDF whose pages
+    are only images has no text to return."""
     authority_error = _authority_tool_error(ctx.context, READ_PDF_TOOL_NAME)
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, READ_PDF_TOOL_NAME, authority_error)
