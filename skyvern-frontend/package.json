@@ -140,6 +140,9 @@
     "js-yaml": "^4.2.0",
     "@opentelemetry/core": "^2.8.0",
     "postcss-selector-parser": "^7.1.6",
-    "body-parser": "^1.20.9"
+    "body-parser": "^1.20.9",
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.3"
+    }
   }
 }
