@@ -191,6 +191,14 @@ async def login(
     totp_verification_url = _validate_url(login_request.totp_url, field_name="totp_url")
     webhook_url = _validate_url(login_request.webhook_url, field_name="webhook_url")
 
+    if login_request.credential_type == CredentialType.bitwarden:
+        await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+            organization.organization_id,
+            {login_request.bitwarden_item_id} if login_request.bitwarden_item_id else set(),
+            {login_request.bitwarden_collection_id} if login_request.bitwarden_collection_id else set(),
+            allow_own_token=True,
+        )
+
     # 1. create empty workflow with a credential parameter
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
         organization,

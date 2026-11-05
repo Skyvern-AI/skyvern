@@ -845,6 +845,7 @@ def _install_credential_app(
                 enforce_workflow_context_credential_use=AsyncMock(),
                 enforce_credential_use=AsyncMock(),
                 enforce_platform_azure_vault_item_ownership=AsyncMock(),
+                enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False),
                 process_registered_credential_item=AsyncMock(side_effect=lambda **kwargs: kwargs["credential_item"]),
                 parse_enterprise_totp_secret=AsyncMock(return_value=None),
             ),
