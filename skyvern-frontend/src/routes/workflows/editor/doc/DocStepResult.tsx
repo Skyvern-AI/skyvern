@@ -17,10 +17,15 @@ import {
 import { describeCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
 import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
 import { StatusDot } from "../../workflowRun/StatusDot";
-import { HeroScreenshot } from "../../studio/runview/HeroScreenshot";
+import {
+  HeroScreenshot,
+  type HeroSelection,
+} from "../../studio/runview/HeroScreenshot";
+import { useHeroScreenshot } from "../../studio/runview/useHeroScreenshot";
 import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { useDocRun } from "./useDocRun";
+import { failureHeadlineInPlainWords } from "./docFailureText";
 import {
   docLoopProgressText,
   docRunStoppedByStep,
@@ -76,7 +81,10 @@ function failureLine(block: WorkflowRunBlock): string {
   if (!block.failure_reason?.trim()) return "Failed";
   const headline =
     describeCodeBlockFailure(block)?.title ??
-    formatFailureReason(block.failure_reason).headline;
+    failureHeadlineInPlainWords(
+      block.failure_reason,
+      (raw) => formatFailureReason(raw).headline,
+    );
   return headline ? `Failed: ${headline}` : "Failed";
 }
 
@@ -109,6 +117,36 @@ function resultText(
   }
 }
 
+function DocLiveThumbnail({ block }: { block: WorkflowRunBlock }) {
+  const selection: HeroSelection = {
+    kind: "block",
+    workflowRunBlockId: block.workflow_run_block_id,
+    blockType: block.block_type,
+  };
+  const { screenshot } = useHeroScreenshot(selection, true);
+  const [unavailable, setUnavailable] = useState(false);
+  // No box until a capture that can be shown exists: a placeholder says nothing.
+  const hidden = !screenshot || unavailable;
+  return (
+    <div
+      hidden={hidden}
+      className={cn(
+        "mt-1.5 aspect-video w-full max-w-[280px] overflow-hidden rounded-md border border-border bg-muted",
+        hidden && "hidden",
+      )}
+      data-testid="doc-step-live-thumbnail"
+    >
+      <div className="relative h-full w-full">
+        <HeroScreenshot
+          selection={selection}
+          running
+          onUnavailable={setUnavailable}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function DocStepResult({
   label,
   completedText,
@@ -134,8 +172,20 @@ export function DocStepResult({
   );
   if (!runId || unknownLabels.has(label)) return null;
   if (!block) {
-    // Only once the run has settled: a live run may still get here.
-    if (live || !run || blockRun) return null;
+    if (!run || blockRun) return null;
+    // A live run has not got here yet: say so, so every step in the run shows one state.
+    if (live) {
+      return (
+        <div
+          className="mb-1 mt-1 flex items-center gap-1.5 text-[13px] text-muted-foreground"
+          data-testid="doc-step-result"
+          data-doc-waiting
+        >
+          <StatusDot status={Status.Queued} isFinalized={false} />
+          Waiting to run
+        </div>
+      );
+    }
     return (
       <div
         className="mb-1 mt-1 text-[13px] text-muted-foreground"
@@ -214,29 +264,12 @@ export function DocStepResult({
       {loop && loop.items.length > 0 && (live || open) && (
         <DocLoopItems progress={loop} />
       )}
-      {running && !loop && (
-        <div
-          className="mt-1.5 aspect-video w-full max-w-[280px] overflow-hidden rounded-md border border-border bg-muted"
-          data-testid="doc-step-live-thumbnail"
-        >
-          <div className="relative h-full w-full">
-            <HeroScreenshot
-              selection={{
-                kind: "block",
-                workflowRunBlockId: block.workflow_run_block_id,
-                blockType: block.block_type,
-              }}
-              running
-              unavailableText="Waiting for the first capture…"
-            />
-          </div>
-        </div>
-      )}
+      {running && !loop && <DocLiveThumbnail block={block} />}
       {open && (
         <div className="mt-1.5 min-w-0 space-y-3 overflow-x-auto rounded-md border border-border">
           <BlockInspector block={block} wrapTabs />
           {!running && screenshot && (
-            <div className="relative mx-3 aspect-video max-w-[480px] overflow-hidden rounded-md border border-border bg-muted">
+            <div className="relative mx-3 mb-3 aspect-video max-w-[480px] overflow-hidden rounded-md border border-border bg-muted">
               <HeroScreenshot
                 selection={{
                   kind: "block",
