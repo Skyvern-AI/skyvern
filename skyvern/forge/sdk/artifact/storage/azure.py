@@ -37,6 +37,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     presign_with_sensitive_cap,
     resolve_download_attempt_fail_open,
 )
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import extract_profile_archive, write_profile_archive
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import RUN_RECORDING_PATH_SEGMENT, sync_run_recording_clips
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
@@ -287,7 +288,8 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to Azure."""
         temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
+        zip_file_path = f"{temp_zip_file.name}.zip"
+        write_profile_archive(directory, zip_file_path, organization_id=organization_id, profile_id=profile_id)
         profile_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -314,7 +316,7 @@ class AzureStorage(BaseStorage, StreamingArtifactStorage):
         downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_profile_")
+        return extract_profile_archive(downloaded_zip_bytes, organization_id=organization_id, profile_id=profile_id)
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Non-destructive existence check via blob metadata — avoids downloading the whole archive."""
