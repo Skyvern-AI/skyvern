@@ -386,6 +386,37 @@ async def test_a_page_whose_url_carried_a_secret_is_not_recorded_as_an_anchor() 
     assert update_block.await_args is None
 
 
+@pytest.mark.asyncio
+async def test_billing_hook_is_told_whether_a_label_already_reached_it_in_the_run() -> None:
+    page = SimpleNamespace(url="https://example.com/", is_closed=lambda: False)
+    shared_context = FakeWorkflowRunContext(values={}, secrets={})
+    other_block = _code_block().model_copy(update={"label": "other_block"})
+    billing_hook = AsyncMock()
+
+    async def finalize(code_block: CodeBlock, success: bool) -> None:
+        recording = _recording(page)
+        recording._code_block = code_block
+        recording._workflow_run_context = shared_context  # type: ignore[assignment]
+        await recording.finalize(success=success)
+
+    with (
+        patch(f"{_RECORDING_PATH}.DATABASE.tasks.update_task", AsyncMock()),
+        patch(f"{_RECORDING_PATH}.DATABASE.tasks.update_step", AsyncMock()),
+        patch(f"{_RECORDING_PATH}.DATABASE.observer.update_workflow_run_block", AsyncMock()),
+        patch(f"{_RECORDING_PATH}.AGENT_FUNCTION.post_code_block_execution", billing_hook),
+    ):
+        await finalize(_code_block(), success=False)
+        await finalize(_code_block(), success=True)
+        await finalize(_code_block(), success=True)
+        await finalize(other_block, success=True)
+
+    assert [call.kwargs["is_first_successful_execution"] for call in billing_hook.await_args_list] == [
+        True,
+        False,
+        True,
+    ]
+
+
 _PENDING_SECRET = "credential-value-never-log"
 
 _PENDING_EVENT_BASE = {
