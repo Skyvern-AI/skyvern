@@ -362,6 +362,33 @@ class TestTheModelsReplyIsDelivered:
         assert facts["ranCleanOnCurrentSource"] is False
         assert result.proposal_disposition == "review_untested"
 
+    def test_browser_start_capacity_refusal_reports_no_run_and_keeps_its_facts(self) -> None:
+        ctx = _ctx()
+        refusal = BuildTestConnectFailure(
+            state="browser_start_capacity",
+            starting_sessions=10,
+            max_starting_sessions=10,
+            retry_after_seconds=17,
+        )
+        _record_connect_failure(ctx, refusal)
+
+        result = _result(
+            ctx,
+            updated_workflow=SimpleNamespace(name="untested draft"),
+            workflow_yaml=two_page_login_yaml(),
+            proposal_disposition="auto_applicable",
+            turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD),
+            narrative_payload=_payload(),
+        )
+
+        facts = (result.narrative_payload or {})["turnFacts"]
+        assert facts["terminalCause"] == "browser_start_capacity"
+        assert facts["runId"] is None
+        assert facts["ranCleanOnCurrentSource"] is False
+        assert result.proposal_disposition == "review_untested"
+        recorded = ctx.latest_recorded_build_test_outcome
+        assert recorded is not None and recorded.connect_failure == refusal
+
     def test_an_empty_completion_reports_its_cause_and_never_claims_a_clean_run(self) -> None:
         ctx = _ctx()
         ctx.empty_completion = True

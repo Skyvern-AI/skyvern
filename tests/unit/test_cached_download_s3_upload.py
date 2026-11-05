@@ -153,6 +153,7 @@ def test_render_template_with_label_injects_workflow_run_id():
     workflow_run_context = SimpleNamespace(
         values={},
         secrets={},
+        agent_unmasked_platform_secret_ids=set,
         workflow_title="Cached workflow",
         workflow_id="wf_cached",
         workflow_permanent_id="wpid_cached",
@@ -178,6 +179,7 @@ def test_render_template_with_label_uses_workflow_parameter_over_extra_binding()
     workflow_run_context = SimpleNamespace(
         values={"original_filename": "custom.pdf"},
         secrets={},
+        agent_unmasked_platform_secret_ids=set,
         workflow_title="Cached workflow",
         workflow_id="wf_cached",
         workflow_permanent_id="wpid_cached",

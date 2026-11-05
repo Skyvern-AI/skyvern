@@ -647,7 +647,9 @@ function BlockInspector({
                 action,
                 diagnosticsStepIndex,
               )}
-              title="Go to diagnostics"
+              title="Open diagnostics in a new tab"
+              target="_blank"
+              rel="noreferrer"
               onClick={(event) => event.stopPropagation()}
               className={cn(
                 triggerClassName,

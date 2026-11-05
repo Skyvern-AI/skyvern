@@ -86,7 +86,6 @@ class Keys:
     """
     VNC RFB keycodes. There's likely a pithier repr (indexes 6-7). This is ok for now.
 
-    ref: https://www.notion.so/References-21c426c42cd480fb9258ecc9eb8f09b4
     ref: https://github.com/novnc/noVNC/blob/master/docs/rfbproto-3.8.pdf
     """
 

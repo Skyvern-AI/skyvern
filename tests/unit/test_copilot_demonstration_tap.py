@@ -14,6 +14,7 @@ from structlog.testing import capture_logs
 from skyvern.forge.sdk.copilot import demonstration_tap as tap_module
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_accessible_role_name_expression
 from skyvern.forge.sdk.copilot.demonstration_tap import PageTap, TapEvent
+from tests.unit.conftest import requires_full_chromium
 from tests.unit.copilot_test_helpers import skip_no_browser
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
@@ -74,7 +75,7 @@ async def _wait_for_event(
     raise AssertionError(f"tap event not observed: {[event.payload for event in seen]}")
 
 
-@skip_no_browser
+@requires_full_chromium
 @pytest.mark.asyncio
 async def test_page_tap_captures_trusted_actions_navigation_and_oopif() -> None:
     main_origin = "http://main.test"
@@ -577,7 +578,7 @@ async def test_page_tap_credits_each_navigation_to_its_own_entry_when_the_url_re
             await tap.stop()
 
 
-@skip_no_browser
+@requires_full_chromium
 @pytest.mark.asyncio
 async def test_page_tap_protects_labelled_secrets_and_captures_combobox_typing() -> None:
     tap: PageTap | None = None

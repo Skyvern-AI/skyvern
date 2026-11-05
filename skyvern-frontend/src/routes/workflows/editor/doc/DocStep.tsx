@@ -3,7 +3,14 @@ import { stripJinjaReferences } from "./docTextUtils";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { goalChangeIsPending } from "../workflowEditorUtils";
 import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
-import { ChevronRightIcon, GearIcon } from "@radix-ui/react-icons";
+import {
+  CheckIcon,
+  ChevronRightIcon,
+  ClockIcon,
+  Cross2Icon,
+  GearIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -34,9 +41,10 @@ import {
   getDocProseFields,
   getDocSettingSummary,
   getDocStepSummary,
-  docStepCanRun,
 } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
+import { docTagState, type DocTagState } from "./docRunState";
+import { useDocRun } from "./useDocRun";
 import { DocText } from "./DocText";
 import type { DocPlace } from "./docEditApi";
 import {
@@ -47,20 +55,70 @@ import {
   DocStepPicker,
 } from "./DocEditing";
 import { useDocStepPending } from "./DocProposalView";
+import { takeCaretAtStart, type LineSplit, type PickerOpener } from "./docKeys";
 
 /** Where a step sits, for the moves its tag menu offers. Absent when the step's place can't be edited. */
 export type DocStepPlace = DocPlace & { count: number; isFinally: boolean };
 
+const tagStateClasses: Partial<Record<DocTagState, string>> = {
+  succeeded:
+    "bg-[#EAF3EC] text-[#3F7A57] dark:bg-[rgba(108,191,140,.14)] dark:text-[#6CBF8C]",
+  failed:
+    "bg-[#FBEAE8] text-[#C0392B] dark:bg-[rgba(240,138,126,.15)] dark:text-[#F08A7E]",
+  waiting:
+    "bg-[#FBEEE2] text-[#B45B0A] dark:bg-[rgba(231,154,85,.15)] dark:text-[#E79A55]",
+  // The dark block-type colours would outrank plain utilities, so dark restates the grey.
+  notReached:
+    "bg-muted text-muted-foreground dark:bg-[rgba(255,255,255,.04)] dark:text-muted-foreground",
+};
+
+const tagStateNames: Record<DocTagState, string> = {
+  running: "running",
+  succeeded: "done",
+  failed: "failed",
+  waiting: "waiting for you",
+  notReached: "not reached",
+};
+
 const tagClass = (
   blockType: ReturnType<typeof docBlockType>,
   pending = false,
+  state: DocTagState | null = null,
 ) =>
   cn(
-    "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded pl-[5px] pr-[7px] text-[12.5px] font-semibold",
+    "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded px-[6px] text-[12.5px] font-semibold leading-none",
     docTagClasses[docTagColor(blockType)],
     pending &&
-      "border border-dashed border-current bg-transparent pl-1 pr-1.5 opacity-80 dark:bg-transparent",
+      "border border-dashed border-current bg-transparent px-[5px] opacity-80 dark:bg-transparent",
+    state && tagStateClasses[state],
   );
+
+/** The step's state in the Doc's run, for its tag. */
+function useDocTagState(label: string): DocTagState | null {
+  const { runId, blocksByLabel, live, blockRun, unknownLabels } = useDocRun();
+  const block = blocksByLabel.get(label);
+  if (unknownLabels.has(label)) return null;
+  if (blockRun && !block) return null;
+  return docTagState(block, live, Boolean(runId));
+}
+
+function DocTagIcon({
+  blockType,
+  state,
+}: {
+  blockType: ReturnType<typeof docBlockType>;
+  state: DocTagState | null;
+}) {
+  const icon = "size-3 shrink-0";
+  if (state === "running")
+    return <ReloadIcon aria-hidden className={cn(icon, "animate-spin")} />;
+  if (state === "succeeded") return <CheckIcon aria-hidden className={icon} />;
+  if (state === "failed") return <Cross2Icon aria-hidden className={icon} />;
+  if (state === "waiting") return <ClockIcon aria-hidden className={icon} />;
+  return blockType ? (
+    <WorkflowBlockIcon workflowBlockType={blockType} className={icon} />
+  ) : null;
+}
 
 function DocStepMenu({
   node,
@@ -77,6 +135,7 @@ function DocStepMenu({
   const [confirming, setConfirming] = useState(false);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
+  const state = useDocTagState(node.data.label);
   const container = node.type === "loop" || node.type === "conditional";
   const topLevel = place.scope.parentId === null;
   const destinations = moveOpen
@@ -128,18 +187,15 @@ function DocStepMenu({
               place.isFinally ? undefined : "Click for actions, drag to move"
             }
             aria-label={`${blockType ? workflowBlockTitle[blockType] : node.type} step ${node.data.label}, actions`}
+            data-doc-tag-state={state}
             className={cn(
-              tagClass(blockType, pending),
+              tagClass(blockType, pending, state),
               "outline-none hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring",
             )}
           >
-            {blockType && (
-              <WorkflowBlockIcon
-                workflowBlockType={blockType}
-                className="size-3"
-              />
-            )}
+            <DocTagIcon blockType={blockType} state={state} />
             {blockType ? workflowBlockTitle[blockType] : node.type}
+            {state && <span className="sr-only">, {tagStateNames[state]}</span>}
           </button>
           <DropdownMenu
             modal={false}
@@ -286,13 +342,16 @@ export function DocTag({
   const actions = useContext(WorkflowDocActionsContext);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
+  const state = useDocTagState(node.data.label);
   if (actions.edit && place) return <DocStepMenu node={node} place={place} />;
   return (
-    <span className={tagClass(blockType, pending)}>
-      {blockType && (
-        <WorkflowBlockIcon workflowBlockType={blockType} className="size-3" />
-      )}
+    <span
+      className={tagClass(blockType, pending, state)}
+      data-doc-tag-state={state}
+    >
+      <DocTagIcon blockType={blockType} state={state} />
       {blockType ? workflowBlockTitle[blockType] : node.type}
+      {state && <span className="sr-only">, {tagStateNames[state]}</span>}
     </span>
   );
 }
@@ -300,16 +359,15 @@ export function DocTag({
 export function DocSettingsButton({
   node,
   editable,
-  inline = false,
 }: {
   node: WorkflowBlockNode;
   editable: boolean;
-  inline?: boolean;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   if (!editable) return null;
   const changed = getDocSettingsChips(node).length;
-  const button = (
+  // Without a changed count the gear is not rendered at rest (display: none), so nothing is reserved for it.
+  return (
     <button
       type="button"
       aria-label={`Settings for ${node.data.label}${changed ? `, ${changed} changed` : ""}`}
@@ -320,21 +378,32 @@ export function DocSettingsButton({
       }
       onClick={() => actions.openSettings(node.id)}
       className={cn(
-        "inline-flex items-center gap-[3px] rounded-[5px] py-0.5 text-xs font-semibold leading-4 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring",
+        "items-center gap-[3px] rounded-[5px] py-0.5 text-xs font-semibold leading-4 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
         changed
-          ? "bg-muted pl-1 pr-1.5 text-foreground"
-          : "px-1 opacity-0 group-focus-within/line:opacity-100 group-hover/line:opacity-100",
+          ? "inline-flex px-1"
+          : "hidden px-1 focus-visible:inline-flex group-focus-within/line:inline-flex group-hover/line:inline-flex [@media(hover:none)]:inline-flex",
       )}
     >
       <GearIcon className="size-[15px]" />
       {changed > 0 && <span>{changed}</span>}
     </button>
   );
-  if (changed || inline) return button;
-  // Shown only on hover or focus, so it takes no width: on a narrow pane it must not wrap the row onto a blank line.
+}
+
+/** Run/stop then settings, as one group: a control that is absent leaves no gap, and the gear trails so Run never moves. */
+export function DocStepControls({
+  node,
+  editable,
+  showRunControl,
+}: {
+  node: WorkflowBlockNode;
+  editable: boolean;
+  showRunControl: boolean;
+}) {
   return (
-    <span className="relative -ml-2 h-5 w-0 shrink-0 self-center">
-      <span className="absolute left-2 top-0">{button}</span>
+    <span className="inline-flex items-center gap-0.5">
+      {showRunControl && <DocRunStepButton node={node} disabled={!editable} />}
+      <DocSettingsButton node={node} editable={editable} />
     </span>
   );
 }
@@ -375,27 +444,25 @@ export function DocStepHeader({
       <DocTag node={node} place={editable ? place : undefined} />
       {extra}
       {docStepProducesData(node) && (
-        <span className="flex min-w-0 items-center gap-1 text-[12.5px] text-muted-foreground">
+        <span className="flex min-w-0 items-baseline gap-1 text-[12.5px] text-muted-foreground">
           saves{" "}
           {editable && place ? (
             <DocOutputName id={node.id} label={node.data.label} />
           ) : (
             <span
               title={`${node.data.label}_output`}
-              className="min-w-0 truncate rounded bg-muted px-[5px] font-medium leading-[1.25]"
+              className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
             >
               {node.data.label}_output
             </span>
           )}
         </span>
       )}
-      {/* With a Run button the row already reserves width, so the gear takes its own slot instead of overlapping Run. */}
-      <DocSettingsButton
+      <DocStepControls
         node={node}
         editable={editable}
-        inline={editable && docStepCanRun(node)}
+        showRunControl={showRunControl}
       />
-      {showRunControl && <DocRunStepButton node={node} disabled={!editable} />}
     </div>
   );
 }
@@ -407,13 +474,18 @@ export function DocStepBody({
   onSlash,
   onTab,
   onBackspaceAtStart,
+  onMove,
+  onRunStep,
 }: {
   node: WorkflowBlockNode;
   editable?: boolean;
-  onEnter?: () => void;
-  onSlash?: (finish: (keepSlash: boolean) => void) => void;
+  // Enter; `key` is the field the caret was in, and the split is null outside the step's main text.
+  onEnter?: (split: LineSplit | null, key: string) => void;
+  onSlash?: PickerOpener;
   onTab?: (outdent: boolean) => boolean;
   onBackspaceAtStart?: () => boolean;
+  onMove?: (delta: -1 | 1) => boolean;
+  onRunStep?: () => void;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const data = node.data as Record<string, unknown>;
@@ -494,12 +566,28 @@ export function DocStepBody({
       }
       onTab={key === mainKey ? onTab : undefined}
       onBackspaceAtStart={key === mainKey ? onBackspaceAtStart : undefined}
+      onMove={onMove}
+      onRunStep={onRunStep}
+      onSettings={
+        actions.edit ? () => actions.openSettings(node.id) : undefined
+      }
+      caretAtStart={
+        key === mainKey ? () => takeCaretAtStart(node.id) : undefined
+      }
       multiline
       onChange={(v) => {
         if (!v.trim() && !kept.includes(key)) setKept([...kept, key]);
         actions.edit?.setText(node.id, key, v);
       }}
-      onEnter={onEnter}
+      onEnter={
+        onEnter
+          ? (split) => {
+              if (key === mainKey) return onEnter(split, key);
+              // A secondary line has no twin to split into: Enter at its end adds the step below, mid-text does nothing.
+              if (!split?.after.trim()) onEnter(null, key);
+            }
+          : undefined
+      }
       onSlash={onSlash}
       onDone={() => {
         if (kept.includes(key)) setKept(kept.filter((k) => k !== key));
@@ -530,7 +618,7 @@ export function DocStepBody({
                   description ?? "",
                   stringOf("loopVariableReference") ||
                     stringOf("loopValue") ||
-                    "type @ to pick the list",
+                    "@ pick a list",
                   "",
                 )
               ) : (

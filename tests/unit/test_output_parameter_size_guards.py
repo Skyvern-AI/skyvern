@@ -1338,7 +1338,11 @@ async def test_get_thought_timelines_caps_text_fields_when_opted_in(monkeypatch:
     monkeypatch.setattr(
         task_v2_service.app,
         "DATABASE",
-        SimpleNamespace(observer=SimpleNamespace(get_thoughts=AsyncMock(return_value=[thought]))),
+        SimpleNamespace(
+            observer=SimpleNamespace(
+                get_thoughts=AsyncMock(return_value=[thought]), get_task_v2=AsyncMock(return_value=None)
+            )
+        ),
     )
     monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 

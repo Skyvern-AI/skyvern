@@ -52,7 +52,14 @@ vi.mock("./DocRunStepButton", () => ({ DocRunStepButton: () => null }));
 
 vi.mock("./useDocRun", () => {
   const blocksByLabel = new Map();
-  return { useDocRun: () => ({ runId: null, blocksByLabel, live: false }) };
+  return {
+    useDocRun: () => ({
+      runId: null,
+      blocksByLabel,
+      live: false,
+      unknownLabels: new Set(),
+    }),
+  };
 });
 
 async function renderInStudio(ui: ReactElement) {
@@ -155,12 +162,17 @@ const review: ReviewProjection = {
   keptDescriptions: [],
 };
 
-async function renderDoc(actionable = true, acceptable = actionable) {
+async function renderDoc(
+  actionable = true,
+  acceptable = actionable,
+  tested = false,
+) {
   const decide = vi.fn(async () => true);
   useCopilotProposalStore.getState().setProposal({
     proposed: workflow(proposed),
     baseline: workflow(saved),
     review,
+    tested,
     actionable,
     acceptable,
     decide,
@@ -199,6 +211,18 @@ afterEach(() => {
 });
 
 describe("Copilot proposal in the Doc view", () => {
+  test("the banner says Tested when Copilot ran the proposal and Untested when it did not", async () => {
+    await renderDoc(true, true, true);
+    const banner = screen.getByRole("region", { name: "Copilot proposal" });
+    expect(banner.textContent).toContain("Tested");
+    expect(banner.textContent).not.toContain("Untested");
+    cleanup();
+    await renderDoc(true, true, false);
+    expect(
+      screen.getByRole("region", { name: "Copilot proposal" }).textContent,
+    ).toContain("Untested");
+  });
+
   test("renders what Accept would save, with changed, removed and note changes marked", async () => {
     await renderDoc();
 

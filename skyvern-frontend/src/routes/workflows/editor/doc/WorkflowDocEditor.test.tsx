@@ -26,12 +26,15 @@ import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
+import { useDocUnfinishedStore } from "./docUnfinished";
 import { block, conditional, forLoop, settings } from "./docTestBlocks";
 import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
-vi.mock("./useDocRun", () => ({ useDocRun: () => docRun.current }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({ unknownLabels: new Set(), ...docRun.current }),
+}));
 import type { DocGraph } from "./docGraphEdits";
 import * as axiosClientModule from "@/api/AxiosClient";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
@@ -122,6 +125,92 @@ describe("WorkflowDocEditor navigation", () => {
     cleanup();
     useLocateBlockStore.getState().clearLocate();
     vi.unstubAllGlobals();
+  });
+
+  describe("keyboard-first editing", () => {
+    const editsWithAdd = (): DocGraphEdits => ({
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(() => "new_step"),
+      duplicate: vi.fn(),
+    });
+    // Opens the line and puts the caret `at` characters in; jsdom has no innerText, so the text is set both ways.
+    const openLine = (name: string, text: string, at: number) => {
+      fireEvent.focus(screen.getByRole("textbox", { name }));
+      const box = screen.getByRole("textbox", { name });
+      Object.defineProperty(box, "innerText", {
+        value: text,
+        configurable: true,
+      });
+      box.textContent = text;
+      const range = document.createRange();
+      if (box.firstChild) range.setStart(box.firstChild, at);
+      else range.setStart(box, 0);
+      range.collapse(true);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      return box;
+    };
+    const prompt = () =>
+      block("text_prompt", "write_it", null, { prompt: "Do the next thing" });
+
+    test("Enter at the end of a step adds a step of the same type below", () => {
+      const edits = editsWithAdd();
+      const nodes = renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 17);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(edits.addStep).mock.calls[0]![0].nodeType).toBe(
+        nodes.find(isWorkflowBlockNode)!.type,
+      );
+    });
+
+    test("Enter in the middle of a step splits its text between the two steps", () => {
+      const edits = editsWithAdd();
+      const nodes = renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 6);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).toHaveBeenCalledTimes(1);
+      const updates = vi.mocked(edits.update).mock.calls;
+      const last = updates[updates.length - 1]![0];
+      const first = last(nodes).find(isWorkflowBlockNode)!.data as Record<
+        string,
+        unknown
+      >;
+      expect(first.prompt).toBe("Do the");
+    });
+
+    test("Shift+Enter is a line break inside the step, not a new step", () => {
+      const edits = editsWithAdd();
+      renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 17);
+      const proceeded = fireEvent.keyDown(box, {
+        key: "Enter",
+        shiftKey: true,
+      });
+
+      expect(proceeded).toBe(true);
+      expect(edits.addStep).not.toHaveBeenCalled();
+    });
+
+    test("Tab on a note under an empty loop opens the step menu and picks no type", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [
+          forLoop("books", null, [], {
+            trailing_notes: "Open each book page",
+          }),
+        ],
+        edits,
+      );
+      const box = openLine("Note", "Open each book page", 19);
+      fireEvent.keyDown(box, { key: "Tab" });
+
+      expect(screen.getByPlaceholderText("Add a step…")).toBeTruthy();
+      expect(edits.addStep).not.toHaveBeenCalled();
+    });
   });
 
   test("Tab nests into the run branch displayed on screen without a manual selection", () => {
@@ -226,6 +315,13 @@ describe("WorkflowDocEditor navigation", () => {
     },
   );
 
+  test("a read-only doc reserves no empty row above Inputs", () => {
+    renderDoc([block("goto_url", "open_site", null, { url: "x" })]);
+    expect(document.querySelector('[aria-hidden="true"].h-\\[28px\\]')).toBe(
+      null,
+    );
+  });
+
   test("a Go to URL step with no URL shows a required chip", () => {
     renderDoc([block("goto_url", "open_site", null, { url: "" })]);
     expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
@@ -254,6 +350,19 @@ describe("WorkflowDocEditor navigation", () => {
     expect(useLocateBlockStore.getState().request).toBeNull();
   });
 
+  test("jumping to a step flashes it", async () => {
+    const animate = vi.fn();
+    HTMLElement.prototype.animate = animate;
+    vi.stubGlobal("matchMedia", () => ({ matches: false }));
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => cb());
+    const nodes = renderDoc();
+    const inner = nodes.find((n) => n.data.label === "inner_step")!;
+    act(() => useLocateBlockStore.getState().requestLocate(inner.id));
+    expect(animate).toHaveBeenCalledTimes(1);
+    // @ts-expect-error cleanup of the jsdom stub
+    delete HTMLElement.prototype.animate;
+  });
+
   test("opens step search from Ctrl+K anywhere in the document", () => {
     renderDoc([
       block("goto_url", "find_by_label", null, {
@@ -272,6 +381,26 @@ describe("WorkflowDocEditor navigation", () => {
     const input = screen.getByPlaceholderText("Search steps…");
     fireEvent.change(input, { target: { value: "find_by_label" } });
     expect(screen.getAllByRole("option")).toHaveLength(1);
+  });
+
+  test("the branch actions button shows only when the branch has an action", () => {
+    const edits: DocGraphEdits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    renderDoc(
+      [
+        conditional("route", null, [
+          { id: "yes", next: "if_step", when: "found" },
+          { id: "otherwise", next: null },
+        ]),
+        code("if_step", null),
+      ],
+      edits,
+    );
+    expect(screen.queryByRole("button", { name: /Branch actions/ })).toBeNull();
   });
 
   test("collapse all closes loops and conditionals", () => {
@@ -622,6 +751,117 @@ test("a step that reads an output only some branches produce shows the warning u
   }
 });
 
+describe("a step that was just added", () => {
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("CSS", { escape: (value: string) => value });
+  });
+  afterEach(() => {
+    cleanup();
+    useDocUnfinishedStore.getState().clear();
+    vi.unstubAllGlobals();
+  });
+
+  test("shows its missing setting once, and only after the user leaves it", () => {
+    const nodes = renderDoc([block("login", "sign_in", null, { url: "" })]);
+    const login = nodes.find((n) => isWorkflowBlockNode(n))!;
+    act(() => useDocUnfinishedStore.getState().add(login.id));
+    expect(document.querySelector("[data-doc-step-fix]")).toBeNull();
+    expect(document.querySelector("[data-doc-problems]")).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+
+    fireEvent.pointerDown(document.body);
+
+    expect(
+      screen.getAllByText("Choose a saved credential in this step's settings"),
+    ).toHaveLength(1);
+    expect(document.querySelector("[data-doc-problems]")?.textContent).toBe(
+      "1 problem",
+    );
+    expect(screen.queryByText(/need.* fixing/)).toBeNull();
+  });
+
+  test("a click inside a floating menu does not count as leaving the new step", () => {
+    const nodes = renderDoc([block("login", "sign_in", null, { url: "" })]);
+    const login = nodes.find((n) => isWorkflowBlockNode(n))!;
+    act(() => useDocUnfinishedStore.getState().add(login.id));
+    const option = document.body.appendChild(document.createElement("div"));
+    option.setAttribute("role", "listbox");
+    fireEvent.pointerDown(option);
+    expect(document.querySelector("[data-doc-problems]")).toBeNull();
+    option.remove();
+  });
+});
+
+describe("A Browser Action that needs several actions", () => {
+  const actionStep = {
+    label: "search_step",
+    block_type: "action",
+    next_block_label: null,
+    continue_on_failure: false,
+    model: null,
+    output_parameter: output("search_step"),
+    url: "",
+    navigation_goal: "Search for apple stock and get its price",
+    parameters: [],
+  } as unknown as WorkflowBlock;
+
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  test("offers to turn into a Browser Task before running, keeping the text", () => {
+    const apply = vi.fn();
+    renderDoc([actionStep], {
+      apply,
+      update: vi.fn(),
+      addStep: vi.fn(() => null),
+      duplicate: vi.fn(),
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Turn into Browser Task" }),
+    );
+
+    const turned = apply.mock.calls[0]![0].nodes.find(
+      (node: { data: { label?: string } }) => node.data.label === "search_step",
+    );
+    expect(turned.type).toBe("navigation");
+    expect(turned.data.navigationGoal).toBe(
+      "Search for apple stock and get its price",
+    );
+  });
+});
+
 describe("Doc inputs", () => {
   beforeEach(() => {
     docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
@@ -712,7 +952,11 @@ describe("Doc inputs", () => {
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "+ Input" }));
-    expect(screen.getByText("Edit Input")).toBeTruthy();
+    // A just-created placeholder is still an Add: not titled "Edit", and no "changing the type" warning.
+    expect(screen.getByText("Add Input")).toBeTruthy();
+    expect(screen.getByRole("dialog").getAttribute("aria-label")).toBe(
+      "Add input",
+    );
     fireEvent.change(
       within(screen.getByRole("dialog")).getAllByRole("textbox")[0]!,
       {

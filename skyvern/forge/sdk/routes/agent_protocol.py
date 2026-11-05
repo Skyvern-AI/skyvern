@@ -157,9 +157,17 @@ from skyvern.forge.sdk.schemas.tasks import (
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.services.browser_session_artifacts import (
+    ACTION_METADATA,
+    STEP_METADATA,
+    TASK_V2_METADATA,
+    BrowserSessionArtifactAccess,
+    ChildRunArtifactCache,
     browser_session_artifact_access,
     browser_session_artifact_read,
+    cache_child_run_artifact_access,
     child_run_artifact_access,
+    redact_descendant_entity,
+    redact_workflow_run_artifact_rows,
 )
 from skyvern.forge.sdk.services.browser_session_redaction import (
     BrowserSessionAddressResponse,
@@ -3494,6 +3502,8 @@ _DESCENDANT_CHECKED_ARTIFACT_TYPES = frozenset(
         ArtifactType.SESSION_REPLAY,
         ArtifactType.HAR,
         ArtifactType.BROWSER_CONSOLE_LOG,
+        ArtifactType.SKYVERN_LOG,
+        ArtifactType.SKYVERN_LOG_RAW,
         ArtifactType.TRACE,
         ArtifactType.STEP_ARCHIVE,
         ArtifactType.TASK_ARCHIVE,
@@ -4564,8 +4574,8 @@ def _ndjson_line(content: Any) -> bytes:
     )
 
 
-def _serialize_task_export_batch(tasks: list[Task]) -> bytes:
-    return b"".join(_ndjson_line(task.to_task_response().model_dump()) for task in tasks)
+def _serialize_task_export_batch(tasks: list[TaskResponse]) -> bytes:
+    return b"".join(_ndjson_line(task.model_dump()) for task in tasks)
 
 
 # Registered before /tasks/{task_id}, which would otherwise match "export" as a task id.
@@ -4587,12 +4597,14 @@ async def export_tasks(
     """
     analytics.capture("skyvern-oss-agent-tasks-export")
     organization_id = current_org.organization_id
+    principal = get_request_principal()
     scope = _task_cursor_scope(organization_id, filters)
     start_after = _decode_task_cursor(cursor or "", scope)
 
     async def batches() -> AsyncIterator[bytes]:
         after = start_after
         task_count = 0
+        child_access_cache: ChildRunArtifactCache = {}
         while True:
             tasks = await app.DATABASE.tasks.get_tasks(
                 page_size=TASK_EXPORT_BATCH_SIZE,
@@ -4604,7 +4616,9 @@ async def export_tasks(
             if tasks:
                 task_count += len(tasks)
                 await _redact_browser_session_addresses(tasks, organization_id)
-                yield await asyncio.to_thread(_serialize_task_export_batch, tasks)
+                with cache_child_run_artifact_access(child_access_cache):
+                    responses = await _task_list_responses(tasks, organization_id, principal)
+                yield await asyncio.to_thread(_serialize_task_export_batch, responses)
             if len(tasks) < TASK_EXPORT_BATCH_SIZE:
                 yield _ndjson_line({"export_complete": True, "task_count": task_count})
                 return
@@ -5047,6 +5061,26 @@ async def retry_webhook(
     return response
 
 
+async def _task_list_responses(
+    tasks: list[Task], organization_id: str, principal: RequestPrincipal | None
+) -> list[TaskResponse]:
+    if not await app.AGENT_FUNCTION.should_check_browser_session_artifacts(principal, organization_id):
+        return await asyncio.to_thread(lambda: [task.to_task_response() for task in tasks])
+    responses: list[TaskResponse] = []
+    with browser_session_artifact_read(principal):
+        for offset in range(0, len(tasks), 8):
+            responses.extend(
+                await asyncio.gather(*(app.agent.build_task_response(task) for task in tasks[offset : offset + 8]))
+            )
+    return responses
+
+
+async def _task_list_response(tasks: list[Task], organization_id: str) -> Response:
+    with cache_child_run_artifact_access({}):
+        responses = await _task_list_responses(tasks, organization_id, get_request_principal())
+    return await asyncio.to_thread(lambda: ORJSONResponse([response.model_dump() for response in responses]))
+
+
 @legacy_base_router.get(
     "/tasks",
     tags=["agent"],
@@ -5090,9 +5124,7 @@ async def get_tasks(
             page, page_size, organization_id=current_org.organization_id, **asdict(filters)
         )
         await _redact_browser_session_addresses(tasks, current_org.organization_id)
-        # Without a last step, build_task_response is just to_task_response. Building and serializing a large page
-        # in a thread keeps it from stalling every other request on the event loop.
-        return await asyncio.to_thread(lambda: ORJSONResponse([task.to_task_response().model_dump() for task in tasks]))
+        return await _task_list_response(tasks, current_org.organization_id)
 
     if page != 1:
         raise HTTPException(
@@ -5109,9 +5141,7 @@ async def get_tasks(
     )
     page_tasks = tasks[:page_size]
     await _redact_browser_session_addresses(page_tasks, current_org.organization_id)
-    response = await asyncio.to_thread(
-        lambda: ORJSONResponse([task.to_task_response().model_dump() for task in page_tasks])
-    )
+    response = await _task_list_response(page_tasks, current_org.organization_id)
     if len(tasks) > page_size:
         response.headers[TASK_NEXT_CURSOR_HEADER] = _encode_task_cursor(scope, page_tasks[-1], filters.order_by_column)
     return response
@@ -5139,6 +5169,11 @@ _WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION = (
     _RUN_SEARCH_KEY_DESCRIPTION + " The workflow title and workflow permanent ID are matched as well."
 )
 _RUN_SEARCH_KEY_EXAMPLES = ["login_url", "wr_abc123", "bp_123456789", "cred_123456789"]
+
+
+async def _redact_workflow_run_list(runs: list[WorkflowRun], organization_id: str) -> list[WorkflowRun]:
+    with browser_session_artifact_read(get_request_principal()):
+        return await redact_workflow_run_artifact_rows(runs, organization_id)
 
 
 @legacy_base_router.get(
@@ -5175,6 +5210,28 @@ async def get_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
     await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
+    workflow_runs = iter(
+        await _redact_workflow_run_list(
+            [run for run in runs if isinstance(run, WorkflowRun)], current_org.organization_id
+        )
+    )
+    tasks = [run for run in runs if isinstance(run, Task)]
+    if tasks:
+        with cache_child_run_artifact_access({}):
+            task_responses = await _task_list_responses(tasks, current_org.organization_id, get_request_principal())
+    else:
+        task_responses = []
+    task_rows = iter(task_responses)
+    redacted_runs: list[WorkflowRun | Task] = []
+    for run in runs:
+        if isinstance(run, WorkflowRun):
+            redacted_runs.append(next(workflow_runs))
+        else:
+            task = next(task_rows).request
+            if not isinstance(task, Task):
+                raise RuntimeError("Task list response did not retain the task")
+            redacted_runs.append(task)
+    runs = redacted_runs
     await _redact_browser_session_addresses(runs, current_org.organization_id)
     # failure_category takes its public JSON-mode form, as response_model serialization would give it; every other
     # field keeps this route's existing encoding.
@@ -5455,6 +5512,27 @@ async def get_runs_v2(
     return ORJSONResponse(response_items)
 
 
+async def _task_artifact_access(task_id: str, organization_id: str) -> tuple[BrowserSessionArtifactAccess, bool]:
+    principal = get_request_principal()
+    if not await app.AGENT_FUNCTION.should_check_browser_session_artifacts(principal, organization_id):
+        return BrowserSessionArtifactAccess(True), False
+    task = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
+    if not task:
+        return BrowserSessionArtifactAccess(False), False
+    with browser_session_artifact_read(principal):
+        access = await browser_session_artifact_access(
+            organization_id,
+            session_ids=[task.browser_session_id],
+            workflow_run_id=task.workflow_run_id,
+            runnable_ids=[task_id],
+        )
+        if task.workflow_run_id:
+            child_access = await child_run_artifact_access(organization_id, task.workflow_run_id)
+            if not child_access.allowed:
+                return child_access, True
+    return access, False
+
+
 @legacy_base_router.get(
     "/tasks/{task_id}/steps",
     tags=["agent"],
@@ -5481,8 +5559,16 @@ async def get_steps(
     steps = await app.DATABASE.tasks.get_task_steps(task_id, organization_id=current_org.organization_id)
     actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
     marked_ids, values = one_time_code_markers(actions)
+    access, descendant_denied = await _task_artifact_access(task_id, current_org.organization_id)
     return ORJSONResponse(
-        [redact_one_time_code_step(step, marked_ids, values).model_dump(exclude_none=True) for step in steps]
+        [
+            (
+                redact_descendant_entity(step, preserve=STEP_METADATA)
+                if descendant_denied
+                else access.redact_output(redact_one_time_code_step(step, marked_ids, values))
+            ).model_dump(exclude_none=True)
+            for step in steps
+        ]
     )
 
 
@@ -5603,7 +5689,15 @@ async def get_actions(
     # Hydrated, not the base read: the typed value of an INPUT_TEXT lives only in action_json, so
     # Action.model_validate on the ORM row returns text=None for every row.
     hydrated = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    access, descendant_denied = await _task_artifact_access(task_id, current_org.organization_id)
     actions = redact_one_time_code_actions(hydrated)
+    if descendant_denied:
+        actions = [
+            redact_descendant_entity(Action.model_validate(action.model_dump()), preserve=ACTION_METADATA)
+            for action in actions
+        ]
+    else:
+        actions = access.redact_output(actions)
     if caps_run_response_values(x_user_agent):
         # Hydration puts a completion action's whole response/output on the wire, which the app
         # renders with JSON.stringify on the main thread. Same bound the run-detail reads apply.
@@ -5865,6 +5959,7 @@ async def get_workflow_runs(
             created_at_start=effective_created_at_start,
             created_at_end=created_at_end,
         )
+        workflow_runs = await _redact_workflow_run_list(workflow_runs, current_org.organization_id)
         await _redact_browser_session_addresses(workflow_runs, current_org.organization_id)
         return workflow_runs
     except RunsListSearchCanceled as exc:
@@ -5951,6 +6046,7 @@ async def _get_workflow_runs_by_id(
             created_at_end=created_at_end,
             run_tags=run_tags,
         )
+        workflow_runs = await _redact_workflow_run_list(workflow_runs, organization_id)
         await _redact_browser_session_addresses(workflow_runs, organization_id)
         return workflow_runs
     except RunsListSearchCanceled as exc:
@@ -7293,10 +7389,14 @@ async def get_task_v2(
             workflow_run_id=task_v2.workflow_run_id,
             runnable_ids=[task_v2.observer_cruise_id],
         )
-        if access.allowed and task_v2.workflow_run_id:
-            access = await child_run_artifact_access(organization.organization_id, task_v2.workflow_run_id)
-        if not access.allowed:
-            task_v2 = task_v2.model_copy(update={"output": access.redact_output(task_v2.output)})
+        descendant_denied = bool(
+            task_v2.workflow_run_id
+            and not (await child_run_artifact_access(organization.organization_id, task_v2.workflow_run_id)).allowed
+        )
+        if descendant_denied:
+            task_v2 = redact_descendant_entity(task_v2, preserve=TASK_V2_METADATA)
+        elif not access.allowed:
+            task_v2 = access.redact_output(task_v2)
     await _redact_browser_session_addresses(
         [task_v2], organization.organization_id, task_v2_browser_session_id=browser_session_id
     )
@@ -7425,6 +7525,7 @@ async def _flatten_workflow_run_timeline(
             task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
             cap_output_values=cap_output_values,
+            workflow_run_id=workflow_run_id,
         )
         attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
         block_attempts: dict[str, int] = {}

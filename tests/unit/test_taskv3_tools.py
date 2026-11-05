@@ -118,6 +118,7 @@ from skyvern.forge.taskv3.tools import (
 )
 from skyvern.webeye.actions.handler import get_actual_value_of_parameter_if_secret_with_task
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
+from tests.unit.conftest import CARD_SECRET_RUN_ID
 from tests.unit.copilot_test_helpers import page_with_unprobeable_vendor_embedder
 from tests.unit.scoped_asyncio import ScopedAsyncio
 from tests.unit.test_taskv3_loop import _ScriptedCaller
@@ -2107,6 +2108,68 @@ async def test_type_resolves_secret_placeholder_at_fill_time() -> None:
     assert "placeholder_abc" not in result.content
 
 
+class _MaskRecordingPage(_FakePage):
+    """Answers locator(...).first for the secret visual mask only; any other probe fails as before. A field that is not
+    yet rendered mounts only once something waits for it."""
+
+    rendered = True
+
+    def locator(self, selector: str) -> SimpleNamespace:
+        page = self
+
+        async def wait_for(**_kwargs: Any) -> None:
+            page.rendered = True
+
+        async def evaluate(js: str, *_args: Any, **_kwargs: Any) -> None:
+            if "data-skyvern-secret-mask" not in js:
+                raise AttributeError("only the secret visual mask is faked")
+            if not page.rendered:
+                raise TimeoutError("waiting for the field")
+            page.calls.append(("mask", {"selector": selector}))
+
+        return SimpleNamespace(first=SimpleNamespace(wait_for=wait_for, evaluate=evaluate))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "masked"), [("card_cvv", True), ("card_holder_name", False)])
+async def test_type_masks_a_vault_card_field_before_writing_it(
+    card_secret_run: dict[str, str], field: str, masked: bool
+) -> None:
+    # v3 writes without the action handler, so a card number or CVV it types is masked here whatever the
+    # workflow's Mask Secrets setting, or the run's screenshots and recording keep it legible (SKY-19351).
+    page = _MaskRecordingPage()
+    task = SimpleNamespace(workflow_run_id=CARD_SECRET_RUN_ID)
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: get_actual_value_of_parameter_if_secret_with_task(task, text),
+    )
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
+        await _tool(tools, "type").handler({"selector": "#cvc", "text": card_secret_run[field]})
+
+    kinds = [call[0] for call in page.calls]
+    assert ("mask" in kinds) is masked
+    if masked:
+        assert kinds.index("mask") < kinds.index("fill")
+
+
+@pytest.mark.asyncio
+async def test_type_masks_a_card_field_that_renders_late(card_secret_run: dict[str, str]) -> None:
+    # A card field that mounts after both bounded mask attempts would have given up, but within the write's own wait,
+    # is still masked before the write reaches it.
+    page = _MaskRecordingPage()
+    page.rendered = False
+    task = SimpleNamespace(workflow_run_id=CARD_SECRET_RUN_ID)
+    tools = build_browser_tools(
+        _fixed_page_provider(page),
+        resolve_typed_text=lambda text: get_actual_value_of_parameter_if_secret_with_task(task, text),
+    )
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=CARD_SECRET_RUN_ID)):
+        await _tool(tools, "type").handler({"selector": "#card", "text": card_secret_run["card_number"]})
+
+    kinds = [call[0] for call in page.calls]
+    assert "mask" in kinds and kinds.index("mask") < kinds.index("fill")
+
+
 def _armed_guard(allowed_url: str, *, secret: str = "real-secret-value") -> CredentialReleaseGuard:
     guard = CredentialReleaseGuard(workflow_run_id="wr_taskv3", block_label="sign_in")
     assert guard.arm(secret, allowed_url, "portal_credential")
@@ -4031,6 +4094,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "frame_unreadable_regions",
         "elements_listed",
         "pointer_roots_listed",
+        "pointer_extras_listed",
         "pointer_capped",
         "pointer_truncated",
         "pointer_dropped",
@@ -9615,6 +9679,134 @@ async def test_download_signal_surfaces_file_created_between_calls(tmp_path: Pat
     assert "Downloaded: invoice.csv" in r2.content
 
 
+class _BlockedInlineFramePage(_DownloadFakePage):
+    """A click that renders the target inline in an <iframe> the browser refuses to display: no
+    download event fires and no file lands, while the element keeps the src it was refused."""
+
+    def __init__(self, downloads_dir: Path) -> None:
+        super().__init__(downloads_dir)
+        self.iframe_srcs: list[str] = []
+        self.click_opens: str | None = None
+        self.clicked = False
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        self.clicked = True
+        if self.click_opens:
+            self.iframe_srcs = [self.click_opens]
+        await super().click(selector, timeout=timeout)
+
+    # The iframe enumeration arrives through SkyvernFrame.evaluate, which passes its expression by
+    # keyword; observe and the text delta call page.evaluate(js) positionally.
+    async def evaluate(self, expression: str = "", arg: Any = None) -> Any:
+        if "querySelectorAll('iframe')" in expression:
+            return list(self.iframe_srcs)
+        return await super().evaluate(expression)
+
+
+_BLOCKED_BILL_SRC = "https://portal.test/api/ViewBill?token=abc"
+
+
+@pytest.mark.asyncio
+async def test_a_bill_the_browser_refuses_to_frame_is_recovered_as_this_calls_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # v1 recovers these bytes same-origin (SKY-12559); on a download block v3 must too, or the model
+    # is told no file arrived for a click that did reach the right document (SKY-19922).
+    page = _BlockedInlineFramePage(tmp_path)
+    page.click_opens = _BLOCKED_BILL_SRC
+    pdf = b"%PDF-1.7 statement bytes"
+    monkeypatch.setattr("skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes", AsyncMock(return_value=pdf))
+
+    async def download_wait() -> None:
+        return None
+
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    watch.close()
+
+    # Named by the same path a browser download takes: the run-unique prefix plus the frame's own basename.
+    assert re.search(r"Downloaded: [0-9a-f-]{36}-ViewBill\.pdf \(24 B\)", result.content), result.content
+    assert DOWNLOAD_NO_FILE_THIS_ACTION not in result.content
+    assert [path.read_bytes() for path in sorted(tmp_path.iterdir())] == [pdf]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why_not", ["frame_was_already_there", "page_was_replaced", "not_a_download_block"])
+async def test_a_pdf_frame_this_call_did_not_open_is_not_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, why_not: str
+) -> None:
+    page = _BlockedInlineFramePage(tmp_path)
+    if why_not == "frame_was_already_there":
+        # A viewer left by an earlier click is not this click's file: attribution comes from the
+        # pre-call snapshot, so recovering it would mean saving an unrelated document.
+        page.iframe_srcs = [_BLOCKED_BILL_SRC]
+    else:
+        page.click_opens = _BLOCKED_BILL_SRC
+    monkeypatch.setattr(
+        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
+        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
+    )
+
+    async def download_wait() -> None:
+        return None
+
+    replacement: _BlockedInlineFramePage | None = None
+    if why_not == "page_was_replaced":
+        # The click opened a tab that took the working-page slot, so the baseline describes a
+        # document this call no longer holds and nothing readable now is attributable to it.
+        replacement = _BlockedInlineFramePage(tmp_path)
+        replacement.iframe_srcs = [_BLOCKED_BILL_SRC]
+
+    async def page_provider() -> Any:
+        return replacement if replacement is not None and page.clicked else page
+
+    watch = DownloadFailureWatch(page_provider)
+    tools = build_browser_tools(
+        page_provider,
+        downloads_dir=str(tmp_path),
+        download_failures=watch,
+        # A block the engine built no download machinery for pays none of this and recovers nothing.
+        download_wait=download_wait if why_not != "not_a_download_block" else None,
+    )
+    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    watch.close()
+
+    assert "Downloaded:" not in result.content, result.content
+    assert DOWNLOAD_NO_FILE_THIS_ACTION in result.content
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_a_click_that_landed_its_file_does_not_also_recover_the_frame_it_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A site that both downloads the bill and shows it in a viewer would otherwise record the same
+    # invoice twice, and the block would report two files for one statement.
+    page = _BlockedInlineFramePage(tmp_path)
+    page.click_opens = _BLOCKED_BILL_SRC
+    page._click_writes = "statement.pdf"
+    monkeypatch.setattr(
+        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
+        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
+    )
+
+    async def download_wait() -> None:
+        return None
+
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    watch.close()
+
+    assert "Downloaded: statement.pdf" in result.content, result.content
+    assert [path.name for path in tmp_path.iterdir()] == ["statement.pdf"]
+
+
 @pytest.mark.asyncio
 async def test_download_signal_lifecycle_started_then_completed_or_never(tmp_path: Path) -> None:
     tools = build_browser_tools(_fixed_page_provider(_FakePage()), downloads_dir=str(tmp_path))
@@ -10047,10 +10239,10 @@ async def test_the_failure_watch_waits_only_on_its_own_call_and_reports_only_the
 
 
 @pytest.mark.asyncio
-async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_navigate_dead_end_reaches_the_model_through_real_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     # End-to-end through the REAL navigate handler and the REAL loop (not a fake tool): a model-issued
-    # navigate that lands on a hard 404 must end the run `terminated`, even though the model then tries
-    # to finish `completed`. Reverting the tools.py dead-end flag makes this go `completed` (RED).
+    # navigate that lands on a hard 404 is returned to the model, whose verdict stands. Reverting the
+    # tools.py dead-end flag drops the dead-end log line (RED).
     import skyvern.utils.url_validators as urlv
     from skyvern.forge.taskv3.loop import make_finish_tool, run_agent_tool_loop
 
@@ -10066,24 +10258,27 @@ async def test_navigate_dead_end_terminates_run_through_real_handler(monkeypatch
     all_tools = build_browser_tools(_fixed_page_provider(page)) + [make_finish_tool()]
     script = [
         [("navigate", {"url": "https://jobs.example.test/acme/closed"})],
-        [("finish", {"status": "completed", "reason": "should not win"})],
+        [("finish", {"status": "failed", "reason": "the posting is gone"})],
     ]
     rounds: list[list[Any]] = []
 
     async def _on_round(round_actions: list[Any], _turn_text: str | None, *, round_done: bool) -> None:
         rounds.append(round_actions)
 
-    outcome = await run_agent_tool_loop(
-        llm_caller=_ScriptedCaller(script),
-        system_prompt="sys",
-        user_prompt="goal",
-        tools=all_tools,
-        max_turns=10,
-        max_tool_calls=20,
-        on_action_round=_on_round,
-    )
+    with capture_logs() as logs:
+        outcome = await run_agent_tool_loop(
+            llm_caller=_ScriptedCaller(script),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=all_tools,
+            max_turns=10,
+            max_tool_calls=20,
+            on_action_round=_on_round,
+        )
 
-    assert outcome.status == "terminated"
+    assert (outcome.status, outcome.reason) == ("failed", "the posting is gone")
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert (line["http_status"], line["returned_to_model"]) == (404, True)
     # ...and the whole production chain behind the row the customer reads: the real spec is recordable,
     # so the navigation reaches the caller as its own round; the real handler's outcome rides it; and a
     # 404 landing is flagged as a FAILED action even though the tool honestly returned ok (SKY-16374).
@@ -14091,6 +14286,68 @@ async def test_observe_holder_stand_ins_never_displace_a_frames_pointer_roots_or
         pointer_lines = [line for line in ref_lines if re.match(r"^ref=\d+ (?:div|span) ", line)]
         assert len(pointer_lines) == OBSERVE_POINTER_ROOT_CAP, pointer_lines
         assert sum("'Pay " in line for line in ref_lines) == 30, ref_lines
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_an_href_less_anchor_beside_the_card_whose_click_misses_it() -> None:
+    # The card's centre is its description, so a click on the card never reaches the anchor's handler.
+    card = (
+        '<div style="cursor:pointer;width:300px;padding:10px"><div>Send a message</div>'
+        '<div style="height:65px">Fill out a quick form and someone will get in touch.</div>'
+        '<a tabindex="0" style="display:block" onclick="window.__sent = (window.__sent || 0) + 1">Send Us A Message</a>'
+        "</div>"
+    )
+    # An anchor that fills its root is reached by a click on the root, so it is not listed again.
+    filled = '<div style="cursor:pointer;width:200px"><a style="display:block;height:30px">Menu item</a></div>'
+    async with _live_page(f"<!doctype html><html><body>{card}{filled}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert _ref_line(r.content, "div 'Send a message"), ref_lines
+        assert [line for line in ref_lines if "Menu item" in line][0].endswith("div 'Menu item'"), ref_lines
+        assert len(ref_lines) == 3, ref_lines
+        assert r.data is not None and r.data["summary"]["pointer_extras_listed"] == 1
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "div 'Send a message")})
+        assert await page.evaluate("() => window.__sent || 0") == 0
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "a 'Send Us A Message'")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.__sent || 0") == 1
+
+    # The anchor has a budget of its own: with the page's roots at the cap, every root keeps its place, and the
+    # holder's stand-in still gives way to them.
+    holder = '<div style="cursor:pointer;width:300px"><span>Row 1</span><button type="button">Pay 1</button></div>'
+    plain = "".join(
+        f'<div style="cursor:pointer;width:200px">Plain {i}</div>' for i in range(OBSERVE_POINTER_ROOT_CAP - 1)
+    )
+    async with _live_page(f"<!doctype html><html><body>{card}{holder}{plain}</body></html>") as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert _ref_line(r.content, f"div 'Plain {OBSERVE_POINTER_ROOT_CAP - 2}'"), ref_lines
+        assert sum(bool(re.match(r"^ref=\d+ div ", line)) for line in ref_lines) == OBSERVE_POINTER_ROOT_CAP, ref_lines
+        assert not any("span 'Row 1'" in line for line in ref_lines), ref_lines
+        assert _ref_line(r.content, "a 'Send Us A Message'"), ref_lines
+
+    # A card with an action of its own keeps it reachable beside the anchor's, and an anchor that passes clicks
+    # through (pointer-events:none) is not listed: a click on it would land on the card.
+    job = (
+        '<div style="cursor:pointer;width:300px" onclick="window.__open = 1"><div>Senior Engineer</div>'
+        '<div style="height:65px">Remote, full-time, posted today.</div>'
+        '<a aria-label="Save job" onclick="event.stopPropagation(); window.__save = 1">&#9825;</a></div>'
+    )
+    decor = (
+        '<div style="cursor:pointer;width:300px"><div>Open item</div><div style="height:65px">Details.</div>'
+        '<a style="pointer-events:none">Label</a></div>'
+    )
+    async with _live_page(f"<!doctype html><html><body>{job}{decor}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert not any("a 'Label'" in line for line in r.content.splitlines()), r.content
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "div 'Senior Engineer")})
+        assert await page.evaluate("() => [window.__open, window.__save]") == [1, None]
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "a 'Save job'")})
+        assert await page.evaluate("() => [window.__open, window.__save]") == [1, 1]
 
 
 @_skip_no_browser
@@ -26363,8 +26620,11 @@ async def test_the_real_probe_names_a_non_interactive_catcher_but_not_a_submit_b
                 {"selector": "#name", "text": "Jane Doe"}
             )
             assert r.error_class == "covered", r.content
-            assert "Pick whichever one actually closes or dismisses the layer" in r.content, r.content
+            assert "data-tv3-catcher" not in r.content and "Its controls:" in r.content, r.content
             assert await page.locator("[data-tv3-catcher]").count() == 0
+            # A layer of nothing but its own button has nothing to quote, so it keeps the dismissal message.
+            if markup != _SIBLING_BANNER_HTML:
+                assert "Pick whichever one actually closes or dismisses the layer" in r.content, r.content
 
 
 # A cover that qualifies as NOTHING: not pinned, no layer role, no aria-modal, not view-sized, and
@@ -26818,6 +27078,234 @@ async def test_only_a_qualified_layer_refusal_names_a_layer() -> None:
         type_tool = _tool(build_browser_tools(_fixed_page_provider(page)), "type")
         hidden = await type_tool.handler({"selector": "#city", "text": "x"})
         assert hidden.error_class == "unreachable" and key not in (hidden.data or {}), hidden.content
+
+
+def _text_named_layer_html(body: str) -> str:
+    # A modal with no accessible name and no heading, so the probe names it by the start of its own text.
+    return f"""
+<input id="email" style="position:absolute;left:20px;top:40px;width:200px;height:30px">
+<dialog id="notice" style="width:440px">{body}<button id="go" type="button">Continue</button></dialog>
+<script>document.getElementById('notice').showModal()</script>
+"""
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_layer_named_by_its_own_text_is_quoted_by_what_it_shows_masked_before_the_cut() -> None:
+    secret = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5"
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    hidden = (
+        '<span style="display:none">HIDDEN-DISPLAY</span><span style="visibility:hidden">HIDDEN-VISIBILITY</span>'
+        '<span style="opacity:0">HIDDEN-OPACITY</span><template><p>HIDDEN-TEMPLATE</p></template>'
+        "<script>/* HIDDEN-SCRIPT */</script><textarea>HIDDEN-TEXTAREA</textarea>"
+        "<select><option>HIDDEN-OPTION</option></select>"
+        '<div contenteditable="true">HIDDEN-EDITABLE</div>'
+    )
+    try:
+        shown = _text_named_layer_html(
+            f"<p>Members only past this point, and this sentence runs past the name. Your code is {secret}.</p>"
+            f"{hidden}<p>You may send a different request instead.</p>"
+        )
+        async with _content_page(shown) as page:
+            refused = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+                {"selector": "#email", "text": "x"}
+            )
+        assert refused.error_class == "covered", refused.content
+        assert taskv3_loop.BLOCKING_LAYER_DATA_KEY in (refused.data or {}), refused.content
+        assert "You may send a different request instead." in refused.content, refused.content
+        assert f"Your code is {skyvern_context.MODEL_HIDDEN_PLACEHOLDER}." in refused.content, refused.content
+        assert secret[:8] not in refused.content and secret[-8:] not in refused.content, refused.content
+        assert "HIDDEN-" not in refused.content, refused.content
+        assert "then retry" not in refused.content and '#go "Continue"' in refused.content, refused.content
+
+        long = _text_named_layer_html("<p>" + " ".join(f"Clause {n} of the notice." for n in range(60)) + "</p>")
+        async with _content_page(long) as page:
+            cut = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+                {"selector": "#email", "text": "x"}
+            )
+        quoted = cut.content.split('reads all of it): "', 1)[-1].split('". Its controls', 1)[0]
+        assert 'It reads, cut short (get_html of #notice with format "text" reads all of it)' in cut.content, cut
+        assert len(quoted) == taskv3_tools._LAYER_TEXT_MAX, cut.content
+
+        # A heading names the layer, so its name is not a cut of its text and the message stays as it was.
+        titled = _text_named_layer_html("<h2>Before you go</h2><p>Members only past this point.</p>")
+        async with _content_page(titled) as page:
+            named = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+                {"selector": "#email", "text": "x"}
+            )
+        assert '"Before you go"' in named.content and "It reads" not in named.content, named.content
+        assert "Pick whichever one actually closes or dismisses the layer" in named.content, named.content
+    finally:
+        skyvern_context.reset()
+
+
+def test_a_layer_text_read_cut_inside_a_hidden_value_quotes_no_part_of_it() -> None:
+    # The page script bounds its read, so a long hidden value can be cut there, past every whole-value mask; the
+    # quote must not then show the part of it the read kept.
+    secret = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5" * 80
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.register_secret_value(secret, hide_from_model=True)
+    skyvern_context.set(ctx)
+    try:
+        for start in (380, 396, 399):
+            said = taskv3_tools._layer_text_clause(
+                {"text": ["." * start, secret[: 2000 - start]], "textCut": True}, "#n"
+            )
+            assert "cut short" in said and secret[:4] not in said, (start, said)
+    finally:
+        skyvern_context.reset()
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_payload_signed_url_the_layer_read_cuts_shows_no_part_of_it_in_full_or_held_refusals() -> None:
+    # The read stops at 2000 characters inside a payload's signed URL that starts within the quoted 400, where a
+    # whole-URL mask no longer matches; the cut head must not reach the model from either refusal.
+    signed = "https://files.example.test/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" + "ab12" * 480
+    refs = _refs_for(signed)
+    ctx = SkyvernContext(organization_id="o_1")
+    ctx.opaque_url_refs = refs.refs
+    skyvern_context.set(ctx)
+    try:
+        page_html = _text_named_layer_html("<p>" + "<span>a</span>" * 190 + f"<span>{signed}</span></p>")
+        async with _content_page(page_html) as page:
+            type_tool = _tool(build_browser_tools(_fixed_page_provider(page), opaque_refs=refs), "type")
+            full = await type_tool.handler({"selector": "#email", "text": "x"})
+            lease = (full.data or {}).get(taskv3_loop.BLOCKING_LAYER_DATA_KEY)
+            assert type_tool.layer_probe is not None and lease is not None, full.content
+            check, held = await type_tool.layer_probe({"selector": "#email", "text": "x"}, lease)
+        assert check is taskv3_loop.LayerCheck.SAME and held is not None, full.content
+        for refusal in (full, held):
+            assert "It reads, cut short" in refusal.content, refusal.content
+            leaked = [
+                piece for piece in ("X-Amz", "Signature", signed[:30], "ab12ab12ab12") if piece in refusal.content
+            ]
+            assert not leaked, (leaked, refusal.content)
+    finally:
+        skyvern_context.reset()
+
+
+async def _full_and_held_refusals(page_html: str, hidden: tuple[str, ...], signed: str | None = None) -> list[Any]:
+    """The full refusal for a type behind the page's text-named layer and the held one rebuilt from a fresh probe,
+    with `hidden` registered on the run's context and `signed` as a payload ref, as the engine wires them."""
+    refs = _refs_for(signed) if signed else None
+    ctx = SkyvernContext(organization_id="o_1")
+    for value in hidden:
+        ctx.register_secret_value(value, hide_from_model=True)
+    if refs is not None:
+        ctx.opaque_url_refs = refs.refs
+    skyvern_context.set(ctx)
+    try:
+        async with _content_page(page_html) as page:
+            type_tool = _tool(build_browser_tools(_fixed_page_provider(page), opaque_refs=refs), "type")
+            full = await type_tool.handler({"selector": "#email", "text": "x"})
+            lease = (full.data or {}).get(taskv3_loop.BLOCKING_LAYER_DATA_KEY)
+            assert type_tool.layer_probe is not None and lease is not None, full.content
+            check, held = await type_tool.layer_probe({"selector": "#email", "text": "x"}, lease)
+        assert check is taskv3_loop.LayerCheck.SAME and held is not None, full.content
+        return [full, held]
+    finally:
+        skyvern_context.reset()
+
+
+_SPLIT_HIDDEN_VALUE = "Qz7Kp4Wm9Xr2Vt6Ny3Lb8Hc5"
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mark", ["­", "⁠", "﻿", "᠎", "\U000e0041"])
+async def test_an_invisible_mark_inside_a_hidden_value_does_not_split_it_past_the_mask(mark: str) -> None:
+    value = _SPLIT_HIDDEN_VALUE
+    page_html = _text_named_layer_html(
+        "<p>Members only past this point, and this sentence runs past the name. "
+        f"Your code is {value[:12]}{mark}{value[12:]} and stays valid today.</p>"
+    )
+    for refusal in await _full_and_held_refusals(page_html, (value,)):
+        assert value[:12] not in refusal.content and value[12:] not in refusal.content, refusal.content
+        assert skyvern_context.MODEL_HIDDEN_PLACEHOLDER in refusal.content, refusal.content
+
+
+_LONG_SIGNED_URL = (
+    "https://files.example.test/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=" + "ab12" * 480
+)
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mark", ["­", "​"])
+async def test_a_cut_signed_url_rejoined_by_tidying_is_dropped_from_the_quote(mark: str) -> None:
+    # The mark breaks the URL head, so the raw pass cannot see a ref head at the cut; tidying rejoins it.
+    shown = _LONG_SIGNED_URL[:30] + mark + _LONG_SIGNED_URL[30:]
+    page_html = _text_named_layer_html("<p>" + "<span>a</span>" * 190 + f"<span>{shown}</span></p>")
+    for refusal in await _full_and_held_refusals(page_html, (), signed=_LONG_SIGNED_URL):
+        assert "It reads, cut short" in refusal.content, refusal.content
+        leaked = [piece for piece in ("X-Amz", "Signature", _LONG_SIGNED_URL[:30]) if piece in refusal.content]
+        assert not leaked, (leaked, refusal.content)
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_cut_hidden_value_that_holds_another_hidden_value_is_dropped_before_masking() -> None:
+    # Masking the inner value first would leave the rest of the cut one matching no prefix: only the raw trim sees it.
+    inner = "Qz7Kp4Wm9X"
+    outer = inner + "".join(f"S{i:04d}" for i in range(380))
+    page_html = _text_named_layer_html("<p>" + "<span>a</span>" * 190 + f"<span>{outer}</span></p>")
+    for refusal in await _full_and_held_refusals(page_html, (inner, outer)):
+        assert "It reads, cut short" in refusal.content, refusal.content
+        assert outer[len(inner) : len(inner) + 12] not in refusal.content, refusal.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_hidden_values_whose_starts_alternate_at_the_cut_are_all_dropped() -> None:
+    # Trimming one value's start exposes the other's, more times than one pass over both values reaches.
+    first = "".join(f"A{i:04d}" for i in range(400))
+    second = "".join(f"B{i:04d}" for i in range(400))
+    tail = first[:300] + second[:300] + first[:300] + second[:300] + first
+    page_html = _text_named_layer_html("<p>" + "<span>a</span>" * 190 + f"<span>{tail}</span></p>")
+    for refusal in await _full_and_held_refusals(page_html, (first, second)):
+        assert "It reads, cut short" in refusal.content, refusal.content
+        assert first[:12] not in refusal.content and second[:12] not in refusal.content, refusal.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_a_hidden_value_the_page_spreads_over_a_line_break_is_masked_once_collapsed() -> None:
+    value = "Qz7Kp4 Wm9Xr2Vt6"
+    page_html = _text_named_layer_html(
+        "<p>Members only past this point, and this sentence runs past the name. "
+        "Your code is Qz7Kp4\n\tWm9Xr2Vt6 and stays valid today.</p>"
+    )
+    for refusal in await _full_and_held_refusals(page_html, (value,)):
+        assert "Qz7Kp4" not in refusal.content and "Wm9Xr2Vt6" not in refusal.content, refusal.content
+
+
+@pytest.mark.usefixtures("short_action_timeout")
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_the_covered_record_names_a_quoted_layer_apart_from_a_named_one() -> None:
+    quoted_html = _text_named_layer_html("<p>Members only past this point, and this sentence runs past the name.</p>")
+    controls_only = _STICKY_FORM_HTML.format(
+        over='<button id="go" type="submit" style="position:absolute;left:0;top:0;width:220px;height:40px">Go</button>'
+    )
+    for markup, selector, branch in ((quoted_html, "#email", "quoted"), (controls_only, "#name", "named")):
+        async with _content_page(markup) as page:
+            taskv3_loop._COVERED_LAYER.set(None)
+            refused = await _tool(build_browser_tools(_fixed_page_provider(page)), "type").handler(
+                {"selector": selector, "text": "x"}
+            )
+        recorded = taskv3_loop._COVERED_LAYER.get() or {}
+        assert refused.error_class == "covered", refused.content
+        assert recorded.get("branch") == branch and recorded.get("layer_kind") == "qualified", (recorded, refused)
 
 
 @_skip_no_browser
@@ -43050,6 +43538,7 @@ def _straddle_renders() -> list[tuple[str, int, Callable[[str], str]]]:
             taskv3_tools.SELECTION_REPORT_OPTION_WIDTH,
             lambda t: taskv3_tools._selection_report([t, "B"]),
         ),
+        ("layer-text", taskv3_tools._LAYER_TEXT_MAX, lambda t: taskv3_tools._layer_text_clause({"text": [t]}, "#n")),
     ]
 
 

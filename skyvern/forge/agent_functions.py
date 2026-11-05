@@ -1071,6 +1071,10 @@ class AgentFunction:
         """Cloud may hide OSS email-forwarding routes until its ingress is configured."""
         return True
 
+    async def ensure_email_forwarding_management_available(self, organization_id: str) -> bool:
+        """Whether the organization may use the shared email-forwarding management routes."""
+        return await self.ensure_email_forwarding_available(organization_id)
+
     def report_download_failure(self, reason: str, *, failure_key: str | None = None) -> None:
         return None
 
@@ -2157,6 +2161,9 @@ class AgentFunction:
     def is_residential_browser_egress(self, browser_context: BrowserContext) -> bool:
         return False
 
+    def note_page_action(self, page: Page, action: Action) -> None:
+        return None
+
     async def on_browser_context_acquired(
         self,
         browser_context: Any,
@@ -2268,7 +2275,9 @@ class AgentFunction:
     ) -> None:
         return
 
-    def browser_session_create_admission(self, organization_id: str) -> AbstractAsyncContextManager[None]:
+    def browser_session_create_admission(
+        self, organization_id: str, *, copilot: bool = False
+    ) -> AbstractAsyncContextManager[None]:
         """Held around a browser-session create; a deployment refuses it by raising TooManyStartingBrowserSessions."""
         return nullcontext()
 
@@ -2330,7 +2339,7 @@ class AgentFunction:
         db_credential: Credential,
         credential_item: CredentialItem,
     ) -> CredentialItem:
-        return credential_item
+        return credential_item.model_copy(update={"passkeys": []})
 
     async def get_extra_extract_action_guidance(self, task: Task) -> str | None:
         return None

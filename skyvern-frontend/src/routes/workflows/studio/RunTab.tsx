@@ -7,6 +7,7 @@ import { RunView } from "./runview/RunView";
 import { useStudioInspectedRun } from "./useStudioInspectedRun";
 import { useStudioPanes } from "./useStudioPanes";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+import { useDocRunOwnsTopBar } from "../editor/doc/useDocRunOwnsTopBar";
 
 /**
  * Overview pane of the studio shell — the run timeline + run-data view (the
@@ -17,7 +18,11 @@ export function RunTab() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const workflowPermanentId = useWorkflowPermanentId();
-  const { openPane } = useStudioPanes();
+  const { openPane, panes } = useStudioPanes();
+  // The Run pane stays mounted while closed; behind the Doc, its selection must not reach the URL,
+  // or a reload opens the run layout instead of the Doc.
+  const docOwnsEditor = useDocRunOwnsTopBar();
+  const mirrorSelectionToUrl = !(docOwnsEditor && !panes.includes("overview"));
   const { runId, pending } = useStudioInspectedRun();
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
     workflowRunId: runId,
@@ -47,6 +52,7 @@ export function RunTab() {
     <RunView
       workflowRunId={runId}
       runIdPending={pending}
+      mirrorSelectionToUrl={mirrorSelectionToUrl}
       onFix={
         workflowDeleted || !runId
           ? undefined

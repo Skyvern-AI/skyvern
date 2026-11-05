@@ -31,6 +31,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
 from urllib.parse import unquote, urlparse
@@ -46,7 +47,12 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.files import resolve_run_download_id
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import URL_IN_TEXT, canonical_url, opaque_url_echo_window
+from skyvern.forge.sdk.core.skyvern_context import (
+    URL_IN_TEXT,
+    canonical_url,
+    mask_opaque_urls_in_text,
+    opaque_url_echo_window,
+)
 from skyvern.forge.sdk.services.credentials import (
     is_totp_sentinel,
     is_unresolved_totp_placeholder,
@@ -131,6 +137,11 @@ from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CA
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date
 from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
+from skyvern.webeye.actions.handler import (
+    _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+    _collect_inline_iframe_src_candidates,
+    _recover_blocked_inline_pdf_download,
+)
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
@@ -161,6 +172,7 @@ from skyvern.webeye.utils.page import (
     OTP_INPUT_PRIVACY_JS,
     OTP_SAFE_ELEMENT_HTML_JS,
     SkyvernFrame,
+    apply_secret_visual_mask_to_locator,
     mask_otp_values_in_html,
 )
 
@@ -1214,6 +1226,96 @@ def _model_text(text: object, cap: int) -> str:
     return shown[:cap]
 
 
+# The most of a covering layer's own text a covered refusal quotes.
+_LAYER_TEXT_MAX = 400
+
+
+def _without_split_hidden_tail(text: str, tidy: Callable[[str], str] | None = None) -> str:
+    """`text` less any tail that begins a hidden value (or, given `tidy`, its tidied form). A read the page script cut
+    short can end inside one, where the whole-value mask cannot see it; cutting that tail can split another value in
+    turn, so it repeats."""
+    ctx = skyvern_context.current()
+    values = [value for value in (ctx.model_hidden_values if ctx is not None else ()) if value]
+    values += [tidied for value in values if tidy is not None and (tidied := tidy(value)) and tidied != value]
+    trimmed = True
+    while trimmed:
+        trimmed = False
+        for value in values:
+            for k in range(min(len(value) - 1, len(text)), 0, -1):
+                if text.endswith(value[:k]):
+                    text, trimmed = text[:-k], True
+                    break
+    return text
+
+
+# Removed from a quoted layer's text after it is masked: the page script's label set, plus the marks below.
+# A str.translate delete table rather than a regex character class, because the same ranges inside a
+# character class trip CodeQL's py/overly-large-range check.
+_FORGEABLE_TEXT = dict.fromkeys(
+    code_point
+    for first, last in (
+        (0x00, 0x08),
+        (0x0E, 0x1F),
+        (0x7F, 0x7F),
+        (0x85, 0x85),
+        (0x2028, 0x2029),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2066, 0x2069),
+        # Default-ignorable marks a page can hide inside a value: they render as nothing but split it for the mask.
+        (0xAD, 0xAD),
+        (0x34F, 0x34F),
+        (0x61C, 0x61C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180E),
+        (0x2060, 0x2060),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xE0000, 0xE007F),
+        (0xE0100, 0xE01EF),
+    )
+    for code_point in range(first, last + 1)
+)
+
+
+def _tidied_layer_text(text: str) -> str:
+    return " ".join(text.translate(_FORGEABLE_TEXT).split())
+
+
+def _layer_text_clause(occluder: dict[str, Any] | None, layer_selector: str | None) -> str:
+    """The sentence quoting what a layer named only by its own text says, or "" when the probe read none."""
+    nodes = (occluder or {}).get("text")
+    if not isinstance(nodes, list) or not all(isinstance(node, str) for node in nodes):
+        return ""
+    text = "".join(nodes)
+    if not text.strip():
+        return ""
+    cut = (occluder or {}).get("textCut") is True
+    if cut:
+        text = _without_split_hidden_tail(text)
+    # Masked as the page holds it, then again after tidying, which can join what the first pass could not match.
+    ctx = skyvern_context.current()
+    if ctx is not None:
+        text = ctx.hide_from_model(text)
+        if cut:
+            # The cut can end inside a payload signed URL, which only the cut-aware mask drops.
+            text = mask_opaque_urls_in_text(text, ctx.opaque_url_refs, cut=True)
+    text = _tidied_layer_text(text)
+    if cut:
+        # Tidying can rejoin the start of a hidden value the raw cut left broken up by a formatting character.
+        text = _without_split_hidden_tail(text, tidy=_tidied_layer_text)
+        if ctx is not None:
+            text = mask_opaque_urls_in_text(text, ctx.opaque_url_refs, cut=True)
+    shown = _model_text(text, _LAYER_TEXT_MAX + 1)
+    quoted = json.dumps(shown[:_LAYER_TEXT_MAX], ensure_ascii=False)
+    if cut or len(shown) > _LAYER_TEXT_MAX:
+        rest = f"get_html of {layer_selector}" if layer_selector else "get_html"
+        return f' It reads, cut short ({rest} with format "text" reads all of it): {quoted}.'
+    return f" It reads: {quoted}."
+
+
 def _row_value_suffix(o: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     """Every present distinguishing surface for one row — value, accessible label, then any other
     declared value (data-code, data-key, ...) — each truncated to 60 chars like the row text already is,
@@ -1501,7 +1603,8 @@ _OFF_CANVAS_JS = r"""(el, r) => {
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
 # not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
 # pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
-# named, control-free pointer descendant is listed for it, recorded in `state.held`.
+# named, control-free pointer descendant is listed for it, recorded in `state.held`. A named href-less <a>
+# inside a root whose centre misses it is listed beside that root, recorded in `state.extra`.
 _SCROLL_GEOMETRY_JS = r"""
   const flowNegative = (cs) => {
     const wm = cs.writingMode || 'horizontal-tb';
@@ -2314,7 +2417,7 @@ _WITH_POINTER_ROOTS_JS = (
     if (!hasSlotDescendant.has(el)) return false;
     for (const slot of qsa.call(el, 'slot')) {
       for (const a of slot.assignedElements({ flatten: true })) {
-        if (state.roots.has(a) || inListable(a) || anyListable(qsa.call(a, q))) return true;
+        if ((state.roots.has(a) && !state.extra.has(a)) || inListable(a) || anyListable(qsa.call(a, q))) return true;
       }
     }
     return false;
@@ -2459,6 +2562,27 @@ _WITH_POINTER_ROOTS_JS = (
     const hit = l.getRootNode().elementFromPoint(x, y);
     return !!hit && (hit === l || l.contains(hit));
   };
+  // An <a> with no href is not a control to `q`, so the pointer root around it is listed and the anchor covered.
+  // A click on that root lands on its centre, so this returns the root when the centre is outside an anchor that
+  // takes clicks (one with pointer-events:none passes them through to the root).
+  const upOf = (n) => {
+    const p = parentOf.call(n);
+    if (p) return p;
+    const r = Node.prototype.getRootNode.call(n);
+    return r && r.nodeType === 11 ? hostOf.call(r) : null;
+  };
+  const rootMissing = (el) => {
+    if (!state.extra || String(localNameOf.call(el) || '') !== 'a' || getAttr.call(el, 'href') !== null
+      || matches.call(el, q) || getComputedStyle(el).pointerEvents === 'none') return null;
+    for (let a = upOf(el), i = 0; a && i < 64 && isPointer(a); a = upOf(a), i++) {
+      if (state.icons.has(a) || matches.call(a, q)) return null;
+      if (!state.roots.has(a)) continue;
+      const ar = bcr.call(a), r = bcr.call(el);
+      const x = ar.left + ar.width / 2, y = ar.top + ar.height / 2;
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? null : a;
+    }
+    return null;
+  };
   // Every label of a dropped control performs the same click, so only its most-named label a pointer can land on is
   // a root; the rest would spend the pointer-root cap on duplicates of one action. A box under 2px a side is unseen,
   // as _unseen holds, so a screen-reader-only label never wins. No eligible label leaves every label to the gates.
@@ -2489,7 +2613,24 @@ _WITH_POINTER_ROOTS_JS = (
         // The cursor is inherited, so a covered parent is the target. A shadow root's top-level element
         // inherits from its host.
         const parent = parentOf.call(el) || root.host || null;
-        if (isPointer(parent) && state.covered.has(parent)) { state.covered.add(el); continue; }
+        if (isPointer(parent) && state.covered.has(parent)) {
+          state.covered.add(el);
+          // Listed beside the root, never instead of it, and under its own budget: the root's line and every
+          // other root's place stay as they were.
+          if (state.extraCount >= state.heldCap || !rootMissing(el)
+            || closest.call(el, '[aria-hidden="true"], [inert]')) continue;
+          const er = bcr.call(el);
+          if (!rootable(el, er) || !hitsItself(el, er)) continue;
+          const name = nameOf(el);
+          if (!name) continue;
+          state.roots.set(el, name.replace(/\s+/g, ' ').slice(0, retain));
+          state.extra.add(el);
+          state.extraCount++;
+          const node = { el, next: null };
+          if (tail) tail.next = node; else head = node;
+          tail = node;
+          continue;
+        }
         const tag = String(localNameOf.call(el) || '');
         // A page-wide pointer cursor says nothing about any one element under it.
         if (tag === 'html' || tag === 'body') { state.covered.add(el); continue; }
@@ -6654,7 +6795,36 @@ _TYPE_TARGET_PROBE_JS = (
       if (dialog) layerName = ownName(dialog) || headingNameOf(dialog);
     }
     if (!layerName) layerName = headingNameOf(layer);
-    if (!layerName) layerName = boundedClean(layer.textContent, 60);
+    // A layer named only by the start of its own text may be the page's reply to the last action, and that start
+    // can stop before the part that matters. Its raw visible text outside its controls, fields, templates, scripts and
+    // invisible boxes rides beside the name, uncleaned and unjoined so the mask in Python sees what the page holds.
+    const layerText = [];
+    let layerTextCut = false;
+    if (!layerName) {
+      layerName = boundedClean(layer.textContent, 60);
+      if (layerName && layerKind === 'qualified') {
+        const shownBy = new Map();
+        let read = 0;
+        let nodes = 0;
+        const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+        for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+          if (++nodes > 5000) { layerTextCut = true; break; }
+          const p = t.parentElement;
+          const v = t.nodeValue;
+          if (!p || !v) continue;
+          if (p.closest('script,style,template,noscript,textarea,select,option,datalist,'
+            + '[contenteditable]:not([contenteditable="false"]),button,a[href],[role="button"],[role="link"],'
+            + '[role="checkbox"],[role="radio"],[role="option"],[role="menuitem"],[role="menuitemcheckbox"],'
+            + '[role="menuitemradio"],[role="switch"],[role="tab"]')) continue;
+          let seen = shownBy.get(p);
+          if (seen === undefined) { seen = visible(p, true); shownBy.set(p, seen); }
+          if (!seen) continue;
+          if (read + v.length > 2000) { layerText.push(v.slice(0, 2000 - read)); layerTextCut = true; break; }
+          layerText.push(v);
+          read += v.length;
+        }
+      }
+    }
     if (!layerName) layerName = layer.tagName ? layer.tagName.toLowerCase() : 'layer';
     const layerSelector = idSelector(layer) || markerSelector(layer);
     const allControls = [];
@@ -6730,6 +6900,7 @@ _TYPE_TARGET_PROBE_JS = (
       .concat(onclickControls);
     try { layer.setAttribute('data-tv3-cover', '1'); } catch (e) { /* best-effort */ }
     out.occluder = { selector: layerSelector, name: layerName, controls, truncated };
+    if (layerText.join('').trim()) { out.occluder.text = layerText; out.occluder.textCut = layerTextCut; }
     out.occluder.layerKind = layerKind;
     // Which layer node this is, and the state of its controls, kept only in a realm the page cannot read or patch
     // (the same trust allowOwnLabel grants): a page that could reach the table could make one layer pass for another.
@@ -10155,12 +10326,14 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
     + str(OBSERVE_POINTER_ROOT_CAP)
     + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
     + r""" };
   let pointerListed = 0;
+  // Anchors listed beside the root that misses them (`extra`): a budget of their own, so none takes a root's place.
+  let extraListed = 0;
   // Pointer roots past the cap, and those past the element budget: counted apart from `truncated`,
   // which the budget spends on semantic controls only.
   let pointerCapped = 0;
@@ -11107,7 +11280,8 @@ async (__tv3TextArgs) => {
     const iconRoot = _pointerState.icons.has(el);
     if (iconRoot && iconsListed >= iconRoom) { iconsTruncated++; continue; }
     pointerRoot = _pointerState.roots.has(el) && !iconRoot;
-    if (pointerRoot && !_pointerState.held.has(el)) pointerReserved--;
+    const extraRoot = pointerRoot && _pointerState.extra.has(el);
+    if (pointerRoot && !_pointerState.held.has(el) && !extraRoot) pointerReserved--;
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -11177,7 +11351,9 @@ async (__tv3TextArgs) => {
         continue;
       }
     }
-    if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    // Main never listed these anchors, so one past its budget is not a cut the cap note reports.
+    if (extraRoot && extraListed >= _POINTER_ROOT_CAP) continue;
+    if (!extraRoot && pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
     let bind = '';
     if (!selector) {
@@ -11231,6 +11407,7 @@ async (__tv3TextArgs) => {
     if (pointerRoot) rec.pointerRoot = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
+    if (extraRoot) rec.pointerExtra = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     const shows = _shownText(el, label);
     if (shows) rec.shows = shows;
@@ -11362,7 +11539,8 @@ async (__tv3TextArgs) => {
     // _resolve_ref, which requires the element the record NAMES to be the one carrying the act token.
     rec[__OBSERVE_EL_KEY__] = el;
     out.push(rec);
-    if (pointerRoot) pointerListed++;
+    if (extraRoot) extraListed++;
+    else if (pointerRoot) pointerListed++;
     if (iconRoot) iconsListed++;
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
@@ -11379,6 +11557,7 @@ async (__tv3TextArgs) => {
           const r2 = els[k].el.getBoundingClientRect();
           if (r2.width === 0 || r2.height === 0) continue;
           if (_pointerState.icons.has(els[k].el)) { iconsTruncated++; continue; }
+          if (_pointerState.extra.has(els[k].el)) continue;
           if (_pointerState.roots.has(els[k].el)) {
             if (pointerListed + pointerTruncated < _POINTER_ROOT_CAP) pointerTruncated++;
             else pointerCapped++;
@@ -11422,7 +11601,7 @@ async (__tv3TextArgs) => {
         const at = c.rec === null ? -1 : out.indexOf(c.rec);
         if (at !== -1) {
           out.splice(at, 1); labelOfControl.delete(c.el); boundLabelOfControl.delete(c.el);
-          if (c.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+          if (c.rec.pointerRoot) { if (c.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
         }
       }
       if (lost && !rem.shared) { if (rem.fresh) markersWritten--; else markersReused--; }
@@ -11432,7 +11611,7 @@ async (__tv3TextArgs) => {
       const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
       if (at !== -1) {
         out.splice(at, 1); labelOfControl.delete(rem.el); boundLabelOfControl.delete(rem.el);
-        if (rem.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+        if (rem.rec.pointerRoot) { if (rem.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
       }
       if (rem.fresh) markersWritten--; else markersReused--;
     }
@@ -11492,7 +11671,7 @@ async (__tv3TextArgs) => {
       // as holding one field when it holds two.
       if (el && connected) droppedStillLive.push(el);
       labelOfControl.delete(el); boundLabelOfControl.delete(el); out.splice(k, 1);
-      if (rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
     }
     else if (el) {
       // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
@@ -13430,13 +13609,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     # page-wide, so neither limit ever costs the other kind a place.
     room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))))
     pointer_room = max(
-        0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+        0,
+        OBSERVE_POINTER_ROOT_CAP
+        - sum(1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))),
     )
     kept: list[int] = []
     pointer_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
-        if e.get("pointerHeld") or e.get("icon"):
+        if e.get("pointerHeld") or e.get("pointerExtra") or e.get("icon"):
             pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
         elif e.get("pointerRoot"):
             if pointer_room == 0:
@@ -13477,11 +13658,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
 
 
 def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
-    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, and an
-    icon only in the page-wide element budget left after every control. Returns the kept indices, which the caller
-    applies to its handle and owner lists."""
+    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, an
+    anchor listed beside the root that misses it only in a page-wide cap of its own, and an icon only in the
+    page-wide element budget left after every control. Returns the kept indices, which the caller applies to its
+    handle and owner lists."""
     elements = data.get("elements") or []
-    room = OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    room = OBSERVE_POINTER_ROOT_CAP - sum(
+        1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))
+    )
+    extra_room = OBSERVE_POINTER_ROOT_CAP
     icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon")))
     kept: list[int] = []
     held_over = 0
@@ -13492,6 +13677,10 @@ def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
                 held_over += 1
                 continue
             room -= 1
+        elif e.get("pointerExtra"):
+            if extra_room <= 0:
+                continue
+            extra_room -= 1
         elif e.get("icon"):
             if icon_room <= 0:
                 icons_over += 1
@@ -13740,6 +13929,17 @@ def build_browser_tools(
             await _check_credential_release(
                 resolved, operation=operation, page=page, selector=selector, url_is_target=url_is_target
             )
+            ctx = skyvern_context.current()
+            if (
+                not url_is_target
+                and selector
+                and settings.ENABLE_SECRET_VISUAL_MASKING
+                and ctx is not None
+                and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(ctx.workflow_run_id, text)
+            ):
+                # Every tool that writes a resolved value into a field comes through here, so this one
+                # mask covers them all. It is CSS-only and ignores the Mask Secrets opt-in for card data.
+                await apply_secret_visual_mask_to_locator(page.locator(selector).first, timeout=_ACTION_TIMEOUT_MS)
         return resolved
 
     # INVARIANT: holds at most one page, written by the preflight wrapper (or, ahead of it, the
@@ -14591,7 +14791,9 @@ def build_browser_tools(
             "icons_truncated": int(data.get("iconsTruncated") or 0),
             # Distinct unnamed pointer roots rejected by the icon heuristic, separate from budget and selector drops.
             "unnamed_not_icon": int(data.get("unnamedNotIcon") or 0),
-            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot")),
+            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerExtra")),
+            # Href-less anchors listed beside the pointer root whose click would miss them.
+            "pointer_extras_listed": sum(1 for e in elements if e.get("pointerExtra")),
             "pointer_capped": int(data.get("pointerCapped") or 0),
             "pointer_truncated": int(data.get("pointerTruncated") or 0),
             "pointer_dropped": int(data.get("pointerDropped") or 0),
@@ -15460,7 +15662,8 @@ def build_browser_tools(
         # recorded -- it is page text, and these names carry personal data.
         parts = _named_controls(occluder)
         branch = _covered_branch(occluder)
-        _record_covered(occluder, branch, controls=[] if branch == "own_container" else parts)
+        said = _layer_text_clause(occluder, layer_selector) if branch == "named" else ""
+        _record_covered(occluder, "quoted" if said else branch, controls=[] if branch == "own_container" else parts)
         blocker = _blocking_layer(occluder, branch) if verb == "typed into" else None
         # The probe walks only the hit element and its ancestors, so this claims nothing about other layers.
         unqualified = (
@@ -15554,6 +15757,23 @@ def build_browser_tools(
             return ToolResult.error(
                 f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}. {unqualified} "
                 f"{found} Re-observe and reach {selector} another way or act on a different control.",
+                error_class="covered",
+            )
+        # A layer that is quoted is reported, not prescribed for: its text may be the page answering the last action,
+        # which closing it and retrying the same field does not address.
+        if said and not parts:
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} The probe found no "
+                f"named controls on it; one without a label (an icon or an ×) would show in get_html of "
+                f"{layer_selector or 'the layer'}.",
+                data=blocker,
+                error_class="covered",
+            )
+        if said:
+            return ToolResult.error(
+                f"{selector} is covered by {layer_desc}, so it cannot be {verb}{also}.{said} Its controls: "
+                f"{controls_desc}.",
+                data=blocker,
                 error_class="covered",
             )
         if not parts:
@@ -22470,8 +22690,8 @@ def build_browser_tools(
             data["nav_revisit"] = True
         _recent_nav_canonicals.append(pre_nav_canonical)
         _recent_nav_canonicals.append(landed_canonical)
-        # A hard 404/410 landing is a dead/removed target: flag it so the loop ends the run as
-        # terminated (v1's behavior) rather than defaulting the outcome to failed. The landing URL rides
+        # A hard 404/410 landing is a dead/removed target: flag it so the loop logs it and, on the granted
+        # final turn, ends the run as terminated (v1's behavior). The landing URL rides
         # along because the loop's verdict names the dead page to the customer, and only this call knows
         # where the status came from -- after a redirect that is not the URL it was asked for.
         if response is not None and response.status in NAVIGATION_DEAD_END_STATUSES:
@@ -23920,7 +24140,7 @@ def build_browser_tools(
             _tool_spec.handler = _with_act_deadline(_tool_spec.name, _tool_spec.handler)
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
-    _apply_download_signal(tools, downloads_dir, download_failures, download_wait)
+    _apply_download_signal(tools, downloads_dir, download_failures, download_wait, page_provider)
     if unseen_text is not None:
         unseen_text.unreported = _unreported_text
     return tools
@@ -24247,6 +24467,7 @@ _DOWNLOAD_FAILURE_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 _DOWNLOAD_FAILURE_SETTLE_SECONDS = 2.5
 _SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS = 2.0
 DOWNLOAD_NO_FILE_THIS_ACTION = "No file downloaded during this action."
+_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_NO_SESSION_FILE_YET = "No file has reached the browser session's storage yet."
 _DOWNLOAD_FAILURE_URL_MAX = 120
 _DOWNLOAD_NAME_WAIT_SECONDS = 1.0
@@ -24493,11 +24714,15 @@ def _apply_download_signal(
     downloads_dir: str | None,
     failure_watch: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
+    page_provider: PageProvider | None = None,
 ) -> None:
     """Wrap every tool so the next wrapped result reports files landing in `downloads_dir` and failures `failure_watch`
     saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file."""
     if not downloads_dir and failure_watch is None:
         return
+    # Only a block the engine built a download wait for: elsewhere the per-call iframe enumeration
+    # below would be paid by every click for a recovery that has no file to stand in for.
+    recover_blocked_frames = bool(downloads_dir) and download_wait is not None and page_provider is not None
 
     seen_completed: set[str] = set()
     seen_started: set[str] = set()
@@ -24561,6 +24786,60 @@ def _apply_download_signal(
             session_baselined = True
             return None
         return listed
+
+    def _landed_a_file_this_call(session_files: list[str] | None) -> bool:
+        completed, in_progress = _list_split()
+        return (
+            any(name not in seen_completed for name in completed)
+            or bool(in_progress)
+            or any(uri not in seen_session for uri in session_files or ())
+        )
+
+    async def _inline_iframe_baseline() -> tuple[Any, list[str]] | None:
+        """The page and its iframe srcs before the call, which the recovery below attributes a frame by."""
+        assert page_provider is not None
+        try:
+            page = await page_provider()
+            if page is None:
+                return None
+            # Unlike v1's once-per-download-action read, this runs before every may-submit call on a
+            # download block, so it is bounded: enumeration is one evaluate per frame, and a frame
+            # that will not answer must delay the click itself by a known amount, not by its own timeout.
+            async with asyncio.timeout(_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS):
+                return page, await _collect_inline_iframe_src_candidates(page)
+        except Exception:
+            LOG.info("taskv3 inline iframe baseline failed", exc_info=True)
+            return None
+
+    async def _recover_blocked_inline_pdf(baseline: tuple[Any, list[str]]) -> None:
+        """Save a PDF this call rendered in a frame the browser refused to display, so the lines below name it.
+
+        The target downloads fine; it just cannot be framed, so no download event ever fires and
+        nothing reaches `downloads_dir`. v1 recovers the bytes same-origin from the refused frame's
+        own src (SKY-12559); writing them into `downloads_dir` here rejoins the same reporting,
+        settle and finalize path a browser download takes.
+        """
+        assert page_provider is not None and downloads_dir
+        baseline_page, iframe_srcs_before = baseline
+        context = skyvern_context.current()
+        try:
+            page = await page_provider()
+            # A call that took the working page somewhere else (a popup it opened, a page it closed)
+            # leaves a baseline that belongs to a document this one no longer holds, so nothing in the
+            # page we can read now is attributable to it.
+            if page is None or page is not baseline_page:
+                return
+            # One whole-operation budget over every candidate fetch, as v1 caps it: a hung
+            # same-origin server must not out-wait the loop this recovery backstops.
+            async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+                await _recover_blocked_inline_pdf_download(
+                    page,
+                    Path(downloads_dir),
+                    workflow_run_id=context.workflow_run_id if context is not None else None,
+                    iframe_srcs_before=iframe_srcs_before,
+                )
+        except Exception:
+            LOG.warning("taskv3 blocked-inline PDF recovery failed", exc_info=True)
 
     def _with_file_lines(
         result: ToolResult, compactable: bool, page_names: Mapping[str, str], session_files: list[str]
@@ -24647,6 +24926,10 @@ def _apply_download_signal(
                     except Exception:
                         LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
                     baseline["done"] = True
+            # Before the handler: a frame already on the page is not the one this call opened.
+            iframe_baseline = (
+                await _inline_iframe_baseline() if recover_blocked_frames and _may_submit(_tool_name, args) else None
+            )
             call = await failure_watch.begin() if failure_watch is not None else 0
             try:
                 result = await _handler(args)
@@ -24674,6 +24957,9 @@ def _apply_download_signal(
                 if landed:
                     page_names = await failure_watch.page_names(landed)
             session_files = await _new_session_files()
+            # Last, after every signal that a file did arrive: a recovery is for the call that got none.
+            if iframe_baseline is not None and not _landed_a_file_this_call(session_files):
+                await _recover_blocked_inline_pdf(iframe_baseline)
             reported = True
             try:
                 result, reported = _with_file_lines(result, _compactable, page_names, session_files or [])

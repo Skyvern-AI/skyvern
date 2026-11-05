@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, test } from "vitest";
 
-import { useWorkflowPresentationStore } from "./WorkflowPresentationStore";
+import {
+  openNewAgentInDoc,
+  useWorkflowPresentationStore,
+} from "./WorkflowPresentationStore";
 
 const store = () => useWorkflowPresentationStore.getState();
 
@@ -28,6 +31,17 @@ describe("remembering Doc or Visual per agent", () => {
     expect(store().presentation).toBe("doc");
 
     store().syncScope("wpid_b", true);
+    expect(store().presentation).toBe("visual");
+  });
+
+  test("an agent created from a demonstration opens in the Doc, but a stored Visual choice wins", () => {
+    openNewAgentInDoc("wpid_new");
+    store().syncScope("wpid_new", true);
+    expect(store().presentation).toBe("doc");
+
+    store().setPresentation("visual");
+    store().syncScope("wpid_other", true);
+    store().syncScope("wpid_new", true);
     expect(store().presentation).toBe("visual");
   });
 

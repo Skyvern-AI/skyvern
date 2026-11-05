@@ -1060,7 +1060,8 @@ class WorkflowRunModel(Base):
     # classifier ran and abstained. none_as_null=True so clearing it (ORM `= None` or Core
     # `.values(...=None)`) stores SQL NULL, not the JSON token `null`: reopen/reset/timeout
     # clears must be SQL NULL for the COALESCE repair and the completed-run NULL invariant to
-    # hold at SQL/CDC/Redshift grain, not just when deserialized back to Python None.
+    # hold at the SQL level and for downstream replication, not just when deserialized back to
+    # Python None.
     failure_attribution = Column(JSON(none_as_null=True), nullable=True)
     # When True, this run was spawned by a WorkflowTriggerBlock whose
     # ignore_workflow_system_prompt flag was set, and the child must not
@@ -1707,7 +1708,7 @@ class WorkflowRunBlockModel(Base):
     script_run = Column(JSON, nullable=True)
 
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
-    # not CDC-mirrored, so download success would not otherwise be queryable.
+    # not replicated downstream, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
     attempt_number = Column(Integer, nullable=True)
 

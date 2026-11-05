@@ -172,6 +172,20 @@ class ObserverRepository(BaseRepository):
             total = (await session.execute(query)).scalar_one()
             return float(total)
 
+    @db_operation("get_block_llm_costs_by_workflow_run_id")
+    async def get_block_llm_costs_by_workflow_run_id(
+        self, workflow_run_id: str, organization_id: str
+    ) -> dict[str, float]:
+        """`llm_cost` of each workflow_run_block in this run that has one."""
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunBlockModel.workflow_run_block_id, WorkflowRunBlockModel.llm_cost)
+                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .where(WorkflowRunBlockModel.llm_cost > 0)
+            )
+            return {block_id: float(cost) for block_id, cost in (await session.execute(query)).all()}
+
     @db_operation("increment_workflow_run_block_llm_cost")
     async def increment_workflow_run_block_llm_cost(
         self,

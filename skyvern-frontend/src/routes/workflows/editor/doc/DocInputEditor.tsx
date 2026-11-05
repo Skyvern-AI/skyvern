@@ -14,6 +14,7 @@ export function DocInputEditor({
   open,
   type,
   initialValues,
+  isNew = false,
   onSave,
   onDelete,
   onClose,
@@ -22,6 +23,8 @@ export function DocInputEditor({
   open: boolean;
   type: WorkflowEditorParameterType;
   initialValues?: ParametersState[number];
+  /** A just-created placeholder input: titled and validated as an Add. */
+  isNew?: boolean;
   onSave: (parameter: ParametersState[number]) => void;
   onDelete?: () => void;
   onClose: () => void;
@@ -34,13 +37,14 @@ export function DocInputEditor({
         <PopoverContent
           align="start"
           collisionPadding={16}
-          aria-label={initialValues ? "Edit input" : "Add input"}
-          className="w-[min(352px,calc(100vw-32px))] rounded-[9px] p-2"
+          aria-label={initialValues && !isNew ? "Edit input" : "Add input"}
+          className="max-h-[var(--radix-popover-content-available-height)] w-[min(352px,calc(100vw-32px))] overflow-y-auto rounded-[9px] p-2"
           onCloseAutoFocus={(event) => event.preventDefault()}
         >
           <WorkflowParameterEditPanel
             type={type}
             initialValues={initialValues}
+            isNew={isNew}
             onSave={onSave}
             onClose={onClose}
           />

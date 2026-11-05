@@ -33,6 +33,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.schemas.runs import RunEngine
 from skyvern.webeye import real_browser_state as real_browser_state_mod
+from skyvern.webeye.document_navigation import DocumentNavigation
 from skyvern.webeye.real_browser_state import RealBrowserState
 from skyvern.webeye.scraper import scraper as scraper_mod
 from skyvern.webeye.utils import document as document_mod
@@ -877,6 +878,9 @@ class _FakeRequest:
     redirected_from: Any = None
     navigation: bool = True
     _impl_obj: Any = field(default_factory=lambda: SimpleNamespace(_channel=object()), repr=False)
+    method: str = "GET"
+    url: str = "https://example.com/a"
+    timing: dict[str, float] = field(default_factory=lambda: {"startTime": 1000.0})
 
     def is_navigation_request(self) -> bool:
         return self.navigation
@@ -1174,3 +1178,100 @@ async def test_a_closed_context_reports_stopped_while_its_browser_stays_connecte
             assert real_browser_state_mod.browser_context_stopped_reason(sibling) is None
         finally:
             await browser.close()
+
+
+def _sent(page: _FakePage, url: str = "https://example.com/a", **fields: Any) -> _FakeRequest:
+    request = _FakeRequest(frame=page.main_frame, url=url, **fields)
+    page.emit("request", request)
+    return request
+
+
+def _from_creation(
+    monkeypatch: pytest.MonkeyPatch, admitted: str = "https://example.com/"
+) -> tuple[_FakePage, RealBrowserState]:
+    monkeypatch.setattr(scraper_mod, "captures_origin", lambda url: url.startswith(admitted))
+    state = RealBrowserState(pw=AsyncMock(), browser_context=None)
+    page = _FakePage()
+    state._observe_main_frame_navigation(page, observed_from_creation=True)  # type: ignore[arg-type]
+    return page, state
+
+
+def test_a_committed_document_is_named_by_its_redirect_chain_and_how_many_such_requests_the_page_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page, state = _from_creation(monkeypatch)
+    # A subresource with the page's url is one of its requests too: the page's recording holds an entry for it.
+    _sent(page, navigation=False)
+    first = _sent(page)
+    page.main_frame.commit(first)
+    assert state.committed_document_navigation(page) == DocumentNavigation(  # type: ignore[arg-type]
+        (("GET", "https://example.com/a"),), 2, 1000.0, (1000.0,)
+    )
+
+    start = _sent(page, url="https://example.com/start")
+    landing = _sent(page, redirected_from=start, timing={"startTime": 2000.0})
+    page.main_frame.commit(landing)
+    assert state.committed_document_navigation(page) == DocumentNavigation(  # type: ignore[arg-type]
+        (("GET", "https://example.com/start"), ("GET", "https://example.com/a")),
+        3,
+        2000.0,
+        (1000.0, 1000.0),
+        ((1000.0,),),
+    )
+
+
+@pytest.mark.parametrize(
+    "unknown",
+    [
+        # A commit naming another request than the pending one, or none at all (a history navigation), is not that
+        # request's document.
+        "stale-commit",
+        "commit-without-a-request",
+        # A request never answered has no start time.
+        "no-start-time",
+        # A page whose earlier requests were not seen, or too many to remember, cannot be counted.
+        "watched-after-creation",
+        "too-many-requests",
+        "detached",
+        # Nothing is remembered for a url the agent function does not admit to origin capture, so a redirect through
+        # such a url leaves the chain unproven.
+        "not-admitted",
+        "redirected-from-a-url-not-remembered",
+    ],
+)
+def test_a_committed_document_whose_request_cannot_be_counted_exactly_is_unknown(
+    unknown: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if unknown == "watched-after-creation":
+        page, state, _ = _observed_page()
+    else:
+        admitted = {
+            "not-admitted": "https://elsewhere.test/",
+            "redirected-from-a-url-not-remembered": "https://example",
+        }
+        page, state = _from_creation(monkeypatch, admitted.get(unknown, "https://"))
+    page.main_frame.commit(_sent(page, url="https://example.com/known"))
+    if unknown == "too-many-requests":
+        monkeypatch.setattr(real_browser_state_mod, "_MAX_REMEMBERED_REQUESTS", 4)
+        for n in range(3):
+            _sent(page, url=f"https://example.com/sub{n}", navigation=False)
+    redirect = (
+        _sent(page, url="https://elsewhere.test/hop") if unknown == "redirected-from-a-url-not-remembered" else None
+    )
+    request = _sent(
+        page,
+        redirected_from=redirect,
+        timing={"startTime": -1.0} if unknown == "no-start-time" else {"startTime": 1000.0},
+    )
+    if unknown == "stale-commit":
+        page.main_frame.commit(_FakeRequest(frame=page.main_frame))
+    elif unknown == "commit-without-a-request":
+        page.main_frame._impl_obj._event_emitter.emit("navigated", {"newDocument": {}})
+    else:
+        page.main_frame.commit(request)
+    if unknown == "detached":
+        state._main_frame_navigations[page].detach()  # type: ignore[index]
+
+    assert state.committed_document_navigation(page) is None  # type: ignore[arg-type]
+    if unknown == "not-admitted":
+        assert state._main_frame_navigations[page]._sent == {}  # type: ignore[index]

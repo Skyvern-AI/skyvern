@@ -56,7 +56,11 @@ from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.utils.contained_effects import contained_effect
-from skyvern.webeye.browser_profile_utils import FRESH_PROFILE_COPY_IGNORE, valid_operator_profile_generation
+from skyvern.webeye.browser_profile_utils import (
+    FRESH_PROFILE_COPY_IGNORE,
+    ROOT_STORE_COMPONENT_DIRS,
+    valid_operator_profile_generation,
+)
 from skyvern.webeye.profile_cookie_merge import cookies_for_login_urls, sanitize_cookies, write_signin_cookies
 
 try:
@@ -718,7 +722,8 @@ def _clear_directory(directory: FilePath) -> None:
 
 def _copy_browser_profile_template(source_dir: FilePath, destination_dir: FilePath) -> None:
     for source_child in source_dir.iterdir():
-        if source_child.name in FRESH_PROFILE_COPY_IGNORE:
+        # The new profile is not tied to a browser yet, so it does not inherit the template browser's root store.
+        if source_child.name in FRESH_PROFILE_COPY_IGNORE or source_child.name in ROOT_STORE_COMPONENT_DIRS:
             continue
 
         destination_child = destination_dir / source_child.name

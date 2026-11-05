@@ -280,7 +280,7 @@ export function DocProposalCard({
                 Proposed changes
               </span>
               <span className="rounded-full border border-border bg-[hsl(0_0%_98.3%)] px-2 py-px text-[11.5px] font-semibold text-muted-foreground dark:bg-[hsl(222_50%_7.5%)]">
-                Untested
+                {proposal.tested ? "Tested" : "Untested"}
               </span>
             </span>
             {!comparisonUnavailable && summaryParts.length > 0 && (

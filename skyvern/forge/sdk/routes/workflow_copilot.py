@@ -4963,6 +4963,10 @@ async def workflow_copilot_demonstration_control(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)") from exc
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)")
+    if control_request.action == "note" and not (control_request.text or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="text is required when action is 'note'"
+        )
     if control_request.action == "fill_credential" and not (
         control_request.credential_id and control_request.selector and control_request.field
     ):

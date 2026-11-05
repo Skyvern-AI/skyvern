@@ -133,9 +133,14 @@ function GmailCapabilityPills({
 type CheckboxesProps = {
   value: Record<GmailCapability, boolean>;
   onChange: (value: Record<GmailCapability, boolean>) => void;
+  onlyRead?: boolean;
 };
 
-function GmailCapabilityCheckboxes({ value, onChange }: CheckboxesProps) {
+function GmailCapabilityCheckboxes({
+  value,
+  onChange,
+  onlyRead = false,
+}: CheckboxesProps) {
   const idPrefix = useId();
 
   return (
@@ -143,32 +148,36 @@ function GmailCapabilityCheckboxes({ value, onChange }: CheckboxesProps) {
       <legend className="mb-2 text-sm font-medium">
         What can Skyvern do with this account?
       </legend>
-      {CAPABILITIES.map(({ id, label, description }) => (
-        <Label
-          key={id}
-          htmlFor={`${idPrefix}-${id}`}
-          className="flex cursor-pointer items-start gap-2.5 rounded-md border px-3 py-2.5 font-normal leading-normal"
-        >
-          <Checkbox
-            id={`${idPrefix}-${id}`}
-            className="mt-0.5"
-            checked={value[id]}
-            onCheckedChange={(checked) =>
-              onChange({ ...value, [id]: checked === true })
-            }
-          />
-          <span>
-            <span className="block text-sm font-medium">{label}</span>
-            <span className="block text-xs text-muted-foreground">
-              {description}
+      {CAPABILITIES.filter(({ id }) => !onlyRead || id === "read").map(
+        ({ id, label, description }) => (
+          <Label
+            key={id}
+            htmlFor={`${idPrefix}-${id}`}
+            className="flex cursor-pointer items-start gap-2.5 rounded-md border px-3 py-2.5 font-normal leading-normal"
+          >
+            <Checkbox
+              id={`${idPrefix}-${id}`}
+              className="mt-0.5"
+              checked={value[id]}
+              onCheckedChange={(checked) =>
+                onChange({ ...value, [id]: checked === true })
+              }
+            />
+            <span>
+              <span className="block text-sm font-medium">{label}</span>
+              <span className="block text-xs text-muted-foreground">
+                {description}
+              </span>
             </span>
-          </span>
-        </Label>
-      ))}
-      <p className="text-xs text-muted-foreground">
-        Google asks you to approve only what you tick. You can enable the other
-        one later.
-      </p>
+          </Label>
+        ),
+      )}
+      {!onlyRead ? (
+        <p className="text-xs text-muted-foreground">
+          Google asks you to approve only what you tick. You can enable the
+          other one later.
+        </p>
+      ) : null}
     </fieldset>
   );
 }

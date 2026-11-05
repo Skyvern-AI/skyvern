@@ -568,7 +568,9 @@ export interface WorkflowCopilotDemonstrationActionUpdate {
     | "drag"
     | "navigate_browser"
     | "upload_attached_file"
-    | "fill_credential_field";
+    | "fill_credential_field"
+    | "note"
+    | "skyvern_tab_switch";
   // Present only on an upload the recorder attached; a skipped file request has none.
   file_id?: string;
   filename?: string;
@@ -608,8 +610,15 @@ export interface WorkflowCopilotDemonstrationStoppedUpdate {
 
 export interface WorkflowCopilotDemonstrationControlRequest {
   demonstration_id: string;
-  action: "navigate" | "fill_credential" | "upload_file" | "stop" | "cancel";
+  action:
+    | "navigate"
+    | "fill_credential"
+    | "upload_file"
+    | "note"
+    | "stop"
+    | "cancel";
   url?: string | null;
+  text?: string | null;
   selector?: string | null;
   credential_id?: string | null;
   field?: "password" | "totp" | null;

@@ -652,6 +652,7 @@ async def _run_bound_cell(
                         dict(notes),
                         disposition=disposition,
                         deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=copilot_ctx.browser_session_continuity_acquisition_failure,
                     ),
                     **last_run_facts(copilot_ctx, call_browser_session_id),
                 }

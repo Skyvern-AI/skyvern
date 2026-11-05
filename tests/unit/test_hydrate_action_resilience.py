@@ -110,6 +110,7 @@ def _get_task_actions(test_app: FastAPI, *rows: SimpleNamespace, headers: dict[s
         ),
     ):
         app_module.DATABASE.tasks = repo
+        app_module.AGENT_FUNCTION.should_check_browser_session_artifacts = AsyncMock(return_value=False)
         return TestClient(test_app).get(
             "/api/v1/tasks/tsk_test/actions", headers={"x-api-key": "key", **(headers or {})}
         )
@@ -158,6 +159,7 @@ def test_task_steps_endpoint_withholds_the_one_time_code_and_leaves_the_stored_s
         ),
     ):
         app_module.DATABASE.tasks = repo
+        app_module.AGENT_FUNCTION.should_check_browser_session_artifacts = AsyncMock(return_value=False)
         response = TestClient(test_app).get("/api/v1/tasks/tsk_test/steps", headers={"x-api-key": "key"})
 
     assert response.status_code == 200, response.text

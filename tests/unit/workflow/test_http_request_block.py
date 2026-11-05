@@ -31,6 +31,7 @@ def _make_context(
 ) -> WorkflowRunContext:
     context = WorkflowRunContext.__new__(WorkflowRunContext)
     context.secrets = dict(secrets or {})
+    context._platform_smtp_secret_ids = {}
     context.values = dict(values or {})
     context.parameters = {}
     context.workflow_run_outputs = {}

@@ -60,6 +60,8 @@ type Props = {
   onClose: () => void;
   onSave: (value: ParametersState[number]) => void;
   initialValues?: ParametersState[number];
+  /** The values are a placeholder the caller just created, so this is still an Add. */
+  isNew?: boolean;
 };
 
 const workflowParameterTypeOptions = [
@@ -182,12 +184,13 @@ function WorkflowParameterEditPanel({
   onClose,
   onSave,
   initialValues,
+  isNew = false,
 }: Props) {
   const skyvernCredentialSourceAvailable =
     useSkyvernCredentialSourceAvailable();
   const { isConfigured: hasCustomCredentialService } =
     useCustomCredentialServiceConfig();
-  const isEditMode = !!initialValues;
+  const isEditMode = !!initialValues && !isNew;
   const [key, setKey] = useState(initialValues?.key ?? "");
   const keyValidationError = validateParameterKey(key);
 

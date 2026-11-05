@@ -42,6 +42,7 @@ from skyvern.utils.token_counter import approx_count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.action_deadline import bounded_lookup_call
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, BrowserState
+from skyvern.webeye.document_navigation import DocumentNavigation
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -560,7 +561,7 @@ _READ_DOM_CHANGE_WITNESS = """(token) => {
 }"""
 
 
-def _captures_origin(url: str) -> bool:
+def captures_origin(url: str) -> bool:
     """Whether the agent function opts this page into origin capture. Anything but True, including an error, is no."""
     try:
         decision = app.AGENT_FUNCTION.should_capture_scrape_origin(url)
@@ -737,12 +738,14 @@ async def scrape_web_unsafe(
     # Each tree read decides from the page it reads whether the scrape captures an origin; only the final read counts.
     witness_token = ""
     witness_url: str | None = None
+    witness_navigation: DocumentNavigation | None = None
 
     async def read_tree() -> tuple[list[dict], list[dict], dict[str, dict], FlutterSemanticsState]:
-        nonlocal witness_token, witness_url
-        witness_token, witness_url = "", None
+        nonlocal witness_token, witness_url, witness_navigation
+        witness_token, witness_url, witness_navigation = "", None, None
         read_url = page.url
-        if _captures_origin(read_url):
+        if captures_origin(read_url):
+            witness_navigation = browser_state.committed_document_navigation(page)
             witness_token = await _arm_dom_change_witness(page, browser_state.engine_selection)
             witness_url = read_url
         flutter_state = FlutterSemanticsState()
@@ -791,6 +794,7 @@ async def scrape_web_unsafe(
     source_html: str | None = None
     source_read_at: datetime | None = None
     source_read_url: str | None = None
+    source_navigation: DocumentNavigation | None = None
     dom_unchanged = False
     if witness_token and witness_url == url:
         try:
@@ -801,6 +805,9 @@ async def scrape_web_unsafe(
             source_read_at = datetime.now(UTC)
             source_read_url = page.url
             dom_unchanged = await _dom_unchanged_since_armed(page, witness_token, browser_state.engine_selection)
+            # Known only when the same commit stood from before the tree was read until after its html was.
+            navigation_now = browser_state.committed_document_navigation(page)
+            source_navigation = witness_navigation if navigation_now == witness_navigation else None
         except Exception:
             LOG.debug("Could not read the scrape's origin html", exc_info=True)
 
@@ -958,7 +965,7 @@ async def scrape_web_unsafe(
             and source_read_url == url
             and dom_unchanged
         ):
-            scraped_page.bind_origin(page, source_read_at, source_html)
+            scraped_page.bind_origin(page, source_read_at, source_html, source_navigation)
         return scraped_page
     except Exception:
         raise

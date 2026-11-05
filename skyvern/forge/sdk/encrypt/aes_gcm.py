@@ -36,5 +36,5 @@ class AESGCMEncryptor(BaseEncryptor):
             data = base64.b64decode(ciphertext.encode("utf-8"), validate=True)
             nonce, sealed = data[:_NONCE_BYTES], data[_NONCE_BYTES:]
             return AESGCM(self._key).decrypt(nonce, sealed, None).decode("utf-8")
-        except Exception as e:
-            raise TokenDecryptionError("Failed to decrypt token") from e
+        except Exception:
+            raise TokenDecryptionError("Failed to decrypt token") from None

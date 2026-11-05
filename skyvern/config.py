@@ -598,9 +598,6 @@ class Settings(BaseSettings):
     # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
     # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
     TASK_V3_LOGIN_PACE: bool = False
-    # Return an in-loop navigate's 404/410 to the model as the navigate result instead of ending the run (SKY-16206).
-    # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
-    TASK_V3_DEAD_END_RETURN: bool = False
     # The acting model declares whether a run is a job application, and only a yes delivers the application defaults.
     # Force-on term only: runs are randomized per run by the flag of the same name (APPLICATION_CONTEXT_FLAG).
     TASK_V3_APPLICATION_CONTEXT: bool = False

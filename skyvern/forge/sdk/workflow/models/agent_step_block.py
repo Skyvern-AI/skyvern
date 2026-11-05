@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import Any, ClassVar, Literal
 
 import structlog
+from pydantic import field_validator
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.schemas.agent_step_tool_names import current_tool_names
 from skyvern.schemas.workflows import AGENT_STEP_LLM_FLAG, BlockResult, BlockStatus, BlockType
 
 LOG = structlog.get_logger()
@@ -58,6 +60,11 @@ class AgentStepBlock(Block):
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"prompt"})
 
+    @field_validator("tools")
+    @classmethod
+    def map_retired_tool_names(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else current_tool_names(value)
+
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
@@ -90,8 +97,13 @@ class AgentStepBlock(Block):
             workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, prompt=self.prompt
         )
         try:
+            run_context.reject_platform_smtp_references(self.model_dump())
             prompt = self.render_templatable_field("prompt", self.prompt, run_context)
             self._apply_workflow_system_prompt(run_context)
+            prompt = run_context.mask_platform_smtp_for_agent(prompt)
+            if self.workflow_system_prompt is not None:
+                self.workflow_system_prompt = run_context.mask_platform_smtp_for_agent(self.workflow_system_prompt)
+                run_context.record_block_workflow_system_prompt(self.label, self.workflow_system_prompt)
         except Exception as e:
             return await self._template_format_failure_result(
                 e,

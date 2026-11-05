@@ -113,6 +113,7 @@ TerminalCause = Literal[
     "saved_profile_unresolved",
     "saved_profile_not_applied",
     "unsaved_browser_profile_pick",
+    "browser_start_capacity",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -1575,6 +1576,8 @@ def _required_input_unbound_outcome(
         key_provenance={
             "structural_failure_identity": (
                 "resolution-seam unbound required parameter keys referenced by the failed block"
+                if failed_block is not None
+                else "blank inputs that run-context init resolves as required login credential fields"
             )
         },
     )
@@ -1595,6 +1598,7 @@ def recorded_outcome_from_run_blocks_result(
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
     runtime_failure_class: str | None = None,
+    blank_login_credential_input_keys: Sequence[str] = (),
 ) -> RecordedBuildTestOutcome | None:
     outcome = _recorded_outcome_from_run_blocks_result(
         result,
@@ -1610,6 +1614,7 @@ def recorded_outcome_from_run_blocks_result(
         block_shape_hashes=block_shape_hashes,
         block_associations_by_label=block_associations_by_label,
         runtime_failure_class=runtime_failure_class,
+        blank_login_credential_input_keys=blank_login_credential_input_keys,
     )
     if outcome is None:
         return None
@@ -1636,6 +1641,7 @@ def _recorded_outcome_from_run_blocks_result(
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
     runtime_failure_class: str | None = None,
+    blank_login_credential_input_keys: Sequence[str] = (),
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
@@ -1685,6 +1691,7 @@ def _recorded_outcome_from_run_blocks_result(
         failed_block,
         unbound_required_parameter_keys or [],
         block_parameter_keys or {},
+        blank_login_credential_input_keys,
     )
     graded_page_evidence = page_evidence if _post_run_page_evidence_matches_result(data, page_evidence) else None
     page_refs = _page_evidence_refs(graded_page_evidence)
@@ -2433,8 +2440,15 @@ def _referenced_unbound_input_keys(
     failed_block: Mapping[str, object] | None,
     unbound_required_parameter_keys: Sequence[str],
     block_parameter_keys: Mapping[str, Sequence[str]],
+    blank_login_credential_input_keys: Sequence[str],
 ) -> list[str]:
-    if bool(result.get("ok")) is not False or failed_block is None:
+    if bool(result.get("ok")) is not False:
+        return []
+    if failed_block is None:
+        data = _dict(result.get("data"))
+        # Login credentials resolve at run-context init, which fails before any block runs or a watchdog acts.
+        if data.get("blocks") == [] and data.get("control_signal") is None:
+            return list(dict.fromkeys(blank_login_credential_input_keys))
         return []
     label = _safe_str(failed_block.get("label"))
     referenced = block_parameter_keys.get(label) if label else None

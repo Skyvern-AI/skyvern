@@ -15,10 +15,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from skyvern.forge import app
+from skyvern.forge.sdk.db.enums import BrowserSeedSource
 from skyvern.forge.sdk.schemas.credentials import credential_auto_profile_disabled
 from skyvern.forge.sdk.workflow.browser_profile_key import build_workflow_browser_session_storage_key
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_manager import BrowserCleanupResult
 from skyvern.webeye.profile_cookie_merge import BANKED_COOKIES_FILENAME
 
@@ -683,6 +685,62 @@ async def test_sink_changed_false_on_verified_login_unchanged_or_unknown(monkeyp
     monkeypatch.setattr(app.STORAGE, "get_browser_profile_etag", AsyncMock(return_value=None))
     bs_unknown_now = _make_browser_state_b2(seed_cookies=[], seed_etag="etag_seed", fresh_login=False)
     assert await svc._sink_profile_changed_under_run(wr, "bp", bs_unknown_now) is False
+
+
+async def _save_twice_through_one_lane_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    seeds: tuple[tuple[str | None, BrowserSeedSource], tuple[str | None, BrowserSeedSource]],
+    etag_after_each_write: str,
+) -> AsyncMock:
+    stored = {"etag": "etag_boot"}
+
+    async def store_browser_profile(organization_id: str, *, profile_id: str, directory: str) -> None:
+        stored["etag"] = etag_after_each_write
+
+    store = AsyncMock(side_effect=store_browser_profile)
+    monkeypatch.setattr(app.STORAGE, "store_browser_profile", store)
+    monkeypatch.setattr(app.STORAGE, "get_browser_profile_etag", AsyncMock(side_effect=lambda *_: stored["etag"]))
+    artifacts = BrowserArtifacts(browser_session_dir=str(tmp_path), applied_browser_profile_id="bp_own")
+    artifacts.record_seed_profile_state([], "etag_boot")
+    lane_browser = SimpleNamespace(
+        browser_artifacts=artifacts, browser_context=SimpleNamespace(cookies=AsyncMock(return_value=[]))
+    )
+    for workflow_run_id, (seed_profile_id, seed_source) in zip(("wr_first", "wr_next"), seeds):
+        workflow_run = _make_workflow_run(
+            WorkflowRunStatus.completed, browser_profile_id=seed_profile_id, browser_sink_profile_id="bp_own"
+        )
+        workflow_run.workflow_run_id = workflow_run_id
+        workflow_run.browser_seed_source = seed_source
+        await WorkflowService()._persist_run_sink_profile_if_needed(
+            workflow_run=workflow_run,
+            browser_state=lane_browser,
+            close_browser_on_completion=False,
+            effective_workflow_run_status=WorkflowRunStatus.completed,
+        )
+    return store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "next_seed",
+    [
+        pytest.param(("bp_own", BrowserSeedSource.own_memory), id="seeded_next_run"),
+        pytest.param((None, BrowserSeedSource.own_memory), id="seedless_next_run"),
+    ],
+)
+async def test_lane_run_does_not_overwrite_a_write_interleaved_after_the_previous_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, next_seed: tuple[str | None, BrowserSeedSource]
+) -> None:
+    store = await _save_twice_through_one_lane_browser(
+        monkeypatch,
+        tmp_path,
+        seeds=(("bp_own", BrowserSeedSource.own_memory), next_seed),
+        etag_after_each_write="etag_other_writer",
+    )
+
+    assert [call.kwargs["directory"] for call in store.await_args_list] == [str(tmp_path)]
 
 
 @pytest.mark.asyncio

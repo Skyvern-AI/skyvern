@@ -21,6 +21,7 @@ import {
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 
 import { DocEditBar, DocStepPicker } from "./DocEditing";
+import { caretOnEdge } from "./docCaret";
 import { DocStepHeader } from "./DocStep";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { createDocEditApi, TOP_SCOPE } from "./docEditApi";
@@ -36,6 +37,17 @@ const catalogState = vi.hoisted(() => ({
     | undefined,
 }));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({
+    runId: undefined,
+    run: undefined,
+    blocksByLabel: new Map(),
+    loopsByLabel: new Map(),
+    live: false,
+    blockRun: false,
+    unknownLabels: new Set(),
+  }),
+}));
 vi.mock("@/hooks/useIntegrationCatalogQuery", () => ({
   useIntegrationCatalogQuery: () => ({ data: catalogState.data }),
 }));
@@ -48,6 +60,15 @@ afterEach(() => {
   useWorkflowHistoryAccessStore.getState().reset();
   useWorkflowSnapshotStore.getState().clearSnapshot();
   useWorkflowHasChangesStore.setState({ hasChanges: false });
+});
+
+describe("Doc edit bar row", () => {
+  test("an idle bar reserves its phone row only when it floats", () => {
+    const { container, rerender } = render(<DocEditBar floating />);
+    expect(container.querySelector('[aria-hidden="true"]')).toBeTruthy();
+    rerender(<DocEditBar />);
+    expect(container.querySelector('[aria-hidden="true"]')).toBe(null);
+  });
 });
 
 describe("Doc Save", () => {
@@ -72,6 +93,19 @@ describe("Doc Save", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  test("Cmd+S saves the Doc and keeps the browser's own save out", () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    render(<DocEditBar />);
+
+    const proceeded = fireEvent.keyDown(document.body, {
+      key: "s",
+      metaKey: true,
+    });
+
+    expect(proceeded).toBe(false);
     expect(save).toHaveBeenCalledTimes(1);
   });
 
@@ -130,7 +164,7 @@ describe("Doc Save", () => {
       contentDirty: false,
     });
     useWorkflowHistoryAccessStore.setState({ canRedo: true });
-    render(<DocEditBar reserve />);
+    render(<DocEditBar floating />);
 
     await waitFor(() => expect(screen.getByText("Saved")).toBeTruthy());
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
@@ -243,5 +277,39 @@ describe("Add a step search", () => {
     );
     fireEvent.change(input, { target: { value: "For" } });
     expect(screen.getAllByRole("option")[0]!.textContent).toMatch(/^Loop/);
+  });
+});
+
+describe("caretOnEdge", () => {
+  test("a caret with no box in the middle of wrapped text is not on an edge", () => {
+    const rect = (top: number, height: number) =>
+      ({ top, bottom: top + height, height }) as DOMRect;
+    const el = document.createElement("div");
+    el.contentEditable = "true";
+    el.textContent = "first wrapped line second wrapped line";
+    el.getBoundingClientRect = () => rect(0, 40);
+    document.body.appendChild(el);
+    const proto = Range.prototype as unknown as Record<string, unknown>;
+    const saved = [proto.getClientRects, proto.getBoundingClientRect];
+    // jsdom has no layout: a collapsed caret has no box, and the one character next to it sits on the second line.
+    proto.getBoundingClientRect = () => rect(0, 0);
+    proto.getClientRects = function (this: Range) {
+      return this.startOffset === 25 && this.endOffset === 26
+        ? [rect(20, 20)]
+        : [];
+    };
+    try {
+      const text = el.firstChild as Text;
+      const range = document.createRange();
+      range.setStart(text, 25);
+      range.collapse(true);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      expect(caretOnEdge(el, "first")).toBe(false);
+      expect(caretOnEdge(el, "last")).toBe(true);
+    } finally {
+      [proto.getClientRects, proto.getBoundingClientRect] = saved;
+      el.remove();
+    }
   });
 });

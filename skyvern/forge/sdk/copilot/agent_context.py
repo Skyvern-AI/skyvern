@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from skyvern.cli.core.session_manager import RequestFailureLog
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, CopilotToolSurfaceIdentity
+    from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
     from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
@@ -342,6 +343,7 @@ class AgentContext:
     # Whether the session this turn lost was ended by the deadline its infrastructure fixes, rather
     # than by an unexplained browser failure. Reported to the model and the user as the cause.
     browser_session_continuity_deadline_expired: bool = False
+    browser_session_continuity_acquisition_failure: BuildTestConnectFailure | None = None
     # Each unsolved challenge solve can bill an external solver, so it is counted per browser session.
     unsolved_page_challenges_by_session_id: dict[str, int] = field(default_factory=dict)
     image_captcha_reads: int = 0

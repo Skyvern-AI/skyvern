@@ -7,6 +7,8 @@ type WorkflowPresentationStore = {
   workflowPermanentId: string | null;
   enabled: boolean;
   generation: number;
+  docMounted: boolean;
+  setDocMounted: (mounted: boolean) => void;
   syncScope: (workflowPermanentId: string | null, enabled: boolean) => void;
   setPresentation: (presentation: WorkflowPresentation) => void;
 };
@@ -23,6 +25,11 @@ function readStored(workflowPermanentId: string | null): WorkflowPresentation {
   } catch {
     return "visual";
   }
+}
+
+// An agent born from a demonstration opens in the Doc the first time; any later choice replaces this.
+export function openNewAgentInDoc(workflowPermanentId: string) {
+  writeStored(workflowPermanentId, "doc");
 }
 
 function writeStored(
@@ -44,6 +51,8 @@ export const useWorkflowPresentationStore = create<WorkflowPresentationStore>(
     workflowPermanentId: null,
     enabled: false,
     generation: 0,
+    docMounted: false,
+    setDocMounted: (docMounted) => set({ docMounted }),
     syncScope: (workflowPermanentId, enabled) => {
       const state = get();
       if (

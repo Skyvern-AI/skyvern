@@ -84,6 +84,7 @@ _BUILD_TEST_FAILURE_REASON_MAX_CHARS = 1_200
 _BUILD_TEST_LABEL_MAX_ITEMS = 24
 _BUILD_TEST_OUTPUT_MAX_ITEMS = 12
 _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS = 800
+OUTPUT_VALUE_MAX_CHARS = 200
 # The share of that cap a failure reason may hold before it starts crowding out available_keys, and
 # the shortest it is worth trimming one to.
 _AVAILABLE_KEYS_REASON_SHARE = 400
@@ -918,6 +919,21 @@ def _clipped_120(text: str | None) -> str | None:
     return text[:117] + "..." if text is not None and len(text) > 120 else text
 
 
+REGISTERED_OUTPUTS_NOTICE_PREFIX = "registered_outputs "
+DOWNLOADS_NOTICE_PREFIX = "downloads "
+
+
+def bound_output_value(value: JsonValue, value_complete: bool) -> tuple[JsonValue, bool]:
+    # An incomplete string is already-rendered text; quoting it again would escape it and grow it on every pass.
+    if isinstance(value, str) and not value_complete:
+        rendered = value
+    else:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) > OUTPUT_VALUE_MAX_CHARS:
+        return rendered[: OUTPUT_VALUE_MAX_CHARS - 3] + "...", False
+    return value, value_complete
+
+
 def _compact_packet_for_aggregate_limit(
     packet: BuildTestEvidencePacket,
     notices: list[str],
@@ -930,15 +946,8 @@ def _compact_packet_for_aggregate_limit(
     for output in _compacted(
         packet.registered_outputs, 6, field_name="registered_outputs", notices=notices, keep="first"
     ):
-        rendered = json.dumps(output.output, ensure_ascii=False, separators=(",", ":"))
-        outputs.append(
-            output.model_copy(
-                update={
-                    "output": rendered[:197] + "..." if len(rendered) > 200 else output.output,
-                    "value_complete": output.value_complete and len(rendered) <= 200,
-                }
-            )
-        )
+        value, value_complete = bound_output_value(output.output, output.value_complete)
+        outputs.append(output.model_copy(update={"output": value, "value_complete": value_complete}))
 
     def compact_page_state(
         page_state: BuildTestPacketPageState | None, *, field_prefix: str
@@ -1279,7 +1288,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(packet.registered_outputs) > _BUILD_TEST_OUTPUT_MAX_ITEMS:
         append_omission_notice(
             notices,
-            "registered_outputs shortened: "
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}shortened: "
             f"{len(packet.registered_outputs) - _BUILD_TEST_OUTPUT_MAX_ITEMS} item(s) omitted.",
         )
 
@@ -1379,7 +1388,8 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(packet.downloads) > _BUILD_TEST_DOWNLOAD_MAX_ITEMS:
         append_omission_notice(
             notices,
-            f"downloads shortened: {len(packet.downloads) - _BUILD_TEST_DOWNLOAD_MAX_ITEMS} item(s) omitted.",
+            f"{DOWNLOADS_NOTICE_PREFIX}shortened: "
+            f"{len(packet.downloads) - _BUILD_TEST_DOWNLOAD_MAX_ITEMS} item(s) omitted.",
         )
     unfinished = [
         item.model_copy(
@@ -1534,7 +1544,8 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
         notices.append("executed_block_labels omitted: no block execution was recorded.")
     if not packet.registered_outputs:
         notices.append(
-            "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}empty: no workflow run block output or registered output-parameter "
+            "value was recorded."
         )
     redacted_output_count = sum(
         REDACTED_SECRET_PLACEHOLDER in json.dumps(output.output, ensure_ascii=False)
@@ -1542,10 +1553,11 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
     )
     if redacted_output_count:
         notices.append(
-            f"registered_outputs redacted {redacted_output_count} item(s) containing registered secret values."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}redacted {redacted_output_count} item(s) containing registered secret "
+            "values."
         )
     if not packet.downloads:
-        notices.append("downloads empty: no registered download artifact was recorded.")
+        notices.append(f"{DOWNLOADS_NOTICE_PREFIX}empty: no registered download artifact was recorded.")
     if not packet.screenshot.present:
         notices.append("screenshot omitted: no final or failed-block screenshot was recorded.")
     if not packet.unfinished_items:
