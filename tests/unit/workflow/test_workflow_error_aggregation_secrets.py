@@ -6,8 +6,10 @@ from typing import Any
 import structlog
 from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
 from skyvern.forge.sdk.workflow import service
-from skyvern.forge.sdk.workflow.service import _merge_workflow_run_errors
+from skyvern.forge.sdk.workflow.service import _errors_without_child_run_text, _merge_workflow_run_errors
+from tests.unit.helpers import merge_block_error_reasons
 
 SHORT_SECRET = "587"
 MASK = "[redacted]"
@@ -51,7 +53,7 @@ def _string_values(value: object) -> list[str]:
 
 
 def test_aggregation_scrubs_short_secret_from_typed_reasoning() -> None:
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("block", [], None, {"errors": [_typed_error("typed", f"PIN {SHORT_SECRET} leaked")]}, "code")],
         registered_secret_values={SHORT_SECRET},
@@ -61,7 +63,7 @@ def test_aggregation_scrubs_short_secret_from_typed_reasoning() -> None:
 
 
 def test_aggregation_scrubs_short_secret_from_legacy_reasoning() -> None:
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("block", ["legacy"], f"PIN {SHORT_SECRET} leaked", None, "code")],
         registered_secret_values={SHORT_SECRET},
@@ -71,7 +73,7 @@ def test_aggregation_scrubs_short_secret_from_legacy_reasoning() -> None:
 
 
 def test_aggregation_normalizes_then_scrubs_secret_from_legacy_reasoning() -> None:
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("block", ["legacy"], "PIN 5\u200b87 leaked", None, "code")],
         registered_secret_values={SHORT_SECRET},
@@ -86,7 +88,7 @@ def test_aggregation_normalizes_then_scrubs_secret_from_legacy_reasoning() -> No
 
 
 def test_aggregation_scrubs_short_card_secrets_from_all_reasoning_sinks() -> None:
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [
             (
@@ -107,7 +109,7 @@ def test_aggregation_scrubs_short_card_secrets_from_all_reasoning_sinks() -> Non
 
 def test_aggregation_skips_code_containing_short_secret_and_warns() -> None:
     with captured_drop_warnings() as logs:
-        errors = _merge_workflow_run_errors(
+        errors = merge_block_error_reasons(
             [],
             [
                 ("legacy", [f"legacy_{SHORT_SECRET}"], "failure", None, "code"),
@@ -129,7 +131,7 @@ def test_aggregation_skips_code_containing_short_secret_and_warns() -> None:
 
 def test_aggregation_normalizes_then_drops_code_containing_short_secret_and_warns() -> None:
     with captured_drop_warnings() as logs:
-        errors = _merge_workflow_run_errors(
+        errors = merge_block_error_reasons(
             [],
             [("legacy", ["ERR_5\u200b87"], "failure", None, "code")],
             registered_secret_values={SHORT_SECRET},
@@ -145,7 +147,7 @@ def test_aggregation_normalizes_then_drops_code_containing_short_secret_and_warn
 def test_aggregation_preserves_non_secret_category_c_reasoning_byte_for_byte() -> None:
     reasoning = "network\u200b failure"
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("block", ["legacy"], reasoning, None, "code")],
         registered_secret_values={SHORT_SECRET},
@@ -157,7 +159,7 @@ def test_aggregation_preserves_non_secret_category_c_reasoning_byte_for_byte() -
 def test_aggregation_preserves_only_category_c_reasoning_byte_for_byte() -> None:
     reasoning = "\u200b"
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("block", ["legacy"], reasoning, None, "code")],
         registered_secret_values={SHORT_SECRET},
@@ -168,7 +170,7 @@ def test_aggregation_preserves_only_category_c_reasoning_byte_for_byte() -> None
 
 def test_aggregation_preserves_empty_legacy_reasoning_with_registered_secrets() -> None:
     for failure_reason in (None, ""):
-        errors = _merge_workflow_run_errors(
+        errors = merge_block_error_reasons(
             [],
             [("block", ["legacy"], failure_reason, None, "code")],
             registered_secret_values={SHORT_SECRET},
@@ -178,7 +180,7 @@ def test_aggregation_preserves_empty_legacy_reasoning_with_registered_secrets() 
 
 
 def test_aggregation_replaces_reasoning_that_is_exactly_a_registered_secret() -> None:
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("block", ["legacy"], SHORT_SECRET, None, "code")],
         registered_secret_values={SHORT_SECRET},
@@ -190,7 +192,7 @@ def test_aggregation_replaces_reasoning_that_is_exactly_a_registered_secret() ->
 def test_aggregation_without_context_or_registry_passes_through() -> None:
     typed = _typed_error(f"typed_{SHORT_SECRET}", f"PIN {SHORT_SECRET} leaked")
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("block", [f"legacy_{SHORT_SECRET}"], f"PIN {SHORT_SECRET} leaked", {"errors": [typed]}, "code")],
     )
@@ -208,7 +210,7 @@ def test_secret_scrub_preserves_order_dedupe_upgrade_and_100_cap() -> None:
     task_errors.append(dict(task_errors[0]))
     typed = _typed_error("upgrade", f"typed {SHORT_SECRET}")
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         task_errors,
         [
             ("block", ["upgrade", "last"], f"legacy {SHORT_SECRET}", {"errors": [typed]}, "code"),
@@ -221,3 +223,112 @@ def test_secret_scrub_preserves_order_dedupe_upgrade_and_100_cap() -> None:
     assert [error["error_code"] for error in errors[:98]] == [f"task_{index}" for index in range(98)]
     assert errors[98] == _typed_error("upgrade", f"typed {MASK}")
     assert errors[99] == {"error_code": "last", "reasoning": f"legacy {MASK}", "confidence_float": 1.0}
+
+
+def test_block_rows_carry_their_block_and_masked_code_failure_facts() -> None:
+    raw_message = f"No visible input for PIN {SHORT_SECRET}."
+    output = {
+        "errors": [{"error_code": "user_code_error", "reasoning": "ignored", "confidence_float": 1.0}],
+        "code_failure": {
+            "exception_class": "ValueError",
+            "message": raw_message,
+            "line": 4,
+            "source_line": f'raise ValueError("No visible input for PIN {SHORT_SECRET}.")',
+        },
+    }
+    errors = _merge_workflow_run_errors(
+        [],
+        [
+            WorkflowRunBlockErrorRow(
+                workflow_run_block_id="wrb_row0",
+                error_codes=["user_code_error"],
+                failure_reason=f"CodeBlock failed with ValueError at line 4: {raw_message}",
+                output=output,
+                block_type="code",
+                label="fill_policy_dates",
+                current_index=0,
+                final_url=f"https://quote.test/step?pin={SHORT_SECRET}",
+            ),
+            WorkflowRunBlockErrorRow("wrb_parser", ["file_parser_error"], "parser reason", None, "file_url_parser"),
+        ],
+        registered_secret_values={SHORT_SECRET},
+    )
+
+    assert errors == [
+        {
+            "error_code": "user_code_error",
+            "reasoning": f"CodeBlock failed with ValueError at line 4: No visible input for PIN {MASK}.",
+            "confidence_float": 1.0,
+            "workflow_run_block_id": "wrb_row0",
+            "block_label": "fill_policy_dates",
+            "block_type": "code",
+            "loop_index": 0,
+            "final_url": f"https://quote.test/step?pin={MASK}",
+            "exception_class": "ValueError",
+            "exception_message": f"No visible input for PIN {MASK}.",
+            "failing_line": 4,
+            "source_line": f'raise ValueError("No visible input for PIN {MASK}.")',
+        },
+        {
+            "error_code": "file_parser_error",
+            "reasoning": "parser reason",
+            "confidence_float": 1.0,
+            "workflow_run_block_id": "wrb_parser",
+            "block_label": None,
+            "block_type": "file_url_parser",
+            "loop_index": None,
+            "final_url": None,
+        },
+    ]
+    assert all(SHORT_SECRET not in text for text in _string_values(errors))
+
+    # Mask Secrets redacted the stored reason further than the message: the message is dropped, not shown in clear.
+    [stored_redacted] = _merge_workflow_run_errors(
+        [],
+        [
+            WorkflowRunBlockErrorRow(
+                "wrb_row0",
+                ["user_code_error"],
+                "CodeBlock failed with ValueError at line 4: [REDACTED]",
+                output,
+                "code",
+            )
+        ],
+    )
+    assert stored_redacted["exception_message"] is None
+
+
+def test_child_run_redaction_keeps_only_the_timeline_block_metadata() -> None:
+    row = {
+        "error_code": "user_code_error",
+        "error_type": "SYSTEM_DEFINED_ERROR",
+        "confidence_float": 1.0,
+        "workflow_run_block_id": "wrb_row0",
+        "block_type": "code",
+        "reasoning": "failed on https://quote.test/step",
+        "block_label": "fill_policy_dates",
+        "loop_index": 0,
+        "final_url": "https://quote.test/step",
+        "exception_class": "ValueError",
+        "exception_message": "No input on the step.",
+        "failing_line": 4,
+        "source_line": 'raise ValueError("No input on the step.")',
+        "future_key": {"nested": "text"},
+    }
+    visible = {"error_code", "error_type", "confidence_float", "workflow_run_block_id", "block_type"}
+
+    redacted = _errors_without_child_run_text([row, {"error_code": "task_error", "reasoning": "", "final_url": None}])
+
+    assert {key: redacted[0][key] for key in visible} == {key: row[key] for key in visible}
+    assert {key: value for key, value in redacted[0].items() if key not in visible} == {
+        "reasoning": service.REDACTED_ARTIFACT,
+        "block_label": service.REDACTED_ARTIFACT,
+        "loop_index": None,
+        "final_url": service.REDACTED_ARTIFACT,
+        "exception_class": service.REDACTED_ARTIFACT,
+        "exception_message": service.REDACTED_ARTIFACT,
+        "failing_line": None,
+        "source_line": service.REDACTED_ARTIFACT,
+        "future_key": None,
+    }
+    assert redacted[1] == {"error_code": "task_error", "reasoning": service.REDACTED_ARTIFACT, "final_url": None}
