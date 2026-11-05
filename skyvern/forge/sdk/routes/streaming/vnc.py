@@ -241,6 +241,7 @@ async def stream(
     try:
         LOG.info(
             "Starting vnc loops.",
+            browser_session_id=browser_session_id,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
@@ -264,6 +265,7 @@ async def stream(
     finally:
         LOG.info(
             "Closing the vnc session.",
+            browser_session_id=browser_session_id,
             task_id=task_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
