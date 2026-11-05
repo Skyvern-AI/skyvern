@@ -11,6 +11,7 @@ identifies it.
 
 import time
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from types import FrameType
 from typing import Any, NamedTuple, TypeVar, TypeVarTuple, Unpack
 
@@ -34,6 +35,12 @@ _Ts = TypeVarTuple("_Ts")
 # o200k averages about 4 characters a token in English prose, so a child that stops reading pages at 8 characters
 # per allowed token still returns every page the token cap keeps; the exact cut happens in the parent.
 _CHARS_PER_TOKEN_STOP = 8
+
+
+@dataclass
+class PdfExtractStats:
+    page_count: int = 0
+    truncated: bool = False
 
 
 class _ResultLimit(NamedTuple):
@@ -260,6 +267,7 @@ def extract_pdf_file(
     file_path: str,
     file_identifier: str | None = None,
     max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
+    stats: PdfExtractStats | None = None,
 ) -> str:
     """
     Extract text from a PDF file with fallback support.
@@ -273,6 +281,7 @@ def extract_pdf_file(
         file_path: Path to the PDF file to parse
         file_identifier: Optional identifier for logging (e.g., URL or filename).
                         If not provided, uses file_path.
+        stats: Optional out-param that receives the page count and whether a limit cut the text.
 
     Returns:
         Extracted text from all pages of the PDF
@@ -288,6 +297,7 @@ def extract_pdf_file(
     identifier = file_identifier or file_path
     log_identifier = identifier.partition("?")[0]
     started_at = time.monotonic()
+    stats = stats if stats is not None else PdfExtractStats()
 
     # Try pypdf first
     try:
@@ -295,6 +305,7 @@ def extract_pdf_file(
         extracted_text = ""
         current_tokens = 0
         page_count = len(reader.pages)
+        stats.page_count = page_count
 
         for i in range(page_count):
             page_text = reader.pages[i].extract_text() or ""
@@ -308,6 +319,7 @@ def extract_pdf_file(
                         total_pages=page_count,
                         max_tokens=max_tokens,
                     )
+                    stats.truncated = True
                     break
                 current_tokens += page_tokens
             extracted_text += page_text + "\n"
@@ -378,6 +390,8 @@ def extract_pdf_file(
                 else:
                     page_texts, page_count, read_every_page = more_texts, more_page_count, more_read_every_page
                     extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
+            stats.page_count = page_count
+            stats.truncated = truncated_at_page is not None or not read_every_page
             if truncated_at_page is not None:
                 LOG.warning(
                     "PDF text exceeds token limit, truncating at page boundary",

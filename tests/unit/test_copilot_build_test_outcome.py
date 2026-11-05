@@ -40,6 +40,8 @@ from skyvern.forge.sdk.copilot.build_test_connect_failure import (
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
     BLOCK_FACT_URL_MAX_CHARS,
+    DOWNLOAD_TEXT_OVER_PACKET_LIMIT,
+    DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
     OBSERVED_BLOCK_END_URLS_EMPTY,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -231,7 +233,7 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
 
 
 def _evidence_naming(run_id: str, file_name: str) -> RegisteredArtifactEvidence:
-    entry = RegisteredArtifactEntry(artifact_id="a_dl_9", file_name=file_name, parsed_text="text")
+    entry = RegisteredArtifactEntry(artifact_id="a_dl_9", file_name=file_name, text="text")
     return RegisteredArtifactEvidence(entries=(entry,), workflow_run_id=run_id)
 
 
@@ -279,6 +281,64 @@ def test_registered_block_download_reaches_packet_with_its_best_known_name(
 
     assert [(d.artifact_id, d.file_name, d.generated) for d in packet.downloads] == [("a_dl_9", expected_name, None)]
     assert any("another run" in notice for notice in packet.omission_notices) is expect_other_run_notice
+
+
+def _statement_download(index: int) -> BuildTestPacketDownload:
+    return BuildTestPacketDownload(
+        artifact_id=f"a_dl_{index}",
+        file_name=f"statement_{index}.pdf",
+        text="Amount due 89.68 " * 1_000,
+        page_count=2,
+        char_count=17_000,
+        truncated=False,
+    )
+
+
+def test_an_over_budget_packet_shortens_download_text_before_the_workflow_readback() -> None:
+    packet = build_test_evidence_packet(make_copilot_ctx(), {"ok": True, "data": {"workflow_run_id": "wr_1"}})
+    statement = BuildTestPacketDownload(
+        artifact_id="a_dl_1",
+        file_name="statement.pdf",
+        text="Amount due 89.68 " * 1_200,
+        page_count=2,
+        char_count=20_400,
+        truncated=False,
+    )
+    oversized = packet.model_copy(
+        update={
+            "canonical_workflow_yaml": "w" * 29_000,
+            "canonical_workflow_yaml_complete": True,
+            "downloads": [statement],
+        }
+    )
+
+    projected = project_build_test_packet_for_llm(oversized)
+
+    assert projected.canonical_workflow_yaml == "w" * 29_000
+    assert projected.canonical_workflow_yaml_complete is True
+    shortened = projected.downloads[0]
+    assert shortened.text is not None and statement.text is not None
+    assert 0 < len(shortened.text) < len(statement.text)
+    assert statement.text.startswith(shortened.text)
+    assert (shortened.page_count, shortened.char_count, shortened.truncated) == (2, 20_400, True)
+    assert DOWNLOAD_TEXT_OVER_PACKET_LIMIT in projected.omission_notices
+    assert len(json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)) <= 47_000
+
+
+def test_the_direct_test_handoff_keeps_download_text_omission_notices() -> None:
+    packet = build_test_evidence_packet(make_copilot_ctx(), {"ok": True, "data": {"workflow_run_id": "wr_1"}})
+    recorded = packet.model_copy(
+        update={
+            "downloads": [_statement_download(1)],
+            "omission_notices": [DOWNLOAD_TEXT_PAST_CHAR_LIMIT, "run-supplied prose that must not be relayed"],
+        }
+    )
+
+    handoff = project_direct_test_handoff_packet_for_llm(recorded)
+
+    assert DOWNLOAD_TEXT_PAST_CHAR_LIMIT in handoff.omission_notices
+    assert "run-supplied prose that must not be relayed" not in handoff.omission_notices
+    assert handoff.downloads[0].text == _statement_download(1).text
 
 
 def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> None:

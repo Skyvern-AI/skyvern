@@ -20,6 +20,7 @@ from datetime import datetime
 from datetime import time as stdlib_time
 from datetime import timedelta, timezone
 from functools import partial
+from pathlib import Path
 from types import FunctionType, SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import AsyncMock, MagicMock
@@ -32,10 +33,15 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from structlog.testing import capture_logs
 
 import skyvern.forge.sdk.copilot.code_block_security as code_block_security
+import skyvern.forge.sdk.workflow.document_text as document_text
 import skyvern.forge.sdk.workflow.models.block as block_module
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot.code_block_security import rendering_introduced_security_errors
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
+from skyvern.forge.sdk.workflow.code_block_authorized_files import (
+    MaterializedAuthorizedFile,
+    capture_authorized_file,
+)
 from skyvern.forge.sdk.workflow.code_block_safety import (
     ALWAYS_DENIED_BUILTINS,
     SANDBOX_ONLY_BUILTINS,
@@ -43,6 +49,7 @@ from skyvern.forge.sdk.workflow.code_block_safety import (
     safe_builtins,
 )
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.document_text import ClaimedDocuments
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToFormatJinjaStyleParameter,
     InsecureCodeDetected,
@@ -59,6 +66,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     _resolve_code_block_otp,
     _resolve_code_block_otp_for_identifier,
     dispose_opened_code_block_pages,
+    read_pdf_text_layer,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import RecordingPage
 from skyvern.forge.sdk.workflow.models.credential_release import (
@@ -3813,6 +3821,134 @@ class TestSearchWebHelperBinding:
             (200, None, 2)
         ] * 4
         assert context.opened == []
+
+
+class TestReadDocumentTextHelperBinding:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("spelling", ["read_document_text", "\uff52ead_document_text"])
+    async def test_code_that_names_the_helper_reads_the_download_it_claimed(
+        self, spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        code = f'name = await click_and_claim_download(page, "#bill")\nreturn await {spelling}(name)\n'
+        run_directory = tmp_path / "wr_read"
+        run_directory.mkdir()
+        (run_directory / "bill.txt").write_bytes(b"Total 12.50")
+        materialized = capture_authorized_file(
+            run_directory / "bill.txt",
+            download_root=tmp_path,
+            workflow_run_id="wr_read",
+            organization_id="o_read",
+            max_bytes=1024,
+        )
+        download = SimpleNamespace(suggested_filename="bill.txt")
+
+        async def claim(*args: Any, outcome_recorder: Any, on_claimed: Callable[[Any], None], **kwargs: Any) -> str:
+            on_claimed(download)
+            outcome_recorder.record("returned_proven")
+            return "bill.txt"
+
+        async def capture(source: object, **kwargs: object) -> MaterializedAuthorizedFile:
+            assert source is download
+            return materialized
+
+        monkeypatch.setattr(block_module, "_code_block_click_and_claim_download_builtin", claim)
+        monkeypatch.setattr(document_text, "capture_claimed_download", capture)
+        documents = ClaimedDocuments(
+            read_pdf_text_layer,
+            download_root=tmp_path,
+            download_run_id="wr_read",
+            organization_id="o_read",
+            inherited_files=frozenset(),
+        )
+
+        result = await TestSearchWebHelperBinding._block().generate_async_user_function(
+            code,
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+            workflow_run_id="wr_read",
+            organization_id="o_read",
+            claimed_documents=documents,
+            inherited_files=frozenset(),
+        )()
+
+        assert result["text"] == "Total 12.50"
+
+    @pytest.mark.asyncio
+    async def test_an_inline_block_reads_a_proven_claim_whatever_its_code_spells(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_directory = tmp_path / "wrid_test"
+        run_directory.mkdir()
+        (run_directory / "bill.txt").write_bytes(b"Total 12.50")
+        materialized = capture_authorized_file(
+            run_directory / "bill.txt",
+            download_root=tmp_path,
+            workflow_run_id="wrid_test",
+            organization_id=None,
+            max_bytes=1024,
+        )
+        download = SimpleNamespace(suggested_filename="bill.txt")
+        page = MagicMock(spec=Page)
+        page.context = MagicMock()
+
+        async def claim(
+            *args: object,
+            outcome_recorder: block_module.DownloadClaimOutcomeRecorder,
+            on_claimed: Callable[[object], None],
+            **kwargs: object,
+        ) -> str:
+            on_claimed(download)
+            outcome_recorder.record("returned_proven")
+            return "bill.txt"
+
+        async def capture(source: object, **kwargs: object) -> MaterializedAuthorizedFile:
+            assert source is download
+            return materialized
+
+        class ReadyBrowserState:
+            browser_artifacts = BrowserArtifacts()
+            engine_selection = None
+
+            async def get_working_page(self) -> object:
+                return page
+
+        async def validate_code_block(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def get_browser_state(*args: object, **kwargs: object) -> ReadyBrowserState:
+            return ReadyBrowserState()
+
+        async def record_output(*args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(block_module.settings, "DOWNLOAD_PATH", str(tmp_path))
+        monkeypatch.setattr(block_module, "_code_block_click_and_claim_download_builtin", claim)
+        monkeypatch.setattr(document_text, "capture_claimed_download", capture)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            validate_code_block,
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+        monkeypatch.setattr(
+            CodeBlock, "get_workflow_run_context", lambda self, run_id: FakeWorkflowRunContext(values={})
+        )
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+        block = TestSearchWebHelperBinding._block()
+        block.code = 'name = await click_and_claim_download(page, "#bill")\nread = await ｒead_document_text(name)\n'
+
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert result.success is True, result.failure_reason
+        assert result.output_parameter_value["read"]["text"] == "Total 12.50"
+
+    @pytest.mark.asyncio
+    async def test_without_claimed_documents_the_helper_refuses_every_handle(self) -> None:
+        result = await TestSearchWebHelperBinding._block().generate_async_user_function(
+            'return await read_document_text("bill.txt")\n',
+            SimpleNamespace(url="about:blank", context=FakeClearingBrowserContext()),  # type: ignore[arg-type]
+        )()
+
+        assert result.keys() == {"error"}
+        assert "click_and_claim_download" in result["error"]
 
 
 class TestOpenPageHelperBinding:

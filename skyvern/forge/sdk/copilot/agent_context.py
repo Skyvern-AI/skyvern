@@ -118,17 +118,26 @@ class PreRunPageReference:
     workflow_run_id: str
 
 
+RegisteredDownloadTextError: TypeAlias = Literal["unavailable", "parse_failed", "parse_timeout", "not_utf8"]
+
+
 @dataclass(frozen=True)
 class RegisteredArtifactEntry:
     artifact_id: str
-    file_name: str
-    parsed_text: str
+    file_name: str | None
+    text: str | None = None
+    page_count: int | None = None
+    char_count: int | None = None
+    truncated: bool | None = None
+    text_layer_problem: str | None = None
+    error: RegisteredDownloadTextError | None = None
 
 
 @dataclass(frozen=True)
 class RegisteredArtifactEvidence:
     entries: tuple[RegisteredArtifactEntry, ...]
     workflow_run_id: str
+    omission_notices: tuple[str, ...] = ()
 
 
 class ScoutedEquivalentInput(TypedDict):

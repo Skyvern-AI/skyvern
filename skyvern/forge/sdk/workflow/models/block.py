@@ -31,7 +31,8 @@ import uuid
 import zipfile
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Iterator, Mapping, Sequence
-from contextvars import ContextVar
+from concurrent.futures import Executor
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from email.message import EmailMessage
@@ -233,6 +234,7 @@ from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePassw
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import (
+    PdfExtractStats,
     extract_pdf_file,
     render_pdf_pages_as_images,
     scrambled_text_layer_reason,
@@ -253,6 +255,7 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     capture_authorized_file,
     inline_authorized_file_path,
     pin_file_chooser,
+    run_directory_entry_identities,
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
@@ -272,6 +275,10 @@ from skyvern.forge.sdk.workflow.context_manager import (
     BlockMetadata,
     WorkflowRunContext,
     register_secret_derived_output,
+)
+from skyvern.forge.sdk.workflow.document_text import (
+    ClaimedDocuments,
+    unbound_read_document_text,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     RENDER_FAILURE_OUTPUT_KEY,
@@ -6783,20 +6790,50 @@ def _bind_code_block_download_claim(
     download_binding: DownloadBinding | None,
     download_evidence: DownloadEvidenceProbe | None = None,
     outcome_recorder: DownloadClaimOutcomeRecorder | None = None,
+    claimed_documents: ClaimedDocuments | None = None,
+    download_run_id: str | None = None,
 ) -> Callable[[Page | RecordingPage, str], Awaitable[str]]:
     """Two-argument closure rather than a `partial`: keyword
     defaults on a `partial` would let block code override the run identity it is bound to."""
 
     async def click_and_claim_download(page: Page | RecordingPage, selector: str) -> str:
-        return await _code_block_click_and_claim_download_builtin(
-            page,
-            selector,
-            organization_id=organization_id,
-            workflow_run_id=workflow_run_id,
-            download_binding=download_binding,
-            download_evidence=download_evidence,
-            outcome_recorder=outcome_recorder,
+        claimed: list[Download] = []
+        claim_outcome = DownloadClaimOutcomeRecorder()
+        # Baselined before this click, so a delivery with no Download event resolves only to a row registered after it.
+        registered_downloads = (
+            await _registered_download_source(
+                download_evidence,
+                page,
+                download_binding=download_binding,
+                organization_id=organization_id,
+                download_run_id=download_run_id or workflow_run_id or "",
+            )
+            if claimed_documents is not None
+            else None
         )
+        try:
+            name = await _code_block_click_and_claim_download_builtin(
+                page,
+                selector,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                download_binding=download_binding,
+                download_evidence=download_evidence,
+                outcome_recorder=claim_outcome,
+                on_claimed=claimed.append,
+                registered_downloads=registered_downloads,
+            )
+        finally:
+            if outcome_recorder is not None and claim_outcome.outcome is not None:
+                outcome_recorder.record(claim_outcome.outcome)
+        if claimed_documents is not None:
+            claimed_documents.record(
+                name,
+                claimed[0] if claimed else None,
+                outcome=claim_outcome.outcome,
+                registered=registered_downloads,
+            )
+        return name
 
     return click_and_claim_download
 
@@ -7285,7 +7322,15 @@ def _link_without_overwrite(source: str, directory: str) -> str:
 
 
 _LATE_SAFE_GLOBALS = frozenset(
-    {"attach_authorized_file", "clear_browser_data", "open_page", "publish_file", "html", "datetime"}
+    {
+        "attach_authorized_file",
+        "clear_browser_data",
+        "open_page",
+        "publish_file",
+        "read_document_text",
+        "html",
+        "datetime",
+    }
 )
 
 CODE_BLOCK_DIALOG_POLICY_HELPER_NAME = "set_dialog_policy"
@@ -7449,6 +7494,7 @@ class CodeBlock(Block):
             ),
             "attach_authorized_file": unbound_attach_authorized_file,
             "search_web": web_search.search_web,
+            "read_document_text": unbound_read_document_text,
             "open_page": _bind_code_block_open_page(None, []),
             "clear_browser_data": _code_block_clear_browser_data_builtin,
             "publish_file": _code_block_publish_file_builtin,
@@ -7471,6 +7517,8 @@ class CodeBlock(Block):
         authorized_file_materializations: Mapping[str, AuthorizedFileMaterialization] | None = None,
         download_log: BlockDownloadLog | None = None,
         registered_downloads: RegisteredDownloadSource | None = None,
+        claimed_documents: ClaimedDocuments | None = None,
+        inherited_files: frozenset[tuple[str, int, int, int]] | None = None,
         opened_pages: list[Page | RecordingPage] | None = None,
         browser_state: BrowserState | None = None,
         browser_session_id: str | None = None,
@@ -7518,7 +7566,11 @@ class CodeBlock(Block):
             download_binding=download_binding,
             download_evidence=download_evidence,
             outcome_recorder=download_claim_outcome_recorder,
+            claimed_documents=claimed_documents,
+            download_run_id=download_run_id,
         )
+        if claimed_documents is not None:
+            safe_vars["read_document_text"] = claimed_documents.read
         safe_vars["attach_authorized_file"] = bind_inline_attach_authorized_file(
             page,
             authorized_file_materializations or {},
@@ -7532,6 +7584,7 @@ class CodeBlock(Block):
             locate=page._pinned_locator() if isinstance(page, RecordingPage) else None,
             registered_downloads=registered_downloads,
             file_chooser=pin_file_chooser(_raw_code_block_page(page)),
+            inherited_files=inherited_files,
             # Taken before execute_user_function_with_timeout starts its clock, so it errs early.
             deadline=(
                 monotonic() + settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
@@ -10786,6 +10839,19 @@ async def wrapper({default_args}):
                     if "attach_authorized_file" in unicodedata.normalize("NFKC", self.code)
                     else None
                 )
+                inherited_files = await asyncio.to_thread(
+                    run_directory_entry_identities,
+                    settings.DOWNLOAD_PATH,
+                    resolved_download_id or workflow_run_id,
+                )
+                claimed_documents = ClaimedDocuments(
+                    read_pdf_text_layer,
+                    download_root=settings.DOWNLOAD_PATH,
+                    download_run_id=resolved_download_id or workflow_run_id,
+                    organization_id=organization_id,
+                    inherited_files=inherited_files,
+                    download_log=download_log,
+                )
                 user_function = self.generate_async_user_function(
                     self.code,
                     recording_page,
@@ -10800,6 +10866,8 @@ async def wrapper({default_args}):
                     authorized_file_materializations=authorized_file_materializations,
                     download_log=download_log,
                     registered_downloads=registered_downloads,
+                    claimed_documents=claimed_documents,
+                    inherited_files=inherited_files,
                     opened_pages=opened_pages,
                     browser_state=browser_state,
                     browser_session_id=browser_session_id,
@@ -14463,6 +14531,7 @@ async def _run_blocking_parse_step(
     file_url: str,
     func: Callable[..., _ParseStepResult],
     *args: Any,
+    executor: Executor | None = None,
     **kwargs: Any,
 ) -> _ParseStepResult:
     """Run a blocking file-parse step in a worker thread under a wall-clock ceiling.
@@ -14472,11 +14541,14 @@ async def _run_blocking_parse_step(
     run to completion — threads cannot be cancelled — so the ceiling bounds the run's
     exposure to a pathological document rather than the CPU work itself.
     """
+    work = (
+        asyncio.to_thread(func, *args, **kwargs)
+        if executor is None
+        else asyncio.get_running_loop().run_in_executor(executor, partial(copy_context().run, func, *args, **kwargs))
+    )
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(func, *args, **kwargs),
-            timeout=FILE_PARSE_STEP_TIMEOUT_SECONDS,
-        )
+        # With an executor, time spent queued behind its busy workers counts against the ceiling too.
+        return await asyncio.wait_for(work, timeout=FILE_PARSE_STEP_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         LOG.warning(
             "File parse step exceeded its time budget",
@@ -14485,6 +14557,39 @@ async def _run_blocking_parse_step(
             timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS,
         )
         raise FileParseTimeout(file_url=file_url, step=step, timeout_seconds=FILE_PARSE_STEP_TIMEOUT_SECONDS)
+
+
+PDF_EMPTY_TEXT_LAYER_REASON = "PDF text extraction returned empty content"
+PDF_FIRST_PAGE_OVER_TOKEN_LIMIT_REASON = "PDF text exceeds the parse token limit on the first page"
+
+
+async def read_pdf_text_layer(
+    file_url: str, file_path: str, *, stats: PdfExtractStats | None = None, executor: Executor | None = None
+) -> tuple[str, str | None]:
+    """The PDF's text layer and, when it cannot be trusted as the document's text, why not."""
+    extracted_text = await _run_blocking_parse_step(
+        "PDF text extraction",
+        file_url,
+        extract_pdf_file,
+        file_path,
+        executor=executor,
+        file_identifier=file_url,
+        stats=stats,
+    )
+    if not extracted_text.strip():
+        if stats is not None and stats.truncated:
+            return extracted_text, PDF_FIRST_PAGE_OVER_TOKEN_LIMIT_REASON
+        return extracted_text, PDF_EMPTY_TEXT_LAYER_REASON
+    # A scrambled layer reads as plausible text whose characters a model would invent. The per-character scan over
+    # up to a million characters stays off the event loop.
+    scrambled_reason = await _run_blocking_parse_step(
+        "PDF text layer check",
+        file_url,
+        scrambled_text_layer_reason,
+        extracted_text,
+        executor=executor,
+    )
+    return extracted_text, scrambled_reason
 
 
 class _FileParserLLMTimeout(TimeoutError):
@@ -15003,29 +15108,9 @@ class FileParserBlock(Block):
             ocr_reason = "the block is configured to always OCR PDFs"
         else:
             try:
-                extracted_text = await _run_blocking_parse_step(
-                    "PDF text extraction",
-                    self.file_url,
-                    extract_pdf_file,
-                    file_path,
-                    file_identifier=self.file_url,
-                )
+                extracted_text, ocr_reason = await read_pdf_text_layer(self.file_url, file_path)
             except PDFParsingError as e:
                 raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
-
-            if not extracted_text.strip():
-                ocr_reason = "PDF text extraction returned empty content"
-            else:
-                # A scrambled text layer is worse than an empty one: it reaches the extraction
-                # LLM as plausible text, which then invents values for the characters it cannot
-                # read. Only OCR recovers the real ones. The scan is per-character over a text
-                # layer that can reach a million characters, so it stays off the event loop.
-                ocr_reason = await _run_blocking_parse_step(
-                    "PDF text layer check",
-                    self.file_url,
-                    scrambled_text_layer_reason,
-                    extracted_text,
-                )
 
             if ocr_reason is None:
                 return extracted_text
