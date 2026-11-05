@@ -30,6 +30,7 @@ from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.taskv3 import engine as taskv3_engine
 from skyvern.services import organization_log_scope
+from tests.unit.chromium_probe import chromium_available
 
 _monkeypatch_setattr = pytest.MonkeyPatch.setattr
 _monkeypatch_undo = pytest.MonkeyPatch.undo
@@ -69,6 +70,14 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     # short-deadline tests late in a CI shard. Freezing them hides them from the GC and from gc.get_objects().
     gc.collect()
     gc.freeze()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    # Decided before any fixture runs: a test that cannot get Chromium would otherwise start a Playwright driver,
+    # fail to launch, and only then skip, which costs a few hundred milliseconds per test.
+    if item.get_closest_marker("requires_chromium") is not None and not chromium_available():
+        pytest.skip("Requires Playwright browsers installed (run: playwright install chromium)")
 
 
 @pytest.fixture(autouse=True, scope="session")
