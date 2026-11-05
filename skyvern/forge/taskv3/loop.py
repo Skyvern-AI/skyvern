@@ -2636,6 +2636,7 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "frame_unreadable_regions",
         "elements_listed",
         "pointer_roots_listed",
+        "pointer_extras_listed",
         "pointer_capped",
         "pointer_truncated",
         "pointer_dropped",

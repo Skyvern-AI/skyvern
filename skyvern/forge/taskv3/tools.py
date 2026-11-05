@@ -1580,7 +1580,8 @@ _OFF_CANVAS_JS = r"""(el, r) => {
 # isHoverPointerElement, domUtils.js), recording each root and its name in `state.roots`. An element is
 # not a root when the reading already covers it: it is or is inside a control `listable` keeps, or its
 # pointer parent is itself a root or covered. One that holds such a control is a holder: at most one
-# named, control-free pointer descendant is listed for it, recorded in `state.held`.
+# named, control-free pointer descendant is listed for it, recorded in `state.held`. A named href-less <a>
+# inside a root whose centre misses it is listed beside that root, recorded in `state.extra`.
 _SCROLL_GEOMETRY_JS = r"""
   const flowNegative = (cs) => {
     const wm = cs.writingMode || 'horizontal-tb';
@@ -2393,7 +2394,7 @@ _WITH_POINTER_ROOTS_JS = (
     if (!hasSlotDescendant.has(el)) return false;
     for (const slot of qsa.call(el, 'slot')) {
       for (const a of slot.assignedElements({ flatten: true })) {
-        if (state.roots.has(a) || inListable(a) || anyListable(qsa.call(a, q))) return true;
+        if ((state.roots.has(a) && !state.extra.has(a)) || inListable(a) || anyListable(qsa.call(a, q))) return true;
       }
     }
     return false;
@@ -2538,6 +2539,27 @@ _WITH_POINTER_ROOTS_JS = (
     const hit = l.getRootNode().elementFromPoint(x, y);
     return !!hit && (hit === l || l.contains(hit));
   };
+  // An <a> with no href is not a control to `q`, so the pointer root around it is listed and the anchor covered.
+  // A click on that root lands on its centre, so this returns the root when the centre is outside an anchor that
+  // takes clicks (one with pointer-events:none passes them through to the root).
+  const upOf = (n) => {
+    const p = parentOf.call(n);
+    if (p) return p;
+    const r = Node.prototype.getRootNode.call(n);
+    return r && r.nodeType === 11 ? hostOf.call(r) : null;
+  };
+  const rootMissing = (el) => {
+    if (!state.extra || String(localNameOf.call(el) || '') !== 'a' || getAttr.call(el, 'href') !== null
+      || matches.call(el, q) || getComputedStyle(el).pointerEvents === 'none') return null;
+    for (let a = upOf(el), i = 0; a && i < 64 && isPointer(a); a = upOf(a), i++) {
+      if (state.icons.has(a) || matches.call(a, q)) return null;
+      if (!state.roots.has(a)) continue;
+      const ar = bcr.call(a), r = bcr.call(el);
+      const x = ar.left + ar.width / 2, y = ar.top + ar.height / 2;
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? null : a;
+    }
+    return null;
+  };
   // Every label of a dropped control performs the same click, so only its most-named label a pointer can land on is
   // a root; the rest would spend the pointer-root cap on duplicates of one action. A box under 2px a side is unseen,
   // as _unseen holds, so a screen-reader-only label never wins. No eligible label leaves every label to the gates.
@@ -2568,7 +2590,24 @@ _WITH_POINTER_ROOTS_JS = (
         // The cursor is inherited, so a covered parent is the target. A shadow root's top-level element
         // inherits from its host.
         const parent = parentOf.call(el) || root.host || null;
-        if (isPointer(parent) && state.covered.has(parent)) { state.covered.add(el); continue; }
+        if (isPointer(parent) && state.covered.has(parent)) {
+          state.covered.add(el);
+          // Listed beside the root, never instead of it, and under its own budget: the root's line and every
+          // other root's place stay as they were.
+          if (state.extraCount >= state.heldCap || !rootMissing(el)
+            || closest.call(el, '[aria-hidden="true"], [inert]')) continue;
+          const er = bcr.call(el);
+          if (!rootable(el, er) || !hitsItself(el, er)) continue;
+          const name = nameOf(el);
+          if (!name) continue;
+          state.roots.set(el, name.replace(/\s+/g, ' ').slice(0, retain));
+          state.extra.add(el);
+          state.extraCount++;
+          const node = { el, next: null };
+          if (tail) tail.next = node; else head = node;
+          tail = node;
+          continue;
+        }
         const tag = String(localNameOf.call(el) || '');
         // A page-wide pointer cursor says nothing about any one element under it.
         if (tag === 'html' || tag === 'body') { state.covered.add(el); continue; }
@@ -10264,12 +10303,14 @@ async (__tv3TextArgs) => {
   const _screenListable = (el) => {
     try { return _screen(el, false).why === null; } catch (e) { return false; }
   };
-  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
+  const _pointerState = { pointer: new Map(), covered: new Set(), roots: new Map(), holders: new Set(), represented: new Set(), held: new Set(), extra: new Set(), extraCount: 0, icons: new Set(), iconCount: 0, iconOverflow: 0, notIcon: 0, notIconRoots: new Set(), heldCount: 0, heldCap: """
     + str(OBSERVE_POINTER_ROOT_CAP)
     + r""", count: 0, retain: _RETAIN_WIDTH, ceiling: """
     + str(_POINTER_ROOT_SCAN_CEILING)
     + r""" };
   let pointerListed = 0;
+  // Anchors listed beside the root that misses them (`extra`): a budget of their own, so none takes a root's place.
+  let extraListed = 0;
   // Pointer roots past the cap, and those past the element budget: counted apart from `truncated`,
   // which the budget spends on semantic controls only.
   let pointerCapped = 0;
@@ -11216,7 +11257,8 @@ async (__tv3TextArgs) => {
     const iconRoot = _pointerState.icons.has(el);
     if (iconRoot && iconsListed >= iconRoom) { iconsTruncated++; continue; }
     pointerRoot = _pointerState.roots.has(el) && !iconRoot;
-    if (pointerRoot && !_pointerState.held.has(el)) pointerReserved--;
+    const extraRoot = pointerRoot && _pointerState.extra.has(el);
+    if (pointerRoot && !_pointerState.held.has(el) && !extraRoot) pointerReserved--;
     const screened = _screen(el, pointerRoot);
     const { r, gr, gateEl, ownGated } = screened;
     if (screened.why === 'offCanvas') { hiddenDropped++; hiddenDroppedOffCanvas++; continue; }
@@ -11286,7 +11328,9 @@ async (__tv3TextArgs) => {
         continue;
       }
     }
-    if (pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
+    // Main never listed these anchors, so one past its budget is not a cut the cap note reports.
+    if (extraRoot && extraListed >= _POINTER_ROOT_CAP) continue;
+    if (!extraRoot && pointerRoot && pointerListed + (_pointerState.held.has(el) ? pointerReserved : 0) >= _POINTER_ROOT_CAP) { pointerCapped++; continue; }
     let selector = naturalSelector(el);
     let bind = '';
     if (!selector) {
@@ -11340,6 +11384,7 @@ async (__tv3TextArgs) => {
     if (pointerRoot) rec.pointerRoot = true;
     if (iconRoot) rec.icon = true;
     if (pointerRoot && _pointerState.held.has(el)) rec.pointerHeld = true;
+    if (extraRoot) rec.pointerExtra = true;
     if (placeholder && placeholder !== label) rec.placeholder = placeholder.slice(0, _RETAIN_WIDTH);
     const shows = _shownText(el, label);
     if (shows) rec.shows = shows;
@@ -11471,7 +11516,8 @@ async (__tv3TextArgs) => {
     // _resolve_ref, which requires the element the record NAMES to be the one carrying the act token.
     rec[__OBSERVE_EL_KEY__] = el;
     out.push(rec);
-    if (pointerRoot) pointerListed++;
+    if (extraRoot) extraListed++;
+    else if (pointerRoot) pointerListed++;
     if (iconRoot) iconsListed++;
     elOfRec.set(rec, el);
     stampOfRec.set(rec, { fp: fingerprint(el), anchor: lastAnchor && lastAnchor.sel === selector ? lastAnchor : null });
@@ -11488,6 +11534,7 @@ async (__tv3TextArgs) => {
           const r2 = els[k].el.getBoundingClientRect();
           if (r2.width === 0 || r2.height === 0) continue;
           if (_pointerState.icons.has(els[k].el)) { iconsTruncated++; continue; }
+          if (_pointerState.extra.has(els[k].el)) continue;
           if (_pointerState.roots.has(els[k].el)) {
             if (pointerListed + pointerTruncated < _POINTER_ROOT_CAP) pointerTruncated++;
             else pointerCapped++;
@@ -11531,7 +11578,7 @@ async (__tv3TextArgs) => {
         const at = c.rec === null ? -1 : out.indexOf(c.rec);
         if (at !== -1) {
           out.splice(at, 1); labelOfControl.delete(c.el); boundLabelOfControl.delete(c.el);
-          if (c.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+          if (c.rec.pointerRoot) { if (c.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
         }
       }
       if (lost && !rem.shared) { if (rem.fresh) markersWritten--; else markersReused--; }
@@ -11541,7 +11588,7 @@ async (__tv3TextArgs) => {
       const at = rem.rec === null ? -1 : out.indexOf(rem.rec);
       if (at !== -1) {
         out.splice(at, 1); labelOfControl.delete(rem.el); boundLabelOfControl.delete(rem.el);
-        if (rem.rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+        if (rem.rec.pointerRoot) { if (rem.rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
       }
       if (rem.fresh) markersWritten--; else markersReused--;
     }
@@ -11601,7 +11648,7 @@ async (__tv3TextArgs) => {
       // as holding one field when it holds two.
       if (el && connected) droppedStillLive.push(el);
       labelOfControl.delete(el); boundLabelOfControl.delete(el); out.splice(k, 1);
-      if (rec.pointerRoot) { pointerListed--; pointerDropped++; } else dropped++;
+      if (rec.pointerRoot) { if (rec.pointerExtra) extraListed--; else pointerListed--; pointerDropped++; } else dropped++;
     }
     else if (el) {
       // Recomputed after the drain rather than added to the fingerprint above: a page's own observer
@@ -13539,13 +13586,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
     # page-wide, so neither limit ever costs the other kind a place.
     room = max(0, OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon"))))
     pointer_room = max(
-        0, OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+        0,
+        OBSERVE_POINTER_ROOT_CAP
+        - sum(1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))),
     )
     kept: list[int] = []
     pointer_over_cap = 0
     over_page_cap = 0
     for i, e in enumerate(incoming):
-        if e.get("pointerHeld") or e.get("icon"):
+        if e.get("pointerHeld") or e.get("pointerExtra") or e.get("icon"):
             pass  # Ranked page-wide by _rank_held_pointer_roots_last once every realm is merged.
         elif e.get("pointerRoot"):
             if pointer_room == 0:
@@ -13586,11 +13635,15 @@ def _merge_realm(into: dict[str, Any], other: dict[str, Any]) -> list[int]:
 
 
 def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
-    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, and an
-    icon only in the page-wide element budget left after every control. Returns the kept indices, which the caller
-    applies to its handle and owner lists."""
+    """Keep a holder's stand-in child only in the page-wide pointer cap left after every other pointer root, an
+    anchor listed beside the root that misses it only in a page-wide cap of its own, and an icon only in the
+    page-wide element budget left after every control. Returns the kept indices, which the caller applies to its
+    handle and owner lists."""
     elements = data.get("elements") or []
-    room = OBSERVE_POINTER_ROOT_CAP - sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerHeld"))
+    room = OBSERVE_POINTER_ROOT_CAP - sum(
+        1 for e in elements if e.get("pointerRoot") and not (e.get("pointerHeld") or e.get("pointerExtra"))
+    )
+    extra_room = OBSERVE_POINTER_ROOT_CAP
     icon_room = OBSERVE_MERGED_ELEMENT_MAX - sum(1 for e in elements if not (e.get("pointerRoot") or e.get("icon")))
     kept: list[int] = []
     held_over = 0
@@ -13601,6 +13654,10 @@ def _rank_held_pointer_roots_last(data: dict[str, Any]) -> list[int]:
                 held_over += 1
                 continue
             room -= 1
+        elif e.get("pointerExtra"):
+            if extra_room <= 0:
+                continue
+            extra_room -= 1
         elif e.get("icon"):
             if icon_room <= 0:
                 icons_over += 1
@@ -14711,7 +14768,9 @@ def build_browser_tools(
             "icons_truncated": int(data.get("iconsTruncated") or 0),
             # Distinct unnamed pointer roots rejected by the icon heuristic, separate from budget and selector drops.
             "unnamed_not_icon": int(data.get("unnamedNotIcon") or 0),
-            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot")),
+            "pointer_roots_listed": sum(1 for e in elements if e.get("pointerRoot") and not e.get("pointerExtra")),
+            # Href-less anchors listed beside the pointer root whose click would miss them.
+            "pointer_extras_listed": sum(1 for e in elements if e.get("pointerExtra")),
             "pointer_capped": int(data.get("pointerCapped") or 0),
             "pointer_truncated": int(data.get("pointerTruncated") or 0),
             "pointer_dropped": int(data.get("pointerDropped") or 0),
