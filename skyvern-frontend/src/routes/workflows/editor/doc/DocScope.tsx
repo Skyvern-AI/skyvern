@@ -25,6 +25,7 @@ import { DocEditableLine, DocInsertPopover } from "./DocEditing";
 import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
 import { DocStepResult } from "./DocStepResult";
+import { DocOneActionHint } from "./DocOneActionHint";
 
 type PlacedItem = Exclude<DocItem, DocNoteItem>;
 export type DocNoteProblem = {
@@ -277,6 +278,7 @@ function DocNode({
           </div>
         </DocInsertPopover>
         <DocStepProblem nodeId={item.nodeId} problems={noteProblems} />
+        {editable && <DocOneActionHint node={node} />}
         <DocStepResult label={node.data.label} />
       </div>
       {item.kind === "loop" && open && (
