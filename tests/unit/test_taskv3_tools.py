@@ -4094,6 +4094,7 @@ async def test_observe_result_carries_count_only_summary_for_the_call_record() -
         "frame_unreadable_regions",
         "elements_listed",
         "pointer_roots_listed",
+        "pointer_extras_listed",
         "pointer_capped",
         "pointer_truncated",
         "pointer_dropped",
@@ -14285,6 +14286,68 @@ async def test_observe_holder_stand_ins_never_displace_a_frames_pointer_roots_or
         pointer_lines = [line for line in ref_lines if re.match(r"^ref=\d+ (?:div|span) ", line)]
         assert len(pointer_lines) == OBSERVE_POINTER_ROOT_CAP, pointer_lines
         assert sum("'Pay " in line for line in ref_lines) == 30, ref_lines
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_observe_lists_an_href_less_anchor_beside_the_card_whose_click_misses_it() -> None:
+    # The card's centre is its description, so a click on the card never reaches the anchor's handler.
+    card = (
+        '<div style="cursor:pointer;width:300px;padding:10px"><div>Send a message</div>'
+        '<div style="height:65px">Fill out a quick form and someone will get in touch.</div>'
+        '<a tabindex="0" style="display:block" onclick="window.__sent = (window.__sent || 0) + 1">Send Us A Message</a>'
+        "</div>"
+    )
+    # An anchor that fills its root is reached by a click on the root, so it is not listed again.
+    filled = '<div style="cursor:pointer;width:200px"><a style="display:block;height:30px">Menu item</a></div>'
+    async with _live_page(f"<!doctype html><html><body>{card}{filled}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert r.status == "ok", r.content
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert _ref_line(r.content, "div 'Send a message"), ref_lines
+        assert [line for line in ref_lines if "Menu item" in line][0].endswith("div 'Menu item'"), ref_lines
+        assert len(ref_lines) == 3, ref_lines
+        assert r.data is not None and r.data["summary"]["pointer_extras_listed"] == 1
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "div 'Send a message")})
+        assert await page.evaluate("() => window.__sent || 0") == 0
+        clicked = await _tool(tools, "click").handler({"selector": _ref_line(r.content, "a 'Send Us A Message'")})
+        assert clicked.status == "ok", clicked.content
+        assert await page.evaluate("() => window.__sent || 0") == 1
+
+    # The anchor has a budget of its own: with the page's roots at the cap, every root keeps its place, and the
+    # holder's stand-in still gives way to them.
+    holder = '<div style="cursor:pointer;width:300px"><span>Row 1</span><button type="button">Pay 1</button></div>'
+    plain = "".join(
+        f'<div style="cursor:pointer;width:200px">Plain {i}</div>' for i in range(OBSERVE_POINTER_ROOT_CAP - 1)
+    )
+    async with _live_page(f"<!doctype html><html><body>{card}{holder}{plain}</body></html>") as page:
+        r = await _tool(build_browser_tools(_fixed_page_provider(page)), "observe").handler({})
+        ref_lines = [line for line in r.content.splitlines() if line.startswith("ref=")]
+        assert _ref_line(r.content, f"div 'Plain {OBSERVE_POINTER_ROOT_CAP - 2}'"), ref_lines
+        assert sum(bool(re.match(r"^ref=\d+ div ", line)) for line in ref_lines) == OBSERVE_POINTER_ROOT_CAP, ref_lines
+        assert not any("span 'Row 1'" in line for line in ref_lines), ref_lines
+        assert _ref_line(r.content, "a 'Send Us A Message'"), ref_lines
+
+    # A card with an action of its own keeps it reachable beside the anchor's, and an anchor that passes clicks
+    # through (pointer-events:none) is not listed: a click on it would land on the card.
+    job = (
+        '<div style="cursor:pointer;width:300px" onclick="window.__open = 1"><div>Senior Engineer</div>'
+        '<div style="height:65px">Remote, full-time, posted today.</div>'
+        '<a aria-label="Save job" onclick="event.stopPropagation(); window.__save = 1">&#9825;</a></div>'
+    )
+    decor = (
+        '<div style="cursor:pointer;width:300px"><div>Open item</div><div style="height:65px">Details.</div>'
+        '<a style="pointer-events:none">Label</a></div>'
+    )
+    async with _live_page(f"<!doctype html><html><body>{job}{decor}</body></html>") as page:
+        tools = build_browser_tools(_fixed_page_provider(page))
+        r = await _tool(tools, "observe").handler({})
+        assert not any("a 'Label'" in line for line in r.content.splitlines()), r.content
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "div 'Senior Engineer")})
+        assert await page.evaluate("() => [window.__open, window.__save]") == [1, None]
+        await _tool(tools, "click").handler({"selector": _ref_line(r.content, "a 'Save job'")})
+        assert await page.evaluate("() => [window.__open, window.__save]") == [1, 1]
 
 
 @_skip_no_browser
