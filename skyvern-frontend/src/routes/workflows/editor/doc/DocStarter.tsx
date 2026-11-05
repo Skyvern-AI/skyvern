@@ -110,7 +110,7 @@ export function DocGettingStarted({
   progress,
   kept = [],
   onHide,
-  raised = false,
+  folded = false,
   compact = false,
   clearOfPanel = false,
 }: {
@@ -119,13 +119,14 @@ export function DocGettingStarted({
   // A narrow pane shows a small pill that opens the card, so it never covers the step being edited.
   compact?: boolean;
   progress: DocStarterProgress;
-  // Lifts the card clear of a toast, which stacks in the same corner.
-  raised?: boolean;
+  // Inert pill while a toast needs the corner; it is short-lived, so there is nothing to open.
+  folded?: boolean;
   // Items ticked earlier in this agent; they stay ticked when the draft no longer satisfies them.
   kept?: string[];
   onHide: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const asPill = folded || (compact && !expanded);
   const doneIds = [...docStarterDone(progress), ...kept];
   const items: Array<[boolean, string, string]> = [
     [doneIds.includes("step"), "Make a step yourself", "Type / on a line"],
@@ -143,15 +144,15 @@ export function DocGettingStarted({
   ];
   const done = items.filter(([d]) => d).length;
   const position = cn(
-    "absolute z-40 transition-[bottom]",
+    "absolute bottom-4 z-40",
     clearOfPanel ? "right-[calc(min(24rem,45%)+1.25rem)]" : "right-5",
-    raised ? "bottom-36" : "bottom-4",
   );
-  if (compact && !expanded) {
+  if (asPill) {
     return (
       <button
         type="button"
         aria-label={`Getting started, ${done} of ${items.length} done`}
+        disabled={folded}
         onClick={() => setExpanded(true)}
         className={cn(
           position,

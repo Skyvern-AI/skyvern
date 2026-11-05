@@ -200,6 +200,37 @@ export function DocInsertPopover({
   );
 }
 
+// A collapsed caret `offset` characters into a line's text, counting each <br> as one.
+function caretRangeAt(el: HTMLElement, offset: number): Range {
+  const range = document.createRange();
+  let left = offset;
+  const walker = document.createTreeWalker(
+    el,
+    NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+  );
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const length = node.nodeValue?.length ?? 0;
+      if (left <= length) {
+        range.setStart(node, left);
+        range.collapse(true);
+        return range;
+      }
+      left -= length;
+    } else if (node.nodeName === "BR") {
+      if (left === 0) {
+        range.setStartBefore(node);
+        range.collapse(true);
+        return range;
+      }
+      left -= 1;
+    }
+  }
+  range.selectNodeContents(el);
+  range.collapse(false);
+  return range;
+}
+
 const runHistory = (redo: boolean) => {
   const history = useWorkflowHistoryAccessStore.getState();
   // undo() flushes a pending debounced edit itself, so don't gate on canUndo here.
@@ -317,20 +348,43 @@ export function DocEditableLine({
       el.innerText = value;
     emitted.current = value;
   }, [value, editing]);
+  // A save locks the Doc read-only while the line stays in edit mode; the edit span then remounts empty.
+  const resumed = useRef(false);
+  // Where the caret or selection was at the last key, so a Cmd+S puts it back there.
+  const keyCaret = useRef<[number, number] | null>(null);
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!editing || !el) return;
+    if (!editing) return;
+    if (!editable || !el) {
+      resumed.current = true;
+      return;
+    }
+    const resuming = resumed.current;
+    resumed.current = false;
     el.innerText = value;
+    // Back from read-only, the caret returns only if nothing else took focus meanwhile.
+    const elsewhere =
+      document.activeElement && document.activeElement !== document.body;
+    if (resuming && elsewhere) return;
     el.focus();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    const atStart = caretAtStart?.() ?? false;
-    range.collapse(takeNextCaretAtStart() || atStart);
+    let range: Range;
+    if (resuming) {
+      const [start, end] = keyCaret.current ?? [value.length, value.length];
+      range = caretRangeAt(el, start);
+      const endAt = caretRangeAt(el, end);
+      range.setEnd(endAt.endContainer, endAt.endOffset);
+    } else {
+      keyCaret.current = null;
+      range = document.createRange();
+      range.selectNodeContents(el);
+      const atStart = caretAtStart?.() ?? false;
+      range.collapse(takeNextCaretAtStart() || atStart);
+    }
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
-    // Only on entering edit mode.
+    // Only on entering edit mode, or coming back to it after a read-only spell.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editing]);
+  }, [editing, editable]);
   useEffect(() => {
     if (autoFocus) setEditing(true);
   }, [autoFocus]);
@@ -410,6 +464,16 @@ export function DocEditableLine({
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     const mod = event.metaKey || event.ctrlKey;
     const split = ref.current ? splitAtCaret(ref.current) : null;
+    keyCaret.current =
+      split && ref.current
+        ? [
+            split[0].length,
+            Math.max(
+              split[0].length,
+              ref.current.innerText.length - split[1].length,
+            ),
+          ]
+        : null;
     // A menu opens only where a word or line starts, so "bob@example.com" and "Open /settings" stay text.
     const atWordStart = !split || /(^|\s)$/.test(split[0]);
     if (mod && event.key.toLowerCase() === "z") {
