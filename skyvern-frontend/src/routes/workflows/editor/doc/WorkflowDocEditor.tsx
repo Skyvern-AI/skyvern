@@ -71,10 +71,13 @@ import {
   docDestinations,
   TOP_SCOPE,
   type DocGraphEdits,
+  type DocPlace,
+  type NodeType,
 } from "./docEditApi";
 import { countReferences, findOutputUsers } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
 import { docStepProblems } from "./docProblems";
+import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import {
   DocGettingStarted,
   DocKeyHints,
@@ -364,7 +367,13 @@ export function WorkflowDocEditor({
   }, [tree, byId, blocksByLabel, branches]);
   const selectBranch = (conditionalId: string, branchId: string) =>
     setBranches((current) => ({ ...current, [conditionalId]: branchId }));
-  const edit =
+  const openStepSettings = (id: string) => {
+    panelOpener.current = document.activeElement as HTMLElement;
+    setSelectedStepId(id);
+    setPanelTab("settings");
+    setPanelOpen(true);
+  };
+  const baseEdit =
     editable && edits
       ? createDocEditApi({
           nodes,
@@ -379,6 +388,18 @@ export function WorkflowDocEditor({
           credentialKeys,
         })
       : null;
+  const edit = baseEdit && {
+    ...baseEdit,
+    insertStep: (place: DocPlace, nodeType: NodeType) => {
+      const added = baseEdit.insertStep(place, nodeType);
+      if (added) {
+        useDocUnfinishedStore.getState().add(added);
+        // A login has nothing to run without its credential, so its settings open on it.
+        if (nodeType === "login") openStepSettings(added);
+      }
+      return added;
+    },
+  };
   // References to step outputs that no step saves any more, for the inline "missing" pills.
   const missingOutputs = useMemo(() => {
     const labels = new Set(
@@ -415,15 +436,34 @@ export function WorkflowDocEditor({
     return missing;
   }, [nodes, parameters]);
   // What steps still need before they can run, found as the draft is typed; the server's check follows.
-  const stepFixes = useMemo(
-    () => (proposal ? new Map<string, string[]>() : docStepProblems(nodes)),
-    [nodes, proposal],
+  // A step added a moment ago is unfinished, not wrong: its problems wait until the user leaves it, runs or saves.
+  const unfinishedIds = useDocUnfinishedStore((s) => s.ids);
+  const stepFixes = useMemo(() => {
+    if (proposal) return new Map<string, string[]>();
+    const found = docStepProblems(nodes);
+    for (const id of unfinishedIds) found.delete(id);
+    return found;
+  }, [nodes, proposal, unfinishedIds]);
+  const unfinishedLabels = useMemo(
+    () =>
+      new Set(
+        nodes.filter((n) => unfinishedIds.has(n.id)).map((n) => n.data.label),
+      ),
+    [nodes, unfinishedIds],
   );
   const fixCount = [...stepFixes.values()].reduce(
     (count, messages) => count + messages.length,
     0,
   );
-  const problems = validationProblems.length + fixCount;
+  const shownProblems = useMemo(
+    () =>
+      validationProblems.filter(
+        (problem) =>
+          !problem.block_label || !unfinishedLabels.has(problem.block_label),
+      ),
+    [validationProblems, unfinishedLabels],
+  );
+  const problems = shownProblems.length + fixCount;
   // A check that couldn't reach the server says so, but doesn't hold the run. The problems it left
   // from an earlier check describe an older draft, so they stay on screen but no longer block it.
   const checkFailed = validationProblems.some(
@@ -436,7 +476,7 @@ export function WorkflowDocEditor({
   const noteProblems = useMemo(() => {
     const idsByLabel = new Map(nodes.map((node) => [node.data.label, node.id]));
     const result = new Map<string, DocNoteProblem>();
-    for (const problem of validationProblems) {
+    for (const problem of shownProblems) {
       if (
         problem.code === "credential_in_note" &&
         problem.block_label &&
@@ -468,7 +508,7 @@ export function WorkflowDocEditor({
         message: messages.join("\n"),
       });
     return result;
-  }, [nodes, validationProblems, stepFixes]);
+  }, [nodes, shownProblems, stepFixes]);
 
   // Step warnings sit in the same map but are not notes and do not need fixing.
   const noteProblemCount = [...noteProblems.keys()].filter(
@@ -480,7 +520,7 @@ export function WorkflowDocEditor({
     (checkFailed ? 0 : noteProblemCount) +
     (checkFailed
       ? 0
-      : validationProblems.filter(
+      : shownProblems.filter(
           (problem) =>
             problem.code !== "validation_failed" &&
             problem.severity !== "warning" &&
@@ -493,6 +533,37 @@ export function WorkflowDocEditor({
     () => () => useRunValidationStore.getState().setDocProblemCount(0),
     [],
   );
+  // The panel is exempt from leave detection while it shows the step's settings; closing it or switching away is leaving.
+  useEffect(() => {
+    const { ids, settle } = useDocUnfinishedStore.getState();
+    settle(
+      [...ids].filter(
+        (id) =>
+          !(panelOpen && panelTab === "settings" && id === selectedStepId),
+      ),
+    );
+  }, [panelOpen, panelTab, selectedStepId]);
+  // A new step turns into a normal one when the user moves on: clicks or tabs elsewhere, or presses a Run/Save shortcut.
+  useEffect(() => {
+    const store = useDocUnfinishedStore.getState;
+    const leave = (event: Event) => {
+      const { ids, settle } = store();
+      if (ids.size) settle(stepsLeftBy(ids, event.target));
+    };
+    const shortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && /^(s|Enter)$/i.test(event.key))
+        store().clear();
+    };
+    document.addEventListener("pointerdown", leave, true);
+    document.addEventListener("focusin", leave, true);
+    document.addEventListener("keydown", shortcut, true);
+    return () => {
+      document.removeEventListener("pointerdown", leave, true);
+      document.removeEventListener("focusin", leave, true);
+      document.removeEventListener("keydown", shortcut, true);
+      store().clear();
+    };
+  }, []);
   const firstProblemId = useMemo(() => {
     const ids = new Set(
       [...noteProblems.keys()]
@@ -899,12 +970,7 @@ export function WorkflowDocEditor({
       value={{
         editable,
         runControlsVisible: !scopeReadOnly && !proposal && !fullRunGoing,
-        openSettings: (id) => {
-          panelOpener.current = document.activeElement as HTMLElement;
-          setSelectedStepId(id);
-          setPanelTab("settings");
-          setPanelOpen(true);
-        },
+        openSettings: openStepSettings,
         openVisual: () =>
           useWorkflowPresentationStore.getState().setPresentation("visual"),
         goTo,
@@ -1193,7 +1259,7 @@ export function WorkflowDocEditor({
                   data-doc-problems
                   disabled={!firstProblemId}
                   onClick={() => firstProblemId && goTo(firstProblemId)}
-                  className="rounded-md border border-[#C0392B] px-2 py-[2px] text-[#C0392B] outline-none hover:bg-[#C0392B]/10 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default dark:border-[#F08A7E] dark:text-[#F08A7E]"
+                  className="rounded-md border border-border px-2 py-[2px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
                 >
                   {problems} problem{problems === 1 ? "" : "s"}
                 </button>
