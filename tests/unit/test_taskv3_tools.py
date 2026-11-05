@@ -9678,6 +9678,134 @@ async def test_download_signal_surfaces_file_created_between_calls(tmp_path: Pat
     assert "Downloaded: invoice.csv" in r2.content
 
 
+class _BlockedInlineFramePage(_DownloadFakePage):
+    """A click that renders the target inline in an <iframe> the browser refuses to display: no
+    download event fires and no file lands, while the element keeps the src it was refused."""
+
+    def __init__(self, downloads_dir: Path) -> None:
+        super().__init__(downloads_dir)
+        self.iframe_srcs: list[str] = []
+        self.click_opens: str | None = None
+        self.clicked = False
+
+    async def click(self, selector: str, timeout: int | None = None) -> None:
+        self.clicked = True
+        if self.click_opens:
+            self.iframe_srcs = [self.click_opens]
+        await super().click(selector, timeout=timeout)
+
+    # The iframe enumeration arrives through SkyvernFrame.evaluate, which passes its expression by
+    # keyword; observe and the text delta call page.evaluate(js) positionally.
+    async def evaluate(self, expression: str = "", arg: Any = None) -> Any:
+        if "querySelectorAll('iframe')" in expression:
+            return list(self.iframe_srcs)
+        return await super().evaluate(expression)
+
+
+_BLOCKED_BILL_SRC = "https://portal.test/api/ViewBill?token=abc"
+
+
+@pytest.mark.asyncio
+async def test_a_bill_the_browser_refuses_to_frame_is_recovered_as_this_calls_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # v1 recovers these bytes same-origin (SKY-12559); on a download block v3 must too, or the model
+    # is told no file arrived for a click that did reach the right document (SKY-19922).
+    page = _BlockedInlineFramePage(tmp_path)
+    page.click_opens = _BLOCKED_BILL_SRC
+    pdf = b"%PDF-1.7 statement bytes"
+    monkeypatch.setattr("skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes", AsyncMock(return_value=pdf))
+
+    async def download_wait() -> None:
+        return None
+
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    watch.close()
+
+    # Named by the same path a browser download takes: the run-unique prefix plus the frame's own basename.
+    assert re.search(r"Downloaded: [0-9a-f-]{36}-ViewBill\.pdf \(24 B\)", result.content), result.content
+    assert DOWNLOAD_NO_FILE_THIS_ACTION not in result.content
+    assert [path.read_bytes() for path in sorted(tmp_path.iterdir())] == [pdf]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why_not", ["frame_was_already_there", "page_was_replaced", "not_a_download_block"])
+async def test_a_pdf_frame_this_call_did_not_open_is_not_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, why_not: str
+) -> None:
+    page = _BlockedInlineFramePage(tmp_path)
+    if why_not == "frame_was_already_there":
+        # A viewer left by an earlier click is not this click's file: attribution comes from the
+        # pre-call snapshot, so recovering it would mean saving an unrelated document.
+        page.iframe_srcs = [_BLOCKED_BILL_SRC]
+    else:
+        page.click_opens = _BLOCKED_BILL_SRC
+    monkeypatch.setattr(
+        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
+        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
+    )
+
+    async def download_wait() -> None:
+        return None
+
+    replacement: _BlockedInlineFramePage | None = None
+    if why_not == "page_was_replaced":
+        # The click opened a tab that took the working-page slot, so the baseline describes a
+        # document this call no longer holds and nothing readable now is attributable to it.
+        replacement = _BlockedInlineFramePage(tmp_path)
+        replacement.iframe_srcs = [_BLOCKED_BILL_SRC]
+
+    async def page_provider() -> Any:
+        return replacement if replacement is not None and page.clicked else page
+
+    watch = DownloadFailureWatch(page_provider)
+    tools = build_browser_tools(
+        page_provider,
+        downloads_dir=str(tmp_path),
+        download_failures=watch,
+        # A block the engine built no download machinery for pays none of this and recovers nothing.
+        download_wait=download_wait if why_not != "not_a_download_block" else None,
+    )
+    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    watch.close()
+
+    assert "Downloaded:" not in result.content, result.content
+    assert DOWNLOAD_NO_FILE_THIS_ACTION in result.content
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_a_click_that_landed_its_file_does_not_also_recover_the_frame_it_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A site that both downloads the bill and shows it in a viewer would otherwise record the same
+    # invoice twice, and the block would report two files for one statement.
+    page = _BlockedInlineFramePage(tmp_path)
+    page.click_opens = _BLOCKED_BILL_SRC
+    page._click_writes = "statement.pdf"
+    monkeypatch.setattr(
+        "skyvern.webeye.utils.page.SkyvernFrame.read_http_url_bytes",
+        AsyncMock(return_value=b"%PDF-1.7 statement bytes"),
+    )
+
+    async def download_wait() -> None:
+        return None
+
+    watch = DownloadFailureWatch(_fixed_page_provider(page))
+    tools = build_browser_tools(
+        _fixed_page_provider(page), downloads_dir=str(tmp_path), download_failures=watch, download_wait=download_wait
+    )
+    result = await _tool(tools, "click").handler({"selector": "#view-bill"})
+    watch.close()
+
+    assert "Downloaded: statement.pdf" in result.content, result.content
+    assert [path.name for path in tmp_path.iterdir()] == ["statement.pdf"]
+
+
 @pytest.mark.asyncio
 async def test_download_signal_lifecycle_started_then_completed_or_never(tmp_path: Path) -> None:
     tools = build_browser_tools(_fixed_page_provider(_FakePage()), downloads_dir=str(tmp_path))
