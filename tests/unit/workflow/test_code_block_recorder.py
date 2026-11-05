@@ -1306,6 +1306,7 @@ class FakeWorkflowRunContext:
         self.parameters: dict[str, object] = {}
         self.credential_tested_urls: dict[str, str] = {}
         self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
+        self.succeeded_code_block_labels: set[str] = set()
         self._failure_evidence_capture = None
 
     start_failure_evidence_capture = WorkflowRunContext.start_failure_evidence_capture

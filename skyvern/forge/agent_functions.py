@@ -2460,8 +2460,9 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
-    async def post_code_block_execution(self, task: Task, step: Step) -> None:
-        """Billing seam for a code block's container task; called only after a successful execution."""
+    async def post_code_block_execution(self, task: Task, step: Step, *, is_first_successful_execution: bool) -> None:
+        """Billing seam for a code block's container task, called only after a successful execution.
+        is_first_successful_execution is True the first time the block's label reaches this hook in a run attempt."""
         return
 
     async def post_agent_step_execution(
