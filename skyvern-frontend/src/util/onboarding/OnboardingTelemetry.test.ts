@@ -178,7 +178,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_shown",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         primary_intent: null,
         prompt_reason: "initial",
@@ -191,7 +190,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_completed",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         response_id: "response",
         revision: 1,
@@ -214,7 +212,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_skipped",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         response_id: "response",
         revision: 2,
@@ -229,7 +226,6 @@ describe("OnboardingTelemetry", () => {
       "onboarding_questionnaire_updated",
       {
         questionnaire_version: 1,
-        "$feature/onboarding_questionnaire_v1": true,
         surface: "welcome_page",
         response_id: "response",
         revision: 3,

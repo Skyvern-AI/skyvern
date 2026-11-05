@@ -168,8 +168,6 @@ type ExampleAttribution = { id: string; edited: boolean };
 const UPLOAD_RETENTION_DAYS = 30;
 // Mirrors MAX_ATTACHED_FILES_PER_MESSAGE on the copilot chat request.
 const MAX_HOME_ATTACHMENTS = 20;
-// A failed /customer load leaves the flag unknown for the whole session, so stop waiting and show the flag-off controls.
-const HANDOFF_FLAG_WAIT_MS = 3000;
 
 const HOW_IT_WORKS = [
   {
@@ -191,8 +189,6 @@ const HOW_IT_WORKS = [
 
 type PromptBoxProps = {
   enableCopilotHandoff?: boolean;
-  /** Hides the toolbar controls until `enableCopilotHandoff` is known (at most HANDOFF_FLAG_WAIT_MS), so they don't swap on load. */
-  handoffFlagLoading?: boolean;
   /** Home-screen variant: no prompt improver and no advanced settings. */
   minimal?: boolean;
   /** Fires once an agent has been created from this prompt box. */
@@ -284,7 +280,6 @@ function showCreateErrorToast(title: string, error: unknown) {
 function PromptBoxImpl(
   {
     enableCopilotHandoff = false,
-    handoffFlagLoading = false,
     minimal = false,
     onAgentCreated,
     secondaryAction,
@@ -317,16 +312,6 @@ function PromptBoxImpl(
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [promptTouched, setPromptTouched] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<CopilotAttachedFile[]>([]);
-  const [handoffFlagWaitExpired, setHandoffFlagWaitExpired] = useState(false);
-  useEffect(() => {
-    if (!handoffFlagLoading) return;
-    const timer = window.setTimeout(
-      () => setHandoffFlagWaitExpired(true),
-      HANDOFF_FLAG_WAIT_MS,
-    );
-    return () => window.clearTimeout(timer);
-  }, [handoffFlagLoading]);
-  const hideFlagControls = handoffFlagLoading && !handoffFlagWaitExpired;
   const fileInputRef = useRef<HTMLInputElement>(null);
   // file_id of the sample resume an example uploaded, so a user's own upload is never mistaken for it.
   const exampleFileIdRef = useRef<string>();
@@ -914,22 +899,20 @@ function PromptBoxImpl(
               <div className="px-5">{attachmentChips}</div>
             ) : null}
             <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-2">
-              {!hideFlagControls ? (
-                <SpeechInputButton
-                  isSupported={isSpeechSupported}
-                  isListening={isSpeechListening}
-                  isHearingSpeech={isSpeechHearing}
-                  disabled={isSubmitting}
-                  onToggle={() => {
-                    HomeTelemetry.voiceToggled();
-                    setPromptTouched(true);
-                    toggleSpeech();
-                  }}
-                  className="size-11 rounded-full border-0 bg-transparent md:size-9"
-                  iconClassName="h-[18px] w-[18px]"
-                />
-              ) : null}
-              {!hideFlagControls && !enableCopilotHandoff ? (
+              <SpeechInputButton
+                isSupported={isSpeechSupported}
+                isListening={isSpeechListening}
+                isHearingSpeech={isSpeechHearing}
+                disabled={isSubmitting}
+                onToggle={() => {
+                  HomeTelemetry.voiceToggled();
+                  setPromptTouched(true);
+                  toggleSpeech();
+                }}
+                className="size-11 rounded-full border-0 bg-transparent md:size-9"
+                iconClassName="h-[18px] w-[18px]"
+              />
+              {!enableCopilotHandoff ? (
                 <AdvancedSettingsPopover
                   settings={taskRunSettings}
                   onChange={setTaskRunSettings}
