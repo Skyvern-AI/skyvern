@@ -15,6 +15,7 @@ from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
 from skyvern.webeye.browser_runtime_events import AcquireMode, BrowserRuntimeLogContext
+from skyvern.webeye.document_navigation import DocumentNavigation
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
 
 if TYPE_CHECKING:
@@ -177,6 +178,10 @@ class BrowserState(Protocol):
 
     async def wait_for_main_frame_navigation(self, page: Page, deadline: float) -> None:
         """Wait, until at most the monotonic ``deadline``, for ``page``'s in-flight main-frame navigation to settle."""
+        ...
+
+    def committed_document_navigation(self, page: Page) -> DocumentNavigation | None:
+        """The request that committed ``page``'s current main-frame document, or None when it is not known."""
         ...
 
     async def close(
