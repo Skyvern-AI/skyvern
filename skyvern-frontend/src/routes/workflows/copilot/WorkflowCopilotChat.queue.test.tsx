@@ -422,16 +422,24 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     const dropWasNotCancelled = await dropAttachments(
       new File(["row_id,url\n"], "rows.csv"),
       new File(["%PDF"], "report.pdf"),
+      new File(["PK"], "procedure.docx"),
     );
 
     expect(dropWasNotCancelled).toBe(false);
-    await waitFor(() => expect(uploadCount.n).toBe(2));
+    await waitFor(() => expect(uploadCount.n).toBe(3));
     expect(
       screen.getByRole("button", { name: "Remove rows.csv" }),
     ).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Remove report.pdf" }),
     ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Remove procedure.docx" }),
+    ).toBeTruthy();
+    const picker = document.querySelector(
+      'input[type="file"][accept*=".csv"]',
+    ) as HTMLInputElement;
+    expect(picker.accept.split(",")).toContain(".docx");
     expect(screen.queryByText("Drop files to attach")).toBeNull();
   });
 
