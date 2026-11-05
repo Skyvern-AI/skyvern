@@ -1071,6 +1071,10 @@ class AgentFunction:
         """Cloud may hide OSS email-forwarding routes until its ingress is configured."""
         return True
 
+    async def ensure_email_forwarding_management_available(self, organization_id: str) -> bool:
+        """Whether the organization may use the shared email-forwarding management routes."""
+        return await self.ensure_email_forwarding_available(organization_id)
+
     def report_download_failure(self, reason: str, *, failure_key: str | None = None) -> None:
         return None
 
