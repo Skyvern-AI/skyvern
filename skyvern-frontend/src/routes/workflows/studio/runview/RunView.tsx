@@ -108,12 +108,13 @@ import {
   type RunOutputError,
   type RunOutputFile,
 } from "./RunOutputsSection";
-import { failingBlock } from "./failingBlock";
+import { failedBlockRuns, failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunFeedback } from "@/components/feedback/RunFeedback";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
 import {
+  ContinuedFailuresLine,
   FailureRecoveryActions,
   RunFailureLine,
 } from "./RunFailurePresentation";
@@ -621,6 +622,13 @@ export function RunView({
     () => failingBlock(currentTimeline, finallyBlockLabel),
     [currentTimeline, finallyBlockLabel],
   );
+  const continuedFailures = useMemo(
+    () =>
+      outcome === "success" && !runIsPlaceholder
+        ? failedBlockRuns(currentTimeline)
+        : [],
+    [outcome, runIsPlaceholder, currentTimeline],
+  );
   const failureBlockId =
     codeFailure?.workflowRunBlockId ??
     failedBlock?.workflow_run_block_id ??
@@ -1047,6 +1055,13 @@ export function RunView({
               {recovery}
             </RunFailureLine>
           ) : null}
+          {continuedFailures.length > 0 ? (
+            <ContinuedFailuresLine
+              count={continuedFailures.length}
+              firstLabel={continuedFailures[0]!.label}
+              onJump={() => selectTimelineBlock(continuedFailures[0]!)}
+            />
+          ) : null}
           <ResizableTimelineSplit
             className="flex-1"
             top={
@@ -1101,6 +1116,7 @@ export function RunView({
                     // pin; otherwise the pin's URL writer can drop `browser`.
                     requestAnimationFrame(() => pinFrame(workflowRunBlockId));
                   }}
+                  onFix={embedded ? undefined : onFix}
                   statedFailureBlockId={failed ? failureBlockId : null}
                   statedFailureHeadline={failed ? failureHeadline : null}
                 />

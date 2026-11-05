@@ -45,6 +45,7 @@ import type {
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
 import { WorkflowCopilotChat } from "../../copilot/WorkflowCopilotChat";
+import { describeCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
 import { StudioPaneCompactContext } from "../StudioShellContext";
 import { RunPaneActions, RunPaneViewToggles } from "./RunPaneHeader";
 import capturedRun from "../__fixtures__/completed-code-block-run.json";
@@ -1434,6 +1435,134 @@ describe("RunView live-watch terminal transition", () => {
   });
 });
 
+describe("RunView failed blocks of a run that continued", () => {
+  function seedContinuedLoopFailure(
+    runStatus: Status = Status.Completed,
+    errorCode = "user_code_error",
+    blockRunId = "wr_1",
+  ) {
+    seedCompletedRun({ status: runStatus });
+    const failedRow = buildBlock({
+      workflow_run_block_id: "wrb_row0",
+      workflow_run_id: blockRunId,
+      parent_workflow_run_block_id: "wrb_loop",
+      label: "fill_policy_dates",
+      block_type: "code",
+      status: Status.Failed,
+      continue_on_failure: true,
+      current_index: 0,
+      error_codes: [errorCode],
+      failure_reason: "CodeBlock failed with ValueError at line 4: missing.",
+      output: {
+        code_failure: {
+          exception_class: "ValueError",
+          message: "missing.",
+          line: 4,
+        },
+      },
+      created_at: "2026-06-10T00:00:10Z",
+    });
+    const okRow = buildBlock({
+      workflow_run_block_id: "wrb_row1",
+      workflow_run_id: blockRunId,
+      parent_workflow_run_block_id: "wrb_loop",
+      label: "fill_policy_dates",
+      block_type: "code",
+      status: Status.Completed,
+      current_index: 1,
+      created_at: "2026-06-10T00:00:20Z",
+    });
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_loop",
+      workflow_run_id: "wr_1",
+      block_type: "for_loop",
+      label: "each_row",
+      status: Status.Failed,
+      continue_on_failure: true,
+      created_at: "2026-06-10T00:00:00Z",
+    });
+    mocks.timeline = [
+      buildBlockItem(loop, [buildBlockItem(failedRow), buildBlockItem(okRow)]),
+    ];
+  }
+
+  test("a completed run names its failed block runs and jumps to the first", () => {
+    seedContinuedLoopFailure();
+    const onFix = vi.fn();
+    const { container, getByTestId, queryByTestId } = renderRunView({
+      onFix,
+      onRetry: vi.fn(),
+    });
+
+    expect(queryByTestId("run-failure-line")).toBeNull();
+    const line = within(getByTestId("run-continued-failures-line"));
+    expect(
+      line.getByText(
+        "Completed. 1 block run failed and the run continued past it.",
+      ),
+    ).not.toBeNull();
+    fireEvent.click(line.getByRole("button", { name: /fill_policy_dates/ }));
+    expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_row0");
+
+    const scope = within(container);
+    expect(scope.getByText("missing.")).not.toBeNull();
+    fireEvent.click(scope.getByRole("button", { name: "Fix with Copilot" }));
+    expect(onFix).toHaveBeenCalledWith("fill_policy_dates");
+  });
+
+  test("a completed run without failed blocks shows no continued-failures line", () => {
+    seedCompletedRun();
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          workflow_run_block_id: "wrb_ok",
+          status: Status.Completed,
+        }),
+      ),
+    ];
+    const { queryByTestId } = renderRunView({ onFix: vi.fn() });
+
+    expect(queryByTestId("run-continued-failures-line")).toBeNull();
+  });
+
+  test("the card offers Fix only once the run is final", () => {
+    seedContinuedLoopFailure(Status.Running);
+    const view = renderRunView({ onFix: vi.fn() }, "/?wr=wr_1");
+    act(() => useRunViewStore.getState().pinFrame("wrb_row0"));
+    const scope = within(view.container);
+
+    expect(scope.getByText("missing.")).not.toBeNull();
+    expect(
+      scope.queryByRole("button", { name: "Fix with Copilot" }),
+    ).toBeNull();
+
+    seedContinuedLoopFailure(Status.Completed);
+    view.rerenderRunView();
+
+    expect(
+      scope.getByRole("button", { name: "Fix with Copilot" }),
+    ).not.toBeNull();
+  });
+
+  test("a retry-only failure, or a block from another run, gets no Fix on its card", () => {
+    for (const [errorCode, blockRunId] of [
+      ["runner_unavailable", "wr_1"],
+      ["user_code_error", "wr_child"],
+    ]) {
+      seedContinuedLoopFailure(Status.Completed, errorCode, blockRunId);
+      const view = renderRunView({ onFix: vi.fn() });
+      act(() => useRunViewStore.getState().pinFrame("wrb_row0"));
+
+      expect(
+        within(view.container).queryByRole("button", {
+          name: "Fix with Copilot",
+        }),
+      ).toBeNull();
+      cleanup();
+    }
+  });
+});
+
 describe("RunView failure presentation", () => {
   // A code block that killed the run, preceded in the (newest-first) timeline
   // by a block that still ran after it — so the last frame is NOT the failure.
@@ -1466,6 +1595,11 @@ describe("RunView failure presentation", () => {
       ),
     ];
   }
+
+  const userCodeGuidance = () =>
+    describeCodeBlockFailure(
+      buildBlock({ block_type: "code", error_codes: ["user_code_error"] }),
+    )!.guidance;
 
   test("leads with the failure headline and working Fix and Retry CTAs", () => {
     seedCompletedRun({
@@ -1626,23 +1760,22 @@ describe("RunView failure presentation", () => {
     });
     const line = within(getByTestId("run-failure-line"));
 
-    expect(
-      line.getByText("— The block's code raised NameError"),
-    ).not.toBeNull();
-    // One line at run level: badges and the disclosure live on the block.
-    expect(line.queryByText("Line 6")).toBeNull();
+    expect(line.getByText("— The block's code raised an error")).not.toBeNull();
+    // One line at run level: the facts and the disclosure live on the block.
     expect(line.queryByText("Technical details")).toBeNull();
 
     fireEvent.click(line.getByRole("button", { name: "scrape-prices" }));
 
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
     const scope = within(container);
-    expect(scope.getByText("Line 6")).not.toBeNull();
-    expect(scope.getByText("Error code user_code_error")).not.toBeNull();
+    expect(scope.getByText(userCodeGuidance())).not.toBeNull();
+    fireEvent.click(scope.getByText("Technical details"));
+    expect(scope.getByText("NameError")).not.toBeNull();
+    expect(scope.getByText("user_code_error")).not.toBeNull();
+    // The run-level line already offers Fix for this block, so the card does not repeat it.
     expect(
-      scope.getByText(/Open the block and fix the line that raised/),
-    ).not.toBeNull();
-    expect(scope.getByText("Technical details")).not.toBeNull();
+      scope.getAllByRole("button", { name: "Fix with Copilot" }),
+    ).toHaveLength(1);
   });
 
   test("the detail expands the line without restating it", () => {
@@ -1682,21 +1815,19 @@ describe("RunView failure presentation", () => {
     // detail keeps guidance, badges and the disclosure.
     expect(useRunViewStore.getState().pinnedFrameId).toBe("wrb_code");
     expect(
-      scope.getByText("— The block's code raised NameError"),
+      scope.getByText("— The block's code raised an error"),
     ).not.toBeNull();
-    expect(scope.queryByText("The block's code raised NameError")).toBeNull();
-    expect(
-      scope.getByText(/Open the block and fix the line that raised/),
-    ).not.toBeNull();
-    expect(scope.getByText("Line 6")).not.toBeNull();
+    expect(scope.queryByText("The block's code raised an error")).toBeNull();
+    expect(scope.getByText(userCodeGuidance())).not.toBeNull();
+    expect(scope.getByText("Technical details")).not.toBeNull();
 
     // Reached through one of its action rows, the block's failure still expands
     // (SKY-12240 keeps it on every action's Summary) and still skips the title.
     for (const actionId of ["act_ok", "act_fail"]) {
       act(() => useRunViewStore.getState().pinFrame(actionId));
       expect(scope.getByText("Failure")).not.toBeNull();
-      expect(scope.getByText("Line 6")).not.toBeNull();
-      expect(scope.queryByText("The block's code raised NameError")).toBeNull();
+      expect(scope.getByText("Technical details")).not.toBeNull();
+      expect(scope.queryByText("The block's code raised an error")).toBeNull();
     }
   });
 

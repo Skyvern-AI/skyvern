@@ -88,7 +88,7 @@ from skyvern.forge.sdk.services.request_principal import (
     scoped_api_key_id_from_actor,
 )
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
@@ -354,6 +354,7 @@ class CodeBlockEngineFailure:
     native_exception_class: str | None = None
     # Decided by the executor from the runner's typed code, so it survives when redaction empties the reason.
     failure_kind: CodeBlockFailureKind | None = None
+    code_failure: CodeFailure | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -1856,6 +1857,7 @@ class AgentFunction:
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
         download_log: BlockDownloadLog | None = None,
+        authored_code: str | None = None,
     ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner, or return None for legacy.
 

@@ -49,3 +49,25 @@ export function failingBlock(
   walk(flattenTimelineChronologically([...timeline]));
   return found ?? finallyFailure;
 }
+
+// Oldest first; a failed container counts only when none of its children failed, so a loop that
+// failed because one iteration did counts once.
+export function failedBlockRuns(
+  timeline: ReadonlyArray<WorkflowRunTimelineItem> | undefined,
+): Array<WorkflowRunBlock> {
+  const walk = (
+    items: ReadonlyArray<WorkflowRunTimelineItem>,
+  ): Array<WorkflowRunBlock> =>
+    items.flatMap((item) => {
+      const nested = walk(item.children);
+      if (nested.length > 0) {
+        return nested;
+      }
+      return isBlockItem(item) &&
+        item.block.status &&
+        statusIsAFailureType({ status: item.block.status })
+        ? [item.block]
+        : [];
+    });
+  return timeline ? walk(flattenTimelineChronologically([...timeline])) : [];
+}

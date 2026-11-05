@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequ
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from typing import cast as typing_cast
 
 import structlog
@@ -189,6 +189,17 @@ def _is_bounded_runs_list_read(session: AsyncSession, search_key: str | None) ->
     if not search_key or is_indexed_runs_list_search_key(search_key):
         return False
     return session.bind.dialect.name == "postgresql"
+
+
+class WorkflowRunBlockErrorRow(NamedTuple):
+    workflow_run_block_id: str
+    error_codes: list[str]
+    failure_reason: str | None
+    output: Any
+    block_type: str
+    label: str | None = None
+    current_index: int | None = None
+    final_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -4224,7 +4235,7 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         organization_id: str | None = None,
         attempt_number: int | None = None,
-    ) -> list[tuple[str, list[str], str | None, Any, str]]:
+    ) -> list[WorkflowRunBlockErrorRow]:
         """Return block provenance and error details for errored blocks in stable creation order."""
         async with self.Session() as session:
             query = select(
@@ -4233,6 +4244,9 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowRunBlockModel.failure_reason,
                 WorkflowRunBlockModel.output,
                 WorkflowRunBlockModel.block_type,
+                WorkflowRunBlockModel.label,
+                WorkflowRunBlockModel.current_index,
+                WorkflowRunBlockModel.final_url,
             ).filter_by(workflow_run_id=workflow_run_id)
             if organization_id is not None:
                 query = query.filter_by(organization_id=organization_id)
@@ -4246,6 +4260,15 @@ class WorkflowRunsRepository(BaseRepository):
             query = query.order_by(WorkflowRunBlockModel.created_at, WorkflowRunBlockModel.workflow_run_block_id)
             rows = (await session.execute(query)).all()
             return [
-                (row.workflow_run_block_id, row.error_codes, row.failure_reason, row.output, row.block_type)
+                WorkflowRunBlockErrorRow(
+                    row.workflow_run_block_id,
+                    row.error_codes,
+                    row.failure_reason,
+                    row.output,
+                    row.block_type,
+                    row.label,
+                    row.current_index,
+                    row.final_url,
+                )
                 for row in rows
             ]

@@ -41,6 +41,7 @@ function BlockOutputs({
     delete blockOutput.task_id;
     delete blockOutput.status;
     delete blockOutput.failure_reason;
+    delete blockOutput.code_failure;
     delete blockOutput.errors;
 
     if ("created_at" in blockOutput) {

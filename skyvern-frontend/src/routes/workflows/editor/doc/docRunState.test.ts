@@ -106,6 +106,38 @@ describe("Doc run state", () => {
     );
   });
 
+  it("states a failed loop item with the same headline as the Run panel", () => {
+    const loop = row("each_row", {
+      block_type: "for_loop",
+      loop_values: ["a"],
+    });
+    const { loops } = project([
+      item(loop, [
+        item(
+          row("fill_dates", {
+            block_type: "code",
+            current_index: 0,
+            status: Status.Failed,
+            error_codes: ["user_code_error"],
+            failure_reason:
+              "CodeBlock failed with ValueError at line 4: Could not find the input.",
+            output: {
+              code_failure: {
+                exception_class: "ValueError",
+                message: "Could not find the input.",
+                line: 4,
+              },
+            },
+          }),
+        ),
+      ]),
+    ]);
+
+    expect(loops.get("each_row")!.items[0]!.failureHeadline).toBe(
+      "Could not find the input.",
+    );
+  });
+
   it("names how the run ended", () => {
     const plain = project([item(row("open_site"))]);
     const stopped = project([

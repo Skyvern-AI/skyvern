@@ -557,12 +557,14 @@ function BlockInspector({
   block,
   action,
   onViewScreenshot,
+  onFix,
   statedFailureHeadline = null,
   wrapTabs = false,
 }: {
   block: WorkflowRunBlock;
   action?: ActionsApiResponse | null;
   onViewScreenshot?: () => void;
+  onFix?: () => void;
   statedFailureHeadline?: string | null;
   // Narrow hosts (the Doc) let the tab row wrap; the run page keeps its single row.
   wrapTabs?: boolean;
@@ -671,6 +673,7 @@ function BlockInspector({
             <BlockDetailFailure
               block={block}
               onViewScreenshot={onViewScreenshot}
+              onFix={onFix}
               statedFailureHeadline={statedFailureHeadline}
             />
           )}
