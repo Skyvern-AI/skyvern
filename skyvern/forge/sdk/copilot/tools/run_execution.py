@@ -733,7 +733,8 @@ def _without_typed_input(text: str) -> str:
 
 
 def _screened_failure_output(output: Any) -> Any:
-    """A failed block's output repeats its failure text as ``failure_reason`` and as each error's ``reasoning``."""
+    """A failed block's output repeats its failure text as ``failure_reason``, each error's ``reasoning`` and
+    ``code_failure``."""
     if not isinstance(output, dict) or output.get("status") != BlockStatus.failed.value:
         return output
     screened = dict(output)
@@ -746,6 +747,14 @@ def _screened_failure_output(output: Any) -> Any:
             else error
             for error in screened["errors"]
         ]
+    if isinstance(screened.get("code_failure"), dict):
+        # diagnostic=True is explicit because the TOTP screen recognizes diagnostics by key name and does not list these.
+        screened["code_failure"] = {
+            key: redact_totp_runtime_values(_without_typed_input(value), diagnostic=True)
+            if key in ("message", "source_line") and isinstance(value, str)
+            else value
+            for key, value in screened["code_failure"].items()
+        }
     return screened
 
 

@@ -140,6 +140,7 @@ from skyvern.forge.sdk.db.repositories.workflow_run_attempts import (
 )
 from skyvern.forge.sdk.db.repositories.workflow_runs import (
     PrepareNextAttemptResult,
+    WorkflowRunBlockErrorRow,
     WorkflowRunDispatchFinalization,
     lock_workflow_run_for_dispatch,
 )
@@ -680,9 +681,29 @@ def _with_root_user_errors(
     return [*errors, *missing][: max(len(errors), 100)]
 
 
+# The errors-row keys a reader without child-run access may see, matching what the timeline keeps for a block.
+_CHILD_VISIBLE_ERROR_KEYS = frozenset(
+    {"error_code", "error_type", "confidence_float", "workflow_run_block_id", "block_type"}
+)
+
+
+def _errors_without_child_run_text(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            key: value
+            if key in _CHILD_VISIBLE_ERROR_KEYS or value is None
+            else REDACTED_ARTIFACT
+            if isinstance(value, str)
+            else None
+            for key, value in error.items()
+        }
+        for error in errors
+    ]
+
+
 def _merge_workflow_run_errors(
     task_errors: list[dict[str, Any]],
-    block_errors: list[tuple[str, list[str], str | None, Any, str]],
+    block_errors: Sequence[WorkflowRunBlockErrorRow],
     mask_reasoning: Callable[[Any], Any] | None = None,
     registered_secret_values: Iterable[Any] = (),
     workflow_run_id: str | None = None,
@@ -731,6 +752,31 @@ def _merge_workflow_run_errors(
             )
         return is_safe
 
+    def bounded_text(value: Any) -> str | None:
+        return bounded_reasoning(without_category_c(value)) if isinstance(value, str) else None
+
+    def block_facts(row: WorkflowRunBlockErrorRow) -> dict[str, str | int | None]:
+        facts: dict[str, str | int | None] = {
+            "workflow_run_block_id": row.workflow_run_block_id,
+            "block_label": row.label,
+            "block_type": row.block_type,
+            "loop_index": row.current_index,
+            "final_url": bounded_text(row.final_url),
+        }
+        code_failure = row.output.get("code_failure") if type(row.output) is dict else None
+        if row.block_type == BlockType.CODE and type(code_failure) is dict:
+            exception_class = code_failure.get("exception_class")
+            message = code_failure.get("message")
+            line = code_failure.get("line")
+            facts["exception_class"] = exception_class if isinstance(exception_class, str) else None
+            # The stored reason had a further redaction pass; a message it no longer contains held something it removed.
+            facts["exception_message"] = (
+                bounded_text(message) if isinstance(message, str) and message in (row.failure_reason or "") else None
+            )
+            facts["failing_line"] = line if type(line) is int else None
+            facts["source_line"] = bounded_text(code_failure.get("source_line"))
+        return facts
+
     def signature(error: dict[str, Any]) -> tuple[str, str, str | None]:
         error_type = error.get("error_type")
         return (
@@ -761,15 +807,18 @@ def _merge_workflow_run_errors(
         error = dict(task_error)
         append(error, "task", "legacy")
 
-    for block_id, error_codes, failure_reason, output, block_type in block_errors:
+    for row in block_errors:
+        block_id = row.workflow_run_block_id
+        output = row.output
         if len(errors) >= 100 and not legacy_positions:
             break
         block_has_upgrade = any(provenance == block_id for provenance, _ in legacy_positions)
         if len(errors) >= 100 and not block_has_upgrade:
             continue
+        facts = block_facts(row)
         # Legitimate ingress emits only a handful of entries, with typed upgrades near the front.
         # Ignore corrupt/adversarial row data beyond the per-source scan cap.
-        for code in (error_codes or [])[:100]:
+        for code in (row.error_codes or [])[:100]:
             if len(errors) >= 100:
                 break
             provenance = (block_id, code)
@@ -778,8 +827,9 @@ def _merge_workflow_run_errors(
             position = append(
                 {
                     "error_code": code,
-                    "reasoning": failure_reason or "",
+                    "reasoning": row.failure_reason or "",
                     "confidence_float": 1.0,
+                    **facts,
                 },
                 block_id,
                 "legacy",
@@ -788,7 +838,7 @@ def _merge_workflow_run_errors(
                 legacy_positions[provenance] = position
 
         if (
-            block_type not in (BlockType.CODE, BlockType.WEB_SEARCH)
+            row.block_type not in (BlockType.CODE, BlockType.WEB_SEARCH)
             or type(output) is not dict
             or type(output.get("errors")) is not list
         ):
@@ -808,6 +858,7 @@ def _merge_workflow_run_errors(
             accepted_signature = (block_id, "typed", *signature(accepted))
             if accepted_signature in exact_errors:
                 continue
+            accepted.update(facts)
             if legacy_position is not None:
                 exact_errors.discard((block_id, "legacy", *signature(errors[legacy_position])))
                 errors[legacy_position] = accepted
@@ -16558,7 +16609,7 @@ class WorkflowService:
         errors = _with_diagnostic_system_errors(errors, workflow_run.failure_category, current_attempt)
         errors = _with_final_har_user_errors(errors, workflow_run.failure_category, current_attempt)
         if not child_access.allowed:
-            errors = [{**error, "reasoning": REDACTED_ARTIFACT} if "reasoning" in error else error for error in errors]
+            errors = _errors_without_child_run_text(errors)
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 

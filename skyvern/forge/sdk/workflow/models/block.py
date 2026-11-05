@@ -53,8 +53,10 @@ from typing import (
     Literal,
     NamedTuple,
     NoReturn,
+    NotRequired,
     ParamSpec,
     Protocol,
+    TypedDict,
     TypeVar,
     Union,
     cast,
@@ -190,7 +192,12 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
 from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
-from skyvern.forge.sdk.copilot.code_block_security import SlottedReference, is_inert_slot, slot_template
+from skyvern.forge.sdk.copilot.code_block_security import (
+    INERT_SLOT_NAME,
+    SlottedReference,
+    is_inert_slot,
+    slot_template,
+)
 from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions, code_typed_values
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
@@ -1164,6 +1171,41 @@ def build_block_failure_output(failure_reason: str, error_codes: Sequence[str]) 
         "failure_reason": failure_reason,
         "errors": [{"error_code": code, "reasoning": failure_reason, "confidence_float": 1.0} for code in error_codes],
     }
+
+
+class CodeFailure(TypedDict):
+    exception_class: str | None
+    message: str | None
+    line: int | None
+    source_line: NotRequired[str]
+
+
+CODE_FAILURE_SOURCE_LINE_MAX_CHARS = 300
+
+
+def code_failure_source_line(
+    *,
+    authored_code: str | None,
+    executed_code: str | None,
+    line: int | None,
+    workflow_run_context: WorkflowRunContext,
+    redaction_parameters: dict[str, Any],
+) -> str | None:
+    # authored_code is the inert-slot render; a line count that differs from the executed code means its numbering
+    # would not match the failing line, and a line holding a slot would show the internal slot name.
+    if authored_code is None or line is None or line < 1:
+        return None
+    authored_lines = authored_code.splitlines()
+    if len(authored_lines) != len((executed_code or "").splitlines()) or line > len(authored_lines):
+        return None
+    source_line = authored_lines[line - 1].strip()
+    if INERT_SLOT_NAME in source_line:
+        return None
+    # Masked whole before the cap so a secret crossing the cut is never partly kept.
+    masked = _redact_codeblock_failure_text(
+        workflow_run_context.mask_secrets_in_data(source_line), redaction_parameters, ""
+    )
+    return masked[:CODE_FAILURE_SOURCE_LINE_MAX_CHARS] if masked else None
 
 
 def user_defined_failure_category(error: UserDefinedError) -> list[dict[str, Any]]:
@@ -10448,6 +10490,7 @@ async def wrapper({default_args}):
                     download_binding=download_binding_of(browser_state),
                     download_evidence=download_evidence,
                     download_log=download_log,
+                    authored_code=authored_code,
                 )
                 LOG.info(
                     "Secure CodeBlock override returned",
@@ -10603,6 +10646,8 @@ async def wrapper({default_args}):
                                 )
                             if secure_failure.denied_exception_class is not None:
                                 failure_output["runner_exception_class"] = secure_failure.denied_exception_class
+                            if secure_failure.code_failure is not None:
+                                failure_output["code_failure"] = secure_failure.code_failure
                             await self.record_output_parameter_value(
                                 workflow_run_context, workflow_run_id, failure_output
                             )
@@ -11062,6 +11107,7 @@ async def wrapper({default_args}):
                     download_claim_outcome=inline_download_claim_outcome.outcome,
                     sign_in_form_visible=await page_shows_sign_in_form(failing_tab or page),
                 )
+            code_failure: CodeFailure | None = None
             if (
                 type(e) is ErrorCode
                 and e.error_code not in self._effective_error_code_mapping(workflow_run_context)
@@ -11093,11 +11139,32 @@ async def wrapper({default_args}):
                 # User code can raise an exception carrying a resolved secret (e.g.
                 # `raise Exception(await cred.otp())`) or a parameter value; mask both before the
                 # cause reaches the persisted reason, and keep the bare reason when nothing survives.
-                masked_message = workflow_run_context.mask_secrets_in_data(CustomizedCodeException(e).message)
+                customized_message = CustomizedCodeException(e).message or ""
+                masked_message = workflow_run_context.mask_secrets_in_data(customized_message)
                 failure_reason = (
                     scrub_failure_reason(masked_message[:CODE_BLOCK_FAILURE_REASON_MAX_CHARS])
                     or CODE_BLOCK_GENERIC_FAILURE_REASON
                 )
+                # The message is read back out of the persisted reason, so it never shows more than the reason does.
+                reason_prefix = customized_message.removesuffix(str(e))
+                code_failure = CodeFailure(
+                    exception_class=type(e).__name__ if type(e).__module__ == "builtins" else None,
+                    message=(
+                        (failure_reason.removeprefix(reason_prefix) or None)
+                        if failure_reason.startswith(reason_prefix)
+                        else None
+                    ),
+                    line=failing_line,
+                )
+                source_line = code_failure_source_line(
+                    authored_code=authored_code,
+                    executed_code=self.code,
+                    line=failing_line,
+                    workflow_run_context=workflow_run_context,
+                    redaction_parameters=serialized_parameter_values,
+                )
+                if source_line is not None:
+                    code_failure["source_line"] = source_line
             inline_failure_page_state: dict[str, str] = {}
             if isinstance(e, PlaywrightTimeoutError):
                 # Bind to the original exception before diagnostic proxy calls can alter recorder state.
@@ -11192,6 +11259,10 @@ async def wrapper({default_args}):
             if inline_nav_code and is_registered_secret(inline_nav_code, workflow_run_context):
                 inline_nav_code = None
             driver_nav_codes = [inline_nav_code] if inline_nav_code else None
+            # A non-browser exception takes the code the secure runner gives it, so the run's errors list carries it.
+            user_code_error_codes = (
+                ["user_code_error"] if code_failure is not None and not isinstance(e, PlaywrightError) else None
+            )
 
             async def build_legacy_failure_result() -> BlockResult:
                 failure_output = None
@@ -11223,17 +11294,26 @@ async def wrapper({default_args}):
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                 )
+                block_row_output = download_aware_failure_output or failure_output
+                if code_failure is not None:
+                    # Only the block row carries it, for the run view and the run's errors list: what later
+                    # blocks and loop outputs read stays the recorded value above.
+                    block_row_output = {
+                        **(block_row_output or build_block_failure_output(failure_reason, [])),
+                        "code_failure": code_failure,
+                    }
                 return await self.build_block_result(
                     success=False,
                     failure_reason=failure_reason,
-                    output_parameter_value=download_aware_failure_output or failure_output,
+                    output_parameter_value=block_row_output,
                     status=BlockStatus.failed,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
                     # This block catches its own failures, so the driver's code never reaches the
                     # wrapper that stamps it. A consumer reading only failure_reason cannot tell a
                     # real browser error from a sentence describing one.
-                    error_codes=_redact_codeblock_error_codes(driver_nav_codes, serialized_parameter_values) or None,
+                    error_codes=_redact_codeblock_error_codes(driver_nav_codes, serialized_parameter_values)
+                    or user_code_error_codes,
                 )
 
             return await self._resolve_failure_with_heal(

@@ -28,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
     is_sensitive_workflow_parameter,
 )
+from skyvern.schemas.run_enums import TERMINAL_STATUSES
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import BlockType
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest as WorkflowCreateYAMLRequestSchema
@@ -40,6 +41,7 @@ from ._workflow_http import (
     coerce_timestamp,
     create_workflow_raw,
     get_workflow_by_id,
+    get_workflow_run_block_artifacts,
     get_workflow_run_status,
     list_workflow_runs_raw,
     list_workflows_raw,
@@ -426,6 +428,39 @@ _RUN_LIST_DETAILS_HINT = (
 )
 
 
+_BLOCK_FAILURE_PREVIEW_COUNT = 3
+
+
+def _failed_block_rows(run: Any) -> list[dict[str, Any]]:
+    """The first errors row of each distinct failed block, in the order the run reported them."""
+    errors = _jsonable(_get_value(run, "errors"))
+    first_rows: dict[str, dict[str, Any]] = {}
+    for error in errors if isinstance(errors, list) else []:
+        if isinstance(error, dict) and isinstance(error.get("workflow_run_block_id"), str):
+            first_rows.setdefault(error["workflow_run_block_id"], error)
+    return list(first_rows.values())
+
+
+async def _block_screenshot_url(row: dict[str, Any]) -> str | None:
+    """The block's newest screenshot, picked the way the run view picks it; None when unavailable."""
+    preferred = (
+        ("screenshot_action", "screenshot_llm")
+        if row.get("block_type") == BlockType.CODE
+        else ("screenshot_llm", "screenshot_action")
+    )
+    try:
+        artifacts = await get_workflow_run_block_artifacts(row["workflow_run_block_id"])
+    except Exception:
+        LOG.debug("Block screenshot lookup failed", workflow_run_block_id=row["workflow_run_block_id"], exc_info=True)
+        return None
+    for artifact_type in preferred:
+        for artifact in artifacts:
+            signed_url = artifact.get("signed_url")
+            if artifact.get("artifact_type") == artifact_type and not artifact.get("archived") and signed_url:
+                return str(signed_url)
+    return None
+
+
 def _serialize_run_summary(run: Any) -> dict[str, Any]:
     run_id = _get_run_id(run)
     run_type = _get_value(run, "run_type")
@@ -481,6 +516,10 @@ def _serialize_run_summary(run: Any) -> dict[str, Any]:
         summary["step_count"] = step_count
     elif total_steps is not None:
         summary["total_steps"] = total_steps
+
+    failed_blocks = _failed_block_rows(run)
+    if failed_blocks:
+        summary["block_failures"] = {"total": len(failed_blocks)}
 
     return {key: value for key, value in summary.items() if value is not None}
 
@@ -2322,8 +2361,31 @@ async def skyvern_workflow_status(
                 error=make_error(ErrorCode.API_ERROR, str(e), "Check the run ID and your API key"),
             )
 
+    status = _get_value(run, "status")
+    run_status = status.value if isinstance(status, Enum) else status
+    failed_blocks = _failed_block_rows(run) if run_status in TERMINAL_STATUSES else []
+    screenshot_url = await _block_screenshot_url(failed_blocks[0]) if failed_blocks else None
+    status_warnings = (
+        [f"Run completed, but {len(failed_blocks)} block run(s) failed and the run continued past them."]
+        if failed_blocks and run_status == "completed"
+        else []
+    )
+
     def _payload_for(selected_verbosity: str) -> dict[str, Any]:
         payload = _serialize_run_full(run) if selected_verbosity == "full" else _serialize_run_summary(run)
+        if selected_verbosity == "full":
+            errors = payload.get("errors")
+            if screenshot_url and isinstance(errors, list):
+                first_block_id = failed_blocks[0]["workflow_run_block_id"]
+                for position, error in enumerate(errors):
+                    if isinstance(error, dict) and error.get("workflow_run_block_id") == first_block_id:
+                        errors[position] = {**error, "screenshot_url": screenshot_url}
+                        break
+        elif failed_blocks:
+            rows = failed_blocks[:_BLOCK_FAILURE_PREVIEW_COUNT]
+            if screenshot_url:
+                rows = [{**rows[0], "screenshot_url": screenshot_url}, *rows[1:]]
+            payload["block_failures"] = {"total": len(failed_blocks), "rows": rows}
         if run_id.startswith("wr_"):
             payload["sdk_equivalent"] = (
                 f"await skyvern_workflow_status(run_id={run_id!r}, verbosity={selected_verbosity!r})"
@@ -2335,7 +2397,9 @@ async def skyvern_workflow_status(
             )
         return payload
 
-    result = make_result("skyvern_workflow_status", data=_payload_for(verbosity), timing_ms=timer.timing_ms)
+    result = make_result(
+        "skyvern_workflow_status", data=_payload_for(verbosity), timing_ms=timer.timing_ms, warnings=status_warnings
+    )
     if within_response_limits(result):
         return result
 
@@ -2353,7 +2417,7 @@ async def skyvern_workflow_status(
         "skyvern_workflow_status",
         data=summary_data,
         timing_ms=timer.timing_ms,
-        warnings=[oversized_warning],
+        warnings=[oversized_warning, *status_warnings],
     )
     if within_response_limits(summary_result):
         return summary_result
@@ -2373,7 +2437,7 @@ async def skyvern_workflow_status(
             "skyvern_workflow_status",
             data={**minimal, "artifact_summary": downloads},
             timing_ms=timer.timing_ms,
-            warnings=[oversized_warning],
+            warnings=[oversized_warning, *status_warnings],
         )
         if within_response_limits(with_downloads):
             return with_downloads
@@ -2381,7 +2445,7 @@ async def skyvern_workflow_status(
         "skyvern_workflow_status",
         data=minimal,
         timing_ms=timer.timing_ms,
-        warnings=[oversized_warning],
+        warnings=[oversized_warning, *status_warnings],
     )
 
 
