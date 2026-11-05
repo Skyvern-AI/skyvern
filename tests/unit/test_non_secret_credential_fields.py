@@ -55,6 +55,7 @@ async def _register(
     app.CREDENTIAL_VAULT_SERVICES.get.return_value = vault
     # Mirror the OSS no-op hook: return the resolved item unchanged.
     app.AGENT_FUNCTION.enforce_credential_use = AsyncMock()
+    app.AGENT_FUNCTION.enforce_workflow_context_credential_use = AsyncMock()
     app.AGENT_FUNCTION.process_registered_credential_item = AsyncMock(
         side_effect=lambda *, workflow_run_id, db_credential, credential_item: credential_item
     )

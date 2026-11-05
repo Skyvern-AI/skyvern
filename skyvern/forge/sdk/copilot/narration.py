@@ -104,6 +104,7 @@ _TOOL_ACTIVITY_DISPLAY_LABELS = {
     "extend_browser_session": "Extending the browser session",
     "upload_attached_file": "Attaching your file to the page",
     "read_attached_pdf": "Reading your attached PDF",
+    "read_chat_history": "Reading earlier messages in this chat",
     "run_browser_code": "Working in the browser",
     "edit_block": "Editing block",
     "add_block": "Adding block",

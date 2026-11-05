@@ -35,7 +35,8 @@ _DOC_POINTER = "Skyvern Cloud-only runbook: cloud_docs/fern-sdk/README.md (not p
 _NEW_BLOCK_TYPE_CHECKLIST = (
     "A new BlockType addition must satisfy ALL of the following before merge:\n"
     "  1. Added to `skyvern/schemas/workflows.BlockType` enum.\n"
-    "  2. Added to `skyvern/cli/mcp_tools/blocks.BLOCK_TYPE_MAP` AND `_YAML_CLASS_MAP`.\n"
+    "  2. YAML class added to `skyvern/schemas/workflows.BLOCK_YAML_SUBCLASSES` (BLOCK_TYPE_MAP derives from it)\n"
+    "     and a `skyvern/cli/mcp_tools/blocks.BLOCK_SUMMARIES` entry added.\n"
     "  3. EITHER regenerate the Fern SDK in a paired PR (link it),\n"
     "     OR add a `BlockDriftEntry` to `_KNOWN_DRIFT_ALLOWLIST` in this file with\n"
     "     populated `ticket`, `owner`, and `added_at` fields.\n"

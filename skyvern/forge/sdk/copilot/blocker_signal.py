@@ -85,6 +85,7 @@ _INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
     "extend_browser_session",
     "upload_attached_file",
     "read_attached_pdf",
+    "read_chat_history",
     "get_browser_screenshot",
     "list_credentials",
     "list_integrations",

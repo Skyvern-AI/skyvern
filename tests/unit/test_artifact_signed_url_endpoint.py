@@ -58,6 +58,7 @@ def _patch_app() -> Any:
     return patch(
         "skyvern.forge.sdk.routes.agent_protocol.app",
         **{
+            "AGENT_FUNCTION.should_check_browser_session_artifacts": AsyncMock(return_value=False),
             "AGENT_FUNCTION.accessible_workflow_folder_ids": AsyncMock(return_value=None),
             "AGENT_FUNCTION.enforce_folder_access": AsyncMock(),
         },

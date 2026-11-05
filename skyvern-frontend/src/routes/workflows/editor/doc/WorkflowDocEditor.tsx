@@ -1,6 +1,8 @@
 import { graphNoteReadings } from "./noteSequences";
 import {
   type HTMLAttributes,
+  type Ref,
+  forwardRef,
   useEffect,
   useMemo,
   useRef,
@@ -8,7 +10,7 @@ import {
 } from "react";
 import { buildWorkflowSaveRequest } from "../workflowYamlDocument";
 import type { Edge } from "@xyflow/react";
-import { QuestionMarkCircledIcon } from "@radix-ui/react-icons";
+import { GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 import { cn } from "@/util/utils";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
@@ -23,7 +25,10 @@ import {
   selectEditorMutationLocked,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
-import { WorkflowParameterValueType } from "../../types/workflowTypes";
+import {
+  WorkflowEditorParameterTypes,
+  WorkflowParameterValueType,
+} from "../../types/workflowTypes";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { isEditableTarget } from "../editableTarget";
@@ -33,7 +38,19 @@ import {
 } from "../WorkflowScopeContext";
 import { buildDocTree, countDocSteps, type DocItem } from "./buildDocTree";
 import { docLearnContent, type DocLearnContent } from "./docLearnContent";
+import { docStarterDone, useDocStarter } from "./useDocStarter";
 import { getDocInputChips } from "./docInputChips";
+import {
+  docInputNameProblem,
+  isDocEditableInput,
+  newDocInputKey,
+  parseDocInputForm,
+  removeDocInput,
+  saveDocInput,
+} from "./docInputs";
+import { DocInputEditor } from "./DocInputEditor";
+import type { ParametersState } from "../types";
+import { toast } from "@/components/ui/use-toast";
 import {
   WorkflowDocActionsContext,
   type DocPendingNote,
@@ -42,6 +59,7 @@ import { docBranchSelection } from "./docBranchSelection";
 import { useDocRun } from "./useDocRun";
 import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
+import { DocStepSearch } from "./DocStepSearch";
 import { DocAddStep, DocScope, type DocNoteProblem } from "./DocScope";
 import { DocSidePanel } from "./DocSidePanel";
 import { DocText } from "./DocText";
@@ -52,8 +70,17 @@ import {
   TOP_SCOPE,
   type DocGraphEdits,
 } from "./docEditApi";
-import { findOutputUsers } from "./docGraphEdits";
+import { countReferences, findOutputUsers } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
+import { docStepProblems } from "./docProblems";
+import {
+  DocGettingStarted,
+  DocKeyHints,
+  DocStarterNote,
+  DocTip,
+  type DocStarterProgress,
+} from "./DocStarter";
+import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import {
   DocProposalCard,
   DocProposalProvider,
@@ -62,19 +89,29 @@ import {
 } from "./DocProposalView";
 
 // The conditionals and branches that contain a step, outermost first.
-type RevealPath = { branches: Array<[string, string]>; loops: string[] };
+type RevealPath = {
+  branches: Array<[string, string]>;
+  loops: string[];
+  conditionals: string[];
+};
 
 function revealPath(items: DocItem[], id: string): RevealPath | null {
   for (const item of items) {
     if (item.kind === "note") continue;
     if (item.kind === "unplaced") {
-      if (item.nodeIds.includes(id)) return { branches: [], loops: [] };
+      if (item.nodeIds.includes(id))
+        return { branches: [], loops: [], conditionals: [] };
       continue;
     }
-    if (item.nodeId === id) return { branches: [], loops: [] };
+    if (item.nodeId === id)
+      return { branches: [], loops: [], conditionals: [] };
     if (item.kind === "loop") {
       const found = revealPath(item.children, id);
-      if (found) return { ...found, loops: [item.nodeId, ...found.loops] };
+      if (found)
+        return {
+          ...found,
+          loops: [item.nodeId, ...found.loops],
+        };
     }
     if (item.kind === "conditional")
       for (const branch of item.branches) {
@@ -83,10 +120,24 @@ function revealPath(items: DocItem[], id: string): RevealPath | null {
           return {
             ...found,
             branches: [[item.nodeId, branch.branchId], ...found.branches],
+            conditionals: [item.nodeId, ...found.conditionals],
           };
       }
   }
   return null;
+}
+
+function docContainerIds(items: DocItem[]): string[] {
+  return items.flatMap((item) => {
+    if (item.kind === "loop")
+      return [item.nodeId, ...docContainerIds(item.children)];
+    if (item.kind === "conditional")
+      return [
+        item.nodeId,
+        ...item.branches.flatMap((branch) => docContainerIds(branch.children)),
+      ];
+    return [];
+  });
 }
 
 const OUTLINE_MIN_WIDTH = 640;
@@ -107,22 +158,26 @@ type WorkflowValidationProblem = {
   field: string | null;
   code: string;
   message: string;
+  severity?: "error" | "warning";
 };
 
 const VALIDATE_DEBOUNCE_MS = 600;
 
-function InputChip({
-  onClick,
-  ...props
-}: Omit<HTMLAttributes<HTMLElement>, "onClick"> & {
-  onClick?: () => void;
-}) {
+const InputChip = forwardRef<
+  HTMLElement,
+  Omit<HTMLAttributes<HTMLElement>, "onClick"> & { onClick?: () => void }
+>(function InputChip({ onClick, ...props }, ref) {
   return onClick ? (
-    <button type="button" onClick={onClick} {...props} />
+    <button
+      type="button"
+      ref={ref as Ref<HTMLButtonElement>}
+      onClick={onClick}
+      {...props}
+    />
   ) : (
-    <span {...props} />
+    <span ref={ref as Ref<HTMLSpanElement>} {...props} />
   );
-}
+});
 
 export function WorkflowDocEditor({
   nodes: liveNodes,
@@ -182,12 +237,27 @@ export function WorkflowDocEditor({
   const [learn, setLearn] = useState<DocLearnContent>(docLearnContent[0]!);
   const [branches, setBranches] = useState<Record<string, string>>({});
   const [closedLoops, setClosedLoops] = useState<Set<string>>(() => new Set());
+  const [closedConditionals, setClosedConditionals] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [searchOpen, setSearchOpen] = useState(false);
   const locateRequest = useLocateBlockStore((s) => s.request);
   const clearLocate = useLocateBlockStore((s) => s.clearLocate);
   const [wide, setWide] = useState(false);
   const [focusId, setFocusId] = useState<string | null>(null);
+  const focusIdRef = useRef(focusId);
+  focusIdRef.current = focusId;
   const [pendingNote, setPendingNote] = useState<DocPendingNote | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
+  const [editingInput, setEditingInput] = useState<{
+    key: string | null;
+    type: "workflow" | "context";
+    isNew?: boolean;
+  } | null>(null);
+  // Inputs deleted here: their mentions stay in the text and show as missing.
+  const [removedInputs, setRemovedInputs] = useState<Set<string>>(
+    () => new Set(),
+  );
   // Native drag events can end outside the doc, or not reach a drop target; any end clears the drag.
   useEffect(() => {
     if (!dragId) return;
@@ -248,6 +318,9 @@ export function WorkflowDocEditor({
     [parameters],
   );
   const stepCount = countDocSteps(tree.items);
+  const containerIds = useMemo(() => docContainerIds(tree.items), [tree.items]);
+  const startId =
+    nodes.find((n) => n.type === "start" && !n.parentId)?.id ?? null;
   const finallyId = useMemo(
     () =>
       nodes.find(
@@ -335,7 +408,21 @@ export function WorkflowDocEditor({
       }
     return missing;
   }, [nodes, parameters]);
-  const problems = validationProblems.length;
+  // What steps still need before they can run, found as the draft is typed; the server's check follows.
+  const stepFixes = useMemo(
+    () => (proposal ? new Map<string, string[]>() : docStepProblems(nodes)),
+    [nodes, proposal],
+  );
+  const fixCount = [...stepFixes.values()].reduce(
+    (count, messages) => count + messages.length,
+    0,
+  );
+  const problems = validationProblems.length + fixCount;
+  // A check that couldn't reach the server says so, but doesn't hold the run. The problems it left
+  // from an earlier check describe an older draft, so they stay on screen but no longer block it.
+  const checkFailed = validationProblems.some(
+    (problem) => problem.code === "validation_failed",
+  );
   const workflowProblems = useMemo(
     () => validationProblems.filter((problem) => !problem.block_label),
     [validationProblems],
@@ -369,13 +456,96 @@ export function WorkflowDocEditor({
         });
       }
     }
+    for (const [nodeId, messages] of stepFixes)
+      result.set(`${nodeId}:fix`, {
+        code: "needs_setting",
+        message: messages.join("\n"),
+      });
     return result;
-  }, [nodes, validationProblems]);
+  }, [nodes, validationProblems, stepFixes]);
 
   // Step warnings sit in the same map but are not notes and do not need fixing.
   const noteProblemCount = [...noteProblems.keys()].filter(
-    (key) => !key.endsWith(":step"),
+    (key) => !key.endsWith(":step") && !key.endsWith(":fix"),
   ).length;
+  // A credential named in a note is only a save warning, but the run would read it, so it holds Run like a step problem.
+  const runProblems =
+    fixCount +
+    (checkFailed ? 0 : noteProblemCount) +
+    (checkFailed
+      ? 0
+      : validationProblems.filter(
+          (problem) =>
+            problem.code !== "validation_failed" &&
+            problem.severity !== "warning" &&
+            problem.code !== "credential_in_note",
+        ).length);
+  useEffect(() => {
+    useRunValidationStore.getState().setDocProblemCount(runProblems);
+  }, [runProblems]);
+  useEffect(
+    () => () => useRunValidationStore.getState().setDocProblemCount(0),
+    [],
+  );
+  const firstProblemId = useMemo(() => {
+    const ids = new Set(
+      [...noteProblems.keys()]
+        .filter((key) => key.endsWith(":step") || key.endsWith(":fix"))
+        .map((key) => key.slice(0, key.lastIndexOf(":"))),
+    );
+    const visit = (items: DocItem[]): string | null => {
+      for (const item of items) {
+        if (item.kind === "note") {
+          if (noteProblems.has(`${item.ownerNodeId}:${item.placement}`))
+            return item.ownerNodeId;
+          continue;
+        }
+        if (item.kind === "unplaced") {
+          const hit = item.nodeIds.find((id) => ids.has(id));
+          if (hit) return hit;
+          continue;
+        }
+        if (ids.has(item.nodeId)) return item.nodeId;
+        const inner =
+          item.kind === "loop"
+            ? visit(item.children)
+            : item.kind === "conditional"
+              ? item.branches.reduce<string | null>(
+                  (found, branch) => found ?? visit(branch.children),
+                  null,
+                )
+              : null;
+        if (inner) return inner;
+      }
+      return null;
+    };
+    return visit(tree.items);
+  }, [noteProblems, tree]);
+  const starter = useDocStarter(
+    workflowId ?? null,
+    Boolean(edit) && stepCount === 0 && !description?.trim(),
+  );
+  const starterProgress: DocStarterProgress = {
+    steps: stepCount,
+    usedReference: nodes.some(
+      (node) =>
+        isWorkflowBlockNode(node) &&
+        textValues(node.data).some((value) => value.includes("{{")),
+    ),
+    nested: nodes.some((node) => isWorkflowBlockNode(node) && node.parentId),
+    hasContainer: nodes.some(
+      (node) => node.type === "loop" || node.type === "conditional",
+    ),
+    problems,
+    ran: blocksByLabel.size > 0,
+  };
+  const reached = docStarterDone(starterProgress);
+  const { markDone } = starter;
+  useEffect(() => {
+    if (starter.active) markDone(reached);
+    // `reached` is a fresh array each render; its contents are the dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [starter.active, reached.join(",")]);
 
   // Checks the draft as it stands, so a credential typed into a note is flagged before the save.
   useEffect(() => {
@@ -487,17 +657,42 @@ export function WorkflowDocEditor({
         for (const loopId of path.loops) next.delete(loopId);
         return next;
       });
+    if (path?.conditionals.length)
+      setClosedConditionals((current) => {
+        if (!path.conditionals.some((id) => current.has(id))) return current;
+        const next = new Set(current);
+        for (const conditionalId of path.conditionals)
+          next.delete(conditionalId);
+        return next;
+      });
     requestAnimationFrame(() => {
       const target = scrollRef.current?.querySelector<HTMLElement>(
         `[data-doc-node-id="${CSS.escape(id)}"]`,
       );
       target?.scrollIntoView({ block: "center", behavior: "smooth" });
-      target?.focus({ preventScroll: true });
+      // A step whose line is being typed in (Tab just moved it) gets the caret back on that line.
+      const line =
+        focusIdRef.current === id
+          ? target?.querySelector<HTMLElement>('[role="textbox"]')
+          : null;
+      (line ?? target)?.focus({ preventScroll: true });
     });
   };
   // The run-blocking panel's Locate lands here while the canvas is covered.
   const goToRef = useRef(goTo);
   goToRef.current = goTo;
+  const firstProblemIdRef = useRef(firstProblemId);
+  firstProblemIdRef.current = firstProblemId;
+  useEffect(() => {
+    const show = () => {
+      if (firstProblemIdRef.current) goToRef.current(firstProblemIdRef.current);
+    };
+    useRunValidationStore.getState().setDocShowFirstProblem(show);
+    return () => {
+      if (useRunValidationStore.getState().docShowFirstProblem === show)
+        useRunValidationStore.getState().setDocShowFirstProblem(null);
+    };
+  }, []);
   useEffect(() => {
     if (!locateRequest) return;
     if (
@@ -514,6 +709,118 @@ export function WorkflowDocEditor({
     useWorkflowPanelStore
       .getState()
       .setWorkflowPanelState({ active: true, content: "parameters" });
+  // The same store and step rewrites as the Inputs panel, applied as one Doc edit.
+  const applyInputs = (
+    nextParameters: typeof liveParameters,
+    nextNodes: ((nodes: AppNode[]) => AppNode[]) | null,
+  ) => {
+    useWorkflowParametersStore.getState().setParametersFromUser(nextParameters);
+    useWorkflowHasChangesStore.getState().setHasChanges(true);
+    if (nextNodes) edits?.update(nextNodes);
+  };
+  const forgetRemovedInput = (key: string) =>
+    setRemovedInputs((current) => {
+      if (!current.has(key)) return current;
+      const next = new Set(current);
+      next.delete(key);
+      return next;
+    });
+  const changesBeforeNewInput = useRef(false);
+  const addInput = (type: "workflow" | "context") => {
+    if (type === "context") {
+      setEditingInput({ key: null, type });
+      return;
+    }
+    changesBeforeNewInput.current =
+      useWorkflowHasChangesStore.getState().hasChanges;
+    const key = newDocInputKey(liveParameters, liveNodes);
+    applyInputs(
+      [
+        ...liveParameters,
+        {
+          key,
+          parameterType: "workflow",
+          dataType: WorkflowParameterValueType.String,
+          description: null,
+          defaultValue: null,
+        },
+      ],
+      null,
+    );
+    forgetRemovedInput(key);
+    setEditingInput({ key, type, isNew: true });
+  };
+  const saveInput = (
+    oldKey: string | null,
+    parameter: ParametersState[number],
+  ) => {
+    const nameProblem = docInputNameProblem(
+      parameter.key,
+      oldKey,
+      liveNodes,
+      liveParameters
+        .filter((existing) => existing.key !== oldKey)
+        .map((existing) => existing.key),
+    );
+    if (nameProblem) {
+      toast({
+        title: "Failed to save input",
+        description: nameProblem,
+        variant: "destructive",
+      });
+      return;
+    }
+    const rewritten =
+      oldKey === parameter.key || oldKey === null
+        ? 0
+        : countReferences(liveNodes, oldKey);
+    const result = saveDocInput(liveParameters, oldKey, parameter);
+    applyInputs(result.parameters, result.nodes);
+    forgetRemovedInput(parameter.key);
+    if (rewritten > 0)
+      toast({
+        title: `Renamed ${oldKey} to ${parameter.key}`,
+        description: `${rewritten} reference${rewritten === 1 ? "" : "s"} updated`,
+      });
+    setEditingInput(null);
+  };
+  // Closing the form of a new input nobody filled in or used drops it, so "+ Input" then Escape leaves nothing behind.
+  const closeInputEditor = () => {
+    const editing = editingInput;
+    setEditingInput(null);
+    if (!editing?.isNew || editing.key === null) return;
+    const parameter = liveParameters.find((p) => p.key === editing.key);
+    const untouched =
+      parameter?.parameterType === "workflow" &&
+      !parameter.description &&
+      parameter.defaultValue == null &&
+      parameter.dataType === WorkflowParameterValueType.String;
+    if (untouched && countReferences(liveNodes, editing.key) === 0) {
+      applyInputs(
+        liveParameters.filter((p) => p.key !== editing.key),
+        null,
+      );
+      // The agent is back to what it was before "+ Input", so it isn't unsaved.
+      if (!changesBeforeNewInput.current)
+        useWorkflowHasChangesStore.getState().setHasChanges(false);
+    }
+  };
+  const deleteInput = (key: string) => {
+    const used = inputs.some((input) => input.key === key && !input.unused);
+    const result = removeDocInput(liveParameters, key);
+    if ("refused" in result) {
+      toast({ title: result.refused, variant: "destructive" });
+      return;
+    }
+    applyInputs(result.parameters, result.nodes);
+    setRemovedInputs((current) => new Set(current).add(key));
+    setEditingInput(null);
+    toast({
+      title: used
+        ? "Input deleted. Its mentions now show as missing."
+        : "Input deleted",
+    });
+  };
 
   return (
     <WorkflowDocActionsContext.Provider
@@ -539,6 +846,14 @@ export function WorkflowDocEditor({
             if (!next.delete(loopId)) next.add(loopId);
             return next;
           }),
+        conditionalOpen: (conditionalId) =>
+          !closedConditionals.has(conditionalId),
+        toggleConditional: (conditionalId) =>
+          setClosedConditionals((current) => {
+            const next = new Set(current);
+            if (!next.delete(conditionalId)) next.add(conditionalId);
+            return next;
+          }),
         edit,
         destinations: () =>
           docDestinations(tree.items, byId, (node) => docStepTitle(node)),
@@ -548,8 +863,39 @@ export function WorkflowDocEditor({
             label: node.data.label,
             text: docStepTitle(node),
           })),
-        missingReference: (reference) =>
-          missingOutputs.has(reference.split(/[.\s|[]/)[0] ?? ""),
+        createInput: edit
+          ? (key) => {
+              const parsed = parseDocInputForm(
+                {
+                  key,
+                  dataType: WorkflowParameterValueType.String,
+                  defaultText: "",
+                  description: "",
+                },
+                null,
+                liveParameters,
+                liveNodes,
+              );
+              if ("error" in parsed) {
+                toast({ title: parsed.error, variant: "destructive" });
+                return false;
+              }
+              changesBeforeNewInput.current =
+                useWorkflowHasChangesStore.getState().hasChanges;
+              applyInputs([...liveParameters, parsed.parameter], null);
+              forgetRemovedInput(key);
+              setEditingInput({ key, type: "workflow", isNew: true });
+              return true;
+            }
+          : null,
+        missingReference: (reference) => {
+          const root = reference.split(/[.\s|[]/)[0] ?? "";
+          return (
+            missingOutputs.has(root) ||
+            (removedInputs.has(root) &&
+              !parameters.some((parameter) => parameter.key === root))
+          );
+        },
         focusId,
         setFocusId,
         pendingNote,
@@ -570,6 +916,31 @@ export function WorkflowDocEditor({
             event.stopPropagation();
             if (panelOpen) closePanel();
           }
+          if (
+            event.key.toLowerCase() === "k" &&
+            (event.metaKey || event.ctrlKey)
+          ) {
+            event.preventDefault();
+            event.stopPropagation();
+            setSearchOpen(true);
+          }
+          // "/" with no line focused adds a step at the end, as it would on a line.
+          if (
+            event.key === "/" &&
+            event.target === rootRef.current &&
+            !event.metaKey &&
+            !event.ctrlKey
+          ) {
+            const adders =
+              scrollRef.current?.querySelectorAll<HTMLButtonElement>(
+                "[data-doc-add-step]",
+              );
+            const last = adders?.[adders.length - 1];
+            if (last) {
+              event.preventDefault();
+              last.click();
+            }
+          }
         }}
       >
         <div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto">
@@ -580,48 +951,143 @@ export function WorkflowDocEditor({
             )}
           >
             <DocEditBar
-              problems={problems}
               reserve={Boolean(edit)}
               proposalPending={Boolean(proposal)}
             />
             <div className="mb-[26px] flex flex-wrap items-center gap-1.5 border-b border-border pb-[18px]">
-              <span className="mr-1 text-[12.5px] text-muted-foreground">
+              <span className="mr-1 text-[12.5px] text-[hsl(0_0%_60%)] dark:text-[hsl(215_14%_52%)]">
                 Inputs
               </span>
-              {inputs.map((input) => (
-                // A proposal's inputs are Copilot's, not the live workflow's, so they don't open the Inputs panel.
-                <InputChip
-                  key={input.key}
-                  onClick={proposal ? undefined : openInputs}
-                  title={
-                    input.missing
-                      ? "Needed to run"
-                      : input.unused
-                        ? "Not used by any step"
-                        : undefined
+              {inputs.map((input) => {
+                const parameter = parameters.find((p) => p.key === input.key);
+                const inDoc =
+                  Boolean(edit) && parameter && isDocEditableInput(parameter);
+                const chip = (
+                  // A proposal's inputs are Copilot's, not the live workflow's, so they don't open the Inputs panel.
+                  <InputChip
+                    key={input.key}
+                    onClick={
+                      proposal
+                        ? undefined
+                        : inDoc
+                          ? () =>
+                              setEditingInput({
+                                key: input.key,
+                                type:
+                                  parameter.parameterType === "context"
+                                    ? "context"
+                                    : "workflow",
+                              })
+                          : openInputs
+                    }
+                    aria-label={`Input ${input.key}${input.missing ? ", needed to run" : ""}${input.unused ? ", not used yet" : ""}`}
+                    title={
+                      input.missing
+                        ? "Needed to run"
+                        : input.unused
+                          ? "Not used by any step"
+                          : undefined
+                    }
+                    className={cn(
+                      "inline-flex max-w-full items-center gap-[5px] whitespace-nowrap rounded-md border border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      !proposal && "hover:bg-muted",
+                      input.missing &&
+                        "border-[#B45B0A] bg-[#FBEEE2] dark:border-[#E79A55] dark:bg-[rgba(231,154,85,.15)]",
+                      input.unused && "opacity-[.55]",
+                    )}
+                  >
+                    <span className="truncate">{input.key}</span>
+                    {(input.missing || input.value) && (
+                      <em
+                        className={cn(
+                          "max-w-[160px] truncate not-italic text-muted-foreground",
+                          input.missing && "text-[#B45B0A] dark:text-[#E79A55]",
+                        )}
+                      >
+                        {input.missing ? "needed to run" : input.value}
+                      </em>
+                    )}
+                  </InputChip>
+                );
+                if (!inDoc || !parameter || !isDocEditableInput(parameter))
+                  return chip;
+                return (
+                  <DocInputEditor
+                    key={input.key}
+                    open={editingInput?.key === input.key}
+                    type={
+                      parameter.parameterType === "context"
+                        ? WorkflowEditorParameterTypes.Context
+                        : WorkflowEditorParameterTypes.Workflow
+                    }
+                    initialValues={parameter}
+                    onSave={(value) => saveInput(input.key, value)}
+                    onDelete={() => deleteInput(input.key)}
+                    onClose={closeInputEditor}
+                  >
+                    {chip}
+                  </DocInputEditor>
+                );
+              })}
+              {edit && (
+                <DocInputEditor
+                  open={
+                    editingInput?.key === null &&
+                    editingInput.type === "workflow"
                   }
-                  className={cn(
-                    "inline-flex max-w-full items-center gap-[5px] whitespace-nowrap rounded-md border border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                    !proposal && "hover:bg-muted",
-                    input.missing &&
-                      "border-[#B45B0A] bg-[#FBEEE2] dark:border-[#E79A55] dark:bg-[rgba(231,154,85,.15)]",
-                    input.unused && "opacity-[.55]",
-                  )}
+                  type={WorkflowEditorParameterTypes.Workflow}
+                  onSave={(value) => saveInput(null, value)}
+                  onClose={() => setEditingInput(null)}
                 >
-                  <span className="truncate">{input.key}</span>
-                  {(input.missing || input.value) && (
-                    <em
-                      className={cn(
-                        "max-w-[160px] truncate not-italic text-muted-foreground",
-                        input.missing && "text-[#B45B0A] dark:text-[#E79A55]",
-                      )}
-                    >
-                      {input.missing ? "needed to run" : input.value}
-                    </em>
-                  )}
-                </InputChip>
-              ))}
-              {inputs.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => addInput("workflow")}
+                    className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    + Input
+                  </button>
+                </DocInputEditor>
+              )}
+              {edit && (
+                <DocInputEditor
+                  open={
+                    editingInput?.key === null &&
+                    editingInput.type === "context"
+                  }
+                  type={WorkflowEditorParameterTypes.Context}
+                  onSave={(value) => saveInput(null, value)}
+                  onClose={() => setEditingInput(null)}
+                >
+                  <button
+                    type="button"
+                    onClick={() => addInput("context")}
+                    className="inline-flex items-center whitespace-nowrap rounded-md border border-dashed border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    + Context input
+                  </button>
+                </DocInputEditor>
+              )}
+              {startId && !proposal && (
+                <button
+                  type="button"
+                  aria-expanded={
+                    panelOpen &&
+                    panelTab === "settings" &&
+                    selectedStepId === startId
+                  }
+                  onClick={() => {
+                    panelOpener.current = document.activeElement as HTMLElement;
+                    setSelectedStepId(startId);
+                    setPanelTab("settings");
+                    setPanelOpen(true);
+                  }}
+                  className="ml-auto inline-flex items-center gap-[5px] whitespace-nowrap rounded-md border border-border bg-background py-0.5 pl-[7px] pr-[9px] text-[13px] text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <GearIcon className="size-[13px]" />
+                  Agent settings
+                </button>
+              )}
+              {inputs.length === 0 && !edit && (
                 <span className="text-[12.5px] text-muted-foreground">
                   None
                 </span>
@@ -631,7 +1097,50 @@ export function WorkflowDocEditor({
               <span>
                 {stepCount} step{stepCount === 1 ? "" : "s"}
               </span>
+              {problems > 0 && (
+                <button
+                  type="button"
+                  data-doc-problems
+                  disabled={!firstProblemId}
+                  onClick={() => firstProblemId && goTo(firstProblemId)}
+                  className="rounded-md border border-[#C0392B] px-2 py-[2px] text-[#C0392B] outline-none hover:bg-[#C0392B]/10 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default dark:border-[#F08A7E] dark:text-[#F08A7E]"
+                >
+                  {problems} problem{problems === 1 ? "" : "s"}
+                </button>
+              )}
               <DocLiveIndicator />
+              <button
+                type="button"
+                onClick={() => setSearchOpen(true)}
+                className="rounded-md px-2 py-[3px] outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Search{" "}
+                <kbd className="text-[11px] text-muted-foreground">⌘K</kbd>
+              </button>
+              {containerIds.length >= 2 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setClosedLoops(new Set(containerIds));
+                      setClosedConditionals(new Set(containerIds));
+                    }}
+                    className="rounded-md px-2 py-[3px] outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    Collapse all
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setClosedLoops(new Set());
+                      setClosedConditionals(new Set());
+                    }}
+                    className="rounded-md px-2 py-[3px] outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    Expand all
+                  </button>
+                </>
+              )}
               <span className="flex-1" />
               <button
                 ref={learnButtonRef}
@@ -670,6 +1179,9 @@ export function WorkflowDocEditor({
               </p>
             )}
             {proposal && <DocProposalCard proposal={proposal} goTo={goTo} />}
+            {edit && stepCount === 0 && !description?.trim() && (
+              <DocStarterNote />
+            )}
             <DocProposalProvider value={proposal}>
               <DocScope
                 items={tree.items}
@@ -687,6 +1199,21 @@ export function WorkflowDocEditor({
                     }}
                     label="Add step"
                   />
+                  <DocKeyHints />
+                  {starter.active && (
+                    <DocTip
+                      progress={starterProgress}
+                      seen={starter.seenTips}
+                      onSeen={starter.seeTip}
+                    />
+                  )}
+                  {starter.active && (
+                    <DocGettingStarted
+                      progress={starterProgress}
+                      kept={starter.done}
+                      onHide={starter.hide}
+                    />
+                  )}
                 </div>
               )}
             </DocProposalProvider>
@@ -695,6 +1222,13 @@ export function WorkflowDocEditor({
         {wide && !panelOpen && (
           <DocOutline items={tree.items} byId={byId} scrollRef={scrollRef} />
         )}
+        <DocStepSearch
+          open={searchOpen}
+          onOpenChange={setSearchOpen}
+          items={tree.items}
+          byId={byId}
+          goTo={goTo}
+        />
         {panelOpen && (
           <DocSidePanel
             tab={panelTab}

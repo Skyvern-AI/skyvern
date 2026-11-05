@@ -6305,7 +6305,8 @@ def run_results_cursor(workflow_run_id: str, offset: int) -> str:
 
 def parse_run_results_cursor(cursor: str) -> tuple[str, int] | None:
     workflow_run_id, separator, offset = cursor.rpartition(":")
-    if not separator or not workflow_run_id or not (offset.isascii() and offset.isdigit()):
+    # int() raises ValueError past 4300 digits; no real offset needs more than 18.
+    if not separator or not workflow_run_id or not (offset.isascii() and offset.isdigit()) or len(offset) > 18:
         return None
     return workflow_run_id, int(offset)
 

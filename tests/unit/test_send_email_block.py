@@ -65,6 +65,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
 )
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -90,7 +91,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.workflows import (
@@ -99,6 +100,7 @@ from skyvern.schemas.workflows import (
     BlockStatus,
     BlockType,
     ForLoopBlockYAML,
+    HttpRequestBlockYAML,
     HumanInteractionBlockYAML,
     SendEmailBlockYAML,
     WhileLoopBlockYAML,
@@ -929,6 +931,79 @@ def _paused_run_database() -> MagicMock:
     # An approved run ends the block's wait loop on its first check.
     database.workflow_runs.get_workflow_run = AsyncMock(return_value=MagicMock(status=WorkflowRunStatus.running))
     return database
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
+async def test_platform_email_runs_with_synthesized_secrets(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None, nested: bool
+) -> None:
+    email_yaml = SendEmailBlockYAML(
+        label="email",
+        sender="sender@example.com",
+        recipients=["recipient@example.com"],
+        subject="Subject",
+        body="Body",
+    )
+    definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[],
+            blocks=[
+                HttpRequestBlockYAML(label="request", url="https://example.com"),
+                ForLoopBlockYAML(label="loop", loop_variable_reference="{{ items }}", loop_blocks=[email_yaml])
+                if nested
+                else email_yaml,
+            ],
+        ),
+        workflow_id="w_1",
+    )
+    now = datetime.now(UTC)
+    organization = Organization(organization_id="o_1", organization_name="Test", created_at=now, modified_at=now)
+    workflow = Workflow(
+        workflow_id="w_1",
+        organization_id="o_1",
+        title="Test",
+        workflow_permanent_id="wpid_1",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=definition,
+        created_at=now,
+        modified_at=now,
+    )
+    values = dict(zip(PLATFORM_SMTP_AWS_KEYS.values(), ("smtp.example.com", "587", "user", "password"), strict=True))
+    manager = WorkflowContextManager()
+    manager.aws_client = MagicMock(get_secret=AsyncMock(side_effect=values.get))
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(app, "DATABASE", _paused_run_database())
+    monkeypatch.setattr(
+        app, "EXPERIMENTATION_PROVIDER", SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=False))
+    )
+    monkeypatch.setattr(block_module, "get_download_retry_started_at", AsyncMock(return_value=None))
+    smtp_client = MagicMock()
+    monkeypatch.setattr(block_module.smtplib, "SMTP", MagicMock(return_value=smtp_client))
+
+    await manager.initialize_workflow_run_context(
+        organization=organization,
+        workflow_run_id="wr_1",
+        workflow_title=workflow.title,
+        workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_parameter_tuples=[],
+        workflow_output_parameters=[p for p in definition.parameters if isinstance(p, OutputParameter)],
+        context_parameters=[],
+        secret_parameters=[p for p in definition.parameters if isinstance(p, AWSSecretParameter)],
+        workflow=workflow,
+    )
+    email = definition.blocks[1]
+    if nested:
+        assert isinstance(email, ForLoopBlock)
+        email = email.loop_blocks[0]
+    assert isinstance(email, SendEmailBlock)
+    result = await email.execute("wr_1", "wrb_1", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    smtp_client.login.assert_called_once_with("user", "password")
+    assert smtp_client.send_message.call_args.args[0]["To"] == "recipient@example.com"
 
 
 async def _human_interaction_message(

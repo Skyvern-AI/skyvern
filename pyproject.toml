@@ -28,7 +28,6 @@ local = [
     "azure-storage-blob>=12.30.0",
     "google-cloud-storage>=3.13.1,<4",
     "openai>=1.68.2",
-    "yutori>=0.8.1",
     "sqlalchemy>=2.0.29,<3",
     "aiohttp>=3.14.3,<4",
     "python-multipart>=0.0.30,<1",
@@ -94,7 +93,6 @@ server = [
     "azure-storage-blob>=12.30.0",
     "google-cloud-storage>=3.13.1,<4",
     "openai>=1.68.2",
-    "yutori>=0.8.1",
     # The server imports Copilot at startup, and Copilot uses names added after 0.14 (run error handlers).
     "openai-agents>=0.19.4,<0.20",
     "python-dotenv==1.2.2",
@@ -277,8 +275,6 @@ override-dependencies = [
     # An override replaces every package's openai requirement, the SDK's and LiteLLM's
     # included, so it carries openai-agents 0.19's floor and LiteLLM's <3 cap itself.
     "openai>=2.45.0,<3",
-    # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
-    "httpx[socks]>=0.26.0",
     # litellm exact-pins aiohttp; relax so the security-patched
     # 3.14.x resolves for cloud/source installs (plain pip keeps litellm's pin).
     "aiohttp>=3.14.0",

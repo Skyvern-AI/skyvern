@@ -333,7 +333,7 @@ describe("Copilot proposal in the Doc view", () => {
       </>,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /Copilot proposal/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Proposed changes/ }));
 
     for (const label of [
       "Different source",
@@ -1146,7 +1146,8 @@ test("marks steps rendered in an unplaced group", async () => {
     </DocProposalProvider>,
   );
 
-  expect(screen.getByText("Added")).toBeTruthy();
+  expect(screen.queryByText("Added")).toBeNull();
+  expect(screen.getByText("Browser Task").className).toContain("border-dashed");
   expect(screen.getByText("Goal of unplaced")).toBeTruthy();
 });
 

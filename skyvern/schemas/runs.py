@@ -28,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import (
+    normalize_blank_totp_identifier,
     normalize_run_metadata,
     normalize_run_with,
 )
@@ -177,9 +178,7 @@ BROWSER_SESSION_SERVER_ASSIGNED_CONTEXT_KEY = "browser_session_id_is_server_assi
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
 if TYPE_CHECKING:
-    TaskRunTypeField: TypeAlias = Literal[
-        "task_v1", "task_v2", "task_v3", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
-    ]
+    TaskRunTypeField: TypeAlias = Literal["task_v1", "task_v2", "task_v3", "openai_cua", "anthropic_cua", "ui_tars"]
     WorkflowRunTypeField: TypeAlias = Literal["workflow_run"]
 else:
     TaskRunTypeField = Literal[
@@ -189,7 +188,6 @@ else:
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
-        RunType.yutori_navigator,
     ]
     WorkflowRunTypeField = Literal[RunType.workflow_run]
 
@@ -522,6 +520,8 @@ class WorkflowRunRequest(BaseModel):
         description=RUN_FILE_IDS_DOC_STRING,
         examples=[["file_123456789"]],
     )
+
+    _normalize_totp_identifier = field_validator("totp_identifier")(normalize_blank_totp_identifier)
 
     @field_validator("run_with", mode="before")
     @classmethod

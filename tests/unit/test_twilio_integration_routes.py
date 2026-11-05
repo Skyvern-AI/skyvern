@@ -1283,7 +1283,9 @@ async def test_login_route_parameters_reach_converter(
         run_blocks,
         "app",
         SimpleNamespace(
-            WORKFLOW_SERVICE=workflow_service, RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock())
+            WORKFLOW_SERVICE=workflow_service,
+            RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False)),
         ),
     )
     run_result = object()
@@ -1326,7 +1328,9 @@ async def _register(
             get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="service-account-token"))
         )
         credentials = SimpleNamespace(get_onepassword_credentials=AsyncMock(return_value=[]))
-        agent_function = SimpleNamespace(enforce_credential_use=AsyncMock())
+        agent_function = SimpleNamespace(
+            enforce_credential_use=AsyncMock(), enforce_workflow_context_credential_use=AsyncMock()
+        )
         monkeypatch.setattr(
             cm,
             "app",

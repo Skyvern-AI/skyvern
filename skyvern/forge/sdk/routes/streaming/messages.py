@@ -2,17 +2,22 @@
 Provides WS endpoints for streaming messages to/from our frontend application.
 """
 
+import asyncio
+
 import structlog
 from fastapi import WebSocket
 
+from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth
+from skyvern.forge.sdk.routes.streaming.cdp_input import _reauthorize_stream_periodically
 from skyvern.forge.sdk.routes.streaming.channels.message import (
     Loops,
     MessageChannel,
     get_message_channel_for_browser_session,
     get_message_channel_for_workflow_run,
 )
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.utils.aio import collect
 
 LOG = structlog.get_logger()
@@ -123,15 +128,50 @@ async def messages(
         return
 
     message_channel, loops = result
+    principal = get_request_principal()
+    scoped = principal is not None and principal.api_key_access_mode == "scoped"
+    reauthorization_task: asyncio.Task[None] | None = None
 
     try:
+        if scoped and await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(
+            principal, organization_id
+        ):
+
+            async def reauthorize() -> bool:
+                if workflow_run_id and not await app.AGENT_FUNCTION.reauthorize_workflow_run_stream(
+                    principal, organization_id, workflow_run_id, "stream.connect", folder_action="workflow_run.execute"
+                ):
+                    return False
+                session = message_channel.browser_session
+                if session is None:
+                    return False
+                return await app.AGENT_FUNCTION.reauthorize_browser_session_stream(
+                    principal,
+                    organization_id,
+                    session.persistent_browser_session_id,
+                    action="stream.connect",
+                    folder_action="workflow_run.execute",
+                )
+
+            reauthorization_task = asyncio.create_task(
+                _reauthorize_stream_periodically(
+                    websocket,
+                    reauthorize,
+                    {"browser_session_id": browser_session_id or "", "workflow_run_id": workflow_run_id or ""},
+                )
+            )
         LOG.debug(
             "Starting message channel loops.",
             browser_session_id=browser_session_id,
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
-        await collect(loops)
+        if reauthorization_task is None:
+            await collect(loops)
+        else:
+            done, _ = await asyncio.wait([*loops, reauthorization_task], return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
     except Exception:
         LOG.exception(
             "An exception occurred in the message loop function(s).",
@@ -140,6 +180,14 @@ async def messages(
             organization_id=organization_id,
         )
     finally:
+        if scoped:
+            if reauthorization_task is not None:
+                reauthorization_task.cancel()
+            for loop in loops:
+                loop.cancel()
+            await asyncio.gather(
+                *loops, *([reauthorization_task] if reauthorization_task else []), return_exceptions=True
+            )
         LOG.debug(
             "Closing the message channel.",
             browser_session_id=browser_session_id,

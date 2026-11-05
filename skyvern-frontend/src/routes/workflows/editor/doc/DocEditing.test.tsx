@@ -10,7 +10,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { useContext } from "react";
 
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { AxiosError } from "axios";
+
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
+import {
+  useWorkflowYamlEditorStore,
+  type YamlCommitOwner,
+} from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 
 import { DocEditBar, DocStepPicker } from "./DocEditing";
 import { DocStepHeader } from "./DocStep";
@@ -37,6 +45,9 @@ afterEach(() => {
   save.mockClear();
   catalogState.data = undefined;
   useCopilotActionStore.setState({ pendingGoalChanges: [] });
+  useWorkflowHistoryAccessStore.getState().reset();
+  useWorkflowSnapshotStore.getState().clearSnapshot();
+  useWorkflowHasChangesStore.setState({ hasChanges: false });
 });
 
 describe("Doc Save", () => {
@@ -47,7 +58,7 @@ describe("Doc Save", () => {
         { label: "read_total", goal: "Read the total", previousGoal: "Old" },
       ],
     });
-    render(<DocEditBar problems={0} />);
+    render(<DocEditBar />);
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -57,11 +68,73 @@ describe("Doc Save", () => {
 
   test("saves straight away when no Goal is pending", () => {
     useWorkflowHasChangesStore.setState({ hasChanges: true });
-    render(<DocEditBar problems={0} />);
+    render(<DocEditBar />);
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failed save says why, keeps the edit and offers Try again", async () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    save.mockRejectedValueOnce(new AxiosError("Network Error", "ERR_NETWORK"));
+    render(<DocEditBar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(
+      await screen.findByText(/Couldn't save: can't reach the server/),
+    ).toBeTruthy();
+    expect(screen.queryByText("Unsaved changes")).toBe(null);
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/Couldn't save/)).toBe(null));
+  });
+
+  test("a failed save releases its own workflow's lock, not the one now open", async () => {
+    const a: YamlCommitOwner = { workflowPermanentId: "wpid_a", active: true };
+    const b: YamlCommitOwner = { workflowPermanentId: "wpid_b", active: true };
+    const pending = (owner: YamlCommitOwner) => ({
+      owner,
+      kind: "save" as const,
+      persisting: true,
+    });
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: a,
+      pendingSaves: { wpid_a: pending(a), wpid_b: pending(b) },
+    });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    save.mockImplementationOnce(async () => {
+      useWorkflowYamlEditorStore.setState({ editorOwner: b });
+      throw new AxiosError("Network Error", "ERR_NETWORK");
+    });
+    render(<DocEditBar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await screen.findByText(/Couldn't save/);
+    const pendingSaves = useWorkflowYamlEditorStore.getState().pendingSaves;
+    expect(pendingSaves.wpid_a).toBeUndefined();
+    expect(pendingSaves.wpid_b?.persisting).toBe(true);
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: null,
+      pendingSaves: {},
+    });
+  });
+
+  test("says Saved, not Unsaved, once the doc is back at the saved version", async () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    useWorkflowSnapshotStore.setState({
+      snapshot: {} as never,
+      userHasEdited: true,
+      contentDirty: false,
+    });
+    useWorkflowHistoryAccessStore.setState({ canRedo: true });
+    render(<DocEditBar reserve />);
+
+    await waitFor(() => expect(screen.getByText("Saved")).toBeTruthy());
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    expect(screen.queryByText("Unsaved changes")).toBe(null);
   });
 });
 
@@ -159,5 +232,16 @@ describe("Add a step search", () => {
     const options = screen.getAllByRole("option");
     expect(options[0]!.textContent).toMatch(/^Wait/);
     expect(options[0]!.getAttribute("aria-selected")).toBe("true");
+  });
+
+  test("the words the Doc shows put Conditional and Loop first, even when another group mentions them", () => {
+    render(<DocStepPicker onPick={() => {}} />);
+    const input = screen.getByPlaceholderText("Add a step…");
+    fireEvent.change(input, { target: { value: "If" } });
+    expect(screen.getAllByRole("option")[0]!.textContent).toMatch(
+      /^Conditional/,
+    );
+    fireEvent.change(input, { target: { value: "For" } });
+    expect(screen.getAllByRole("option")[0]!.textContent).toMatch(/^Loop/);
   });
 });

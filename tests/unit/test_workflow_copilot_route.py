@@ -16,14 +16,15 @@ from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, Literal
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 import yaml
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
@@ -34,7 +35,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
-from skyvern.forge.sdk.copilot import credential_pause
+from skyvern.forge.sdk.copilot import credential_pause, streaming_adapter
 from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction, QuestionResponse
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode
@@ -83,6 +84,7 @@ from skyvern.forge.sdk.copilot.interruption import (
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome, interim_run_start_outcome
 from skyvern.forge.sdk.copilot.secret_scrub import register_secret_scrub_value
+from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft
 from skyvern.forge.sdk.copilot.tools import workflow_update
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
@@ -90,6 +92,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, dump
 from skyvern.forge.sdk.db.agent_db import _build_engine
 from skyvern.forge.sdk.db.base_alchemy_db import BaseAlchemyDB
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError, DatabaseConnectionUnavailableError
+from skyvern.forge.sdk.db.models import WorkflowCopilotChatModel
 from skyvern.forge.sdk.db.repositories.workflow_parameters import (
     WorkflowParametersRepository,
     _completed_turn_id_for_idempotency_digest,
@@ -6808,15 +6811,15 @@ class _FakeCopilotChatStore:
         workflow_copilot_chat_id: str,
         turn_id: str,
         claim_before: datetime,
-    ) -> bool:
+    ) -> Literal["claimed", "recovering", "refused"]:
         self.claim_calls.append(turn_id)
         entry = self.chat.pending_turns.get(turn_id)
         if entry is None:
-            return False
+            return "refused"
         if entry.recovering_at is not None and entry.recovering_at > claim_before:
-            return False
+            return "recovering"
         entry.recovering_at = datetime.now(UTC)
-        return True
+        return "claimed"
 
     async def clear_pending_copilot_turn(
         self, organization_id: str, workflow_copilot_chat_id: str, turn_id: str
@@ -7750,6 +7753,162 @@ async def test_request_browser_receipt_survives_terminal_pending_handoff(sqlite_
 
 
 @pytest.mark.asyncio
+async def test_in_flight_turn_serves_the_latest_draft_until_the_turn_answers(sqlite_engine, monkeypatch):
+    repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session, db_engine=sqlite_engine)
+    monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
+    monkeypatch.setattr(workflow_copilot_route, "pending_credential_requests", AsyncMock(return_value=[]))
+    monkeypatch.setattr(workflow_copilot_route, "credential_pause_is_active", AsyncMock(return_value=False))
+    chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
+    chat_id = chat.workflow_copilot_chat_id
+    older, turn, token = "e" * 32, "a" * 32, "b" * 32
+    await repo.start_copilot_turn(
+        "org", chat_id, CopilotPendingTurn(turn_id=turn, started_at=datetime.now(UTC)), "Build it"
+    )
+
+    async def write_pending(entries: dict[str, dict[str, Any]]) -> None:
+        pending_turns = {
+            turn_id: {"turn_id": turn_id, "cancel_token": token, **fields} for turn_id, fields in entries.items()
+        }
+        async with repo.Session() as session:
+            await session.execute(
+                update(WorkflowCopilotChatModel)
+                .where(WorkflowCopilotChatModel.workflow_copilot_chat_id == chat_id)
+                .values(pending_turns=pending_turns)
+            )
+            await session.commit()
+
+    api = FastAPI()
+    api.dependency_overrides[workflow_copilot_route.org_auth_service.get_current_org] = lambda: SimpleNamespace(
+        organization_id="org"
+    )
+    api.add_api_route("/history", workflow_copilot_chat_history)
+    async with AsyncClient(transport=ASGITransport(app=api), base_url="http://test") as client:
+
+        async def in_flight() -> dict[str, Any] | None:
+            response = await client.get("/history", params={"workflow_copilot_chat_id": chat_id})
+            assert response.status_code == 200, response.text
+            return response.json()["in_flight_turn"]
+
+        now = datetime.now(UTC)
+        await write_pending(
+            {older: {"started_at": (now - timedelta(seconds=5)).isoformat()}, turn: {"started_at": now.isoformat()}}
+        )
+        before_draft = await in_flight()
+        assert before_draft is not None
+        assert (before_draft["turn_id"], before_draft["cancel_token"], before_draft["latest_draft"]) == (
+            turn,
+            token,
+            None,
+        )
+
+        draft = _make_copilot_workflow("Draft", _NOW)
+        draft.workflow_definition = convert_workflow_definition(
+            WorkflowCreateYAMLRequest.model_validate(
+                {
+                    "title": "Draft",
+                    "workflow_definition": {
+                        "parameters": [],
+                        "blocks": [
+                            {
+                                "block_type": "send_email",
+                                "label": "notify",
+                                "custom_smtp_host": "smtp.example.com",
+                                "custom_smtp_password": "synthetic-smtp-password",
+                                "sender": "a@example.com",
+                                "recipients": ["b@example.com"],
+                                "subject": "s",
+                                "body": "b",
+                            }
+                        ],
+                    },
+                }
+            ).workflow_definition,
+            "wf-1",
+        )
+        draft.cdp_connect_headers = {"Authorization": "Bearer synthetic-cdp-token"}
+        stream = SimpleNamespace(send=AsyncMock(return_value=True))
+        ctx = make_copilot_context(organization_id="org", workflow_permanent_id="wpid")
+        ctx.workflow_copilot_chat_id = chat_id
+        ctx.turn_id = turn
+        await emit_workflow_draft(stream, ctx, draft)
+        frame = stream.send.await_args.args[0].model_dump(mode="json")
+        await emit_workflow_draft(stream, ctx, _make_copilot_workflow("Untested", _NOW), include_workflow=False)
+        await repo.record_pending_copilot_turn_draft(
+            "org",
+            chat_id,
+            turn,
+            draft={**frame["workflow"], "title": "Stale"},
+            drafted_at=datetime.fromisoformat(frame["timestamp"]) - timedelta(seconds=1),
+        )
+
+        drafted = await in_flight()
+        assert drafted is not None
+        assert drafted["latest_draft"] == frame["workflow"]
+        assert drafted["latest_draft_at"] == frame["timestamp"]
+        assert drafted["latest_draft"]["workflow_definition"]["blocks"][0]["custom_smtp_password"] == "[REDACTED]"
+        assert drafted["latest_draft"]["cdp_connect_headers"] == {"Authorization": "***"}
+        async with repo.Session() as session:
+            stored = json.dumps((await session.get(WorkflowCopilotChatModel, chat_id)).pending_turns)
+        assert "synthetic-smtp-password" not in stored and "synthetic-cdp-token" not in stored
+
+        async def hang(**_: object) -> None:
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(repo, "record_pending_copilot_turn_draft", hang),
+            patch.object(streaming_adapter, "_PENDING_TURN_DRAFT_SAVE_TIMEOUT_SECONDS", 0.05),
+            capture_logs() as logs,
+        ):
+            await asyncio.wait_for(emit_workflow_draft(stream, ctx, _make_copilot_workflow("Hung", _NOW)), 5)
+        assert stream.send.await_args.args[0].workflow["title"] == "Hung"
+        assert [entry["event"] for entry in logs] == ["copilot_pending_turn_draft_save_failed"]
+        assert (await in_flight() or {}).get("latest_draft") == frame["workflow"]
+
+        await repo.create_workflow_copilot_chat_message(
+            organization_id="org",
+            workflow_copilot_chat_id=chat_id,
+            sender=WorkflowCopilotChatSender.AI,
+            content="Done",
+            turn_outcome=TurnOutcome(response_kind=ResponseKind.BUILD, copilot_turn_id=turn),
+        )
+        assert (await in_flight() or {}).get("turn_id") == older
+
+        stale = datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS + 60)
+        await write_pending(
+            {"c" * 32: {"started_at": stale.isoformat(), "credential_resumed_at": datetime.now(UTC).isoformat()}}
+        )
+        assert (await in_flight() or {}).get("turn_id") == "c" * 32
+
+        await write_pending({"f" * 32: {"started_at": stale.isoformat()}})
+        async with repo.hold_copilot_turn_finalisation(chat_id, "f" * 32):
+            assert (await in_flight() or {}).get("turn_id") == "f" * 32
+
+        question = QuestionInteraction(interaction_id="question-1", turn_id="g" * 32, tool_call_id="call-1", parts=[])
+        await write_pending(
+            {
+                "g" * 32: {
+                    "started_at": stale.isoformat(),
+                    "question_interactions": [question.model_dump(mode="json")],
+                    "question_heartbeat_at": datetime.now(UTC).isoformat(),
+                }
+            }
+        )
+        with patch.object(workflow_copilot_route, "question_wait_is_live", return_value=False):
+            assert (await in_flight() or {}).get("turn_id") == "g" * 32
+
+        await write_pending({"h" * 32: {"started_at": stale.isoformat()}})
+        with patch.object(repo, "claim_pending_copilot_turn", AsyncMock(return_value="recovering")):
+            assert await in_flight() is None
+
+        await write_pending({"d" * 32: {"started_at": stale.isoformat()}})
+        with patch.object(
+            workflow_copilot_route, "_recover_interrupted_copilot_turn", AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            assert await in_flight() is None
+        assert await repo.claim_pending_copilot_turn("org", chat_id, "d" * 32, stale) == "recovering"
+
+
+@pytest.mark.asyncio
 async def test_request_browser_receipt_overflow_stays_explicitly_incomplete(sqlite_engine):
     repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
     chat = await repo.create_workflow_copilot_chat(organization_id="org", workflow_permanent_id="wpid")
@@ -7875,7 +8034,7 @@ async def test_a_turn_finishing_after_reconcile_claimed_it_cannot_write(
     repo = WorkflowParametersRepository(BaseAlchemyDB(sqlite_engine).Session)
     monkeypatch.setattr(app.DATABASE, "workflow_params", repo)
     mid_chat_id = await _start_abandoned_turn(repo, "turn-mid")
-    assert await repo.claim_pending_copilot_turn("org", mid_chat_id, "turn-mid", datetime.now(UTC))
+    assert await repo.claim_pending_copilot_turn("org", mid_chat_id, "turn-mid", datetime.now(UTC)) == "claimed"
     mid_chat = await repo.get_workflow_copilot_chat_by_id("org", mid_chat_id)
     assert not await workflow_copilot_route._claim_turn_finalisation(mid_chat, "turn-mid")
 
@@ -7934,7 +8093,7 @@ async def test_reconcile_leaves_a_turn_that_just_resumed_from_a_credential_pause
     chat_id = await _start_abandoned_turn(repo, "turn-a")
     await repo.record_pending_copilot_turn_credential_resume("org", chat_id, "turn-a")
     abandoned_before = datetime.now(UTC) - timedelta(seconds=RECONCILE_ABANDON_AFTER_SECONDS)
-    assert not await repo.claim_pending_copilot_turn("org", chat_id, "turn-a", abandoned_before)
+    assert await repo.claim_pending_copilot_turn("org", chat_id, "turn-a", abandoned_before) == "refused"
 
     await workflow_copilot_route._reconcile_interrupted_copilot_turns(
         await repo.get_workflow_copilot_chat_by_id("org", chat_id), "org"

@@ -248,6 +248,7 @@ function useIgnoringNodePositions(nodes: AppNode[]): AppNode[] {
 // protected by beginInternalUpdate/endInternalUpdate guards, so this timeout
 // only needs to cover synchronous mount-time effects.
 const INITIAL_LOAD_SETTLE_MS = 500;
+const PRESENTATION_LAYOUT_SETTLE_MS = 50;
 
 // Max gap between a user gesture and the draft change it caused for that change
 // to count as a user edit (vs. post-load materialization like login autofill).
@@ -255,6 +256,19 @@ const INITIAL_LOAD_SETTLE_MS = 500;
 // that an autofill landing within this window of a gesture can still read as a
 // phantom (the broad autofill-on-mount case is tracked as a follow-up).
 const USER_EDIT_GESTURE_WINDOW_MS = 250;
+
+// The Copilot lock refuses edits, not presentation, so layout may still move nodes under it.
+const selectCopilotOnlyLock = (
+  state: ReturnType<typeof useWorkflowYamlEditorStore.getState>,
+) => state.lockKind === "copilot";
+
+function isCopilotOnlyLock(): boolean {
+  return selectCopilotOnlyLock(useWorkflowYamlEditorStore.getState());
+}
+
+function canLayoutUnderLock(): boolean {
+  return !isLockedByOther() || isCopilotOnlyLock();
+}
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -564,6 +578,7 @@ function FlowRenderer({
   const hydrationLocked = useWorkflowYamlEditorStore(
     selectEditorMutationLocked,
   );
+  const copilotOnlyLock = useWorkflowYamlEditorStore(selectCopilotOnlyLock);
   const { title, description, initializeTitle, initializeDescription } =
     useWorkflowTitleStore();
   const parameters = useWorkflowParametersStore((state) => state.parameters);
@@ -788,6 +803,7 @@ function FlowRenderer({
 
   // Track if we're currently in a layout operation to prevent infinite loops
   const isLayoutingRef = useRef(false);
+  const relayoutAfterLayoutingRef = useRef(false);
 
   // An expand schedules its container effect before FlowRenderer sees the
   // header-resized event. Keep search settling blocked through that gap and
@@ -912,8 +928,59 @@ function FlowRenderer({
   }, [embedded, isNavBlocked]);
 
   const pendingLayoutRef = useRef(false);
+  const layoutGuardTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    const releaseLayoutGuard = () => {
+      if (layoutGuardTimerRef.current !== null) {
+        window.clearTimeout(layoutGuardTimerRef.current);
+        layoutGuardTimerRef.current = null;
+        useWorkflowHasChangesStore.getState().endInternalUpdate();
+      }
+    };
+    // Released synchronously on unlock so the user's first edit is not absorbed as layout drift.
+    const unsubscribe = useWorkflowYamlEditorStore.subscribe(
+      (state, previous) => {
+        if (selectCopilotOnlyLock(previous) && !selectCopilotOnlyLock(state)) {
+          releaseLayoutGuard();
+        }
+      },
+    );
+    return () => {
+      unsubscribe();
+      releaseLayoutGuard();
+    };
+  }, []);
+  // `presentation` callers lay out the graph as it stands; the rest pass an edited graph and stay refused under a lock.
   const doLayout = useCallback(
-    (nodes: Array<AppNode>, edges: Array<Edge>) => {
+    (nodes: Array<AppNode>, edges: Array<Edge>, presentation = false) => {
+      if (presentation && isLockedByOther() && isCopilotOnlyLock()) {
+        const layoutedElements = layout(nodes, edges, targettedBlockLabel);
+        const positionChanges = layoutedElements.nodes.map(
+          (node): NodeChange<AppNode> => ({
+            type: "position",
+            id: node.id,
+            position: node.position,
+          }),
+        );
+        if (readOnly) {
+          onNodesChange(positionChanges);
+          return layoutedElements;
+        }
+        // Hold an internal update past the position commit so history records it as drift, not an undo step.
+        // The count is global, so read-only canvases must not touch it.
+        const changesStore = useWorkflowHasChangesStore.getState();
+        if (layoutGuardTimerRef.current !== null) {
+          window.clearTimeout(layoutGuardTimerRef.current);
+          changesStore.endInternalUpdate();
+        }
+        changesStore.beginInternalUpdate();
+        onNodesChange(positionChanges);
+        layoutGuardTimerRef.current = window.setTimeout(() => {
+          layoutGuardTimerRef.current = null;
+          changesStore.endInternalUpdate();
+        }, PRESENTATION_LAYOUT_SETTLE_MS);
+        return layoutedElements;
+      }
       if (refuseMutationDuringYamlCommit()) {
         pendingLayoutRef.current = true;
         return null;
@@ -924,18 +991,19 @@ function FlowRenderer({
       setEdges(layoutedElements.edges);
       return layoutedElements;
     },
-    [setNodes, setEdges, targettedBlockLabel],
+    [setNodes, setEdges, targettedBlockLabel, onNodesChange, readOnly],
   );
 
   // Debounced layout for dimension changes to prevent infinite loops (React error #185)
   // when copy-pasting triggers rapid successive dimension changes
   const debouncedLayoutForDimensions = useDebouncedCallback(
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
-      if (isLockedByOther()) {
+      if (!canLayoutUnderLock()) {
         pendingLayoutRef.current = true;
         return;
       }
       if (isLayoutingRef.current) {
+        if (isCopilotOnlyLock()) relayoutAfterLayoutingRef.current = true;
         return;
       }
       isLayoutingRef.current = true;
@@ -952,7 +1020,7 @@ function FlowRenderer({
         // regardless of width changes elsewhere. Skipped while an explicit
         // fit/jump is animating so the two don't fight.
         const startBefore = tempNodes.find((node) => node.type === "start");
-        const layoutedElements = doLayout(tempNodes, currentEdges);
+        const layoutedElements = doLayout(tempNodes, currentEdges, true);
         if (!layoutedElements) return;
         if (startBefore && !fitViewInProgressRef.current) {
           const startAfter = layoutedElements.nodes.find(
@@ -981,6 +1049,12 @@ function FlowRenderer({
         // Reset the flag after a short delay to allow React to flush updates
         requestAnimationFrame(() => {
           isLayoutingRef.current = false;
+          if (!relayoutAfterLayoutingRef.current) return;
+          relayoutAfterLayoutingRef.current = false;
+          debouncedLayoutForDimensions(
+            reactFlowInstance.getNodes() as Array<AppNode>,
+            reactFlowInstance.getEdges(),
+          );
         });
       }
     },
@@ -992,7 +1066,7 @@ function FlowRenderer({
     (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
       // The measured size is already stored on the node, so a dropped layout
       // never re-triggers; replay it once the lock clears.
-      if (isLockedByOther()) {
+      if (!canLayoutUnderLock()) {
         pendingLayoutRef.current = true;
         return;
       }
@@ -1007,15 +1081,17 @@ function FlowRenderer({
         (state.commitInProgress && !previous.commitInProgress) ||
         (state.copilotAcceptance && !previous.copilotAcceptance)
       ) {
+        if (debouncedLayoutForDimensions.isPending())
+          pendingLayoutRef.current = true;
         debouncedLayoutForDimensions.cancel();
       }
     });
   }, [debouncedLayoutForDimensions]);
 
   useEffect(() => {
-    if (hydrationLocked) return;
+    if (hydrationLocked && !copilotOnlyLock) return;
     if (nodesInitialized && !hasCompletedInitialLoad.current) {
-      if (!doLayout(nodes, edges)) return;
+      if (!doLayout(nodes, edges, true)) return;
       // After Dagre computes positions, wait one frame for the DOM to update
       // with new positions, then fade in the nodes/edges at their final positions.
       const rafId = requestAnimationFrame(() => {
@@ -1039,7 +1115,7 @@ function FlowRenderer({
     // re-running on every nodes/edges/doLayout change would re-trigger the
     // pre-layout fade after every edit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodesInitialized, hydrationLocked]);
+  }, [nodesInitialized, hydrationLocked, copilotOnlyLock]);
 
   // Re-layout when the targeted block changes to account for the status row
   // that appears when a block is being debugged
@@ -1059,7 +1135,7 @@ function FlowRenderer({
       // the previous block's status-row resize may have exhausted.
       lastLaidOutTargetLabelRef.current = targettedBlockLabel;
       resetDimensionConvergence(dimensionConvergenceRef.current);
-      doLayout(nodes, edges);
+      doLayout(nodes, edges, true);
     }
     // Re-layout only when the targeted (debugged) block label changes.
     // nodes/edges/doLayout intentionally omitted: a normal edit already
@@ -1069,10 +1145,13 @@ function FlowRenderer({
   }, [targettedBlockLabel, nodesInitialized]);
 
   useEffect(() => {
-    if (hydrationLocked || !pendingLayoutRef.current) return;
+    if ((hydrationLocked && !copilotOnlyLock) || !pendingLayoutRef.current)
+      return;
+    // Cleared first: the presentation layout's position commit re-runs this effect.
+    pendingLayoutRef.current = false;
     // The transaction may have replaced the graph since layout was requested.
-    doLayout(nodes, edges);
-  }, [hydrationLocked, nodes, edges, doLayout]);
+    doLayout(nodes, edges, true);
+  }, [hydrationLocked, copilotOnlyLock, nodes, edges, doLayout]);
 
   // Re-layout when a loop node's header height changes (e.g., data schema toggled)
   useEffect(() => {
@@ -1949,7 +2028,7 @@ function FlowRenderer({
   );
 
   useEffect(() => {
-    doLayout(nodes, edges);
+    doLayout(nodes, edges, true);
     // Trigger re-layout only when the parent container resizes. nodes/edges
     // mutations have their own layout paths and including them here would
     // double-layout after every edit.
@@ -1968,7 +2047,7 @@ function FlowRenderer({
     const rafId = requestAnimationFrame(() => {
       const currentNodes = reactFlowInstance.getNodes() as Array<AppNode>;
       const currentEdges = reactFlowInstance.getEdges();
-      doLayout(currentNodes, currentEdges);
+      doLayout(currentNodes, currentEdges, true);
     });
     return () => cancelAnimationFrame(rafId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2776,11 +2855,11 @@ function FlowRenderer({
                         change.type === "dimensions",
                     );
 
-                    // Only process dimension changes if we're not already in a layout operation
-                    // This prevents infinite loops (React error #185) during copy-paste
+                    // Canvases without the Copilot lock drop mid-layout changes to avoid the React #185 loop;
+                    // Copilot-locked ones queue one relayout.
                     if (
                       dimensionChanges.length > 0 &&
-                      !isLayoutingRef.current
+                      (!isLayoutingRef.current || isCopilotOnlyLock())
                     ) {
                       const { nodes: tempNodes, shouldLayout } =
                         processDimensionChanges(
@@ -2789,7 +2868,9 @@ function FlowRenderer({
                           dimensionConvergenceRef.current,
                         );
 
-                      if (shouldLayout) {
+                      if (shouldLayout && isLayoutingRef.current) {
+                        relayoutAfterLayoutingRef.current = true;
+                      } else if (shouldLayout) {
                         queueDimensionLayout(tempNodes, edges);
                       }
                     }

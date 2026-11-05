@@ -32,6 +32,8 @@ class EmailInboxBlock(Block):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
 
     email_client: Literal["gmail", "outlook"]
+    credential_source: Literal["native", "nango"] = "native"
+    connection_id: str | None = None
     credential_id: str | None = None
     folder: str | None = None
     prompt: str | None = None
@@ -49,7 +51,7 @@ class EmailInboxBlock(Block):
         return self.parameters
 
     def _render_templates(self, workflow_run_context: WorkflowRunContext) -> None:
-        if self.credential_id:
+        if self.credential_id and self.credential_source == "native":
             self.credential_id = self.render_templatable_field(
                 "credential_id", self.credential_id, workflow_run_context
             )
@@ -295,7 +297,7 @@ class EmailInboxBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
-        if not self.credential_id:
+        if self.credential_source == "native" and not self.credential_id:
             return await self._failure(
                 failure_reason="credential_id is required",
                 workflow_run_block_id=workflow_run_block_id,
@@ -310,41 +312,72 @@ class EmailInboxBlock(Block):
                 organization_id=organization_id,
             )
 
-        if self.email_client == "gmail":
-            creds = await app.AGENT_FUNCTION.get_google_workspace_credentials(
-                organization_id=effective_org_id,
-                credential_id=self.credential_id,
-                required_scopes=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
-            )
-            access_token = creds.token if creds else None
-            reconnect_label = "Gmail"
-        else:
-            access_token = await app.AGENT_FUNCTION.get_microsoft_credentials(
-                organization_id=effective_org_id,
-                credential_id=self.credential_id,
-                required_scopes=["Mail.Read"],
-            )
-            reconnect_label = "Outlook"
-        if not access_token:
-            return await self._failure(
-                failure_reason=f"Reconnect the {reconnect_label} account: no valid access token",
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-
+        access_token: str | None = None
         folder_used = self.folder or ("INBOX" if self.email_client == "gmail" else "inbox")
         try:
-            candidates = await email.list_folder_messages(
-                email_client=self.email_client,
-                access_token=access_token,
-                folder=folder_used,
-                sender=self.sender,
-                subject=self.subject,
-                newer_than_days=self.newer_than_days,
-                max_results=self.max_results,
-                include_body=self.include_body,
-                include_attachments=self.download_attachments,
-            )
+            if self.credential_source == "nango":
+                if (
+                    self.email_client != "gmail"
+                    or self.download_attachments
+                    or not self.connection_id
+                    or any(marker in self.connection_id for marker in ("{{", "{%", "{#"))
+                ):
+                    raise email.GmailAPIError(
+                        status=404, code="integration_unavailable", message="Gmail integration unavailable"
+                    )
+                data = await app.AGENT_FUNCTION.execute_gmail_inbox_for_run(
+                    organization_id=effective_org_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    connection_id=self.connection_id,
+                    hop_token=workflow_run_context.get_gmail_hop_token(self.label),
+                    folder=folder_used,
+                    sender=self.sender,
+                    subject=self.subject,
+                    newer_than_days=max(1, self.newer_than_days) if self.newer_than_days is not None else None,
+                    max_results=max(1, min(self.max_results, 100)),
+                    include_body=self.include_body,
+                )
+                try:
+                    candidates = [email.EmailMessage.model_validate(item) for item in data]
+                except Exception:  # noqa: BLE001 - validation errors may contain message content.
+                    raise email.GmailAPIError(
+                        status=502, code="provider_unavailable", message="Gmail read unavailable"
+                    ) from None
+            else:
+                assert self.credential_id is not None
+                if self.email_client == "gmail":
+                    creds = await app.AGENT_FUNCTION.get_google_workspace_credentials(
+                        organization_id=effective_org_id,
+                        credential_id=self.credential_id,
+                        required_scopes=list(google_oauth_service.GOOGLE_GMAIL_SCOPES),
+                    )
+                    access_token = creds.token if creds else None
+                    reconnect_label = "Gmail"
+                else:
+                    access_token = await app.AGENT_FUNCTION.get_microsoft_credentials(
+                        organization_id=effective_org_id,
+                        credential_id=self.credential_id,
+                        required_scopes=["Mail.Read"],
+                    )
+                    reconnect_label = "Outlook"
+                if not access_token:
+                    return await self._failure(
+                        failure_reason=f"Reconnect the {reconnect_label} account: no valid access token",
+                        workflow_run_block_id=workflow_run_block_id,
+                        organization_id=organization_id,
+                    )
+                candidates = await email.list_folder_messages(
+                    email_client=self.email_client,
+                    access_token=access_token,
+                    folder=folder_used,
+                    sender=self.sender,
+                    subject=self.subject,
+                    newer_than_days=self.newer_than_days,
+                    max_results=self.max_results,
+                    include_body=self.include_body,
+                    include_attachments=self.download_attachments,
+                )
         except email.GmailAPIError as e:
             return await self._api_failure(
                 provider="Gmail",
@@ -373,6 +406,7 @@ class EmailInboxBlock(Block):
         emails = [message.model_dump(mode="json") for message in matched]
         downloaded_files: list[FileInfo] = []
         if self.download_attachments:
+            assert access_token is not None
             try:
                 emails, downloaded_files = await self._download_matched_attachments(
                     matched,

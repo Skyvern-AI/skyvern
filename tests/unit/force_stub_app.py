@@ -100,6 +100,15 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.enforce_platform_aws_secret_ownership = (
+        base_agent_function.enforce_platform_aws_secret_ownership
+    )
+    fake_app_module.AGENT_FUNCTION.should_check_browser_session_artifacts = (
+        base_agent_function.should_check_browser_session_artifacts
+    )
+    fake_app_module.AGENT_FUNCTION.can_access_browser_session_artifacts = (
+        base_agent_function.can_access_browser_session_artifacts
+    )
     fake_app_module.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = (
         base_agent_function.browser_session_ids_authorized_for_connect
     )

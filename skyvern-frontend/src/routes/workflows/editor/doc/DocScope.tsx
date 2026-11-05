@@ -104,14 +104,33 @@ function DocStepProblem({
   problems: ReadonlyMap<string, DocNoteProblem>;
 }) {
   const problem = problems.get(`${nodeId}:step`);
-  return problem ? (
-    <p
-      data-doc-step-problem
-      className="mt-1 whitespace-pre-line text-sm font-medium text-amber-700 dark:text-amber-300"
-    >
-      {problem.message}
-    </p>
-  ) : null;
+  // What the step still needs before it can run, found as the draft is typed.
+  const fix = problems.get(`${nodeId}:fix`);
+  return (
+    <>
+      {fix && (
+        <ul data-doc-step-fix className="mt-0.5 flex flex-col">
+          {fix.message.split("\n").map((message) => (
+            <li
+              key={message}
+              className="flex items-baseline gap-1.5 text-[13px] leading-[1.55] text-[#C0392B] dark:text-[#F08A7E]"
+            >
+              <span aria-hidden>✕</span>
+              {message}
+            </li>
+          ))}
+        </ul>
+      )}
+      {problem && (
+        <p
+          data-doc-step-problem
+          className="mt-1 whitespace-pre-line text-sm font-medium text-amber-700 dark:text-amber-300"
+        >
+          {problem.message}
+        </p>
+      )}
+    </>
+  );
 }
 
 function DocNode({
@@ -157,6 +176,7 @@ function DocNode({
           editable={editable}
           showRunControl={showRunControl}
           place={place}
+          onEnter={onEnter}
           renderChildren={(children, scope, branchId) => (
             <>
               <DocScope
@@ -231,7 +251,11 @@ function DocNode({
                 place && actions.edit
                   ? (outdent) => {
                       const nested = actions.edit!.nest(node.id, outdent);
-                      if (nested) actions.setFocusId(node.id);
+                      // The moved line remounts and the old one's blur clears the focus, so refocus after it.
+                      if (nested)
+                        requestAnimationFrame(() =>
+                          actions.setFocusId(node.id),
+                        );
                       return nested;
                     }
                   : undefined
@@ -348,8 +372,9 @@ export function DocAddStep({
         {emptyText && <span>{emptyText} ·</span>}
         <button
           type="button"
+          data-doc-add-step
           onClick={() => setOpen(true)}
-          className="rounded text-foreground underline-offset-4 outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+          className="rounded-md px-2 py-1 text-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
         >
           + {label}
         </button>
@@ -429,6 +454,24 @@ function DocNote({
               : undefined
           }
           onDone={() => pending && actions.setPendingNote(null)}
+          onTab={
+            actions.edit
+              ? (outdent) => {
+                  const moved = actions.edit!.nestNote(
+                    { ownerNodeId, placement },
+                    outdent,
+                  );
+                  if (moved && "stepId" in moved) {
+                    actions.setPendingNote(null);
+                    actions.setFocusId(moved.stepId);
+                    return true;
+                  }
+                  if (!moved) return false;
+                  requestAnimationFrame(() => actions.setPendingNote(moved));
+                  return true;
+                }
+              : undefined
+          }
         />
       </div>
     </DocInsertPopover>

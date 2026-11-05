@@ -235,14 +235,16 @@ async def test_close_true_detached_teardown_task_is_strongly_held_until_completi
     loop.set_exception_handler(lambda _loop, context_: unretrieved.append(context_))
     try:
         state = RealBrowserState(pw=pw, browser_context=context, browser_cleanup=cleanup)
-        await asyncio.wait_for(state.close(True), timeout=1.0)
+        # Allow for slow CI scheduling without changing the interceptor's detach budget.
+        await asyncio.wait_for(state.close(True), timeout=30)
 
-        await asyncio.wait_for(entered_cancel.wait(), timeout=1.0)
+        await asyncio.wait_for(entered_cancel.wait(), timeout=30)
         assert len(state._detached_teardown_tasks) == 1  # detached drain is strongly held while pending
+        detached = next(iter(state._detached_teardown_tasks))
+        assert not detached.done()
 
         release.set()
-        detached = next(iter(state._detached_teardown_tasks))
-        await asyncio.wait_for(asyncio.shield(asyncio.gather(detached, return_exceptions=True)), timeout=1.0)
+        await asyncio.wait_for(asyncio.shield(asyncio.gather(detached, return_exceptions=True)), timeout=30)
         await asyncio.sleep(0)  # let the done-callback discard the finished task
 
         assert state._detached_teardown_tasks == set()  # discarded only after it actually completed

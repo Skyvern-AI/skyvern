@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import inspect
 import json
 import threading
@@ -16,10 +17,16 @@ import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 from sqlalchemy import Engine, func, insert, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
+# Ruff and isort classify the local alembic directory differently.
+# isort: split
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+
+# isort: split
 from skyvern.forge import request_logging
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.log_redaction import REDACTED
@@ -1194,6 +1201,86 @@ async def test_address_rotation_rejects_previously_revoked_address(
     assert (await agent_db.email_forwarding.get_address(current.forwarding_address_id, "o_test")).status == (
         ForwardingAddressStatus.PENDING
     )
+
+
+def test_revoked_email_index_upgrade_rebuilds_failed_concurrent_build(postgres_scratch_database: Engine) -> None:
+    versions = Path(__file__).resolve().parents[2] / "alembic" / "versions"
+    paths = list(versions.glob("*_index_revoked_forwarding_email_lookup.py")) + list(
+        versions.glob("*_add_index_for_revoked_email_forwarding_address_lookups.py")
+    )
+    assert len(paths) == 1
+    spec = importlib.util.spec_from_file_location("revoked_forwarding_email_index_migration", paths[0])
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    index_name = "ix_organization_forwarding_addresses_revoked_email"
+    with postgres_scratch_database.begin() as connection:
+        Base.metadata.create_all(
+            connection,
+            tables=[
+                OrganizationModel.__table__,
+                CredentialFolderModel.__table__,
+                CredentialModel.__table__,
+                OrganizationEmailConfigModel.__table__,
+                OrganizationForwardingAddressModel.__table__,
+            ],
+        )
+        connection.execute(insert(OrganizationModel).values(organization_id="o_test", organization_name="Test"))
+        connection.execute(
+            insert(OrganizationEmailConfigModel).values(
+                email_config_id="emc_test", organization_id="o_test", mode="managed"
+            )
+        )
+        connection.execute(
+            insert(OrganizationForwardingAddressModel).values(
+                forwarding_address_id="fwa_test",
+                organization_id="o_test",
+                email_config_id="emc_test",
+                email_address="Revoked@inbound.example",
+                org_slug="test",
+                status="revoked",
+            )
+        )
+        connection.exec_driver_sql(f"DROP INDEX {index_name}")
+
+    with postgres_scratch_database.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        with pytest.raises(DBAPIError, match="division by zero"):
+            connection.exec_driver_sql(
+                f"CREATE INDEX CONCURRENTLY {index_name} ON organization_forwarding_addresses "
+                "((length(email_address) / 0)) WHERE status = 'revoked'"
+            )
+        invalid_oid, valid = connection.exec_driver_sql(
+            f"SELECT indexrelid, indisvalid FROM pg_index WHERE indexrelid = '{index_name}'::regclass"
+        ).one()
+        assert valid is False
+
+    with postgres_scratch_database.connect() as connection:
+        context = MigrationContext.configure(connection)
+        with Operations.context(context), context.begin_transaction():
+            migration.upgrade()
+        rebuilt_oid, valid = connection.exec_driver_sql(
+            f"SELECT indexrelid, indisvalid FROM pg_index WHERE indexrelid = '{index_name}'::regclass"
+        ).one()
+        assert rebuilt_oid != invalid_oid
+        assert valid is True
+        connection.exec_driver_sql("SET LOCAL enable_seqscan = off")
+        plan = (
+            connection.exec_driver_sql(
+                "EXPLAIN SELECT * FROM organization_forwarding_addresses "
+                "WHERE lower(email_address) = 'revoked@inbound.example' AND status = 'revoked'"
+            )
+            .scalars()
+            .all()
+        )
+        assert index_name in "\n".join(plan)
+        assert (
+            connection.exec_driver_sql(
+                "SELECT email_address FROM organization_forwarding_addresses "
+                "WHERE lower(email_address) = 'revoked@inbound.example' AND status = 'revoked'"
+            ).scalar_one()
+            == "Revoked@inbound.example"
+        )
 
 
 @pytest.mark.asyncio

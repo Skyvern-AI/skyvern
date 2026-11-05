@@ -39,6 +39,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import (
+    normalize_blank_totp_identifier,
     normalize_run_metadata,
     normalize_run_with,
 )
@@ -81,6 +82,8 @@ class WorkflowRequestBody(BaseModel):
     browser_type: str | None = None
     ai_fallback: bool | None = None
     run_metadata: dict[str, str] | None = None
+
+    _normalize_totp_identifier = field_validator("totp_identifier")(normalize_blank_totp_identifier)
 
     @field_validator("max_elapsed_time_minutes", mode="before")
     @classmethod

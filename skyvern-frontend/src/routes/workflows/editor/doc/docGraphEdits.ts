@@ -27,9 +27,13 @@ import {
   removeJinjaReferenceFromNodes,
   removeKeyFromNodesParameterKeys,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
+  goalTextEditPatch,
+  inferBranchCriteriaTypeFromExpression,
   updateNodeAndDescendantsVisibility,
 } from "../workflowEditorUtils";
-import { getDocProseFields } from "./docStepRegistry";
+import { extractSpreadsheetIdFromUrl } from "@/util/googleSheetsUrl";
+import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
+import { docMainIsSetting, getDocProseFields } from "./docStepRegistry";
 
 export type DocScopeRef = SortableBlockScopeDescriptor;
 export type DocGraph = { nodes: AppNode[]; edges: Edge[] };
@@ -538,7 +542,7 @@ export function contextInputsFedBy(
     .map((p) => p.key);
 }
 
-function countReferences(nodes: AppNode[], key: string): number {
+export function countReferences(nodes: AppNode[], key: string): number {
   const pattern = new RegExp(
     `\\{\\{\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-zA-Z0-9_])`,
     "g",
@@ -865,7 +869,14 @@ export function turnInto(
   const mainText = fromKey
     ? node.data[fromKey as keyof typeof node.data]
     : null;
-  if (toKey && typeof mainText === "string" && mainText.trim())
+  // A URL or file is not an instruction, so it does not move between types.
+  if (
+    toKey &&
+    !docMainIsSetting(node) &&
+    !docMainIsSetting(next) &&
+    typeof mainText === "string" &&
+    mainText.trim()
+  )
     kept[toKey] = mainText;
   return {
     nodes: graph.nodes.map((n) =>
@@ -893,10 +904,36 @@ export function setStepField(
     n.id === id
       ? ({
           ...n,
-          data: { ...n.data, [key]: isNote && !value.trim() ? null : value },
+          data: {
+            ...n.data,
+            ...fieldEditPatch(n, key, value),
+          },
         } as AppNode)
       : n,
   );
+  function fieldEditPatch(node: AppNode, field: string, text: string) {
+    const data = node.data as Record<string, unknown>;
+    // Typing in the Doc must leave the same companion fields as the visual editor's input does.
+    if (node.type === "codeBlock" && field === "prompt")
+      return goalTextEditPatch(node.data as CodeBlockNodeData, text) ?? {};
+    if (
+      (node.type === "googleSheetsRead" || node.type === "googleSheetsWrite") &&
+      field === "spreadsheetUrl"
+    ) {
+      const newId = extractSpreadsheetIdFromUrl(text);
+      const switched =
+        newId !== null &&
+        newId !==
+          extractSpreadsheetIdFromUrl(String(data.spreadsheetUrl ?? ""));
+      return switched ? { [field]: text, sheetName: "" } : { [field]: text };
+    }
+    if (node.type === "loop" && field === "whileConditionExpression")
+      return {
+        [field]: text,
+        whileConditionCriteriaType: inferBranchCriteriaTypeFromExpression(text),
+      };
+    return { [field]: isNote && !text.trim() ? null : text };
+  }
 }
 
 /** A new step's default prompt is long; the Doc's title line is that prompt, so start it empty. */

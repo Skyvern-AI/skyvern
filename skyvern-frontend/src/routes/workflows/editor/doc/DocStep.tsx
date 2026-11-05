@@ -1,4 +1,8 @@
 import { useContext, useRef, useState, type ReactNode } from "react";
+import { stripJinjaReferences } from "./docTextUtils";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { goalChangeIsPending } from "../workflowEditorUtils";
+import type { CodeBlockNodeData } from "../nodes/CodeBlockNode/types";
 import { ChevronRightIcon, GearIcon } from "@radix-ui/react-icons";
 import {
   DropdownMenu,
@@ -22,6 +26,11 @@ import {
   docTagClasses,
   docTagColor,
   getDocKeyFields,
+  docStepIsNoteOnly,
+  docStepProducesData,
+  getDocMainPlaceholder,
+  getDocMissingSettings,
+  loopLineLeadsIn,
   getDocProseFields,
   getDocSettingSummary,
   getDocStepSummary,
@@ -37,14 +46,20 @@ import {
   DocOutputName,
   DocStepPicker,
 } from "./DocEditing";
+import { useDocStepPending } from "./DocProposalView";
 
 /** Where a step sits, for the moves its tag menu offers. Absent when the step's place can't be edited. */
 export type DocStepPlace = DocPlace & { count: number; isFinally: boolean };
 
-const tagClass = (blockType: ReturnType<typeof docBlockType>) =>
+const tagClass = (
+  blockType: ReturnType<typeof docBlockType>,
+  pending = false,
+) =>
   cn(
     "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded pl-[5px] pr-[7px] text-[12.5px] font-semibold",
     docTagClasses[docTagColor(blockType)],
+    pending &&
+      "border border-dashed border-current bg-transparent pl-1 pr-1.5 opacity-80 dark:bg-transparent",
   );
 
 function DocStepMenu({
@@ -61,6 +76,7 @@ function DocStepMenu({
   const tagRef = useRef<HTMLButtonElement>(null);
   const [confirming, setConfirming] = useState(false);
   const blockType = docBlockType(node);
+  const pending = useDocStepPending(node);
   const container = node.type === "loop" || node.type === "conditional";
   const topLevel = place.scope.parentId === null;
   const destinations = moveOpen
@@ -113,7 +129,7 @@ function DocStepMenu({
             }
             aria-label={`${blockType ? workflowBlockTitle[blockType] : node.type} step ${node.data.label}, actions`}
             className={cn(
-              tagClass(blockType),
+              tagClass(blockType, pending),
               "outline-none hover:brightness-95 focus-visible:ring-2 focus-visible:ring-ring",
             )}
           >
@@ -269,9 +285,10 @@ export function DocTag({
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const blockType = docBlockType(node);
+  const pending = useDocStepPending(node);
   if (actions.edit && place) return <DocStepMenu node={node} place={place} />;
   return (
-    <span className={tagClass(blockType)}>
+    <span className={tagClass(blockType, pending)}>
       {blockType && (
         <WorkflowBlockIcon workflowBlockType={blockType} className="size-3" />
       )}
@@ -357,8 +374,8 @@ export function DocStepHeader({
       )}
       <DocTag node={node} place={editable ? place : undefined} />
       {extra}
-      {node.type !== "conditional" && (
-        <span className="flex min-w-[7rem] flex-1 items-center gap-1 text-[12.5px] text-muted-foreground">
+      {docStepProducesData(node) && (
+        <span className="flex min-w-0 items-center gap-1 text-[12.5px] text-muted-foreground">
           saves{" "}
           {editable && place ? (
             <DocOutputName id={node.id} label={node.data.label} />
@@ -385,7 +402,7 @@ export function DocStepHeader({
 
 export function DocStepBody({
   node,
-  editable = false,
+  editable: editableProp = false,
   onEnter,
   onSlash,
   onTab,
@@ -400,6 +417,21 @@ export function DocStepBody({
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const data = node.data as Record<string, unknown>;
+  // A build in flight carries the Goal it started with, so the Code line is read-only until it ends, as in Visual.
+  const goalBuild = useCopilotActionStore((state) =>
+    state.generatingBlockLabel === node.data.label
+      ? "building"
+      : state.queuedBuilds.some(
+            (queued) => queued.blockLabel === node.data.label,
+          )
+        ? "queued"
+        : null,
+  );
+  const editable = editableProp && !(node.type === "codeBlock" && goalBuild);
+  const goalNotApplied =
+    node.type === "codeBlock" &&
+    !goalBuild &&
+    goalChangeIsPending(node.data as CodeBlockNodeData);
   const fields = getDocProseFields(node);
   const isProse = fields.length > 0;
   const stringOf = (key: string) =>
@@ -422,11 +454,25 @@ export function DocStepBody({
           ...prose.filter((f) => f.key !== fields[0]!.key),
         ]
       : prose;
-  const keyFields = isProse ? [] : getDocKeyFields(node);
+  const keyFields = getDocKeyFields(node);
+  const missing = getDocMissingSettings(node);
+  const noteOnly = docStepIsNoteOnly(node);
   // A description sits under a prompt-driven step's text; on other steps it is the main line, with the setting it would hide underneath.
+  // A loop's line that already names its list says what "For each of …" would, so the summary is left out.
+  const loopSource = stripJinjaReferences(
+    stringOf("loopVariableReference") || stringOf("loopValue"),
+  );
+  const lineNamesLoopSource =
+    node.type === "loop" &&
+    loopSource !== "" &&
+    stripJinjaReferences(description ?? "").includes(loopSource);
   const settingSummary =
-    !isProse && description ? getDocSettingSummary(node) : null;
+    !isProse && description && !lineNamesLoopSource
+      ? getDocSettingSummary(node)
+      : null;
   const focus = actions.focusId === node.id;
+  const emptyText = getDocMainPlaceholder(node);
+  const forEachLoop = node.type === "loop" && data.loopKind !== "while";
   const mainKey = isProse ? fields[0]!.key : "description";
   const line = (
     key: string,
@@ -466,12 +512,37 @@ export function DocStepBody({
       <div className="min-h-[1.55em] text-base font-medium leading-[1.55]">
         {isProse ? (
           main ? (
-            line(main.key, main.value, "No instructions yet", "")
+            line(main.key, main.value, emptyText, "")
           ) : (
             <span className="font-normal text-muted-foreground">
-              No instructions yet
+              {emptyText}
             </span>
           )
+        ) : forEachLoop ? (
+          <div className="flex items-baseline gap-1.5">
+            {!loopLineLeadsIn(description) && (
+              <span className="shrink-0">For each of</span>
+            )}
+            <span className="min-w-0 flex-1">
+              {editable ? (
+                line(
+                  "description",
+                  description ?? "",
+                  stringOf("loopVariableReference") ||
+                    stringOf("loopValue") ||
+                    "type @ to pick the list",
+                  "",
+                )
+              ) : (
+                <DocText
+                  value={
+                    description ??
+                    (stringOf("loopVariableReference") || stringOf("loopValue"))
+                  }
+                />
+              )}
+            </span>
+          </div>
         ) : editable ? (
           line("description", description ?? "", getDocStepSummary(node), "")
         ) : (
@@ -503,6 +574,36 @@ export function DocStepBody({
           ) : (
             <DocText value={description ?? ""} className="text-foreground" />
           )}
+        </div>
+      )}
+      {noteOnly && (editable || description) && (
+        <div className="text-[12.5px] leading-[1.4] text-muted-foreground">
+          A note for people. The agent does not read it.
+        </div>
+      )}
+      {node.type === "codeBlock" && (goalBuild || goalNotApplied) && (
+        <div
+          role="status"
+          className="text-[12.5px] leading-[1.4] text-muted-foreground"
+        >
+          {goalBuild === "building"
+            ? "Applying the new Goal…"
+            : goalBuild === "queued"
+              ? "Waiting to apply the new Goal…"
+              : "Goal changed, not applied yet. Save to apply it."}
+        </div>
+      )}
+      {missing.length > 0 && (
+        <div className="mb-0.5 mt-1 flex flex-wrap gap-1.5">
+          {missing.map((label) => (
+            <span
+              key={label}
+              data-doc-missing={label}
+              className="inline-flex items-center rounded-md border border-destructive/40 px-2 py-px text-[12.5px] text-destructive"
+            >
+              {label} required
+            </span>
+          ))}
         </div>
       )}
       {settingSummary && (

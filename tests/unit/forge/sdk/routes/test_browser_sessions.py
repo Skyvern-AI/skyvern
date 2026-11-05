@@ -397,6 +397,7 @@ async def test_browser_session_read_responses_only_reveal_connect_token_to_autho
     app_mock.DATABASE.browser_sessions.get_persistent_browser_sessions_history = AsyncMock(return_value=[session])
     app_mock.DATABASE.browser_sessions.get_folder_visible_browser_session_ids = AsyncMock(return_value={session_id})
     app_mock.AGENT_FUNCTION.accessible_browser_session_ids = AsyncMock(return_value={session_id})
+    app_mock.AGENT_FUNCTION.redact_inaccessible_browser_session_artifacts = AsyncMock(return_value=False)
     app_mock.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = AsyncMock(
         return_value={session_id} if connect_authorized else set()
     )
@@ -894,6 +895,7 @@ async def test_fan_out_listings_keep_each_sessions_storage_listings_sequential(e
     sessions = [MagicMock(browser_profile_id=None, persistent_browser_session_id=f"pbs_{index}") for index in range(2)]
     app_mock = MagicMock()
     app_mock.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
+    app_mock.AGENT_FUNCTION.redact_inaccessible_browser_session_artifacts = AsyncMock(return_value=False)
     app_mock.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = AsyncMock(return_value=set())
     app_mock.AGENT_FUNCTION.accessible_browser_session_ids = AsyncMock(
         return_value={session.persistent_browser_session_id for session in sessions}
