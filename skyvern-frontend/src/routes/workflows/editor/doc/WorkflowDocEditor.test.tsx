@@ -383,6 +383,26 @@ describe("WorkflowDocEditor navigation", () => {
     expect(screen.getAllByRole("option")).toHaveLength(1);
   });
 
+  test("the branch actions button shows only when the branch has an action", () => {
+    const edits: DocGraphEdits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    renderDoc(
+      [
+        conditional("route", null, [
+          { id: "yes", next: "if_step", when: "found" },
+          { id: "otherwise", next: null },
+        ]),
+        code("if_step", null),
+      ],
+      edits,
+    );
+    expect(screen.queryByRole("button", { name: /Branch actions/ })).toBeNull();
+  });
+
   test("collapse all closes loops and conditionals", () => {
     const nodes = renderDoc([
       forLoop("each_row", "route", [code("inner_loop", null)]),
