@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { DocStarterProgress } from "./DocStarter";
+import type { DocStarterProgress } from "./docStarterTips";
 
 const STORE_KEY = "skyvern.doc.gettingStarted";
 

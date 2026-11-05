@@ -23,6 +23,7 @@ import { docStepCanRun, docStepTitle } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
 import { DocStepResult } from "./DocStepResult";
 import { DocSettingsButton, DocTag, type DocStepPlace } from "./DocStep";
+import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
 import { DocText } from "./DocText";
 import { DocDeleteConfirm, DocEditableLine } from "./DocEditing";
@@ -164,7 +165,7 @@ export function DocConditional({
   showRunControl?: boolean;
   place?: DocStepPlace;
   // Enter on the If line starts the line after the conditional.
-  onEnter?: () => void;
+  onEnter?: (split: LineSplit | null, key?: string) => void;
   renderChildren: (
     children: DocItem[],
     scope?: DocScopeRef,
@@ -424,6 +425,8 @@ export function DocConditional({
                           )
                         }
                         onEnter={onEnter}
+                        onRunStep={() => runStepByKey(node.id)}
+                        onSettings={() => actions.openSettings(node.id)}
                         onDone={() => {
                           if (actions.focusId === node.id)
                             actions.setFocusId(null);
