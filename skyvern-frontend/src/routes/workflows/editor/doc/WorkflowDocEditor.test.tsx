@@ -644,6 +644,63 @@ test("a step that reads an output only some branches produce shows the warning u
   }
 });
 
+describe("A Browser Action that needs several actions", () => {
+  const actionStep = {
+    label: "search_step",
+    block_type: "action",
+    next_block_label: null,
+    continue_on_failure: false,
+    model: null,
+    output_parameter: output("search_step"),
+    url: "",
+    navigation_goal: "Search for apple stock and get its price",
+    parameters: [],
+  } as unknown as WorkflowBlock;
+
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  test("offers to turn into a Browser Task before running, keeping the text", () => {
+    const apply = vi.fn();
+    renderDoc([actionStep], {
+      apply,
+      update: vi.fn(),
+      addStep: vi.fn(() => null),
+      duplicate: vi.fn(),
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Turn into Browser Task" }),
+    );
+
+    const turned = apply.mock.calls[0]![0].nodes.find(
+      (node: { data: { label?: string } }) => node.data.label === "search_step",
+    );
+    expect(turned.type).toBe("navigation");
+    expect(turned.data.navigationGoal).toBe(
+      "Search for apple stock and get its price",
+    );
+  });
+});
+
 describe("Doc inputs", () => {
   beforeEach(() => {
     docRun.current = { runId: null, blocksByLabel: new Map(), live: false };

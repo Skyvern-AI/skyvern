@@ -21,6 +21,7 @@ import { HeroScreenshot } from "../../studio/runview/HeroScreenshot";
 import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import { useDocRun } from "./useDocRun";
+import { failureHeadlineInPlainWords } from "./docFailureText";
 import {
   docLoopProgressText,
   docRunStoppedByStep,
@@ -76,7 +77,10 @@ function failureLine(block: WorkflowRunBlock): string {
   if (!block.failure_reason?.trim()) return "Failed";
   const headline =
     describeCodeBlockFailure(block)?.title ??
-    formatFailureReason(block.failure_reason).headline;
+    failureHeadlineInPlainWords(
+      block.failure_reason,
+      (raw) => formatFailureReason(raw).headline,
+    );
   return headline ? `Failed: ${headline}` : "Failed";
 }
 
