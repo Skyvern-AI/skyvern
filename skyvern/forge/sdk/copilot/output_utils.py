@@ -2231,6 +2231,7 @@ _TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
     "invalid_mapping": "Mapping is invalid",
     "invalid_parameters": "Inputs failed validation",
     "owner_lookup_failed": "Couldn't look up your role; try again",
+    "owner_not_authorized": "Trigger owner cannot access a required credential",
 }
 
 
