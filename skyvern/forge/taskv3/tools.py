@@ -31,6 +31,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Literal, NamedTuple, TypeVar
 from urllib.parse import unquote, urlparse
@@ -136,6 +137,11 @@ from skyvern.forge.taskv3.target_label import TARGET_KIND_TOKENS, TARGET_NAME_CA
 from skyvern.utils.contained_effects import contained_effect
 from skyvern.utils.date_values import canonical_iso_date
 from skyvern.webeye.action_deadline import cancellable_driver_call, under_action_deadline
+from skyvern.webeye.actions.handler import (
+    _BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS,
+    _collect_inline_iframe_src_candidates,
+    _recover_blocked_inline_pdf_download,
+)
 from skyvern.webeye.actions.key_names import normalize_key_chord
 from skyvern.webeye.browser_driver_errors import is_driver_error, is_driver_timeout_error
 from skyvern.webeye.browser_state import BLANK_PAGE_URLS, is_selectable_page_url
@@ -24052,7 +24058,7 @@ def build_browser_tools(
             _tool_spec.handler = _with_act_deadline(_tool_spec.name, _tool_spec.handler)
     # Inside the download signal, so download lines and failures follow the page-text delta.
     _apply_text_delta(tools)
-    _apply_download_signal(tools, downloads_dir, download_failures, download_wait)
+    _apply_download_signal(tools, downloads_dir, download_failures, download_wait, page_provider)
     if unseen_text is not None:
         unseen_text.unreported = _unreported_text
     return tools
@@ -24379,6 +24385,7 @@ _DOWNLOAD_FAILURE_RESOURCE_TYPES = frozenset({"xhr", "fetch"})
 _DOWNLOAD_FAILURE_SETTLE_SECONDS = 2.5
 _SESSION_DOWNLOAD_LIST_TIMEOUT_SECONDS = 2.0
 DOWNLOAD_NO_FILE_THIS_ACTION = "No file downloaded during this action."
+_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS = 5.0
 DOWNLOAD_NO_SESSION_FILE_YET = "No file has reached the browser session's storage yet."
 _DOWNLOAD_FAILURE_URL_MAX = 120
 _DOWNLOAD_NAME_WAIT_SECONDS = 1.0
@@ -24625,11 +24632,15 @@ def _apply_download_signal(
     downloads_dir: str | None,
     failure_watch: DownloadFailureWatch | None = None,
     download_wait: Callable[[], Awaitable[None]] | None = None,
+    page_provider: PageProvider | None = None,
 ) -> None:
     """Wrap every tool so the next wrapped result reports files landing in `downloads_dir` and failures `failure_watch`
     saw. A billable call, or one that leaves a download in flight, first awaits `download_wait` so it names its file."""
     if not downloads_dir and failure_watch is None:
         return
+    # Only a block the engine built a download wait for: elsewhere the per-call iframe enumeration
+    # below would be paid by every click for a recovery that has no file to stand in for.
+    recover_blocked_frames = bool(downloads_dir) and download_wait is not None and page_provider is not None
 
     seen_completed: set[str] = set()
     seen_started: set[str] = set()
@@ -24693,6 +24704,60 @@ def _apply_download_signal(
             session_baselined = True
             return None
         return listed
+
+    def _landed_a_file_this_call(session_files: list[str] | None) -> bool:
+        completed, in_progress = _list_split()
+        return (
+            any(name not in seen_completed for name in completed)
+            or bool(in_progress)
+            or any(uri not in seen_session for uri in session_files or ())
+        )
+
+    async def _inline_iframe_baseline() -> tuple[Any, list[str]] | None:
+        """The page and its iframe srcs before the call, which the recovery below attributes a frame by."""
+        assert page_provider is not None
+        try:
+            page = await page_provider()
+            if page is None:
+                return None
+            # Unlike v1's once-per-download-action read, this runs before every may-submit call on a
+            # download block, so it is bounded: enumeration is one evaluate per frame, and a frame
+            # that will not answer must delay the click itself by a known amount, not by its own timeout.
+            async with asyncio.timeout(_BLOCKED_INLINE_FRAME_BASELINE_TIMEOUT_SECONDS):
+                return page, await _collect_inline_iframe_src_candidates(page)
+        except Exception:
+            LOG.info("taskv3 inline iframe baseline failed", exc_info=True)
+            return None
+
+    async def _recover_blocked_inline_pdf(baseline: tuple[Any, list[str]]) -> None:
+        """Save a PDF this call rendered in a frame the browser refused to display, so the lines below name it.
+
+        The target downloads fine; it just cannot be framed, so no download event ever fires and
+        nothing reaches `downloads_dir`. v1 recovers the bytes same-origin from the refused frame's
+        own src (SKY-12559); writing them into `downloads_dir` here rejoins the same reporting,
+        settle and finalize path a browser download takes.
+        """
+        assert page_provider is not None and downloads_dir
+        baseline_page, iframe_srcs_before = baseline
+        context = skyvern_context.current()
+        try:
+            page = await page_provider()
+            # A call that took the working page somewhere else (a popup it opened, a page it closed)
+            # leaves a baseline that belongs to a document this one no longer holds, so nothing in the
+            # page we can read now is attributable to it.
+            if page is None or page is not baseline_page:
+                return
+            # One whole-operation budget over every candidate fetch, as v1 caps it: a hung
+            # same-origin server must not out-wait the loop this recovery backstops.
+            async with asyncio.timeout(_BLOCKED_INLINE_PDF_RECOVERY_TIMEOUT_SECONDS):
+                await _recover_blocked_inline_pdf_download(
+                    page,
+                    Path(downloads_dir),
+                    workflow_run_id=context.workflow_run_id if context is not None else None,
+                    iframe_srcs_before=iframe_srcs_before,
+                )
+        except Exception:
+            LOG.warning("taskv3 blocked-inline PDF recovery failed", exc_info=True)
 
     def _with_file_lines(
         result: ToolResult, compactable: bool, page_names: Mapping[str, str], session_files: list[str]
@@ -24779,6 +24844,10 @@ def _apply_download_signal(
                     except Exception:
                         LOG.warning("taskv3 download signal baseline snapshot failed", tool=_tool_name, exc_info=True)
                     baseline["done"] = True
+            # Before the handler: a frame already on the page is not the one this call opened.
+            iframe_baseline = (
+                await _inline_iframe_baseline() if recover_blocked_frames and _may_submit(_tool_name, args) else None
+            )
             call = await failure_watch.begin() if failure_watch is not None else 0
             try:
                 result = await _handler(args)
@@ -24806,6 +24875,9 @@ def _apply_download_signal(
                 if landed:
                     page_names = await failure_watch.page_names(landed)
             session_files = await _new_session_files()
+            # Last, after every signal that a file did arrive: a recovery is for the call that got none.
+            if iframe_baseline is not None and not _landed_a_file_this_call(session_files):
+                await _recover_blocked_inline_pdf(iframe_baseline)
             reported = True
             try:
                 result, reported = _with_file_lines(result, _compactable, page_names, session_files or [])
