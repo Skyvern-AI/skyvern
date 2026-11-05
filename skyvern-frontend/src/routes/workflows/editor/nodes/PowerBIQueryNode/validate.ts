@@ -11,7 +11,7 @@ export function validatePowerBIQueryNode(
 
   if (credentialSource !== "nango") {
     errors.push(
-      `${label}: Select a verified Nango Power BI connection; native connections are no longer supported.`,
+      `${label}: Select a verified Power BI connection; native connections are no longer supported.`,
     );
   }
 

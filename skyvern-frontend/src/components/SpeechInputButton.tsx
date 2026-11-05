@@ -13,6 +13,7 @@ type SpeechInputButtonProps = {
   isHearingSpeech: boolean;
   disabled?: boolean;
   onToggle: () => void;
+  label?: string;
   className?: string;
   iconClassName?: string;
 };
@@ -23,6 +24,7 @@ function SpeechInputButton({
   isHearingSpeech,
   disabled = false,
   onToggle,
+  label = "Dictate message",
   className,
   iconClassName = "h-4 w-4",
 }: SpeechInputButtonProps) {
@@ -31,14 +33,14 @@ function SpeechInputButton({
     ? "Voice input isn't supported in this browser. Try Chrome or Edge."
     : isListening
       ? "Stop dictating"
-      : "Dictate message";
+      : label;
 
   const button = (
     <button
       type="button"
       onClick={onToggle}
       disabled={isDisabled}
-      aria-label={isListening ? "Stop dictating" : "Dictate message"}
+      aria-label={isListening ? "Stop dictating" : label}
       aria-pressed={isListening}
       className={cn(
         "flex shrink-0 items-center justify-center rounded-md border",

@@ -130,6 +130,7 @@ import {
 } from "../../collapse/useNodeCollapseStore";
 import { useWorkflowEditorMode } from "../../hooks/useWorkflowEditorMode";
 import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
+import { useDocRunOwnsTopBar } from "../../doc/useDocRunOwnsTopBar";
 
 class ValidationFailureError extends Error {
   readonly isValidationFailure = true;
@@ -306,6 +307,7 @@ function NodeHeader({
   const queryClient = useQueryClient();
   const location = useLocation();
   const { resolveLivePanes, preserveNextEntry } = useStudioPanes();
+  const docShowing = useDocRunOwnsTopBar();
   const isDebuggable = debuggableWorkflowBlockTypes.has(type);
   const isScriptable = scriptableWorkflowBlockTypes.has(type);
   const {
@@ -608,7 +610,10 @@ function NodeHeader({
         // One navigation carries the pane state (open panes never move or
         // close; the run surfaces append); other query params intentionally
         // reset for the fresh run.
-        const panes = withPanesOpen(resolveLivePanes(), RUN_APPEND_PANES);
+        // The Doc shows the step's progress on its own line; adding panes would squeeze it.
+        const panes = docShowing
+          ? resolveLivePanes()
+          : withPanesOpen(resolveLivePanes(), RUN_APPEND_PANES);
         const search = new URLSearchParams({
           wr: response.data.run_id,
           bl: label,
