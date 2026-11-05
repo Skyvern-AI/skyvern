@@ -75,17 +75,16 @@ class AES(BaseEncryptor):
             padded_plaintext = self._pad(plaintext.encode("utf-8"))
             ciphertext = encryptor.update(padded_plaintext) + encryptor.finalize()
             return base64.b64encode(ciphertext).decode("utf-8")
-        except Exception as e:
-            raise Exception("Failed to encrypt token") from e
+        except Exception:
+            raise Exception("Failed to encrypt token") from None
 
     async def decrypt(self, ciphertext: str) -> str:
         try:
             encrypted_data = base64.b64decode(ciphertext.encode("utf-8"))
-        except Exception as e:
-            raise TokenDecryptionError("Failed to decrypt token") from e
+        except Exception:
+            raise TokenDecryptionError("Failed to decrypt token") from None
 
         candidates: list[tuple[bytes, bytes]] = [(self.salt, self.iv), *self._fallback_decrypt_params]
-        last_error: Exception | None = None
         for salt, iv in candidates:
             try:
                 key = self._derive_key(salt=salt)
@@ -94,11 +93,11 @@ class AES(BaseEncryptor):
                 padded_plaintext = decryptor.update(encrypted_data) + decryptor.finalize()
                 plaintext = self._unpad(padded_plaintext)
                 return plaintext.decode("utf-8")
-            except Exception as e:
-                last_error = e
+            except Exception:
                 continue
 
-        raise TokenDecryptionError("Failed to decrypt token") from last_error
+        # Never chain the candidate failure: padding and key errors must not distinguish one cause from another.
+        raise TokenDecryptionError("Failed to decrypt token") from None
 
     def _pad(self, data: bytes) -> bytes:
         block_size = 16

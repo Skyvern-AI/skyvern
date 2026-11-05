@@ -1837,17 +1837,6 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         return f"{lead} {reply}{keep_draft_affordance}" if reply else lead
 
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
-    if (
-        policy is not None
-        and policy.clarification_reason == "workflow_credential_inputs_unbound"
-        and ctx.last_workflow is not None
-        and block_count is not None
-    ):
-        return lead_then_reply(
-            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-            "the required credentials. Add them in Credentials, then I can try again."
-        )
-
     if ctx.last_test_ok is False and block_count is not None:
         connect_failure = _terminal_connect_failure(ctx)
         if connect_failure is not None and connect_failure.state == "billing_credit_admission_refusal":

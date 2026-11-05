@@ -169,7 +169,9 @@ from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     BUILD_TEST_PACKET_KEY,
+    DOWNLOADS_NOTICE_PREFIX,
     LOOP_INPUTS_KEY,
+    REGISTERED_OUTPUTS_NOTICE_PREFIX,
     bounded_loop_inputs,
     build_run_blocks_response,
     iter_failure_reasons,
@@ -189,6 +191,7 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     bank_completed_outputs,
     browser_session_settings,
 )
+from skyvern.forge.sdk.copilot.request_policy import login_credential_input_defaults
 from skyvern.forge.sdk.copilot.review_gate import workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.run_outcome import (
     TERMINAL_CHALLENGE_RUN_OUTCOME_REASON_CODE,
@@ -3836,6 +3839,13 @@ def _with_build_test_acquisition_context(
     data["executed_block_labels"] = []
     # Nothing was minted when acquisition fails, whichever route was attempted.
     data["used_fresh_run_session"] = False
+    acquisition_failure = data.get("browser_session_acquisition_failure")
+    if data.get("build_test_connect_failure") is None and isinstance(acquisition_failure, dict):
+        try:
+            failure = BuildTestConnectFailure.model_validate(acquisition_failure)
+        except ValueError:
+            return result
+        data["build_test_connect_failure"] = failure.model_dump(mode="json", exclude_none=True)
     return result
 
 
@@ -7309,6 +7319,19 @@ def _same_run_runtime_failure_class(copilot_ctx: CopilotContext, workflow_run_id
     return None
 
 
+def blank_login_credential_input_keys(
+    workflow_yaml: str | None,
+    unbound_keys: Sequence[str],
+    dispatched_input_values: Mapping[str, Any],
+) -> list[str]:
+    blank: list[str] = []
+    for key, default_value in login_credential_input_defaults(workflow_yaml).items():
+        value = dispatched_input_values.get(key)
+        if key in unbound_keys or not (default_value if value is None else value):
+            blank.append(key)
+    return blank
+
+
 def _build_recorded_build_test_outcome(
     copilot_ctx: CopilotContext,
     result: dict[str, Any],
@@ -7363,6 +7386,11 @@ def _build_recorded_build_test_outcome(
         if isinstance(result_data.get("post_run_page_evidence"), dict)
         else None
     )
+    blank_login_input_keys = (
+        blank_login_credential_input_keys(workflow_yaml, execution.unbound_keys, execution.dispatched_input_values)
+        if execution
+        else []
+    )
     outcome = recorded_outcome_from_run_blocks_result(
         result,
         page_evidence=result_page_evidence or copilot_ctx.composition_page_evidence,
@@ -7389,6 +7417,7 @@ def _build_recorded_build_test_outcome(
         block_associations_by_label=execution.associations
         if execution
         else ({} if historical_run else getattr(copilot_ctx, "runner_code_block_associations_by_label", {})),
+        blank_login_credential_input_keys=blank_login_input_keys,
     )
     raw_blocks = result_data.get("blocks")
     ai_fallback_blocks = _packet_ai_fallback_blocks(raw_blocks if isinstance(raw_blocks, list) else [])
@@ -8011,26 +8040,31 @@ def _packet_registered_outputs(
     outputs = fallback_outputs + recorded_outputs
     if fallback_by_label:
         omission_notices.append(
-            "registered_outputs included "
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}included "
             f"{len(fallback_by_label)} item(s) reconstructed from same-run output-parameter rows "
             "because no workflow run block output was recorded."
         )
     redacted += len(fallback_redacted_labels)
     if malformed:
-        omission_notices.append(f"registered_outputs omitted {malformed} non-JSON or malformed item(s).")
+        omission_notices.append(f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}omitted {malformed} non-JSON or malformed item(s).")
     if null_block_outputs:
         omission_notices.append(
-            f"registered_outputs omitted {null_block_outputs} explicit null workflow run block output(s); "
-            "registered output-parameter rows cannot replace them."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}omitted {null_block_outputs} explicit null workflow run block "
+            "output(s); registered output-parameter rows cannot replace them."
         )
     if other_run:
-        omission_notices.append(f"registered_outputs omitted {other_run} item(s) belonging to another or unknown run.")
+        omission_notices.append(
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}omitted {other_run} item(s) belonging to another or unknown run."
+        )
     if unbound:
         omission_notices.append(
-            f"registered_outputs omitted {unbound} output-parameter item(s) with no run-snapshot block mapping."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}omitted {unbound} output-parameter item(s) "
+            "with no run-snapshot block mapping."
         )
     if redacted:
-        omission_notices.append(f"registered_outputs redacted {redacted} item(s) containing registered secret values.")
+        omission_notices.append(
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}redacted {redacted} item(s) containing registered secret values."
+        )
     return outputs
 
 
@@ -8097,17 +8131,23 @@ def _packet_downloads(
     artifact_ids = _collect_downloaded_artifact_ids(outputs_by_label, generated=frozenset())
     evidence = copilot_ctx.registered_artifact_evidence
     names_by_id: dict[str, str | None] = {
-        file["artifact_id"]: file.get("filename")
+        file["artifact_id"]: name
         for output in outputs_by_label.values()
         if isinstance(files := output.get("downloaded_files"), list)
         for file in files
-        if isinstance(file, Mapping) and file.get("artifact_id") in generated
+        if isinstance(file, Mapping)
+        and isinstance(file.get("artifact_id"), str)
+        and (name := _packet_string(file.get("filename")))
     }
     if isinstance(evidence, RegisteredArtifactEvidence):
         if evidence.workflow_run_id == run_id:
-            names_by_id |= {entry.artifact_id: entry.file_name for entry in evidence.entries}
-        elif artifact_ids:
-            omission_notices.append("downloads omitted file names from artifact evidence belonging to another run.")
+            names_by_id |= {
+                entry.artifact_id: name for entry in evidence.entries if (name := _packet_string(entry.file_name))
+            }
+        elif any(names_by_id.get(artifact_id) is None for artifact_id in artifact_ids):
+            omission_notices.append(
+                f"{DOWNLOADS_NOTICE_PREFIX}omitted file names from artifact evidence belonging to another run."
+            )
     return [
         BuildTestPacketDownload(
             artifact_id=artifact_id,
@@ -8317,11 +8357,12 @@ def build_test_evidence_packet(
     registered_outputs = _packet_registered_outputs(copilot_ctx, data, run_id, omission_notices)
     if not registered_outputs:
         omission_notices.append(
-            "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}empty: no workflow run block output or registered output-parameter "
+            "value was recorded."
         )
     downloads = _packet_downloads(copilot_ctx, data, omission_notices)
     if not downloads:
-        omission_notices.append("downloads empty: no registered download artifact was recorded.")
+        omission_notices.append(f"{DOWNLOADS_NOTICE_PREFIX}empty: no registered download artifact was recorded.")
 
     screenshot_present = (
         run_id is not None and isinstance(data.get("screenshot_base64"), str) and bool(data.get("screenshot_base64"))

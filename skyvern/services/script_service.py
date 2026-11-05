@@ -3834,6 +3834,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     jinja_template = jinja_sandbox_env.from_string(template)
     context = skyvern_context.current()
     run_secrets: dict[str, Any] | None = None
+    excluded_secret_ids: set[str] | None = None
     if context:
         template_data.update(context.script_run_parameters)
         if context.workflow_run_id:
@@ -3843,6 +3844,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
             if template in template_data:
                 return template_data[template]
             run_secrets = workflow_run_context.secrets
+            excluded_secret_ids = workflow_run_context.agent_unmasked_platform_secret_ids()
         # Inject for_loop / while_loop metadata (current_value, current_index, current_item) so
         # that cached function bodies inside script loops can resolve {{ current_value }}
         # in page.goto() and other template-rendered calls. while_loop only sets current_index.
@@ -3852,7 +3854,9 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
                     template_data[key] = context.loop_metadata[key]
     rendered = jinja_template.render(template_data)
     if run_secrets is not None:
-        register_secret_derived_output(run_secrets, jinja_template, template, template_data, rendered)
+        register_secret_derived_output(
+            run_secrets, jinja_template, template, template_data, rendered, excluded_secret_ids=excluded_secret_ids
+        )
     return rendered
 
 

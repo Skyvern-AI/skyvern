@@ -110,10 +110,14 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import is_temp_working_dir, resolve_run_download_id
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import _file_infos_from_download_artifacts, artifact_filename_from_uri
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import ResponseComparison, unique_pdf_file_infos
 from skyvern.forge.sdk.browser_action_policy import BrowserActionPolicy
 from skyvern.forge.sdk.cache import extraction_cache
 from skyvern.forge.sdk.cache.factory import CacheFactory
-from skyvern.forge.sdk.copilot.reached_download_target import generated_file_artifact_ids
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    REGISTERED_DOWNLOAD_OUTPUT_KEYS,
+    generated_file_artifact_ids,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -191,10 +195,14 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.schemas.workflow_schedules import OneTimeDispatchStatus
 from skyvern.forge.sdk.services.browser_session_artifacts import (
+    REDACTED_ARTIFACT,
+    TASK_V2_METADATA,
+    TIMELINE_BLOCK_METADATA,
     BrowserSessionArtifactAccess,
     browser_session_artifact_access,
     browser_session_artifact_system_read,
     child_run_artifact_access,
+    redact_descendant_entity,
 )
 from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
@@ -1086,6 +1094,17 @@ class DebugSessionProfileDecision:
 
     attach_browser_session_id: str | None
     incompatible_reason: str | None
+
+
+def _is_download_registration(value: dict[str, Any]) -> bool:
+    """The host's download registration keys, which the binder writes over or drops when executed code authored them."""
+    artifact_ids = value.get("downloaded_file_artifact_ids")
+    return (
+        all(key in value for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+        and isinstance(artifact_ids, list)
+        and all(isinstance(aid, str) for aid in artifact_ids)
+        and isinstance(value["downloaded_files"], list)
+    )
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -2861,6 +2880,52 @@ class WorkflowService:
                 scoped.append(file_info)
         return scoped
 
+    async def unique_task_pdf_file_infos(
+        self,
+        files: list[FileInfo],
+        task: Task,
+        download_run_id: str,
+        comparison: ResponseComparison | None = None,
+    ) -> list[FileInfo]:
+        """``files`` of a task response with equal PDF copies merged only among those its own attempt owns.
+
+        Files another attempt owns, or whose attempt cannot be shown, stay listed; a failed attempt lookup keeps all.
+        """
+        owned = files
+        if task.workflow_run_id:
+            try:
+                attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(task.workflow_run_id)
+                if attempt_rows:
+                    attempt_number = task.attempt_number or 1
+                    artifact_ids = await self._download_artifact_ids_for_attempt(
+                        run_id=download_run_id,
+                        organization_id=task.organization_id,
+                        attempt_rows=attempt_rows,
+                        attempt_number=attempt_number,
+                        attribution_workflow_run_id=task.workflow_run_id,
+                    )
+                    # The attempt filter counts an undated file as current for live checks; that proves no ownership.
+                    owned = [
+                        file_info
+                        for file_info in self._filter_downloaded_files_to_attempt(
+                            files, attempt_rows=attempt_rows, attempt_number=attempt_number, artifact_ids=artifact_ids
+                        )
+                        if file_info.artifact_id in artifact_ids or file_info.modified_at is not None
+                    ]
+            except Exception:
+                LOG.warning(
+                    "Could not scope a task's downloads to its attempt; listing every copy",
+                    task_id=task.task_id,
+                    exc_info=True,
+                )
+                return files
+        kept = {
+            id(file_info)
+            for file_info in await unique_pdf_file_infos(owned, task.organization_id, [download_run_id], comparison)
+        }
+        owned_ids = {id(file_info) for file_info in owned}
+        return [file_info for file_info in files if id(file_info) not in owned_ids or id(file_info) in kept]
+
     @staticmethod
     def _collect_artifact_ids(value: Any) -> tuple[list[str], list[str]]:
         """Sync scan of the block-output tree → (screenshot_ids, download_ids). No DB calls."""
@@ -2873,6 +2938,8 @@ class WorkflowService:
                 screenshot_ids.extend(value.get("workflow_screenshot_artifact_ids") or [])
                 download_ids.extend(value.get("downloaded_file_artifact_ids") or [])
             else:
+                if _is_download_registration(value):
+                    download_ids.extend(value["downloaded_file_artifact_ids"])
                 for v in value.values():
                     # Scalars hold no ids; skipping the call saves a frame and three allocations per leaf.
                     if not isinstance(v, (dict, list)):
@@ -2898,16 +2965,20 @@ class WorkflowService:
         attempt_number: int | None = None,
         historical_artifacts: list[Artifact] | None = None,
         current_attempt_artifacts: list[Artifact] | None = None,
+        comparison: ResponseComparison | None = None,
     ) -> Any:
         """Two-pass batch URL refresh: scan artifact IDs (sync), fetch all in 2 parallel DB calls, substitute in-place."""
         if not organization_id:
             return value
+        comparison = comparison or ResponseComparison()
 
         screenshot_ids, download_ids = WorkflowService._collect_artifact_ids(value)
         download_scope_active = bool(attempt_rows and attempt_number is not None)
+        # Resolved before any await: the context object can name another run once this resumes.
+        download_run_id = (
+            resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id) or workflow_run_id
+        )
         if attempt_rows and attempt_number is not None and download_ids:
-            context = skyvern_context.current()
-            download_run_id = resolve_run_download_id(context, fallback_run_id=workflow_run_id) or workflow_run_id
             scoped_download_ids = await self._download_artifact_ids_for_attempt(
                 run_id=download_run_id,
                 organization_id=organization_id,
@@ -2926,13 +2997,20 @@ class WorkflowService:
 
         url_map: dict[str, str] = {}
         fileinfo_map: dict[str, FileInfo] = {}
+        unresolved = frozenset(download_ids).intersection(comparison.looked_up).difference(comparison.rows)
 
         if all_ids:
-            artifacts, expiry_seconds = await asyncio.gather(
-                app.DATABASE.artifacts.get_artifacts_by_ids(all_ids, organization_id),
+            missing = [aid for aid in all_ids if aid not in comparison.rows and aid not in comparison.looked_up]
+            comparison.looked_up.update(missing)
+            fetched, expiry_seconds = await asyncio.gather(
+                app.DATABASE.artifacts.get_artifacts_by_ids(missing, organization_id)
+                if missing
+                else asyncio.sleep(0, []),
                 app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds(organization_id),
             )
             download_id_set = set(download_ids)
+            comparison.remember_rows(fetched, organization_id)
+            artifacts = [comparison.rows[aid] for aid in all_ids if aid in comparison.rows]
             for artifact in artifacts:
                 url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
                 if url is None:
@@ -2959,6 +3037,9 @@ class WorkflowService:
             attempt_number=attempt_number,
             download_scope_active=download_scope_active,
             historical_artifacts=historical_artifacts,
+            comparison=comparison,
+            unresolved=unresolved,
+            download_run_id=download_run_id,
         )
 
     async def _substitute_artifact_urls(
@@ -2972,6 +3053,9 @@ class WorkflowService:
         attempt_number: int | None = None,
         historical_artifacts: list[Artifact] | None = None,
         download_scope_active: bool = False,
+        comparison: ResponseComparison | None = None,
+        unresolved: frozenset[str] = frozenset(),
+        download_run_id: str | None = None,
     ) -> Any:
         """Substitute artifact IDs with pre-built URLs and FileInfos (no DB in the common path).
 
@@ -2992,12 +3076,27 @@ class WorkflowService:
                         url_map[aid] for aid in value["workflow_screenshot_artifact_ids"] if aid in url_map
                     ]
                 if value.get("downloaded_file_artifact_ids"):
+                    # A download whose lookup this response already failed or missed keeps its stored entry.
+                    for entry in value.get("downloaded_files") or []:
+                        aid = entry.get("artifact_id") if isinstance(entry, dict) else None
+                        if isinstance(aid, str) and aid in unresolved:
+                            with suppress(ValueError):
+                                fileinfo_map = {aid: FileInfo.model_validate(entry), **fileinfo_map}
                     refreshed = [
                         fileinfo_map[aid] for aid in value["downloaded_file_artifact_ids"] if aid in fileinfo_map
                     ]
-                    if refreshed or download_scope_active:
-                        value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
-                        value["downloaded_file_urls"] = [fi.url for fi in refreshed]
+                    unique = await unique_pdf_file_infos(
+                        refreshed,
+                        organization_id,
+                        [download_run_id or workflow_run_id],
+                        comparison,
+                    )
+                    if len(unique) < len(refreshed) or not unresolved.isdisjoint(value["downloaded_file_artifact_ids"]):
+                        # This is the response copy; the stored output keeps every id, so a later read re-decides.
+                        value["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in unique]
+                    if unique or download_scope_active:
+                        value["downloaded_files"] = [fi.model_dump(mode="json") for fi in unique]
+                        value["downloaded_file_urls"] = [fi.url for fi in unique]
                 elif value.get("downloaded_files") and organization_id:
                     # Fallback for snapshots persisted without downloaded_file_artifact_ids:
                     # one query for the whole run, filtered by filename.
@@ -3015,6 +3114,13 @@ class WorkflowService:
                             historical_artifacts=historical_artifacts,
                             attempt_rows=attempt_rows,
                             attempt_number=attempt_number,
+                        )
+                        # The lookup reads rows of the run's download key or, without attempts, of the run itself.
+                        refreshed = await unique_pdf_file_infos(
+                            refreshed,
+                            organization_id,
+                            [download_run_id or workflow_run_id, workflow_run_id],
+                            comparison,
                         )
                         if refreshed or download_scope_active:
                             value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
@@ -3046,6 +3152,10 @@ class WorkflowService:
                         historical_artifacts=historical_artifacts,
                     )
             else:
+                if _is_download_registration(value):
+                    await self._select_registered_downloads(
+                        value, fileinfo_map, download_run_id or workflow_run_id, organization_id, comparison
+                    )
                 for k, v in value.items():
                     # Only containers can hold artifact IDs; awaiting a coroutine per scalar leaf blocks the event
                     # loop for seconds on large outputs. The assignment stays so container subclasses see every write.
@@ -3062,6 +3172,9 @@ class WorkflowService:
                         attempt_number=attempt_number,
                         download_scope_active=download_scope_active,
                         historical_artifacts=historical_artifacts,
+                        comparison=comparison,
+                        unresolved=unresolved,
+                        download_run_id=download_run_id,
                     )
         elif isinstance(value, list):
             for i, item in enumerate(value):
@@ -3078,8 +3191,36 @@ class WorkflowService:
                     attempt_number=attempt_number,
                     download_scope_active=download_scope_active,
                     historical_artifacts=historical_artifacts,
+                    comparison=comparison,
+                    unresolved=unresolved,
+                    download_run_id=download_run_id,
                 )
         return value
+
+    @staticmethod
+    async def _select_registered_downloads(
+        value: dict[str, Any],
+        fileinfo_map: dict[str, FileInfo],
+        download_run_id: str,
+        organization_id: str | None,
+        comparison: ResponseComparison | None,
+    ) -> None:
+        """List each PDF content once in a host download registration whose every id is a download row of this run."""
+        artifact_ids = value["downloaded_file_artifact_ids"]
+        if len(artifact_ids) != len(value["downloaded_files"]) or not all(aid in fileinfo_map for aid in artifact_ids):
+            return
+        registered = [fileinfo_map[aid] for aid in artifact_ids]
+        unique = await unique_pdf_file_infos(
+            registered,
+            organization_id,
+            [download_run_id],
+            comparison,
+        )
+        if len(unique) < len(registered):
+            # This is the response copy; the stored output keeps every id, so a later read re-decides.
+            value["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in unique]
+            value["downloaded_files"] = [fi.model_dump(mode="json") for fi in unique]
+            value["downloaded_file_urls"] = [fi.url for fi in unique]
 
     async def _validate_credential_ids(
         self,
@@ -4321,38 +4462,34 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
         )
 
-    async def _reseed_from_saved_profile_at_run_start(
-        self, *, workflow: Workflow, workflow_run: WorkflowRun
-    ) -> WorkflowRun:
-        """Setup resolves the seed before the sequential wait, so re-point the run at its own saved profile if
-        that profile gained content while it waited. Only the seed moves: credential, sequential key, sink and IP
-        pin stay as setup resolved them."""
+    async def _saved_profile_to_reseed_from(
+        self, *, workflow: Workflow, workflow_run: WorkflowRun, booting_lane_browser: bool = False
+    ) -> str | None:
+        """The run's own saved profile if it gained content after setup chose a different seed, else None."""
         sink_profile_id = workflow_run.browser_sink_profile_id
         # Only the no-pick Save & Reuse branch resolves a seed that differs from its own sink; an
         # override, a pick and start-fresh all seed where the caller said and are left alone.
         if not sink_profile_id or workflow_run.browser_profile_id == sink_profile_id:
-            return workflow_run
+            return None
         if workflow_run.browser_seed_source not in (BrowserSeedSource.own_memory, BrowserSeedSource.credential):
-            return workflow_run
+            return None
         # A live session or a fixed browser address never loads this stamp, and a reuse run may adopt its lane's live
         # session after this point. Re-stamping any of them would only make the end-of-run write-back skip.
-        if (
-            workflow_run.browser_session_id
-            or workflow_run.browser_address
-            or should_acquire_reused_session(
-                browser_session_id=workflow_run.browser_session_id,
-                start_fresh_browser=workflow_run.start_fresh_browser,
-                run_override=workflow_run.reuse_browser_session,
-                workflow_default=workflow.reuse_browser_session,
-            )
+        if workflow_run.browser_session_id or workflow_run.browser_address:
+            return None
+        if not booting_lane_browser and should_acquire_reused_session(
+            browser_session_id=workflow_run.browser_session_id,
+            start_fresh_browser=workflow_run.start_fresh_browser,
+            run_override=workflow_run.reuse_browser_session,
+            workflow_default=workflow.reuse_browser_session,
         ):
-            return workflow_run
+            return None
         # Unserialized runs can still be mid-flight when this one starts, so their saved profile is
         # not a settled predecessor state — they keep resolving once, at queue time.
         if not (run_row_serializes(workflow_run) or workflow_config_serializes(workflow, workflow_run)):
-            return workflow_run
+            return None
         if not await app.AGENT_FUNCTION.is_browser_memory_engine_enabled(workflow_run):
-            return workflow_run
+            return None
         # Strict here: an unreadable probe leaves the queue-time seed alone rather than trading a
         # signed-in credential profile for an own profile we could not prove holds anything.
         if not await self._managed_browser_profile_has_content(
@@ -4360,6 +4497,17 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
             fallback_on_error=False,
         ):
+            return None
+        return sink_profile_id
+
+    async def _reseed_from_saved_profile_at_run_start(
+        self, *, workflow: Workflow, workflow_run: WorkflowRun
+    ) -> WorkflowRun:
+        """Setup resolves the seed before the sequential wait, so re-point the run at its own saved profile if
+        that profile gained content while it waited. Only the seed moves: credential, sequential key, sink and IP
+        pin stay as setup resolved them."""
+        sink_profile_id = await self._saved_profile_to_reseed_from(workflow=workflow, workflow_run=workflow_run)
+        if sink_profile_id is None:
             return workflow_run
         try:
             updated_workflow_run = await app.DATABASE.workflow_runs.update_workflow_run(
@@ -6271,6 +6419,39 @@ class WorkflowService:
             ):
                 browser_dispatch["expected_browser_session_id"] = None
 
+        # Only after every adoption path has returned: an adopted browser keeps the seed it booted with. The row keeps
+        # its queued stamp, since a run attached over CDP reports no applied profile to the end-of-run write.
+        boot_profile_id = workflow_run.browser_profile_id
+        boot_proxy_kwargs: dict[str, Any] = {"proxy_location": workflow.proxy_location}
+        if saved_profile_id := await self._saved_profile_to_reseed_from(
+            workflow=workflow, workflow_run=workflow_run, booting_lane_browser=True
+        ):
+            # A session takes its IP from the profile it boots from, so keep the pin the queued seed would have given.
+            queued_seed: BrowserProfile | None = None
+            try:
+                if workflow_run.browser_profile_id:
+                    queued_seed = await app.DATABASE.browser_sessions.get_browser_profile(
+                        profile_id=workflow_run.browser_profile_id, organization_id=organization_id
+                    )
+            except Exception:
+                LOG.warning(
+                    "Failed to read the queued seed's proxy pin; keeping it as the boot profile",
+                    workflow_run_id=workflow_run_id,
+                    exc_info=True,
+                )
+            else:
+                boot_profile_id = saved_profile_id
+                if queued_seed and queued_seed.proxy_session_id:
+                    boot_proxy_kwargs = {
+                        "proxy_location": queued_seed.proxy_location,
+                        "proxy_session_id": queued_seed.proxy_session_id,
+                    }
+                LOG.info(
+                    "Booting reusable browser session from the profile saved since the run was queued",
+                    workflow_run_id=workflow_run_id,
+                    browser_profile_id=saved_profile_id,
+                    queued_browser_profile_id=workflow_run.browser_profile_id,
+                )
         last_unusable_session_id: str | None = None
         for _ in range(2):
             try:
@@ -6283,8 +6464,8 @@ class WorkflowService:
                     organization_id=organization_id,
                     workflow_run_id=workflow_run_id,
                     timeout_minutes=30,
-                    proxy_location=workflow.proxy_location,
-                    browser_profile_id=workflow_run.browser_profile_id,
+                    **boot_proxy_kwargs,
+                    browser_profile_id=boot_profile_id,
                     inherit_profile_proxy=True,
                     bound_workflow_permanent_id=workflow_permanent_id,
                     bound_key=bound_key,
@@ -12111,6 +12292,7 @@ class WorkflowService:
             raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id, version=version)
 
         labels_to_outputs: dict[str, BlockOutputParameter] = {}
+        masked_counts: dict[str, int] = {}
 
         for block in workflow.workflow_definition.blocks:
             label = block.label
@@ -12123,6 +12305,15 @@ class WorkflowService:
             )
 
             if not block_run:
+                continue
+
+            access = await browser_session_artifact_access(
+                organization_id, workflow_run_id=block_run.workflow_run_id, include_run_tasks=True
+            )
+            if access.allowed:
+                access = await child_run_artifact_access(organization_id, block_run.workflow_run_id)
+            if not access.allowed:
+                masked_counts[block_run.workflow_run_id] = masked_counts.get(block_run.workflow_run_id, 0) + 1
                 continue
 
             output_parameter = await app.DATABASE.workflow_runs.get_workflow_run_output_parameter_by_id(
@@ -12140,6 +12331,10 @@ class WorkflowService:
             block_output_parameter["created_at"] = output_parameter.created_at
             labels_to_outputs[label] = block_output_parameter  # type: ignore[assignment]
 
+        for run_id, count in masked_counts.items():
+            LOG.info(
+                "Parent workflow outputs masked", organization_id=organization_id, workflow_run_id=run_id, count=count
+            )
         return labels_to_outputs  # type: ignore[return-value]
 
     async def get_workflows_by_permanent_ids(
@@ -14736,7 +14931,7 @@ class WorkflowService:
     async def _session_download_artifact_ids(
         self,
         workflow_run: WorkflowRun,
-        context: SkyvernContext | None,
+        browser_session_id: str | None,
         download_run_id: str | None,
         attempt_rows: Sequence[Any] | None = None,
         attempt_number: int | None = None,
@@ -14744,7 +14939,6 @@ class WorkflowService:
         """This run's downloads still scoped to the browser session, whether the watcher already
         bound them to it or cleanup has yet to. Failure-tolerant: an unavailable read must not
         manufacture a shortfall."""
-        browser_session_id = context.browser_session_id if context else None
         if not browser_session_id or not download_run_id:
             return set()
         run_started_at: datetime | None = workflow_run.created_at
@@ -14789,6 +14983,14 @@ class WorkflowService:
             # A subset run was never asked to produce the whole workflow's deliverable.
             return None
         try:
+            # The context object can change while this awaits, so the identity it names is read once, up front.
+            context = skyvern_context.current()
+            browser_session_id = context.browser_session_id if context else None
+            # Producer and consumer must resolve the same download key: a sub-workflow registers
+            # files under the parent's run id, so the raw workflow_run_id would read an empty dir.
+            download_run_id = resolve_run_download_id(context, fallback_run_id=workflow_run.workflow_run_id)
+            if download_run_id is None:
+                download_run_id = workflow_run.workflow_run_id
             # The run is pinned to one workflow version; grading the permanent id would read
             # whatever version exists now, so an edit mid-run could judge this run by a contract
             # it never executed. Execution hands over the version it loaded because this active-only
@@ -14805,7 +15007,6 @@ class WorkflowService:
                 criteria = parse_completion_contract({"completion_contract": requested_completion_contract})
             if not criteria:
                 return None
-            context = skyvern_context.current()
             attempt_rows: Sequence[Any] = []
             attempt_repository = getattr(app.DATABASE, "workflow_run_attempts", None)
             get_attempts = getattr(attempt_repository, "get_attempts", None)
@@ -14819,11 +15020,6 @@ class WorkflowService:
                         exc_info=True,
                     )
             attempt_number = compute_attempt_view(workflow_run, attempt_rows).attempt if attempt_rows else None
-            # Producer and consumer must resolve the same download key: a sub-workflow registers
-            # files under the parent's run id, so the raw workflow_run_id would read an empty dir.
-            download_run_id = resolve_run_download_id(context, fallback_run_id=workflow_run.workflow_run_id)
-            if download_run_id is None:
-                download_run_id = workflow_run.workflow_run_id
             artifact_ids: set[str] | None = None
             if attempt_rows and attempt_number is not None:
                 artifact_ids = await self._download_artifact_ids_for_attempt(
@@ -14846,7 +15042,7 @@ class WorkflowService:
             # keeps a real download from reading as zero.
             session_download_ids = await self._session_download_artifact_ids(
                 workflow_run,
-                context,
+                browser_session_id,
                 download_run_id,
                 attempt_rows=attempt_rows,
                 attempt_number=attempt_number,
@@ -14864,7 +15060,39 @@ class WorkflowService:
             # two reads address different storage prefixes (run dir vs browser_sessions/<id>/
             # downloads), so they are separate files and both count.
             registered_ids = {file.artifact_id for file in registered if file.artifact_id}
-            download_count = len(registered) + len(session_download_ids - registered_ids)
+            session_only = session_download_ids - registered_ids
+            # The scoped query above proved these rows' membership; they share one content comparison with the run's
+            # files, so two saves of one PDF are one document. A row that cannot be read keeps counting.
+            comparison = ResponseComparison()
+            comparison.looked_up.update(session_only)
+            rows: list[Artifact] = []
+            if session_only:
+                try:
+                    rows = await app.DATABASE.artifacts.get_artifacts_by_ids(
+                        sorted(session_only), workflow_run.organization_id
+                    )
+                except Exception:
+                    LOG.warning("Could not read session download rows; counting each", exc_info=True)
+            comparison.remember_rows(rows, workflow_run.organization_id)
+            session_files = [
+                FileInfo(
+                    url=row.uri,
+                    checksum=row.checksum,
+                    filename=artifact_filename_from_uri(row.uri),
+                    file_size=row.file_size,
+                    artifact_id=row.artifact_id,
+                )
+                for aid in sorted(session_only)
+                if (row := comparison.rows.get(aid))
+            ]
+            unique = await unique_pdf_file_infos(
+                registered + session_files,
+                workflow_run.organization_id,
+                [download_run_id],
+                comparison,
+                unbound_ids=session_only,
+            )
+            download_count = len(unique) + len(session_only) - len(session_files)
             # A CODE row carries this key only from the secure worker: the in-process executor and the AI
             # fallback drop it. On any other block type it is authored data.
             worker_generated = generated_file_artifact_ids(
@@ -15934,17 +16162,16 @@ class WorkflowService:
         attempt_rows: Sequence[Any] | None = None,
         attempt_number: int | None = None,
         historical_artifacts: list[Artifact] | None = None,
+        comparison: ResponseComparison | None = None,
     ) -> tuple[list[FileInfo] | None, list[str] | None]:
         """Fetch downloaded files for a workflow run, including task_v2 files when present."""
         downloaded_files: list[FileInfo] | None = None
         downloaded_file_urls: list[str] | None = None
         workflow_run_downloaded_files: list[FileInfo] | None = None
+        context = skyvern_context.current()
+        download_run_id = (context.run_id if context and context.run_id else None) or workflow_run.workflow_run_id
         try:
             async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                context = skyvern_context.current()
-                download_run_id = (
-                    context.run_id if context and context.run_id else None
-                ) or workflow_run.workflow_run_id
                 downloaded_files = await app.STORAGE.get_downloaded_files(
                     organization_id=workflow_run.organization_id,
                     run_id=download_run_id,
@@ -16017,6 +16244,14 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
             )
             downloaded_files = workflow_run_downloaded_files or None
+        if downloaded_files:
+            downloaded_files = await unique_pdf_file_infos(
+                downloaded_files,
+                workflow_run.organization_id,
+                [download_run_id, task_v2.observer_cruise_id if task_v2 else None],
+                comparison,
+            )
+            downloaded_file_urls = [file_info.url for file_info in downloaded_files]
         return downloaded_files, downloaded_file_urls
 
     async def build_workflow_run_status_response(
@@ -16167,9 +16402,12 @@ class WorkflowService:
                     *(task.task_id for task in scoped_tasks),
                 ],
             )
-            if access.allowed:
-                access = await child_run_artifact_access(workflow_run.organization_id, workflow_run_id)
+            child_access = await child_run_artifact_access(workflow_run.organization_id, workflow_run_id)
+            if not child_access.allowed:
+                access = child_access
             artifacts_accessible = access.allowed
+            # One deadline and one set of content verdicts for every download list this response shows.
+            comparison = ResponseComparison()
 
             async def fetch_screenshots() -> list[str]:
                 if not artifacts_accessible:
@@ -16200,6 +16438,7 @@ class WorkflowService:
                         attempt_rows=attempt_rows,
                         attempt_number=current_attempt,
                         historical_artifacts=historical_artifacts,
+                        comparison=comparison,
                     ),
                 )
 
@@ -16228,6 +16467,7 @@ class WorkflowService:
         recording_url = recording_urls[-1] if recording_urls else None
 
         outputs = None
+        masked_output_count = 0
         EXTRACTED_INFORMATION_KEY = "extracted_information"
         if output_parameter_tuples:
 
@@ -16252,6 +16492,9 @@ class WorkflowService:
             outputs = {output_parameter.key: output.value for output_parameter, output in output_parameter_tuples}
             outputs[EXTRACTED_INFORMATION_KEY] = extracted_information
             outputs = access.redact_output(outputs)
+            if not child_access.allowed:
+                outputs = {key: REDACTED_ARTIFACT for key in outputs}
+                masked_output_count = len(outputs)
             outputs = {key: _cap(value, key) for key, value in outputs.items()}
             # Refresh any expired presigned screenshot URLs in the outputs
             async with app.DATABASE.Session.released():
@@ -16263,6 +16506,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run_id,
                     attempt_rows=attempt_rows,
                     attempt_number=current_attempt,
+                    comparison=comparison,
                 )
             # The refresh expands artifact IDs into presigned URLs and FileInfo objects —
             # ~25x on an ID-dense value — so a value that fit before it can exceed the cap
@@ -16313,6 +16557,8 @@ class WorkflowService:
         )
         errors = _with_diagnostic_system_errors(errors, workflow_run.failure_category, current_attempt)
         errors = _with_final_har_user_errors(errors, workflow_run.failure_category, current_attempt)
+        if not child_access.allowed:
+            errors = [{**error, "reasoning": REDACTED_ARTIFACT} if "reasoning" in error else error for error in errors]
 
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
@@ -16326,22 +16572,41 @@ class WorkflowService:
                     cached_credits_used=workflow_run.cached_credits_used,
                 )
         response_task_v2 = capped_task_v2(task_v2) if cap_output_values else task_v2
-        if response_task_v2 and not artifacts_accessible:
-            response_task_v2 = response_task_v2.model_copy(
-                update={"output": access.redact_output(response_task_v2.output)}
+        if response_task_v2 and not child_access.allowed:
+            response_task_v2 = redact_descendant_entity(response_task_v2, preserve=TASK_V2_METADATA)
+            masked_output_count += 1
+        if masked_output_count:
+            LOG.info(
+                "Parent workflow outputs masked",
+                organization_id=workflow_run.organization_id,
+                workflow_run_id=workflow_run_id,
+                count=masked_output_count,
             )
-        return WorkflowRunResponseBase(
+        response = WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
             status=workflow_run.status,
             attempt=attempt_view.attempt,
             retry_pending=attempt_view.retry_pending,
             next_attempt_at=attempt_view.next_attempt_at,
-            attempts=attempt_view.attempts,
+            attempts=(
+                attempt_view.attempts
+                if child_access.allowed
+                else [
+                    attempt.model_copy(
+                        update={"failure_reason": REDACTED_ARTIFACT if attempt.failure_reason is not None else None}
+                    )
+                    for attempt in attempt_view.attempts
+                ]
+            ),
             failure_reason=(
-                truncate_oversized_response_text(workflow_run.failure_reason)
-                if cap_output_values
-                else workflow_run.failure_reason
+                REDACTED_ARTIFACT
+                if not child_access.allowed and workflow_run.failure_reason is not None
+                else (
+                    truncate_oversized_response_text(workflow_run.failure_reason)
+                    if cap_output_values
+                    else workflow_run.failure_reason
+                )
             ),
             failure_category=without_final_har_user_match(workflow_run.failure_category),
             retried_from_workflow_run_id=workflow_run.retried_from_workflow_run_id,
@@ -16384,6 +16649,7 @@ class WorkflowService:
             script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
             errors=errors,
         )
+        return access.redact_output(response)
 
     async def _clean_up_workflow_browser(
         self,
@@ -16592,11 +16858,11 @@ class WorkflowService:
                 browser_profile_id=sink_profile_id,
             )
             return
-        if (
-            workflow_run.browser_profile_id
-            and browser_state.browser_artifacts.applied_browser_profile_id != workflow_run.browser_profile_id
+        if workflow_run.browser_profile_id and browser_state.browser_artifacts.applied_browser_profile_id not in (
+            workflow_run.browser_profile_id,
+            sink_profile_id,
         ):
-            # The stamped seed was never applied (e.g. a vendor-routed boot) — this directory does not
+            # Neither the stamped seed nor the sink was applied (e.g. a vendor-routed boot) — this directory does not
             # extend the sink's accumulated state, so writing it back would erase the saved archive.
             # Seedless accumulate rows (browser_profile_id None, sink set) still write by design.
             LOG.warning(
@@ -18765,12 +19031,14 @@ class WorkflowService:
             prefer_capped=cap_output_values,
         )
         access = BrowserSessionArtifactAccess(True)
+        child_access = BrowserSessionArtifactAccess(True)
         if organization_id and workflow_run_blocks:
             access = await browser_session_artifact_access(
                 organization_id, workflow_run_id=workflow_run_id, include_run_tasks=True
             )
-            if access.allowed:
-                access = await child_run_artifact_access(organization_id, workflow_run_id)
+            child_access = await child_run_artifact_access(organization_id, workflow_run_id)
+            if not child_access.allowed:
+                access = child_access
         # Hydrate actions before projecting each complete entry, and cap only after redaction.
         task_ids = [block.task_id for block in workflow_run_blocks if block.task_id]
         task_id_to_block: dict[str, WorkflowRunBlock] = {
@@ -18796,7 +19064,17 @@ class WorkflowService:
                 created_at=block.created_at,
                 modified_at=block.modified_at,
             )
+            if not child_access.allowed:
+                timeline.block = redact_descendant_entity(block, preserve=TIMELINE_BLOCK_METADATA)
             block_map[block.workflow_run_block_id] = access.redact_output(timeline)
+
+        if not child_access.allowed and workflow_run_blocks:
+            LOG.info(
+                "Parent workflow outputs masked",
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                count=len(workflow_run_blocks),
+            )
 
         if cap_output_values:
             for timeline in block_map.values():
