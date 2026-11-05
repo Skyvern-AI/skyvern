@@ -27,6 +27,8 @@ const mocks = vi.hoisted(() => {
     _framebufferUpdate: () => boolean;
   }> = [];
   const autoConnect = { value: true };
+  const rfbUrls: string[] = [];
+  const wsUrls: string[] = [];
   const apiGet = vi.fn(async () => ({
     data: {
       browser_session_id: "pbs_test",
@@ -49,8 +51,9 @@ const mocks = vi.hoisted(() => {
 
     private listeners: Record<string, RfbListener[]> = {};
 
-    constructor(target: HTMLElement) {
+    constructor(target: HTMLElement, url: string) {
       rfbInstances.push(this);
+      rfbUrls.push(url);
       target.appendChild(document.createElement("canvas"));
       if (autoConnect.value) {
         queueMicrotask(() => this.emit("connect"));
@@ -83,8 +86,9 @@ const mocks = vi.hoisted(() => {
     send = vi.fn();
     close = vi.fn();
 
-    constructor() {
+    constructor(url: string) {
       wsInstances.push(this);
+      wsUrls.push(url);
       queueMicrotask(() => this.onopen?.(new Event("open")));
     }
   }
@@ -100,7 +104,9 @@ const mocks = vi.hoisted(() => {
     apiGet,
     autoConnect,
     rfbInstances,
+    rfbUrls,
     wsInstances,
+    wsUrls,
     settingsStore,
     toast: vi.fn(),
   };
@@ -172,11 +178,6 @@ vi.mock("@/routes/browserSessions/BrowserSessionStream", () => ({
       data-testid="cdp-screencast"
     />
   ),
-}));
-
-vi.mock("@/store/useClientIdStore", () => ({
-  useClientIdStore: (selector: (state: { clientId: string }) => unknown) =>
-    selector({ clientId: "client-test" }),
 }));
 
 vi.mock("@/store/SettingsStore", () => ({
@@ -305,7 +306,26 @@ describe("BrowserStream", () => {
     vi.clearAllMocks();
     mocks.apiGet.mockImplementation(respondWithRunningSession);
     mocks.rfbInstances.length = 0;
+    mocks.rfbUrls.length = 0;
     mocks.wsInstances.length = 0;
+    mocks.wsUrls.length = 0;
+  });
+
+  it("gives each mounted stream its own client id, shared by that stream's VNC and message sockets", async () => {
+    renderBrowserStream();
+    renderBrowserStream();
+    await waitFor(() => expect(mocks.wsUrls).toHaveLength(2), {
+      timeout: 10000,
+    });
+
+    const clientIdOf = (url: string) =>
+      new URL(url).searchParams.get("client_id");
+    const vncIds = mocks.rfbUrls.map(clientIdOf);
+    const messageIds = mocks.wsUrls.map(clientIdOf);
+    expect(vncIds).toHaveLength(2);
+    expect(vncIds[0]).toBeTruthy();
+    expect(vncIds[0]).not.toBe(vncIds[1]);
+    expect([...messageIds].sort()).toEqual([...vncIds].sort());
   });
 
   it("releases and restores held left Cmd around VNC paste", async () => {
