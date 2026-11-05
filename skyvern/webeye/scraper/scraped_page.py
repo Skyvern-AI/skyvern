@@ -16,6 +16,7 @@ from pydantic import BaseModel, PrivateAttr
 from skyvern.exceptions import UnknownElementTreeFormat
 from skyvern.forge.sdk.api.crypto import calculate_sha256
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.webeye.document_navigation import DocumentNavigation
 
 if typing.TYPE_CHECKING:
     from skyvern.webeye.browser_state import BrowserState
@@ -198,6 +199,7 @@ class _ScrapeOrigin:
     # The tree stays mutable after the scrape, so an edit in place is caught by its digest rather than its identity.
     tree_digest: str
     captured_at: datetime
+    navigation: DocumentNavigation | None = None
 
 
 def _tree_digest(element_tree: list[dict]) -> str | None:
@@ -264,10 +266,15 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self._document_loader_id = document_loader_id
 
     def bind_origin(
-        self, page: Page | None, captured_at: datetime | None = None, source_html: str | None = None
+        self,
+        page: Page | None,
+        captured_at: datetime | None = None,
+        source_html: str | None = None,
+        navigation: DocumentNavigation | None = None,
     ) -> None:
         """Record the page this scrape's url and element tree were read from, the html read with them (the public html
-        unless given) and when they were read (now unless given)."""
+        unless given), when they were read (now unless given) and, when known, the request that committed their
+        document."""
         digest = _tree_digest(self.element_tree) if page is not None else None
         try:
             self._origin = (
@@ -281,6 +288,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
                     self.element_tree,
                     digest,
                     captured_at or datetime.now(UTC),
+                    navigation,
                 )
             )
         except TypeError:
@@ -313,6 +321,11 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         """When this html was read from ``origin_page()``, not when the object is later used; None like it."""
         origin = self._live_origin()
         return origin.captured_at if origin is not None else None
+
+    def origin_navigation(self) -> DocumentNavigation | None:
+        """The request that committed the document this scrape read, when the scrape observed it; None like origin_page()."""
+        origin = self._live_origin()
+        return origin.navigation if origin is not None else None
 
     @staticmethod
     def _is_pdf_embed(element: dict) -> str | None:
