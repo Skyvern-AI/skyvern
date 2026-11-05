@@ -35,6 +35,10 @@ const mocks = vi.hoisted(() => ({
   runs: [] as Array<{ workflow_run_id: string }>,
   realScreenshot: false,
   artifactsByUrl: {} as Record<string, Array<Record<string, unknown>>>,
+  sessionsByUrl: {} as Record<
+    string,
+    { browser_session_id: string; completed_at: string | null }
+  >,
   streamExternal: false,
 }));
 
@@ -42,9 +46,13 @@ vi.mock("@/api/AxiosClient", () => ({
   getClient: async () => ({
     get: async (url: string) => ({
       data:
+        Object.entries(mocks.sessionsByUrl).find(([path]) =>
+          url.includes(path),
+        )?.[1] ??
         Object.entries(mocks.artifactsByUrl).find(([path]) =>
           url.includes(path),
-        )?.[1] ?? [],
+        )?.[1] ??
+        [],
     }),
   }),
 }));
@@ -298,6 +306,7 @@ beforeEach(() => {
   mocks.runs = [];
   mocks.realScreenshot = false;
   mocks.artifactsByUrl = {};
+  mocks.sessionsByUrl = {};
   mocks.streamExternal = false;
 });
 
@@ -597,6 +606,107 @@ describe("BrowserTab view machine", () => {
     expect(screen.queryByTestId("browser-pane-stream-slot")).toBeNull();
   });
 
+  it("shows the debug browser live while Copilot works in it over a failed run", () => {
+    seedRun({
+      status: Status.Failed,
+      browserSessionId: "pbs_run",
+      recordingUrl: "https://r.test/1.mp4",
+    });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=pbs_test`);
+
+    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
+    expect(screen.queryByTestId("run-live-stream")).toBeNull();
+  });
+
+  it("names Copilot's browser while the run it focused is not finished", () => {
+    seedRun({ status: Status.Running, browserSessionId: "pbs_run" });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=pbs_test`);
+
+    expect(screen.getByTestId("browser-pane-stream-slot")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("button", { name: "Copilot browser" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it.each([
+    ["names a browser the studio cannot show", "pbs_other", true],
+    ["is left over from a turn that is no longer running", "pbs_test", false],
+  ])(
+    "keeps the failed run's replay when the Copilot pin %s",
+    (_case, pinned, turnActive) => {
+      seedRun({
+        status: Status.Failed,
+        browserSessionId: "pbs_run",
+        recordingUrl: "https://r.test/1.mp4",
+      });
+      mocks.debugSession = { browser_session_id: "pbs_test" };
+      useStudioBrowserStore.setState({ copilotTurnActive: turnActive });
+      renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=${pinned}`);
+
+      expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
+      expect(screen.queryByTestId("run-live-stream")).toBeNull();
+      expect(screen.queryByTestId("browser-pane-stream-slot")).toBeNull();
+    },
+  );
+
+  it("streams a finished run's own browser while Copilot inspects it there", async () => {
+    seedRun({
+      status: Status.Failed,
+      browserSessionId: "pbs_run",
+      recordingUrl: "https://r.test/1.mp4",
+    });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    mocks.sessionsByUrl["/browser_sessions/pbs_run"] = {
+      browser_session_id: "pbs_run",
+      completed_at: null,
+    };
+    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&wrs=pbs_run`);
+
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("run-live-stream").getAttribute("data-session"),
+      ).toBe("pbs_run"),
+    );
+    expect(screen.queryByTestId("browser-pane-stream-slot")).toBeNull();
+    expect(
+      screen
+        .getByRole("button", { name: "Run browser" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("keeps the replay when Copilot names a finished run's browser that has closed", async () => {
+    seedRun({
+      status: Status.Failed,
+      browserSessionId: "pbs_run",
+      recordingUrl: "https://r.test/1.mp4",
+    });
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    mocks.sessionsByUrl["/browser_sessions/pbs_run"] = {
+      browser_session_id: "pbs_run",
+      completed_at: "2026-09-24T12:05:00",
+    };
+    useStudioBrowserStore.setState({ copilotTurnActive: true });
+    const { queryClient } = renderBrowserPane(
+      `${STUDIO_PATH}&wr=wr_1&wrs=pbs_run`,
+    );
+
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryData(["browserSession", "pbs_run"]),
+      ).toBeDefined(),
+    );
+    expect(screen.getByTestId("hero-screenshot")).toBeTruthy();
+    expect(screen.queryByTestId("run-live-stream")).toBeNull();
+  });
+
   it("shows the inspected step's screenshot when ?active= is set", () => {
     seedRun({ status: Status.Completed });
     mocks.debugSession = { browser_session_id: "pbs_test" };
@@ -608,6 +718,40 @@ describe("BrowserTab view machine", () => {
       artifactId: "art_1",
       stepId: "step_1",
       actionOrder: 0,
+      workflowRunBlockId: null,
+    });
+  });
+
+  it("gives a failed code block's trailing row its block so the hero can fall back to a block screenshot", () => {
+    seedRun({ status: Status.Failed });
+    mocks.timeline = [
+      buildBlockItem(
+        buildBlock({
+          block_type: "code",
+          status: Status.Failed,
+          actions: [
+            buildAction({
+              action_id: "act_failed",
+              action_type: ActionTypes.NullAction,
+              status: Status.Failed,
+              action_order: 1,
+              screenshot_artifact_id: null,
+            }),
+            buildAction(),
+          ],
+        }),
+      ),
+    ];
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    renderBrowserPane(`${STUDIO_PATH}&wr=wr_1&active=act_failed`);
+
+    const shot = screen.getByTestId("hero-screenshot");
+    expect(JSON.parse(shot.getAttribute("data-selection") ?? "{}")).toEqual({
+      kind: "action",
+      artifactId: null,
+      stepId: "step_1",
+      actionOrder: 1,
+      workflowRunBlockId: "wrb_1",
     });
   });
 
@@ -688,16 +832,16 @@ describe("BrowserTab view machine", () => {
     );
   });
 
-  it("says the latest run's browser is starting while that run is queued", () => {
+  it("says the latest run is queued, not starting a browser, while it waits", () => {
     seedRun({ status: Status.Queued, browserSessionId: "pbs_run" });
     mocks.debugSession = { browser_session_id: "pbs_test" };
     renderBrowserPane(STUDIO_PATH);
 
     expect(screen.getByTestId("stream-status").textContent).toContain(
-      "Starting the browser",
+      "Run queued",
     );
     expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
-      "Starting browser…",
+      "Run queued",
     );
   });
 
@@ -763,9 +907,37 @@ describe("BrowserTab view machine", () => {
     renderBrowserPane(`${STUDIO_PATH}&wr=wr_1`);
 
     expect(screen.getByTestId("stream-status").textContent).toContain(
-      "Starting the browser",
+      "Run queued",
     );
     expect(screen.queryByTestId("run-live-stream")).toBeNull();
+  });
+
+  it("says the browser is starting only until the run names one, in header and body alike", () => {
+    mocks.debugSession = { browser_session_id: "pbs_test" };
+    seedRun({ status: Status.Created });
+    const { unmount } = renderBrowserPane(STUDIO_PATH);
+    expect(screen.getByTestId("stream-status").textContent).toContain(
+      "Starting the browser",
+    );
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "Starting the browser",
+    );
+    expect(
+      screen.getByTestId("browser-pane-live-status").querySelector("svg"),
+    ).not.toBeNull();
+    unmount();
+
+    seedRun({ status: Status.Created, browserSessionId: "pbs_run" });
+    renderBrowserPane(STUDIO_PATH);
+    expect(screen.getByTestId("stream-status").textContent).toContain(
+      "Browser ready",
+    );
+    expect(screen.getByTestId("browser-pane-live-status").textContent).toBe(
+      "Browser ready",
+    );
+    expect(
+      screen.getByTestId("browser-pane-live-status").querySelector("svg"),
+    ).toBeNull();
   });
 
   it("offers no record button in the studio browser header", () => {

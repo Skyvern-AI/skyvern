@@ -82,6 +82,8 @@ import { getErrorDetail } from "@/util/getErrorDetail";
 import { cn } from "@/util/utils";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { useWorkflowStudioEnabled } from "@/hooks/useWorkflowStudioEnabled";
+import { useWorkflowDocEditorFlag } from "@/hooks/useWorkflowDocEditorFlag";
+import { openNewAgentInDoc } from "@/store/WorkflowPresentationStore";
 import { rememberDiscoverCopilotPrompt } from "@/routes/workflows/discoverCopilotHandoff";
 import { workflowEditorPath } from "@/routes/workflows/studioNavigation";
 
@@ -292,6 +294,7 @@ function PromptBoxImpl(
 ) {
   const navigate = useNavigate();
   const studioEnabled = useWorkflowStudioEnabled();
+  const docEditorEnabled = useWorkflowDocEditorFlag();
   const [prompt, setPrompt] = useState<string>("");
   const [exampleAttribution, setExampleAttribution] = useState<
     ExampleAttribution | undefined
@@ -482,7 +485,10 @@ function PromptBoxImpl(
 
   const recordTaskMutation = useMutation({
     mutationFn: () => createBlankWorkflow("Demonstrated Agent"),
-    onSuccess: (workflow) => openCreatedWorkflow(workflow, "?record=1"),
+    onSuccess: (workflow) => {
+      if (docEditorEnabled) openNewAgentInDoc(workflow.workflow_permanent_id);
+      openCreatedWorkflow(workflow, "?record=1");
+    },
     onError: (error: AxiosError) => {
       showCreateErrorToast("Could not start demonstration", error);
     },
@@ -966,7 +972,7 @@ function PromptBoxImpl(
           ) : null}
           <StartFromCards
             className="mt-3.5"
-            labelClassName="text-left"
+            labelClassName="text-center"
             gridClassName="md:grid-cols-2"
             uploadSOP={{
               onFile: (file) => {

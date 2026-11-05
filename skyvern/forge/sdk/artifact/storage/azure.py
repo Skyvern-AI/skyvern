@@ -1,8 +1,9 @@
 import os
 import shutil
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import structlog
 
@@ -25,6 +26,8 @@ from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     SENSITIVE_SHARE_URL_EXPIRY_HOURS,
     BaseStorage,
+    StoredObjectVersion,
+    StreamingArtifactStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
@@ -63,7 +66,21 @@ async def _get_object_info_safe(storage: "AzureStorage", uri: str) -> dict | Non
         return None
 
 
-class AzureStorage(BaseStorage):
+class _AzureBlobStream:
+    def __init__(self, download: Any) -> None:
+        self._download = download
+        self.content_length: int = download.size
+
+    async def iter_chunks(self, chunk_size: int) -> AsyncIterator[bytes]:
+        # The SDK sets the size of each ranged read; every one is conditioned on the pinned ETag.
+        async for chunk in self._download.chunks():
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
+
+
+class AzureStorage(BaseStorage, StreamingArtifactStorage):
     _PATH_VERSION = "v1"
 
     def __init__(
@@ -159,6 +176,24 @@ class AzureStorage(BaseStorage):
 
     async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
         return {}
+
+    def can_stream_artifact(self, artifact: Artifact) -> bool:
+        # Content comparison reads pinned whole objects only; the content route serves retrieved bytes.
+        return False
+
+    def can_verify_artifact(self, artifact: Artifact) -> bool:
+        return not artifact.bundle_key
+
+    async def stat_artifact(self, artifact: Artifact) -> StoredObjectVersion | None:
+        props = await self.async_client.get_blob_properties(artifact.uri)
+        return StoredObjectVersion(size=props["size"], etag=props["etag"]) if props else None
+
+    async def open_artifact_stream(
+        self, artifact: Artifact, *, byte_range: tuple[int, int] | None = None, etag: str | None = None
+    ) -> _AzureBlobStream | None:
+        if byte_range is not None or etag is None:
+            return None
+        return _AzureBlobStream(await self.async_client.open_blob_download(artifact.uri, etag))
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await self.async_client.download_file(artifact.uri)

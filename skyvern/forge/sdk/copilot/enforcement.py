@@ -27,8 +27,8 @@ from agents.run_error_handlers import RunErrorHandlerInput, RunErrorHandlerResul
 from agents.tool import Tool
 from openai.types.responses import ResponseFunctionToolCall
 from PIL import Image
+from pydantic import JsonValue
 
-from skyvern.config import settings
 from skyvern.forge.sdk.agents.context import get_agent_message_field
 from skyvern.forge.sdk.copilot import streaming_adapter
 from skyvern.forge.sdk.copilot.ask_user import ACCOUNT_GROUP_SUBMIT_TOOL_NAME
@@ -67,13 +67,19 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
+    TOTAL_TIMEOUT_SECONDS,
     CopilotConfig,
 )
-from skyvern.forge.sdk.copilot.context import BLOCK_RUNNING_TOOLS, REPLY_TOOL_NAME, WORKFLOW_MUTATION_TOOLS
+from skyvern.forge.sdk.copilot.context import (
+    BLOCK_RUNNING_TOOLS,
+    CREATE_WEBHOOK_TRIGGER_TOOL_NAME,
+    REPLY_TOOL_NAME,
+    WORKFLOW_MUTATION_TOOLS,
+)
 from skyvern.forge.sdk.copilot.credential_fill_fields import LIVE_SCOUT_CREDENTIAL_FIELDS
 from skyvern.forge.sdk.copilot.credential_pause import maybe_credential_pause, release_credential_pause_gate
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction, effective_proxy_label
-from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
+from skyvern.forge.sdk.copilot.human_input_wait import turn_clock_seconds
 from skyvern.forge.sdk.copilot.output_extraction_plan import (
     resolve_shape_expectations_by_path,
 )
@@ -81,10 +87,15 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
+    _BUILD_TEST_IDENTIFIER_MAX_CHARS,
     _RECENT_TOOL_OUTPUT_CHAR_CAP,
     BUILD_TEST_PACKET_KEY,
+    DOWNLOADS_NOTICE_PREFIX,
     MCP_RESULT_PROVENANCE_KEY,
     MCP_RESULT_PROVENANCE_VALUE,
+    REGISTERED_OUTPUTS_NOTICE_PREFIX,
+    _bounded_packet_string,
+    bound_output_value,
     extract_final_text,
     parse_final_response,
     screened_recorded_url,
@@ -152,10 +163,11 @@ if TYPE_CHECKING:
 
 LOG = structlog.get_logger()
 
-TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 BUDGET_DRAIN_HEADROOM = 4
 ToolT = TypeVar("ToolT", bound=Tool)
-BUDGET_DRAIN_EXCLUDED_TOOLS = WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME}
+BUDGET_DRAIN_EXCLUDED_TOOLS = (
+    WORKFLOW_MUTATION_TOOLS | BLOCK_RUNNING_TOOLS | {ACCOUNT_GROUP_SUBMIT_TOOL_NAME, CREATE_WEBHOOK_TRIGGER_TOOL_NAME}
+)
 HARD_BACKSTOP_ALLOWANCE_SECONDS = 90
 # A turn whose budget is already spent may have no backstop time left for its one final reply, so
 # that reply gets at least this long. Budget-drain reports that finished took a median 14s, p90 35s.
@@ -344,27 +356,8 @@ def _mark_copilot_total_timeout(ctx: Any, *, elapsed_seconds: float, iteration: 
 
 
 def _elapsed_run_seconds(ctx: Any, start_time: float) -> float:
-    """Wall-clock elapsed since ``start_time``, minus completed and active human-input waits.
-
-    Keeps TOTAL_TIMEOUT_SECONDS a budget over actual agent work, not real
-    time, so a paused-and-resumed turn isn't penalized for pause time.
-
-    ``pause_seconds`` is coerced defensively: tests commonly pass a bare
-    ``MagicMock()`` as ``ctx``, whose ``getattr(..., default)`` returns a
-    fresh Mock instead of the default (Mock never raises AttributeError).
-    """
-    pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
-    if not isinstance(pause_seconds, (int, float)):
-        pause_seconds = 0.0
-    question_seconds = getattr(ctx, "copilot_question_pause_seconds", 0.0)
-    if not isinstance(question_seconds, (int, float)):
-        question_seconds = 0.0
-    now = time.monotonic()
-    wait = getattr(ctx, "human_input_wait", None)
-    # Overlapping waits credit their union only when the last waiter exits.
-    # Until then, exclude the active union at model/tool completion boundaries.
-    active_wait_seconds = now - wait.started_at if isinstance(wait, HumanInputWait) and wait.count > 0 else 0.0
-    return now - start_time - pause_seconds - question_seconds - active_wait_seconds
+    """Keeps TOTAL_TIMEOUT_SECONDS a budget over agent work, so a paused-and-resumed turn isn't charged pause time."""
+    return turn_clock_seconds(ctx, start_time, time.monotonic())
 
 
 def _record_copilot_cancellation(ctx: Any, start_time: float, iteration: int) -> None:
@@ -666,6 +659,7 @@ def is_synthetic_user_message(item: Any) -> bool:
 _PACKET_FAILURE_SCALARS = ("block_label", "block_status", "reason", "failing_line")
 _PACKET_LIST_CAP = 6
 _PACKET_REASON_CAP = 200
+_RETAINED_LIST_NOTICE_PREFIXES = (REGISTERED_OUTPUTS_NOTICE_PREFIX, DOWNLOADS_NOTICE_PREFIX)
 # The challenge notices are whole sentences whose trailing clauses carry the qualification
 # ("availability ... is not a recommendation"), so the failure-reason cap would cut the meaning out.
 _PACKET_NOTICE_CAP = 400
@@ -684,7 +678,7 @@ def _bounded_scalars(fact: dict[str, Any]) -> dict[str, bool | int | float | str
 
 
 def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
-    """The packet's identity and failure scalars, bounded. Lists are tails, so they yield first."""
+    """The packet's identity, failure, block outputs and downloads, each bounded."""
     if not isinstance(packet, dict):
         return None
     kept: dict[str, Any] = {}
@@ -726,7 +720,57 @@ def _retained_run_packet(packet: Any) -> dict[str, Any] | None:
             bounded["error_codes"] = _bounded_error_codes(codes)
         if bounded:
             kept["failure"] = bounded
+    own_notices: list[str] = []
+    outputs = _first_dict_entries(packet.get("registered_outputs"), REGISTERED_OUTPUTS_NOTICE_PREFIX, own_notices)
+    if outputs:
+        kept["registered_outputs"] = [_retained_registered_output(entry) for entry in outputs]
+    downloads = _first_dict_entries(packet.get("downloads"), DOWNLOADS_NOTICE_PREFIX, own_notices)
+    if downloads:
+        kept["downloads"] = [_retained_download(entry) for entry in downloads]
+    source_notices = packet.get("omission_notices")
+    # The synopsis's own notices lead so a later pass, which reads them back as source notices, keeps them first.
+    if isinstance(source_notices, list):
+        own_notices += [
+            notice
+            for notice in source_notices
+            if isinstance(notice, str) and notice.startswith(_RETAINED_LIST_NOTICE_PREFIXES)
+        ]
+    if own_notices:
+        kept["omission_notices"] = [notice[:_PACKET_REASON_CAP] for notice in own_notices[:_PACKET_LIST_CAP]]
     return kept or None
+
+
+def _first_dict_entries(values: JsonValue, notice_prefix: str, notices: list[str]) -> list[dict[str, JsonValue]]:
+    if not isinstance(values, list):
+        return []
+    entries = [entry for entry in values if isinstance(entry, dict)]
+    if len(entries) > _PACKET_LIST_CAP:
+        notices.append(f"{notice_prefix}shortened in synopsis: {len(entries) - _PACKET_LIST_CAP} item(s) omitted.")
+    return entries[:_PACKET_LIST_CAP]
+
+
+def _retained_registered_output(entry: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    kept: dict[str, JsonValue] = {}
+    for key in ("label", "status"):
+        if isinstance(identifier := entry.get(key), str):
+            kept[key] = _bounded_packet_string(
+                identifier, field_name=key, max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS, notices=[]
+            )
+    kept["output"], kept["value_complete"] = bound_output_value(
+        entry.get("output"), entry.get("value_complete") is True
+    )
+    return kept
+
+
+def _retained_download(entry: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    kept: dict[str, JsonValue] = {}
+    if isinstance(file_name := entry.get("file_name"), str):
+        kept["file_name"] = _bounded_packet_string(
+            file_name, field_name="file_name", max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS, notices=[]
+        )
+    if entry.get("generated") is True:
+        kept["generated"] = True
+    return kept
 
 
 def _truncated_output_fallback(output: str) -> str:

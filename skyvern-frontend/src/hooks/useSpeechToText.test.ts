@@ -194,6 +194,83 @@ describe("useSpeechToText", () => {
     expect(instance?.stop).toHaveBeenCalled();
   });
 
+  it("keeps listening after clearTranscript and only reports speech heard after it", async () => {
+    const onTranscript = vi.fn();
+    const { result } = renderHook(() => useSpeechToText({ onTranscript }));
+    const instance = await startSpeech(() => result.current.start());
+
+    act(() => {
+      instance?.emitResult("pick the cheapest", true, 0);
+      instance?.emitResult("skip the", false, 1);
+    });
+    expect(onTranscript).toHaveBeenLastCalledWith("pick the cheapest skip the");
+
+    act(() => result.current.clearTranscript());
+    act(() => {
+      instance?.emitResult("skip the popup", false, 1);
+    });
+    expect(onTranscript).toHaveBeenLastCalledWith("popup");
+    act(() => {
+      instance?.emitResult("skip the popup please", true, 1);
+      instance?.emitResult("next", true, 2);
+    });
+    expect(onTranscript).toHaveBeenLastCalledWith("popup please next");
+    expect(result.current.isListening).toBe(true);
+
+    // A restarted session numbers results from zero but keeps what was heard.
+    act(() => {
+      instance?.emitEnd();
+      vi.runOnlyPendingTimers();
+    });
+    act(() => {
+      instance?.emitResult("again", true, 0);
+    });
+    expect(onTranscript).toHaveBeenLastCalledWith("popup please next again");
+  });
+
+  it("keeps speech heard after clearTranscript in a language without word spaces", async () => {
+    const onTranscript = vi.fn();
+    const { result } = renderHook(() => useSpeechToText({ onTranscript }));
+    const instance = await startSpeech(() => result.current.start());
+
+    act(() => {
+      instance?.emitResult("选择最便宜的", false, 0);
+    });
+    act(() => result.current.clearTranscript());
+    act(() => {
+      instance?.emitResult("选择最便宜的然后继续", true, 0);
+    });
+
+    expect(onTranscript).toHaveBeenLastCalledWith("然后继续");
+  });
+
+  it("restarts a fresh session from the current text, not the previous session's", async () => {
+    const onTranscript = vi.fn();
+    let composer = "";
+    const { result } = renderHook(() =>
+      useSpeechToText({ onTranscript, getBaseText: () => composer }),
+    );
+    const first = await startSpeech(() => result.current.start());
+    act(() => {
+      first?.emitResult("hello", true, 0);
+    });
+    act(() => {
+      result.current.stop();
+    });
+
+    composer = "typed draft";
+    const second = await startSpeech(() => result.current.start());
+    // Chrome can end a session before its first result; the restart must keep the new base.
+    act(() => {
+      second?.emitEnd();
+      vi.runOnlyPendingTimers();
+    });
+    act(() => {
+      second?.emitResult("world", true, 0);
+    });
+    expect(onTranscript).toHaveBeenLastCalledWith("typed draft world");
+  });
+
   it("captures an audio blob while dictating", async () => {
     const onAudioCaptured = vi.fn();
     const { result } = renderHook(() =>
@@ -219,6 +296,35 @@ describe("useSpeechToText", () => {
     expect(audioBlob.type).toBe("audio/webm");
     expect(result.current.takeAudioBlob()).toBe(audioBlob);
     expect(trackStop).toHaveBeenCalled();
+  });
+
+  it("drops the audio of a cancelled capture even when it finishes later", async () => {
+    const onAudioCaptured = vi.fn();
+    const { result } = renderHook(() =>
+      useSpeechToText({ onTranscript: vi.fn(), onAudioCaptured }),
+    );
+    await startSpeech(() => result.current.start());
+    const recorder = MockMediaRecorder.lastInstance;
+    if (!recorder) throw new Error("audio capture did not start");
+    // A real MediaRecorder delivers its data and onstop after stop() returns.
+    recorder.stop = vi.fn(() => {
+      recorder.state = "inactive";
+      setTimeout(() => {
+        recorder.ondataavailable?.({
+          data: new Blob(["narration"], { type: "audio/webm" }),
+        } as BlobEvent);
+        recorder.onstop?.();
+      }, 10);
+    });
+
+    act(() => result.current.cancel());
+    await act(async () => {
+      vi.runOnlyPendingTimers();
+      await Promise.resolve();
+    });
+
+    expect(onAudioCaptured).not.toHaveBeenCalled();
+    expect(result.current.takeAudioBlob()).toBeNull();
   });
 
   it("keeps buffered audio chunks when the recorder is already inactive", async () => {

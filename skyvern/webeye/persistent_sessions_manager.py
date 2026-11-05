@@ -236,7 +236,11 @@ class PersistentSessionsManager(Protocol):
         created_for_workflow_run_id: str | None = None,
         created_for_workflow_permanent_id: str | None = None,
     ) -> PersistentBrowserSession:
-        """Create a new browser session."""
+        """Create a new browser session.
+
+        A create cancelled before it returns can still start a browser that the manager may not clean up, so a
+        cancellable caller shields the create and closes the session it returns.
+        """
         ...
 
     async def create_fresh_exit_session(
@@ -247,6 +251,7 @@ class PersistentSessionsManager(Protocol):
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
         session_kind: BrowserSessionKind,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> FreshExitReceipt:
         """Create one browser in the prior session's geography and profile scope on a verified different egress.
         A new browser whose exit is not verified distinct is closed, and the receipt says why no alternate exists."""

@@ -13,7 +13,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
 
@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _review_projection_for,
     _translate_to_agent_result,
 )
+from skyvern.forge.sdk.copilot.agent_context import RegisteredArtifactEntry, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     BuildTestConnectFailureState,
     build_test_connect_failure_sentence,
@@ -79,6 +80,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     _BUILD_TEST_PACKET_MAX_CHARS,
     _INTERNAL_RUN_OUTCOME_RECORDED_KEY,
     BUILD_TEST_PACKET_KEY,
+    OUTPUT_VALUE_MAX_CHARS,
     _compact_block_fact_maps,
     _compact_packet_for_aggregate_limit,
     _compacted_newest_labelled,
@@ -109,6 +111,7 @@ from skyvern.forge.sdk.copilot.tools.run_execution import (
     _recorded_run_block_result,
     _run_blocks_and_collect_debug,
     _verify_and_record_run_blocks_result,
+    blank_login_credential_input_keys,
     build_test_evidence_packet,
     finalize_build_test_result,
     loop_definition_facts,
@@ -134,7 +137,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock
+from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
+from skyvern.forge.sdk.workflow.models.block import CodeBlock, ForLoopBlock, render_failure_reason
 from skyvern.forge.sdk.workflow.models.google_sheets_blocks import GoogleSheetsWriteBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
@@ -226,29 +230,55 @@ def test_run_blocks_outcome_records_requested_labels_and_shape_hashes() -> None:
     assert outcome.block_shape_hashes == {"open": "h1", "search": "h2", "extract": "h3"}
 
 
-def test_registered_block_download_reaches_packet_without_parseable_artifact_evidence() -> None:
+def _evidence_naming(run_id: str, file_name: str) -> RegisteredArtifactEvidence:
+    entry = RegisteredArtifactEntry(artifact_id="a_dl_9", file_name=file_name, parsed_text="text")
+    return RegisteredArtifactEvidence(entries=(entry,), workflow_run_id=run_id)
+
+
+@pytest.mark.parametrize(
+    ("block_file_names", "evidence", "expected_name", "expect_other_run_notice"),
+    [
+        ([None], None, None, False),
+        (["tool_1.0_amd64.deb"], None, "tool_1.0_amd64.deb", False),
+        ([7], None, None, False),
+        ([""], None, None, False),
+        (["tool_1.0_amd64.deb"], _evidence_naming("wr_1", "release_notes.pdf"), "release_notes.pdf", False),
+        (["tool_1.0_amd64.deb"], _evidence_naming("wr_1", ""), "tool_1.0_amd64.deb", False),
+        (["tool_1.0_amd64.deb"], _evidence_naming("wr_other", "release_notes.pdf"), "tool_1.0_amd64.deb", False),
+        ([None], _evidence_naming("wr_other", "release_notes.pdf"), None, True),
+        (["tool_1.0_amd64.deb", ""], _evidence_naming("wr_other", "release_notes.pdf"), "tool_1.0_amd64.deb", False),
+    ],
+)
+def test_registered_block_download_reaches_packet_with_its_best_known_name(
+    block_file_names: list[str | int | None],
+    evidence: RegisteredArtifactEvidence | None,
+    expected_name: str | None,
+    expect_other_run_notice: bool,
+) -> None:
     ctx = make_copilot_ctx()
-    ctx.registered_artifact_evidence = None
+    ctx.registered_artifact_evidence = evidence
+    blocks: list[dict[str, JsonValue]] = []
+    for index, block_file_name in enumerate(block_file_names):
+        extracted: dict[str, JsonValue] = {"downloaded_file_artifact_ids": ["a_dl_9"]}
+        if block_file_name is not None:
+            extracted["downloaded_files"] = [{"artifact_id": "a_dl_9", "filename": block_file_name}]
+        blocks.append({"label": f"download_{index}", "status": "completed", "extracted_data": extracted})
+    labels = [block["label"] for block in blocks]
     result = {
         "ok": True,
         "data": {
             "workflow_run_id": "wr_1",
             "overall_status": "completed",
-            "requested_block_labels": ["download_statement"],
-            "executed_block_labels": ["download_statement"],
-            "blocks": [
-                {
-                    "label": "download_statement",
-                    "status": "completed",
-                    "extracted_data": {"downloaded_file_artifact_ids": ["a_dl_9"]},
-                }
-            ],
+            "requested_block_labels": labels,
+            "executed_block_labels": labels,
+            "blocks": blocks,
         },
     }
 
     packet = build_test_evidence_packet(ctx, result)
 
-    assert [(download.artifact_id, download.file_name) for download in packet.downloads] == [("a_dl_9", None)]
+    assert [(d.artifact_id, d.file_name, d.generated) for d in packet.downloads] == [("a_dl_9", expected_name, None)]
+    assert any("another run" in notice for notice in packet.omission_notices) is expect_other_run_notice
 
 
 def test_packet_workflow_readback_hides_saved_notes_with_doc_editor_off() -> None:
@@ -374,15 +404,16 @@ async def test_packet_surfaces_available_keys_from_a_sheets_render_failure() -> 
         "output": {"failure_rate": "25.65%"},
     }
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(FailedToFormatJinjaStyleParameter) as excinfo:
         write_block._render_values_or_raise(run_context)
+    reason = render_failure_reason("Failed to format jinja template:", excinfo.value, lambda value: value)
 
     with (
         patch.object(GoogleSheetsWriteBlock, "record_output_parameter_value", AsyncMock()) as record_output,
         patch.object(GoogleSheetsWriteBlock, "build_block_result", AsyncMock()),
     ):
         await write_block._template_format_failure_result(
-            excinfo.value, str(excinfo.value), run_context, "wr_sheets_available_keys", None, None
+            excinfo.value, reason, run_context, "wr_sheets_available_keys", None, None
         )
         recorded_output = record_output.await_args.args[2]
 
@@ -404,10 +435,8 @@ async def test_packet_surfaces_available_keys_from_a_sheets_render_failure() -> 
 def test_projection_keeps_available_keys_when_the_output_exceeds_the_per_output_cap() -> None:
     failure_output = {
         "failure_reason": (
-            "Failed to format jinja template: block `write_row` field `values` references a value no "
-            "upstream block produced: 'dict object' has no attribute 'extracted_information'. Return "
-            "that key from the producing block, or write an explicit default (e.g. "
-            "{{ block_label.field | default('') }}) if an empty cell is intended."
+            "Failed to format jinja template: Missing key or attribute in "
+            "`extract_metrics.output.extracted_information` (field values, line 1)."
         ),
         "available_keys": [
             *[f"extract_metrics.output.metric_{index:02d}" for index in range(25)],
@@ -3153,6 +3182,174 @@ def test_required_input_unbound_outcome_preserves_the_typed_capture_fact() -> No
     assert outcome.page_capture.model_dump() == {"status": "unavailable", "omission": "page_capture_unavailable"}
 
 
+_VAULT_KEY_INPUTS_YAML = """
+workflow_definition:
+  parameters:
+    - {parameter_type: workflow, workflow_parameter_type: string, key: vault_input, default_value: team-vault}
+    - {parameter_type: workflow, workflow_parameter_type: string, key: username_secret_name, default_value: ""}
+    - {parameter_type: workflow, workflow_parameter_type: string, key: password_secret_name, default_value: ""}
+    - parameter_type: azure_vault_credential
+      key: vault_login
+      vault_name: vault_input
+      username_key: "{{ username_secret_name }}"
+      password_key: "{{ password_secret_name | default('p-fallback', true) }}"
+  blocks:
+    - {block_type: login, label: login, parameter_keys: [vault_login]}
+"""
+_BLANK_KEY_NAMES = ["username_secret_name", "password_secret_name"]
+_BOUND_KEY_NAMES = {"username_secret_name": "u-item", "password_secret_name": "p-item"}
+_NAMED_BLANK_KEY_NAMES = ["username_secret_name"]
+
+
+@pytest.mark.parametrize(
+    ("run_shape", "unbound", "dispatched", "expected_named"),
+    [
+        ("init_failure", _BLANK_KEY_NAMES, {}, _NAMED_BLANK_KEY_NAMES),
+        ("init_failure", [], {"username_secret_name": "", "password_secret_name": ""}, _NAMED_BLANK_KEY_NAMES),
+        ("init_failure", [], {**_BOUND_KEY_NAMES, "username_secret_name": "  "}, []),
+        ("init_failure", [], {"username_secret_name": None, "password_secret_name": None}, _NAMED_BLANK_KEY_NAMES),
+        ("init_failure", [], {**_BOUND_KEY_NAMES, "vault_input": None}, []),
+        ("init_failure", [], {**_BOUND_KEY_NAMES, "vault_input": ""}, ["vault_input"]),
+        ("init_failure", [], _BOUND_KEY_NAMES, []),
+        ("later_block_failure", _BLANK_KEY_NAMES, {}, []),
+        ("watchdog_no_blocks", _BLANK_KEY_NAMES, {}, []),
+        ("success", _BLANK_KEY_NAMES, {}, []),
+    ],
+    ids=[
+        "unbound",
+        "explicit_blank",
+        "whitespace",
+        "none_with_empty_default",
+        "none_with_default",
+        "vault_name_blank",
+        "bound",
+        "later_block_failure",
+        "watchdog_no_blocks",
+        "success",
+    ],
+)
+def test_a_run_names_the_blank_inputs_its_login_credential_key_names_template(
+    run_shape: str, unbound: list[str], dispatched: dict[str, str | None], expected_named: list[str]
+) -> None:
+    ok = run_shape == "success"
+    blocks = (
+        [{"label": "login", "status": "failed", "failure_reason": "Login rejected."}]
+        if run_shape == "later_block_failure"
+        else []
+    )
+    result: dict[str, Any] = {
+        "ok": ok,
+        "data": {
+            "workflow_run_id": "wr_vault",
+            "overall_status": "completed" if ok else "failed",
+            "failure_reason": None if ok else "Failed to initialize workflow run context.",
+            "failure_type": "runtime_error" if blocks else None,
+            "blocks": blocks,
+        },
+    }
+    if run_shape == "watchdog_no_blocks":
+        result["data"]["control_signal"] = {"kind": "watchdog_timeout", "user_facing_summary": "Stopped."}
+    recorded_run_outcome = (
+        RecordedRunOutcome(verdict="demonstrated", workflow_run_id="wr_vault")
+        if ok
+        else RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="blocker_reported",
+            display_reason="Failed to initialize workflow run context.",
+            workflow_run_id="wr_vault",
+            run_completed=False,
+        )
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=recorded_run_outcome,
+        unbound_required_parameter_keys=unbound,
+        block_parameter_keys={},
+        blank_login_credential_input_keys=blank_login_credential_input_keys(
+            _VAULT_KEY_INPUTS_YAML, unbound, dispatched
+        ),
+    )
+
+    assert outcome is not None
+    expected_reason = {"success": "verified_success", "later_block_failure": "runtime_block_failure"}.get(
+        run_shape, "required_input_unbound" if expected_named else "blocker_reported"
+    )
+    assert outcome.reason_code == expected_reason
+    if expected_named:
+        assert outcome.observed_evidence_summary == "unbound required inputs: " + ", ".join(expected_named)
+
+
+@pytest.mark.parametrize(
+    ("credential_param", "named"),
+    [
+        pytest.param(
+            "{parameter_type: azure_vault_credential, key: c, vault_name: v, username_key: '{{ key_input }}', "
+            "password_key: p}",
+            True,
+            id="azure_vault_required_key",
+        ),
+        pytest.param(
+            "{parameter_type: onepassword, key: c, vault_id: v, item_id: '{{ key_input }}'}",
+            True,
+            id="onepassword_required_item",
+        ),
+        pytest.param("{parameter_type: credential, key: c, credential_id: key_input}", True, id="credential_id"),
+        pytest.param(
+            "{parameter_type: azure_vault_credential, key: c, vault_name: v, username_key: u, password_key: p, "
+            "totp_secret_key: '{{ key_input }}'}",
+            False,
+            id="azure_optional_totp",
+        ),
+        pytest.param(
+            "{parameter_type: bitwarden_login_credential, key: c, bitwarden_item_id: '{{ key_input }}'}",
+            False,
+            id="bitwarden_item",
+        ),
+        pytest.param(
+            "{parameter_type: bitwarden_login_credential, key: c, bitwarden_collection_id: key_input}",
+            False,
+            id="bitwarden_collection",
+        ),
+        pytest.param(
+            "{parameter_type: credential, key: c, credential_id: key_input, credential_ids: [cred_a]}",
+            False,
+            id="credential_id_behind_pool",
+        ),
+    ],
+)
+def test_an_init_failure_names_only_inputs_a_login_credential_requires(credential_param: str, named: bool) -> None:
+    workflow_yaml = (
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "    - {parameter_type: workflow, workflow_parameter_type: string, key: key_input, default_value: ''}\n"
+        f"    - {credential_param}\n"
+        "  blocks: []\n"
+    )
+    result = {
+        "ok": False,
+        "data": {"workflow_run_id": "wr_init", "overall_status": "failed", "failure_reason": "Init.", "blocks": []},
+    }
+    recorded_run_outcome = RecordedRunOutcome(
+        verdict="not_demonstrated",
+        reason_code="blocker_reported",
+        display_reason="Init.",
+        workflow_run_id="wr_init",
+        run_completed=False,
+    )
+
+    outcome = recorded_outcome_from_run_blocks_result(
+        result,
+        recorded_run_outcome=recorded_run_outcome,
+        unbound_required_parameter_keys=["key_input"],
+        block_parameter_keys={},
+        blank_login_credential_input_keys=blank_login_credential_input_keys(workflow_yaml, ["key_input"], {}),
+    )
+
+    assert outcome is not None
+    assert (outcome.reason_code == "required_input_unbound") is named
+
+
 @pytest.mark.parametrize(
     "return_path",
     [
@@ -5450,6 +5647,12 @@ async def _execute_code_block(monkeypatch: pytest.MonkeyPatch, code: str) -> dic
         workflow_run_outputs: list[object] = []
         workflow = None
 
+        reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+        agent_unmasked_platform_secret_ids = staticmethod(set)
+
+        def __init__(self) -> None:
+            self.parameters: dict[str, object] = {}
+
         def get_block_metadata(self, label: str | None) -> dict[str, object]:
             return {}
 
@@ -7157,6 +7360,11 @@ def test_every_packet_rendering_keeps_the_newest_per_block_facts_and_says_what_i
             "per_block_action_observations": {
                 f"block_{index}": [f"click completed code_line={line}" for line in range(20)] for index in range(30)
             },
+            "registered_outputs": [
+                BuildTestPacketRegisteredOutput(
+                    label="collect_rows", status="completed", output={"rows": [f'row "{i}"' for i in range(100)]}
+                )
+            ],
         }
     )
 
@@ -7178,6 +7386,11 @@ def test_every_packet_rendering_keeps_the_newest_per_block_facts_and_says_what_i
     assert list(compacted.observed_block_end_urls) == ["block_28", "block_29"]
     assert compacted.per_block_action_observations["block_29"] == ["click completed code_line=19"]
     assert any("observed_block_end_urls shortened at the aggregate packet limit" in n for n in compact_notices)
+    projected_cut = projected.registered_outputs[0].output
+    assert projected.registered_outputs[0].value_complete is False
+    recompacted = _compact_packet_for_aggregate_limit(projected, []).registered_outputs[0]
+    assert recompacted.output == projected_cut[: OUTPUT_VALUE_MAX_CHARS - 3] + "..."
+    assert recompacted.value_complete is False
 
 
 def test_an_over_long_page_state_url_is_refused_rather_than_cut() -> None:

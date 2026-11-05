@@ -5,22 +5,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from skyvern.forge.sdk.copilot.credential_resolution import connected_vault_credential
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tools import (
     _credential_id_misbinding_findings,
-    _credential_reference_validation_error,
     _list_credentials,
     _update_workflow,
 )
-from skyvern.forge.sdk.copilot.tools.account_groups import AccountGroupRefused, _check_common_inputs
 from skyvern.forge.sdk.copilot.tools.credentials import (
-    _credential_run_approval_error,
     _google_connection_reference_ids,
+    bitwarden_binding_change_error,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import bitwarden_secret_bindings
-from tests.unit.conftest import ORG_VAULT_ITEM_ID, ORG_VAULT_LOGIN_ID, OrgVaultFake
+from tests.unit.conftest import ORG_VAULT_ITEM_ID
 
 
 def _yaml(body: str) -> str:
@@ -641,149 +638,59 @@ def _bitwarden_workflow(
 _LITERAL_BINDING = _bitwarden_workflow(
     f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1"
 )
+_CREDIT_CARD_BINDING = _bitwarden_workflow(
+    f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1",
+    f"""
+          - key: card
+            parameter_type: bitwarden_credit_card_data{_BITWARDEN_SECRET_KEYS}
+            bitwarden_collection_id: col_1
+            bitwarden_item_id: {ORG_VAULT_ITEM_ID}""",
+)
 
 
-def _vault_ctx(*, persisted_ids: list[str] | None = None) -> AgentContext:
-    ctx = _ctx_with_policy()
-    ctx.request_policy.persisted_workflow_credential_ids = persisted_ids or []
-    return ctx
-
-
-@pytest.mark.asyncio
-async def test_a_bitwarden_login_parameter_naming_a_listed_vault_login_is_accepted(org_vault: OrgVaultFake) -> None:
-    assert await _credential_reference_validation_error(_LITERAL_BINDING, _vault_ctx()) is None
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "yaml",
     [
+        pytest.param(_LITERAL_BINDING, id="literal"),
         pytest.param(_bitwarden_workflow('\n            bitwarden_item_id: "{{ item_id }}"'), id="templated"),
-        pytest.param(_bitwarden_workflow("\n            bitwarden_item_id: portal_item"), id="key-reference"),
         pytest.param(_bitwarden_workflow("\n            url_parameter_key: portal_url"), id="url-only"),
-        pytest.param(
-            _bitwarden_workflow(
-                f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}",
-                f"""
-          - key: "{ORG_VAULT_ITEM_ID}"
-            parameter_type: workflow
-            workflow_parameter_type: string
-            default_value: shadow""",
-            ),
-            id="key-shadowed",
-        ),
-        pytest.param(
-            _bitwarden_workflow(
-                f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}",
-                secret_keys=_BITWARDEN_SECRET_KEYS.replace("SKYVERN_BITWARDEN_MASTER_PASSWORD", "OTHER_SECRET"),
-            ),
-            id="unpinned-secret-key",
-        ),
-        pytest.param(
-            _bitwarden_workflow("\n            bitwarden_item_id: 5c1d2e3f-0000-4000-8000-000000000009"),
-            id="not-listed",
-        ),
-        pytest.param(
-            _bitwarden_workflow(
-                f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_9"
-            ),
-            id="other-collection",
-        ),
-        pytest.param(_bitwarden_workflow(f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}"), id="no-collection"),
-        pytest.param(
-            _bitwarden_workflow(
-                f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1",
-                f"""
-          - key: card
-            parameter_type: bitwarden_credit_card_data{_BITWARDEN_SECRET_KEYS}
-            bitwarden_collection_id: col_1
-            bitwarden_item_id: {ORG_VAULT_ITEM_ID}""",
-            ),
-            id="new-credit-card-binding",
-        ),
-        pytest.param(
-            _yaml(
-                f"""
-                title: Sign in
-                workflow_definition:
-                  parameters:
-                  - key: portal_login
-                    parameter_type: workflow
-                    workflow_parameter_type: credential_id
-                    default_value: {ORG_VAULT_LOGIN_ID}
-                  blocks:
-                  - block_type: login
-                    label: login_to_portal
-                    url: https://portal.example.com/login
-                    parameter_keys: [portal_login]
-                """
-            ),
-            id="credential-id-slot",
-        ),
     ],
 )
-async def test_a_vault_login_binding_that_is_not_a_listed_literal_with_pinned_keys_is_refused(
-    org_vault: OrgVaultFake, yaml: str
-) -> None:
-    assert await _credential_reference_validation_error(yaml, _vault_ctx()) is not None
+def test_a_new_bitwarden_login_parameter_is_refused_but_one_the_workflow_had_is_kept(yaml: str) -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(yaml)
+
+    assert bitwarden_binding_change_error(yaml, _ctx_with_policy().request_policy) is not None
+    assert bitwarden_binding_change_error(yaml, kept.request_policy) is None
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("connection", ["not_configured", "unreadable"])
-async def test_a_literal_vault_binding_persists_while_the_vault_cannot_be_listed_but_a_template_does_not(
-    org_vault: OrgVaultFake, connection: str
-) -> None:
-    if connection == "not_configured":
-        org_vault.org_token.return_value = None
-    else:
-        org_vault.listing.side_effect = TimeoutError()
-    templated = _bitwarden_workflow('\n            bitwarden_item_id: "{{ item_id }}"')
-
-    assert await _credential_reference_validation_error(_LITERAL_BINDING, _vault_ctx()) is None
-    assert await _credential_reference_validation_error(templated, _vault_ctx()) is not None
-
-
-@pytest.mark.asyncio
-async def test_a_credit_card_binding_the_workflow_already_had_is_kept(org_vault: OrgVaultFake) -> None:
-    yaml = _bitwarden_workflow(
-        f"\n            bitwarden_item_id: {ORG_VAULT_ITEM_ID}\n            bitwarden_collection_id: col_1",
-        f"""
-          - key: card
-            parameter_type: bitwarden_credit_card_data{_BITWARDEN_SECRET_KEYS}
-            bitwarden_collection_id: col_1
-            bitwarden_item_id: {ORG_VAULT_ITEM_ID}""",
+def test_a_kept_bitwarden_login_parameter_cannot_be_repointed() -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(_LITERAL_BINDING)
+    repointed = _bitwarden_workflow(
+        '\n            bitwarden_item_id: "{{ item_id }}"\n            bitwarden_collection_id: col_1'
     )
-    ctx = _vault_ctx()
-    ctx.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(yaml)
 
-    assert await _credential_reference_validation_error(yaml, ctx) is None
+    assert bitwarden_binding_change_error(repointed, kept.request_policy) is not None
+
+
+def test_a_new_bitwarden_credit_card_binding_is_refused_but_one_the_workflow_had_is_kept() -> None:
+    kept = _ctx_with_policy()
+    kept.request_policy.existing_bitwarden_secret_bindings = bitwarden_secret_bindings(_CREDIT_CARD_BINDING)
+
+    assert bitwarden_binding_change_error(_CREDIT_CARD_BINDING, _ctx_with_policy().request_policy) is not None
+    assert bitwarden_binding_change_error(_CREDIT_CARD_BINDING, kept.request_policy) is None
 
 
 @pytest.mark.asyncio
-async def test_a_url_only_bitwarden_lookup_the_saved_workflow_already_had_still_runs(org_vault: OrgVaultFake) -> None:
-    yaml = _bitwarden_workflow("\n            url_parameter_key: portal_url")
+async def test_update_workflow_refuses_a_new_bitwarden_parameter_even_when_an_untested_draft_is_allowed() -> None:
+    ctx = _ctx_with_policy()
+    ctx.allow_untested_workflow_draft = True
 
-    assert await _credential_reference_validation_error(yaml, _vault_ctx(persisted_ids=["bwitem_"])) is None
+    result = await _update_workflow({"workflow_yaml": _LITERAL_BINDING}, ctx)
 
-
-def test_a_vault_login_id_outside_a_bitwarden_parameter_is_refused_at_every_run_approval() -> None:
-    policy = RequestPolicy(resolved_credentials=[connected_vault_credential("o_test", ORG_VAULT_ITEM_ID, "Portal")])
-    slot_definition = {
-        "parameters": [
-            {
-                "key": "portal_login",
-                "parameter_type": "workflow",
-                "workflow_parameter_type": "credential_id",
-                "default_value": ORG_VAULT_LOGIN_ID,
-            }
-        ]
-    }
-
-    # Run inputs, account-group inputs and seed owners carry no definition; a schedule or run passes its own.
-    assert _credential_run_approval_error([ORG_VAULT_LOGIN_ID], policy) is not None
-    assert _credential_run_approval_error([ORG_VAULT_LOGIN_ID], policy, workflow_definition=slot_definition) is not None
-    with pytest.raises(AccountGroupRefused):
-        _check_common_inputs(MagicMock(request_policy=policy), {"portal_login": ORG_VAULT_LOGIN_ID})
+    assert result["ok"] is False
+    assert result["error"] == bitwarden_binding_change_error(_LITERAL_BINDING, ctx.request_policy)
 
 
 def test_a_bitwarden_login_parameter_does_not_back_a_google_sheets_connection_slot() -> None:

@@ -43,7 +43,8 @@ export function useStudioPanes() {
     preserveNextEntry,
   } = useStudioPaneDefaults();
   const workflowDeleted = useStudioWorkflowDeletedAt() !== null;
-  const { organizationId, restoreExpandedPane } = useStudioShellContext();
+  const { organizationId, restoreExpandedPane, showPane } =
+    useStudioShellContext();
   const panes = useMemo(() => {
     const resolved = isStudio
       ? [...currentPanes]
@@ -129,10 +130,14 @@ export function useStudioPanes() {
       }),
     [applyPanes],
   );
+  // Every caller asks to see the pane, so it comes on screen even when it was
+  // already open behind another (phone) or folded into a strip (Doc).
   const openPane = useCallback(
-    (id: StudioPaneId, options?: ApplyPanesOptions) =>
-      applyPanes((current, slots) => withPaneOpen(current, id, slots), options),
-    [applyPanes],
+    (id: StudioPaneId, options?: ApplyPanesOptions) => {
+      applyPanes((current, slots) => withPaneOpen(current, id, slots), options);
+      showPane?.(id);
+    },
+    [applyPanes, showPane],
   );
   const closePane = useCallback(
     (id: StudioPaneId) =>

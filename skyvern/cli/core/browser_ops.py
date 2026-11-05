@@ -11,18 +11,18 @@ import json
 import os
 import re
 import string
+import sys
 import time
 from contextlib import suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator, Literal, Sequence
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
@@ -33,7 +33,19 @@ from .js_dispatch import under_action_deadline
 from .page_change import is_page_change_error
 from .perception_telemetry import track_perception_probe
 
+if TYPE_CHECKING:
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
 LOG = structlog.get_logger(__name__)
+
+_SKYVERN_PAGE_MODULE = "skyvern.core.script_generations.skyvern_page"
+
+
+def is_skyvern_page(page: Any) -> bool:
+    # Importing skyvern_page loads the whole server graph, and an instance cannot exist before its module does.
+    module = sys.modules.get(_SKYVERN_PAGE_MODULE)
+    return module is not None and isinstance(page, module.SkyvernPage)
+
 
 TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
 COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
@@ -825,6 +837,12 @@ _ROLE_TO_TAG: dict[str, str] = {
     "treeitem": "li",
 }
 
+# Roles `roleFor` in _OBSERVE_INTERACTABLES_JS can assign by heuristic rather than read from markup;
+# merge keys keep the host tag for these so a pointer-cursor wrapper sharing a label cannot claim an
+# a11y entry. Every other role is declared by markup, where _ROLE_TO_TAG names just one of the tags
+# that can carry it (a combobox is a <select>, or an input/div with role=combobox).
+_INFERRED_DOM_ROLES = frozenset({"button", "option"})
+
 # Structural fields always kept in serialized output; display fields filtered if empty.
 _ELEMENT_KEEP_ALWAYS = frozenset({"ref", "role"})
 
@@ -1356,19 +1374,19 @@ def _merge_dom_observe_elements(
     merged = list(a11y_elements)
     selector_seen = {element.get("selector") for element in merged if element.get("selector")}
 
-    # Only upgrade an a11y element with a DOM selector when the (role, name, tag) key is
-    # unambiguous on both sides. A duplicate label would otherwise risk attaching the
-    # selector to the wrong element — a confidently wrong deterministic action. Ambiguous
-    # DOM elements still fall through to the append path with their own distinct selector.
+    # Only upgrade an a11y element with a DOM selector when the merge key is unambiguous on
+    # both sides. A duplicate label would otherwise risk attaching the selector to the wrong
+    # element — a confidently wrong deterministic action. Ambiguous DOM elements still fall
+    # through to the append path with their own distinct selector.
     def _key(role: str, name: str, tag: str) -> tuple[str, str, str]:
-        return role, name, tag
+        return role, name, tag if role in _INFERRED_DOM_ROLES else ""
 
-    a11y_key_counts: dict[tuple[str, str, str], int] = {}
+    a11y_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for element in merged:
         if not element.get("selector"):
             role = element.get("role", "")
             key = _key(role, element.get("name", ""), _ROLE_TO_TAG.get(role, ""))
-            a11y_key_counts[key] = a11y_key_counts.get(key, 0) + 1
+            a11y_by_key.setdefault(key, []).append(element)
     dom_key_counts: dict[tuple[str, str, str], int] = {}
     for dom_element in dom_elements:
         key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
@@ -1379,40 +1397,33 @@ def _merge_dom_observe_elements(
         if dom_selector and dom_selector in selector_seen:
             continue
         dom_key = _key(dom_element.get("role", ""), dom_element.get("name", ""), dom_element.get("tag", ""))
-        unambiguous = a11y_key_counts.get(dom_key, 0) == 1 and dom_key_counts.get(dom_key, 0) == 1
-        matched_existing = False
-        if unambiguous:
-            for existing in merged:
-                if (
-                    not existing.get("selector")
-                    and existing.get("role", "") == dom_element.get("role", "")
-                    and existing.get("name", "") == dom_element.get("name", "")
-                    and _ROLE_TO_TAG.get(existing.get("role", ""), "") == dom_element.get("tag", "")
-                ):
-                    existing["selector"] = dom_selector
-                    if dom_element.get("value") is not None:
-                        existing["value"] = dom_element["value"]
-                    if dom_element.get("options") and not existing.get("children"):
-                        existing["options"] = dom_element.get("options")
-                    if dom_element.get("aria_controls"):
-                        existing["aria_controls"] = dom_element["aria_controls"]
-                    if dom_element.get("aria_owns"):
-                        existing["aria_owns"] = dom_element["aria_owns"]
-                    matched_existing = True
-                    if dom_selector:
-                        selector_seen.add(dom_selector)
-                    break
-        if not matched_existing:
+        candidates = a11y_by_key.get(dom_key, [])
+        if len(candidates) == 1 and dom_key_counts.get(dom_key, 0) == 1:
+            existing = candidates[0]
+            existing["selector"] = dom_selector
+            # The a11y entry carries no tag of its own; without this it keeps reporting
+            # _ROLE_TO_TAG's guess instead of the tag it merged with.
+            if dom_element.get("tag"):
+                existing["tag"] = dom_element["tag"]
+            if dom_element.get("value") is not None:
+                existing["value"] = dom_element["value"]
+            if dom_element.get("options") and not existing.get("children"):
+                existing["options"] = dom_element.get("options")
+            if dom_element.get("aria_controls"):
+                existing["aria_controls"] = dom_element["aria_controls"]
+            if dom_element.get("aria_owns"):
+                existing["aria_owns"] = dom_element["aria_owns"]
+        else:
             merged.append(dom_element)
-            if dom_selector:
-                selector_seen.add(dom_selector)
+        if dom_selector:
+            selector_seen.add(dom_selector)
 
     return merged
 
 
 async def get_observe_document_id(page: Any) -> str | None:
     """Read the current document revision marker without taking an observe snapshot."""
-    scope = page.locator_scope if isinstance(page, SkyvernPage) else None
+    scope = page.locator_scope if is_skyvern_page(page) else None
     target = scope if scope is not None else page
     raw_page = getattr(page, "page", page)
     session_target: Any = scope if scope is not None else raw_page
@@ -2223,7 +2234,13 @@ async def do_select_option(
         raise CustomSelectMatchError(selector, value, observed_options)
 
     matched = matches[0]
-    matched_label = str(matched.get("name") or matched.get("label") or value)
+    # `name` comes from the earlier DOM scan and `label` from the live re-read at the same positional selector, so a
+    # list that re-renders in between leaves a stale `name`; report the one that matched, else the live `label`.
+    matched_label = str(matched.get("label") or matched.get("name") or value)
+    for candidate in (matched.get("name"), matched.get("label")):
+        if _normalized_option(candidate) == requested:
+            matched_label = str(candidate)
+            break
     matched_value = str(matched.get("value") or "")
     expected_values = {requested, _normalized_option(matched_value)} - {""}
     display_labels = {

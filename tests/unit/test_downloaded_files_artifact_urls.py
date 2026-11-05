@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+import skyvern.forge.sdk.api.files as files_module
 import skyvern.forge.sdk.artifact.manager as manager_module
 import skyvern.forge.sdk.artifact.storage.azure as azure_module
 import skyvern.forge.sdk.artifact.storage.base as base_module
@@ -42,6 +43,7 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository, fake_download_registration_app
 from tests.unit.forge.sdk.artifact.storage.test_azure_storage import AzureStorageForTests
 from tests.unit.forge.sdk.artifact.storage.test_gcs_storage import GcsStorageForTests
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _is_amazonaws_s3_url(url: str) -> bool:
@@ -573,7 +575,7 @@ def test_sanitize_header_filename_strips_control_characters():
 
 
 @pytest.mark.asyncio
-async def test_content_endpoint_sets_nosniff_header_end_to_end():
+async def test_content_endpoint_sets_nosniff_header_end_to_end(monkeypatch: pytest.MonkeyPatch):
     """Hit the real route through a FastAPI TestClient and verify the response
     actually carries X-Content-Type-Options: nosniff on the DOWNLOAD path.
 
@@ -581,12 +583,10 @@ async def test_content_endpoint_sets_nosniff_header_end_to_end():
     the header without this suite noticing."""
     import json
 
-    from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from skyvern.config import settings
     from skyvern.forge.sdk.artifact.signing import sign_artifact_url
-    from skyvern.forge.sdk.routes.routers import base_router
 
     artifact = _make_artifact("a_e2e", "s3://skyvern-uploads/downloads/local/o_1/wr_1/report.pdf")
     keyring_json = json.dumps({"current_kid": "k1", "keys": {"k1": {"secret": "0" * 64, "created_at": "2026-04-23"}}})
@@ -609,9 +609,7 @@ async def test_content_endpoint_sets_nosniff_header_end_to_end():
             artifact_type="download",
         )
 
-        test_app = FastAPI()
-        test_app.include_router(base_router, prefix="/v1")
-        client = TestClient(test_app)
+        client = TestClient(shared_route_app(monkeypatch))
         resp = client.get(signed_url.replace("http://testserver", ""))
 
     assert resp.status_code == 200, resp.text
@@ -1272,6 +1270,7 @@ def test_local_snapshot_aliases_consume_primary_before_live_baseline_and_preserv
 @pytest.mark.parametrize("signed", [False, True])
 @pytest.mark.parametrize("run_id", ["wr_1", "tsk_1"])
 async def test_partial_bytes_are_neither_published_nor_returned(tmp_path, monkeypatch, backend, signed, run_id):
+    monkeypatch.setattr(files_module, "PENDING_EXTENSION_RENAME_WAIT_SECONDS", 0.0)
     monkeypatch.setattr(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON if signed else None)
     storage = {
         "local": lambda: LocalStorage(str(tmp_path / "artifacts")),

@@ -16,11 +16,14 @@ import {
   getElements,
   getWorkflowBlocks,
   getWorkflowErrors,
+  getUniqueLabelForExistingNode,
   pendingGoalChangesOf,
+  removeKeyFromNodesParameterKeys,
+  replaceJinjaReferenceInNodes,
   withGoalUndoRecordsFrom,
   workflowEffectiveDefaultEngine,
 } from "./workflowEditorUtils";
-import { agentStepToolsFromSelection } from "./nodes/AgentStepNode/types";
+import { removeJinjaReferenceFromNodes } from "./jinjaReferences";
 import { collectKnownErrorCodes } from "./nodes/StartNode/retryPolicyUtils";
 import { terminateNodeDefaultData } from "./nodes/TerminateNode/types";
 
@@ -388,6 +391,7 @@ describe("agent block load and save", () => {
     prompt: "Find the plan for {{ account_number }}",
     data_schema: dataSchema,
     max_turns: 40,
+    tools: ["http_request", "web_search"],
     parameters: [{ key: "account_number" }],
   } as unknown as WorkflowBlock;
   const savedFields = {
@@ -396,55 +400,39 @@ describe("agent block load and save", () => {
     prompt: "Find the plan for {{ account_number }}",
     data_schema: dataSchema,
     max_turns: 40,
+    tools: ["http_request", "web_search"],
     parameter_keys: ["account_number"],
   };
 
-  test.each([
-    ["a tools list", ["http_request", "web_search"]],
-    ["no tools list", null],
-  ])(
-    "an existing block with %s saves unchanged from the canvas and from an export",
-    (_, tools) => {
-      const block = { ...agentStepBlock, tools } as WorkflowBlock;
-      const saved = { ...savedFields, tools };
-      const { nodes, edges } = getElements([block], SETTINGS, true);
+  test("an existing block saves unchanged from the canvas and from an export", () => {
+    const { nodes, edges } = getElements([agentStepBlock], SETTINGS, true);
 
-      expect(getWorkflowErrors(nodes)).toEqual([]);
-      expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(saved);
-      const source = {
-        title: "Source",
-        description: null,
-        is_saved_task: false,
-        status: null,
-        run_with: "agent",
-        workflow_definition: { parameters: [], blocks: [block] },
-      } as unknown as WorkflowApiResponse;
-      expect(convert(source).workflow_definition.blocks[0]).toMatchObject(
-        saved,
-      );
-    },
-  );
-
-  test("checking every tool saves no list, and checking some saves those", () => {
-    const choosable = ["code", "http_request", "web_search"];
-
-    expect(
-      agentStepToolsFromSelection(
-        ["web_search", "code", "http_request"],
-        choosable,
-      ),
-    ).toBeNull();
-    expect(agentStepToolsFromSelection(["http_request"], choosable)).toEqual([
-      "http_request",
-    ]);
+    expect(getWorkflowErrors(nodes)).toEqual([]);
+    expect(getWorkflowBlocks(nodes, edges)[0]).toMatchObject(savedFields);
+    const source = {
+      title: "Source",
+      description: null,
+      is_saved_task: false,
+      status: null,
+      run_with: "agent",
+      workflow_definition: { parameters: [], blocks: [agentStepBlock] },
+    } as unknown as WorkflowApiResponse;
+    expect(convert(source).workflow_definition.blocks[0]).toMatchObject(
+      savedFields,
+    );
   });
 
-  test("a new agent step blocks the save until a tool is chosen", () => {
-    const node = createNode({ id: "n1" }, "agentStep", "find_plan");
-
-    expect(getWorkflowErrors([node])).toContain(
-      "find_plan: Choose at least one tool.",
+  test("a new agent step starts with tools, and one saved with none blocks the save", () => {
+    const error = "find_plan: Choose at least one tool.";
+    const added = createNode({ id: "n1" }, "agentStep", "find_plan");
+    const { nodes: listless } = getElements(
+      [{ ...agentStepBlock, tools: null } as WorkflowBlock],
+      SETTINGS,
+      true,
     );
+
+    expect(getWorkflowErrors([added])).not.toContain(error);
+    expect(getWorkflowErrors(listless)).toContain(error);
   });
 
   test.each([
@@ -724,8 +712,58 @@ describe("FileDownloadBlock SFTP source round trip", () => {
   });
 });
 
+describe("replaceJinjaReferenceInNodes", () => {
+  test("rename rewrites references inside a code block's code", () => {
+    const [renamed] = replaceJinjaReferenceInNodes(
+      [
+        {
+          id: "c",
+          type: "codeBlock",
+          position: { x: 0, y: 0 },
+          data: {
+            label: "Compute",
+            code: "rows = {{ region | tojson }}\nprint(region)\n",
+          },
+        },
+      ],
+      "region",
+      "area",
+    );
+    expect(renamed!.data.code).toBe(
+      "rows = {{ area | tojson }}\nprint(region)\n",
+    );
+  });
+});
+
+describe("removeKeyFromNodesParameterKeys", () => {
+  test("a block delete drops the declared output key and leaves the code unchanged", () => {
+    const [saved] = removeKeyFromNodesParameterKeys(
+      removeJinjaReferenceFromNodes(
+        [
+          {
+            id: "c",
+            type: "codeBlock",
+            position: { x: 0, y: 0 },
+            data: {
+              label: "Pick",
+              code: "first = Fetch_output[0]\n",
+              parameterKeys: ["Fetch_output"],
+            },
+          },
+        ],
+        ["Fetch_output", "Fetch"],
+      ),
+      "Fetch_output",
+    );
+    expect(saved!.data).toMatchObject({
+      code: "first = Fetch_output[0]\n",
+      parameterKeys: [],
+    });
+  });
+});
+
 describe("block note metadata round trip", () => {
-  test("preserves notes and explicit clears through editor serialization", () => {
+  test("preserves notes and omits unset fields through graph serialization", () => {
     const noted = {
       ...minimalTaskBlock(),
       notes: "Read the saved plan first.",
@@ -876,5 +914,15 @@ describe("block note metadata round trip", () => {
     for (const key of ["notes", "trailing_notes", "description"] as const) {
       expect(saved).not.toHaveProperty(key);
     }
+  });
+
+  test("generated label suffixes skip workflow parameter output keys", () => {
+    expect(
+      getUniqueLabelForExistingNode(
+        "email_inbox",
+        ["email_inbox"],
+        ["email_inbox_2_output"],
+      ),
+    ).toBe("email_inbox_3");
   });
 });

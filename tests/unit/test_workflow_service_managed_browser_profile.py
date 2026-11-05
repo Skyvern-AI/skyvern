@@ -90,6 +90,7 @@ def _execute_workflow(*, retry_policy: object | None = None) -> SimpleNamespace:
         workflow_id="wf_1",
         persist_browser_session=True,
         reuse_browser_session=False,
+        run_sequentially=False,
         workflow_permanent_id="wpid_test",
         title="Workflow",
         organization_id="o_test",
@@ -116,6 +117,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         browser_session_id=None,
         browser_profile_id="bp_managed",
         browser_seed_source=BrowserSeedSource.own_memory,
+        browser_sink_profile_id="bp_managed",
         browser_address=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
@@ -129,6 +131,8 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         parent_workflow_run_id=None,
         depends_on_workflow_run_id=None,
         task_queue=None,
+        sequential_key=None,
+        sequential_credential_id=None,
         proxy_location=None,
         max_elapsed_time_minutes=1,
         started_at=now,
@@ -2129,6 +2133,40 @@ async def test_human_interaction_run_boots_session_from_its_profile_before_first
 
 
 @pytest.mark.asyncio
+async def test_run_start_reseed_boots_the_browser_from_the_newly_saved_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-19415: a run queued before any profile held content stamps a credential seed. Once it
+    # clears the sequential gate, its browser must boot from the profile an earlier run in the lane
+    # saved meanwhile — the stamped seed is re-read all the way through to session creation.
+    svc = WorkflowService()
+    create_session, _close_session, _bound = _patch_real_session_factory(
+        monkeypatch,
+        svc,
+        _human_interaction_workflow(),
+        is_managed=True,
+        browser_sink_profile_id="bp_own",
+        engine_enabled=True,
+    )
+    for run in (svc.get_workflow_run.return_value, svc.mark_workflow_run_as_running.return_value):
+        run.browser_profile_id = "bp_cred"
+        run.browser_seed_source = BrowserSeedSource.credential
+        run.sequential_key = "seq_c_1"
+    reseeded_run = _execute_workflow_run(WorkflowRunStatus.running)
+    reseeded_run.browser_profile_id = "bp_own"
+    reseeded_run.browser_sink_profile_id = "bp_own"
+    reseeded_run.sequential_key = "seq_c_1"
+    app.DATABASE.workflow_runs.update_workflow_run.return_value = reseeded_run
+    monkeypatch.setattr(service_module.app.STORAGE, "browser_profile_exists", AsyncMock(return_value=True))
+    _patch_browser_cleanup(monkeypatch, svc, [])
+    _patch_finalize(monkeypatch, svc, [], _execute_workflow_run(WorkflowRunStatus.completed))
+
+    await _run_execute_workflow(svc)
+
+    assert create_session.await_args.kwargs["browser_profile_id"] == "bp_own"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("is_managed", "expected_inherit"),
     [pytest.param(False, False, id="ordinary-profile"), pytest.param(True, True, id="managed-profile")],
@@ -2421,14 +2459,11 @@ async def forced_session_setup(
                     )
                 )
                 await session.commit()
-        run = await database.workflow_runs.get_workflow_run(kwargs["workflow_run_id"], "o_test")
-        if run is not None and (run.reuse_bound_key or "").startswith("off:force_pending:"):
-            await database.workflow_runs.update_workflow_run(kwargs["workflow_run_id"], browser_session_id="pbs_forced")
+        # Like the V2 manager for a non-Apply run, creation does not link the run to its session.
         return SimpleNamespace(persistent_browser_session_id="pbs_forced")
 
     monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "create_session", AsyncMock(side_effect=create_session))
     service = WorkflowService()
-    monkeypatch.setattr(service, "_resolve_managed_browser_profile_for_run_request", AsyncMock(return_value=None))
     yield database, service, workflow
     while service._background_tasks:
         await asyncio.gather(*list(service._background_tasks))
@@ -2679,6 +2714,10 @@ async def test_forced_session_is_pinned_for_first_and_prepared_retry_attempt(
         organization_id="o_test",
         workflow=workflow,
     )
+    assert run.browser_session_id is None
+    run = await service._prepare_forced_browser_session(
+        workflow=workflow, workflow_run=run, workflow_request=WorkflowRequestBody(), has_attempt_row=True
+    )
 
     assert run.browser_session_id == "pbs_forced"
     attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
@@ -2779,23 +2818,12 @@ async def test_forced_session_is_pinned_for_first_and_prepared_retry_attempt(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_source", ["forced", "explicit", "unpinned"])
-async def test_retry_preparation_preserves_session_after_transient_forced_pin_failure(
+async def test_retry_preparation_preserves_the_first_attempt_session(
     monkeypatch: pytest.MonkeyPatch,
     forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
     session_source: str,
 ) -> None:
     database, service, workflow = forced_session_setup
-    pin_session = database.workflow_run_attempts.pin_first_attempt_browser_session_if_unset
-    pin_calls = 0
-
-    async def fail_first_pin(**kwargs: Any) -> None:
-        nonlocal pin_calls
-        pin_calls += 1
-        if pin_calls == 1:
-            raise RuntimeError("pin failed")
-        await pin_session(**kwargs)
-
-    monkeypatch.setattr(database.workflow_run_attempts, "pin_first_attempt_browser_session_if_unset", fail_first_pin)
     if session_source != "forced":
         monkeypatch.setattr(app.EXPERIMENTATION_PROVIDER, "is_feature_enabled_cached", AsyncMock(return_value=False))
     if session_source == "explicit":
@@ -2822,6 +2850,10 @@ async def test_retry_preparation_preserves_session_after_transient_forced_pin_fa
         organization_id="o_test",
         workflow=workflow,
     )
+    if session_source == "forced":
+        run = await service._prepare_forced_browser_session(
+            workflow=workflow, workflow_run=run, workflow_request=WorkflowRequestBody(), has_attempt_row=True
+        )
     await database.workflow_runs.update_workflow_run(
         run.workflow_run_id,
         status=WorkflowRunStatus.failed,
@@ -2844,7 +2876,6 @@ async def test_retry_preparation_preserves_session_after_transient_forced_pin_fa
     reopened = await database.workflow_runs.get_workflow_run(run.workflow_run_id, "o_test")
     assert reopened is not None
     assert reopened.browser_session_id == expected_session_id
-    assert pin_calls == (2 if session_source == "forced" else 0)
 
 
 @pytest.mark.asyncio
@@ -2915,66 +2946,6 @@ async def test_submission_refuses_a_session_past_its_lifetime_and_accepts_a_live
         assert (await session.scalars(select(TaskModel))).all() == []
     assert await submit("pbs_live") == "pbs_live"
     assert await submit("pbs_external") == "pbs_external"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure_point", ["assignment", "pin"])
-async def test_forced_session_assignment_precedes_required_pin(
-    monkeypatch: pytest.MonkeyPatch,
-    forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
-    failure_point: str,
-) -> None:
-    database, service, workflow = forced_session_setup
-    close_session = AsyncMock()
-    monkeypatch.setattr(app.PERSISTENT_SESSIONS_MANAGER, "close_session", close_session)
-    if failure_point == "assignment":
-        monkeypatch.setattr(
-            database.workflow_runs, "update_workflow_run", AsyncMock(side_effect=RuntimeError("assignment failed"))
-        )
-    else:
-        monkeypatch.setattr(
-            database.workflow_run_attempts,
-            "pin_first_attempt_browser_session_if_unset",
-            AsyncMock(side_effect=RuntimeError("pin failed")),
-        )
-
-    if failure_point == "pin":
-        with pytest.raises(RuntimeError, match="pin failed"):
-            await service.create_workflow_run(
-                workflow_request=WorkflowRequestBody(),
-                workflow_permanent_id="wpid_test",
-                workflow_id="wf_1",
-                workflow_run_id="wr_pin_failure",
-                organization_id="o_test",
-                workflow=workflow,
-            )
-        run = await database.workflow_runs.get_workflow_run("wr_pin_failure", "o_test")
-        assert run is not None
-        assert run.status == WorkflowRunStatus.failed
-        assert run.finished_at is not None
-        assert run.failure_reason == "Failed to pin forced browser session for workflow retry"
-        close_session.assert_awaited_once_with("o_test", "pbs_forced", reason=BrowserSessionCloseReason.aborted)
-        assert database.workflow_run_attempts.pin_first_attempt_browser_session_if_unset.await_count == 2
-    else:
-        run = await service.create_workflow_run(
-            workflow_request=WorkflowRequestBody(),
-            workflow_permanent_id="wpid_test",
-            workflow_id="wf_1",
-            organization_id="o_test",
-            workflow=workflow,
-        )
-
-    persisted_run = await database.workflow_runs.get_workflow_run(run.workflow_run_id, "o_test")
-    assert persisted_run is not None
-    expected_session_id = None if failure_point == "assignment" else "pbs_forced"
-    assert run.browser_session_id == persisted_run.browser_session_id == expected_session_id
-    assert run.row_write_unconfirmed is (failure_point == "assignment")
-    attempts = await database.workflow_run_attempts.get_attempts(run.workflow_run_id)
-    assert len(attempts) == 1
-    assert attempts[0].pinned_browser_session_id is None
-    if failure_point == "pin":
-        assert attempts[0].status == WorkflowRunStatus.failed.value
-        assert attempts[0].retry_decision == "abandoned"
 
 
 @pytest.mark.asyncio
@@ -3191,12 +3162,10 @@ async def test_superseded_admission_does_not_finalize_replacement(monkeypatch: p
 
 
 @pytest.mark.asyncio
-async def test_forced_browser_deferral_preserves_preparation_and_first_attempt_pin(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_forced_browser_session_is_created_at_run_start_and_pins_the_first_attempt(
     forced_session_setup: tuple[AgentDB, WorkflowService, Workflow],
 ) -> None:
     database, svc, workflow = forced_session_setup
-    monkeypatch.setattr(app.AGENT_FUNCTION, "should_defer_workflow_browser_creation", AsyncMock(return_value=True))
     request = WorkflowRequestBody(data={})
     run = await svc.create_workflow_run(
         workflow_request=request,
@@ -3420,11 +3389,6 @@ async def test_deferred_execution_uses_persisted_seed_for_forced_browser(
     monkeypatch.setattr(app, "DATABASE", database)
     monkeypatch.setattr(svc, "get_workflow_run", WorkflowService.get_workflow_run.__get__(svc))
     monkeypatch.setattr(svc, "mark_workflow_run_as_running", WorkflowService.mark_workflow_run_as_running.__get__(svc))
-    monkeypatch.setattr(
-        svc,
-        "_resolve_managed_browser_profile_for_run_request",
-        WorkflowService._resolve_managed_browser_profile_for_run_request.__get__(svc),
-    )
     monkeypatch.setattr(svc, "_seed_managed_browser_profile_from_legacy_session", AsyncMock())
     monkeypatch.setattr(svc, "_reconcile_managed_browser_profile_proxy_pin", AsyncMock())
     monkeypatch.setattr(app.AGENT_FUNCTION, "should_defer_workflow_browser_creation", AsyncMock(return_value=True))
@@ -3675,7 +3639,7 @@ async def test_forced_retirement_claim_propagates_cancellation(monkeypatch, forc
             entered.set()
         raise pin_error
 
-    monkeypatch.setattr(database.workflow_runs, "pin_browser_session_for_dispatch", AsyncMock(side_effect=pin))
+    monkeypatch.setattr(database.workflow_runs, "link_browser_session_for_dispatch", AsyncMock(side_effect=pin))
     order, budgets = [], []
     timeout_context = None
     original_claim = database.workflow_runs.claim_browser_session_retirement
@@ -3715,7 +3679,6 @@ async def test_forced_retirement_claim_propagates_cancellation(monkeypatch, forc
             workflow_run=run,
             workflow_request=request,
             has_attempt_row=True,
-            use_resolved_run_seed=True,
             on_finalization_denied=lambda: order.append("denied"),
         )
     )
@@ -3814,7 +3777,7 @@ async def test_superseded_forced_startup_cannot_pin_or_close_replacement(monkeyp
     denied = []
     if pin_cancelled:
         monkeypatch.setattr(
-            database.workflow_runs, "pin_browser_session_for_dispatch", AsyncMock(side_effect=asyncio.CancelledError())
+            database.workflow_runs, "link_browser_session_for_dispatch", AsyncMock(side_effect=asyncio.CancelledError())
         )
     if case == "orphan_cancelled":
         app.PERSISTENT_SESSIONS_MANAGER.close_session.side_effect = asyncio.CancelledError()
@@ -3826,7 +3789,6 @@ async def test_superseded_forced_startup_cannot_pin_or_close_replacement(monkeyp
             workflow_run=run,
             workflow_request=WorkflowRequestBody(data={}),
             has_attempt_row=True,
-            use_resolved_run_seed=True,
             attempt_number=1,
             dispatch_claim_started_at=claim,
             on_finalization_denied=lambda: denied.append(True),

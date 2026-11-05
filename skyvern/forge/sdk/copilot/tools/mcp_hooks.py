@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Mapping
 from contextvars import ContextVar
 from enum import StrEnum
-from typing import Any
+from typing import Any, get_args
 
 import structlog
 import yaml
@@ -25,6 +25,7 @@ from skyvern.cli.mcp_tools.blocks import (
 )
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent_context import ScoutedDragDestination, ScoutedInteraction, ScoutedSelectorCandidate
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.blocker_signal import stash_blocker_signal
 from skyvern.forge.sdk.copilot.composition_browser_expressions import scout_control_state_expression
@@ -74,9 +75,6 @@ from skyvern.forge.sdk.copilot.request_slots import is_canonical_request_slot_pa
 from skyvern.forge.sdk.copilot.result_evidence import COMPOSITION_INSPECTION_TOOL_NAME, EVALUATE_TOOL_NAME
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
-    ScoutedDragDestination,
-    ScoutedInteraction,
-    ScoutedSelectorCandidate,
     browser_valid_tab_count,
     current_demonstrated_action,
     tab_switch_refusal,
@@ -98,7 +96,8 @@ from skyvern.forge.sdk.workflow.models.block import (
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.schedules import MIN_SCHEDULE_INTERVAL_SECONDS
 from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
-from skyvern.schemas.workflows import AgentStepBlockYAML, TaskBlockYAML
+from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
+from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY, AgentStepBlockYAML, TaskBlockYAML
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK
 from skyvern.webeye.dialog_handler import DIALOG_POLICY_HELPER_CONTRACT
 
@@ -113,7 +112,6 @@ from .banned_blocks import (
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
     _TASK_V3_ENGINE,
     AGENT_FAMILY_BLOCK_SUMMARIES,
-    AGENT_STEP_BLOCK_SUMMARY,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     _authoring_violation_reject_message,
@@ -202,6 +200,9 @@ async def _tab_switch_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    # A demonstrated switch is a recorded fact; the live tab list may have changed since.
+    if current_demonstrated_action() is not None:
+        return None
     raw_index = params.get("index")
     index: int | None = None
     if isinstance(raw_index, int):
@@ -463,7 +464,7 @@ async def _block_schema_pre_hook_result(
                 "block_type": "task",
                 "summary": AGENT_FAMILY_BLOCK_SUMMARIES["task"],
                 "schema": _task_v3_pure_schema(TaskBlockYAML.model_json_schema()),
-                "agent_block_guidance": _agent_block_schema_guidance(),
+                "browser_task_guidance": _task_v3_block_schema_guidance(),
             },
         }
     if normalized == "agent_step" and normalized not in _copilot_banned_block_types(ctx):
@@ -670,6 +671,40 @@ def _apply_for_loop_schema_guidance(data: dict[str, Any]) -> None:
     data["example"] = copy.deepcopy(_FOR_LOOP_EXAMPLE)
 
 
+_WEB_SEARCH_BLOCK_OUTPUT: dict[str, JsonValue] = {
+    "referenced_as": "<label> or <label>_output",
+    "fields": {
+        "query": "the rendered query that was searched",
+        "provider": f"the provider that answered, one of {list(get_args(SearchProvider))}",
+        "results": {"item_keys": list(SearchResult.__annotations__)},
+        "total_count": "number of items in results",
+        "prompt_output": (
+            "null when the block has neither prompt nor json_schema; the json_schema-shaped answer when "
+            "json_schema is set; the prompt's plain answer when prompt is set without json_schema"
+        ),
+        "raw_response": {"pages": "the provider's unprocessed response pages"},
+    },
+    "when_not_completed": (
+        "the same fields plus status, failure_reason, errors and failure_category, and available_keys "
+        "or render_failure when the failure produced them"
+    ),
+    "example_with_json_schema": SearchResponse(
+        query="example official site",
+        provider="google",
+        results=[
+            SearchResult(
+                title="Example A",
+                link="https://a.example.test/",
+                snippet="The official site is https://b.example.test/.",
+                display_link="a.example.test",
+                position=1,
+            )
+        ],
+        prompt_output={"official_url": "https://b.example.test/"},
+    ).output(),
+}
+
+
 async def _get_block_schema_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -682,6 +717,8 @@ async def _get_block_schema_post_hook(
     if isinstance(data, dict):
         if data.get("block_type") == "for_loop":
             _apply_for_loop_schema_guidance(data)
+        if data.get("block_type") == "web_search":
+            data["block_output"] = copy.deepcopy(_WEB_SEARCH_BLOCK_OUTPUT)
         block_types = data.get("block_types")
         if isinstance(block_types, dict):
             # The server's hint names its own tool and a block type this turn may not author.
@@ -707,7 +744,7 @@ async def _get_block_schema_post_hook(
             and isinstance(data.get("schema"), dict)
         ):
             data["schema"] = _task_v3_pure_schema(data["schema"])
-            data["agent_block_guidance"] = _agent_block_schema_guidance()
+            data["browser_task_guidance"] = _task_v3_block_schema_guidance()
         if capability.code_blocks and block_type == "code":
             schema = data.get("schema")
             if isinstance(schema, dict):
@@ -738,6 +775,16 @@ async def _get_block_schema_post_hook(
                             "`items` is that object schema; null only when the block returns nothing. Mark a key "
                             "`required` only when the block cannot have done its job without it. Rewrite the "
                             "schema whenever you rewrite the return."
+                        ),
+                    }
+                    properties["parameter_keys"] = {
+                        "type": ["array", "null"],
+                        "items": {"type": "string"},
+                        "description": (
+                            "Keys whose values this code reads as Python variables of the same name: workflow "
+                            "parameter keys, and earlier block outputs as `<label>_output`. A `{{ }}` reference in "
+                            "the code is rendered into the source as text before it runs; a key listed here arrives "
+                            "as the value itself."
                         ),
                     }
                     required = schema.get("required")
@@ -789,12 +836,13 @@ def _task_v3_pure_schema(schema: dict[str, JsonValue]) -> dict[str, JsonValue]:
 
 
 _ENGINE_FIELD_DESCRIPTION = (
-    f"Omit on a new block: Copilot-authored agent blocks run on the {_TASK_V3_ENGINE} engine and it is filled in. "
-    "A saved block keeps the engine it has unless the user asks to change it."
+    f"Omit on a new block: Copilot-authored Browser Task blocks run on the {_TASK_V3_ENGINE} engine and it is "
+    "filled in. A saved block keeps the engine it has unless the user asks to change it."
 )
+_AGENT_STEP_CHOOSING_ENTRY = f"`agent_step`: {AGENT_STEP_BLOCK_SUMMARY}."
 
 
-def _agent_block_schema_guidance() -> list[str]:
+def _task_v3_block_schema_guidance() -> list[str]:
     return [
         _ENGINE_FIELD_DESCRIPTION,
         "Use engine-less blocks for orchestration, integrations, direct navigation, waits, files, and human interaction.",
@@ -868,12 +916,16 @@ async def _get_workflow_knowledge_post_hook(
             sections[NOTES_KNOWLEDGE_TOPIC] = copy.deepcopy(notes_section)
     if not isinstance(sections, dict):
         return result
+    # Section dicts are the knowledge tool's cached objects; edit copies so repeat calls start clean.
     for_loop = sections.get("for_loop_block")
     if isinstance(for_loop, dict):
-        for_loop["content"] = _FOR_LOOP_GUIDANCE
-    if capability.code_blocks and capability.agent_blocks:
-        choosing = sections.get("choosing_a_block")
-        if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
+        sections["for_loop_block"] = {**for_loop, "content": _FOR_LOOP_GUIDANCE}
+    choosing = sections.get("choosing_a_block")
+    if isinstance(choosing, dict) and isinstance(choosing.get("content"), str):
+        choosing = sections["choosing_a_block"] = dict(choosing)
+        if "agent_step" not in _copilot_banned_block_types(ctx):
+            choosing["content"] = f"{_AGENT_STEP_CHOOSING_ENTRY}\n\n{choosing['content']}"
+        if capability.code_blocks and capability.agent_blocks:
             choosing["content"] = f"{AUTHORING_FAMILY_GUIDANCE}\n\n{choosing['content']}"
     if not copilot_sees_notes(ctx):
         sections.pop(NOTES_KNOWLEDGE_TOPIC, None)
@@ -2374,11 +2426,7 @@ async def _schedule_parameters_credential_pre_hook(
         )
         tool_error = stash_blocker_signal(ctx, google_approval_blocker)
         return {"ok": False, "error": tool_error}
-    credential_approval_error = _credential_run_approval_error(
-        credential_ids,
-        ctx.request_policy,
-        workflow_definition=workflow.workflow_definition if workflow is not None else None,
-    )
+    credential_approval_error = _credential_run_approval_error(credential_ids, ctx.request_policy)
     if credential_approval_error is not None:
         return {"ok": False, "error": credential_approval_error}
     return None
@@ -2536,8 +2584,8 @@ def _normalized_authoring_capability(
 
 def _workflow_knowledge_description(capability: AuthoringCapability) -> str:
     topics_lead = (
-        f"Topic {CODE_BLOCK_RUNTIME_TOPIC} covers the builtins, module shims, and helpers a code block's Python may "
-        "use; omit"
+        f"Topic {CODE_BLOCK_RUNTIME_TOPIC} covers the builtins, module shims, helpers, and page object a code "
+        "block's Python may use, including which page calls are recorded as actions; omit"
         if capability.code_blocks
         else "Omit"
     )

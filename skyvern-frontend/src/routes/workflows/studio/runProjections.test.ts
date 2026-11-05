@@ -6,6 +6,7 @@ import {
 import { describe, expect, test } from "vitest";
 
 import {
+  ActionTypes,
   ActionsApiResponse,
   Status,
   TaskV2,
@@ -487,6 +488,48 @@ describe("resolveLandingSelectionId", () => {
     expect(resolveLandingSelectionId(frames, timeline, true)).toBe("act_last");
   });
 
+  test("a failed code block lands on its trailing failed row, which has no screenshot of its own", () => {
+    const timeline = [
+      blockItem({
+        workflow_run_block_id: "wrb_code",
+        block_type: "code",
+        status: Status.Failed,
+        actions: [
+          action({
+            action_id: "act_failed",
+            action_type: ActionTypes.NullAction,
+            status: Status.Failed,
+            step_id: "stp_1",
+            action_order: 2,
+          }),
+          action({
+            action_id: "act_2",
+            step_id: "stp_1",
+            action_order: 1,
+            screenshot_artifact_id: "art_2",
+          }),
+          action({
+            action_id: "act_1",
+            step_id: "stp_1",
+            action_order: 0,
+            screenshot_artifact_id: "art_1",
+          }),
+        ],
+      }),
+    ];
+    const frames = buildFilmstrip(timeline);
+
+    expect(resolveLandingSelectionId(frames, timeline, true)).toBe(
+      "act_failed",
+    );
+    expect(frames[frames.length - 1]).toMatchObject({
+      blockId: "wrb_code",
+      screenshotArtifactId: null,
+      stepId: "stp_1",
+      actionOrder: 2,
+    });
+  });
+
   // modified_at is bumped by any later write — a background block-description
   // update lands one on a block the run left long ago — so it cannot decide
   // which block ran last.
@@ -625,18 +668,42 @@ describe("buildBlockStatusMap", () => {
     });
   });
 
+  test("scopes repeated labels and flattened Task V2 wrappers to the selected run", () => {
+    const child = blockItem({
+      workflow_run_id: "child",
+      label: "constructor",
+      status: Status.Completed,
+    });
+    const outer = blockItem({
+      workflow_run_id: "outer",
+      label: "constructor",
+      status: Status.Failed,
+    });
+    const wrapper = blockItem({
+      workflow_run_id: "outer",
+      label: "task",
+      block_type: "task_v2",
+    }).block;
+    child.task_v2_blocks = [wrapper];
+
+    const map = buildBlockStatusMap([child, outer], "outer");
+
+    expect(map["constructor"]).toMatchObject({ block: outer.block });
+    expect(map.task?.block).toBe(wrapper);
+  });
+
   test("latest occurrence wins for looped block labels", () => {
     const map = buildBlockStatusMap([
       blockItem({ block_type: "for_loop", label: "loop", actions: null }, [
         blockItem({
           label: "inner",
-          status: Status.Completed,
-          actions: [action()],
+          status: Status.Failed,
+          actions: [action(), action()],
         }),
         blockItem({
           label: "inner",
-          status: Status.Failed,
-          actions: [action(), action()],
+          status: Status.Completed,
+          actions: [action()],
         }),
       ]),
     ]);

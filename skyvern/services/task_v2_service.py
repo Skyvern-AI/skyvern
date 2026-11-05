@@ -74,6 +74,14 @@ from skyvern.forge.sdk.schemas.task_v2 import (
     ThoughtType,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    TASK_V2_METADATA,
+    THOUGHT_METADATA,
+    browser_session_artifact_access,
+    browser_session_artifact_system_read,
+    child_run_artifact_access,
+    redact_descendant_entity,
+)
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
@@ -444,6 +452,8 @@ async def initialize_task_v2(
     trigger_type: WorkflowRunTriggerType | None = None,
     created_by: str | None = None,
 ) -> TaskV2:
+    if totp_identifier is not None and not totp_identifier.strip():
+        totp_identifier = None
     await _validate_task_v2_model_for_org(organization, model)
     if user_url:
         user_url = await asyncio.to_thread(validate_fetch_url, user_url)
@@ -726,6 +736,7 @@ async def run_task_v2(
     # work for subsequent blocks in the same loop iteration.
     with (
         skyvern_context.scoped(context, propagate_captcha_timeout=True),
+        browser_session_artifact_system_read(),
         track_run(task_v2.workflow_run_id, "workflow_run") if task_v2.workflow_run_id else nullcontext(),
     ):
         if task_v2.workflow_run_id:
@@ -904,7 +915,8 @@ async def settle_child_of_ended_parent(
     settled = await app.DATABASE.observer.get_task_v2(task_v2.observer_cruise_id, organization_id=organization_id)
     settled = settled or task_v2
     if won:
-        await send_task_v2_webhook(settled)
+        with browser_session_artifact_system_read():
+            await send_task_v2_webhook(settled)
     return settled
 
 
@@ -2478,7 +2490,7 @@ async def _generate_goto_url_task(
 
 
 async def get_thought_timelines(
-    *, task_v2_id: str, organization_id: str, cap_output_values: bool = False
+    *, task_v2_id: str, organization_id: str, cap_output_values: bool = False, workflow_run_id: str | None = None
 ) -> list[WorkflowRunTimeline]:
     thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
@@ -2488,6 +2500,30 @@ async def get_thought_timelines(
             ThoughtType.user_goal_check,
         ],
     )
+    if thoughts:
+        run_ids = {thought.workflow_run_id for thought in thoughts if thought.workflow_run_id}
+        if workflow_run_id:
+            run_ids.add(workflow_run_id)
+        if not run_ids:
+            task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+            if task_v2 and task_v2.workflow_run_id:
+                run_ids.add(task_v2.workflow_run_id)
+        access = await browser_session_artifact_access(
+            organization_id,
+            workflow_run_id=workflow_run_id or next(iter(run_ids), None),
+            runnable_ids=[task_v2_id],
+            include_run_tasks=True,
+        )
+        descendant_denied = any(
+            not access.allowed
+            for access in await asyncio.gather(
+                *(child_run_artifact_access(organization_id, run_id) for run_id in run_ids)
+            )
+        )
+        if descendant_denied:
+            thoughts = [redact_descendant_entity(thought, preserve=THOUGHT_METADATA) for thought in thoughts]
+        elif not access.allowed:
+            thoughts = [access.redact_output(thought) for thought in thoughts]
     if cap_output_values:
         # A thought's generated text and structured output ride this response beside
         # block outputs and are rendered directly by the run-detail UI.
@@ -3188,6 +3224,24 @@ async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = 
                 task_v2_id=task_v2.observer_cruise_id,
             )
 
+    access = await browser_session_artifact_access(
+        task_v2.organization_id,
+        session_ids=[task_v2.browser_session_id],
+        workflow_run_id=task_v2.workflow_run_id,
+        runnable_ids=[task_v2.observer_cruise_id],
+    )
+    descendant_denied = bool(
+        task_v2.workflow_run_id
+        and not (await child_run_artifact_access(task_v2.organization_id, task_v2.workflow_run_id)).allowed
+    )
+    artifacts_accessible = access.allowed and not descendant_denied
+    task_v2 = (
+        redact_descendant_entity(task_v2, preserve=TASK_V2_METADATA)
+        if descendant_denied
+        else access.redact_output(task_v2)
+    )
+    output = task_v2.output
+
     app_url = None
     if task_v2.workflow_run_id:
         app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{task_v2.workflow_run_id}"
@@ -3197,9 +3251,9 @@ async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = 
         run_type=RunType.task_v2,
         status=task_v2.status,
         output=(
-            truncate_oversized_response_value(task_v2.output, task_v2_id=task_v2.observer_cruise_id)
+            truncate_oversized_response_value(output, task_v2_id=task_v2.observer_cruise_id)
             if cap_output_values
-            else task_v2.output
+            else output
         ),
         failure_reason=workflow_run_resp.failure_reason if workflow_run_resp else None,
         queued_at=task_v2.queued_at,
@@ -3207,10 +3261,12 @@ async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = 
         finished_at=task_v2.finished_at,
         created_at=task_v2.created_at,
         modified_at=task_v2.modified_at,
-        recording_url=workflow_run_resp.recording_url if workflow_run_resp else None,
-        recording_archived=workflow_run_resp.recording_archived if workflow_run_resp else False,
-        screenshot_urls=workflow_run_resp.screenshot_urls if workflow_run_resp else None,
-        downloaded_files=workflow_run_resp.downloaded_files if workflow_run_resp else None,
+        recording_url=workflow_run_resp.recording_url if workflow_run_resp and artifacts_accessible else None,
+        recording_archived=workflow_run_resp.recording_archived
+        if workflow_run_resp and artifacts_accessible
+        else False,
+        screenshot_urls=workflow_run_resp.screenshot_urls if workflow_run_resp and artifacts_accessible else None,
+        downloaded_files=workflow_run_resp.downloaded_files if workflow_run_resp and artifacts_accessible else None,
         app_url=app_url,
         run_request=TaskRunRequest(
             engine=RunEngine.skyvern_v2,

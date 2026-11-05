@@ -24,7 +24,9 @@ class TaskType(StrEnum):
 class BrowserSeedSource(StrEnum):
     """Which layer of the seed-precedence chain seeded a run's browser (provenance).
 
-    Resolved once at run setup, before any browser creation, for all run types (C-semantics).
+    Resolved at run setup, before any browser creation, for all run types (C-semantics). A
+    serialized Save & Reuse run re-resolves once more after the sequential wait, so a profile an
+    earlier run in its lane saved while it was queued becomes own_memory rather than a stale pick.
     - override: explicit request browser_profile_id (one-run-only pick via API)
     - picked: the workflow's explicit profile pick (workflows.browser_profile_id) — "always start here"
     - own_memory: the workflow's own auto-profile (no pick + persist_browser_session)

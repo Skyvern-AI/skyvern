@@ -126,6 +126,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_PYTHON,
     UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_INT4, MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
 from skyvern.forge.sdk.routes.trigger_type import (
     caps_run_response_values,
@@ -155,6 +156,23 @@ from skyvern.forge.sdk.schemas.tasks import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    ACTION_METADATA,
+    STEP_METADATA,
+    TASK_V2_METADATA,
+    BrowserSessionArtifactAccess,
+    ChildRunArtifactCache,
+    browser_session_artifact_access,
+    browser_session_artifact_read,
+    cache_child_run_artifact_access,
+    child_run_artifact_access,
+    redact_descendant_entity,
+    redact_workflow_run_artifact_rows,
+)
+from skyvern.forge.sdk.services.browser_session_redaction import (
+    BrowserSessionAddressResponse,
+    redact_browser_session_addresses,
+)
 from skyvern.forge.sdk.services.request_principal import (
     RequestPrincipal,
     get_request_principal,
@@ -191,6 +209,14 @@ from skyvern.forge.sdk.workflow.service import (
     one_time_code_markers,
     redact_one_time_code_actions,
     redact_one_time_code_step,
+)
+from skyvern.forge.sdk.workflow.validation import (
+    WorkflowProblem,
+    WorkflowValidationResult,
+    WorkflowValidationTooComplex,
+    ensure_workflow_validation_limits,
+    validate_stored_workflow,
+    validate_workflow_definition,
 )
 from skyvern.schemas.artifacts import EntityType, entity_type_to_param
 from skyvern.schemas.folders import Folder, FolderCreate, FolderUpdate, UpdateWorkflowFolderRequest
@@ -269,6 +295,22 @@ from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.real_browser_manager import runtime_supports_browser_type_selection
 
 LOG = structlog.get_logger()
+
+
+async def _redact_browser_session_addresses(
+    responses: Sequence[BrowserSessionAddressResponse],
+    organization_id: str,
+    *,
+    task_v2_browser_session_id: str | None = None,
+) -> None:
+    await redact_browser_session_addresses(
+        responses,
+        organization_id,
+        app.AGENT_FUNCTION,
+        get_request_principal(),
+        task_v2_browser_session_id=task_v2_browser_session_id,
+    )
+
 
 # Every OrganizationUpdate input has one corresponding persisted organization field.
 ORGANIZATION_UPDATE_AUDIT_FIELD_MAP = {
@@ -507,8 +549,6 @@ async def run_task(
             run_type = RunType.anthropic_cua
         elif resolved_engine == RunEngine.ui_tars:
             run_type = RunType.ui_tars
-        elif resolved_engine == RunEngine.yutori_navigator:
-            run_type = RunType.yutori_navigator
         elif resolved_engine == RunEngine.skyvern_v3:
             run_type = RunType.task_v3
         _schedule_task_run_created(
@@ -519,7 +559,7 @@ async def run_task(
             caller_type=caller.caller_type,
         )
         # build the task run response
-        return TaskRunResponse(
+        response = TaskRunResponse(
             run_id=task_v1_response.task_id,
             run_type=run_type,
             status=str(task_v1_response.status),
@@ -545,6 +585,8 @@ async def run_task(
                 file_ids=run_request.file_ids,
             ),
         )
+        await _redact_browser_session_addresses([response], current_org.organization_id)
+        return response
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
         v2_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
@@ -617,7 +659,7 @@ async def run_task(
             run_type=RunType.task_v2,
             caller_type=caller.caller_type,
         )
-        return TaskRunResponse(
+        response = TaskRunResponse(
             run_id=task_v2.observer_cruise_id,
             run_type=RunType.task_v2,
             status=str(task_v2.status),
@@ -645,6 +687,8 @@ async def run_task(
                 file_ids=run_request.file_ids,
             ),
         )
+        await _redact_browser_session_addresses([response], current_org.organization_id)
+        return response
     LOG.error("Invalid agent engine", engine=run_request.engine, organization_id=current_org.organization_id)
     raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")
 
@@ -808,7 +852,7 @@ async def run_workflow(
         workflow_run_request, workflow_run, owned_workflow
     )
 
-    return WorkflowRunResponse(
+    response = WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
         status=str(workflow_run.status),
@@ -827,6 +871,8 @@ async def run_workflow(
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
+    await _redact_browser_session_addresses([response], current_org.organization_id)
+    return response
 
 
 @base_router.get(
@@ -863,16 +909,19 @@ async def get_run(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> RunResponse:
-    run_response = await run_service.get_run_response_coalesced(
-        run_id,
-        organization_id=current_org.organization_id,
-        cap_output_values=caps_run_response_values(x_user_agent),
-    )
+    with browser_session_artifact_read(get_request_principal()):
+        run_response = await run_service.get_run_response_coalesced(
+            run_id,
+            organization_id=current_org.organization_id,
+            cap_output_values=caps_run_response_values(x_user_agent),
+        )
     if not run_response:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Task run not found {run_id}",
         )
+    run_response = run_response.model_copy(deep=True)
+    await _redact_browser_session_addresses([run_response], current_org.organization_id)
     return run_response
 
 
@@ -961,6 +1010,16 @@ async def bulk_cancel_runs(
         raise
 
 
+def _sanitize_workflow_yaml_mapping(parsed: Any) -> dict[str, Any]:
+    # YAML parses a bare word, number, list or empty body to a non-dict, which the sanitizer cannot copy.
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid workflow definition. The YAML must be a mapping with a title and a workflow_definition.",
+        )
+    return sanitize_workflow_yaml_with_references(parsed)
+
+
 @legacy_base_router.post(
     "/workflows",
     openapi_extra={
@@ -999,7 +1058,7 @@ async def create_workflow_legacy(
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     # Auto-sanitize block labels and update references for imports
-    workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
+    workflow_yaml = _sanitize_workflow_yaml_mapping(workflow_yaml)
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
@@ -1043,6 +1102,105 @@ async def create_workflow_legacy(
 
 IDEMPOTENCY_KEY_MAX_BYTES = 255
 IDEMPOTENCY_KEY_CONTRACT = f"Idempotency-Key must contain 1 to {IDEMPOTENCY_KEY_MAX_BYTES} visible ASCII bytes."
+MAX_WORKFLOW_VALIDATION_DRAFT_BYTES = 100_000
+
+
+async def _validate_workflow_draft(request: Request) -> WorkflowValidationResult:
+    body = await request.body()
+    if len(body) > MAX_WORKFLOW_VALIDATION_DRAFT_BYTES:
+        raise HTTPException(
+            status_code=http_status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"Workflow validation drafts must be at most {MAX_WORKFLOW_VALIDATION_DRAFT_BYTES} bytes.",
+        )
+    try:
+        data = await asyncio.to_thread(orjson.loads, body)
+        if not isinstance(data, dict):
+            raise ValueError("Workflow validation requires a JSON object.")
+        ensure_workflow_validation_limits(data)
+        return await asyncio.to_thread(validate_workflow_definition, data)
+    except WorkflowValidationTooComplex as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[
+                WorkflowProblem(
+                    path="workflow_definition",
+                    code="validation_limit",
+                    message=str(exc),
+                )
+            ],
+        )
+    except (orjson.JSONDecodeError, RecursionError, ValueError) as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[WorkflowProblem(path="body", code="invalid_draft", message=str(exc))],
+        )
+
+
+@legacy_base_router.post("/workflows/validate", include_in_schema=False)
+@base_router.post(
+    "/workflows/validate",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/agents/validate",
+    include_in_schema=False,
+)
+async def validate_workflow(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    del current_org
+    return await _validate_workflow_draft(request)
+
+
+@legacy_base_router.post("/workflows/validate/", include_in_schema=False)
+@base_router.post("/workflows/validate/", include_in_schema=False)
+@base_router.post("/agents/validate/", include_in_schema=False)
+async def validate_workflow_trailing_slash(
+    request: Request,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    del current_org
+    return await _validate_workflow_draft(request)
+
+
+@legacy_base_router.post("/workflows/{workflow_permanent_id}/validate", include_in_schema=False)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/validate",
+    include_in_schema=False,
+)
+@base_router.post(
+    "/agents/{workflow_permanent_id}/validate",
+    include_in_schema=False,
+)
+async def validate_saved_workflow(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    await _enforce_folder_access("workflow.read", {"workflow_permanent_id": workflow_permanent_id})
+    workflow = await app.WORKFLOW_SERVICE.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=current_org.organization_id,
+    )
+    try:
+        return await asyncio.to_thread(validate_stored_workflow, workflow)
+    except WorkflowValidationTooComplex as exc:
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+    except RecursionError as exc:
+        return WorkflowValidationResult(
+            valid=False,
+            problems=[WorkflowProblem(path="body", code="invalid_draft", message=str(exc))],
+        )
+
+
+@legacy_base_router.post("/workflows/{workflow_permanent_id}/validate/", include_in_schema=False)
+@base_router.post("/workflows/{workflow_permanent_id}/validate/", include_in_schema=False)
+@base_router.post("/agents/{workflow_permanent_id}/validate/", include_in_schema=False)
+async def validate_saved_workflow_trailing_slash(
+    workflow_permanent_id: str,
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowValidationResult:
+    return await validate_saved_workflow(workflow_permanent_id, current_org)
 
 
 def validate_idempotency_key(
@@ -1107,7 +1265,7 @@ async def create_workflow(
         if data.yaml_definition:
             workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
-            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
+            workflow_json_from_yaml = _sanitize_workflow_yaml_mapping(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
@@ -1328,6 +1486,8 @@ async def import_workflow_from_pdf(
 ) -> dict[str, Any]:
     """Import a workflow from a PDF file containing Standard Operating Procedures."""
     analytics.capture("skyvern-oss-workflow-import-pdf")
+    # Notes go into the import only for people the server finds on the Doc editor; a client-sent field is ignored.
+    doc_editor_enabled = await app.AGENT_FUNCTION.workflow_doc_editor_enabled(current_org.organization_id, user_id)
     build_source = workflow_build_source_from_user_agent(x_user_agent)
 
     # Read file and validate early (before creating import record)
@@ -1384,7 +1544,9 @@ async def import_workflow_from_pdf(
     async def process_pdf_import() -> None:
         try:
             # Create workflow from extracted text (LLM processing)
-            result = await pdf_import_service.create_workflow_from_sop_text(sop_text, current_org)
+            result = await pdf_import_service.create_workflow_from_sop_text(
+                sop_text, current_org, doc_editor_enabled=doc_editor_enabled
+            )
             imported = WorkflowCreateYAMLRequest.model_validate(result)
             await app.AGENT_FUNCTION.enforce_folder_access_for_references(
                 principal, "workflow.run", imported.model_dump(exclude={"folder_id"})
@@ -1603,7 +1765,7 @@ async def update_workflow(
         if data.yaml_definition:
             workflow_json_from_yaml = safe_load_no_dates(data.yaml_definition)
             # Auto-sanitize block labels and update references for imports
-            workflow_json_from_yaml = sanitize_workflow_yaml_with_references(workflow_json_from_yaml)
+            workflow_json_from_yaml = _sanitize_workflow_yaml_mapping(workflow_json_from_yaml)
             workflow_definition = WorkflowCreateYAMLRequest.model_validate(workflow_json_from_yaml)
         elif data.json_definition:
             workflow_definition = data.json_definition
@@ -1842,7 +2004,7 @@ async def get_folder(
 )
 @base_router.get("/folders/", response_model=list[Folder], include_in_schema=False)
 async def get_folders(
-    page: int = Query(1, ge=1, description="Page number"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -3332,11 +3494,146 @@ async def _require_write_in_every_folder() -> None:
 
 
 _COPILOT_CHAT_LOG_PATH = re.compile(rf"/logs/{LogEntityType.WORKFLOW_COPILOT_CHAT}/([^/]+)/")
+_DESCENDANT_CHECKED_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.DOWNLOAD,
+        ArtifactType.PDF,
+        ArtifactType.RECORDING,
+        ArtifactType.SESSION_REPLAY,
+        ArtifactType.HAR,
+        ArtifactType.BROWSER_CONSOLE_LOG,
+        ArtifactType.SKYVERN_LOG,
+        ArtifactType.SKYVERN_LOG_RAW,
+        ArtifactType.TRACE,
+        ArtifactType.STEP_ARCHIVE,
+        ArtifactType.TASK_ARCHIVE,
+        ArtifactType.SCREENSHOT,
+        ArtifactType.SCREENSHOT_LLM,
+        ArtifactType.SCREENSHOT_ACTION,
+        ArtifactType.SCREENSHOT_FINAL,
+        ArtifactType.SCREENSHOT_PROXY,
+        ArtifactType.SCREENSHOT_PRE_SUBMIT,
+        ArtifactType.HTML,
+        ArtifactType.HTML_SCRAPE,
+        ArtifactType.HTML_ACTION,
+        ArtifactType.HTML_PRE_SUBMIT,
+        ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+        ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+        ArtifactType.VISIBLE_ELEMENTS_ID_XPATH_MAP,
+        ArtifactType.VISIBLE_ELEMENTS_TREE,
+        ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+        ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+        ArtifactType.HASHED_HREF_MAP,
+        ArtifactType.LLM_PROMPT,
+        ArtifactType.LLM_REQUEST,
+        ArtifactType.LLM_RESPONSE,
+        ArtifactType.LLM_RESPONSE_PARSED,
+        ArtifactType.LLM_RESPONSE_RENDERED,
+    }
+)
 
 
-async def _authorize_artifact_read(artifact: Artifact) -> None:
+async def _authorize_artifact_read(
+    artifact: Artifact, checked_access: set[tuple[str, str, str]] | None = None, *, check_folder: bool = True
+) -> None:
+    principal = get_request_principal()
+    organization_id = artifact.organization_id
+    if checked_access is None:
+        checked_access = set()
+    if await app.AGENT_FUNCTION.should_check_browser_session_artifacts(principal, organization_id):
+        session_ids = {artifact.browser_session_id} if artifact.browser_session_id else set()
+        run_ids = {artifact.workflow_run_id} if artifact.workflow_run_id else set()
+        standalone_ids: set[str] = set()
+        try:
+            task_ids = {artifact.task_id} if artifact.task_id else set()
+            task_v2_ids = {artifact.observer_cruise_id} if artifact.observer_cruise_id else set()
+            if artifact.run_id and artifact.run_id not in run_ids:
+                run = await app.DATABASE.workflow_runs.get_workflow_run(
+                    artifact.run_id, organization_id=organization_id
+                )
+                if run:
+                    run_ids.add(run.workflow_run_id)
+                else:
+                    task = await app.DATABASE.tasks.get_task(artifact.run_id, organization_id=organization_id)
+                    if task:
+                        task_ids.add(task.task_id)
+                    else:
+                        task_v2_ids.add(artifact.run_id)
+            if artifact.workflow_run_block_id and not run_ids:
+                block = await app.DATABASE.observer.get_workflow_run_block(
+                    artifact.workflow_run_block_id, organization_id=organization_id
+                )
+                run_ids.add(block.workflow_run_id)
+            for task_id in task_ids:
+                task = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
+                if not task:
+                    raise PermissionError
+                if task.browser_session_id:
+                    session_ids.add(task.browser_session_id)
+                if task.workflow_run_id:
+                    run_ids.add(task.workflow_run_id)
+                else:
+                    standalone_ids.add(task_id)
+            for task_v2_id in task_v2_ids:
+                task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+                if not task_v2:
+                    raise PermissionError
+                if task_v2.browser_session_id:
+                    session_ids.add(task_v2.browser_session_id)
+                if task_v2.workflow_run_id:
+                    run_ids.add(task_v2.workflow_run_id)
+                else:
+                    standalone_ids.add(task_v2_id)
+            for session_id in session_ids:
+                key = ("session", organization_id, session_id)
+                if key not in checked_access:
+                    if not await app.AGENT_FUNCTION.can_access_browser_session_artifacts(
+                        principal, organization_id, session_id
+                    ):
+                        raise PermissionError
+                    checked_access.add(key)
+            for workflow_run_id in run_ids:
+                key = ("run", organization_id, workflow_run_id)
+                if key not in checked_access:
+                    with browser_session_artifact_read(principal):
+                        access = await browser_session_artifact_access(
+                            organization_id,
+                            workflow_run_id=workflow_run_id,
+                            include_run_tasks=True,
+                        )
+                    if not access.allowed:
+                        raise PermissionError
+                    checked_access.add(key)
+                if artifact.artifact_type in _DESCENDANT_CHECKED_ARTIFACT_TYPES:
+                    key = ("descendants", organization_id, workflow_run_id)
+                    if key not in checked_access:
+                        with browser_session_artifact_read(principal):
+                            access = await child_run_artifact_access(organization_id, workflow_run_id)
+                        if not access.allowed:
+                            raise PermissionError
+                        checked_access.add(key)
+            for runnable_id in standalone_ids:
+                key = ("runnable", organization_id, runnable_id)
+                if key not in checked_access:
+                    with browser_session_artifact_read(principal):
+                        access = await browser_session_artifact_access(organization_id, runnable_ids=[runnable_id])
+                    if not access.allowed:
+                        raise PermissionError
+                    checked_access.add(key)
+        except PermissionError:
+            raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Artifact access denied") from None
+        except Exception:
+            LOG.warning(
+                "Artifact authorization lookup failed; denying",
+                organization_id=organization_id,
+                artifact_id=artifact.artifact_id,
+            )
+            raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Artifact access denied") from None
+
+    if not check_folder:
+        return
     # Any folder grant allows reads, so a caller who can see every folder needs no lookups.
-    if await app.AGENT_FUNCTION.accessible_workflow_folder_ids(get_request_principal()) is None:
+    if await app.AGENT_FUNCTION.accessible_workflow_folder_ids(principal) is None:
         return
     for artifact_key, resource_key in (
         ("workflow_run_id", "workflow_run_id"),
@@ -3359,6 +3656,26 @@ async def _authorize_artifact_read(artifact: Artifact) -> None:
     # Copilot screenshots and audio name their chat only in the log path create_log_artifact writes.
     if chat_match := _COPILOT_CHAT_LOG_PATH.search(artifact.uri or ""):
         await _enforce_folder_access("workflow_copilot.read", {"workflow_copilot_chat_id": chat_match.group(1)})
+
+
+async def _authorize_artifact_list(artifacts: list[Artifact], *, check_folder: bool = True) -> None:
+    checked: set[tuple[str | None, ...]] = set()
+    checked_access: set[tuple[str, str, str]] = set()
+    for artifact in artifacts:
+        key: tuple[str | None, ...] = (
+            artifact.workflow_run_id,
+            artifact.task_id,
+            artifact.run_id,
+            artifact.workflow_run_block_id,
+            artifact.observer_cruise_id,
+            artifact.browser_session_id,
+            "descendants" if artifact.artifact_type in _DESCENDANT_CHECKED_ARTIFACT_TYPES else None,
+        )
+        if not any(key[:-1]):
+            key = (*key, artifact.artifact_id)
+        if key not in checked:
+            await _authorize_artifact_read(artifact, checked_access, check_folder=check_folder)
+            checked.add(key)
 
 
 @base_router.get(
@@ -3776,6 +4093,7 @@ async def get_run_artifacts(
     # Ensure we have a list of artifacts (since group_by_type=False, this will always be a list)
     artifacts_list = artifacts if isinstance(artifacts, list) else []
 
+    await _authorize_artifact_list(artifacts_list)
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts_list)
     for i, artifact in enumerate(artifacts_list):
         artifact.signed_url = signed_urls[i]
@@ -3815,6 +4133,7 @@ async def retry_run_webhook(
         organization_id=current_org.organization_id,
         api_key=x_api_key,
         webhook_url=request.webhook_url if request else None,
+        principal=get_request_principal(),
     )
 
 
@@ -3973,7 +4292,7 @@ async def run_block(
         )
         raise
 
-    return BlockRunResponse(
+    response = BlockRunResponse(
         block_labels=block_run_request.block_labels,
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
@@ -3991,6 +4310,8 @@ async def run_block(
         browser_session_id=workflow_run.browser_session_id,
         app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
     )
+    await _redact_browser_session_addresses([response], organization.organization_id)
+    return response
 
 
 ################# Legacy Endpoints #################
@@ -4253,8 +4574,8 @@ def _ndjson_line(content: Any) -> bytes:
     )
 
 
-def _serialize_task_export_batch(tasks: list[Task]) -> bytes:
-    return b"".join(_ndjson_line(task.to_task_response().model_dump()) for task in tasks)
+def _serialize_task_export_batch(tasks: list[TaskResponse]) -> bytes:
+    return b"".join(_ndjson_line(task.model_dump()) for task in tasks)
 
 
 # Registered before /tasks/{task_id}, which would otherwise match "export" as a task id.
@@ -4276,12 +4597,14 @@ async def export_tasks(
     """
     analytics.capture("skyvern-oss-agent-tasks-export")
     organization_id = current_org.organization_id
+    principal = get_request_principal()
     scope = _task_cursor_scope(organization_id, filters)
     start_after = _decode_task_cursor(cursor or "", scope)
 
     async def batches() -> AsyncIterator[bytes]:
         after = start_after
         task_count = 0
+        child_access_cache: ChildRunArtifactCache = {}
         while True:
             tasks = await app.DATABASE.tasks.get_tasks(
                 page_size=TASK_EXPORT_BATCH_SIZE,
@@ -4292,7 +4615,10 @@ async def export_tasks(
             )
             if tasks:
                 task_count += len(tasks)
-                yield await asyncio.to_thread(_serialize_task_export_batch, tasks)
+                await _redact_browser_session_addresses(tasks, organization_id)
+                with cache_child_run_artifact_access(child_access_cache):
+                    responses = await _task_list_responses(tasks, organization_id, principal)
+                yield await asyncio.to_thread(_serialize_task_export_batch, responses)
             if len(tasks) < TASK_EXPORT_BATCH_SIZE:
                 yield _ndjson_line({"export_complete": True, "task_count": task_count})
                 return
@@ -4317,11 +4643,13 @@ async def get_task_v1(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> TaskResponse:
     analytics.capture("skyvern-oss-agent-task-get")
-    task_response = await task_v1_service.get_task_v1_response(
-        task_id=task_id, organization_id=current_org.organization_id
-    )
+    with browser_session_artifact_read(get_request_principal()):
+        task_response = await task_v1_service.get_task_v1_response(
+            task_id=task_id, organization_id=current_org.organization_id
+        )
     if caps_run_response_values(x_user_agent):
-        return capped_task_v1_response(task_response)
+        task_response = capped_task_v1_response(task_response)
+    await _redact_browser_session_addresses([task_response], current_org.organization_id)
     return task_response
 
 
@@ -4619,7 +4947,7 @@ async def retry_workflow_run(
         workflow_request=legacy_workflow_request,
     )
 
-    return WorkflowRunResponse(
+    response = WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
         status=str(workflow_run.status),
@@ -4638,6 +4966,8 @@ async def retry_workflow_run(
         run_with=workflow_run.run_with,
         ai_fallback=workflow_run.ai_fallback,
     )
+    await _redact_browser_session_addresses([response], current_org.organization_id)
+    return response
 
 
 @legacy_base_router.post(
@@ -4718,12 +5048,37 @@ async def retry_webhook(
     # get latest step
     latest_step = await app.DATABASE.tasks.get_latest_step(task_id, organization_id=current_org.organization_id)
     if not latest_step:
-        return await app.agent.build_task_response(task=task_obj)
+        with browser_session_artifact_read(get_request_principal()):
+            response = await app.agent.build_task_response(task=task_obj)
+        await _redact_browser_session_addresses([response], current_org.organization_id)
+        return response
 
     # retry the webhook (single-shot - manual replay is itself the retry)
-    await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key, enable_retries=False)
+    with browser_session_artifact_read(get_request_principal()):
+        await app.agent.execute_task_webhook(task=task_obj, api_key=x_api_key, enable_retries=False)
+        response = await app.agent.build_task_response(task=task_obj, last_step=latest_step)
+    await _redact_browser_session_addresses([response], current_org.organization_id)
+    return response
 
-    return await app.agent.build_task_response(task=task_obj, last_step=latest_step)
+
+async def _task_list_responses(
+    tasks: list[Task], organization_id: str, principal: RequestPrincipal | None
+) -> list[TaskResponse]:
+    if not await app.AGENT_FUNCTION.should_check_browser_session_artifacts(principal, organization_id):
+        return await asyncio.to_thread(lambda: [task.to_task_response() for task in tasks])
+    responses: list[TaskResponse] = []
+    with browser_session_artifact_read(principal):
+        for offset in range(0, len(tasks), 8):
+            responses.extend(
+                await asyncio.gather(*(app.agent.build_task_response(task) for task in tasks[offset : offset + 8]))
+            )
+    return responses
+
+
+async def _task_list_response(tasks: list[Task], organization_id: str) -> Response:
+    with cache_child_run_artifact_access({}):
+        responses = await _task_list_responses(tasks, organization_id, get_request_principal())
+    return await asyncio.to_thread(lambda: ORJSONResponse([response.model_dump() for response in responses]))
 
 
 @legacy_base_router.get(
@@ -4741,8 +5096,8 @@ async def retry_webhook(
 )
 async def get_tasks(
     filters: Annotated[TaskListFilters, Depends(task_list_filters)],
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     cursor: str | None = Query(None, max_length=_TASK_CURSOR_MAX_LENGTH),
 ) -> Response:
@@ -4768,9 +5123,8 @@ async def get_tasks(
         tasks = await app.DATABASE.tasks.get_tasks(
             page, page_size, organization_id=current_org.organization_id, **asdict(filters)
         )
-        # Without a last step, build_task_response is just to_task_response. Building and serializing a large page
-        # in a thread keeps it from stalling every other request on the event loop.
-        return await asyncio.to_thread(lambda: ORJSONResponse([task.to_task_response().model_dump() for task in tasks]))
+        await _redact_browser_session_addresses(tasks, current_org.organization_id)
+        return await _task_list_response(tasks, current_org.organization_id)
 
     if page != 1:
         raise HTTPException(
@@ -4786,9 +5140,8 @@ async def get_tasks(
         **asdict(filters),
     )
     page_tasks = tasks[:page_size]
-    response = await asyncio.to_thread(
-        lambda: ORJSONResponse([task.to_task_response().model_dump() for task in page_tasks])
-    )
+    await _redact_browser_session_addresses(page_tasks, current_org.organization_id)
+    response = await _task_list_response(page_tasks, current_org.organization_id)
     if len(tasks) > page_size:
         response.headers[TASK_NEXT_CURSOR_HEADER] = _encode_task_cursor(scope, page_tasks[-1], filters.order_by_column)
     return response
@@ -4818,6 +5171,11 @@ _WORKFLOW_RUN_SEARCH_KEY_DESCRIPTION = (
 _RUN_SEARCH_KEY_EXAMPLES = ["login_url", "wr_abc123", "bp_123456789", "cred_123456789"]
 
 
+async def _redact_workflow_run_list(runs: list[WorkflowRun], organization_id: str) -> list[WorkflowRun]:
+    with browser_session_artifact_read(get_request_principal()):
+        return await redact_workflow_run_artifact_rows(runs, organization_id)
+
+
 @legacy_base_router.get(
     "/runs",
     tags=["agent"],
@@ -4833,8 +5191,8 @@ _RUN_SEARCH_KEY_EXAMPLES = ["login_url", "wr_abc123", "bp_123456789", "cred_1234
 )
 async def get_runs(
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     status: Annotated[list[WorkflowRunStatus] | None, Query()] = None,
     search_key: str | None = Query(
         None,
@@ -4852,6 +5210,29 @@ async def get_runs(
         current_org.organization_id, page=page, page_size=page_size, status=status, search_key=search_key
     )
     await app.WORKFLOW_SERVICE._attach_latest_attempt_views([run for run in runs if isinstance(run, WorkflowRun)])
+    workflow_runs = iter(
+        await _redact_workflow_run_list(
+            [run for run in runs if isinstance(run, WorkflowRun)], current_org.organization_id
+        )
+    )
+    tasks = [run for run in runs if isinstance(run, Task)]
+    if tasks:
+        with cache_child_run_artifact_access({}):
+            task_responses = await _task_list_responses(tasks, current_org.organization_id, get_request_principal())
+    else:
+        task_responses = []
+    task_rows = iter(task_responses)
+    redacted_runs: list[WorkflowRun | Task] = []
+    for run in runs:
+        if isinstance(run, WorkflowRun):
+            redacted_runs.append(next(workflow_runs))
+        else:
+            task = next(task_rows).request
+            if not isinstance(task, Task):
+                raise RuntimeError("Task list response did not retain the task")
+            redacted_runs.append(task)
+    runs = redacted_runs
+    await _redact_browser_session_addresses(runs, current_org.organization_id)
     # failure_category takes its public JSON-mode form, as response_model serialization would give it; every other
     # field keeps this route's existing encoding.
     return ORJSONResponse(
@@ -5131,6 +5512,27 @@ async def get_runs_v2(
     return ORJSONResponse(response_items)
 
 
+async def _task_artifact_access(task_id: str, organization_id: str) -> tuple[BrowserSessionArtifactAccess, bool]:
+    principal = get_request_principal()
+    if not await app.AGENT_FUNCTION.should_check_browser_session_artifacts(principal, organization_id):
+        return BrowserSessionArtifactAccess(True), False
+    task = await app.DATABASE.tasks.get_task(task_id, organization_id=organization_id)
+    if not task:
+        return BrowserSessionArtifactAccess(False), False
+    with browser_session_artifact_read(principal):
+        access = await browser_session_artifact_access(
+            organization_id,
+            session_ids=[task.browser_session_id],
+            workflow_run_id=task.workflow_run_id,
+            runnable_ids=[task_id],
+        )
+        if task.workflow_run_id:
+            child_access = await child_run_artifact_access(organization_id, task.workflow_run_id)
+            if not child_access.allowed:
+                return child_access, True
+    return access, False
+
+
 @legacy_base_router.get(
     "/tasks/{task_id}/steps",
     tags=["agent"],
@@ -5157,8 +5559,16 @@ async def get_steps(
     steps = await app.DATABASE.tasks.get_task_steps(task_id, organization_id=current_org.organization_id)
     actions = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
     marked_ids, values = one_time_code_markers(actions)
+    access, descendant_denied = await _task_artifact_access(task_id, current_org.organization_id)
     return ORJSONResponse(
-        [redact_one_time_code_step(step, marked_ids, values).model_dump(exclude_none=True) for step in steps]
+        [
+            (
+                redact_descendant_entity(step, preserve=STEP_METADATA)
+                if descendant_denied
+                else access.redact_output(redact_one_time_code_step(step, marked_ids, values))
+            ).model_dump(exclude_none=True)
+            for step in steps
+        ]
     )
 
 
@@ -5209,9 +5619,7 @@ async def get_artifacts(
         organization_id=current_org.organization_id,
         **params,  # type: ignore[arg-type]
     )
-    # Every artifact of one entity belongs to the same run.
-    if artifacts:
-        await _authorize_artifact_read(artifacts[0])
+    await _authorize_artifact_list(artifacts)
 
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
     for i, artifact in enumerate(artifacts):
@@ -5251,6 +5659,7 @@ async def get_step_artifacts(
         step_id,
         organization_id=current_org.organization_id,
     )
+    await _authorize_artifact_list(artifacts)
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
     for i, artifact in enumerate(artifacts):
         artifact.signed_url = signed_urls[i]
@@ -5280,7 +5689,15 @@ async def get_actions(
     # Hydrated, not the base read: the typed value of an INPUT_TEXT lives only in action_json, so
     # Action.model_validate on the ORM row returns text=None for every row.
     hydrated = await app.DATABASE.tasks.get_task_actions_hydrated(task_id, organization_id=current_org.organization_id)
+    access, descendant_denied = await _task_artifact_access(task_id, current_org.organization_id)
     actions = redact_one_time_code_actions(hydrated)
+    if descendant_denied:
+        actions = [
+            redact_descendant_entity(Action.model_validate(action.model_dump()), preserve=ACTION_METADATA)
+            for action in actions
+        ]
+    else:
+        actions = access.redact_output(actions)
     if caps_run_response_values(x_user_agent):
         # Hydration puts a completion action's whole response/output on the wire, which the app
         # renders with JSON.stringify on the main thread. Same bound the run-detail reads apply.
@@ -5308,7 +5725,7 @@ async def run_workflow_legacy(
     background_tasks: BackgroundTasks,
     workflow_id: str,  # this is the workflow_permanent_id internally
     workflow_request: WorkflowRequestBody,
-    version: int | None = None,
+    version: Annotated[int | None, Query(ge=1, le=MAX_INT4)] = None,
     caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
     user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
     template: bool = Query(False),
@@ -5449,8 +5866,8 @@ async def run_workflow_legacy(
     include_in_schema=False,
 )
 async def get_workflow_runs(
-    page: int = Query(1, ge=1, description="Page number for pagination."),
-    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE, description="Number of runs to return per page."),
     status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
@@ -5532,7 +5949,7 @@ async def get_workflow_runs(
             _ORG_RUNS_SEARCH_DEFAULT_WINDOW
         )
     try:
-        return await app.WORKFLOW_SERVICE.get_workflow_runs(
+        workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs(
             organization_id=current_org.organization_id,
             page=page,
             page_size=page_size,
@@ -5542,6 +5959,9 @@ async def get_workflow_runs(
             created_at_start=effective_created_at_start,
             created_at_end=created_at_end,
         )
+        workflow_runs = await _redact_workflow_run_list(workflow_runs, current_org.organization_id)
+        await _redact_browser_session_addresses(workflow_runs, current_org.organization_id)
+        return workflow_runs
     except RunsListSearchCanceled as exc:
         LOG.warning(
             "runs_list_statement_timeout",
@@ -5613,7 +6033,7 @@ async def _get_workflow_runs_by_id(
         )
 
     try:
-        return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+        workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_id,
             organization_id=organization_id,
             page=page,
@@ -5626,6 +6046,9 @@ async def _get_workflow_runs_by_id(
             created_at_end=created_at_end,
             run_tags=run_tags,
         )
+        workflow_runs = await _redact_workflow_run_list(workflow_runs, organization_id)
+        await _redact_browser_session_addresses(workflow_runs, organization_id)
+        return workflow_runs
     except RunsListSearchCanceled as exc:
         # Only the search statement raises this, so a cancellation in the attempt lookup that
         # follows it stays a server error instead of being reported as a slow search.
@@ -5670,8 +6093,8 @@ async def _get_workflow_runs_by_id(
 )
 async def get_workflow_runs_by_id(
     workflow_id: str,
-    page: int = Query(1, ge=1, description="Page number for pagination."),
-    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE, description="Number of runs to return per page."),
     status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
@@ -5764,8 +6187,8 @@ async def get_workflow_runs_by_id(
 )
 async def get_workflow_runs_by_id_legacy(
     workflow_id: str,
-    page: int = Query(1, ge=1, description="Page number for pagination."),
-    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE, description="Number of runs to return per page."),
     status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
     search_key: str | None = Query(
         None,
@@ -5849,18 +6272,22 @@ async def get_workflow_run_with_workflow_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> dict[str, Any]:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    return await run_service.coalesce_in_flight(
-        _build_workflow_run_with_workflow_id,
-        current_org.organization_id,
-        workflow_id,
-        workflow_run_id,
-        caps_run_response_values(x_user_agent),
-    )
+    with browser_session_artifact_read(get_request_principal()):
+        response = await run_service.coalesce_in_flight(
+            _build_workflow_run_with_workflow_id,
+            current_org.organization_id,
+            workflow_id,
+            workflow_run_id,
+            caps_run_response_values(x_user_agent),
+        )
+    response = response.model_copy(deep=True)
+    await _redact_browser_session_addresses([response], current_org.organization_id)
+    return response.model_dump(by_alias=True)
 
 
 async def _build_workflow_run_with_workflow_id(
     organization_id: str, workflow_id: str, workflow_run_id: str, cap_output_values: bool
-) -> dict[str, Any]:
+) -> WorkflowRunResponseBase:
     async with app.DATABASE.Session.reading():
         workflow_run_status_response = await app.WORKFLOW_SERVICE.build_workflow_run_status_response(
             workflow_permanent_id=workflow_id,
@@ -5873,13 +6300,10 @@ async def _build_workflow_run_with_workflow_id(
         runnable_id=workflow_run_id,
         organization_id=organization_id,
     )
-    return_dict = workflow_run_status_response.model_dump(by_alias=True)
-
     browser_session_id = browser_session.persistent_browser_session_id if browser_session else None
-
-    return_dict["browser_session_id"] = browser_session_id or return_dict.get("browser_session_id")
-
-    return return_dict
+    return workflow_run_status_response.model_copy(
+        update={"browser_session_id": browser_session_id or workflow_run_status_response.browser_session_id}
+    )
 
 
 @base_router.get(
@@ -5896,13 +6320,15 @@ async def get_workflow_and_run_from_workflow_run_id(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunWithWorkflowResponse:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    response = await run_service.coalesce_in_flight(
-        _build_workflow_and_run_from_workflow_run_id,
-        current_org.organization_id,
-        workflow_run_id,
-        caps_run_response_values(x_user_agent),
-    )
-    response = response.model_copy(update={"workflow": response.workflow.model_copy(deep=True)})
+    with browser_session_artifact_read(get_request_principal()):
+        response = await run_service.coalesce_in_flight(
+            _build_workflow_and_run_from_workflow_run_id,
+            current_org.organization_id,
+            workflow_run_id,
+            caps_run_response_values(x_user_agent),
+        )
+    response = response.model_copy(deep=True)
+    await _redact_browser_session_addresses([response], current_org.organization_id)
     await _redact_inaccessible_workflow_credential_ids([response.workflow])
     response = response.model_copy(update={"workflow": mask_workflow_for_api(response.workflow)})
     return response
@@ -5957,8 +6383,8 @@ async def _build_workflow_and_run_from_workflow_run_id(
 )
 async def get_workflow_run_timeline(
     workflow_run_id: str,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     current_org: Organization = Depends(org_auth_service.get_current_org),
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> list[WorkflowRunTimeline]:
@@ -5986,12 +6412,16 @@ async def get_workflow_run(
     x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
 ) -> WorkflowRunResponseBase:
     analytics.capture("skyvern-oss-agent-workflow-run-get")
-    return await run_service.coalesce_in_flight(
-        _build_workflow_run,
-        current_org.organization_id,
-        workflow_run_id,
-        caps_run_response_values(x_user_agent),
-    )
+    with browser_session_artifact_read(get_request_principal()):
+        response = await run_service.coalesce_in_flight(
+            _build_workflow_run,
+            current_org.organization_id,
+            workflow_run_id,
+            caps_run_response_values(x_user_agent),
+        )
+    response = response.model_copy(deep=True)
+    await _redact_browser_session_addresses([response], current_org.organization_id)
+    return response
 
 
 async def _build_workflow_run(
@@ -6037,8 +6467,8 @@ async def _build_workflow_run(
 )
 @base_router.get("/workflows/", response_model=list[Workflow], include_in_schema=False)
 async def get_workflows(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     only_saved_tasks: bool = Query(False),
     only_workflows: bool = Query(False),
     only_templates: bool = Query(False),
@@ -6295,7 +6725,9 @@ async def get_workflow_templates() -> list[Workflow]:
 @base_router.get("/workflows/{workflow_permanent_id}/", response_model=Workflow, include_in_schema=False)
 async def get_workflow(
     workflow_permanent_id: str,
-    version: int | None = None,
+    # Annotated, not Query(None, ...): this function is also called directly in Python, where
+    # a Query default would become the runtime value and reach the database as a bind param.
+    version: Annotated[int | None, Query(ge=1, le=MAX_INT4)] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> Workflow:
@@ -6911,6 +7343,9 @@ async def run_task_v2(
         run_type=RunType.task_v2,
         caller_type=caller.caller_type,
     )
+    await _redact_browser_session_addresses(
+        [task_v2], organization.organization_id, task_v2_browser_session_id=data.browser_session_id
+    )
     return task_v2.model_dump(by_alias=True)
 
 
@@ -6937,6 +7372,34 @@ async def get_task_v2(
     # uncapped output freezes the tab on exactly the payloads the run-detail reads bound.
     if caps_run_response_values(x_user_agent):
         task_v2 = capped_task_v2(task_v2)
+    browser_session_id = task_v2.browser_session_id
+    if task_v2.browser_address and not browser_session_id:
+        for runnable_id in (task_v2.workflow_run_id, task_v2.observer_cruise_id):
+            if runnable_id:
+                browser_session = await app.DATABASE.browser_sessions.get_persistent_browser_session_by_runnable_id(
+                    runnable_id=runnable_id, organization_id=organization.organization_id
+                )
+                if browser_session:
+                    browser_session_id = browser_session.persistent_browser_session_id
+                    break
+    with browser_session_artifact_read(get_request_principal()):
+        access = await browser_session_artifact_access(
+            organization.organization_id,
+            session_ids=[browser_session_id, task_v2.browser_session_id],
+            workflow_run_id=task_v2.workflow_run_id,
+            runnable_ids=[task_v2.observer_cruise_id],
+        )
+        descendant_denied = bool(
+            task_v2.workflow_run_id
+            and not (await child_run_artifact_access(organization.organization_id, task_v2.workflow_run_id)).allowed
+        )
+        if descendant_denied:
+            task_v2 = redact_descendant_entity(task_v2, preserve=TASK_V2_METADATA)
+        elif not access.allowed:
+            task_v2 = access.redact_output(task_v2)
+    await _redact_browser_session_addresses(
+        [task_v2], organization.organization_id, task_v2_browser_session_id=browser_session_id
+    )
     return task_v2.model_dump(by_alias=True)
 
 
@@ -6971,7 +7434,18 @@ async def _flatten_workflow_run_timeline_recursive(
                     }
                 )
 
-            result.extend(inherit_attempt(item) for item in nested_timeline)
+            flattened = [inherit_attempt(item) for item in nested_timeline]
+            # One copy is enough to find the replaced block; thought rows never carry it. A nested task_v2
+            # already put its own block on that row, so the outer one is added after it.
+            first_block_row = next((index for index, item in enumerate(flattened) if item.block), None)
+            if first_block_row is not None:
+                row = flattened[first_block_row]
+                flattened[first_block_row] = row.model_copy(
+                    update={"task_v2_blocks": [*(row.task_v2_blocks or []), timeline.block]}
+                )
+            else:
+                flattened.append(timeline)
+            result.extend(flattened)
         else:
             LOG.warning(
                 "Block workflow run id is not set for task_v2 block",
@@ -7051,6 +7525,7 @@ async def _flatten_workflow_run_timeline(
             task_v2_id=task_v2_obj.observer_cruise_id,
             organization_id=organization_id,
             cap_output_values=cap_output_values,
+            workflow_run_id=workflow_run_id,
         )
         attempt_rows = await app.DATABASE.workflow_run_attempts.get_attempts(workflow_run_id)
         block_attempts: dict[str, int] = {}

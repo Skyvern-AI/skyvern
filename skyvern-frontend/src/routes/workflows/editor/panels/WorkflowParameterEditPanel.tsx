@@ -50,12 +50,18 @@ import {
   ParameterTypeSelection,
 } from "./WorkflowParameterEditPanel.helpers";
 import { useSkyvernCredentialSourceAvailable } from "../../hooks/useSkyvernCredentialSourceAvailable";
+import {
+  RESERVED_PARAMETER_KEYS,
+  validateParameterKey,
+} from "../parameterEdits";
 
 type Props = {
   type: WorkflowEditorParameterType;
   onClose: () => void;
   onSave: (value: ParametersState[number]) => void;
   initialValues?: ParametersState[number];
+  /** The values are a placeholder the caller just created, so this is still an Add. */
+  isNew?: boolean;
 };
 
 const workflowParameterTypeOptions = [
@@ -112,42 +118,6 @@ function getAvailableSourcesForDataType(
         ...customOption,
       ];
   }
-}
-
-/**
- * Validates that a parameter key is a valid Python/Jinja2 identifier.
- * Parameter keys are used in Jinja2 templates, so they must be valid identifiers.
- * Returns an error message if invalid, or null if valid.
- */
-function validateParameterKey(key: string): string | null {
-  if (!key) return null; // Empty key is handled separately
-
-  // Check for whitespace
-  if (/\s/.test(key)) {
-    return "Key cannot contain whitespace characters. Consider using underscores (_) instead.";
-  }
-
-  // Check if it's a valid Python identifier:
-  // - Must start with a letter (a-z, A-Z) or underscore (_)
-  // - Can only contain letters, digits (0-9), and underscores
-  const validIdentifierRegex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-  if (!validIdentifierRegex.test(key)) {
-    if (/^[0-9]/.test(key)) {
-      return "Key cannot start with a digit. Input keys must start with a letter or underscore.";
-    }
-    if (key.includes("/")) {
-      return "Key cannot contain '/' characters. Use underscores instead (e.g., 'State_or_Province' instead of 'State/Province').";
-    }
-    if (key.includes("-")) {
-      return "Key cannot contain '-' characters. Use underscores instead (e.g., 'my_parameter' instead of 'my-parameter').";
-    }
-    if (key.includes(".")) {
-      return "Key cannot contain '.' characters. Use underscores instead.";
-    }
-    return "Key must be a valid identifier (only letters, digits, and underscores; cannot start with a digit).";
-  }
-
-  return null;
 }
 
 function BitwardenItemFieldHeader({
@@ -214,24 +184,13 @@ function WorkflowParameterEditPanel({
   onClose,
   onSave,
   initialValues,
+  isNew = false,
 }: Props) {
-  const reservedKeys = [
-    "current_item",
-    "current_value",
-    "current_index",
-    "current_date",
-    "workflow_title",
-    "workflow_id",
-    "workflow_permanent_id",
-    "workflow_run_id",
-    "workflow_run_outputs",
-    "workflow_run_summary",
-  ];
   const skyvernCredentialSourceAvailable =
     useSkyvernCredentialSourceAvailable();
   const { isConfigured: hasCustomCredentialService } =
     useCustomCredentialServiceConfig();
-  const isEditMode = !!initialValues;
+  const isEditMode = !!initialValues && !isNew;
   const [key, setKey] = useState(initialValues?.key ?? "");
   const keyValidationError = validateParameterKey(key);
 
@@ -1146,7 +1105,7 @@ function WorkflowParameterEditPanel({
                   });
                   return;
                 }
-                if (!isEditMode && reservedKeys.includes(key)) {
+                if (!isEditMode && RESERVED_PARAMETER_KEYS.includes(key)) {
                   toast({
                     variant: "destructive",
                     title: "Failed to add input",

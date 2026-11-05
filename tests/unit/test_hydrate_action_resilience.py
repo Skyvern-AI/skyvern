@@ -15,7 +15,6 @@ from fastapi.testclient import TestClient
 
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS, hydrate_action
-from skyvern.forge.sdk.routes.routers import legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services.org_auth_service import SKYVERN_UI_USER_AGENT
 from skyvern.forge.sdk.workflow.response_value_caps import RUN_RESPONSE_MAX_VALUE_BYTES
@@ -39,6 +38,7 @@ from tests.unit.helpers import (
     make_one_time_code_steps,
 )
 from tests.unit.helpers import make_session_factory_yielding as _session_yielding
+from tests.unit.shared_route_app import shared_route_app
 
 
 def _organization() -> Organization:
@@ -98,10 +98,8 @@ def test_every_action_type_hydrates_as_its_concrete_model() -> None:
     assert len(set(ACTION_TYPE_TO_CLASS.values())) == len(ActionType)
 
 
-def _get_task_actions(*rows: SimpleNamespace, headers: dict[str, str] | None = None) -> Any:
+def _get_task_actions(test_app: FastAPI, *rows: SimpleNamespace, headers: dict[str, str] | None = None) -> Any:
     repo = TasksRepository.__new__(TasksRepository)
-    test_app = FastAPI()
-    test_app.include_router(legacy_base_router, prefix="/api/v1")
 
     with (
         patch.object(TasksRepository, "Session", _session_yielding(list(rows)), create=True),
@@ -112,37 +110,44 @@ def _get_task_actions(*rows: SimpleNamespace, headers: dict[str, str] | None = N
         ),
     ):
         app_module.DATABASE.tasks = repo
+        app_module.AGENT_FUNCTION.should_check_browser_session_artifacts = AsyncMock(return_value=False)
         return TestClient(test_app).get(
             "/api/v1/tasks/tsk_test/actions", headers={"x-api-key": "key", **(headers or {})}
         )
 
 
-def test_task_actions_endpoint_serves_the_typed_value_and_withholds_the_one_time_code() -> None:
+def test_task_actions_endpoint_serves_the_typed_value_and_withholds_the_one_time_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Driven through the route, because the defect is which repository read it calls: `text` has no
     # ActionModel column, so validating the ORM row resolves it to None on every row.
     rows = make_one_time_code_action_rows()
 
-    from_app = _get_task_actions(*rows, headers={"x-user-agent": SKYVERN_UI_USER_AGENT})
-    from_sdk = _get_task_actions(*rows)
+    test_app = shared_route_app(monkeypatch)
+    from_app = _get_task_actions(test_app, *rows, headers={"x-user-agent": SKYVERN_UI_USER_AGENT})
+    from_sdk = _get_task_actions(test_app, *rows)
 
     for response in (from_app, from_sdk):
         assert response.status_code == 200, response.text
         assert_one_time_code_withheld(response.text, response.json(), [hydrate_action(row) for row in rows])
 
 
-def test_task_actions_endpoint_scrubs_a_fetched_code_from_a_click_with_no_input_row() -> None:
-    response = _get_task_actions(*make_fetched_code_action_rows())
+def test_task_actions_endpoint_scrubs_a_fetched_code_from_a_click_with_no_input_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _get_task_actions(shared_route_app(monkeypatch), *make_fetched_code_action_rows())
 
     assert response.status_code == 200, response.text
     assert ONE_TIME_CODE not in response.text
     assert_code_click_scrubbed(response.json()[1])
 
 
-def test_task_steps_endpoint_withholds_the_one_time_code_and_leaves_the_stored_step_unchanged() -> None:
+def test_task_steps_endpoint_withholds_the_one_time_code_and_leaves_the_stored_step_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     steps = make_one_time_code_steps()
     repo = TasksRepository.__new__(TasksRepository)
-    test_app = FastAPI()
-    test_app.include_router(legacy_base_router, prefix="/api/v1")
+    test_app = shared_route_app(monkeypatch)
 
     with (
         patch.object(TasksRepository, "Session", _session_yielding(make_one_time_code_action_rows()), create=True),
@@ -154,6 +159,7 @@ def test_task_steps_endpoint_withholds_the_one_time_code_and_leaves_the_stored_s
         ),
     ):
         app_module.DATABASE.tasks = repo
+        app_module.AGENT_FUNCTION.should_check_browser_session_artifacts = AsyncMock(return_value=False)
         response = TestClient(test_app).get("/api/v1/tasks/tsk_test/steps", headers={"x-api-key": "key"})
 
     assert response.status_code == 200, response.text
@@ -170,7 +176,9 @@ def test_legacy_step_keeps_its_failure_message_when_the_task_has_no_one_time_cod
     assert served.output is not None and served.output.action_results[0].exception_message
 
 
-def test_task_actions_endpoint_caps_for_the_app_and_keeps_the_stored_value_for_the_sdk() -> None:
+def test_task_actions_endpoint_caps_for_the_app_and_keeps_the_stored_value_for_the_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Hydration puts a completion action's whole output on the wire, and restores the free text that
     # has no ActionModel column -- an extraction prompt runs to megabytes and the app re-reads this
     # route every five seconds. Every one of them must reach the app bounded; `get_actions` is a
@@ -186,8 +194,9 @@ def test_task_actions_endpoint_caps_for_the_app_and_keeps_the_stored_value_for_t
         },
     )
 
-    from_app = _get_task_actions(row, headers={"x-user-agent": SKYVERN_UI_USER_AGENT})
-    from_sdk = _get_task_actions(row)
+    test_app = shared_route_app(monkeypatch)
+    from_app = _get_task_actions(test_app, row, headers={"x-user-agent": SKYVERN_UI_USER_AGENT})
+    from_sdk = _get_task_actions(test_app, row)
 
     for field in ("output", "response", "data_extraction_goal", "description"):
         assert len(from_app.json()[0][field]) < len(oversized), field

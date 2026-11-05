@@ -9,7 +9,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import structlog
@@ -66,6 +66,8 @@ from skyvern.forge.sdk.copilot.workflow_yaml import strip_private_workflow_setti
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.agent_functions import TriggerMappingReasonCode
+
 LOG = structlog.get_logger()
 
 _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY = "_copilot_internal_run_cancelled_by_watchdog"
@@ -82,6 +84,7 @@ _BUILD_TEST_FAILURE_REASON_MAX_CHARS = 1_200
 _BUILD_TEST_LABEL_MAX_ITEMS = 24
 _BUILD_TEST_OUTPUT_MAX_ITEMS = 12
 _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS = 800
+OUTPUT_VALUE_MAX_CHARS = 200
 # The share of that cap a failure reason may hold before it starts crowding out available_keys, and
 # the shortest it is worth trimming one to.
 _AVAILABLE_KEYS_REASON_SHARE = 400
@@ -916,6 +919,21 @@ def _clipped_120(text: str | None) -> str | None:
     return text[:117] + "..." if text is not None and len(text) > 120 else text
 
 
+REGISTERED_OUTPUTS_NOTICE_PREFIX = "registered_outputs "
+DOWNLOADS_NOTICE_PREFIX = "downloads "
+
+
+def bound_output_value(value: JsonValue, value_complete: bool) -> tuple[JsonValue, bool]:
+    # An incomplete string is already-rendered text; quoting it again would escape it and grow it on every pass.
+    if isinstance(value, str) and not value_complete:
+        rendered = value
+    else:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) > OUTPUT_VALUE_MAX_CHARS:
+        return rendered[: OUTPUT_VALUE_MAX_CHARS - 3] + "...", False
+    return value, value_complete
+
+
 def _compact_packet_for_aggregate_limit(
     packet: BuildTestEvidencePacket,
     notices: list[str],
@@ -928,15 +946,8 @@ def _compact_packet_for_aggregate_limit(
     for output in _compacted(
         packet.registered_outputs, 6, field_name="registered_outputs", notices=notices, keep="first"
     ):
-        rendered = json.dumps(output.output, ensure_ascii=False, separators=(",", ":"))
-        outputs.append(
-            output.model_copy(
-                update={
-                    "output": rendered[:197] + "..." if len(rendered) > 200 else output.output,
-                    "value_complete": output.value_complete and len(rendered) <= 200,
-                }
-            )
-        )
+        value, value_complete = bound_output_value(output.output, output.value_complete)
+        outputs.append(output.model_copy(update={"output": value, "value_complete": value_complete}))
 
     def compact_page_state(
         page_state: BuildTestPacketPageState | None, *, field_prefix: str
@@ -1277,7 +1288,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(packet.registered_outputs) > _BUILD_TEST_OUTPUT_MAX_ITEMS:
         append_omission_notice(
             notices,
-            "registered_outputs shortened: "
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}shortened: "
             f"{len(packet.registered_outputs) - _BUILD_TEST_OUTPUT_MAX_ITEMS} item(s) omitted.",
         )
 
@@ -1377,7 +1388,8 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(packet.downloads) > _BUILD_TEST_DOWNLOAD_MAX_ITEMS:
         append_omission_notice(
             notices,
-            f"downloads shortened: {len(packet.downloads) - _BUILD_TEST_DOWNLOAD_MAX_ITEMS} item(s) omitted.",
+            f"{DOWNLOADS_NOTICE_PREFIX}shortened: "
+            f"{len(packet.downloads) - _BUILD_TEST_DOWNLOAD_MAX_ITEMS} item(s) omitted.",
         )
     unfinished = [
         item.model_copy(
@@ -1532,7 +1544,8 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
         notices.append("executed_block_labels omitted: no block execution was recorded.")
     if not packet.registered_outputs:
         notices.append(
-            "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}empty: no workflow run block output or registered output-parameter "
+            "value was recorded."
         )
     redacted_output_count = sum(
         REDACTED_SECRET_PLACEHOLDER in json.dumps(output.output, ensure_ascii=False)
@@ -1540,10 +1553,11 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
     )
     if redacted_output_count:
         notices.append(
-            f"registered_outputs redacted {redacted_output_count} item(s) containing registered secret values."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}redacted {redacted_output_count} item(s) containing registered secret "
+            "values."
         )
     if not packet.downloads:
-        notices.append("downloads empty: no registered download artifact was recorded.")
+        notices.append(f"{DOWNLOADS_NOTICE_PREFIX}empty: no registered download artifact was recorded.")
     if not packet.screenshot.present:
         notices.append("screenshot omitted: no final or failed-block screenshot was recorded.")
     if not packet.unfinished_items:
@@ -2014,9 +2028,9 @@ _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
 _LARGE_DICT_BLOB_RE = re.compile(r"\{[^{}]{40,}\}")
 # Every credential-shaped id prefix in skyvern/forge/sdk/db/id.py, so a new one does
 # not quietly become renderable: cred, the vault/parameter kinds, folders, OAuth,
-# and run credential selections, plus Copilot's connected-vault login ids.
+# and run credential selections, plus Copilot's refs for vault logins not saved yet.
 _CREDENTIAL_ID_RE = re.compile(
-    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|bwitem)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
+    r"`?\b(?:cred|cp|cfld|blc|bccd|bsi|opp|azcp|asp|goac|moac|wrcs|vlogin)_[A-Za-z0-9][A-Za-z0-9_-]*`?"
 )
 # Punctuation an LLM-authored block label may keep. Everything outside this set and
 # the letter/digit categories becomes a space: a whitelist, because any quote-class
@@ -2178,6 +2192,14 @@ _PAGE_CHALLENGE_OUTCOME_SUMMARIES = {
     "unavailable": "Challenge solving is not available for this page",
 }
 
+# The first three match the Studio Triggers panel's delivery reasons (triggerErrors.ts).
+_TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
+    "mapping_path_missing": "A mapped path isn't in the body",
+    "invalid_mapping": "Mapping is invalid",
+    "invalid_parameters": "Inputs failed validation",
+    "owner_lookup_failed": "Couldn't look up your role; try again",
+}
+
 
 def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display: bool = False) -> str:
     """Summarize a tool result. ``for_display`` clamps LLM-authored block labels for
@@ -2190,7 +2212,11 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
     if _is_unconfirmed_extension(result):
         return "Requested more browser session time; not confirmed and not retried"
     if not result.get("ok", False):
-        return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
+        message = _extract_failure_message(result)
+        reason = _result_data(result).get("reason")
+        if message == _UNKNOWN_ERROR_SENTINEL and isinstance(reason, str) and reason:
+            message = reason
+        return f"Failed: {_sanitize_failure_text(message)}"
 
     raw_data = result.get("data")
     data = raw_data if isinstance(raw_data, dict) else {}
@@ -2210,9 +2236,9 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return ran
     if tool_name == "list_credentials":
         if data.get("status") == "resolved":
-            match = data.get("credential") or data.get("vault_login")
+            match = data.get("credential")
             if isinstance(match, dict):
-                name = match.get("name") or match.get("title")
+                name = match.get("name")
                 if isinstance(name, str) and name:
                     safe_name = sanitize_block_label_for_display(name)
                     if safe_name:
@@ -2333,6 +2359,9 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return (
             f"Read characters {result.get('offset')}-{end} of {result.get('total_chars')} from {result.get('filename')}"
         )
+    if tool_name == "read_chat_history":
+        messages = result.get("messages")
+        return f"Read {len(messages) if isinstance(messages, list) else 0} earlier message(s) in this chat"
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0
@@ -2343,6 +2372,25 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         if steps:
             summary = " → ".join(steps)
         return f"{summary} at {url[:80]}" if isinstance(url, str) and url else summary
+    if tool_name == "create_webhook_trigger":
+        return (
+            "Created a webhook trigger. It rejects every event until you click Rotate secret on it in the "
+            "Triggers panel and give your sender the new secret."
+        )
+    if tool_name == "test_trigger_mapping":
+        resolved = data.get("resolved_parameters")
+        if not data.get("accepted") or not isinstance(resolved, dict):
+            reason_code = cast("TriggerMappingReasonCode", data.get("reason_code"))
+            reason = _TRIGGER_MAPPING_REASON_LABELS.get(reason_code, "Mapping was rejected")
+            return f"The mapping did not resolve on the sample: {reason}"
+        pairs = ", ".join(
+            f"{sanitize_block_label_for_display(str(key))} = {sanitize_block_label_for_display(str(value), 80)}"
+            for key, value in resolved.items()
+        )
+        return f"Mapping resolved on the sample: {pairs}" if pairs else "Mapping resolved on the sample"
+    if tool_name == "list_workflow_triggers":
+        triggers = data.get("triggers")
+        return f"Found {len(triggers) if isinstance(triggers, list) else 0} trigger(s) on this workflow"
     return "OK"
 
 
@@ -2371,6 +2419,8 @@ def summarize_tool_result_detail(
     """
     if result.get("ok", False) if success is None else success:
         return None
+    if tool_name == "read_chat_history":
+        return _USER_FACING_CHAT_HISTORY_FAILURE
     structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
     if structured is not None:
         return structured
@@ -2382,7 +2432,12 @@ def summarize_tool_result_detail(
     return _sanitize_failure_text(failure_message, max_chars=max_chars)
 
 
-_JINJA_ERROR_MARKERS: tuple[str, ...] = ("Failed to format jinja", "Jinja style parameter")
+_JINJA_ERROR_MARKERS: tuple[str, ...] = (
+    "Failed to format jinja",
+    "Jinja style parameter",
+    "Failed to resolve templates:",
+    "Failed to evaluate while-loop condition:",
+)
 # Markers are matched against a lower-cased copy of the error.
 _ENGINE_INSTRUCTION_MARKERS: tuple[str, ...] = (
     "invalid selector:",
@@ -2403,6 +2458,7 @@ _INTERNAL_VALIDATION_MARKERS: tuple[str, ...] = (INTERNAL_VALIDATION_FAILURE_PRE
 
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
 _USER_FACING_GENERIC_FAILURE = _STRUCTURED_UNSAFE_FALLBACK
+_USER_FACING_CHAT_HISTORY_FAILURE = "Could not read earlier messages in this chat"
 
 _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
     {
@@ -2451,6 +2507,8 @@ def format_tool_result_for_user(
     if _is_unconfirmed_extension(result):
         return summarize_tool_result(tool_name, result, for_display=True)
     if not result.get("ok", False):
+        if tool_name == "read_chat_history":
+            return _USER_FACING_CHAT_HISTORY_FAILURE
         structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
         if structured is not None:
             return structured

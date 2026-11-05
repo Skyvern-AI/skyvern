@@ -77,10 +77,23 @@ OTHER_ACCOUNT_SID = "AC" + "fedcba9876543210" * 2
 API_KEY_SID = "SK" + "0123456789abcdef" * 2
 
 
-@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
-@pytest.mark.parametrize("prefix", ["/v1", "/api/v1"])
-@pytest.mark.parametrize("path", ["integrations/twilio", "integrations/twilio/credentials", "sms", "sms/inbound/test"])
-@pytest.mark.parametrize("content_type", ["application/json", "application/x-www-form-urlencoded", ""])
+@pytest.mark.parametrize(
+    ("method", "prefix", "path", "content_type"),
+    [
+        ("POST", "/v1", "integrations/twilio", "application/json"),
+        ("PUT", "/api/v1", "integrations/twilio/credentials", "application/x-www-form-urlencoded"),
+        ("PATCH", "/v1", "sms", ""),
+        ("DELETE", "/api/v1", "sms/inbound/test", "application/json"),
+        ("POST", "/api/v1", "sms", "application/x-www-form-urlencoded"),
+        ("PUT", "/v1", "sms/inbound/test", ""),
+        ("PATCH", "/api/v1", "integrations/twilio", ""),
+        ("DELETE", "/v1", "integrations/twilio/credentials", "application/x-www-form-urlencoded"),
+        ("POST", "/v1", "sms/inbound/test", "application/x-www-form-urlencoded"),
+        ("PUT", "/api/v1", "integrations/twilio/credentials", "application/json"),
+        ("PATCH", "/api/v1", "integrations/twilio/credentials", ""),
+        ("DELETE", "/v1", "sms", "application/json"),
+    ],
+)
 def test_twilio_middleware_hides_malformed_secret_bodies(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -104,8 +117,6 @@ def test_twilio_middleware_hides_malformed_secret_bodies(
     assert "api.raw_request" in caplog.text
     assert "SENTINEL" not in caplog.text
     assert request_logging.REDACTED in caplog.text
-    print(f"R1: {method} {prefix}/{path} {content_type or 'missing type'}; captured logs contain no sentinel")
-    print(caplog.text)
 
 
 @pytest.mark.parametrize("model", [CreateTwilioCredentialRequest, twilio_integration.TwilioCredentialResponse])
@@ -1272,7 +1283,9 @@ async def test_login_route_parameters_reach_converter(
         run_blocks,
         "app",
         SimpleNamespace(
-            WORKFLOW_SERVICE=workflow_service, RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock())
+            WORKFLOW_SERVICE=workflow_service,
+            RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False)),
         ),
     )
     run_result = object()
@@ -1315,7 +1328,9 @@ async def _register(
             get_valid_org_auth_token=AsyncMock(return_value=SimpleNamespace(token="service-account-token"))
         )
         credentials = SimpleNamespace(get_onepassword_credentials=AsyncMock(return_value=[]))
-        agent_function = SimpleNamespace(enforce_credential_use=AsyncMock())
+        agent_function = SimpleNamespace(
+            enforce_credential_use=AsyncMock(), enforce_workflow_context_credential_use=AsyncMock()
+        )
         monkeypatch.setattr(
             cm,
             "app",

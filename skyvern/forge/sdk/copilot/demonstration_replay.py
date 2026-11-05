@@ -14,6 +14,7 @@ from mcp.types import CallToolResult, TextContent
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.cache.base import BaseCache
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, safe_admitted_url
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.copilot.demonstration_recorder import (
     encode_demonstration_record,
     expire_demonstration_payload,
     finish_shielded,
+    note_label,
     safe_label,
     store_settled_demonstration,
 )
@@ -37,11 +39,12 @@ from skyvern.forge.sdk.copilot.llm_config import resolve_raw_secret_safety_handl
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
 from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm, summarize_tool_result
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, screen_raw_secret_safety
-from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, ScoutedInteraction, staged_demonstrated_action
+from skyvern.forge.sdk.copilot.runtime import DemonstratedAction, staged_demonstrated_action
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
 from skyvern.forge.sdk.copilot.tools.scouting import record_scouted_interaction_fact
+from skyvern.forge.sdk.schemas.workflow_copilot import CopilotSteerMessage
 
 LOG = structlog.get_logger()
 
@@ -49,6 +52,8 @@ DEMONSTRATION_DONE_INSTRUCTION = (
     "The browser actions above are the user's demonstration of this task, not your own. A value shown as not "
     "recorded was withheld by the secret screen; a replay gap states when the screen could not check it."
     "{insertion}"
+    " A demonstration shows what the user did once, not why: a rule drawn from one action is your reading, not "
+    "something it showed, and it never shows the outcomes the user didn't reach."
 )
 _TYPED_VALUE_SCREEN_CONCURRENCY = 4
 
@@ -92,9 +97,13 @@ async def _replay_events(
     )
     screen_latency_ms = (time.monotonic() - screen_started_at) * 1000
     detected_count = sum(screen.status == "detected" for screen in typed_screens.values())
-    unavailable_count = sum(screen.status == "blocked" for screen in typed_screens.values())
+    # A withheld note gets its own fact at its position, so only typed field values are counted here.
+    unavailable_count = sum(
+        screen.status == "blocked" and events[index].get("kind") != "note" for index, screen in typed_screens.items()
+    )
     withheld_count = sum(
-        not _screen_passed(screen, events[index].get("value")) for index, screen in typed_screens.items()
+        events[index].get("kind") != "note" and not _screen_passed(screen, events[index].get("value"))
+        for index, screen in typed_screens.items()
     )
     failure_kinds = sorted({screen.failure_kind for screen in typed_screens.values() if screen.failure_kind != "none"})
 
@@ -111,6 +120,7 @@ async def _replay_events(
     current_frame_path: tuple[tuple[str, str], ...] | None = None
     sensitive_count = 0
     credential_fill_count = 0
+    failed_call_count = 0
 
     def next_call_id() -> str:
         nonlocal call_counter
@@ -123,10 +133,13 @@ async def _replay_events(
         model_args: dict[str, Any],
         output: CallToolResult | dict[str, Any],
     ) -> None:
+        nonlocal failed_call_count
         call_id = next_call_id()
         parsed = parse_tool_output(output.content if isinstance(output, CallToolResult) else output)
         if isinstance(output, CallToolResult) and output.isError and parsed.get("ok") is not False:
             parsed = {**parsed, "ok": False}
+        if parsed.get("ok") is False:
+            failed_call_count += 1
         safe_output = scrub_secrets_from_structure(ctx, sanitize_tool_result_for_llm(alias, parsed))
         output_text = _call_tool_result_text(output) or json.dumps(safe_output, separators=(",", ":"))
         history.extend(
@@ -168,11 +181,51 @@ async def _replay_events(
 
     for index, event in enumerate(events):
         kind = event.get("kind")
+        if kind == "note":
+            screen = typed_screens.get(index)
+            if screen is not None and screen.status in {"clean", "detected"}:
+                history.append({"role": "user", "content": screen.canonical_user_message})
+                # A note is the user's words this turn, so the policy reads it exactly as a message sent mid-turn.
+                if isinstance(ctx.request_policy, RequestPolicy):
+                    now = datetime.now(UTC)
+                    ctx.request_policy.project_steer_message(
+                        CopilotSteerMessage(
+                            steer_id=f"demonstration_note_{event.get('seq')}",
+                            text=screen.canonical_user_message,
+                            raw_secret_detected=screen.status == "detected",
+                            created_at=now,
+                            delivered_at=now,
+                        )
+                    )
+                    if screen.status == "detected":
+                        ctx.allow_untested_workflow_draft = ctx.request_policy.raw_secret_redacted_draft
+            else:
+                history.append(_gap_fact(event, "the secret check was unavailable"))
+            continue
         if kind == "gap":
             reason = event.get("reason")
             if not isinstance(reason, str) or not reason:
                 reason = "unknown"
             history.append(_gap_fact(event, reason))
+            continue
+        if kind == "tab_switch":
+            url = _safe_model_visible_url(str(event.get("url") or ""))
+            source_url = _safe_model_visible_url(_event_source_url(event))
+            tab_index = event.get("index")
+            tab_args: dict[str, Any] = {"index": tab_index} if isinstance(tab_index, int) else {}
+            action = DemonstratedAction(
+                selector="",
+                source_url=source_url,
+                packet=None,
+                synthesized_result={
+                    "ok": True,
+                    "data": {**tab_args, "url": url, "new_tab": bool(event.get("new_tab"))},
+                    "browser_context": {"url": url, "title": "", "url_changed": source_url != url},
+                },
+            )
+            await replay_recorded_call("skyvern_tab_switch", tab_args, tab_args, action)
+            # A tab switch starts the new tab in its main frame.
+            current_frame_path = None
             continue
         frame = event.get("frame")
         if isinstance(frame, dict):
@@ -264,7 +317,8 @@ async def _replay_events(
         translated = _translate_action(
             ctx,
             event,
-            events[index + 1] if index + 1 < len(events) else None,
+            # A note records no page, so the result URL comes from the next browser event.
+            next((later for later in events[index + 1 :] if later.get("kind") != "note"), None),
             final_url,
             typed_screens.get(index),
         )
@@ -280,6 +334,7 @@ async def _replay_events(
         action_count=action_count,
         sensitive_count=sensitive_count,
         credential_fill_count=credential_fill_count,
+        failed_call_count=failed_call_count,
         screen_detected_count=detected_count,
         screen_withheld_count=withheld_count,
         screen_unavailable_count=unavailable_count,
@@ -333,7 +388,7 @@ async def _screen_typed_values(
     typed_values = {
         index: value
         for index, event in enumerate(events)
-        if event.get("kind") == "type" and isinstance((value := event.get("value")), str)
+        if event.get("kind") in {"type", "note"} and isinstance((value := event.get("value")), str)
     }
     results = dict(await asyncio.gather(*(screen(value) for value in set(typed_values.values()))))
     return {index: results[value] for index, value in typed_values.items()}
@@ -543,6 +598,9 @@ def _event_source_url(event: dict[str, Any] | None) -> str:
 
 
 def _model_visible_url(url: str) -> str:
+    # safe_admitted_url would turn about:blank into https://about.
+    if url.startswith("about:"):
+        return url
     return safe_admitted_url(url) or url
 
 
@@ -561,6 +619,10 @@ def _gap_fact(event: dict[str, Any], reason: str) -> dict[str, str]:
 
 def _demonstration_label(event: dict[str, Any], typed_screen: Any = None) -> str:
     kind = event.get("kind")
+    if kind == "note":
+        if typed_screen is not None and typed_screen.status in {"clean", "detected"}:
+            return note_label(typed_screen.canonical_user_message)
+        return "Note not recorded"
     if kind == "select" and isinstance(event.get("value"), str):
         return f'Select "{safe_label(event["value"])}"'[:60]
     if kind == "secret" and event.get("control") == "select":

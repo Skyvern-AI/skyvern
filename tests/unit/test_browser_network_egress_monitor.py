@@ -1,4 +1,3 @@
-import gc
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -309,7 +308,6 @@ async def test_active_interceptor_registration_is_weak_and_strictly_identity_key
 
     registered_ref = ref(registered_page)
     del registered_page
-    gc.collect()
     assert registered_ref() is None
     assert monitor._active_request_interceptors == {}
 

@@ -16,13 +16,14 @@ from typing import Annotated, Any, Literal, NamedTuple, cast
 
 import structlog
 import yaml
-from jinja2 import TemplateSyntaxError
 from pydantic import AliasChoices, BaseModel, Field, TypeAdapter, ValidationError
+from pydantic_core import to_jsonable_python
 
 from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.author_time_block import (
     CODE_SAFETY_BLOCK_ID,
     CREDENTIAL_SCOUT_BLOCK_ID,
@@ -36,9 +37,9 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BuildTestOutcomeReasonCode,
     CodeSafetyRejectionFact,
     RecordedBuildTestOutcome,
-    authored_structure_signature_from_workflow,
     record_build_test_outcome,
     recorded_outcome_from_author_time_reject,
+    redacted_terminal_text,
 )
 from skyvern.forge.sdk.copilot.canonical_ownership import workflow_content_fingerprint
 from skyvern.forge.sdk.copilot.code_block_preflight import (
@@ -55,11 +56,11 @@ from skyvern.forge.sdk.copilot.code_block_steps import (
 )
 from skyvern.forge.sdk.copilot.code_block_synthesis import wrapped_code_ast as _wrapped_code_ast
 from skyvern.forge.sdk.copilot.code_write_diff import CodeWriteDiff, build_code_write_diffs
-from skyvern.forge.sdk.copilot.completion_verification import grade_definition_criteria
 from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
 )
 from skyvern.forge.sdk.copilot.context import (
+    CanonicalWorkflowUnavailableFacts,
     CodeAuthoringRepairContext,
     CopilotContext,
     ProposalDisposition,
@@ -76,7 +77,6 @@ from skyvern.forge.sdk.copilot.google_connection_notice import (
 from skyvern.forge.sdk.copilot.narration import CODE_REPAIR_PROGRESS_SURFACE_KIND, CODE_REPAIR_PROGRESS_TEXT
 from skyvern.forge.sdk.copilot.output_contracts import (
     code_block_available_contracts_by_label,
-    declared_string_workflow_parameter_keys,
     declared_workflow_parameter_keys,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -85,7 +85,11 @@ from skyvern.forge.sdk.copilot.output_policy import (
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
-from skyvern.forge.sdk.copilot.output_utils import _BUILD_TEST_WORKFLOW_MAX_CHARS, INTERNAL_VALIDATION_FAILURE_PREFIX
+from skyvern.forge.sdk.copilot.output_utils import (
+    _BUILD_TEST_WORKFLOW_MAX_CHARS,
+    INTERNAL_VALIDATION_FAILURE_PREFIX,
+    sanitize_block_label_for_display,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import (
     REGISTERED_DOWNLOAD_OUTPUT_KEYS,
     code_captures_download,
@@ -99,10 +103,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     _coerce_requested_output_evidence_source,
     _is_judgment_boolean_criterion,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    ScoutedInteraction,
-)
+from skyvern.forge.sdk.copilot.review_gate import CODE_BLOCK_NON_IDENTITY_KEYS
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.schema_incompatibility import (
     SCHEMA_INCOMPATIBILITY_REASON_CODE,
     SchemaIncompatibility,
@@ -137,6 +139,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
     resolve_webhook_callback_url,
     runner_code_block_associations,
     strip_private_workflow_settings,
+    strip_runtime_block_fields,
     submitted_private_workflow_settings,
     with_workflow_yaml_title,
     workflow_to_copilot_yaml,
@@ -153,8 +156,10 @@ from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, Ins
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.forge.sdk.workflow.runtime_completion import contract_from_code_artifact_metadata
+from skyvern.forge.sdk.workflow.secret_encryption import mask_workflow_definition_secrets
 from skyvern.schemas.proxy_location import ProxyLocationInput, runtime_proxy_location
 from skyvern.schemas.workflows import (
+    BLOCK_TYPE_MAP,
     BLOCK_YAML_SUBCLASSES,
     BlockType,
     CodeBlockYAML,
@@ -163,7 +168,6 @@ from skyvern.schemas.workflows import (
     WorkflowCreateYAMLRequest,
 )
 from skyvern.utils.secret_headers import SECRET_HEADER_MASK, merge_masked_headers
-from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.url_validators import validate_webhook_url
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -179,7 +183,9 @@ from .banned_blocks import (
 from .credentials import (
     _credential_id_misbinding_findings,
     _credential_reference_validation_error,
+    bitwarden_binding_change_error,
     canonicalize_named_google_sheet_bindings,
+    import_bound_vault_logins,
     resolve_google_sheet_tabs_from_gid,
 )
 from .frontier import (
@@ -840,6 +846,68 @@ def _changed_code_blocks(
     return changed, sorted(rewritten)
 
 
+_NON_EDIT_BLOCK_KEYS = frozenset({"label", "next_block_label", "loop_blocks", *CODE_BLOCK_NON_IDENTITY_KEYS})
+_NO_DECLARED_DEFAULT = object()
+
+
+def _declared_block_default(block_type: str | None, key: str) -> object:
+    model = BLOCK_TYPE_MAP.get(block_type) if isinstance(block_type, str) else None
+    field = model.model_fields.get(key) if model is not None else None
+    if field is None or field.is_required():
+        return _NO_DECLARED_DEFAULT
+    return to_jsonable_python(field.get_default(call_default_factory=True))
+
+
+def _comparable_blocks_by_label(workflow_yaml: str | None) -> dict[str, dict[str, Any]]:
+    parsed = parse_workflow_yaml(workflow_yaml) if workflow_yaml else None
+    if not isinstance(parsed, dict):
+        return {}
+    # Masked on both sides: a save restores stored secrets the model only ever saw masked.
+    mask_workflow_definition_secrets(parsed.get("workflow_definition"))
+    return {
+        block["label"]: {
+            key: value for key, value in strip_runtime_block_fields(block).items() if key not in _NON_EDIT_BLOCK_KEYS
+        }
+        for block in workflow_blocks(parsed)
+        if isinstance(block.get("label"), str) and block["label"]
+    }
+
+
+def _labels_changed_between(prior_yaml: str | None, stored_yaml: str) -> list[str]:
+    """Keys only the prior sets are ignored, so a write that only deletes a field is not named: the
+    prior may be the full stored definition while the write is request-shaped."""
+    prior = _comparable_blocks_by_label(prior_yaml)
+    stored = _comparable_blocks_by_label(stored_yaml)
+    changed = [
+        label
+        for label, block in stored.items()
+        if label not in prior
+        or any(
+            value != prior[label].get(key, _declared_block_default(block.get("block_type"), key))
+            for key, value in block.items()
+        )
+    ]
+    return changed + [label for label in prior if label not in stored]
+
+
+def display_block_label(ctx: AgentContext, label: str) -> str:
+    # The context's own values go first because a context without a session is not in the shared registry.
+    return sanitize_block_label_for_display(redacted_terminal_text(scrub_secrets_from_text(ctx, label)) or "")
+
+
+def display_labels_changed_between(ctx: AgentContext, prior_yaml: str | None, stored_yaml: str) -> list[str]:
+    return [display_block_label(ctx, label) for label in _labels_changed_between(prior_yaml, stored_yaml)]
+
+
+def record_edited_block_labels(ctx: CopilotContext, prior_yaml: str | None, stored_yaml: str) -> None:
+    labels = display_labels_changed_between(ctx, prior_yaml, stored_yaml)
+    for label in labels:
+        ctx.record_edited_block_label(label)
+    # A settings or parameter edit names no block but still postdates any run dispatched before it.
+    if not labels and parse_workflow_yaml(prior_yaml or "") != parse_workflow_yaml(stored_yaml):
+        ctx.block_edits_recorded_this_turn += 1
+
+
 def _advisory_labels_by_diagnostic(
     changed_code_blocks: Mapping[str, str], accepted_yaml: str
 ) -> dict[CodeBlockPreflightDiagnostic, list[str]]:
@@ -958,10 +1026,6 @@ def _generated_code_preflight_reason_code(error: str | CodeBlockSecurityError) -
     if not reason_code.startswith("AUTHOR_PAGE_"):
         return None
     return reason_code
-
-
-def _declared_string_workflow_parameter_keys(parsed: Mapping[str, Any]) -> set[str]:
-    return declared_string_workflow_parameter_keys(parsed)
 
 
 def _clear_code_authoring_repair_context(ctx: AgentContext) -> None:
@@ -1149,452 +1213,6 @@ def _active_completion_criteria(ctx: AgentContext) -> list[CompletionCriterion]:
     if request_policy is None:
         return []
     return request_policy.graded_completion_criteria()
-
-
-class _DefinitionPlaneReject(NamedTuple):
-    criterion_ids: tuple[str, ...]
-    reason_codes: tuple[str, ...]
-    unreferenced_parameter_keys: tuple[str, ...]
-
-
-def _expression_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
-    if isinstance(expression, ast.Name) and isinstance(expression.ctx, ast.Load):
-        return set(bindings.get(expression.id, set()))
-    if isinstance(expression, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
-        local_bindings = {name: set(sources) for name, sources in bindings.items()}
-        comprehension_sources: set[str] = set()
-        for generator in expression.generators:
-            comprehension_sources.update(_expression_parameter_sources(generator.iter, local_bindings))
-            _bind_parameter_sources(generator.target, set(), local_bindings)
-            for condition in generator.ifs:
-                comprehension_sources.update(_expression_parameter_sources(condition, local_bindings))
-        if isinstance(expression, ast.DictComp):
-            comprehension_sources.update(_expression_parameter_sources(expression.key, local_bindings))
-            comprehension_sources.update(_expression_parameter_sources(expression.value, local_bindings))
-        else:
-            comprehension_sources.update(_expression_parameter_sources(expression.elt, local_bindings))
-        return comprehension_sources
-    if isinstance(expression, ast.Lambda):
-        local_bindings = {name: set(sources) for name, sources in bindings.items()}
-        for argument in (*expression.args.posonlyargs, *expression.args.args, *expression.args.kwonlyargs):
-            local_bindings[argument.arg] = set()
-        if expression.args.vararg is not None:
-            local_bindings[expression.args.vararg.arg] = set()
-        if expression.args.kwarg is not None:
-            local_bindings[expression.args.kwarg.arg] = set()
-        return _expression_parameter_sources(expression.body, local_bindings)
-    if isinstance(expression, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return set()
-    sources: set[str] = set()
-    for child in ast.iter_child_nodes(expression):
-        sources.update(_expression_parameter_sources(child, bindings))
-    return sources
-
-
-def _awaited_parameter_sources(expression: ast.AST, bindings: Mapping[str, set[str]]) -> set[str]:
-    if isinstance(expression, ast.Await):
-        return _expression_parameter_sources(expression.value, bindings)
-    if isinstance(expression, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return set()
-    sources: set[str] = set()
-    for child in ast.iter_child_nodes(expression):
-        sources.update(_awaited_parameter_sources(child, bindings))
-    return sources
-
-
-def _bind_parameter_sources(target: ast.expr, sources: set[str], bindings: dict[str, set[str]]) -> None:
-    if isinstance(target, ast.Name):
-        bindings[target.id] = set(sources)
-        return
-    if isinstance(target, (ast.Tuple, ast.List)):
-        for element in target.elts:
-            _bind_parameter_sources(element, sources, bindings)
-
-
-def _merge_parameter_bindings(left: Mapping[str, set[str]], right: Mapping[str, set[str]]) -> dict[str, set[str]]:
-    return {name: set(left.get(name, set())) | set(right.get(name, set())) for name in set(left) | set(right)}
-
-
-def _loop_body_has_reachable_break(statements: Sequence[ast.stmt]) -> bool:
-    for statement in statements:
-        if isinstance(statement, ast.Break):
-            return True
-        if isinstance(
-            statement, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
-            if not _statements_can_fall_through([statement]):
-                return False
-            continue
-        if isinstance(statement, ast.If):
-            if isinstance(statement.test, ast.Constant):
-                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
-                if _loop_body_has_reachable_break(selected_branch):
-                    return True
-            elif _loop_body_has_reachable_break(statement.body) or _loop_body_has_reachable_break(statement.orelse):
-                return True
-        elif isinstance(statement, (ast.Try, ast.TryStar)):
-            if statement.finalbody:
-                if _loop_body_has_reachable_break(statement.finalbody):
-                    return True
-                if not _statements_can_fall_through(statement.finalbody):
-                    return False
-            branches = [statement.body, statement.orelse]
-            branches.extend(handler.body for handler in statement.handlers)
-            if any(_loop_body_has_reachable_break(branch) for branch in branches):
-                return True
-        elif isinstance(statement, (ast.With, ast.AsyncWith)) and _loop_body_has_reachable_break(statement.body):
-            return True
-        elif isinstance(statement, ast.Match) and any(
-            _loop_body_has_reachable_break(case.body) for case in statement.cases
-        ):
-            return True
-        if not _statements_can_fall_through([statement]):
-            return False
-    return False
-
-
-def _statements_can_fall_through(statements: Sequence[ast.stmt]) -> bool:
-    for statement in statements:
-        if isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
-            return False
-        if isinstance(statement, ast.If):
-            if isinstance(statement.test, ast.Constant):
-                selected_branch = statement.body if bool(statement.test.value) else statement.orelse
-                if not _statements_can_fall_through(selected_branch):
-                    return False
-                continue
-            if statement.orelse:
-                if not _statements_can_fall_through(statement.body) and not _statements_can_fall_through(
-                    statement.orelse
-                ):
-                    return False
-        if (
-            isinstance(statement, ast.While)
-            and isinstance(statement.test, ast.Constant)
-            and bool(statement.test.value)
-            and not _loop_body_has_reachable_break(statement.body)
-        ):
-            return False
-        if isinstance(statement, (ast.Try, ast.TryStar)):
-            if statement.finalbody and not _statements_can_fall_through(statement.finalbody):
-                return False
-            normal_falls_through = _statements_can_fall_through(statement.body) and _statements_can_fall_through(
-                statement.orelse
-            )
-            handler_falls_through = any(_statements_can_fall_through(handler.body) for handler in statement.handlers)
-            if not normal_falls_through and not handler_falls_through:
-                return False
-    return True
-
-
-def _statement_parameter_dataflow(
-    statements: Sequence[ast.stmt], bindings: dict[str, set[str]]
-) -> tuple[set[str], dict[str, set[str]]]:
-    consumed: set[str] = set()
-    current = {name: set(sources) for name, sources in bindings.items()}
-    for statement in statements:
-        if isinstance(statement, ast.Assign):
-            consumed.update(_awaited_parameter_sources(statement.value, current))
-            sources = _expression_parameter_sources(statement.value, current)
-            for target in statement.targets:
-                _bind_parameter_sources(target, sources, current)
-            continue
-        if isinstance(statement, ast.AnnAssign):
-            value = statement.value
-            sources = _expression_parameter_sources(value, current) if value is not None else set()
-            if value is not None:
-                consumed.update(_awaited_parameter_sources(value, current))
-            _bind_parameter_sources(statement.target, sources, current)
-            continue
-        if isinstance(statement, ast.AugAssign):
-            sources = _expression_parameter_sources(statement.target, current)
-            sources.update(_expression_parameter_sources(statement.value, current))
-            consumed.update(_awaited_parameter_sources(statement.value, current))
-            _bind_parameter_sources(statement.target, sources, current)
-            continue
-        if isinstance(statement, ast.Expr):
-            consumed.update(_awaited_parameter_sources(statement.value, current))
-            continue
-        if isinstance(statement, ast.Return):
-            if statement.value is not None:
-                consumed.update(_expression_parameter_sources(statement.value, current))
-            break
-        if isinstance(statement, ast.Raise):
-            if statement.exc is not None:
-                consumed.update(_expression_parameter_sources(statement.exc, current))
-            break
-        if isinstance(statement, ast.If):
-            consumed.update(_expression_parameter_sources(statement.test, current))
-            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
-                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.orelse, current)
-                consumed.update(branch_consumed)
-                current = branch_bindings
-                continue
-            if isinstance(statement.test, ast.Constant) and statement.test.value is True:
-                branch_consumed, branch_bindings = _statement_parameter_dataflow(statement.body, current)
-                consumed.update(branch_consumed)
-                current = branch_bindings
-                continue
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
-            consumed.update(body_consumed)
-            consumed.update(else_consumed)
-            body_falls_through = _statements_can_fall_through(statement.body)
-            else_falls_through = _statements_can_fall_through(statement.orelse)
-            if body_falls_through and else_falls_through:
-                current = _merge_parameter_bindings(body_bindings, else_bindings)
-            elif body_falls_through:
-                current = body_bindings
-            elif else_falls_through:
-                current = else_bindings
-            else:
-                break
-            continue
-        if isinstance(statement, (ast.For, ast.AsyncFor)):
-            consumed.update(_expression_parameter_sources(statement.iter, current))
-            loop_bindings = {name: set(sources) for name, sources in current.items()}
-            _bind_parameter_sources(statement.target, set(), loop_bindings)
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, loop_bindings)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
-            consumed.update(body_consumed)
-            consumed.update(else_consumed)
-            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
-            continue
-        if isinstance(statement, ast.While):
-            consumed.update(_expression_parameter_sources(statement.test, current))
-            if isinstance(statement.test, ast.Constant) and statement.test.value is False:
-                else_consumed, current = _statement_parameter_dataflow(statement.orelse, current)
-                consumed.update(else_consumed)
-                continue
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, current)
-            consumed.update(body_consumed)
-            consumed.update(else_consumed)
-            current = _merge_parameter_bindings(current, _merge_parameter_bindings(body_bindings, else_bindings))
-            continue
-        if isinstance(statement, (ast.Try, ast.TryStar)):
-            body_consumed, body_bindings = _statement_parameter_dataflow(statement.body, current)
-            consumed.update(body_consumed)
-            merged = body_bindings
-            for handler in statement.handlers:
-                handler_bindings = {name: set(sources) for name, sources in current.items()}
-                if handler.name:
-                    handler_bindings[handler.name] = set()
-                handler_consumed, handler_bindings = _statement_parameter_dataflow(handler.body, handler_bindings)
-                consumed.update(handler_consumed)
-                merged = _merge_parameter_bindings(merged, handler_bindings)
-            else_consumed, else_bindings = _statement_parameter_dataflow(statement.orelse, body_bindings)
-            consumed.update(else_consumed)
-            merged = _merge_parameter_bindings(merged, else_bindings)
-            final_consumed, current = _statement_parameter_dataflow(statement.finalbody, merged)
-            consumed.update(final_consumed)
-            continue
-        if isinstance(statement, (ast.With, ast.AsyncWith)):
-            with_bindings = {name: set(sources) for name, sources in current.items()}
-            for item in statement.items:
-                consumed.update(_expression_parameter_sources(item.context_expr, current))
-                if item.optional_vars is not None:
-                    _bind_parameter_sources(item.optional_vars, set(), with_bindings)
-            body_consumed, current = _statement_parameter_dataflow(statement.body, with_bindings)
-            consumed.update(body_consumed)
-            continue
-        if isinstance(statement, ast.Match):
-            consumed.update(_expression_parameter_sources(statement.subject, current))
-            merged = {name: set(sources) for name, sources in current.items()}
-            for case in statement.cases:
-                if case.guard is not None:
-                    consumed.update(_expression_parameter_sources(case.guard, current))
-                case_consumed, case_bindings = _statement_parameter_dataflow(case.body, current)
-                consumed.update(case_consumed)
-                merged = _merge_parameter_bindings(merged, case_bindings)
-            current = merged
-            continue
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            function_bindings = {name: set(sources) for name, sources in current.items()}
-            for argument in (
-                *statement.args.posonlyargs,
-                *statement.args.args,
-                *statement.args.kwonlyargs,
-            ):
-                function_bindings[argument.arg] = set()
-            if statement.args.vararg is not None:
-                function_bindings[statement.args.vararg.arg] = set()
-            if statement.args.kwarg is not None:
-                function_bindings[statement.args.kwarg.arg] = set()
-            function_consumed, _ = _statement_parameter_dataflow(statement.body, function_bindings)
-            current[statement.name] = function_consumed
-            continue
-        if isinstance(statement, ast.ClassDef):
-            current[statement.name] = set()
-            continue
-        consumed.update(_expression_parameter_sources(statement, current))
-    return consumed, current
-
-
-def _code_runtime_parameter_sources(code: str, parameter_keys: set[str]) -> set[str] | None:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return None
-    initial_bindings = {key: {key} for key in parameter_keys}
-    consumed, _ = _statement_parameter_dataflow(tree.body, initial_bindings)
-    return consumed
-
-
-def _value_template_parameter_sources(value: Any, parameter_keys: set[str], depth: int = 0) -> set[str]:
-    if depth > 12:
-        return set()
-    if isinstance(value, str):
-        try:
-            return get_missing_variables(value, {}) & parameter_keys
-        except TemplateSyntaxError:
-            return set()
-    if isinstance(value, Mapping):
-        sources: set[str] = set()
-        raw_keys = value.get("parameter_keys")
-        if isinstance(raw_keys, list):
-            sources.update(key for key in raw_keys if key in parameter_keys)
-        for child in value.values():
-            sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
-        return sources
-    if isinstance(value, list):
-        list_sources: set[str] = set()
-        for child in value:
-            list_sources.update(_value_template_parameter_sources(child, parameter_keys, depth + 1))
-        return list_sources
-    return set()
-
-
-def _non_code_runtime_parameter_sources(parsed: Mapping[str, Any], parameter_keys: set[str]) -> set[str]:
-    definition = parsed.get("workflow_definition")
-    blocks = definition.get("blocks") if isinstance(definition, Mapping) else None
-    sources: set[str] = set()
-
-    def visit(value: Any) -> None:
-        if isinstance(value, list):
-            for child in value:
-                visit(child)
-            return
-        if not isinstance(value, Mapping):
-            return
-        is_block = "block_type" in value
-        if is_block and _enum_or_string_name(value.get("block_type")) != BlockType.CODE.value:
-            own_fields = {
-                key: child
-                for key, child in value.items()
-                if key not in {*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS}
-            }
-            sources.update(_value_template_parameter_sources(own_fields, parameter_keys))
-        for key in (*_ORDERED_CHILD_BLOCK_LIST_KEYS, *_ORDERED_BRANCH_LIST_KEYS):
-            visit(value.get(key))
-
-    visit(blocks)
-    return sources
-
-
-def _workflow_runtime_parameter_sources(parsed: dict[str, Any]) -> set[str] | None:
-    parameter_keys = _declared_string_workflow_parameter_keys(parsed)
-    sources: set[str] = set()
-    for block in _workflow_code_blocks(parsed):
-        raw_parameter_keys = block.get("parameter_keys")
-        block_parameter_keys = (
-            {key for key in raw_parameter_keys if isinstance(key, str) and key}
-            if isinstance(raw_parameter_keys, list)
-            else set()
-        )
-        block_sources = _code_runtime_parameter_sources(str(block.get("code") or ""), block_parameter_keys)
-        if block_sources is None:
-            return None
-        sources.update(block_sources)
-    sources.update(_non_code_runtime_parameter_sources(parsed, parameter_keys))
-    return sources
-
-
-def _definition_plane_preflight_reject(
-    ctx: AgentContext,
-    workflow_yaml: str,
-    *,
-    enforce_untagged_declared_inputs: bool = False,
-) -> _DefinitionPlaneReject | None:
-    definition_criteria = [
-        criterion for criterion in _active_completion_criteria(ctx) if criterion.level == "definition"
-    ]
-    code_only_browser = _copilot_authoring_capability(ctx).code_blocks
-    if not definition_criteria and not (code_only_browser and enforce_untagged_declared_inputs):
-        return None
-    unreferenced_parameter_keys: tuple[str, ...] = ()
-    runtime_sources: set[str] | None = None
-    if code_only_browser:
-        parsed = parse_workflow_yaml(workflow_yaml)
-        if isinstance(parsed, dict):
-            runtime_sources = _workflow_runtime_parameter_sources(parsed)
-            if runtime_sources is None:
-                return None
-            parameter_keys = _declared_string_workflow_parameter_keys(parsed)
-            unreferenced_parameter_keys = tuple(sorted(parameter_keys - runtime_sources))
-    unsatisfied = [
-        verdict
-        for verdict in grade_definition_criteria(definition_criteria, workflow_yaml)
-        if verdict.state == "unsatisfied"
-    ]
-    if runtime_sources is not None and not unreferenced_parameter_keys:
-        unsatisfied = [
-            verdict for verdict in unsatisfied if verdict.reason_code != "definition_parameters_unreferenced"
-        ]
-    if not unsatisfied and not unreferenced_parameter_keys:
-        return None
-    return _DefinitionPlaneReject(
-        criterion_ids=tuple(verdict.criterion_id for verdict in unsatisfied)
-        or tuple(criterion.id for criterion in definition_criteria),
-        reason_codes=tuple(verdict.reason_code for verdict in unsatisfied)
-        or (("definition_parameters_unreferenced",) if unreferenced_parameter_keys else ()),
-        unreferenced_parameter_keys=unreferenced_parameter_keys,
-    )
-
-
-def _definition_plane_reject_error(rejection: _DefinitionPlaneReject) -> str:
-    if rejection.unreferenced_parameter_keys:
-        keys = ", ".join(f"`{key}`" for key in rejection.unreferenced_parameter_keys)
-        return f"The submitted workflow declares reusable parameters that no block references: {keys}."
-    return "The submitted workflow does not satisfy its active definition-level requirements."
-
-
-def _definition_plane_structural_payload(
-    workflow_yaml: str,
-    rejection: _DefinitionPlaneReject,
-    code_artifact_metadata: object = None,
-) -> tuple[dict[str, object], str | None]:
-    authored_signature = authored_structure_signature_from_workflow(workflow_yaml, code_artifact_metadata)
-    return (
-        {
-            "reason_code": "definition_contract_unsatisfied",
-            "criterion_ids": rejection.criterion_ids,
-            "definition_reason_codes": rejection.reason_codes,
-            "unreferenced_parameter_keys": rejection.unreferenced_parameter_keys,
-            "authored_structure_signature": authored_signature,
-        },
-        authored_signature,
-    )
-
-
-def _definition_plane_structural_key(
-    workflow_yaml: str,
-    rejection: _DefinitionPlaneReject,
-    code_artifact_metadata: object = None,
-) -> str:
-    structural_payload, authored_signature = _definition_plane_structural_payload(
-        workflow_yaml,
-        rejection,
-        code_artifact_metadata,
-    )
-    outcome = recorded_outcome_from_author_time_reject(
-        reason_code="definition_contract_unsatisfied",
-        block_labels=sorted(_workflow_yaml_code_blocks_by_label(workflow_yaml)),
-        structural_payload=structural_payload,
-        authored_structure_signature=authored_signature,
-        observed_evidence_summary=_definition_plane_reject_error(rejection),
-    )
-    return outcome.structural_key or authored_signature or ""
 
 
 def _judgment_output_paths(ctx: AgentContext) -> set[str]:
@@ -2972,14 +2590,6 @@ def _compiled_authoring_user_summary() -> str:
     return "I need to bind the compiled browser-step code safely before saving this workflow."
 
 
-def _workflow_code_blocks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        block
-        for block in workflow_blocks(parsed)
-        if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value
-    ]
-
-
 def _raw_metadata_item_mapping(raw_item: Any) -> Mapping[str, Any] | None:
     if isinstance(raw_item, CodeArtifactMetadata):
         return raw_item.model_dump(mode="json", exclude_none=True)
@@ -4031,6 +3641,7 @@ def copilot_workflow_yaml_matches(
                 _normalized_canvas_for_proposal_restore(
                     submitted_with_notes,
                     inherited_code_version=source_canvas.code_version,
+                    inherited_enable_self_healing=source_canvas.enable_self_healing,
                     inherited_proxy_location=inherited_proxy_location,
                 )
                 == source_canvas
@@ -4045,6 +3656,7 @@ def _normalized_canvas_for_proposal_restore(
     workflow_yaml: str,
     *,
     inherited_code_version: int | None = None,
+    inherited_enable_self_healing: bool | None = None,
     inherited_proxy_location: ProxyLocationInput = None,
 ) -> WorkflowCreateYAMLRequest:
     """Normalize editor-only empty code outlines before comparing canvas custody.
@@ -4055,12 +3667,15 @@ def _normalized_canvas_for_proposal_restore(
     """
     normalized = _normalize_copilot_yaml(workflow_yaml)
     normalized.webhook_callback_url = normalized.webhook_callback_url or None
+    normalized.description = normalized.description or None
     normalized.proxy_location = resolve_proxy_location(normalized, inherited_proxy_location)
     normalized.extra_http_headers = None
     normalized.cdp_connect_headers = None
     normalized.mask_secrets = bool(normalized.mask_secrets)
     if normalized.code_version is None:
         normalized.code_version = inherited_code_version
+    if normalized.enable_self_healing is None:
+        normalized.enable_self_healing = inherited_enable_self_healing
 
     def normalize_blocks(blocks: Sequence[BLOCK_YAML_SUBCLASSES]) -> None:
         for block in blocks:
@@ -4194,12 +3809,12 @@ async def _validated_pending_workflow_proposal(
     sanitized_yaml = strip_copilot_yaml_headers(workflow_yaml)
     if sanitized_yaml is None:
         return None
-    # An explicit canvas edit remains the model's input to the normal update tool.
-    # Only restore over the persisted canvas or the same pending proposal.
+    # An explicit canvas edit remains the model's input to the normal update tool, so restore only over the
+    # saved canvas or the same pending proposal.
     if ctx.workflow_yaml and not copilot_workflow_yaml_matches(
         ctx.workflow_yaml,
         sanitized_yaml,
-        ctx.persisted_workflow_yaml,
+        saved_workflow_canvas(ctx, canonical),
         inherited_proxy_location=canonical.proxy_location if canonical is not None else None,
     ):
         LOG.info(
@@ -4341,6 +3956,14 @@ def _candidate_private_settings(
         inherited_settings=inherited_header_settings(saved) if saved is not None else None,
     )
     return _CandidatePrivateSettings(proposal_settings, authored, effective)
+
+
+def saved_workflow_canvas(ctx: CopilotContext, saved: Workflow | None = None) -> str | None:
+    """The saved row's canvas: ``persisted_workflow_yaml`` stays None when that row has no blocks."""
+    saved = saved or ctx.saved_workflow
+    if ctx.persisted_workflow_yaml is not None or saved is None:
+        return ctx.persisted_workflow_yaml
+    return workflow_to_copilot_yaml(saved)
 
 
 async def restore_pending_workflow_proposal(
@@ -4492,6 +4115,7 @@ async def adopt_stored_workflow_candidate(ctx: CopilotContext) -> ProposalAdopti
     # This turn's own draft is gone, so no turn-end exit may present or re-publish it. The adopted candidate
     # becomes this turn's result only once this turn edits it.
     ctx.has_staged_proposal = False
+    ctx.edited_block_labels_this_turn = []
     ctx.last_workflow = None
     ctx.last_workflow_yaml = None
     ctx.last_good_workflow = None
@@ -4618,6 +4242,69 @@ def _candidate_proposal_data(workflow: Workflow, workflow_yaml: str, ctx: Copilo
     return proposal
 
 
+class CopilotCanonicalWorkflowUnavailableError(Exception):
+    def __init__(self, workflow_permanent_id: str) -> None:
+        super().__init__("No active workflow exists for the bound permanent ID")
+        self.workflow_permanent_id = workflow_permanent_id
+
+
+_UNAVAILABLE_AGENT_FACTS = (
+    "Another save or test from this chat fails the same way. "
+    "Agents are selected or created on the Agents page at /agents."
+)
+CANONICAL_WORKFLOW_UNAVAILABLE_ERROR = (
+    "This chat's agent is unavailable: no active agent exists for its ID, so this change was not saved or tested. "
+    + _UNAVAILABLE_AGENT_FACTS
+)
+CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR = (
+    "This chat's agent is unavailable: no active agent exists for its ID, so this test was not started. "
+    + _UNAVAILABLE_AGENT_FACTS
+)
+
+
+def record_canonical_workflow_unavailable(
+    ctx: CopilotContext,
+    error: CopilotCanonicalWorkflowUnavailableError,
+    *,
+    refused: Literal["publication", "test_start"],
+) -> CanonicalWorkflowUnavailableFacts:
+    facts: CanonicalWorkflowUnavailableFacts = {
+        "workflow_permanent_id": error.workflow_permanent_id,
+        "test_started": False,
+        "detail": CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR,
+    }
+    # A test-start refusal says nothing about publication: a combined update-and-run may already have
+    # published this call's candidate before the agent became unavailable.
+    if refused == "publication":
+        facts["candidate_published"] = False
+        facts["detail"] = CANONICAL_WORKFLOW_UNAVAILABLE_ERROR
+    ctx.canonical_workflow_unavailable = facts
+    LOG.info(
+        "copilot_canonical_workflow_unavailable", workflow_permanent_id=error.workflow_permanent_id, refused=refused
+    )
+    return facts
+
+
+def canonical_workflow_unavailable_result(
+    ctx: CopilotContext,
+    error: CopilotCanonicalWorkflowUnavailableError,
+    *,
+    refused: Literal["publication", "test_start"],
+) -> dict[str, Any]:
+    facts = record_canonical_workflow_unavailable(ctx, error, refused=refused)
+    return {"ok": False, "canonical_workflow_unavailable": dict(facts), "error": facts["detail"]}
+
+
+async def require_active_canonical_workflow(ctx: CopilotContext) -> Workflow:
+    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=ctx.workflow_permanent_id,
+        organization_id=ctx.organization_id,
+    )
+    if canonical is None:
+        raise CopilotCanonicalWorkflowUnavailableError(ctx.workflow_permanent_id)
+    return canonical
+
+
 async def publish_workflow_candidate(
     ctx: CopilotContext,
     *,
@@ -4643,38 +4330,35 @@ async def publish_workflow_candidate(
             inherited_settings=inherited_header_settings(workflow),
         )
         return strip_copilot_yaml_headers(workflow_yaml) or ""
-    canonical = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        organization_id=ctx.organization_id,
-    )
-    if canonical is None:
-        raise RuntimeError("Canonical workflow disappeared before candidate publication")
-    # The title this proposal froze was resolved when the turn parsed its YAML. Anything that renamed
-    # the row since the turn opened -- background naming, or the user from the header -- has to win
-    # here, or canonical_title would record that name while the bytes keep the stale one, and Accept
-    # would read the two as agreeing and write the stale one back.
-    # Anything that renamed the row since the turn opened -- background naming, or the user saving
-    # from the header -- outranks the title this proposal froze when the turn parsed its YAML. The
-    # baseline is the saved row at turn open: the submitted canvas can carry an unsaved rename that
-    # differs from the row without anything having landed, and a blockless agent has no saved YAML.
-    opening_title = ctx.opening_workflow_title
-    if opening_title is not None and canonical.title and canonical.title != opening_title:
-        workflow.title = canonical.title
-    workflow_yaml = with_workflow_yaml_title(workflow_yaml, workflow.title)
-    proposal = _candidate_proposal_data(workflow, workflow_yaml, ctx)
-    workflow_yaml = strip_copilot_yaml_headers(workflow_yaml) or ""
-    proposal["_copilot_yaml"] = workflow_yaml
-    updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
-        organization_id=ctx.organization_id,
-        workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
-        proposal=proposal,
-        owner_turn_id=ctx.turn_id,
-        canonical_fingerprint=proposal_workflow_fingerprint(canonical),
-        canonical_title=canonical.title,
-        disposition=disposition,
-        expected_owner_turn_id=ctx.proposal_owner_turn_id,
-        expected_revision=ctx.proposal_revision,
-    )
+    # Deletion takes this lock, so the active-row read and the candidate write cannot straddle a delete.
+    async with app.DATABASE.workflows.acquire_workflow_creation_lock(ctx.workflow_permanent_id):
+        canonical = await require_active_canonical_workflow(ctx)
+        # The title this proposal froze was resolved when the turn parsed its YAML. Anything that renamed
+        # the row since the turn opened -- background naming, or the user from the header -- has to win
+        # here, or canonical_title would record that name while the bytes keep the stale one, and Accept
+        # would read the two as agreeing and write the stale one back.
+        # Anything that renamed the row since the turn opened -- background naming, or the user saving
+        # from the header -- outranks the title this proposal froze when the turn parsed its YAML. The
+        # baseline is the saved row at turn open: the submitted canvas can carry an unsaved rename that
+        # differs from the row without anything having landed, and a blockless agent has no saved YAML.
+        opening_title = ctx.opening_workflow_title
+        if opening_title is not None and canonical.title and canonical.title != opening_title:
+            workflow.title = canonical.title
+        workflow_yaml = with_workflow_yaml_title(workflow_yaml, workflow.title)
+        proposal = _candidate_proposal_data(workflow, workflow_yaml, ctx)
+        workflow_yaml = strip_copilot_yaml_headers(workflow_yaml) or ""
+        proposal["_copilot_yaml"] = workflow_yaml
+        updated_chat = await app.DATABASE.workflow_params.publish_workflow_copilot_candidate(
+            organization_id=ctx.organization_id,
+            workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+            proposal=proposal,
+            owner_turn_id=ctx.turn_id,
+            canonical_fingerprint=proposal_workflow_fingerprint(canonical),
+            canonical_title=canonical.title,
+            disposition=disposition,
+            expected_owner_turn_id=ctx.proposal_owner_turn_id,
+            expected_revision=ctx.proposal_revision,
+        )
     metadata = copilot_proposal_metadata(updated_chat.proposed_workflow)
     if metadata is None:
         raise RuntimeError("Candidate publication returned no ownership token")
@@ -4810,6 +4494,12 @@ async def _update_workflow(
                 },
             ),
         )
+    vault_login_error = bitwarden_binding_change_error(workflow_yaml, ctx.request_policy)
+    if vault_login_error is None:
+        workflow_yaml, vault_login_error = await import_bound_vault_logins(workflow_yaml, ctx)
+    if vault_login_error is not None:
+        return _blocked(AuthorTimeBlock(block_id=CREDENTIAL_SCOUT_BLOCK_ID, error=vault_login_error))
+    params["workflow_yaml"] = workflow_yaml
     if allow_missing_credentials is None:
         allow_missing_credentials = ctx.allow_untested_workflow_draft is True
     if not allow_missing_credentials:
@@ -4994,6 +4684,8 @@ async def _update_workflow(
                         reason=conflict.reason,
                         adoption=adoption,
                     )
+                except CopilotCanonicalWorkflowUnavailableError as unavailable:
+                    return canonical_workflow_unavailable_result(ctx, unavailable, refused="publication")
                 ctx.staged_workflow_yaml = workflow_yaml
                 ctx.staged_workflow = workflow
                 ctx.has_staged_proposal = True
@@ -5013,6 +4705,9 @@ async def _update_workflow(
             ctx.workflow_yaml = workflow_yaml
         params["workflow_yaml"] = workflow_yaml
         if isinstance(ctx, CopilotContext):
+            # Recorded only once the draft is durably published, and before the next await, so a stop
+            # during the draft announcement still sees the saved edit.
+            record_edited_block_labels(ctx, prior_yaml, workflow_yaml)
             ctx.runner_code_block_associations_by_label = runner_code_block_associations(
                 workflow_yaml,
                 prior_associations=ctx.runner_code_block_associations_by_label,
@@ -5150,19 +4845,19 @@ async def _update_workflow(
             )
             if isinstance(ctx, CopilotContext):
                 record_kept_note_texts(ctx, kept_note_labels, workflow_yaml)
-        if dropped_note_labels:
+        # Without the Doc editor the person never sees notes, so a lost one is not mentioned at all.
+        if dropped_note_labels and notes_visible:
             data["stored_notes_dropped"] = dropped_note_labels
             data["stored_notes_dropped_message"] = (
                 "These blocks had notes but were removed or changed type in the accepted workflow, so their notes are gone: "
                 + ", ".join(dropped_note_labels)
-                + (". stored_notes_dropped_text has what they said." if notes_visible else ".")
+                + ". stored_notes_dropped_text has what they said."
             )
-            if notes_visible:
-                data["stored_notes_dropped_text"] = stored_notes_for_labels(
-                    dropped_note_labels,
-                    prior_yaml,
-                    ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None,
-                )
+            data["stored_notes_dropped_text"] = stored_notes_for_labels(
+                dropped_note_labels,
+                prior_yaml,
+                ctx.persisted_workflow_yaml if isinstance(ctx, CopilotContext) else None,
+            )
         if stored_code or stored_code_withheld:
             LOG.info(
                 "copilot write returned stored code",

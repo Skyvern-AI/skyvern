@@ -6,6 +6,7 @@ from typing import Any, Protocol
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.agent_context import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.challenge_evidence import carrier_backed_anti_bot_categories
 from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_output_grounding import (
@@ -66,7 +67,6 @@ from skyvern.forge.sdk.copilot.request_policy import (
     is_fallback_floor_criterion,
     is_neutral_reported_boolean_criterion,
 )
-from skyvern.forge.sdk.copilot.runtime import PreRunPageReference, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 

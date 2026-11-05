@@ -7,6 +7,7 @@ from skyvern.forge import set_force_app_instance
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotBrowserCodeMode
+from skyvern.forge.sdk.services.request_principal import APIKeyAuthProfile
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 
 
@@ -21,6 +22,16 @@ def released_session_stub() -> SimpleNamespace:
     return SimpleNamespace(
         released=MagicMock(side_effect=lambda: nullcontext()), reading=MagicMock(side_effect=lambda: nullcontext())
     )
+
+
+def pending_stamp_session_stub(stamped_run_id: str | None = "wr_test") -> MagicMock:
+    """A callable ``Session`` whose session answers create_workflow_run's forced-session pending stamp."""
+    session = SimpleNamespace(scalar=AsyncMock(return_value=stamped_run_id), commit=AsyncMock())
+    factory = MagicMock(side_effect=lambda: nullcontext(session))
+    factory.released = MagicMock(side_effect=lambda: nullcontext())
+    factory.reading = MagicMock(side_effect=lambda: nullcontext())
+    factory.session = session
+    return factory
 
 
 def version_write_transaction_stub() -> MagicMock:
@@ -65,6 +76,9 @@ def create_forge_stub_app() -> ForgeApp:
     # making every wr_ alias read as a live sharer. Default to "no run is live" so tests must opt a run
     # into liveness explicitly (non-PBS ownership signal).
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = MagicMock(return_value=False)
+    # Sync card-provenance predicate — an auto-mocked AsyncMock is truthy and would read every typed
+    # secret as card data.
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_SERVICE = _LazyNamespace()
     fake_app_module.BROWSER_MANAGER = _LazyNamespace()
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace
@@ -89,16 +103,38 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
+    fake_app_module.AGENT_FUNCTION.enforce_platform_aws_secret_ownership = (
+        base_agent_function.enforce_platform_aws_secret_ownership
+    )
+    fake_app_module.AGENT_FUNCTION.should_check_browser_session_artifacts = (
+        base_agent_function.should_check_browser_session_artifacts
+    )
+    fake_app_module.AGENT_FUNCTION.can_access_browser_session_artifacts = (
+        base_agent_function.can_access_browser_session_artifacts
+    )
+    fake_app_module.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = (
+        base_agent_function.browser_session_ids_authorized_for_connect
+    )
+    fake_app_module.AGENT_FUNCTION.should_redact_unresolved_browser_session_address = (
+        base_agent_function.should_redact_unresolved_browser_session_address
+    )
     fake_app_module.AGENT_FUNCTION.accessible_workflow_folder_ids = base_agent_function.accessible_workflow_folder_ids
     fake_app_module.AGENT_FUNCTION.hidden_workflow_permanent_ids = base_agent_function.hidden_workflow_permanent_ids
     fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access
     fake_app_module.AGENT_FUNCTION.enforce_folder_access_for_runs = base_agent_function.enforce_folder_access_for_runs
     fake_app_module.AGENT_FUNCTION.on_folder_created = base_agent_function.on_folder_created
+    fake_app_module.AGENT_FUNCTION.copilot_browser_pattern_accepting_calls = (
+        base_agent_function.copilot_browser_pattern_accepting_calls
+    )
     # Class constant, not a method — _LazyNamespace would auto-mock it into a non-iterable AsyncMock
     # and break every caller that scans it for close-page phrases.
     fake_app_module.AGENT_FUNCTION.MAGIC_LINK_CLOSE_SIGNALS = base_agent_function.MAGIC_LINK_CLOSE_SIGNALS
     fake_app_module.AGENT_FUNCTION.task_v3_age_default = base_agent_function.task_v3_age_default
     fake_app_module.AGENT_FUNCTION.task_v3_application_defaults = base_agent_function.task_v3_application_defaults
+    fake_app_module.AGENT_FUNCTION.task_v3_application_context_texts = (
+        base_agent_function.task_v3_application_context_texts
+    )
     fake_app_module.AGENT_FUNCTION.task_v3_answer_basis_audit = base_agent_function.task_v3_answer_basis_audit
     fake_app_module.AGENT_FUNCTION.task_v3_justify_hold_enabled = base_agent_function.task_v3_justify_hold_enabled
     fake_app_module.AGENT_FUNCTION.serialize_codeblock_parameters = base_agent_function.serialize_codeblock_parameters
@@ -124,7 +160,9 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.is_backup_queue_organization = base_agent_function.is_backup_queue_organization
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_org_lookups = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.resolve_mcp_oauth_member_api_key = AsyncMock(return_value=None)
-    fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(return_value=("full_org", None, True))
+    fake_app_module.AGENT_FUNCTION.resolve_api_key_profile = AsyncMock(
+        return_value=APIKeyAuthProfile("full_org", None, True)
+    )
     fake_app_module.AGENT_FUNCTION.get_mcp_request_organization_id = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.schedule_workflow_run_group_advance = MagicMock(return_value=None)
     fake_app_module.AGENT_FUNCTION.generate_root_workflow_run_id = base_agent_function.generate_root_workflow_run_id
@@ -201,7 +239,6 @@ def make_workflow_run_attempts_fake() -> SimpleNamespace:
     return SimpleNamespace(
         Session=MagicMock(return_value=session_context),
         create_attempt=AsyncMock(return_value=SimpleNamespace(attempt_number=1)),
-        pin_first_attempt_browser_session_if_unset=AsyncMock(),
         get_attempts=AsyncMock(return_value=[]),
         get_interim_payload_snapshot=AsyncMock(return_value={}),
         get_latest_attempts_for_runs=AsyncMock(return_value={}),

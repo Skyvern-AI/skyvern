@@ -18,14 +18,15 @@ try:
     from bs4 import BeautifulSoup  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover — bs4 is a transitive dep but discovery degrades gracefully without it.
     BeautifulSoup = None  # type: ignore[assignment, misc]
-from jinja2 import TemplateError, meta
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import JsonValue
 
 from skyvern.constants import SCRUBBED_VALUE
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.agent_context import FrontierStartProvenance
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
+from skyvern.forge.sdk.copilot.code_block_steps import bind_referenced_parameters_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import code_contains_credential_fill
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import (
@@ -40,6 +41,8 @@ from skyvern.forge.sdk.copilot.frontier_provenance_dump import (
     trust_snapshot,
     write_packet,
 )
+from skyvern.forge.sdk.copilot.input_references import jinja_roots, keys_named_in, root_parameter_key
+from skyvern.forge.sdk.copilot.output_contracts import declared_workflow_parameter_keys
 from skyvern.forge.sdk.copilot.output_utils import INTERNAL_VALIDATION_FAILURE_PREFIX
 from skyvern.forge.sdk.copilot.repair_origin_run import (
     OriginBlockOutput,
@@ -56,12 +59,9 @@ from skyvern.forge.sdk.copilot.repair_origin_run import (
     drop_named_output_source,
     origin_snapshot,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    FrontierStartProvenance,
-    resolve_browser_state_for_context,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext, resolve_browser_state_for_context
 from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
+from skyvern.forge.sdk.copilot.workflow_block_traversal import workflow_block_locations
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml, copilot_round_trip_definition
 from skyvern.forge.sdk.workflow.block_notes import definition_step_notes
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, get_all_blocks
@@ -74,6 +74,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.workflows import BlockStatus, BlockType
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._shared import (
     _block_type_name,
@@ -110,11 +111,6 @@ _BLOCK_TYPES_SIGN_IN = frozenset({"login"})
 
 # Bounds the walk into nested blocks; workflows nest a few levels, not hundreds.
 _MAX_BLOCK_NESTING_DEPTH = 10
-
-_JINJA_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-# Fallback only: this sees the identifier that opens an expression, so `{{ a ~ b }}` hides `b`.
-# _jinja_roots parses instead, and falls back to this when the text is not valid Jinja.
-_JINJA_ROOT_RE = re.compile(rf"\{{\{{\s*({_JINJA_IDENTIFIER})")
 
 _JINJA_RUNTIME_GLOBAL_ROOTS = frozenset(SandboxedEnvironment().globals)
 _JINJA_LITERAL_ROOTS = frozenset({"none", "true", "false"})
@@ -774,58 +770,6 @@ def _workflow_parameter_keys(definition: object | None) -> set[str]:
     return keys
 
 
-_CREDENTIAL_REAL_VALUE_SUFFIXES = ("_real_username", "_real_password")
-
-
-def _jinja_string_leaves(serialized: str) -> list[str]:
-    """The block config's own string values. The serialized form is JSON, so a quoted Jinja literal
-    arrives escaped as ``\\"`` — which no Jinja parser accepts — and parsing the whole blob would cost
-    every reference in a block that uses one."""
-    try:
-        payload = json.loads(serialized)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return [serialized]
-    leaves: list[str] = []
-    stack: list[Any] = [payload]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, str):
-            leaves.append(item)
-        elif isinstance(item, dict):
-            # Keys too: error_code_mapping is templatable on both sides, so a key can carry a reference.
-            stack.extend(item.keys())
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-    return leaves
-
-
-def _jinja_roots(serialized: str) -> set[str]:
-    """Every identifier the config's Jinja expressions read, from Jinja's own parser. Falls back to the
-    opening-identifier regex for a leaf that does not parse, which keeps a malformed block classifiable
-    rather than silently referenceless."""
-    roots: set[str] = set()
-    for leaf in _jinja_string_leaves(serialized):
-        try:
-            roots |= meta.find_undeclared_variables(SandboxedEnvironment().parse(leaf))
-        except (TemplateError, RecursionError):
-            roots |= set(_JINJA_ROOT_RE.findall(leaf))
-    return roots
-
-
-def _root_parameter_key(root: str, parameter_keys: set[str]) -> str | None:
-    if root in parameter_keys:
-        return root
-    return next(
-        (
-            root[: -len(suffix)]
-            for suffix in _CREDENTIAL_REAL_VALUE_SUFFIXES
-            if root.endswith(suffix) and root[: -len(suffix)] in parameter_keys
-        ),
-        None,
-    )
-
-
 def _classify_frontier_jinja_refs(
     frontier_labels: list[str],
     new_definition: object | None,
@@ -847,8 +791,8 @@ def _classify_frontier_jinja_refs(
     unknown_roots: set[str] = set()
 
     for serialized in serialized_configs:
-        for root in _jinja_roots(serialized):
-            parameter_key = _root_parameter_key(root, set(output_producers))
+        for root in jinja_roots(serialized):
+            parameter_key = root_parameter_key(root, set(output_producers))
             if parameter_key is not None:
                 suffix_form_refs.add(output_producers[parameter_key])
                 continue
@@ -858,7 +802,7 @@ def _classify_frontier_jinja_refs(
                 continue
             if root in known_labels:
                 block_form_refs.add(root)
-            if root in known_roots or _root_parameter_key(root, parameter_keys) is not None:
+            if root in known_roots or root_parameter_key(root, parameter_keys) is not None:
                 continue
             unknown_roots.add(root)
 
@@ -1747,15 +1691,46 @@ def _producer_input_keys(producer: str, definition: WorkflowDefinition) -> set[s
             stack.extend(item)
     for serialized in _serialized_frontier_block_configs([producer], definition):
         referenced.update(
-            key for root in _jinja_roots(serialized) if (key := _root_parameter_key(root, input_keys)) is not None
+            key for root in jinja_roots(serialized) if (key := root_parameter_key(root, input_keys)) is not None
         )
     return referenced
 
 
 def _workflow_prompt_input_keys(definition: WorkflowDefinition) -> set[str]:
     input_keys = {parameter.key for parameter in definition.parameters if isinstance(parameter, WorkflowParameter)}
-    roots = _jinja_roots(definition.workflow_system_prompt) if definition.workflow_system_prompt else set()
-    return {key for root in roots if (key := _root_parameter_key(root, input_keys)) is not None}
+    roots = jinja_roots(definition.workflow_system_prompt) if definition.workflow_system_prompt else set()
+    return {key for root in roots if (key := root_parameter_key(root, input_keys)) is not None}
+
+
+def _deleted_block_input_keys(label: str, stored_yaml: str) -> set[str]:
+    scan = safe_load_no_dates(bind_referenced_parameters_in_yaml(stored_yaml))
+    if not isinstance(scan, dict):
+        return set()
+    declared = declared_workflow_parameter_keys(scan)
+    block = next((loc.block for loc in workflow_block_locations(scan) if loc.block.get("label") == label), None)
+    if block is None or not declared:
+        return set()
+    # Reads raw YAML rather than _producer_input_keys because a cold start has no validated prior workflow.
+    return keys_named_in(json.dumps(block, default=str), declared)
+
+
+def inputs_only_read_by_deleted_block(label: str, stored_yaml: str, saved: Workflow) -> list[str]:
+    """Inputs the deleted block read in ``stored_yaml`` that ``saved`` still declares and nothing left in it names.
+    Any exact string or template root naming a key counts as a read, so a key in doubt is left off the list."""
+    try:
+        candidates = _deleted_block_input_keys(label, stored_yaml)
+        if not candidates:
+            return []
+        scan = saved.model_dump(mode="json", include={"workflow_definition", *_CANONICAL_WORKFLOW_SETTING_FIELDS})
+        candidates &= declared_workflow_parameter_keys(scan)
+        for parameter in scan["workflow_definition"]["parameters"]:
+            if parameter.get("key") in candidates:
+                parameter.pop("key")
+        return sorted(candidates - keys_named_in(json.dumps(scan), candidates))
+    except Exception as exc:  # noqa: BLE001 - an advisory scan must never fail the write it reports on.
+        # No exc_info: a validation error quotes workflow values, which can include input defaults.
+        LOG.warning("copilot_deleted_block_input_scan_failed", error_type=type(exc).__name__)
+        return []
 
 
 def origin_input_refusal(

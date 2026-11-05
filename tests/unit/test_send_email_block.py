@@ -65,6 +65,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowRunModel,
     WorkflowRunOutputParameterModel,
 )
+from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -90,7 +91,12 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.models.workflow import (
+    Workflow,
+    WorkflowDefinition,
+    WorkflowRunParameter,
+    WorkflowRunStatus,
+)
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
 from skyvern.schemas.emails import EmailBodyFormat
 from skyvern.schemas.workflows import (
@@ -99,14 +105,17 @@ from skyvern.schemas.workflows import (
     BlockStatus,
     BlockType,
     ForLoopBlockYAML,
+    HttpRequestBlockYAML,
     HumanInteractionBlockYAML,
     SendEmailBlockYAML,
     WhileLoopBlockYAML,
     WorkflowDefinitionYAML,
+    WorkflowParameterYAML,
 )
 from skyvern.services import script_service
 from skyvern.services.email import gmail as gmail_service
 from tests.unit._task_block_fakes import run_bound_browser_state
+from tests.unit.helpers import make_pdf
 from tests.unit.scoped_asyncio import ScopedAsyncio
 
 
@@ -182,6 +191,7 @@ def _run_context(secret_values: dict[str, str] | None = None, values: dict[str, 
     context = MagicMock()
     context.organization_id = "o_1"
     context.get_original_secret_value_or_none.side_effect = lambda value: secrets.get(value)
+    context.resolve_smtp_secret.side_effect = lambda _block, parameter: secrets.get(registered.get(parameter.key))
     context.has_parameter.side_effect = lambda key: key in secrets
     # Mirror WorkflowRunContext: get_value raises for an unregistered key, get_value_or_none does not.
     context.get_value.side_effect = lambda key: registered[key]
@@ -931,6 +941,96 @@ def _paused_run_database() -> MagicMock:
     return database
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("selector", ["Report", "smtp_password"])
+async def test_platform_email_runs_with_synthesized_secrets(
+    monkeypatch: pytest.MonkeyPatch, offline_address_validation: None, nested: bool, selector: str
+) -> None:
+    email_yaml = SendEmailBlockYAML(
+        label="email",
+        sender="sender@example.com",
+        recipients=["recipient@example.com"],
+        subject="Subject",
+        body="{{ selector }}",
+    )
+    definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[WorkflowParameterYAML(key="selector", workflow_parameter_type=WorkflowParameterType.STRING)],
+            blocks=[
+                HttpRequestBlockYAML(label="request", url="https://example.com"),
+                ForLoopBlockYAML(label="loop", loop_variable_reference="{{ items }}", loop_blocks=[email_yaml])
+                if nested
+                else email_yaml,
+            ],
+        ),
+        workflow_id="w_1",
+    )
+    now = datetime.now(UTC)
+    organization = Organization(organization_id="o_1", organization_name="Test", created_at=now, modified_at=now)
+    workflow = Workflow(
+        workflow_id="w_1",
+        organization_id="o_1",
+        title="Test",
+        workflow_permanent_id="wpid_1",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=definition,
+        created_at=now,
+        modified_at=now,
+    )
+    values = dict(zip(PLATFORM_SMTP_AWS_KEYS.values(), ("smtp.example.com", "587", "user", "password"), strict=True))
+    manager = WorkflowContextManager()
+    manager.aws_client = MagicMock(get_secret=AsyncMock(side_effect=values.get))
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    monkeypatch.setattr(app, "DATABASE", _paused_run_database())
+    monkeypatch.setattr(
+        app, "EXPERIMENTATION_PROVIDER", SimpleNamespace(is_feature_enabled_cached=AsyncMock(return_value=False))
+    )
+    monkeypatch.setattr(block_module, "get_download_retry_started_at", AsyncMock(return_value=None))
+    smtp_client = MagicMock()
+    monkeypatch.setattr(block_module.smtplib, "SMTP", MagicMock(return_value=smtp_client))
+
+    selector_parameter = next(p for p in definition.parameters if isinstance(p, WorkflowParameter))
+    context = await manager.initialize_workflow_run_context(
+        organization=organization,
+        workflow_run_id="wr_1",
+        workflow_title=workflow.title,
+        workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        workflow_parameter_tuples=[
+            (
+                selector_parameter,
+                WorkflowRunParameter(
+                    workflow_run_id="wr_1",
+                    workflow_parameter_id=selector_parameter.workflow_parameter_id,
+                    value=selector,
+                    created_at=now,
+                ),
+            )
+        ],
+        workflow_output_parameters=[p for p in definition.parameters if isinstance(p, OutputParameter)],
+        context_parameters=[],
+        secret_parameters=[p for p in definition.parameters if isinstance(p, AWSSecretParameter)],
+        workflow=workflow,
+    )
+    email = definition.blocks[1]
+    if nested:
+        assert isinstance(email, ForLoopBlock)
+        email = email.loop_blocks[0]
+    assert isinstance(email, SendEmailBlock)
+    result = await email.execute("wr_1", "wrb_1", organization_id="o_1")
+
+    smtp_client.login.assert_called_once_with("user", "password")
+    if selector == "smtp_password":
+        assert result.success is False
+        smtp_client.send_message.assert_not_called()
+        assert context.values["smtp_password"] not in str(result.output_parameter_value)
+    else:
+        assert result.success is True, result.failure_reason
+        assert smtp_client.send_message.call_args.args[0]["To"] == "recipient@example.com"
+
+
 async def _human_interaction_message(
     monkeypatch: pytest.MonkeyPatch, block: HumanInteractionBlock, browser_session_id: str | None = None
 ) -> EmailMessage:
@@ -1331,6 +1431,100 @@ async def test_email_download_directory_ignores_previous_attempt_files(
     assert (download_dir / "old.txt").read_text() == "old.txt"
 
 
+INVOICE_PDF, STATEMENT_PDF = make_pdf("Invoice 1001"), make_pdf("Statement 2002")
+
+
+def _run_download_dir_with_equal_pdfs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(settings, "DOWNLOAD_PATH", str(tmp_path))
+    download_dir = tmp_path / "wr_email"
+    download_dir.mkdir()
+    for seconds, (name, data) in enumerate(
+        [("invoice.pdf", INVOICE_PDF), ("invoice (1).pdf", INVOICE_PDF), ("statement.pdf", STATEMENT_PDF)]
+    ):
+        (download_dir / name).write_bytes(data)
+        os.utime(download_dir / name, (1_800_000_000 + seconds,) * 2)
+    return download_dir
+
+
+async def _email_attachments(block: SendEmailBlock, context: MagicMock) -> list[tuple[str | None, bytes]]:
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.get_download_retry_started_at", AsyncMock(return_value=None)),
+    ):
+        message = await block._build_email_message(context, "wr_email", "o_1")
+    return sorted(_attachments(message))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["platform_smtp", "custom_smtp"])
+async def test_both_smtp_routes_attach_each_pdf_of_the_run_download_directory_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None, route: str
+) -> None:
+    download_dir = _run_download_dir_with_equal_pdfs(tmp_path, monkeypatch)
+    custom = {"custom_smtp_host": "smtp.example.com", "custom_smtp_port": 2525} if route == "custom_smtp" else {}
+    block = _send_email_block(file_attachments=[settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY], **custom)
+    sent: list[EmailMessage] = []
+    smtp = MagicMock()
+    smtp.return_value.send_message.side_effect = sent.append
+    monkeypatch.setattr(app, "DATABASE", MagicMock(observer=SimpleNamespace(update_workflow_run_block=AsyncMock())))
+    with (
+        patch.object(SendEmailBlock, "get_workflow_run_context", return_value=_run_context()),
+        patch.object(SendEmailBlock, "record_output_parameter_value", AsyncMock()),
+        patch.object(SendEmailBlock, "build_block_result", AsyncMock(side_effect=lambda **kw: SimpleNamespace(**kw))),
+        patch.object(SendEmailBlock, "_decrypt_smtp_parameters", return_value=("smtp.example.com", 587, "u", "p")),
+        patch.object(
+            SendEmailBlock,
+            "_resolve_custom_smtp_parameters",
+            AsyncMock(return_value=("smtp.example.com", 2525, None, None)),
+        ),
+        patch.object(SendEmailBlock, "_resolve_custom_smtp_connect_hosts", AsyncMock(return_value=("127.0.0.1",))),
+        patch("skyvern.forge.sdk.workflow.models.block._send_via_custom_smtp", lambda **kw: sent.append(kw["message"])),
+        patch("skyvern.forge.sdk.workflow.models.block.smtplib.SMTP", smtp),
+        patch("skyvern.forge.sdk.workflow.models.block.skyvern_context.current", return_value=None),
+        patch("skyvern.forge.sdk.workflow.models.block.get_download_retry_started_at", AsyncMock(return_value=None)),
+    ):
+        result = await block.execute("wr_email", "wrb_1", organization_id="o_1")
+
+    assert result.success is True, result.failure_reason
+    [message] = sent
+    assert sorted(content for _, content in _attachments(message)) == sorted([INVOICE_PDF, STATEMENT_PDF])
+    assert sorted(p.name for p in download_dir.iterdir()) == ["invoice (1).pdf", "invoice.pdf", "statement.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_an_explicitly_listed_pdf_copy_is_attached_beside_the_download_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    download_dir = _run_download_dir_with_equal_pdfs(tmp_path, monkeypatch)
+    explicit = str(download_dir / "invoice (1).pdf")
+    mixed = _send_email_block(file_attachments=[settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY, explicit])
+    both_copies = _send_email_block(file_attachments=[str(download_dir / "invoice.pdf"), explicit])
+
+    assert await _email_attachments(mixed, _run_context()) == sorted(
+        [("invoice.pdf", INVOICE_PDF), ("statement.pdf", STATEMENT_PDF), ("invoice (1).pdf", INVOICE_PDF)]
+    )
+    assert await _email_attachments(both_copies, _run_context()) == sorted(
+        [("invoice.pdf", INVOICE_PDF), ("invoice (1).pdf", INVOICE_PDF)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_parameter_naming_the_download_directory_attaches_each_pdf_once_and_another_directory_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_address_validation: None
+) -> None:
+    download_dir = _run_download_dir_with_equal_pdfs(tmp_path, monkeypatch)
+    (other := download_dir / "kept").mkdir()
+    for name in ("invoice.pdf", "invoice (1).pdf"):
+        (other / name).write_bytes(INVOICE_PDF)
+    by_parameter = _send_email_block(file_attachments=["reports"])
+    context = _run_context(secret_values={"reports": "reports"}, values={"reports": str(download_dir)})
+
+    assert [content for _, content in await _email_attachments(by_parameter, context)] == sorted(
+        [INVOICE_PDF, STATEMENT_PDF]
+    )
+    assert len(await _email_attachments(_send_email_block(file_attachments=[str(other)]), _run_context())) == 2
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("blank", ["", "  "])
 async def test_a_blank_attachment_entry_is_skipped_and_the_email_still_builds(
@@ -1612,6 +1806,18 @@ async def test_gmail_send_refusals_make_no_token_or_provider_call(
     assert gmail_env.requests == []
     gmail_env.token_mints.assert_not_awaited()
     assert await gmail_env.rows(GmailSendDispatchModel) == []
+
+
+@pytest.mark.asyncio
+async def test_gmail_send_template_refusal_names_its_cause(gmail_env: GmailEnv) -> None:
+    result = await _run_gmail(_gmail_block(subject="Weekly report {{ missing_block.output.total }}"))
+
+    assert _outcome(result) == ("failed", "template_error", False)
+    assert result.failure_reason.startswith("A template in the email could not be rendered.")
+    assert "Missing reference in `missing_block.output.total` (field subject, line 1)" in result.failure_reason
+    assert "Weekly report" not in result.failure_reason
+    assert result.output_parameter_value["render_failure"]["kind"] == "Missing reference"
+    assert gmail_env.requests == []
 
 
 @pytest.mark.asyncio

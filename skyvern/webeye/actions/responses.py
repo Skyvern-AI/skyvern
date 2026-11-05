@@ -157,7 +157,7 @@ class ActionAbort(ActionResult):
         )
 
 
-# The tool-result text a tool caller (e.g. Yutori Navigator) must see when an action was skipped
+# The tool-result text a tool caller (e.g. Anthropic CUA) must see when an action was skipped
 # because its target went stale: the action did NOT run, so the model must re-observe and re-plan
 # rather than assume it executed. Generic, carries no customer or DOM text.
 STALE_TARGET_TOOL_RESULT = (

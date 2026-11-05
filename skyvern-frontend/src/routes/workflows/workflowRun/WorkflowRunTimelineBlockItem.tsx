@@ -1,10 +1,7 @@
 import {
-  CheckCircledIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CrossCircledIcon,
-  MinusCircledIcon,
-  ReloadIcon,
 } from "@radix-ui/react-icons";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
@@ -19,12 +16,13 @@ import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { InlineMarkdown } from "@/components/AgentMarkdown";
 import { statusIsFinalized } from "@/routes/tasks/types";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { getWebSearchResultSummary } from "./blockResult";
+import { StatusDot } from "./StatusDot";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { actionTypeIcons as timelineActionIcons } from "../components/actionTypeIcons";
 import { getActionDisplayStatus } from "../components/actionStatus";
-import { TerminatedIcon, terminatedTone } from "@/components/terminatedVisual";
 import {
   isAction,
   isBlockItem,
@@ -50,7 +48,6 @@ import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
-import { isTruncationMarker } from "./responseValueCaps";
 import { ThoughtCard } from "./ThoughtCard";
 import {
   aggregateIterationStatus,
@@ -139,67 +136,6 @@ function IndentRails({ depth }: { depth: number }) {
   );
 }
 
-function StatusDot({
-  status,
-  isFinalized,
-}: {
-  status: Status | null;
-  isFinalized: boolean;
-}) {
-  const label = status
-    ? status.replace("_", " ")
-    : isFinalized
-      ? "did not execute"
-      : "not started";
-  const isCompleted = status === Status.Completed;
-  const isTerminated = status === Status.Terminated;
-  const isFailure =
-    status === Status.Failed ||
-    status === Status.TimedOut ||
-    status === Status.Canceled;
-  const isRunning = status === Status.Running && !isFinalized;
-
-  const glyph = (() => {
-    if (isCompleted) {
-      return <CheckCircledIcon className="size-3.5 shrink-0 text-success" />;
-    }
-    if (isTerminated) {
-      return (
-        <TerminatedIcon className={`size-3.5 shrink-0 ${terminatedTone}`} />
-      );
-    }
-    if (isFailure) {
-      return (
-        <CrossCircledIcon className="size-3.5 shrink-0 text-destructive" />
-      );
-    }
-    if (status === Status.Skipped) {
-      return (
-        <MinusCircledIcon className="size-3.5 shrink-0 text-muted-foreground" />
-      );
-    }
-    if (isRunning) {
-      return (
-        <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-700 dark:text-sky-400" />
-      );
-    }
-    return (
-      <div className="size-2 shrink-0 rounded-full bg-muted-foreground dark:bg-slate-600" />
-    );
-  })();
-
-  return (
-    <span
-      title={label}
-      role="img"
-      aria-label={label}
-      className="flex shrink-0 items-center"
-    >
-      {glyph}
-    </span>
-  );
-}
-
 function getRecordedActionMeta(action: ActionsApiResponse): {
   codeLine: number | null;
   durationMs: number | null;
@@ -231,6 +167,7 @@ type ActionRowPresentation = {
   // Machine syntax (a Playwright call or a Task V3 tool call); shown on hover, never as the primary line.
   detail: string | null;
   tone: "default" | "error";
+  wrap: boolean;
 };
 
 // Rows for code blocks summarize recorded actions as
@@ -242,6 +179,7 @@ type ActionRowPresentation = {
 function getCodeActionRowPresentation(
   action: ActionsApiResponse,
   matchedStep: CodeBlockStep | null,
+  failureReason: string | null,
 ): ActionRowPresentation {
   const isCodeError =
     action.status === Status.Failed &&
@@ -257,24 +195,31 @@ function getCodeActionRowPresentation(
     timelineActionIcons[action.action_type]
   );
   const { codeLine, durationMs } = getRecordedActionMeta(action);
-  // An error row prints both halves of its summary: the exception that ended the block is
-  // recorded as the outcome, not the body.
+  // Without a block failure reason an error row prints both halves of its summary, since the
+  // exception is recorded as the outcome. Otherwise the full reason replaces the recorded
+  // response, which is a capped copy.
   const errorSummary = isCodeError ? getActionSummary(action) : null;
+  const fullFailureReason = isCodeError ? failureReason?.trim() || null : null;
   const parts = [
     // Every other row hides its label from sighted users, so it falls back to the readable
     // type where the chat, which always shows the label, prints nothing.
-    ...(isCodeError
-      ? [
-          normalizeInlineText(errorSummary?.body?.text),
-          errorSummary?.outcome ?? null,
-        ]
-      : [
-          describeRecordedAction(action, matchedStep) ??
-            getReadableActionType(action.action_type, {
-              nullActionLabel: "Step",
-            }),
-        ]),
-    codeLine !== null ? `line ${codeLine}` : null,
+    ...(fullFailureReason !== null
+      ? [fullFailureReason]
+      : isCodeError
+        ? [
+            normalizeInlineText(errorSummary?.body?.text),
+            errorSummary?.outcome ?? null,
+          ]
+        : [
+            describeRecordedAction(action, matchedStep) ??
+              getReadableActionType(action.action_type, {
+                nullActionLabel: "Step",
+              }),
+          ]),
+    codeLine !== null &&
+    !new RegExp(`\\bline ${codeLine}\\b`).test(fullFailureReason ?? "")
+      ? `line ${codeLine}`
+      : null,
     durationMs !== null ? formatActionDurationMs(durationMs) : null,
   ].filter((part): part is string => part !== null);
   return {
@@ -291,6 +236,7 @@ function getCodeActionRowPresentation(
         ? normalizeInlineText(action.description)
         : null,
     tone: isCodeError ? "error" : "default",
+    wrap: fullFailureReason !== null,
   };
 }
 
@@ -355,36 +301,6 @@ function getTimelineDescriptor(block: WorkflowRunBlock): string {
   }
 
   return `${workflowBlockTitle[block.block_type]} block`;
-}
-
-function getWebSearchResultSummary(block: WorkflowRunBlock): string | null {
-  const output = block.output;
-  if (
-    block.block_type !== "web_search" ||
-    block.status !== Status.Completed ||
-    !output ||
-    typeof output !== "object" ||
-    Array.isArray(output) ||
-    !("total_count" in output) ||
-    typeof output.total_count !== "number"
-  ) {
-    return null;
-  }
-
-  const count = output.total_count;
-  const summary = `${count} ${count === 1 ? "result" : "results"}`;
-  if ("prompt_output" in output && Array.isArray(output.prompt_output)) {
-    let itemCount = output.prompt_output.length;
-    const lastItem: unknown = output.prompt_output[itemCount - 1];
-    if (isTruncationMarker(lastItem)) {
-      if (typeof lastItem.original_count !== "number") {
-        return summary;
-      }
-      itemCount = lastItem.original_count;
-    }
-    return `${summary} · Prompt returned ${itemCount} ${itemCount === 1 ? "item" : "items"}`;
-  }
-  return summary;
 }
 
 function getLoopIterationGroups(
@@ -601,13 +517,14 @@ function TimelineActionRows({
         const isActive =
           isAction(activeItem) && activeItem.action_id === action.action_id;
         const displayIndex = index + 1;
-        const { icon, label, summary, detail, tone } = isCodeBlock
+        const { icon, label, summary, detail, tone, wrap } = isCodeBlock
           ? getCodeActionRowPresentation(
               action,
               findCodeStepForLine(
                 codeSteps,
                 getRecordedActionMeta(action).codeLine,
               ),
+              block.failure_reason,
             )
           : {
               icon: timelineActionIcons[action.action_type],
@@ -615,6 +532,7 @@ function TimelineActionRows({
               summary: getActionSummary(action),
               detail: taskV3CallText(action.description),
               tone: "default" as const,
+              wrap: false,
             };
 
         return (
@@ -625,7 +543,8 @@ function TimelineActionRows({
             <IndentRails depth={depth} />
             <div
               className={cn(
-                "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
+                "flex min-w-0 flex-1 gap-1.5 rounded-r py-0.5 pr-1.5",
+                wrap ? "items-start" : "items-center",
                 "hover:bg-muted/60",
                 isActive && "bg-slate-elevation4 dark:bg-slate-800",
               )}
@@ -640,7 +559,10 @@ function TimelineActionRows({
                 }}
                 aria-pressed={isActive}
                 title={detail ?? undefined}
-                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40"
+                className={cn(
+                  "flex min-w-0 flex-1 cursor-pointer gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-foreground/40",
+                  wrap ? "items-start" : "items-center",
+                )}
               >
                 <StatusDot
                   status={getActionDisplayStatus(action)}
@@ -663,7 +585,12 @@ function TimelineActionRows({
                   <span className="sr-only">{label}</span>
                 )}
                 {summary?.body ? (
-                  <span className="min-w-0 truncate text-muted-foreground dark:text-slate-500">
+                  <span
+                    className={cn(
+                      "min-w-0 text-muted-foreground dark:text-slate-500",
+                      wrap ? "whitespace-pre-wrap break-words" : "truncate",
+                    )}
+                  >
                     {summary.body.isProse ? (
                       <InlineMarkdown
                         // One line: InlineMarkdown drops every paragraph break, so prose that

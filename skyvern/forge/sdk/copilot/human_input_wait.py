@@ -6,7 +6,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -80,3 +80,21 @@ def pause_human_input(ctx: CopilotContext, kind: Literal["question", "credential
                     # The owning timeout may already have exited during cancellation.
                     pass
             wait.deadline_when = None
+
+
+def turn_clock_seconds(ctx: Any, start_time: float, now: float) -> float:
+    """Elapsed from ``start_time`` to ``now``, minus completed and active human-input waits.
+
+    Getattr-coerced because tests commonly pass a bare ``MagicMock()`` as ``ctx``, whose attributes are Mocks.
+    """
+    pause_seconds = getattr(ctx, "copilot_credential_pause_seconds", 0.0)
+    if not isinstance(pause_seconds, (int, float)):
+        pause_seconds = 0.0
+    question_seconds = getattr(ctx, "copilot_question_pause_seconds", 0.0)
+    if not isinstance(question_seconds, (int, float)):
+        question_seconds = 0.0
+    wait = getattr(ctx, "human_input_wait", None)
+    # Overlapping waits credit their union only when the last waiter exits.
+    # Until then, exclude the active union at model/tool completion boundaries.
+    active_wait_seconds = now - wait.started_at if isinstance(wait, HumanInputWait) and wait.count > 0 else 0.0
+    return now - start_time - pause_seconds - question_seconds - active_wait_seconds

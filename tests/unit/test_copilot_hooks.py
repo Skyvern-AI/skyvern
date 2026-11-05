@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -20,11 +20,13 @@ import yaml
 from PIL import Image
 from structlog.testing import capture_logs
 
+from skyvern.cli.core import copilot_sessions
 from skyvern.cli.core.browser_ops import ScreenshotResult
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry, PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.build_test_connect_failure import SUPERSEDED_BY_NEWER_TEST_REASON
 from skyvern.forge.sdk.copilot.code_block_synthesis import synthesize_code_block
 from skyvern.forge.sdk.copilot.config import AGENT_BLOCKS_ONLY, CODE_BLOCKS_ONLY, BlockAuthoringPolicy
@@ -32,10 +34,7 @@ from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
 from skyvern.forge.sdk.copilot.result_evidence import EVALUATE_TOOL_NAME
-from skyvern.forge.sdk.copilot.runtime import (
-    AgentContext,
-    OriginRunRedactionRegistry,
-)
+from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import (
     REDACTED_SECRET_PLACEHOLDER,
     clear_session_scrub_values,
@@ -56,6 +55,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import _latest_listing_google_s
 from skyvern.forge.sdk.copilot.tools.integrations import _list_integrations
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
     ScoutReadbackOutcome,
+    _get_block_schema_post_hook,
     _scout_readback_outcome,
     _scout_type_landing_failure,
 )
@@ -72,6 +72,8 @@ from skyvern.forge.sdk.integrations import catalog
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.workflow.web_search import WEB_SEARCH_HELPER_CONTRACT
+from skyvern.forge.sdk.workflow.web_search_client import SearchProvider, SearchResponse, SearchResult
 from skyvern.webeye.persistent_sessions_manager import BrowserOperation, BrowserRetirement
 from skyvern.webeye.utils import challenge_signature as challenge_signature_module
 from tests.unit._mcp_browser_fakes import crash_free_browser_state
@@ -853,7 +855,7 @@ class TestMCPFailedStepLoopDetection:
         client_mod._api_key_clients.clear()
         session_manager._current_session.set(None)
         session_manager._global_session = None
-        session_manager._copilot_sessions.clear()
+        copilot_sessions._copilot_sessions.clear()
         session_manager.set_stateless_http_mode(False)
 
         raw_page = MagicMock()
@@ -953,7 +955,7 @@ class TestMCPFailedStepLoopDetection:
             result = await server.call_tool("get_browser_screenshot", {})
         finally:
             await server.cleanup()
-            session_manager._copilot_sessions.clear()
+            copilot_sessions._copilot_sessions.clear()
 
         parsed = json.loads(result.content[0].text)
         assert result.isError is False
@@ -1378,7 +1380,6 @@ class TestBrowserInteractionObservationHooks:
 
     @pytest.mark.asyncio
     async def test_failed_click_hook_clears_stale_pending_interaction_observation(self) -> None:
-        from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
         from skyvern.forge.sdk.copilot.tools import _click_post_hook
 
         ctx = SimpleNamespace(
@@ -1948,8 +1949,6 @@ class TestScoutedInteractionCapture:
 
     @pytest.mark.asyncio
     async def test_code_schema_surfaces_ordered_facts_not_synthesized_source(self) -> None:
-        from skyvern.forge.sdk.copilot.tools.mcp_hooks import _get_block_schema_post_hook
-
         ctx = self._ctx(policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
         ctx.secret_scrub_values = []
         ctx.scout_trajectory = [
@@ -1987,6 +1986,54 @@ class TestScoutedInteractionCapture:
                 "trajectory_index": 0,
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_web_search_schema_reports_the_native_block_output(self) -> None:
+        ctx = self._ctx()
+        ctx.secret_scrub_values = []
+        oracle = SearchResponse(
+            query="example",
+            provider="google",
+            results=[
+                SearchResult(
+                    title="A",
+                    link="https://a.example.test/",
+                    snippet="",
+                    display_link="a.example.test",
+                    position=1,
+                )
+            ],
+            prompt_output={"official_url": "https://b.example.test/"},
+        ).output()
+
+        result = await _get_block_schema_post_hook({"data": {"block_type": "web_search"}}, {}, ctx)
+
+        block_output = result["data"]["block_output"]
+        fields = block_output["fields"]
+        assert fields.keys() == oracle.keys()
+        assert fields["results"]["item_keys"] == list(oracle["results"][0])
+        assert "url" not in fields["results"]["item_keys"]
+        assert fields["raw_response"].keys() == oracle["raw_response"].keys()
+        example = block_output["example_with_json_schema"]
+        assert example["provider"] in get_args(SearchProvider)
+        links = {item["link"] for item in example["results"]}
+        assert example["prompt_output"] and not links & set(example["prompt_output"].values())
+
+    @pytest.mark.asyncio
+    async def test_web_search_block_output_stays_off_other_schema_results(self) -> None:
+        ctx = self._ctx(policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        ctx.secret_scrub_values = []
+
+        code = await _get_block_schema_post_hook({"data": {"block_type": "code"}}, {}, ctx)
+        listed = await _get_block_schema_post_hook({"data": {"block_types": {"navigation": "Navigate"}}}, {}, ctx)
+        others = [
+            await _get_block_schema_post_hook({"data": {"block_type": block_type}}, {}, ctx)
+            for block_type in ("for_loop", "navigation")
+        ]
+
+        assert code["data"]["web_search_helper_contract"] == WEB_SEARCH_HELPER_CONTRACT
+        assert "url" in code["data"]["web_search_helper_contract"]["returns"]["results"]
+        assert all("block_output" not in item["data"] for item in (code, listed, *others))
 
     def test_consume_scout_source_url_reads_and_clears(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _consume_scout_source_url

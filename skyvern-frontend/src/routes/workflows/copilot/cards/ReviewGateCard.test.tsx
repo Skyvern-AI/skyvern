@@ -206,40 +206,44 @@ describe("ReviewGateCard — untested proposals stay actionable", () => {
 describe("ReviewGateCard — Test end-to-end recourse", () => {
   const noop = () => {};
 
-  it("labels the typed connection-failure action as a fresh-session retry", () => {
-    render(
-      <ReviewGateCard
-        latestTurnCause="already_closed"
-        turn={turn({
-          proposalDisposition: "review_untested",
-          turnFacts: {
-            factsAvailable: true,
-            evaluationState: null,
-            runId: null,
-            runCompleted: null,
-            terminalCause: "already_closed",
-            blocksRunThisTurn: null,
-            ranCleanOnCurrentSource: false,
-            authoredBlockCount: 0,
-            matchingSourceBlockCount: 0,
-          },
-        })}
-        pending
-        verdict="untested"
-        actionsEnabled
-        hasProposal
-        onAccept={noop}
-        onAlwaysAccept={noop}
-        onReject={noop}
-        onReview={noop}
-        onTestEndToEnd={noop}
-      />,
-    );
+  it.each(["already_closed", "browser_start_capacity"])(
+    "offers a fresh-session retry in the card body after %s",
+    (cause) => {
+      render(
+        <ReviewGateCard
+          latestTurnCause={cause}
+          turn={turn({
+            proposalDisposition: "review_untested",
+            turnFacts: {
+              factsAvailable: true,
+              evaluationState: null,
+              runId: null,
+              runCompleted: null,
+              terminalCause: cause,
+              blocksRunThisTurn: null,
+              ranCleanOnCurrentSource: false,
+              authoredBlockCount: 0,
+              matchingSourceBlockCount: 0,
+            },
+          })}
+          pending
+          verdict="untested"
+          actionsEnabled
+          hasProposal
+          onAccept={noop}
+          onAlwaysAccept={noop}
+          onReject={noop}
+          onReview={noop}
+          onTestEndToEnd={noop}
+        />,
+      );
 
-    expect(
-      screen.getByRole("button", { name: "Retry in a fresh session" }),
-    ).not.toBeNull();
-  });
+      expect(
+        screen.getByRole("button", { name: "Retry in a fresh session" }),
+      ).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
+    },
+  );
 
   it("offers Billing instead of a fresh-session retry after credit admission refusal", () => {
     let testRuns = 0;
@@ -724,7 +728,7 @@ describe("ReviewGateCard — recorded review projection", () => {
     expect(screen.getByTitle("removed_cleanup").className).toContain(
       "line-through",
     );
-    expect(screen.getAllByText("Never tested")).toHaveLength(2);
+    expect(screen.getAllByText("Never tested")).toHaveLength(1);
     expect(
       screen.getByText(
         "Added Export and Backup Export write to the same destination.",
@@ -814,6 +818,69 @@ describe("ReviewGateCard — recorded review projection", () => {
     expect(screen.getByRole("button", { name: "Show 1 more" })).not.toBeNull();
   });
 
+  it("shows an input-only change above the fold of unchanged blocks", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: ["one", "two", "three", "four", "five", "six"].map(
+              (name) => ({
+                label: `keep_${name}`,
+                blockType: "task",
+                change: "unchanged" as const,
+              }),
+            ),
+            duplicateWrites: [],
+            inputs: [{ key: "seed_rows", change: "removed" }],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    const input = screen.getByText("seed_rows");
+    const fold = screen.getByRole("button", { name: "Show 2 more" });
+    expect(
+      input.compareDocumentPosition(fold) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByText(/· 1 input$/)).toBeTruthy();
+  });
+
+  it("counts both blocks and inputs in the header when both change", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              { label: "seed_step", blockType: "task", change: "removed" },
+            ],
+            duplicateWrites: [],
+            inputs: [{ key: "seed_rows", change: "removed" }],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText(/· 1 block · 1 input$/)).toBeTruthy();
+  });
+
   it("hydrates the optional projection and ignores malformed review payloads", () => {
     const basePayload = {
       turnId: "turn-1",
@@ -841,7 +908,55 @@ describe("ReviewGateCard — recorded review projection", () => {
     });
 
     expect(hydrated?.review?.blocks[0]?.label).toBe("saved_step");
+    expect(hydrated?.review?.inputs).toEqual([]);
     expect(malformed?.review).toBeNull();
+  });
+
+  it("shows input rows from a reloaded payload, dropping a malformed row instead of the review", () => {
+    const reloaded = hydrateNarrativeFromPayload({
+      turnId: "turn-1",
+      turnIndex: 0,
+      terminal: "response",
+      blocks: [],
+      review: {
+        blocks: [],
+        duplicateWrites: [],
+        inputs: [
+          { key: "seed_rows", change: "removed" },
+          { key: "api_region", change: "added" },
+          { key: "row_limit", change: "renamed" },
+          "not-a-row",
+        ],
+      },
+    });
+    expect(reloaded?.review?.inputs).toEqual([
+      { key: "seed_rows", change: "removed" },
+      { key: "api_region", change: "added" },
+    ]);
+
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({ review: reloaded?.review ?? null })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText("seed_rows").parentElement?.className).toContain(
+      "line-through",
+    );
+    expect(
+      screen.getByText("api_region").parentElement?.className,
+    ).not.toContain("line-through");
+    expect(screen.queryByText("row_limit")).toBeNull();
+    expect(screen.getByText(/· 2 inputs$/)).toBeTruthy();
   });
 });
 
@@ -902,6 +1017,131 @@ describe("ReviewGateCard — answered proposals collapse", () => {
       ),
     ).toBeTruthy();
   });
+
+  it("leaves unchanged blocks out of the untested count of an accepted proposal", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              {
+                label: "compute_total",
+                blockType: "code",
+                change: "changed",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              {
+                label: "open_portal",
+                blockType: "goto_url",
+                change: "unchanged",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              {
+                label: "upload_report",
+                blockType: "file_upload",
+                change: "unchanged",
+                neverTested: true,
+                coverage: "never_run",
+              },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending={false}
+        settled="accepted"
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText("1 untested")).toBeTruthy();
+  });
+
+  it("counts inputs beside the named blocks of a collapsed proposal", () => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              { label: "fetch_rows", blockType: "task", change: "changed" },
+            ],
+            duplicateWrites: [],
+            inputs: [
+              { key: "seed_rows", change: "removed" },
+              { key: "api_region", change: "added" },
+            ],
+          },
+        })}
+        pending={false}
+        settled="accepted"
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getByText(/Fetch Rows · 2 inputs$/)).toBeTruthy();
+  });
+
+  it.each([
+    {
+      name: "names only the changed block of a two-block accepted proposal",
+      second: "changed" as const,
+      first: "unchanged" as const,
+      header: /Compute Total$/,
+    },
+    {
+      name: "claims no changed blocks when every block of an accepted proposal is unchanged",
+      second: "unchanged" as const,
+      first: "unchanged" as const,
+      header: null,
+    },
+  ])("$name", ({ first, second, header }) => {
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              { label: "open_portal", blockType: "goto_url", change: first },
+              { label: "compute_total", blockType: "code", change: second },
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending={false}
+        settled="accepted"
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.queryByText(/Open Portal/)).toBeNull();
+    expect(screen.queryByText(/\d+ blocks?$/)).toBeNull();
+    if (header) {
+      expect(screen.getByText(header)).toBeTruthy();
+    } else {
+      expect(screen.queryByText(/Compute Total/)).toBeNull();
+    }
+  });
 });
 
 describe("ReviewGateCard — source coverage", () => {
@@ -928,6 +1168,13 @@ describe("ReviewGateCard — source coverage", () => {
                 neverTested: true,
                 coverage: "never_run",
               },
+              {
+                label: "open_portal",
+                blockType: "goto_url",
+                change: "unchanged",
+                neverTested: true,
+                coverage: "different_source",
+              },
             ],
             duplicateWrites: [],
           },
@@ -943,7 +1190,7 @@ describe("ReviewGateCard — source coverage", () => {
       />,
     );
 
-    expect(screen.getByText("Different source")).not.toBeNull();
+    expect(screen.getAllByText("Different source")).toHaveLength(2);
     expect(screen.getByText("Never tested")).not.toBeNull();
   });
 
@@ -1009,5 +1256,60 @@ describe("ReviewGateCard — source coverage", () => {
         null,
       ),
     ).toBe("untested");
+  });
+});
+
+describe("ReviewGateCard — coverage tags on unchanged blocks", () => {
+  const noop = () => {};
+
+  it("tags only added and changed blocks as never tested and leaves unchanged ones out of the fold count", () => {
+    const unchanged = ["one", "two", "three", "four", "five"].map((name) => ({
+      label: `keep_${name}`,
+      blockType: "task",
+      change: "unchanged" as const,
+      neverTested: true,
+      coverage: "never_run" as const,
+    }));
+    render(
+      <ReviewGateCard
+        latestTurnCause={null}
+        turn={turn({
+          review: {
+            blocks: [
+              {
+                label: "compute_total",
+                blockType: "code",
+                change: "changed",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              {
+                label: "send_summary",
+                blockType: "task",
+                change: "added",
+                neverTested: true,
+                coverage: "never_run",
+              },
+              ...unchanged,
+            ],
+            duplicateWrites: [],
+          },
+        })}
+        pending
+        verdict="untested"
+        actionsEnabled
+        hasProposal
+        onAccept={noop}
+        onAlwaysAccept={noop}
+        onReject={noop}
+        onReview={noop}
+      />,
+    );
+
+    expect(screen.getAllByText("Never tested")).toHaveLength(2);
+    const fold = screen.getByRole("button", { name: /^Show \d+ more/ });
+    expect(fold.textContent).not.toContain("never tested");
+    fireEvent.click(fold);
+    expect(screen.getAllByText("Never tested")).toHaveLength(2);
   });
 });

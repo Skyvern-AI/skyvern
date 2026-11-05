@@ -38,6 +38,7 @@ from skyvern.forge.sdk.services.request_principal import (
 
 from .api_key_hash import hash_api_key_for_cache
 from .client import reset_api_key_override, set_api_key_override
+from .mcp_token_claims import MCPOrgRoleRequiredError, get_token_org_id
 from .session_manager import request_session_scope
 
 LOG = structlog.get_logger(__name__)
@@ -105,13 +106,6 @@ class MissingOrgContextError(HTTPException):
 
     def __init__(self) -> None:
         super().__init__(status_code=401, detail=_OAUTH_MISSING_ORG_CONTEXT_MSG)
-
-
-class MCPOrgRoleRequiredError(HTTPException):
-    """Raised when an organization session has no supported MCP sign-in role."""
-
-    def __init__(self) -> None:
-        super().__init__(status_code=403, detail="MCP sign-in requires an organization Admin or Member role.")
 
 
 def _canonical_mcp_url(base_url: str | None = None) -> str:
@@ -293,26 +287,6 @@ def _get_oauth_org_auth_methods(db: object) -> tuple[_OrgEntitiesGetter | None, 
         return cast(_OrgEntitiesGetter, get_entities), cast(_OrgAuthTokenGetter, get_auth_token)
 
     return None, None
-
-
-def get_token_org_id(payload: dict[str, object]) -> str | None:
-    """Return the Clerk org id from supported JWT claim shapes, if any.
-
-    Session tokens carry the organization either as top-level ``org_id`` (v1
-    shape, and our JWT template) or as compact claim ``o.id`` (v2 shape,
-    current since Clerk API version 2025-04-10).
-    """
-    org_id_claim = payload.get("org_id")
-    if isinstance(org_id_claim, str) and org_id_claim:
-        return org_id_claim
-
-    compact_org_claim = payload.get("o")
-    if isinstance(compact_org_claim, dict):
-        compact_org_id = compact_org_claim.get("id")
-        if isinstance(compact_org_id, str) and compact_org_id:
-            return compact_org_id
-
-    return None
 
 
 def _extract_explicit_oauth_org_id(payload: dict[str, object]) -> str:

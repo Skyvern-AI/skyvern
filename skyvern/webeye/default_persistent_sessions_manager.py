@@ -13,7 +13,7 @@ from typing import Any, cast
 import structlog
 from playwright._impl._errors import TargetClosedError
 
-from skyvern.cli.core.session_manager import active_copilot_session_ids
+from skyvern.cli.core.copilot_sessions import active_copilot_session_ids
 from skyvern.config import settings
 from skyvern.exceptions import (
     BrowserSessionAlreadyEndedError,
@@ -1011,6 +1011,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         proxy_location: ProxyLocationInput,
         browser_profile_id: str | None,
         session_kind: BrowserSessionKind,
+        created_for_workflow_permanent_id: str | None = None,
     ) -> FreshExitReceipt:
         return FreshExitReceipt(
             outcome=FreshExitOutcome.no_alternate,

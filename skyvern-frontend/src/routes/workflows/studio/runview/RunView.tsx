@@ -140,6 +140,8 @@ type RunViewProps = {
   onFix?: (failingLabel?: string | null) => void;
   onRetry?: () => void;
   milestoneRerun?: WorkflowRunMilestoneCardProps["rerun"];
+  // False keeps the pinned step out of ?active= (a ?active= URL reloads into the run layout).
+  mirrorSelectionToUrl?: boolean;
 };
 
 function isRunOutputError(value: unknown): value is RunOutputError {
@@ -264,6 +266,7 @@ export function RunView({
   onFix,
   onRetry,
   milestoneRerun,
+  mirrorSelectionToUrl = true,
 }: RunViewProps) {
   const { workflowRunMilestoneCard: WorkflowRunMilestoneCard } = usePageSlots();
   const { runId: pathRunId } = useParams();
@@ -505,8 +508,11 @@ export function RunView({
     const next = new URLSearchParams(
       window.location.search || searchParamsRef.current.toString(),
     );
+    // Not mirroring also clears a selection left in the URL from before.
     const desired =
-      pinnedFrameId && !/:\d+$/.test(pinnedFrameId) ? pinnedFrameId : null;
+      mirrorSelectionToUrl && pinnedFrameId && !/:\d+$/.test(pinnedFrameId)
+        ? pinnedFrameId
+        : null;
     const desiredIteration =
       desired && activeIteration !== null ? String(activeIteration) : null;
     if (
@@ -534,6 +540,7 @@ export function RunView({
     workflowRunId,
     navigate,
     preserveNextEntry,
+    mirrorSelectionToUrl,
   ]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on

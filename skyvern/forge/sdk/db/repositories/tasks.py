@@ -140,6 +140,7 @@ class TasksRepository(BaseRepository):
         download_timeout: float | None = None,
         include_extracted_text: bool = True,
         attempt_number: int | None = None,
+        requested_by: str | None = None,
     ) -> Task:
         # Sanitize text fields to remove NUL bytes and control characters
         # that PostgreSQL cannot store in text columns
@@ -202,6 +203,7 @@ class TasksRepository(BaseRepository):
                 download_timeout=download_timeout,
                 include_extracted_text=include_extracted_text,
                 attempt_number=attempt_number,
+                requested_by=requested_by,
             )
             session.add(new_task)
             # The flush fills every column default, so the row needs no re-read; convert it before commit expires it.

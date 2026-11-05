@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import pydantic_core
+import structlog
 from agents import (
     Agent,
     FunctionTool,
@@ -33,6 +35,7 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.copilot_model_usage import copilot_usage_observer
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.cache_envelope import CacheableSystemInstructions
 from skyvern.forge.sdk.copilot.model_resolver import resolve_model_config
 from skyvern.forge.sdk.copilot.model_telemetry import (
@@ -44,10 +47,13 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
+from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     DEDICATED_BLOCK_TOOLS,
+    FILES_DESCRIPTION,
     FINISH_DESCRIPTION,
     RUN_BLOCK_TYPES,
     RUN_TOOL_DESCRIPTIONS,
@@ -57,13 +63,16 @@ from skyvern.forge.sdk.workflow.models.agent_step_tools import (
 )
 from skyvern.forge.sdk.workflow.models.block import Block, _validate_response_against_json_schema
 from skyvern.forge.sdk.workflow.models.parameter import (
+    PARAMETER_TYPE,
     AWSSecretParameter,
     OutputParameter,
     ParameterType,
     WorkflowParameter,
+    WorkflowParameterType,
     is_sensitive_workflow_parameter,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.schemas.agent_step_tool_names import ALWAYS_OFFERED_TOOLS
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.utils.secret_redaction import redact_secrets_from_text
@@ -71,6 +80,7 @@ from skyvern.utils.secret_redaction import redact_secrets_from_text
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 
+LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
 _MASK = "*****"
 
@@ -103,9 +113,14 @@ class _RunState:
     run_context: WorkflowRunContext
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
-    # None offers every tool.
+    workflow_system_prompt: str | None = None
     tools: list[str] | None = None
+    file_keys: list[str] = field(default_factory=list)
+    # Kept out of run_context.parameters, which outlives this execution while child labels repeat in the next one.
+    child_outputs: dict[str, OutputParameter] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
+    # The report each child block returned, by label, so read_run_data can page the text the model was shown.
+    results: dict[str, dict[str, Any]] = field(default_factory=dict)
     answer: dict[str, Any] | None = None
     drained: bool = False
     # The SDK starts one response's tool calls as concurrent tasks even with parallel_tool_calls=False, and providers
@@ -150,8 +165,9 @@ def _in_turn(
 
 class _LoopHooks(RunHooks[Any]):
     # Canceling a run only writes its row, so the loop re-reads the run before every model call and tool.
-    def __init__(self, state: _RunState) -> None:
+    def __init__(self, state: _RunState, block_row: WorkflowRunBlock) -> None:
         self.state = state
+        self.block_row = block_row
         # Per model call, so usage survives a run that raises and sums the retry and max-turns runs.
         self.usage = Usage()
 
@@ -163,9 +179,18 @@ class _LoopHooks(RunHooks[Any]):
         input_items: list[TResponseInputItem],
     ) -> None:
         await _raise_if_run_ended(self.state)
+        tools = [
+            {"name": tool.name, "description": tool.description, "parameters": tool.params_json_schema}
+            for tool in agent.tools
+            if isinstance(tool, FunctionTool)
+        ]
+        await self._store(
+            ArtifactType.LLM_REQUEST, {"system_prompt": system_prompt, "tools": tools, "input": input_items}
+        )
 
     async def on_llm_end(self, context: RunContextWrapper[Any], agent: Agent[Any], response: ModelResponse) -> None:
         self.usage.add(response.usage)
+        await self._store(ArtifactType.LLM_RESPONSE, {"output": response.output, "usage": response.usage})
         self.state.call_order = [item.call_id for item in response.output if isinstance(item, ResponseFunctionToolCall)]
         refusals = [
             part.refusal
@@ -181,10 +206,28 @@ class _LoopHooks(RunHooks[Any]):
         if refusals:
             raise _Refused(" ".join(refusals))
 
+    async def _store(self, artifact_type: ArtifactType, payload: dict[str, object]) -> None:
+        try:
+            data = json.dumps(pydantic_core.to_jsonable_python(payload)).encode("utf-8")
+            await app.ARTIFACT_MANAGER.create_workflow_run_block_artifacts(
+                workflow_run_block=self.block_row, artifacts=[(artifact_type, data)]
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to store agent step model call",
+                artifact_type=artifact_type,
+                workflow_run_block_id=self.block_row.workflow_run_block_id,
+                exc_info=True,
+            )
+
 
 def _record_call(state: _RunState, written: object, **call: str) -> None:
     arguments = redact_secrets_from_text(
-        json.dumps(written, default=str), Block._registered_secret_values(state.run_context)
+        json.dumps(
+            state.run_context.mask_platform_smtp_for_agent(written),
+            default=lambda value: state.run_context.mask_platform_smtp_for_agent(str(value)),
+        ),
+        state.run_context.agent_redactable_secret_values(),
     )
     state.calls.append({**call, "arguments": arguments})
 
@@ -228,17 +271,25 @@ def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
     )
 
 
+def _pseudo_fields(tool: BlockTool) -> set[str]:
+    # A real YAML field of the same name wins: http_request has its own `files` dict, which must not become a name list.
+    return {"credential", "files"} & set(tool.fields) - set(tool.yaml_class.model_fields)
+
+
 def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
     schema = tool.yaml_class.model_json_schema()
+    pseudo = _pseudo_fields(tool)
     params: dict[str, Any] = {
         "type": "object",
-        "properties": {name: schema["properties"][name] for name in tool.fields if name != "credential"},
+        "properties": {name: schema["properties"][name] for name in tool.fields if name not in pseudo},
         "required": [name for name in tool.fields if name in schema.get("required", [])],
         "additionalProperties": False,
     }
-    if "credential" in tool.fields:
+    if "credential" in pseudo:
         params["properties"]["credential"] = {"type": "string", "enum": state.credential_keys}
         params["required"].append("credential")
+    if "files" in pseudo:
+        params["properties"]["files"] = {"type": "array", "items": {"type": "string"}, "description": FILES_DESCRIPTION}
     # Only the definitions a kept field reaches; the rest describe fields the model never sees.
     defs = schema.get("$defs", {})
     used: dict[str, Any] = {}
@@ -255,11 +306,19 @@ def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) 
     if unknown := sorted(set(written) - set(tool.fields)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.fields)}.")
     arguments = dict(written)
-    if "credential" in tool.fields:
+    pseudo = _pseudo_fields(tool)
+    parameter_keys: list[str] = []
+    if "credential" in pseudo:
         credential = arguments.pop("credential", None)
         if credential not in state.credential_keys:
             raise ValueError(f"credential must be one of {state.credential_keys}.")
-        arguments["parameter_keys"] = [credential]
+        parameter_keys.append(credential)
+    files = arguments.pop("files", []) if "files" in pseudo else []
+    if not isinstance(files, list) or not all(isinstance(name, str) and name in state.file_keys for name in files):
+        raise ValueError(f"files must be names from {state.file_keys}.")
+    parameter_keys += dict.fromkeys(files)
+    if parameter_keys:
+        arguments["parameter_keys"] = parameter_keys
     if tool.nested_agent:
         arguments |= {"engine": RunEngine.skyvern_v3, "engine_pinned": True}
     return arguments
@@ -312,11 +371,25 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
     )
 
 
-def _tool_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str:
-    text = redact_secrets_from_text(
-        json.dumps(run_context.mask_secrets_in_data(report), default=str), Block._registered_secret_values(run_context)
+def _masked_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str:
+    data = run_context.mask_secrets_in_data(
+        run_context.mask_platform_smtp_for_agent(report),
+        excluded_secret_ids=run_context.agent_unmasked_platform_secret_ids(),
     )
-    return text if len(text) <= _MAX_TOOL_RESULT_CHARS else text[:_MAX_TOOL_RESULT_CHARS] + " ...[truncated]"
+    return redact_secrets_from_text(
+        json.dumps(data, default=lambda value: run_context.mask_platform_smtp_for_agent(str(value))),
+        run_context.agent_redactable_secret_values(),
+    )
+
+
+def _window(text: str, offset: int = 0, name: str | None = None) -> str:
+    end = offset + _MAX_TOOL_RESULT_CHARS
+    if offset == 0 and end >= len(text):
+        return text
+    notice = f"characters {offset} to {min(end, len(text))} of {len(text)}."
+    if name is not None and end < len(text):
+        notice += f" read_run_data(name={json.dumps(name)}, offset={end}) returns the next ones."
+    return f"{text[offset:end]} ...[{notice}]"
 
 
 def _template_literal(text: str) -> str:
@@ -339,11 +412,17 @@ def _run_tool(
         except json.JSONDecodeError as e:
             return f"Arguments are not valid JSON ({e})."
         try:
+            state.run_context.reject_platform_smtp_references(written)
             report = {"status": "completed", "output": await run(state, **written), "error": None}
+        except InvalidWorkflowDefinition:
+            raise
         except Exception as e:
             report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
         _record_call(state, written, tool=name, status=report["status"])
-        return _tool_text(report, state.run_context)
+        # A read_run_data window is already masked text cut from a longer result.
+        if name == "read_run_data" and report["status"] == "completed":
+            return report["output"]
+        return _window(_masked_text(report, state.run_context))
 
     return FunctionTool(
         name=name,
@@ -361,10 +440,11 @@ def _run_tool(
 
 async def _read_run_data(state: _RunState, name: str | None = None) -> object:
     run_context = state.run_context
+    platform_keys = run_context.platform_smtp_parameter_keys()
     parameters = {
         key: parameter
         for key, parameter in run_context.parameters.items()
-        if parameter.parameter_type != ParameterType.OUTPUT
+        if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys
     }
     if name in run_context.workflow_run_outputs:
         outcome = run_context.get_block_outcome(name)
@@ -388,6 +468,16 @@ async def _read_run_data(state: _RunState, name: str | None = None) -> object:
     if file := next((file for file in files if file.filename == name), None):
         return file.model_dump(mode="json")
     raise ValueError(f"Nothing in this run is named {name!r}. Call read_run_data without a name for the names.")
+
+
+async def _read_run_data_window(state: _RunState, name: str | None = None, offset: int = 0) -> str:
+    report = state.results.get(name) if name is not None else None
+    if report is None:
+        report = {"status": "completed", "output": await _read_run_data(state, name), "error": None}
+    text = _masked_text(report, state.run_context)
+    if not isinstance(offset, int) or not 0 <= offset < len(text):
+        raise ValueError(f"offset must be from 0 to {len(text) - 1} for this result.")
+    return _window(text, offset, name)
 
 
 @asynccontextmanager
@@ -462,14 +552,20 @@ async def _page_extract(
     state: _RunState, prompt: str, schema: dict[str, Any] | None = None
 ) -> dict[str, Any] | list | str | None:
     # The page's AI has no block label, so an omitted system prompt resolves to the run-wide one.
-    opt_out = {"system_prompt": None} if state.ignore_workflow_system_prompt else {}
+    opt_out: dict[str, str | None] = (
+        {"system_prompt": None}
+        if state.ignore_workflow_system_prompt
+        else {"system_prompt": state.workflow_system_prompt}
+        if state.workflow_system_prompt is not None
+        else {}
+    )
     async with _run_page(state) as page:
         return await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
 
 
 _TEXT = {"type": "string"}
 _RUN_TOOLS: tuple[tuple[str, dict[str, Any], list[str], Callable[..., Awaitable[Any]]], ...] = (
-    ("read_run_data", {"name": _TEXT}, [], _read_run_data),
+    ("read_run_data", {"name": _TEXT, "offset": {"type": "integer", "minimum": 0}}, [], _read_run_data_window),
     ("page_goto", {"url": _TEXT}, ["url"], _page_goto),
     ("page_click", {"prompt": _TEXT}, ["prompt"], _page_click),
     ("page_fill", {"prompt": _TEXT, "value": _TEXT}, ["prompt", "value"], _page_fill),
@@ -479,24 +575,23 @@ if {name for name, *_ in _RUN_TOOLS} != set(RUN_TOOL_DESCRIPTIONS):
     raise RuntimeError("_RUN_TOOLS and RUN_TOOL_DESCRIPTIONS must name the same tools.")
 
 
+def _offers(state: _RunState, name: str) -> bool:
+    return name in ALWAYS_OFFERED_TOOLS or name in (state.tools or ())
+
+
 def _tools(state: _RunState) -> list[FunctionTool]:
-    listed = None if state.tools is None else set(state.tools)
-
-    def offered(name: str) -> bool:
-        return listed is None or name in listed
-
-    block_types = [name for name in RUN_BLOCK_TYPES if offered(name)]
+    block_types = [name for name in RUN_BLOCK_TYPES if _offers(state, name)]
     return [
         *(
             _dedicated_tool(block_type, tool, state)
             for name, (block_type, tool) in DEDICATED_BLOCK_TOOLS.items()
-            if offered(name) and ("credential" not in tool.fields or state.credential_keys)
+            if _offers(state, name) and ("credential" not in _pseudo_fields(tool) or state.credential_keys)
         ),
         *([_run_block_tool(state, block_types)] if block_types else []),
         *(
             _run_tool(name, RUN_TOOL_DESCRIPTIONS[name], properties, required, run, state)
             for name, properties, required, run in _RUN_TOOLS
-            if offered(name)
+            if _offers(state, name)
         ),
     ]
 
@@ -517,14 +612,17 @@ async def _run_child_block(
     try:
         if not isinstance(written, dict):
             raise ValueError("arguments must be a JSON object.")
+        state.run_context.reject_platform_smtp_references(written)
         block_yaml = tool.yaml_class(
             **_yaml_arguments(tool, written, state),
             label=label,
             ignore_workflow_system_prompt=state.ignore_workflow_system_prompt,
         )
         # The send-email converter adds the platform SMTP parameters to this dict.
-        parameters = {**state.run_context.parameters, output_parameter.key: output_parameter}
+        parameters = {**state.child_outputs, **state.run_context.parameters, output_parameter.key: output_parameter}
         child = block_yaml_to_block(block_yaml, parameters)  # type: ignore[arg-type]
+    except InvalidWorkflowDefinition:
+        raise
     except Exception as e:
         report = {
             "status": "invalid_arguments",
@@ -540,15 +638,45 @@ async def _run_child_block(
         }
     else:
         # A run resolves its secret parameters when it starts, before the converter added these.
-        for parameter in parameters.values():
-            if isinstance(parameter, AWSSecretParameter) and not state.run_context.has_parameter(parameter.key):
-                await state.run_context.register_aws_secret_parameter_value(parameter)
-        report = await _execute_child(child, written, state)
+        temporary_smtp_keys = [
+            parameter.key
+            for parameter in parameters.values()
+            if isinstance(parameter, AWSSecretParameter)
+            and _is_platform_smtp_aws_key(parameter.aws_key)
+            and not state.run_context.has_parameter(parameter.key)
+        ]
+        try:
+            for parameter in parameters.values():
+                if not isinstance(parameter, AWSSecretParameter):
+                    continue
+                if _is_platform_smtp_aws_key(parameter.aws_key) and state.run_context.has_parameter(parameter.key):
+                    if block_type == BlockType.SEND_EMAIL and not state.run_context._platform_smtp_only_usage(
+                        parameter, child
+                    ):
+                        raise InvalidWorkflowDefinition(
+                            "Platform-managed secrets are restricted to platform email delivery."
+                        )
+                elif not state.run_context.has_parameter(parameter.key):
+                    await state.run_context.register_aws_secret_parameter_value(parameter, platform_smtp_block=child)
+            report = await _execute_child(child, written, state)
+            if (
+                report["status"] == BlockStatus.completed
+                and state.run_context.has_value(output_parameter.key)
+                and output_parameter.key not in state.run_context.parameters
+            ):
+                state.child_outputs[output_parameter.key] = output_parameter
+                state.file_keys.append(output_parameter.key)
+        finally:
+            for key in temporary_smtp_keys:
+                state.run_context.parameters.pop(key, None)
+                state.run_context.values.pop(key, None)
     _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
-    return _tool_text(report, state.run_context)
+    state.results[label] = report
+    return _window(_masked_text(report, state.run_context), 0, label)
 
 
 async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+    child._agent_smtp_isolation = True
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
     with copilot_usage_observer(None):
@@ -561,10 +689,10 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
     return {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
 
 
-def _credential_keys(run_context: WorkflowRunContext) -> list[str]:
+def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
     return [
-        key
-        for key, parameter in run_context.parameters.items()
+        parameter.key
+        for parameter in parameters
         if parameter.parameter_type.is_login_credential()
         or (isinstance(parameter, WorkflowParameter) and parameter.workflow_parameter_type.is_credential_type())
     ]
@@ -578,6 +706,7 @@ async def run_agent_step(
     workflow_run_block_id: str,
     organization_id: str | None,
     browser_session_id: str | None,
+    block_row: WorkflowRunBlock,
 ) -> BlockResult:
     run_context = block.get_workflow_run_context(workflow_run_id)
     state = _RunState(
@@ -588,8 +717,15 @@ async def run_agent_step(
         organization_id=organization_id,
         browser_session_id=browser_session_id,
         run_context=run_context,
-        credential_keys=_credential_keys(run_context),
+        credential_keys=_credential_keys(block.parameters),
+        file_keys=[
+            key
+            for key, parameter in run_context.parameters.items()
+            if isinstance(parameter, WorkflowParameter)
+            and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
+        ],
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
+        workflow_system_prompt=block.workflow_system_prompt,
         tools=block.tools,
     )
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
@@ -615,7 +751,7 @@ async def run_agent_step(
             is_final_output=state.answer is not None, final_output=state.answer
         ),
     )
-    hooks = _LoopHooks(state)
+    hooks = _LoopHooks(state, block_row)
     costs: list[float] = []
     stop_reason, status = "completed", BlockStatus.completed
     failure_reason: str | None = None
@@ -651,11 +787,28 @@ async def run_agent_step(
         }
 
     async def save(value: dict[str, Any]) -> None:
-        if organization_id:
-            await app.DATABASE.observer.increment_workflow_run_block_llm_cost(
-                workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, amount=sum(costs)
+        try:
+            if organization_id:
+                await app.DATABASE.observer.increment_workflow_run_block_llm_cost(
+                    workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, amount=sum(costs)
+                )
+            await block.record_output_parameter_value(run_context, workflow_run_id, value)
+            # Shielded so a timeout during the normal exit does not cancel the model-call uploads still in flight.
+            try:
+                await asyncio.shield(app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([workflow_run_block_id]))
+            except Exception:
+                LOG.warning(
+                    "Failed to upload agent step model calls",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+        finally:
+            await app.AGENT_FUNCTION.post_agent_step_execution(
+                organization_id,
+                workflow_run_id,
+                workflow_run_block_id,
+                decisions=sum(1 for call in state.calls if call["tool"] != "finish"),
             )
-        await block.record_output_parameter_value(run_context, workflow_run_id, value)
 
     try:
         with copilot_usage_observer(lambda event: costs.append(event.cost or 0.0)), model_attempt_telemetry_scope():
@@ -693,27 +846,29 @@ async def run_agent_step(
                 else "The agent block ended without calling finish."
             )
 
-    if state.task and state.step:
-        await app.ARTIFACT_MANAGER.flush_step_archive(state.step.step_id)
-        await app.DATABASE.tasks.update_step(
-            task_id=state.task.task_id,
-            step_id=state.step.step_id,
-            organization_id=organization_id,
-            write_authority_for_run=run_write_authority,
-            status={BlockStatus.completed: StepStatus.completed, BlockStatus.failed: StepStatus.failed}.get(
-                status, StepStatus.canceled
-            ),
-        )
-        await app.DATABASE.tasks.update_task(
-            task_id=state.task.task_id, organization_id=organization_id, status=TaskStatus(status.value)
-        )
-
     value = output(stop_reason)
-    await save(value)
+    try:
+        await save(value)
+    finally:
+        if state.task and state.step:
+            await app.ARTIFACT_MANAGER.flush_step_archive(state.step.step_id)
+            await app.DATABASE.tasks.update_step(
+                task_id=state.task.task_id,
+                step_id=state.step.step_id,
+                organization_id=organization_id,
+                write_authority_for_run=run_write_authority,
+                status={BlockStatus.completed: StepStatus.completed, BlockStatus.failed: StepStatus.failed}.get(
+                    status, StepStatus.canceled
+                ),
+            )
+            await app.DATABASE.tasks.update_task(
+                task_id=state.task.task_id, organization_id=organization_id, status=TaskStatus(status.value)
+            )
+
     return await block.build_block_result(
         success=status == BlockStatus.completed,
         failure_reason=failure_reason
-        and redact_secrets_from_text(failure_reason, Block._registered_secret_values(run_context)),
+        and redact_secrets_from_text(failure_reason, run_context.agent_redactable_secret_values()),
         output_parameter_value=value,
         status=status,
         workflow_run_block_id=workflow_run_block_id,

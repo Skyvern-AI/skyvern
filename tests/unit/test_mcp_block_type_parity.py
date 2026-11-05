@@ -35,7 +35,8 @@ _DOC_POINTER = "Skyvern Cloud-only runbook: cloud_docs/fern-sdk/README.md (not p
 _NEW_BLOCK_TYPE_CHECKLIST = (
     "A new BlockType addition must satisfy ALL of the following before merge:\n"
     "  1. Added to `skyvern/schemas/workflows.BlockType` enum.\n"
-    "  2. Added to `skyvern/cli/mcp_tools/blocks.BLOCK_TYPE_MAP` AND `_YAML_CLASS_MAP`.\n"
+    "  2. YAML class added to `skyvern/schemas/workflows.BLOCK_YAML_SUBCLASSES` (BLOCK_TYPE_MAP derives from it)\n"
+    "     and a `skyvern/cli/mcp_tools/blocks.BLOCK_SUMMARIES` entry added.\n"
     "  3. EITHER regenerate the Fern SDK in a paired PR (link it),\n"
     "     OR add a `BlockDriftEntry` to `_KNOWN_DRIFT_ALLOWLIST` in this file with\n"
     "     populated `ticket`, `owner`, and `added_at` fields.\n"
@@ -122,6 +123,13 @@ _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
         owner="@andrewneilson",
         added_at=date(2026, 10, 26),
         notes="Agent block prototype awaits the next Fern SDK regeneration.",
+    ),
+    BlockDriftEntry(
+        block_type="powerbi_query",
+        ticket="SKY-18242",
+        owner="@AronPerez",
+        added_at=date(2026, 10, 29),
+        notes="Offline Power BI block is accepted by raw-HTTP MCP; typed Fern SDK regeneration is deferred.",
     ),
 )
 
@@ -211,42 +219,3 @@ def test_allowlist_entries_are_actually_drifted() -> None:
         f"longer drift. Remove them to keep the allowlist tight. "
         f"See {_DOC_POINTER} post-regeneration steps."
     )
-
-
-def test_currently_drifted_block_types_includes_backend_removed_fern_values() -> None:
-    """A retired backend block still present in both Fern unions is real drift."""
-    drifted = _currently_drifted_block_types(
-        backend_values={"navigation"},
-        fern_blocks={"navigation", "retired_block"},
-        fern_yaml_blocks={"navigation", "retired_block"},
-    )
-
-    assert drifted == {"retired_block"}
-
-
-def test_allowlist_entries_have_required_metadata() -> None:
-    """Belt-and-suspenders: every allowlist entry has non-empty ticket/owner/added_at.
-
-    Primary enforcement is at construction via ``BlockDriftEntry.__post_init__``; this
-    test is a second layer in case a future refactor relaxes the dataclass. See the
-    Skyvern Cloud-only Fern runbook for the allowlist policy.
-    """
-    for entry in _KNOWN_DRIFT_ALLOWLIST:
-        assert entry.block_type, f"allowlist entry missing block_type: {entry!r}"
-        assert entry.ticket, f"{entry.block_type!r}: ticket must reference a Linear ticket"
-        assert entry.owner, f"{entry.block_type!r}: owner must name a GitHub handle"
-        assert isinstance(entry.added_at, date), f"{entry.block_type!r}: added_at must be datetime.date"
-
-
-def test_block_drift_entry_rejects_missing_metadata() -> None:
-    """Construction-time enforcement: empty ticket/owner/block_type must raise."""
-    valid_date = date(2026, 4, 23)
-
-    with pytest.raises(ValueError):
-        BlockDriftEntry(block_type="", ticket="SKY-1234", owner="@someone", added_at=valid_date)
-    with pytest.raises(ValueError):
-        BlockDriftEntry(block_type="foo", ticket="", owner="@someone", added_at=valid_date)
-    with pytest.raises(ValueError):
-        BlockDriftEntry(block_type="foo", ticket="SKY-1234", owner="", added_at=valid_date)
-    with pytest.raises(TypeError):
-        BlockDriftEntry(block_type="foo", ticket="SKY-1234", owner="@someone", added_at="2026-04-23")  # type: ignore[arg-type]

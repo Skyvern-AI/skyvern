@@ -1201,6 +1201,13 @@ class TestSummarizeToolResult:
         )
         assert "Unknown error" in summary
 
+    def test_denied_result_names_its_reason(self) -> None:
+        summary = self._summarize(
+            "list_credentials",
+            {"ok": False, "data": {"status": "denied", "reason": "reference_not_literal_in_current_user_turn"}},
+        )
+        assert summary == "Failed: reference_not_literal_in_current_user_turn"
+
     def test_update_workflow(self) -> None:
         summary = self._summarize(
             "update_workflow",
@@ -1530,6 +1537,18 @@ class TestFormatToolResultForUser:
             "update_and_run_blocks",
             {"ok": False, "error": "Jinja style parameter 'foo' could not be resolved"},
         )
+        assert summary == "A workflow parameter could not be filled in."
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "workflow_trigger block failed. failure reason: Failed to resolve templates: "
+            "Missing key or attribute in `a.output.id` (line 1) at payload[id].",
+            "Failed to evaluate while-loop condition: Missing reference `count` (line 1).",
+        ],
+    )
+    def test_render_failures_without_a_jinja_prefix_translate_to_parameter_phrasing(self, error: str) -> None:
+        summary = self._format("update_and_run_blocks", {"ok": False, "error": error})
         assert summary == "A workflow parameter could not be filled in."
 
     def test_invalid_selector_failure_replaces_engine_instruction_text(self) -> None:

@@ -7,17 +7,15 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
 import structlog
-from jinja2 import UndefinedError
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter
 from skyvern.forge.sdk.workflow.models._jinja import (
     jinja_json_finalize_required_binding_env,
 )
-from skyvern.forge.sdk.workflow.models.block import Block
+from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
 from skyvern.schemas.google_sheets import (
     MAX_COLUMN_INDEX,
@@ -203,7 +201,9 @@ class GoogleSheetsReadBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -587,22 +587,13 @@ class GoogleSheetsWriteBlock(Block):
     def _render_values_or_raise(self, workflow_run_context: WorkflowRunContext) -> str:
         """A reference no upstream block answered would otherwise render as "" and be appended as a
         blank cell the Sheets API reports as a successful write. `| default(...)` passes an empty."""
-        try:
-            return self.render_templatable_field(
-                "values",
-                self.values,
-                workflow_run_context,
-                env=jinja_json_finalize_required_binding_env,
-                skip_missing_variable_preflight=True,
-            )
-        except FailedToFormatJinjaStyleParameter as exc:
-            if not isinstance(exc.__cause__, UndefinedError):
-                raise
-            raise ValueError(
-                f"block `{self.label}` field `values` references a value no upstream block produced: "
-                f"{exc.__cause__}. Return that key from the producing block, or write an explicit "
-                "default (e.g. {{ block_label.field | default('') }}) if an empty cell is intended."
-            ) from exc
+        return self.render_templatable_field(
+            "values",
+            self.values,
+            workflow_run_context,
+            env=jinja_json_finalize_required_binding_env,
+            skip_missing_variable_preflight=True,
+        )
 
     def _coerce_values(self, raw: Any, *, column_offset: int = 0) -> list[list[Any]]:
         """Rows for the write payload, addressed relative to the column the write starts at."""
@@ -704,7 +695,9 @@ class GoogleSheetsWriteBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,

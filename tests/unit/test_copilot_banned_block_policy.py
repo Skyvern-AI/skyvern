@@ -54,7 +54,6 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _AGENT_FAMILY_BLOCK_TYPES,
     _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES,
     _IMAGE_CAPTCHA_GUIDANCE,
-    AGENT_STEP_BLOCK_SUMMARY,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     CREDENTIAL_CODE_ACCESSORS,
@@ -74,6 +73,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
 from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml
 from skyvern.forge.sdk.workflow.models.block import _TASK_V3_SUPPORTED_BLOCK_TYPES
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _CODE_ONLY_UNAVAILABLE = tuple(
@@ -83,7 +83,7 @@ _CODE_ONLY_REQUIRED_TEXT = {
     "file_download": "download registration",
     "file_upload": "attach_authorized_file",
     "login": "credential-typed code",
-    "task": "agent-block authoring",
+    "task": "Browser Task block authoring",
     "task_v2": "declared AI leaf",
 }
 _CODE_ONLY_HELPERS = tuple(
@@ -310,7 +310,7 @@ async def test_task_v3_pure_schema_exposes_real_task_and_catalog() -> None:
     assert "const" not in engine and "default" not in engine
     assert "engine" not in task_result["data"]["schema"].get("required", [])
     assert "skyvern-3.0" in engine["description"] and "keeps" in engine["description"]
-    assert any("keeps" in line for line in task_result["data"]["agent_block_guidance"])
+    assert any("keeps" in line for line in task_result["data"]["browser_task_guidance"])
 
     listed = await _get_block_schema_post_hook(
         {"ok": True, "data": {"block_types": {"navigation": "Navigate", "code": "Code"}, "count": 2}},
@@ -1473,6 +1473,51 @@ def test_authoring_turn_summary_names_what_the_turn_added() -> None:
         "mid_turn_family_switches": {},
         "switches_after_failed_test": [],
         "same_family_rewrites_after_failed_test": {},
+        "agent_step_blocks": {},
+    }
+
+
+def test_authoring_turn_summary_lists_each_agent_step_with_its_neighbours_in_the_same_block_list() -> None:
+    final = _yaml(
+        {"block_type": "goto_url", "label": "open", "url": "https://example.com"},
+        {
+            "block_type": "for_loop",
+            "label": "each_item",
+            "loop_over_parameter_key": "items",
+            "loop_blocks": [
+                {"block_type": "agent_step", "label": "inspect_item", "prompt": "p", "data_schema": {}},
+                {"block_type": "extraction", "label": "read_item", "data_extraction_goal": "g"},
+            ],
+        },
+        {"block_type": "agent_step", "label": "decide", "prompt": "p", "data_schema": {}},
+        {"block_type": "code", "label": "total", "code": "return {}"},
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "inspect_item": {"before": [], "after": ["extraction"]},
+        "decide": {"before": ["for_loop"], "after": ["code"]},
+    }
+
+
+def test_agent_step_neighbours_follow_conditional_branches_not_list_order() -> None:
+    final = _yaml(
+        {"block_type": "agent_step", "label": "find", "next_block_label": "check", "prompt": "p", "data_schema": {}},
+        {"block_type": "code", "label": "check", "next_block_label": "route", "code": "return {}"},
+        {
+            "block_type": "conditional",
+            "label": "route",
+            "branch_conditions": [
+                {"criteria": {"expression": "{{ check.is_recent }}"}, "next_block_label": "download"},
+                {"is_default": True, "next_block_label": "read_notice"},
+            ],
+        },
+        {"block_type": "file_download", "label": "download", "navigation_goal": "g"},
+        {"block_type": "agent_step", "label": "read_notice", "prompt": "p", "data_schema": {}},
+    )
+
+    assert authoring_turn_summary(None, final)["agent_step_blocks"] == {
+        "find": {"before": [], "after": ["code"]},
+        "read_notice": {"before": ["conditional"], "after": []},
     }
 
 
@@ -1772,7 +1817,7 @@ async def test_the_agent_step_grant_survives_from_the_request_config_to_the_turn
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
     agent_function = AgentFunction()
     monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=True))
-    monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_function, "agent_step_enabled", AsyncMock(return_value=True))
 
     config = await agent_function.get_copilot_config_for_request("o_test")
     assert config is not None
@@ -1795,7 +1840,7 @@ async def test_agent_step_stays_unavailable_without_a_grant_or_when_the_lookup_f
 ) -> None:
     agent_function = AgentFunction()
     if hook is not None:
-        monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", hook)
+        monkeypatch.setattr(agent_function, "agent_step_enabled", hook)
 
     config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=False)
 
@@ -1810,33 +1855,3 @@ def test_copilot_normalization_keeps_an_agent_steps_tools() -> None:
     request = _normalize_copilot_yaml(yaml.safe_dump(workflow))
 
     assert request.workflow_definition.blocks[0].tools == ["browser_task", "page_extract"]
-
-
-_STEP = {"block_type": "agent_step", "label": "check_page", "prompt": "Answer yes or no."}
-_LISTED = {**_STEP, "tools": ["http_request", "web_search"]}
-
-
-@pytest.mark.parametrize(
-    ("prior", "submitted", "reported"),
-    [
-        (None, _STEP, True),
-        (None, _LISTED, False),
-        (_LISTED, _STEP, True),
-        (_STEP, _STEP, False),
-        (_STEP, {**_STEP, "tools": ["web_search"]}, False),
-    ],
-)
-@pytest.mark.asyncio
-async def test_an_agent_step_copilot_saves_without_tools_is_saved_and_reported(
-    prior: dict[str, object] | None, submitted: dict[str, object], reported: bool
-) -> None:
-    ctx = _ctx(prior_yaml=_yaml(prior) if prior else None)
-    ctx.authoring_capability = _AGENT_STEP_GRANTED
-
-    write = await _update_with_stubbed_save(_yaml(submitted), ctx)
-
-    assert write["ok"] is True
-    findings = [f for f in write["data"].get("findings", []) if f["reason_code"] == "agent_step_tools_missing"]
-    assert bool(findings) is reported
-    if reported:
-        assert "check_page" in findings[0]["summary"] and "http_request" in findings[0]["summary"]

@@ -31,6 +31,7 @@ _ENGINE_ONLY_LOOP_CHILD_TYPES = {
     BlockType.GOOGLE_SHEETS_READ,
     BlockType.GOOGLE_SHEETS_WRITE,
     BlockType.PDF_FILL,
+    BlockType.POWERBI_QUERY,
     BlockType.PRINT_PAGE,
     BlockType.SPLIT_PDF,
     BlockType.AGENT_STEP,

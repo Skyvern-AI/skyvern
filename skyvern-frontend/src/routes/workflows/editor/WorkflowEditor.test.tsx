@@ -48,6 +48,7 @@ import {
   useDeferredLockedEdit,
 } from "@/hooks/useDeferredLockedEdit";
 
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import * as workflowHasChangesModule from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import {
@@ -59,6 +60,7 @@ import {
   type WorkflowSaveData,
 } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import {
@@ -74,6 +76,7 @@ import {
   finishYamlCommit,
   registerEditorOwner,
   useWorkflowYamlEditorStore,
+  withCopilotAcceptance,
 } from "@/store/WorkflowYamlEditorStore";
 import type {
   CredentialParameter,
@@ -85,6 +88,7 @@ import * as xyflowModule from "@xyflow/react";
 import * as workflowEditorUtilsModule from "./workflowEditorUtils";
 import * as flowRendererModule from "./FlowRenderer";
 import { apiWorkflowToSettings } from "./apiWorkflowToSettings";
+import { MAX_DIMENSION_LAYOUT_PASSES } from "./dimensionConvergence";
 import {
   buildWorkflowCopilotContext,
   buildWorkflowSaveRequest,
@@ -94,7 +98,9 @@ import {
   getElements,
   getWorkflowSettings,
   getWorkflowBlocks,
+  useWorkflowGraphState,
 } from "./workflowEditorUtils";
+import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
 
 import { getInitialParameters } from "./utils";
 import { Workspace } from "./Workspace";
@@ -103,6 +109,7 @@ import {
   applyNodeChanges,
   ReactFlowProvider,
   useStoreApi,
+  type Edge,
   type NodeChange,
 } from "@xyflow/react";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
@@ -128,6 +135,7 @@ import {
   useLayoutEffect,
   useReducer,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import * as workflowHeaderModule from "./WorkflowHeader";
@@ -216,6 +224,8 @@ vi.mock("@/store/WorkflowHasChangesStore", async (importOriginal) => {
   };
 });
 vi.mock("../hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => runQueryMock(),
 }));
 vi.mock("@/hooks/useWorkflowStudioEnabled", () => ({
@@ -966,112 +976,627 @@ describe("editor and legacy debugger parameter hydration", () => {
 });
 
 describe("save failures stop navigation and block runs", () => {
-  test.each(["save", "copilot"] as const)(
-    "retries a targeted layout once after a %s lock with the latest graph",
-    async (lockKind) => {
-      vi.stubGlobal(
-        "ResizeObserver",
-        class {
-          observe() {}
-          unobserve() {}
-          disconnect() {}
-        },
-      );
-      useWorkflowYamlEditorStore.setState(
-        useWorkflowYamlEditorStore.getInitialState(),
-      );
-      useWorkflowHasChangesStore.setState(
-        useWorkflowHasChangesStore.getInitialState(),
-      );
-      workflowQueryMock.mockReturnValue({
-        data: liveWorkflow,
-        isLoading: false,
+  test("retries a targeted layout once after a save lock with the latest graph", async () => {
+    const canvas = renderLockedCanvas();
+    try {
+      await canvas.reveal();
+      const owner = createYamlCommitOwner("wpid_live");
+      act(() => {
+        registerEditorOwner(owner);
+        expect(beginSaveTransaction(owner)).toBe(true);
       });
-      const initialized = vi
-        .spyOn(xyflowModule, "useNodesInitialized")
-        .mockReturnValue(true);
-      const layout = vi.spyOn(workflowEditorUtilsModule, "layout");
-      const setNodes = vi.fn();
-      const setEdges = vi.fn();
-      const initialNodes: AppNode[] = [
-        { id: "node_1", type: "nodeAdder", position: { x: 0, y: 0 }, data: {} },
-      ];
-      let replaceNodes!: (nodes: AppNode[]) => void;
-      let targetBlock!: () => void;
-      function Canvas() {
-        const [nodes, updateNodes] = useState(initialNodes);
-        const navigate = useNavigate();
-        replaceNodes = updateNodes;
-        targetBlock = () => navigate("/agents/wpid_live/edit/target");
-        return (
-          <FlowRenderer
-            nodes={nodes}
-            edges={[]}
-            setNodes={setNodes}
-            setEdges={setEdges}
-            onNodesChange={vi.fn()}
-            onEdgesChange={vi.fn()}
-            initialTitle="Live agent"
-            workflow={liveWorkflow}
-          />
-        );
-      }
-      const client = new QueryClient({
-        defaultOptions: { queries: { retry: false } },
-      });
-      vi.useFakeTimers();
-      const view = render(
-        <QueryClientProvider client={client}>
-          <MemoryRouter initialEntries={["/agents/wpid_live/edit"]}>
-            <ReactFlowProvider>
-              <DebugStoreContext.Provider
-                value={{ isDebugMode: false, blockRunsEnabled: false }}
-              >
-                <Routes>
-                  <Route
-                    path="/agents/:workflowPermanentId/edit/:blockLabel?"
-                    element={<Canvas />}
-                  />
-                </Routes>
-              </DebugStoreContext.Provider>
-            </ReactFlowProvider>
-          </MemoryRouter>
-        </QueryClientProvider>,
+      canvas.layout.mockClear();
+      act(canvas.harness.targetBlock);
+      expect(canvas.layout).not.toHaveBeenCalled();
+      const { edges } = canvas.harness.graph;
+      const latest = [
+        ...canvas.harness.graph.nodes,
+        { id: "node_3", type: "nodeAdder", position: { x: 0, y: 0 }, data: {} },
+      ] as AppNode[];
+      act(() => canvas.harness.graph.updateNodes(latest));
+      expect(canvas.layout).not.toHaveBeenCalled();
+      act(() => finishSaveTransaction(owner));
+      expect(canvas.layout).toHaveBeenCalledExactlyOnceWith(
+        latest,
+        edges,
+        "target",
       );
-      try {
-        await act(async () => vi.advanceTimersByTimeAsync(400));
-        const owner = createYamlCommitOwner("wpid_live");
-        let reservation: symbol | null = null;
+      act(() =>
+        canvas.harness.graph.updateNodes([...canvas.harness.graph.nodes]),
+      );
+      expect(canvas.layout).toHaveBeenCalledOnce();
+    } finally {
+      canvas.dispose();
+    }
+  });
+  function renderLockedCanvas(readOnly = false, lockFirst = false) {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    let reservation!: symbol;
+    if (lockFirst) reservation = beginCopilotAcceptance()!;
+    let revealed = false;
+    const initialized = vi
+      .spyOn(xyflowModule, "useNodesInitialized")
+      .mockImplementation(() => revealed);
+    const layout = vi.spyOn(workflowEditorUtilsModule, "layout");
+    const initialNodes: AppNode[] = [
+      { id: "node_1", type: "nodeAdder", position: { x: 0, y: 0 }, data: {} },
+      { id: "node_2", type: "nodeAdder", position: { x: 0, y: 0 }, data: {} },
+    ];
+    const initialEdges: Edge[] = [
+      { id: "edge_1", source: "node_1", target: "node_2" },
+    ];
+    const harness = {} as {
+      graph: ReturnType<typeof useWorkflowGraphState>;
+      history: ReturnType<typeof useWorkflowHistory>;
+      flowStore: ReturnType<typeof useStoreApi<AppNode>>;
+      reveal: () => void;
+      targetBlock: () => void;
+    };
+    function Canvas() {
+      const graph = useWorkflowGraphState(initialNodes, initialEdges);
+      const flowStore = useStoreApi<AppNode>();
+      const navigate = useNavigate();
+      const history = useWorkflowHistory({
+        nodes: graph.nodes,
+        edges: graph.edges,
+        organizationId: "o_live",
+        workflowPermanentId: "wpid_live",
+        setNodes: graph.setNodes,
+        setEdges: graph.setEdges,
+      });
+      const [isRevealed, reveal] = useReducer(() => true, false);
+      revealed = isRevealed;
+      Object.assign(harness, {
+        graph,
+        history,
+        flowStore,
+        reveal,
+        targetBlock: () => navigate("/agents/wpid_live/edit/target"),
+      });
+      return (
+        <FlowRenderer
+          readOnly={readOnly}
+          nodes={graph.nodes}
+          edges={graph.edges}
+          setNodes={graph.setNodes}
+          setEdges={graph.setEdges}
+          onNodesChange={graph.onNodesChange}
+          onEdgesChange={graph.onEdgesChange}
+          historyApplyTrigger={history.historyApplyTrigger}
+          initialTitle="Live agent"
+          workflow={liveWorkflow}
+        />
+      );
+    }
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    vi.useFakeTimers();
+    const view = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/agents/wpid_live/edit"]}>
+          <ReactFlowProvider>
+            <DebugStoreContext.Provider
+              value={{ isDebugMode: false, blockRunsEnabled: false }}
+            >
+              <Routes>
+                <Route
+                  path="/agents/:workflowPermanentId/edit/:blockLabel?"
+                  element={<Canvas />}
+                />
+              </Routes>
+            </DebugStoreContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const settle = () => act(async () => vi.advanceTimersByTimeAsync(1000));
+    const isPreLayout = () =>
+      view.container.querySelector(".react-flow--pre-layout") !== null;
+    const reveal = async (beforeReveal?: () => void) => {
+      act(() => {
+        beforeReveal?.();
+        harness.reveal();
+      });
+      await settle();
+    };
+    const dispose = () => {
+      if (reservation) finishCopilotAcceptance(reservation);
+      view.unmount();
+      client.clear();
+      initialized.mockRestore();
+      layout.mockRestore();
+      vi.useRealTimers();
+    };
+    const lock = async () => {
+      await settle();
+      act(() => {
+        reservation = beginCopilotAcceptance()!;
+      });
+    };
+    return {
+      harness,
+      layout,
+      get reservation() {
+        return reservation;
+      },
+      isPreLayout,
+      lock,
+      settle,
+      reveal,
+      dispose,
+    };
+  }
+  test("lays out a canvas revealed during a Copilot turn without unlocking edits or recording undo", async () => {
+    const canvas = renderLockedCanvas();
+    try {
+      await canvas.lock();
+      act(() =>
+        canvas.harness.graph.updateNodes((nodes) =>
+          nodes.map((node) => ({ ...node, position: { x: 0, y: 0 } })),
+        ),
+      );
+      await canvas.settle();
+      useWorkflowHasChangesStore.setState({ hasChanges: true });
+      const revision = useWorkflowYamlEditorStore.getState().revision;
+      expect(canvas.isPreLayout()).toBe(true);
+      vi.mocked(toast).mockClear();
+      await canvas.reveal();
+      expect(canvas.isPreLayout()).toBe(false);
+      const positions = (nodes: AppNode[]) =>
+        Object.fromEntries(nodes.map((node) => [node.id, node.position]));
+      const results = canvas.layout.mock.results;
+      const laidOut = positions(
+        (results[results.length - 1]!.value as { nodes: AppNode[] }).nodes,
+      );
+      expect(laidOut.node_1!.y).not.toBe(laidOut.node_2!.y);
+      expect(positions(canvas.harness.graph.nodes)).toEqual(laidOut);
+      expect(useWorkflowYamlEditorStore.getState().revision).toBe(revision);
+      expect(canvas.harness.history.canUndo).toBe(false);
+      expect(toast).not.toHaveBeenCalled();
+      act(() =>
+        canvas.harness.graph.onNodesChange([{ type: "remove", id: "node_2" }]),
+      );
+      expect(canvas.harness.graph.nodes.map((node) => node.id)).toEqual([
+        "node_1",
+        "node_2",
+      ]);
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Wait for the Copilot change to finish",
+        }),
+      );
+      act(() => canvas.harness.targetBlock());
+      expect(useWorkflowHasChangesStore.getState().internalUpdateCount).toBe(1);
+      act(() => finishCopilotAcceptance(canvas.reservation));
+      expect(useWorkflowHasChangesStore.getState().internalUpdateCount).toBe(0);
+      act(() =>
+        canvas.harness.graph.onNodesChange([{ type: "remove", id: "node_2" }]),
+      );
+      await canvas.settle();
+      expect(canvas.harness.graph.nodes.map((node) => node.id)).toEqual([
+        "node_1",
+      ]);
+      expect(canvas.harness.history.canUndo).toBe(true);
+    } finally {
+      canvas.dispose();
+    }
+  });
+  test("an editor mounted after the Copilot lock is taken lays out the draft and refuses edits", async () => {
+    const canvas = renderLockedCanvas(false, true);
+    try {
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      expect(canvas.isPreLayout()).toBe(true);
+      vi.mocked(toast).mockClear();
+      await canvas.reveal();
+      expect(canvas.isPreLayout()).toBe(false);
+      expectDraftLaidOut(canvas);
+      act(() =>
+        canvas.harness.graph.onNodesChange([{ type: "remove", id: "node_2" }]),
+      );
+      expect(canvas.harness.graph.nodes.map((node) => node.id)).toEqual([
+        "node_1",
+        "node_2",
+      ]);
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Wait for the Copilot change to finish",
+        }),
+      );
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      act(() => finishCopilotAcceptance(canvas.reservation));
+      act(() =>
+        canvas.harness.graph.onNodesChange([{ type: "remove", id: "node_2" }]),
+      );
+      expect(canvas.harness.graph.nodes.map((node) => node.id)).toEqual([
+        "node_1",
+      ]);
+    } finally {
+      canvas.dispose();
+    }
+  });
+  function renderLockedWorkspace() {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    useWorkflowTitleStore.setState(useWorkflowTitleStore.getInitialState());
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    let chat!: NonNullable<
+      Parameters<typeof copilotChatModule.WorkflowCopilotChat>[0]
+    >;
+    const chatSpy = vi
+      .spyOn(copilotChatModule, "WorkflowCopilotChat")
+      .mockImplementation((props) => {
+        chat = props!;
+        return null;
+      });
+    let revealed = false;
+    const listeners = new Set<() => void>();
+    const initialized = vi
+      .spyOn(xyflowModule, "useNodesInitialized")
+      .mockImplementation(() =>
+        useSyncExternalStore(
+          (listener) => {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+          },
+          () => revealed,
+        ),
+      );
+    vi.useFakeTimers();
+    const view = renderSettingsWorkspace(liveWorkflow);
+    const settle = () => act(async () => vi.advanceTimersByTimeAsync(1000));
+    let reservation!: symbol;
+    const nodeIds = () => canvas.current!.nodes.map((node) => node.id);
+    return {
+      settle,
+      nodeIds,
+      get reservation() {
+        return reservation;
+      },
+      lock: async () => {
+        await settle();
         act(() => {
-          registerEditorOwner(owner);
-          if (lockKind === "save")
-            expect(beginSaveTransaction(owner)).toBe(true);
-          else reservation = beginCopilotAcceptance();
+          reservation = beginCopilotAcceptance()!;
         });
-        layout.mockClear();
-        setNodes.mockClear();
-        act(targetBlock);
-        expect(layout).not.toHaveBeenCalled();
-        const latest = [...initialNodes, { ...initialNodes[0]!, id: "node_2" }];
-        act(() => replaceNodes(latest));
-        expect(layout).not.toHaveBeenCalled();
+      },
+      reveal: () =>
         act(() => {
-          if (reservation) finishCopilotAcceptance(reservation);
-          else finishSaveTransaction(owner);
-        });
-        expect(layout).toHaveBeenCalledExactlyOnceWith(latest, [], "target");
-        expect(setNodes).toHaveBeenCalledOnce();
-        act(() => replaceNodes([...latest]));
-        expect(layout).toHaveBeenCalledOnce();
-      } finally {
+          revealed = true;
+          listeners.forEach((listener) => listener());
+        }),
+      applyDraft: (blocks: unknown[]) =>
+        act(() => {
+          withCopilotAcceptance(reservation, () =>
+            chat.onWorkflowUpdate!(
+              {
+                ...(liveWorkflow as WorkflowApiResponse),
+                workflow_definition: { version: 2, blocks, parameters: [] },
+              } as never,
+              { midTurnDraft: true },
+            ),
+          );
+        }),
+      dispose: () => {
+        if (reservation) finishCopilotAcceptance(reservation);
         view.unmount();
-        client.clear();
+        view.client.clear();
+        chatSpy.mockRestore();
         initialized.mockRestore();
-        layout.mockRestore();
         vi.useRealTimers();
+      },
+    };
+  }
+  test("a mid-turn draft applied while a Copilot-locked layout settles is one undo step", async () => {
+    const workspace = renderLockedWorkspace();
+    try {
+      await workspace.lock();
+      const before = workspace.nodeIds();
+      workspace.reveal();
+      expect(useWorkflowHasChangesStore.getState().internalUpdateCount).toBe(1);
+      workspace.applyDraft([
+        { block_type: "wait", label: "draft_wait", wait_sec: 5 },
+      ]);
+      await workspace.settle();
+      expect(workspace.nodeIds()).not.toEqual(before);
+      act(() => {
+        window.dispatchEvent(new Event("loop-header-resized"));
+      });
+      await workspace.settle();
+      act(() => finishCopilotAcceptance(workspace.reservation));
+      expect(useWorkflowHistoryAccessStore.getState().canUndo).toBe(true);
+      act(() => useWorkflowHistoryAccessStore.getState().undo());
+      expect(workspace.nodeIds()).toEqual(before);
+      expect(useWorkflowHistoryAccessStore.getState().canUndo).toBe(false);
+    } finally {
+      workspace.dispose();
+    }
+  });
+  test("a metadata-only Copilot change in a locked layout's settle window leaves the layout out of undo", async () => {
+    const workspace = renderLockedWorkspace();
+    try {
+      await workspace.lock();
+      workspace.reveal();
+      expect(useWorkflowHasChangesStore.getState().internalUpdateCount).toBe(1);
+      act(() => {
+        withCopilotAcceptance(workspace.reservation, () => {
+          useWorkflowTitleStore
+            .getState()
+            .setTitleFromCopilotIfDefault("Renamed");
+          useWorkflowHasChangesStore.getState().setHasChanges(true);
+        });
+      });
+      act(() => {
+        window.dispatchEvent(new Event("loop-header-resized"));
+      });
+      await workspace.settle();
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+      expect(useWorkflowHistoryAccessStore.getState().canUndo).toBe(false);
+    } finally {
+      workspace.dispose();
+    }
+  });
+  test("a Copilot draft committed with the canvas reveal is one undo step", async () => {
+    const canvas = renderLockedCanvas();
+    try {
+      await canvas.lock();
+      await canvas.reveal(() =>
+        withCopilotAcceptance(canvas.reservation, () => {
+          canvas.harness.graph.updateNodes((nodes) => [
+            ...nodes,
+            {
+              id: "node_3",
+              type: "nodeAdder",
+              position: { x: 0, y: 0 },
+              data: {},
+            },
+          ]);
+          useWorkflowHasChangesStore.getState().setHasChanges(true);
+        }),
+      );
+      expect(canvas.isPreLayout()).toBe(false);
+      expect(canvas.harness.history.canUndo).toBe(true);
+      act(() => finishCopilotAcceptance(canvas.reservation));
+      act(() => canvas.harness.history.undo());
+      expect(canvas.harness.graph.nodes.map((node) => node.id)).toEqual([
+        "node_1",
+        "node_2",
+      ]);
+      expect(canvas.harness.history.canUndo).toBe(false);
+    } finally {
+      canvas.dispose();
+    }
+  });
+  const draftNodes = (): AppNode[] =>
+    ["draft_a", "draft_b", "draft_c"].map((id) => ({
+      id,
+      type: "nodeAdder",
+      position: { x: 0, y: 0 },
+      data: {},
+    }));
+  const draftEdges: Edge[] = [
+    { id: "draft_ab", source: "draft_a", target: "draft_b" },
+    { id: "draft_bc", source: "draft_b", target: "draft_c" },
+  ];
+  function measure(
+    canvas: ReturnType<typeof renderLockedCanvas>,
+    ids: string[],
+    height: number,
+  ) {
+    act(() =>
+      canvas.harness.flowStore.getState().triggerNodeChanges(
+        ids.map((id) => ({
+          type: "dimensions",
+          id,
+          dimensions: { width: 40, height },
+        })),
+      ),
+    );
+  }
+  function expectDraftLaidOut(canvas: ReturnType<typeof renderLockedCanvas>) {
+    const ys = canvas.harness.graph.nodes.map((node) => node.position.y);
+    expect(new Set(ys).size).toBe(ys.length);
+  }
+  test("a dimension layout pending when the Copilot lock is taken still lands under the lock, once", async () => {
+    const canvas = renderLockedCanvas();
+    let reservation: symbol | null = null;
+    try {
+      await canvas.reveal();
+      measure(canvas, ["node_1"], 41);
+      await act(async () => vi.advanceTimersByTimeAsync(20));
+      act(() => {
+        canvas.harness.graph.updateNodes(draftNodes());
+        canvas.harness.graph.updateEdges(draftEdges);
+      });
+      measure(canvas, ["draft_a", "draft_b", "draft_c"], 40);
+      canvas.layout.mockClear();
+      act(() => {
+        reservation = beginCopilotAcceptance();
+      });
+      await canvas.settle();
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      expectDraftLaidOut(canvas);
+      expect(canvas.layout).toHaveBeenCalledOnce();
+      act(() =>
+        canvas.harness.graph.updateNodes([...canvas.harness.graph.nodes]),
+      );
+      await canvas.settle();
+      expect(canvas.layout).toHaveBeenCalledOnce();
+      vi.mocked(toast).mockClear();
+      act(() =>
+        canvas.harness.graph.onNodesChange([{ type: "remove", id: "draft_c" }]),
+      );
+      expect(canvas.harness.graph.nodes).toHaveLength(3);
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Wait for the Copilot change to finish",
+        }),
+      );
+    } finally {
+      if (reservation) finishCopilotAcceptance(reservation);
+      canvas.dispose();
+    }
+  });
+  function replaceWithDraft(canvas: ReturnType<typeof renderLockedCanvas>) {
+    act(() => {
+      withCopilotAcceptance(canvas.reservation, () => {
+        canvas.harness.graph.updateNodes(draftNodes());
+        canvas.harness.graph.updateEdges(draftEdges);
+      });
+    });
+  }
+  test("a draft measured in the frame of a Copilot-locked layout is laid out once more", async () => {
+    const canvas = renderLockedCanvas();
+    try {
+      await canvas.lock();
+      await canvas.reveal();
+      canvas.layout.mockClear();
+      measure(canvas, ["node_1"], 41);
+      expect(canvas.layout).toHaveBeenCalledOnce();
+      replaceWithDraft(canvas);
+      measure(canvas, ["draft_a", "draft_b", "draft_c"], 40);
+      await canvas.settle();
+      expectDraftLaidOut(canvas);
+      expect(
+        canvas.harness.graph.nodes.some((node) => node.position.y > 0),
+      ).toBe(true);
+      expect(canvas.layout).toHaveBeenCalledTimes(2);
+      await canvas.settle();
+      expect(canvas.layout).toHaveBeenCalledTimes(2);
+    } finally {
+      canvas.dispose();
+    }
+  });
+  test("a node that keeps resizing in each layout's frame stops relaying out under the Copilot lock", async () => {
+    const canvas = renderLockedCanvas();
+    try {
+      await canvas.lock();
+      await canvas.reveal();
+      canvas.layout.mockClear();
+      for (let pass = 0; pass < 10; pass += 1) {
+        measure(canvas, ["node_1"], pass % 2 === 0 ? 41 : 60);
+        measure(canvas, ["node_1"], pass % 2 === 0 ? 60 : 41);
+        await act(async () => vi.advanceTimersByTimeAsync(100));
       }
-    },
-  );
+      await canvas.settle();
+      expect(canvas.layout.mock.calls.length).toBeLessThanOrEqual(
+        MAX_DIMENSION_LAYOUT_PASSES + 1,
+      );
+    } finally {
+      canvas.dispose();
+    }
+  });
+  test("an unlocked canvas drops a measurement made in a layout's frame", async () => {
+    const canvas = renderLockedCanvas();
+    try {
+      await canvas.reveal();
+      canvas.layout.mockClear();
+      measure(canvas, ["node_1"], 41);
+      expect(canvas.layout).toHaveBeenCalledOnce();
+      act(() => {
+        canvas.harness.graph.updateNodes(draftNodes());
+        canvas.harness.graph.updateEdges(draftEdges);
+      });
+      measure(canvas, ["draft_a", "draft_b", "draft_c"], 40);
+      await canvas.settle();
+      expect(canvas.layout).toHaveBeenCalledOnce();
+    } finally {
+      canvas.dispose();
+    }
+  });
+  test("a dimension layout that fires before the previous layout's frame lands after it", async () => {
+    const canvas = renderLockedCanvas();
+    const frames: FrameRequestCallback[] = [];
+    try {
+      await canvas.lock();
+      await canvas.reveal();
+      // Background tabs pause animation frames while timers keep firing.
+      vi.spyOn(window, "requestAnimationFrame").mockImplementation((frame) => {
+        frames.push(frame);
+        return frames.length;
+      });
+      canvas.layout.mockClear();
+      measure(canvas, ["node_1"], 41);
+      expect(canvas.layout).toHaveBeenCalledOnce();
+      replaceWithDraft(canvas);
+      act(() => {
+        window.dispatchEvent(new Event("loop-header-resized"));
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(500));
+      expect(canvas.layout).toHaveBeenCalledOnce();
+      vi.mocked(window.requestAnimationFrame).mockRestore();
+      act(() => frames.splice(0).forEach((frame) => frame(0)));
+      await canvas.settle();
+      expectDraftLaidOut(canvas);
+      expect(canvas.layout).toHaveBeenCalledTimes(2);
+      await canvas.settle();
+      expect(canvas.layout).toHaveBeenCalledTimes(2);
+    } finally {
+      canvas.dispose();
+    }
+  });
+  test("a layout deferred by a save lands when the lock passes straight to Copilot", async () => {
+    const canvas = renderLockedCanvas();
+    let reservation: symbol | null = null;
+    try {
+      await canvas.reveal();
+      const owner = createYamlCommitOwner("wpid_live");
+      act(() => {
+        registerEditorOwner(owner);
+        expect(beginSaveTransaction(owner)).toBe(true);
+        canvas.harness.graph.updateNodes(draftNodes());
+        canvas.harness.graph.updateEdges(draftEdges);
+      });
+      canvas.layout.mockClear();
+      measure(canvas, ["draft_a", "draft_b", "draft_c"], 40);
+      await canvas.settle();
+      expect(canvas.layout).not.toHaveBeenCalled();
+      act(() => {
+        finishSaveTransaction(owner);
+        reservation = beginCopilotAcceptance();
+      });
+      await canvas.settle();
+      expect(useWorkflowYamlEditorStore.getState().lockKind).toBe("copilot");
+      expectDraftLaidOut(canvas);
+      expect(canvas.layout).toHaveBeenCalledOnce();
+    } finally {
+      if (reservation) finishCopilotAcceptance(reservation);
+      canvas.dispose();
+    }
+  });
+  test("a read-only canvas lays out under the Copilot lock without an internal update", async () => {
+    const canvas = renderLockedCanvas(true);
+    const counts: number[] = [];
+    const unsubscribe = useWorkflowHasChangesStore.subscribe((state) =>
+      counts.push(state.internalUpdateCount),
+    );
+    try {
+      await canvas.lock();
+      await canvas.reveal();
+      expect(canvas.isPreLayout()).toBe(false);
+      expect(Math.max(0, ...counts)).toBe(0);
+    } finally {
+      unsubscribe();
+      canvas.dispose();
+    }
+  });
   afterEach(() => {
     navBlocker.state = "unblocked";
     navBlocker.proceed.mockReset();
@@ -2699,6 +3224,70 @@ describe("save failures stop navigation and block runs", () => {
       expect(released.getAttribute("aria-disabled")).toBeNull();
       expect(released.getAttribute("aria-describedby")).toBeNull();
     } finally {
+      control.unmount();
+      client.clear();
+      saveHook.mockRestore();
+    }
+  });
+
+  const PROPOSAL_HOLD = "Resolve the Copilot proposal before saving.";
+  test("a pending Copilot proposal disables Save as Template and hides version history, so Accept stays the only way to save it", async () => {
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowHasChangesStore.setState(
+      useWorkflowHasChangesStore.getInitialState(),
+    );
+    workflowQueryMock.mockReturnValue({ data: liveWorkflow, isLoading: false });
+    const save = vi.fn<() => Promise<void>>().mockResolvedValue();
+    const saveHook = vi
+      .spyOn(saveWorkflowModule, "useSaveWorkflow")
+      .mockReturnValue(save);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    useCopilotProposalStore.setState({ proposal: {} as never });
+    const control = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ReactFlowProvider>
+            <DebugStoreContext.Provider
+              value={{ isDebugMode: false, blockRunsEnabled: false }}
+            >
+              <EditorOverflowMenu />
+            </DebugStoreContext.Provider>
+          </ReactFlowProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    try {
+      fireEvent.keyDown(control.getByRole("button", { name: "More actions" }), {
+        key: "Enter",
+      });
+      // The name stays the action; the visible reason line is its description.
+      const held = await screen.findByRole("menuitem", {
+        name: "Save as Template",
+        description: PROPOSAL_HOLD,
+      });
+      expect(held.getAttribute("aria-disabled")).toBe("true");
+      expect(held.textContent).toContain(PROPOSAL_HOLD);
+      expect(
+        screen.queryByRole("menuitem", { name: "Version history" }),
+      ).toBeNull();
+      fireEvent.click(held);
+      expect(save).not.toHaveBeenCalled();
+
+      act(() => useCopilotProposalStore.setState({ proposal: null }));
+      expect(
+        screen.getByRole("menuitem", { name: "Version history" }),
+      ).toBeTruthy();
+      const released = screen.getByRole("menuitem", {
+        name: "Save as Template",
+      });
+      expect(released.getAttribute("aria-disabled")).toBeNull();
+      expect(released.getAttribute("aria-describedby")).toBeNull();
+    } finally {
+      useCopilotProposalStore.setState({ proposal: null });
       control.unmount();
       client.clear();
       saveHook.mockRestore();

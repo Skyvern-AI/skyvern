@@ -109,6 +109,7 @@ export const workflowBlockTitle: {
   email_inbox: "Email Inbox",
   google_sheets_read: "Google Sheets Read",
   google_sheets_write: "Google Sheets Write",
+  powerbi_query: "Power BI Query",
   pdf_fill: "PDF Fill",
   split_pdf: "Split PDF",
   data_export: "Data Export",

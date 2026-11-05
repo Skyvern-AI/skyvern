@@ -3,6 +3,7 @@ type BrowserSessionType = "msedge" | "chrome" | "stealth-chromium";
 
 interface BrowserSession {
   browser_address: string | null;
+  browser_address_redacted?: boolean;
   browser_session_id: string;
   completed_at: string | null;
   downloaded_files: DownloadedFile[] | null;

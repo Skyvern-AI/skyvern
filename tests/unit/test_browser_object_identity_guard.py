@@ -21,6 +21,7 @@ migration is finished, and does not raise false positives):
 from __future__ import annotations
 
 import ast
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -315,6 +316,10 @@ def test_no_browser_object_identity_checks_in_production() -> None:
         try:
             tree_src = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
+            continue
+        # A violation needs a name imported from a driver root; the parser NFKC-normalizes identifiers.
+        normalized = unicodedata.normalize("NFKC", tree_src)
+        if not any(root in normalized for root in _BROWSER_DRIVER_ROOTS):
             continue
         try:
             offenders.extend(find_browser_object_identity_checks(tree_src, str(path)))

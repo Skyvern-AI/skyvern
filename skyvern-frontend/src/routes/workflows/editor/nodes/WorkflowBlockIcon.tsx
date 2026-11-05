@@ -1,5 +1,6 @@
 import { ClickIcon } from "@/components/icons/ClickIcon";
 import { GoogleSheetsIcon } from "@/components/icons/GoogleSheetsIcon";
+import { PowerBIIcon } from "@/components/icons/PowerBIIcon";
 import { WorkflowBlockType } from "../../types/workflowTypes";
 import {
   CheckCircledIcon,
@@ -129,6 +130,9 @@ function WorkflowBlockIcon({ workflowBlockType, className }: Props) {
     }
     case "google_sheets_write": {
       return <GoogleSheetsIcon className={className} />;
+    }
+    case "powerbi_query": {
+      return <PowerBIIcon className={className} />;
     }
   }
 }

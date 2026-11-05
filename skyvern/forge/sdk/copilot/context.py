@@ -18,6 +18,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.browser_action_policy import canonicalize_origin
+from skyvern.forge.sdk.copilot.agent_context import AgentContext
 from skyvern.forge.sdk.copilot.browser_ablation import (
     BrowserAblationMetadata,
     CopilotToolSurfaceIdentity,
@@ -36,7 +37,6 @@ from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait
 from skyvern.forge.sdk.copilot.page_identity import page_location_fingerprint, safe_page_origin
 from skyvern.forge.sdk.copilot.review_gate import NarrativeReviewProjection
 from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeRole
-from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_structured_prompt
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.block_notes import block_field_texts
@@ -80,6 +80,7 @@ UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
 UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
 RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
 BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
 BLOCK_RUNNING_TOOLS = frozenset(
     {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )
@@ -161,6 +162,7 @@ class SkippedPrefixBlock(TypedDict):
 class NarrativeBlock(TypedDict):
     label: str
     workflowRunBlockId: NotRequired[str]
+    workflowRunId: NotRequired[str]
     blockType: str
     state: str
     lastSeenIteration: int
@@ -267,6 +269,7 @@ class NarrativeTurnFacts(TypedDict):
     matchingSourceBlockCount: NotRequired[int]
     # The tested claim is decided once, in _turn_fact_bundle, so no surface re-derives it.
     ranCleanOnCurrentSource: bool
+    editedBlockLabels: NotRequired[list[str]]
 
 
 class HistoricalNarrativeTurnFacts(TypedDict, total=False):
@@ -309,6 +312,13 @@ class NarrativeScreenshot(TypedDict):
     toolCallId: str | None
 
 
+class CanonicalWorkflowUnavailableFacts(TypedDict):
+    workflow_permanent_id: str
+    candidate_published: NotRequired[Literal[False]]
+    test_started: Literal[False]
+    detail: NotRequired[str]
+
+
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
     turnIndex: int
@@ -334,6 +344,7 @@ class TurnNarrativePayload(TypedDict):
     outputFiles: NotRequired[list[NarrativeOutputFile]]
     googleConnectionNotices: NotRequired[list[GoogleConnectionNoticePayload]]
     demonstrationOffer: NotRequired[bool]
+    canonicalWorkflowUnavailable: NotRequired[CanonicalWorkflowUnavailableFacts]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -365,6 +376,8 @@ if TYPE_CHECKING:
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
+    from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -375,6 +388,7 @@ if TYPE_CHECKING:
         DeliveredOutputFile,
         TurnOutcome,
     )
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatSender
 
 
 class UrlVisit(BaseModel):
@@ -1208,6 +1222,7 @@ class AgentResult:
     cancellation_iteration: int | None = None
     cancellation_last_recorded_phase: str | None = None
     cancellation_workflow_run_id: str | None = None
+    cancellation_stopped_facts: StoppedTurnFacts | None = None
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
@@ -1240,6 +1255,14 @@ class AgentResult:
     # None when the turn never reached the agent loop, so a terminal frame built without a
     # context leaves the client's rendered plan untouched instead of clearing it.
     work_plan: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class ChatHistoryRow:
+    message_id: str
+    sender: WorkflowCopilotChatSender
+    created_at: str
+    text: str
 
 
 @dataclass(frozen=True)
@@ -1312,6 +1335,10 @@ class CopilotContext(AgentContext):
     selected_block_label: str | None = None
     doc_editor_enabled: bool = False
     turn_context_packet: TurnContextPacket | None = None
+    # Renders this chat's rows older than the chat_history window, oldest first, only when first called.
+    earlier_chat_history_rows: Callable[[], tuple[ChatHistoryRow, ...]] = tuple
+    chat_history_oldest_shown_id: str | None = None
+    earlier_chat_history_unavailable: bool = False
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged Google
     # connection that has no run authority. This never grants authority itself.
@@ -1361,6 +1388,7 @@ class CopilotContext(AgentContext):
     google_connection_notices: list[GoogleConnectionNotice] = field(default_factory=list)
     # Kept apart from google_connection_notices, which each workflow save recomputes wholesale.
     google_setup_notices: list[GoogleConnectionNotice] = field(default_factory=list)
+    canonical_workflow_unavailable: CanonicalWorkflowUnavailableFacts | None = None
 
     # Tool tracking
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -1393,8 +1421,10 @@ class CopilotContext(AgentContext):
     # Workflow state
     authored_private_workflow_settings: dict[str, Any] | None = field(default=None, repr=False)
     persisted_workflow_yaml: str | None = None
+    # The saved row; persisted_workflow_yaml is None when it has no blocks, so its canvas comes from here.
+    saved_workflow: Workflow | None = field(default=None, repr=False)
     private_workflow_settings: dict[str, Any] = field(default_factory=dict, repr=False)
-    last_workflow: Workflow | None = None
+    last_workflow: Workflow | None = field(default=None, repr=False)
     last_workflow_yaml: str | None = None
     # Copies of the saved workflow a full test loaded this turn; matched by identity, never offered as a proposal.
     saved_workflows_under_test: list[Workflow] = field(default_factory=list)
@@ -1429,6 +1459,11 @@ class CopilotContext(AgentContext):
     dispatched_run_ids_this_turn: set[str] = field(default_factory=set)
     # Keyed by run id and drained by that run's own tool result, so a parallel sibling never shows these.
     pending_test_inputs: dict[str, list[CopilotTestInput]] = field(default_factory=dict)
+    # Redacted, display-clamped labels of blocks this turn's writes changed, in first-write order.
+    edited_block_labels_this_turn: list[str] = field(default_factory=list)
+    # Counts every recorded block edit, repeats included, so a run can tell whether an edit followed it.
+    block_edits_recorded_this_turn: int = 0
+    block_edits_recorded_at_dispatch: dict[str, int] = field(default_factory=dict)
     # Whether the latest recorded run-tool result created a run row; None until one is recorded.
     last_test_run_started: bool | None = None
     # The files the last recorded worker run published, keyed by that run's id.
@@ -1502,8 +1537,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_failure_reason: str | None = None
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
-    # The discovery tool reaches the connected FastMCP client through this.
-    discovery_mcp_server: Any | None = None
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
 
     # default_factory is the safety net — Python dataclass inheritance
     # disallows non-default fields after default ones, and the parent
@@ -1598,6 +1632,21 @@ class CopilotContext(AgentContext):
         # Runs this turn dispatched, not ``last_run_blocks_workflow_run_id``: that one can hold a
         # run inherited from an earlier turn, which is not an attempt by this one.
         return bool(self.dispatched_run_ids_this_turn)
+
+    def record_edited_block_label(self, label: str) -> None:
+        if not label:
+            return
+        self.block_edits_recorded_this_turn += 1
+        if label not in self.edited_block_labels_this_turn:
+            self.edited_block_labels_this_turn.append(label)
+
+    def record_dispatched_run(self, workflow_run_id: str) -> None:
+        self.dispatched_run_ids_this_turn.add(workflow_run_id)
+        self.block_edits_recorded_at_dispatch.setdefault(workflow_run_id, self.block_edits_recorded_this_turn)
+
+    def edited_after_dispatch(self, workflow_run_id: str) -> bool:
+        # A run whose dispatch was never recorded is treated as preceding every edit, so it never vouches for one.
+        return self.block_edits_recorded_this_turn > self.block_edits_recorded_at_dispatch.get(workflow_run_id, 0)
 
     def google_connection_notice_payloads(self) -> list[GoogleConnectionNoticePayload]:
         return [notice.to_payload() for notice in (*self.google_setup_notices, *self.google_connection_notices)]

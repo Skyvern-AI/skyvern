@@ -13,6 +13,8 @@ import pytest
 import structlog.testing
 
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.agent_context import PendingBrowserInteractionObservation
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_EXPRESSION,
     COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
@@ -21,7 +23,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP, _prune_input_list
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, _ground_user_provided_sites
 from skyvern.forge.sdk.copilot.runtime import (
-    PendingBrowserInteractionObservation,
+    _browser_session_acquisition_failure_result,
     bound_call_browser_session,
     current_call_browser_session_override,
 )
@@ -475,6 +477,28 @@ async def test_discovery_navigation_failure_falls_back_to_entry_url() -> None:
     assert result["data"]["failure_reason"] is None
     assert result["data"]["confidence"] == 0.2
     assert result["data"]["evidence_trail"][0]["transition_reason"].startswith("navigate_failed:")
+
+
+@pytest.mark.asyncio
+async def test_discovery_returns_a_refused_browser_start_instead_of_a_fallback_candidate() -> None:
+    refusal = _browser_session_acquisition_failure_result(
+        BuildTestConnectFailure(
+            state="browser_start_capacity", starting_sessions=10, max_starting_sessions=10, retry_after_seconds=17
+        )
+    )
+
+    class _RefusingServer:
+        async def call_internal_tool(self, tool_name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            assert tool_name == "skyvern_navigate"
+            return refusal
+
+    result = await _discovery_walk(
+        _Ctx(_RefusingServer()),
+        entry_url="https://www.example.com",
+        intent_hint="find a member",
+    )
+
+    assert result == refusal
 
 
 @pytest.mark.asyncio

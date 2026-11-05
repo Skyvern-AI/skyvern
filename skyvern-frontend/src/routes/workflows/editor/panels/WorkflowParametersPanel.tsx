@@ -24,11 +24,14 @@ import {
   getLabelForWorkflowParameterType,
   removeJinjaReferenceFromNodes,
   removeKeyFromNodesParameterKeys,
-  replaceJinjaReferenceInNodes,
 } from "../workflowEditorUtils";
+import { renameParameterInNodes, replaceParameter } from "../parameterEdits";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AffectedBlocksNotice } from "../AffectedBlocksNotice";
+import { inputDeleteTarget } from "../jinjaReferences";
 import { AppNode } from "../nodes";
+import { cn } from "@/util/utils";
+import { useStudioNarrow } from "../../studio/useStudioNarrow";
 
 const WORKFLOW_EDIT_PANEL_WIDTH = 20 * 16;
 const WORKFLOW_EDIT_PANEL_GAP = 1 * 16;
@@ -65,38 +68,39 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
   });
   const nodes = useNodes<AppNode>();
   const { setNodes } = useReactFlow();
+  // A phone has no room beside the panel, so the form opens over it.
+  const narrow = useStudioNarrow();
 
-  const affectedBlocksForDelete = useMemo(() => {
-    if (!deleteDialogState.parameterKey) {
-      return [];
-    }
-    return getAffectedBlocks(nodes, deleteDialogState.parameterKey);
-  }, [nodes, deleteDialogState.parameterKey]);
+  const parameterToDelete = workflowParameters.find(
+    (p) => p.key === deleteDialogState.parameterKey,
+  );
+  const affectedBlocksForDelete = useMemo(
+    () =>
+      parameterToDelete
+        ? getAffectedBlocks(nodes, inputDeleteTarget(parameterToDelete))
+        : [],
+    [nodes, parameterToDelete],
+  );
 
-  const handleDeleteParameter = (parameterKey: string) => {
+  const handleDeleteParameter = (parameter: ParametersState[number]) => {
     if (refuseMutationDuringYamlCommit()) return;
+    const target = inputDeleteTarget(parameter);
     setWorkflowParameters(
-      workflowParameters.filter((p) => p.key !== parameterKey),
+      workflowParameters.filter((p) => p.key !== parameter.key),
     );
     setHasChanges(true);
-    setNodes((nodes) => {
-      // Step 1: Remove inline {{ parameter.key }} references
-      const nodesWithRemovedRefs = removeJinjaReferenceFromNodes(
-        nodes,
-        parameterKey,
-      );
-      // Step 2: Remove from parameterKeys arrays
-      return removeKeyFromNodesParameterKeys(
-        nodesWithRemovedRefs,
-        parameterKey,
-      );
-    });
+    setNodes((nodes) =>
+      target.parameterKeys.reduce(
+        (updated, key) => removeKeyFromNodesParameterKeys(updated, key),
+        removeJinjaReferenceFromNodes(nodes, target.jinjaKeys),
+      ),
+    );
     setDeleteDialogState({ open: false, parameterKey: null });
   };
 
   return (
     <div
-      className="relative z-10 w-[25rem] rounded-xl border border-border bg-background p-5 shadow-xl"
+      className="relative z-10 w-[min(25rem,calc(100vw-2.5rem))] rounded-xl border border-border bg-background p-5 shadow-xl"
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
       <div className="space-y-4">
@@ -180,10 +184,10 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                           if (refuseMutationDuringYamlCommit()) return;
                           const affected = getAffectedBlocks(
                             nodes,
-                            parameter.key,
+                            inputDeleteTarget(parameter),
                           );
                           if (affected.length === 0) {
-                            handleDeleteParameter(parameter.key);
+                            handleDeleteParameter(parameter);
                             return;
                           }
                           setDeleteDialogState({
@@ -213,8 +217,8 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
         description="This input will be deleted from the agent."
         reversible
         onConfirm={() => {
-          if (deleteDialogState.parameterKey) {
-            handleDeleteParameter(deleteDialogState.parameterKey);
+          if (parameterToDelete) {
+            handleDeleteParameter(parameterToDelete);
           }
         }}
       >
@@ -223,13 +227,23 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
       {operationPanelState.active && (
         <div
           className="absolute"
-          style={{
-            top: 0,
-            left: -1 * (WORKFLOW_EDIT_PANEL_WIDTH + WORKFLOW_EDIT_PANEL_GAP),
-          }}
+          style={
+            narrow
+              ? { top: 0, left: 0, right: 0 }
+              : {
+                  top: 0,
+                  left:
+                    -1 * (WORKFLOW_EDIT_PANEL_WIDTH + WORKFLOW_EDIT_PANEL_GAP),
+                }
+          }
         >
           {operationPanelState.operation === "add" && (
-            <div className="w-80 rounded-xl border border-border bg-background p-5 px-2 shadow-xl">
+            <div
+              className={cn(
+                "rounded-xl border border-border bg-background p-5 px-2 shadow-xl",
+                narrow ? "w-full" : "w-80",
+              )}
+            >
               <WorkflowParameterEditPanel
                 type={operationPanelState.type}
                 onSave={(parameter) => {
@@ -254,7 +268,12 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           )}
           {operationPanelState.operation === "edit" &&
             operationPanelState.parameter && (
-              <div className="w-80 rounded-xl border border-border bg-background p-5 px-2 shadow-xl">
+              <div
+                className={cn(
+                  "rounded-xl border border-border bg-background p-5 px-2 shadow-xl",
+                  narrow ? "w-full" : "w-80",
+                )}
+              >
                 <WorkflowParameterEditPanel
                   key={operationPanelState.parameter?.key}
                   type={operationPanelState.type}
@@ -262,73 +281,21 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                   onSave={(editedParameter) => {
                     if (refuseMutationDuringYamlCommit()) return;
                     setHasChanges(true);
+                    const oldKey = operationPanelState.parameter?.key ?? "";
                     setWorkflowParameters(
-                      workflowParameters.map((parameter) => {
-                        if (
-                          parameter.key === operationPanelState.parameter?.key
-                        ) {
-                          return editedParameter;
-                        }
-                        if (
-                          parameter.parameterType === "context" &&
-                          parameter.sourceParameterKey ===
-                            operationPanelState.parameter?.key
-                        ) {
-                          return {
-                            ...parameter,
-                            sourceParameterKey: editedParameter.key,
-                          };
-                        }
-                        return parameter;
-                      }),
+                      replaceParameter(
+                        workflowParameters,
+                        oldKey,
+                        editedParameter,
+                      ),
                     );
-                    setNodes((nodes) => {
-                      const oldKey = operationPanelState.parameter?.key;
-                      const newKey = editedParameter.key;
-                      const keyChanged = oldKey && newKey && oldKey !== newKey;
-
-                      // Step 1: Update inline {{ old_key }} references to {{ new_key }}
-                      const nodesWithUpdatedRefs = keyChanged
-                        ? replaceJinjaReferenceInNodes(nodes, oldKey, newKey)
-                        : nodes;
-
-                      // Step 2: Update parameterKeys arrays
-                      return nodesWithUpdatedRefs.map((node) => {
-                        // All node types that have parameterKeys
-                        if (
-                          node.type === "task" ||
-                          node.type === "textPrompt" ||
-                          node.type === "agentStep" ||
-                          node.type === "login" ||
-                          node.type === "navigation" ||
-                          node.type === "extraction" ||
-                          node.type === "fileDownload" ||
-                          node.type === "action" ||
-                          node.type === "http_request" ||
-                          node.type === "web_search" ||
-                          node.type === "validation" ||
-                          node.type === "codeBlock" ||
-                          node.type === "printPage"
-                        ) {
-                          const parameterKeys = node.data
-                            .parameterKeys as Array<string> | null;
-                          return {
-                            ...node,
-                            data: {
-                              ...node.data,
-                              parameterKeys:
-                                parameterKeys?.map((key) => {
-                                  if (key === oldKey) {
-                                    return newKey;
-                                  }
-                                  return key;
-                                }) ?? null,
-                            },
-                          };
-                        }
-                        return node;
-                      });
-                    });
+                    setNodes((nodes) =>
+                      renameParameterInNodes(
+                        nodes,
+                        oldKey,
+                        editedParameter.key,
+                      ),
+                    );
                     setOperationPanelState({
                       active: false,
                       operation: "edit",

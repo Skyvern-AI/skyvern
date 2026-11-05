@@ -86,6 +86,7 @@ import {
   EmailInboxBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
+  PowerBIQueryBlockYAML,
   PdfFillBlockYAML,
   SplitPdfBlockYAML,
 } from "../types/workflowYamlTypes";
@@ -210,6 +211,12 @@ import {
 } from "./nodes/GoogleSheetsWriteNode/types";
 import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
 import {
+  POWERBI_QUERY_DEFAULT_MAX_ROWS,
+  isPowerBIQueryNode,
+  powerBIQueryNodeDefaultData,
+} from "./nodes/PowerBIQueryNode/types";
+import { validatePowerBIQueryNode } from "./nodes/PowerBIQueryNode/validate";
+import {
   isPdfFillNode,
   pdfFillNodeDefaultData,
 } from "./nodes/PdfFillNode/types";
@@ -220,10 +227,14 @@ import {
 } from "./nodes/SplitPdfNode/types";
 import { validateSplitPdfNode } from "./nodes/SplitPdfNode/validate";
 import {
+  blockDeleteTarget,
   containsJinjaReference,
+  descendants,
   getAffectedBlocks,
-  removeJinjaReference,
+  removeJinjaReferenceFromNodes,
   replaceJinjaReference,
+  SKIP_KEYS_FOR_JINJA_CHECK,
+  transformStringFieldsInObject,
   type AffectedBlock,
 } from "./jinjaReferences";
 import {
@@ -321,7 +332,7 @@ function serializeLoopNodeWhileBranchToYAML(
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 // Mirrors the backend settings.WORKFLOW_WAIT_BLOCK_MAX_SEC (30 minutes).
-const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
+export const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
 
 function serializeSecretResponsePaths(
   secretResponsePaths: Array<string>,
@@ -387,16 +398,6 @@ function layoutUtil(
     }),
     edges,
   };
-}
-
-// Returns descendants of `id` in topological order: a node's parent always
-// appears earlier in the array than the node itself. Callers that walk the
-// result and read parent state from a per-node map (see
-// applyDescendantCollapseVisibility / updateNodeAndDescendantsVisibility)
-// rely on this contract.
-export function descendants(nodes: Array<AppNode>, id: string): Array<AppNode> {
-  const children = nodes.filter((n) => n.parentId === id);
-  return children.concat(...children.map((c) => descendants(nodes, c.id)));
 }
 
 /**
@@ -841,9 +842,6 @@ function convertToNode(
     nextLoopOnFailure: block.next_loop_on_failure,
     editable,
     model: block.model,
-    notes: block.notes ?? null,
-    trailingNotes: block.trailing_notes ?? null,
-    description: block.description ?? null,
     ignoreWorkflowSystemPrompt: block.ignore_workflow_system_prompt ?? false,
     ...docFieldsFromBlock(block),
   };
@@ -1111,7 +1109,7 @@ function convertToNode(
           prompt: block.prompt,
           dataSchema: JSON.stringify(block.data_schema, null, 2),
           maxTurns: block.max_turns,
-          tools: block.tools ?? null,
+          tools: block.tools ?? [],
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -1518,6 +1516,8 @@ function convertToNode(
           ...commonData,
           emailClient: block.email_client ?? "gmail",
           credentialId: block.credential_id ?? "",
+          credentialSource: block.credential_source ?? "native",
+          connectionId: block.connection_id ?? "",
           folder: block.folder ?? "INBOX",
           prompt: block.prompt ?? "",
           sender: block.sender ?? "",
@@ -1542,6 +1542,22 @@ function convertToNode(
           range: block.range ?? "",
           credentialId: block.credential_id ?? "",
           hasHeaderRow: block.has_header_row ?? true,
+          parameterKeys: (block.parameters ?? []).map((p) => p.key),
+        },
+      };
+    }
+    case "powerbi_query": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "powerBIQuery",
+        data: {
+          ...commonData,
+          connectionId: block.connection_id ?? "",
+          credentialSource: block.credential_source ?? "native",
+          datasetId: block.dataset_id ?? "",
+          query: block.query ?? "",
+          maxRows: block.max_rows ?? POWERBI_QUERY_DEFAULT_MAX_ROWS,
           parameterKeys: (block.parameters ?? []).map((p) => p.key),
         },
       };
@@ -3207,6 +3223,17 @@ function createNode(
         },
       };
     }
+    case "powerBIQuery": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "powerBIQuery",
+        data: {
+          ...powerBIQueryNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "googleSheetsWrite": {
       return {
         ...identifiers,
@@ -3971,6 +3998,8 @@ function getWorkflowBlock(
         block_type: "email_inbox",
         email_client: node.data.emailClient,
         credential_id: node.data.credentialId || null,
+        credential_source: node.data.credentialSource ?? "native",
+        connection_id: node.data.connectionId || null,
         folder: node.data.folder,
         prompt: node.data.prompt,
         sender: node.data.sender || null,
@@ -3991,6 +4020,18 @@ function getWorkflowBlock(
         range: node.data.range || null,
         credential_id: node.data.credentialId || null,
         has_header_row: node.data.hasHeaderRow,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "powerBIQuery": {
+      return {
+        ...base,
+        block_type: "powerbi_query",
+        credential_source: node.data.credentialSource ?? "nango",
+        connection_id: node.data.connectionId,
+        dataset_id: node.data.datasetId,
+        query: node.data.query,
+        max_rows: node.data.maxRows,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4322,14 +4363,19 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
   return defaultSettings;
 }
 
-function generateNodeLabel(existingLabels: Array<string>) {
-  for (let i = 1; i < existingLabels.length + 2; i++) {
+function generateNodeLabel(
+  existingLabels: Array<string>,
+  parameterKeys: readonly string[] = [],
+) {
+  for (let i = 1; ; i++) {
     const label = NEW_NODE_LABEL_PREFIX + i;
-    if (!existingLabels.includes(label)) {
+    if (
+      !existingLabels.includes(label) &&
+      !getLabelOutputParameterKeyCollision(label, parameterKeys)
+    ) {
       return label;
     }
   }
-  throw new Error("Failed to generate a new node label");
 }
 
 function convertEchoParameters(
@@ -4367,72 +4413,6 @@ function getBlockNameOfOutputParameterKey(value: string) {
 // below keep existing in-repo call sites (rename flow, parameter-key
 // updater) compiling unchanged; source of truth is `jinjaReferences.ts`.
 
-// Maximum recursion depth to prevent stack overflow from malicious deeply nested objects
-const MAX_TRANSFORM_DEPTH = 50;
-
-/**
- * Recursively processes all string fields in an object and applies a transformation function.
- * @param obj - The object to process
- * @param transform - Function that transforms string values
- * @param skipKeys - Set of keys to skip (e.g., 'label' which shouldn't be modified)
- * @param depth - Current recursion depth (internal use)
- * @returns A new object with transformed string values
- */
-function transformStringFieldsInObject<T>(
-  obj: T,
-  transform: (value: string) => string,
-  skipKeys: Set<string>,
-  depth: number = 0,
-): T {
-  // Prevent stack overflow from deeply nested objects
-  if (depth > MAX_TRANSFORM_DEPTH) {
-    return obj;
-  }
-
-  if (obj === null || obj === undefined) {
-    return obj;
-  }
-
-  if (typeof obj === "string") {
-    return transform(obj) as T;
-  }
-
-  if (Array.isArray(obj)) {
-    return obj.map((item) =>
-      transformStringFieldsInObject(item, transform, skipKeys, depth + 1),
-    ) as T;
-  }
-
-  if (typeof obj === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj)) {
-      if (skipKeys.has(key)) {
-        result[key] = value;
-      } else {
-        result[key] = transformStringFieldsInObject(
-          value,
-          transform,
-          skipKeys,
-          depth + 1,
-        );
-      }
-    }
-    return result as T;
-  }
-
-  return obj;
-}
-
-// Keys to skip when transforming string fields in node data
-const SKIP_KEYS_FOR_JINJA_TRANSFORM = new Set([
-  "label",
-  "key",
-  "type",
-  "id",
-  "nodeId",
-  "parameterKeys", // handled separately
-]);
-
 /**
  * Replaces all jinja-style references to a variable across all nodes.
  * Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}.
@@ -4455,34 +4435,7 @@ function replaceJinjaReferenceInNodes<T extends Node>(
       data: transformStringFieldsInObject(
         node.data,
         (text) => replaceJinjaReference(text, oldKey, newKey),
-        SKIP_KEYS_FOR_JINJA_TRANSFORM,
-      ),
-    };
-  });
-}
-
-/**
- * Removes all jinja-style references to a variable across all nodes.
- * Handles patterns like {{key}}, {{key.field}}, {{key | filter}}.
- * Returns a new array of nodes with updated data (immutable).
- *
- * Note: This only handles inline {{ variable }} references in string fields.
- * The parameterKeys array should be updated separately.
- */
-function removeJinjaReferenceFromNodes<T extends Node>(
-  nodes: T[],
-  key: string,
-): T[] {
-  return nodes.map((node) => {
-    if (!node.data) {
-      return node;
-    }
-    return {
-      ...node,
-      data: transformStringFieldsInObject(
-        node.data,
-        (text) => removeJinjaReference(text, key),
-        SKIP_KEYS_FOR_JINJA_TRANSFORM,
+        SKIP_KEYS_FOR_JINJA_CHECK,
       ),
     };
   });
@@ -4535,6 +4488,13 @@ function removeKeyFromNodesParameterKeys<T extends Node>(
             loopData.loopVariableReference === keyToRemove
               ? ""
               : loopData.loopVariableReference,
+          loopValue:
+            loopData.loopValue === keyToRemove ? "" : loopData.loopValue,
+          ...(Array.isArray(loopData.parameterKeys) && {
+            parameterKeys: loopData.parameterKeys.filter(
+              (key) => key !== keyToRemove,
+            ),
+          }),
         },
       } as T;
     }
@@ -4568,6 +4528,12 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   const oldLabel = labelUpdatedNode.data.label as string;
   const oldOutputKey = getOutputParameterKey(oldLabel);
   const newOutputKey = getOutputParameterKey(newLabel);
+  const rewriteLoopSource = (value: string) =>
+    value === oldOutputKey ||
+    value.startsWith(`${oldOutputKey}.`) ||
+    value.startsWith(`${oldOutputKey}[`)
+      ? newOutputKey + value.slice(oldOutputKey.length)
+      : value;
 
   // Step 1: Update inline {{ old_output }} references to {{ new_output }}
   const nodesWithUpdatedRefs = replaceJinjaReferenceInNodes(
@@ -4592,18 +4558,15 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
       return node;
     }
 
-    // Handle loop node's loopVariableReference (the active field displayed in UI).
-    // Note: loopValue is a legacy field populated during conversion for backward compatibility.
-    // It's not displayed in UI or sent to backend, so we only update loopVariableReference.
-    if (node.type === "loop") {
+    if (isLoopNode(node)) {
       return {
         ...node,
         data: {
           ...node.data,
-          loopVariableReference:
-            node.data.loopVariableReference === oldOutputKey
-              ? newOutputKey
-              : node.data.loopVariableReference,
+          loopVariableReference: rewriteLoopSource(
+            node.data.loopVariableReference,
+          ),
+          loopValue: rewriteLoopSource(node.data.loopValue),
           label: node.id === id ? newLabel : node.data.label,
         },
       };
@@ -4673,20 +4636,31 @@ function getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
   });
 }
 
+function getLabelOutputParameterKeyCollision(
+  label: string,
+  parameterKeys: readonly string[],
+) {
+  const outputKey = getOutputParameterKey(label);
+  return parameterKeys.includes(outputKey) ? outputKey : null;
+}
+
 function getUniqueLabelForExistingNode(
   label: string,
   existingLabels: Array<string>,
+  parameterKeys: readonly string[],
 ) {
-  if (!existingLabels.includes(label)) {
+  const isTaken = (candidate: string) =>
+    existingLabels.includes(candidate) ||
+    getLabelOutputParameterKeyCollision(candidate, parameterKeys) !== null;
+  if (!isTaken(label)) {
     return label;
   }
-  for (let i = 2; i < existingLabels.length + 1; i++) {
+  for (let i = 2; ; i++) {
     const candidate = `${label}_${i}`;
-    if (!existingLabels.includes(candidate)) {
+    if (!isTaken(candidate)) {
       return candidate;
     }
   }
-  return label;
 }
 
 function getDefaultValueForParameterType(
@@ -5597,6 +5571,8 @@ function convertBlocksToBlockYAML(
           block_type: "email_inbox",
           email_client: block.email_client,
           credential_id: block.credential_id,
+          credential_source: block.credential_source ?? "native",
+          connection_id: block.connection_id ?? null,
           folder: block.folder,
           prompt: block.prompt,
           sender: block.sender,
@@ -5618,6 +5594,19 @@ function convertBlocksToBlockYAML(
           range: block.range,
           credential_id: block.credential_id,
           has_header_row: block.has_header_row,
+          parameter_keys: (block.parameters ?? []).map((p) => p.key),
+        };
+        return blockYaml;
+      }
+      case "powerbi_query": {
+        const blockYaml: PowerBIQueryBlockYAML = {
+          ...base,
+          block_type: "powerbi_query",
+          credential_source: block.credential_source ?? "native",
+          connection_id: block.connection_id,
+          dataset_id: block.dataset_id,
+          query: block.query,
+          max_rows: block.max_rows ?? POWERBI_QUERY_DEFAULT_MAX_ROWS,
           parameter_keys: (block.parameters ?? []).map((p) => p.key),
         };
         return blockYaml;
@@ -5725,6 +5714,43 @@ function pendingGoalChangesOf(nodes: Array<AppNode>): Array<PendingGoalChange> {
     }
   }
   return changes;
+}
+
+/** What the Goal field changes when its text becomes `value`, shared by the visual editor and the Doc. */
+function goalTextEditPatch(
+  data: CodeBlockNodeData,
+  value: string,
+): Partial<CodeBlockNodeData> | null {
+  if (value === (data.prompt ?? "")) {
+    return null;
+  }
+  const undoPatch = goalChangeUndoPatch(data);
+  if (undoPatch && value === (data.goalBeforeEdit?.prompt ?? "")) {
+    return undoPatch;
+  }
+  const goalChangePending = goalChangeIsPending(data);
+  if (value.trim().length > 0) {
+    return {
+      prompt: value,
+      userOwnedGoal: true,
+      goalNeedsRegeneration: true,
+      ...(!goalChangePending && {
+        goalBeforeEdit: {
+          prompt: data.prompt,
+          userOwnedGoal: data.userOwnedGoal,
+          goalNeedsRegeneration: data.goalNeedsRegeneration,
+        },
+      }),
+    };
+  }
+  return {
+    prompt: value,
+    ...(data.userOwnedGoal === true && { userOwnedGoal: false }),
+    ...(goalChangePending && {
+      goalNeedsRegeneration: false,
+      goalBeforeEdit: null,
+    }),
+  };
 }
 
 function goalChangeUndoPatch(
@@ -6123,7 +6149,7 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     if (node.data.prompt.trim().length === 0) {
       errors.push(`${node.data.label}: Prompt is required.`);
     }
-    if (node.data.tools?.length === 0) {
+    if (node.data.tools.length === 0) {
       errors.push(`${node.data.label}: Choose at least one tool.`);
     }
     let dataSchema: unknown;
@@ -6259,6 +6285,9 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isGoogleSheetsReadNode)
     .forEach((node) => errors.push(...validateGoogleSheetsReadNode(node)));
+  nodes
+    .filter(isPowerBIQueryNode)
+    .forEach((node) => errors.push(...validatePowerBIQueryNode(node)));
 
   nodes
     .filter(isEmailInboxNode)
@@ -6345,9 +6374,11 @@ function getParentLoopSkipsOnFail(
 export {
   blockEngineForWorkflow,
   workflowEffectiveDefaultEngine,
+  blockDeleteTarget,
   containsJinjaReference,
   convert,
   convertEchoParameters,
+  descendants,
   convertToNode,
   createNode,
   generateNodeData,
@@ -6366,12 +6397,14 @@ export {
   getWorkflowSettings,
   getOrderedChildrenBlocks,
   getOutputParameterKey,
+  getLabelOutputParameterKeyCollision,
   getPreviousNodeIds,
   getUniqueLabelForExistingNode,
   getUpdatedNodesAfterLabelUpdateForParameterKeys,
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
   goalChangeIsPending,
+  goalTextEditPatch,
   goalChangeUndoPatch,
   keepCodeWithGoalPatch,
   codeEditedNoticeIsShown,

@@ -1,31 +1,61 @@
+import asyncio
+from collections.abc import Set as AbstractSet
+
 from fastapi import HTTPException
 from onepassword import ItemFieldType
-from onepassword.types import Item
+from onepassword.client import Client as OnePasswordClient
+from onepassword.types import Item, ItemField
 
 from skyvern.exceptions import CredentialItemNotFoundError, CredentialSourceNotConfiguredError
 from skyvern.forge import app
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
     CredentialItem,
     CredentialType,
+    CredentialVaultType,
     CreditCardCredential,
     PasswordCredential,
     SecretCredential,
     TotpType,
 )
-from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
+from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService, VaultLogin
 from skyvern.forge.sdk.services.credentials import fetch_onepassword_item, format_resolved_lookup_context
 from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepassword_token
+
+ONEPASSWORD_LISTING_TIMEOUT_SECONDS = 20.0
+
+
+def onepassword_item_credential_type(item: Item) -> CredentialType | None:
+    category = "".join(character for character in item.category.value.casefold() if character.isalnum())
+    return {
+        "login": CredentialType.PASSWORD,
+        "creditcard": CredentialType.CREDIT_CARD,
+    }.get(category)
 
 
 def _normalize_field_name(value: str | None) -> str:
     return "".join(character for character in (value or "").casefold() if character.isalnum())
 
 
+_CARD_NUMBER_FIELD_NAMES = frozenset({"number", "cardnumber", "ccnum"})
+_CARD_CVV_FIELD_NAMES = frozenset({"cvv", "cvc", "securitycode"})
+
+
+def is_onepassword_card_secret_field(item: Item, field: ItemField) -> bool:
+    """Whether a field holds a card number or CVV, matched the way a card credential is read below."""
+    if field.field_type == ItemFieldType.CREDITCARDNUMBER:
+        return True
+    names = {_normalize_field_name(field.id), _normalize_field_name(field.title)}
+    return bool(names & (_CARD_NUMBER_FIELD_NAMES | _CARD_CVV_FIELD_NAMES)) and (
+        onepassword_item_credential_type(item) == CredentialType.CREDIT_CARD
+    )
+
+
 def _field_value(
     item: Item,
-    names: set[str],
+    names: AbstractSet[str],
     field_type: ItemFieldType | None = None,
 ) -> str | None:
     if field_type is not None:
@@ -60,7 +90,7 @@ def _credential_from_item(db_credential: Credential, item: Item) -> CredentialIt
             expiration_parts = [expiration[4:], expiration[:4]]
         else:
             expiration_parts = expiration.split("/", maxsplit=1) if expiration else []
-        card_number = _field_value(item, {"number", "cardnumber", "ccnum"}, ItemFieldType.CREDITCARDNUMBER)
+        card_number = _field_value(item, _CARD_NUMBER_FIELD_NAMES, ItemFieldType.CREDITCARDNUMBER)
         expiration_month = _field_value(item, {"expirationmonth", "expmonth", "month"}) or (
             expiration_parts[0].strip() if len(expiration_parts) == 2 else ""
         )
@@ -71,7 +101,7 @@ def _credential_from_item(db_credential: Credential, item: Item) -> CredentialIt
             raise CredentialItemNotFoundError("1Password item is missing required credit-card fields")
         data = CreditCardCredential(
             card_number=card_number,
-            card_cvv=_field_value(item, {"cvv", "cvc", "securitycode"}) or "",
+            card_cvv=_field_value(item, _CARD_CVV_FIELD_NAMES) or "",
             card_exp_month=expiration_month,
             card_exp_year=expiration_year,
             card_brand=_field_value(item, {"type", "brand", "cardtype"}, ItemFieldType.CREDITCARDTYPE)
@@ -144,3 +174,39 @@ class OnePasswordCredentialVaultService(CredentialVaultService):
             lookup_context,
         )
         return _credential_from_item(db_credential, item)
+
+    async def list_logins(self, organization_id: str) -> list[VaultLogin] | None:
+        resolution = await resolve_onepassword_token(organization_id)
+        # Org-scoped only, like the item listing route: never the instance's global token.
+        if resolution.source != "organization" or resolution.token is None:
+            return None
+        client = await OnePasswordClient.authenticate(
+            auth=resolution.token, integration_name="Skyvern", integration_version="v1.0.0"
+        )
+        vaults = await client.vaults.list()
+        # One vault failing fails the listing: that vault could hold the page's login, so the rest is not complete.
+        listed = await asyncio.wait_for(
+            asyncio.gather(*(client.items.list(vault.id) for vault in vaults)),
+            timeout=ONEPASSWORD_LISTING_TIMEOUT_SECONDS,
+        )
+        logins: list[VaultLogin] = []
+        for vault, items in zip(vaults, listed, strict=True):
+            for item in items:
+                if onepassword_item_credential_type(item) != CredentialType.PASSWORD:
+                    continue
+                websites = tuple(website.url for website in item.websites or [] if website.url)
+                tested_url = websites[0] if websites else None
+                logins.append(
+                    VaultLogin(
+                        vault_type=CredentialVaultType.ONEPASSWORD,
+                        vault_id=vault.id,
+                        item_id=item.id,
+                        title=item.title,
+                        urls=websites,
+                        # An imported 1Password login fills only at its tested URL's origin, so it is not
+                        # placed anywhere wider before it is imported.
+                        sites=(LoginSite(tested_url, whole_site=False),) if tested_url else (),
+                        tested_url=tested_url,
+                    )
+                )
+        return logins

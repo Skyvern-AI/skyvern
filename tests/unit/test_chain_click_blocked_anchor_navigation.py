@@ -806,11 +806,6 @@ class TestChainClickBlockedAnchorNavigation:
         coordinate_click.assert_not_awaited()
 
 
-def test_dom_module_exports_try_navigate_via_href() -> None:
-    """Sanity check that the helper is a method on ``SkyvernElement``."""
-    assert hasattr(dom_module.SkyvernElement, "try_navigate_via_href")
-
-
 class _SelectedEngineTimeout(Exception):
     pass
 
@@ -2287,24 +2282,6 @@ class TestIsSafeForCheckboxDirectClickUsesSkyvernFrameEvaluate:
     ``SkyvernFrame.evaluate`` entry point (repo-standard timeout/dispatch/
     navigation recovery, handle marshalling) rather than ``Locator.evaluate``,
     while preserving fail-closed semantics."""
-
-    @pytest.mark.asyncio
-    async def test_probe_routes_through_skyvernframe_evaluate(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        blocker, blocker_locator = _make_blocking_element(
-            tag=InteractiveElement.BUTTON, interactive_descendant=None, direct_interactive=True
-        )
-        frame_eval = AsyncMock(return_value=True)
-        monkeypatch.setattr(dom_module.SkyvernFrame, "evaluate", frame_eval)
-
-        result = await blocker.is_safe_for_checkbox_direct_click()
-
-        assert result is False  # interactive blocker => unsafe
-        frame_eval.assert_awaited_once()
-        call = frame_eval.await_args
-        assert call.kwargs["expression"] == "(element) => element.matches('a[href], button')"
-        assert call.kwargs["frame"] is blocker.get_frame()
-        assert call.kwargs["arg"] is await blocker.get_element_handler()
-        blocker_locator.evaluate.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_probe_exception_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:

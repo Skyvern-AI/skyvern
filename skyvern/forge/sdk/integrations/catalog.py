@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Collection, Sequence
+from functools import partial
 from typing import Any, Literal
 
 import structlog
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
@@ -21,7 +23,14 @@ LOG = structlog.get_logger()
 IntegrationStatus = Literal["live", "comingSoon"]
 IntegrationKind = Literal["oauth", "credential_form", "external", "internal"]
 IntegrationCategory = Literal[
-    "Workspace", "Communication", "Docs", "Payments", "CRM", "Automation", "Agent Orchestrators", "Credentials"
+    "Workspace",
+    "Communication",
+    "Docs",
+    "Payments",
+    "CRM",
+    "Automation",
+    "Agent Orchestrators",
+    "Credentials",
 ]
 OAuthProvider = Literal["google", "microsoft"]
 AccountsUnavailable = Literal["not_enabled", "read_failed"]
@@ -54,6 +63,8 @@ class IntegrationEntry(BaseModel):
     oauth_scope_profile: str | None = None
     required_scopes: list[str] | None = None
     capability_scopes: list[str] | None = None
+    credential_backend: Literal["nango"] | None = None
+    additional_credential_backends: list[Literal["nango"]] | None = None
     credential_form_id: str | None = None
     learn_more_url: str | None = None
     to: str | None = None
@@ -85,7 +96,10 @@ def oauth_account(
 
 
 def page_payload(entry: IntegrationEntry) -> dict[str, Any]:
-    return entry.model_dump(by_alias=True, exclude_none=True, exclude={"accounts", "accounts_unavailable"})
+    excluded = {"accounts", "accounts_unavailable"}
+    if entry.status == "comingSoon" and entry.kind == "oauth":
+        excluded.update({"oauth_provider", "oauth_scope_profile", "required_scopes"})
+    return entry.model_dump(by_alias=True, exclude_none=True, exclude=excluded)
 
 
 def copilot_payload(entry: IntegrationEntry) -> dict[str, Any]:
@@ -260,6 +274,32 @@ SKYVERN_INTEGRATIONS: tuple[IntegrationEntry, ...] = (
         credential_form_id="custom_credential_service",
         position=16,
     ),
+    IntegrationEntry(
+        id="powerbi",
+        name="Power BI",
+        category="Workspace",
+        description="Run read-only DAX queries against Power BI datasets.",
+        keywords=["microsoft", "dataset", "model", "dax", "analytics"],
+        status="comingSoon",
+        kind="oauth",
+        logo="powerbi",
+        oauth_provider="microsoft",
+        oauth_scope_profile=microsoft_oauth_service.MICROSOFT_OAUTH_SCOPE_PROFILE_POWERBI_DATASET_READ,
+        required_scopes=["Dataset.Read.All"],
+        position=17,
+    ),
+    IntegrationEntry(
+        id="email_forwarding",
+        name="Email forwarding",
+        category="Communication",
+        description="Receive verification emails without connecting a mailbox.",
+        keywords=["2FA", "OTP", "forwarding", "email"],
+        status="live",
+        kind="internal",
+        logo="envelope",
+        to="/settings#email-forwarding",
+        position=18,
+    ),
 )
 
 AccountsById = dict[str, list[IntegrationAccount] | AccountsUnavailable]
@@ -318,8 +358,11 @@ async def _google_accounts(organization_id: str) -> AccountsById:
     }
 
 
-async def _microsoft_accounts(organization_id: str) -> AccountsById:
-    credentials = await microsoft_oauth_service.get_credentials_for_org(organization_id)
+async def _microsoft_accounts(organization_id: str, user_id: str | None = None) -> AccountsById:
+    entries = _entries_for_provider("microsoft")
+    if not entries:
+        return {}
+    credentials = await microsoft_oauth_service.get_credentials_for_org(organization_id, user_id=user_id)
     return {
         entry.id: [
             oauth_account(credential, "microsoft")
@@ -329,7 +372,7 @@ async def _microsoft_accounts(organization_id: str) -> AccountsById:
                 credential.scopes_requested or credential.scopes_granted, entry.required_scopes or []
             )
         ]
-        for entry in _entries_for_provider("microsoft")
+        for entry in entries
     }
 
 
@@ -363,7 +406,6 @@ async def _twilio_accounts(organization_id: str) -> AccountsById:
 
 _ACCOUNT_SOURCES: tuple[tuple[frozenset[str], AccountSource], ...] = (
     (frozenset(entry.id for entry in _entries_for_provider("google")), _google_accounts),
-    (frozenset(entry.id for entry in _entries_for_provider("microsoft")), _microsoft_accounts),
     (frozenset({"twilio"}), _twilio_accounts),
     (frozenset({"onepassword"}), _onepassword_accounts),
     (frozenset({"bitwarden"}), _vault_source("bitwarden", OrganizationAuthTokenType.bitwarden_credential)),
@@ -400,18 +442,96 @@ def with_accounts(
     return entry.model_copy(update={"accounts": accounts, "accounts_unavailable": None})
 
 
-def integration_entries() -> list[IntegrationEntry]:
-    return sorted(
-        [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()], key=lambda entry: entry.position
+def integration_entries(
+    email_forwarding_available: bool = True, powerbi_available: bool = False, gmail_available: bool = False
+) -> list[IntegrationEntry]:
+    entries = [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
+    if not email_forwarding_available:
+        entries = [entry for entry in entries if entry.id != "email_forwarding"]
+    if gmail_available:
+        entries = [
+            entry.model_copy(update={"additional_credential_backends": ["nango"]})
+            if entry.id == _GOOGLE_GMAIL_ENTRY_ID
+            else entry
+            for entry in entries
+        ]
+    if powerbi_available:
+        entries = [
+            entry.model_copy(
+                update={
+                    "status": "live",
+                    "oauth_provider": None,
+                    "oauth_scope_profile": None,
+                    "required_scopes": None,
+                    "capability_scopes": None,
+                    "credential_backend": "nango",
+                }
+            )
+            if entry.id == "powerbi"
+            else entry
+            for entry in entries
+        ]
+    return sorted(entries, key=lambda entry: entry.position)
+
+
+async def integration_entries_for_org(organization_id: str) -> list[IntegrationEntry]:
+    try:
+        email_forwarding_available = await app.AGENT_FUNCTION.ensure_email_forwarding_available(
+            organization_id, fresh=False
+        )
+    except HTTPException as e:
+        if e.status_code != 404:
+            LOG.warning(
+                "Email forwarding availability check failed; omitting it from the integration catalog",
+                organization_id=organization_id,
+                exc_info=True,
+            )
+        email_forwarding_available = False
+    except Exception:
+        LOG.warning(
+            "Email forwarding availability check failed; omitting it from the integration catalog",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        email_forwarding_available = False
+    try:
+        powerbi_available = await app.AGENT_FUNCTION.nango_powerbi_catalog_available(organization_id)
+    except Exception:
+        LOG.warning(
+            "Power BI availability check failed; leaving it unavailable in the integration catalog",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        powerbi_available = False
+    try:
+        gmail_available = await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id)
+    except Exception:  # noqa: BLE001 - availability failures leave Gmail dark.
+        gmail_available = False
+    return integration_entries(
+        email_forwarding_available=email_forwarding_available,
+        powerbi_available=powerbi_available,
+        gmail_available=gmail_available,
     )
 
 
-async def integrations_for_org(organization_id: str) -> list[IntegrationEntry]:
+def integration_is_live(integration_id: str) -> bool:
+    return any(entry.id == integration_id and entry.status == "live" for entry in SKYVERN_INTEGRATIONS)
+
+
+async def integrations_for_org(organization_id: str, user_id: str | None = None) -> list[IntegrationEntry]:
+    microsoft_entry_ids = frozenset(entry.id for entry in _entries_for_provider("microsoft"))
+    microsoft_reader = read_account_source(
+        organization_id,
+        microsoft_entry_ids,
+        partial(_microsoft_accounts, user_id=user_id),
+    )
     reads = await asyncio.gather(
         *(read_account_source(organization_id, entry_ids, source) for entry_ids, source in _ACCOUNT_SOURCES),
+        microsoft_reader,
         app.AGENT_FUNCTION.get_cloud_integration_accounts(organization_id),
     )
     accounts: AccountsById = {}
     for found in reads:
         accounts.update(found)
-    return [with_accounts(entry, accounts.get(entry.id)) for entry in integration_entries()]
+    entries = await integration_entries_for_org(organization_id)
+    return [with_accounts(entry, accounts.get(entry.id)) for entry in entries]

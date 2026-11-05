@@ -50,7 +50,9 @@ class FakeVault:
     entered: asyncio.Event = field(default_factory=asyncio.Event)
     deleted: list[str] = field(default_factory=list)
     get_credential_item: AsyncMock = field(
-        default_factory=lambda: AsyncMock(return_value=SimpleNamespace(credential=SimpleNamespace(secret=SECRET)))
+        default_factory=lambda: AsyncMock(
+            return_value=SimpleNamespace(credential=SimpleNamespace(secret=SECRET), login_sites=None)
+        )
     )
     post_delete_credential_item: AsyncMock = field(default_factory=lambda: AsyncMock(return_value=True))
 
@@ -607,7 +609,7 @@ async def test_read_time_recovery_leaves_a_turn_whose_claim_is_live(chat: Chat) 
     async with chat.env.database.Session() as session:
         after = await session.get(WorkflowCopilotChatModel, chat.chat_id)
         assert after is not None and after.pending_turns["turn"].get("recovering_at") is None
-    assert not await repo.claim_pending_copilot_turn(
+    assert "refused" == await repo.claim_pending_copilot_turn(
         organization_id=RUN_GROUP_ORG,
         workflow_copilot_chat_id=chat.chat_id,
         turn_id="turn",

@@ -239,7 +239,8 @@ type BuildTestConnectFailureState =
   | "provisioning_unavailable"
   | "cdp_connect_failed"
   | "occupied"
-  | "billing_credit_admission_refusal";
+  | "billing_credit_admission_refusal"
+  | "browser_start_capacity";
 
 export function isBuildTestConnectFailureState(
   value: unknown,
@@ -249,11 +250,13 @@ export function isBuildTestConnectFailureState(
     value === "provisioning_unavailable" ||
     value === "cdp_connect_failed" ||
     value === "occupied" ||
-    value === "billing_credit_admission_refusal"
+    value === "billing_credit_admission_refusal" ||
+    value === "browser_start_capacity"
   );
 }
 
 export type ReviewChange = "added" | "changed" | "unchanged" | "removed";
+export type InputChange = "added" | "changed" | "removed";
 export type BlockCoverage =
   | "current_source"
   | "different_source"
@@ -302,6 +305,7 @@ export interface ReviewProjection {
     blockType: string;
     blockLabels: string[];
   }>;
+  inputs?: Array<{ key: string; change: InputChange }>;
   // Blocks whose saved notes Copilot's YAML left out, so the saved notes were kept.
   keptNotes?: string[];
   // The same for descriptions.
@@ -310,6 +314,7 @@ export interface ReviewProjection {
 
 export interface BlockState {
   workflowRunBlockId: string;
+  workflowRunId?: string;
   label: string;
   blockType: string;
   state: BlockUIState;
@@ -461,6 +466,7 @@ export interface TurnNarrativeState {
     verdict: BlockOutcome;
     role?: RunOutcomeRole;
     displayReason: string | null;
+    workflowRunId?: string;
   } | null;
   // Terminal-mode credential ask, from the credentialPrompt narrative signal.
   // reason is kept as a raw string — the card tolerates unknown tokens.
@@ -486,6 +492,7 @@ export interface TurnNarrativeState {
   outputFiles: DeliveredOutputFile[];
   googleConnectionNotices: GoogleConnectionNotice[];
   demonstrationOffer: boolean;
+  canonicalWorkflowUnavailable: CanonicalWorkflowUnavailable | null;
   review: ReviewProjection | null;
   turnFacts: TurnFacts | null;
   budgetExpiry: BudgetExpiryState | null;
@@ -522,6 +529,10 @@ export function googleConnectionNoticeKey(
   return `${notice.scopeProfile}:${notice.connectionId ?? "unbound"}`;
 }
 
+export interface CanonicalWorkflowUnavailable {
+  workflowPermanentId: string;
+}
+
 export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   turnId: null,
   turnIndex: null,
@@ -551,6 +562,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   outputFiles: [],
   googleConnectionNotices: [],
   demonstrationOffer: false,
+  canonicalWorkflowUnavailable: null,
   review: null,
   turnFacts: null,
   budgetExpiry: null,
@@ -773,6 +785,19 @@ export function parseCredentialAutoBound(
     : null;
 }
 
+export function parseCanonicalWorkflowUnavailable(
+  value: unknown,
+): CanonicalWorkflowUnavailable | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  return typeof row.workflow_permanent_id === "string" &&
+    row.workflow_permanent_id.length > 0 &&
+    row.candidate_published !== true &&
+    row.test_started === false
+    ? { workflowPermanentId: row.workflow_permanent_id }
+    : null;
+}
+
 export function parseGoogleConnectionNotices(
   value: unknown,
 ): GoogleConnectionNotice[] {
@@ -884,7 +909,11 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
+  create_webhook_trigger: "Creating a webhook trigger",
+  test_trigger_mapping: "Testing the trigger mapping",
+  list_workflow_triggers: "Checking this workflow's triggers",
   extend_browser_session: "Extending the browser session",
+  read_chat_history: "Reading earlier messages in this chat",
   run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
@@ -935,7 +964,11 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   offer_demonstration: "other",
   read_google_sheet: "other",
   read_attached_pdf: "other",
+  read_chat_history: "other",
   get_organization_usage_quota: "other",
+  create_webhook_trigger: "other",
+  test_trigger_mapping: "other",
+  list_workflow_triggers: "other",
   extend_browser_session: "other",
   search_web: "other",
   list_org_workflows: "other",
@@ -1536,6 +1569,7 @@ export function applyNarrativeEvent(
           : undefined;
       const baseEntry: BlockState = {
         workflowRunBlockId: event.workflow_run_block_id,
+        workflowRunId: runId || previousBlock?.workflowRunId,
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
@@ -1604,6 +1638,7 @@ export function applyNarrativeEvent(
           verdict: event.verdict,
           role: event.role ?? "recorded",
           displayReason: event.display_reason ?? null,
+          workflowRunId: event.workflow_run_id,
         },
       };
     }
@@ -1975,9 +2010,24 @@ function parseReviewProjection(raw: unknown): ReviewProjection | null {
     Array.isArray(raw)
       ? raw.filter((label): label is string => typeof label === "string")
       : [];
+  // Payloads persisted before inputs were published carry none, and a malformed row drops
+  // alone rather than voiding the review.
+  const inputs: NonNullable<ReviewProjection["inputs"]> = [];
+  for (const rawInput of Array.isArray(value.inputs) ? value.inputs : []) {
+    const input = (rawInput ?? {}) as Record<string, unknown>;
+    if (
+      typeof input.key === "string" &&
+      (input.change === "added" ||
+        input.change === "changed" ||
+        input.change === "removed")
+    ) {
+      inputs.push({ key: input.key, change: input.change });
+    }
+  }
   return {
     blocks,
     duplicateWrites,
+    inputs,
     keptNotes: labels(value.keptNotes),
     keptDescriptions: labels(value.keptDescriptions),
   };
@@ -2080,6 +2130,10 @@ export function hydrateNarrativeFromPayload(
           typeof obj.workflowRunBlockId === "string"
             ? obj.workflowRunBlockId
             : "",
+        workflowRunId:
+          typeof obj.workflowRunId === "string" && obj.workflowRunId
+            ? obj.workflowRunId
+            : undefined,
         label: typeof obj.label === "string" ? obj.label : "",
         blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
         outcome,
@@ -2207,6 +2261,9 @@ export function hydrateNarrativeFromPayload(
       payload.googleConnectionNotices,
     ),
     demonstrationOffer: payload.demonstrationOffer === true,
+    canonicalWorkflowUnavailable: parseCanonicalWorkflowUnavailable(
+      payload.canonicalWorkflowUnavailable,
+    ),
     review: parseReviewProjection(payload.review),
     turnFacts,
     budgetExpiry,
@@ -2311,6 +2368,7 @@ export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
 export interface NotConfirmedOutcome {
   verdict: "not_demonstrated";
   displayReason: string | null;
+  workflowRunId?: string;
 }
 
 function notDemonstratedBlock(blocks: BlockState[]): BlockState | null {
@@ -2335,6 +2393,7 @@ export function notConfirmedOutcome(
       ? {
           verdict: "not_demonstrated",
           displayReason: turn.lastRunOutcome.displayReason,
+          workflowRunId: turn.lastRunOutcome.workflowRunId,
         }
       : null;
   }
@@ -2348,6 +2407,7 @@ export function notConfirmedOutcome(
         turn.turnFacts?.recordedFailure ??
         notDemonstratedBlock(turn.blocks)?.outcomeReason ??
         null,
+      workflowRunId: turn.turnFacts?.runId ?? undefined,
     };
   }
   const block = notDemonstratedBlock(turn.blocks);
@@ -2356,6 +2416,7 @@ export function notConfirmedOutcome(
     : {
         verdict: "not_demonstrated",
         displayReason: block.outcomeReason ?? null,
+        workflowRunId: block.workflowRunId,
       };
 }
 

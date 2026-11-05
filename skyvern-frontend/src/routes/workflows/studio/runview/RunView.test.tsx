@@ -168,6 +168,7 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => false,
   usePostHog: () => ({ capture: vi.fn() }),
 }));
 vi.mock("posthog-js", () => ({
@@ -1168,6 +1169,18 @@ describe("RunView cold-open selection", () => {
 
     expect(useRunViewStore.getState().pinnedFrameId).toBe("act_2");
     expect(getByTestId("location-search").textContent).toContain("active=");
+  });
+
+  test("turning mirroring off (the Doc took the editor) clears the selection from the URL", () => {
+    seedTerminalRunWithActions();
+    const props = { mirrorSelectionToUrl: true };
+    const { getByTestId, rerenderRunView } = renderRunView(props, "/?wr=wr_1");
+    expect(getByTestId("location-search").textContent).toContain("active=");
+
+    props.mirrorSelectionToUrl = false;
+    rerenderRunView();
+
+    expect(getByTestId("location-search").textContent).not.toContain("active=");
   });
 
   test("a terminal /runs/{wr} short link with no ?active= selects the last item", () => {

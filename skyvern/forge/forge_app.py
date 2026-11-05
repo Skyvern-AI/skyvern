@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol
 
 import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
-
-if TYPE_CHECKING:
-    from yutori import AsyncYutoriClient
 
 from skyvern.config import Settings
 from skyvern.forge.agent import ForgeAgent
@@ -37,6 +34,9 @@ from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.schemas.organizations import AzureClientSecretCredential, Organization
 from skyvern.forge.sdk.services.credential.azure_credential_vault_service import AzureCredentialVaultService
 from skyvern.forge.sdk.services.credential.bitwarden_credential_service import BitwardenCredentialVaultService
+from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
+    ConnectedBitwardenCredentialVaultService,
+)
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.custom_credential_vault_service import CustomCredentialVaultService
 from skyvern.forge.sdk.services.credential.gcp_credential_vault_service import GcpCredentialVaultService
@@ -79,7 +79,6 @@ class ForgeApp:
     OPENAI_CUA_MODEL: str
     ANTHROPIC_CLIENT: AsyncAnthropic | AsyncAnthropicBedrock
     UI_TARS_CLIENT: AsyncOpenAI | None
-    YUTORI_CLIENT: AsyncYutoriClient | None
     AZURE_CLIENT_FACTORY: AzureClientFactory
     GCP_CLIENT_FACTORY: GcpClientFactory
     SECONDARY_LLM_API_HANDLER: LLMAPIHandler
@@ -180,15 +179,6 @@ def create_forge_app() -> ForgeApp:
             api_key=settings.VOLCENGINE_API_KEY,
             base_url=settings.VOLCENGINE_API_BASE,
             http_client=ForgeAsyncHttpxClientWrapper(),
-        )
-
-    app.YUTORI_CLIENT = None
-    if settings.ENABLE_YUTORI:
-        from yutori import AsyncYutoriClient
-
-        app.YUTORI_CLIENT = AsyncYutoriClient(
-            api_key=settings.YUTORI_API_KEY,
-            base_url=settings.YUTORI_API_BASE,
         )
 
     app.SECONDARY_LLM_API_HANDLER = LLMAPIHandlerFactory.get_llm_api_handler(
@@ -340,6 +330,7 @@ def create_forge_app() -> ForgeApp:
         CredentialVaultType.GCP: app.GCP_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.CUSTOM: app.CUSTOM_CREDENTIAL_VAULT_SERVICE,
         CredentialVaultType.ONEPASSWORD: app.ONEPASSWORD_CREDENTIAL_VAULT_SERVICE,
+        CredentialVaultType.BITWARDEN_CONNECTED: ConnectedBitwardenCredentialVaultService(),
     }
 
     app.scrape_exclude = None

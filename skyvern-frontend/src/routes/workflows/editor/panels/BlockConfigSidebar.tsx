@@ -74,6 +74,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   workflowTrigger: "workflow_trigger",
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
+  powerBIQuery: "powerbi_query",
   pdfFill: "pdf_fill",
   splitPdf: "split_pdf",
   dataExport: "data_export",

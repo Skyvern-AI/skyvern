@@ -42,6 +42,7 @@ from skyvern.forge.sdk.workflow.code_block_safety import (
     is_safe_script_code,
     safe_builtins,
 )
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     FailedToFormatJinjaStyleParameter,
     InsecureCodeDetected,
@@ -1345,6 +1346,12 @@ async def wrapper({default_args}):
             workflow_run_outputs: list[object] = []
             workflow = None
 
+            reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+            agent_unmasked_platform_secret_ids = staticmethod(set)
+
+            def __init__(self) -> None:
+                self.parameters: dict[str, object] = {}
+
             def get_block_metadata(self, label: str | None) -> dict[str, object]:
                 return {}
 
@@ -1428,6 +1435,12 @@ async def wrapper({default_args}):
             browser_session_id = "pbs_test"
             workflow_run_outputs: list[object] = []
             workflow = None
+
+            reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+            agent_unmasked_platform_secret_ids = staticmethod(set)
+
+            def __init__(self) -> None:
+                self.parameters: dict[str, object] = {}
 
             def get_block_metadata(self, label: str | None) -> dict[str, object]:
                 return {}
@@ -1831,6 +1844,7 @@ def _fake_code_block_page(navigations: list | None = None, fills: list | None = 
     from playwright.async_api import Page
 
     page = MagicMock(spec=Page)
+    page.url = "https://customer.auth0.com/callback"
 
     async def goto(url: str, **kwargs: object) -> None:
         if navigations is not None:
@@ -3119,6 +3133,7 @@ class TestCodeBlockMagicLink:
         await magic_link(page)
 
         assert captured["expected_otp_type"] is OTPType.MAGIC_LINK
+        assert captured["task_url"] == page.url
         assert navigations == [link]
         assert fills == []
 

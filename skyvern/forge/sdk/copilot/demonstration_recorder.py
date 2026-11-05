@@ -23,6 +23,7 @@ from skyvern.config import settings
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import BaseCache
+from skyvern.forge.sdk.copilot.agent_context import ScoutedInteraction
 from skyvern.forge.sdk.copilot.config import ALL_BLOCK_FAMILIES, AuthoringCapability
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.credential_pause import apply_connected_credential_to_policy
@@ -30,7 +31,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, sa
 from skyvern.forge.sdk.copilot.demonstration_tap import DEMONSTRATION_MAX_EVENTS, PageTap, TapEvent
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import (
-    ScoutedInteraction,
+    end_minted_browser_renewals,
     record_attached_browser_driver,
     resolve_persistent_browser_state,
     start_browser_driver_release,
@@ -59,6 +60,10 @@ async def finish_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
 DEMONSTRATION_TTL = timedelta(hours=2)
 DEMONSTRATION_CANCELLED_TTL = timedelta(seconds=60)
 DEMONSTRATION_MAX_CONTROLS = 200
+# Notes have their own budget so a narrated recording cannot use up the card's browser controls.
+DEMONSTRATION_MAX_NOTE_CONTROLS = 300
+# Past this a note starts a new step, so one merged note stays a reasonable size for the secret screen.
+DEMONSTRATION_MAX_MERGED_NOTE_CHARS = 4000
 DEMONSTRATION_MAX_VALUE_CHARS = 100_000
 DEMONSTRATION_POLL_SECONDS = 0.25
 DEMONSTRATION_OWNER_REFRESH_SECONDS = 5
@@ -443,8 +448,8 @@ async def append_demonstration_control(
             raise DemonstrationRejection(HTTPStatus.NOT_FOUND, "Unknown demonstration")
         if record.status not in {"recording", "stopping", "stopped"}:
             raise DemonstrationRejection(HTTPStatus.CONFLICT, "Demonstration has ended")
-        # A stopping recorder may already have drained its controls, so an upload queued now would never run.
-        if file_id is not None and record.status != "recording":
+        # A stopping recorder may already have drained its controls, so an upload or note queued now would never run.
+        if (file_id is not None or request.action == "note") and record.status != "recording":
             raise DemonstrationRejection(HTTPStatus.CONFLICT, "Demonstration is not recording")
         if request.action == "stop":
             if record.status == "recording":
@@ -467,8 +472,15 @@ async def append_demonstration_control(
             discarded_events = record.event_count
         else:
             controls = decode_demonstration_controls(await cache.get(controls_key))
-            if len(controls) >= DEMONSTRATION_MAX_CONTROLS:
-                raise DemonstrationRejection(HTTPStatus.CONFLICT, "Too many browser controls for this demonstration")
+            is_note = request.action == "note"
+            same_kind = sum((entry.get("action") == "note") == is_note for entry in controls)
+            if same_kind >= (DEMONSTRATION_MAX_NOTE_CONTROLS if is_note else DEMONSTRATION_MAX_CONTROLS):
+                raise DemonstrationRejection(
+                    HTTPStatus.CONFLICT,
+                    "Too many notes for this demonstration"
+                    if is_note
+                    else "Too many browser controls for this demonstration",
+                )
             seq = len(controls) + 1
             entry = {"seq": seq, **request.model_dump(exclude_none=True, exclude={"demonstration_id"})}
             if file_id is not None:
@@ -544,6 +556,10 @@ async def demonstration_action_labels(
             event = json.loads(raw)
         except (TypeError, ValueError):
             continue
+        # Notes are only screened at replay, so a reloaded card does not show their unscreened text.
+        if isinstance(event, dict) and event.get("kind") == "note":
+            labels.append("Note")
+            continue
         if isinstance(event, dict) and event.get("kind") == "type":
             packet = event.get("packet")
             role_name = packet.get("role_name") if isinstance(packet, dict) else None
@@ -601,6 +617,8 @@ class DemonstrationRecorder:
         self.stream = stream
         self.tap: PageTap | None = None
         self.page: Page | None = None
+        self.event_page: Page | None = None
+        self.known_pages: list[Page] = []
         self.sensitive_count = 0
         self.event_limit_reached = False
         self.credential_filled_selectors: set[str] = set()
@@ -639,6 +657,8 @@ class DemonstrationRecorder:
             self.page = await browser_state.get_working_page(prune_excess_pages=False)
             if self.page is None and pages:
                 self.page = pages[-1]
+            self.event_page = self.page
+            self.known_pages = list(pages)
             self.tap = PageTap(browser_context, max_events=DEMONSTRATION_MAX_EVENTS)
             await self.tap.start(pages)
             try:
@@ -684,11 +704,14 @@ class DemonstrationRecorder:
                 if demonstration_time_limit_reached(record):
                     reason = "time_limit"
                     break
+                # A note is posted when the user starts a click, so one queued by now precedes the clicks drained next.
+                controls = await self._load_controls()
+                await self._run_controls(controls, notes_only=True)
                 stop_reason = await self._drain_tap()
                 if stop_reason is not None:
                     reason = stop_reason
                     break
-                stop_reason = await self._run_controls()
+                stop_reason = await self._run_controls(controls)
                 if stop_reason is not None:
                     reason = stop_reason
                     break
@@ -697,15 +720,18 @@ class DemonstrationRecorder:
                     next_refresh = time.monotonic() + DEMONSTRATION_OWNER_REFRESH_SECONDS
                 await asyncio.sleep(DEMONSTRATION_POLL_SECONDS)
         finally:
+            # A credential fill can mint a browser into this context, and no turn finally ends its renewal.
+            end_minted_browser_renewals(self.recording_ctx)
             await finish_shielded(self._stop(reason))
 
-    async def _append_event(self, event: dict[str, Any]) -> int | None:
+    async def _append_event(self, event: dict[str, Any], *, reserve: int = 0) -> int | None:
         record_key = demonstration_record_key(self.organization_id, self.demonstration_id)
         async with self.cache.get_lock(demonstration_lock_key(self.organization_id, self.demonstration_id)):
             record = decode_demonstration_record(await self.cache.get(record_key))
             if record is None or record.owner != self.owner or record.status not in {"recording", "stopping"}:
                 return None
-            if demonstration_limit_reached(record):
+            # `reserve` holds back slots for the events this one introduces, so they stop together.
+            if demonstration_limit_reached(record) or record.event_count + reserve >= DEMONSTRATION_MAX_EVENTS:
                 self.event_limit_reached = True
                 if record.status == "recording":
                     record.status = "stopping"
@@ -740,6 +766,12 @@ class DemonstrationRecorder:
         return "event_limit" if self.tap.event_limit_reached else None
 
     async def _record_tap_event(self, event: TapEvent) -> None:
+        if event.page is not self.event_page:
+            if self.event_page is not None:
+                await self._record_tab_switch(event.page, _tab_event_url(event))
+                if self.event_limit_reached:
+                    return
+            self.event_page = event.page
         self.page = event.page
         payload = event.payload
         frame: dict[str, Any] = {"is_main": event.is_main_frame, "name": event.frame_name}
@@ -851,6 +883,31 @@ class DemonstrationRecorder:
                 }
             )
 
+    async def _record_tab_switch(self, page: Page, url: str) -> None:
+        previous = self.event_page
+        pages = list(page.context.pages)
+        stored: dict[str, Any] = {
+            "kind": "tab_switch",
+            "url": url,
+            # A popup that closed before its events drained has no index left, but the switch still happened.
+            "index": pages.index(page) if page in pages else None,
+            "new_tab": not any(known is page for known in self.known_pages),
+            "source_url": str(previous.url or "") if previous is not None else "",
+            "frame": {"is_main": True, "name": ""},
+        }
+        self.known_pages.append(page)
+        stored["label"] = _event_label(stored)
+        seq = await self._append_event(stored, reserve=1)
+        if seq is not None:
+            await self.stream.send(
+                {
+                    "type": "demonstration_action",
+                    "seq": seq,
+                    "label": stored["label"],
+                    "tool_name": "skyvern_tab_switch",
+                }
+            )
+
     async def _request_file(self, event: TapEvent, frame: dict[str, Any]) -> None:
         described = await self.tap.call_on_file_input(event, _DESCRIBE_FILE_INPUT) if self.tap is not None else None
         if (
@@ -883,13 +940,21 @@ class DemonstrationRecorder:
                 {"type": "demonstration_action", "seq": seq, "label": stored["label"], "tool_name": "gap"}
             )
 
-    async def _run_controls(self) -> DemonstrationStopReason | None:
-        controls = decode_demonstration_controls(
+    async def _load_controls(self) -> list[dict[str, Any]]:
+        return decode_demonstration_controls(
             await self.cache.get(demonstration_controls_key(self.organization_id, self.demonstration_id))
         )
+
+    async def _run_controls(
+        self, controls: list[dict[str, Any]] | None = None, *, notes_only: bool = False
+    ) -> DemonstrationStopReason | None:
+        if controls is None:
+            controls = await self._load_controls()
         for entry in controls[self.control_cursor :]:
-            self.control_cursor += 1
             action = entry.get("action")
+            if notes_only and action != "note":
+                break
+            self.control_cursor += 1
             if action == "cancel":
                 return "cancelled"
             if action == "navigate":
@@ -898,6 +963,8 @@ class DemonstrationRecorder:
                 await self._run_control_with_owner_heartbeat(self._fill_credential(entry))
             elif action == "upload_file":
                 await self._run_control_with_owner_heartbeat(self._upload_file(entry))
+            elif action == "note":
+                await self._note(entry)
         return None
 
     async def _run_control_with_owner_heartbeat(self, control: Awaitable[None]) -> None:
@@ -1023,6 +1090,57 @@ class DemonstrationRecorder:
                     "tool_name": "fill_credential_field",
                 }
             )
+
+    async def _note(self, entry: dict[str, Any]) -> None:
+        text = entry.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return
+        text = text.strip()
+        seq: int | None
+        extended = await self._extend_last_note(text)
+        if extended is not None:
+            seq, label = extended
+        else:
+            label = note_label(text)
+            event = {"ts": datetime.now(UTC).timestamp() * 1000, "kind": "note", "value": text, "label": label}
+            seq = await self._append_event(event)
+        if seq is not None:
+            await self.stream.send({"type": "demonstration_action", "seq": seq, "label": label, "tool_name": "note"})
+
+    async def _extend_last_note(self, text: str) -> tuple[int, str] | None:
+        record_key = demonstration_record_key(self.organization_id, self.demonstration_id)
+        async with self.cache.get_lock(demonstration_lock_key(self.organization_id, self.demonstration_id)):
+            record = decode_demonstration_record(await self.cache.get(record_key))
+            # A record this recorder can no longer write falls through to _append_event, which refuses it.
+            if (
+                record is None
+                or record.event_count < 1
+                or record.owner != self.owner
+                or record.status not in {"recording", "stopping"}
+                or demonstration_limit_reached(record)
+            ):
+                return None
+            event_key = demonstration_event_key(self.organization_id, self.demonstration_id, record.event_count)
+            raw = await self.cache.get(event_key)
+            try:
+                last = json.loads(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(last, dict) or last.get("kind") != "note" or not isinstance(last.get("value"), str):
+                return None
+            if len(last["value"]) + 1 + len(text) > DEMONSTRATION_MAX_MERGED_NOTE_CHARS:
+                return None
+            last["value"] = f"{last['value']}\n{text}"
+            last["label"] = note_label(last["value"])
+            await self.cache.set(event_key, json.dumps(last, separators=(",", ":")), ex=DEMONSTRATION_TTL)
+            record.value_chars += len(text) + 1
+            if demonstration_limit_reached(record):
+                self.event_limit_reached = True
+                if record.status == "recording":
+                    record.status = "stopping"
+                    record.stop_reason = "event_limit"
+            await self.cache.set(record_key, encode_demonstration_record(record), ex=DEMONSTRATION_TTL)
+            return (record.event_count, last["label"])
 
     async def _upload_file(self, entry: dict[str, Any]) -> None:
         file_id = entry.get("file_id")
@@ -1197,6 +1315,10 @@ def safe_label(value: str | None) -> str:
     return " ".join(redact_raw_secrets_for_prompt(value).replace('"', "").split())[:200]
 
 
+def note_label(text: str) -> str:
+    return "Note: " + "\n".join(line for line in (safe_label(line) for line in text.splitlines()) if line)
+
+
 def _target_label(packet: Any, max_name: int = 200) -> str:
     role_name = packet.get("role_name") if isinstance(packet, dict) else None
     if not isinstance(role_name, dict):
@@ -1225,16 +1347,31 @@ def _event_label(event: dict[str, Any]) -> str:
     if kind == "key":
         return f"Press {event.get('key') or 'key'}"[:60]
     if kind == "navigate":
-        url = event.get("url")
-        parsed = None
-        try:
-            parsed = urlsplit(url) if isinstance(url, str) else None
-            host = parsed.hostname if parsed is not None else None
-            port = f":{parsed.port}" if parsed is not None and parsed.port is not None else ""
-        except ValueError:
-            host = None
-            port = ""
-        destination = f"{host}{port}{parsed.path}" if parsed is not None and host is not None else "page"
-        destination = redact_raw_secrets_for_prompt(destination)
-        return f"Go to {destination}"[:60]
+        return f"Go to {_url_label(event.get('url'))}"[:60]
+    if kind == "tab_switch":
+        verb = "Open new tab" if event.get("new_tab") else "Switch to tab"
+        return f"{verb} {_url_label(event.get('url'))}"[:60]
     return "Action"
+
+
+def _tab_event_url(event: TapEvent) -> str:
+    # The live page URL may already reflect what this event did, so prefer the URL the tap captured.
+    if event.is_main_frame:
+        key = "source_url" if event.payload.get("kind") == "navigate" else "url"
+        captured = event.payload.get(key)
+        if isinstance(captured, str) and captured:
+            return captured
+    return str(event.page.url or "")
+
+
+def _url_label(url: Any) -> str:
+    parsed = None
+    try:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+        host = parsed.hostname if parsed is not None else None
+        port = f":{parsed.port}" if parsed is not None and parsed.port is not None else ""
+    except ValueError:
+        host = None
+        port = ""
+    destination = f"{host}{port}{parsed.path}" if parsed is not None and host is not None else "page"
+    return redact_raw_secrets_for_prompt(destination)

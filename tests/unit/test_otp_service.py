@@ -231,6 +231,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         task = SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
             totp_verification_url="https://example.com/webhook",
@@ -269,6 +270,7 @@ class TestResolveOtpValuePlaceholderFallthrough:
 
         task = SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
             totp_verification_url="https://example.com/email-otp-webhook",
@@ -294,6 +296,7 @@ class TestResolveOtpValueExpectedOtpTypeGating:
     def _task() -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id=None,
             organization_id="o_test",
             totp_verification_url=None,
@@ -1078,6 +1081,38 @@ class TestParseOtpLogin:
 
         assert result is not None
         assert result.value == "123456"  # separators stripped — the digits the site expects
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("content", "llm_value", "expected"),
+        [
+            ("code is\t1234\t5678", "12345678", "12345678"),
+            ("code is 12-3456", "123456", "123456"),
+            ("Your code is 1234 567", "1234567", "1234567"),
+        ],
+    )
+    async def test_verbatim_numeric_code_keeps_permissive_grouping(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        content: str,
+        llm_value: str,
+        expected: str,
+    ) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value=llm_value)
+
+        result = await parse_otp_login(content=content, organization_id="o_test")
+
+        assert result is not None
+        assert result.value == expected
+
+    @pytest.mark.asyncio
+    async def test_hyphenated_code_is_not_welded_to_following_number(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_otp_llm(monkeypatch, otp_type="totp", otp_value="123456")
+
+        result = await parse_otp_login(content="Your code is 123-456 789", organization_id="o_test")
+
+        assert result is not None
+        assert result.value == "123456"
 
     @pytest.mark.asyncio
     async def test_recovers_url_stripping_trailing_sentence_punctuation(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2516,6 +2551,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     other_run = SimpleNamespace(
@@ -2526,6 +2562,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         workflow_run_id="wr_other",
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     scoped = SimpleNamespace(
@@ -2536,6 +2573,7 @@ async def test_get_otp_value_from_db_scopes_query_to_workflow_run_when_provided(
         workflow_run_id="wr_test",
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
 
@@ -2569,6 +2607,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     other_run = SimpleNamespace(
@@ -2579,6 +2618,7 @@ async def test_get_otp_value_from_db_allows_unscoped_code_for_run_scoped_poll() 
         workflow_run_id="wr_other",
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     get_otp_codes = AsyncMock(return_value=[other_run, unscoped])
@@ -2607,6 +2647,7 @@ async def test_get_otp_value_from_db_preserves_unscoped_lookup_without_workflow_
         workflow_run_id=None,
         workflow_id=None,
         task_id=None,
+        source=None,
         expired_at=None,
     )
     get_otp_codes = AsyncMock(return_value=[unscoped])
@@ -2639,6 +2680,7 @@ def _parsed_otp_row(
         workflow_run_id=workflow_run_id,
         workflow_id=None,
         task_id=task_id,
+        source=None,
         expired_at=None,
     )
 
@@ -3078,6 +3120,7 @@ def _raw_otp_row(
         workflow_run_id=None,
         workflow_id=None,
         task_id=task_id,
+        source=None,
         expired_at=None,
     )
 
@@ -3332,6 +3375,7 @@ class TestScopeSuppressionRegressionSentinel:
     def _task(self, totp_verification_url: str | None = None) -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_test",
+            url="https://example.com/login",
             workflow_run_id="wr_test",
             organization_id="o_test",
             totp_verification_url=totp_verification_url,
@@ -3413,6 +3457,7 @@ async def test_retry_resolution_forwards_cutoff_and_ignores_inline_rejected_hash
     cutoff = datetime(2026, 1, 1)
     task = SimpleNamespace(
         task_id="task-test",
+        url="https://example.test/login",
         organization_id="org-test",
         workflow_run_id=None,
         navigation_payload={"otp": rejected},

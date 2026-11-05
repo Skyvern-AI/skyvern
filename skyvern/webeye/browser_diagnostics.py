@@ -36,11 +36,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import structlog
 
+from skyvern.webeye.browser_health import in_container_cgroup, read_container_cpu_counters, read_container_pids
 from skyvern.webeye.browser_object_predicates import is_page_like
 from skyvern.webeye.main_world_eval import evaluate_in_main_world, get_main_world_prefix
 
@@ -87,6 +91,45 @@ PROBE_METHODS = (
 # Renderer CPU of one browser, read on a browser-level session. Kept out of PROBE_METHODS: extension-backed browsers
 # reject SystemInfo, which only costs the reading (renderer_os_cpu=process_info_error:*).
 PROCESS_INFO_METHOD = "SystemInfo.getProcessInfo"
+# getProcessInfo names the GPU process "GPU" and each utility process by the service it hosts, such as
+# "network.mojom.NetworkService", so every type not listed here is a utility.
+_CHROMIUM_PROCESS_TYPE_GROUPS = {"browser": "browser", "renderer": "renderer", "GPU": "gpu"}
+
+PROC_PATH = Path("/proc")
+# Lowercased process names of the Chromium builds the workers launch. Chromium never renames a process's main thread,
+# so every one of its processes reads as the binary's name.
+CHROMIUM_PROCESS_NAME_PREFIXES = ("chrome", "chromium", "headless_shell", "msedge")
+# Groups by the start of a lowercased /proc comm once the worker's own pid is matched; Playwright's recorder is
+# ffmpeg-linux.
+_PROCESS_GROUP_BY_COMM_PREFIX = (
+    *((prefix, "chromium") for prefix in CHROMIUM_PROCESS_NAME_PREFIXES),
+    ("node", "node_driver"),
+    ("xvfb", "xvfb"),
+    ("ffmpeg", "ffmpeg"),
+    ("x11vnc", "vnc"),
+    ("websockify", "vnc"),
+    ("python", "other_python"),
+)
+PROCESS_GROUPS = ("chromium", "node_driver", "xvfb", "ffmpeg", "vnc", "worker", "other_python", "other")
+# One thread, so a /proc read stuck in the kernel parks at most one thread; later reads queue behind it and time out.
+_PROCESS_CPU_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="process-cpu")
+# Candidates for cpu_top_consumer from the CDP reading; they replace the /proc "chromium" group when the browser runs
+# in this container.
+_CHROMIUM_SHARE_FIELDS = {
+    "chromium_browser": "chromium_browser_cpu_share",
+    "chromium_gpu": "chromium_gpu_cpu_share",
+    "chromium_utility": "chromium_utility_cpu_share",
+    "chromium_renderer": "renderer_os_cpu_share",
+}
+
+_T = TypeVar("_T")
+
+
+class DiagnosticsReading(NamedTuple):
+    fields: dict[str, Any]
+    # The processes present at both reads: the CDP reading's, or the /proc reading's Chromium ones.
+    pids: frozenset[int] = frozenset()
+
 
 _METRICS_OF_INTEREST = frozenset(
     {
@@ -289,51 +332,78 @@ async def collect_renderer_load(
     return fields
 
 
-def _process_info_renderer_cpu(result: Any) -> dict[int, float]:
+def _process_info_cpu(result: Any) -> dict[int, tuple[str, float]]:
     return {
-        process["id"]: process["cpuTime"]
+        process["id"]: (str(process.get("type")), process["cpuTime"])
         for process in result.get("processInfo", [])
-        if process.get("type") == "renderer" and isinstance(process.get("cpuTime"), (int, float))
+        if isinstance(process.get("cpuTime"), (int, float))
     }
 
 
-async def _renderer_cpu_across_window(
-    before: dict[int, float], read: Callable[[], Awaitable[dict[int, float]]], window_seconds: float
-) -> dict[str, Any]:
+def _cpu_by_group(
+    before: dict[int, tuple[str, float]], after: dict[int, tuple[str, float]]
+) -> dict[str, tuple[int, float]]:
+    """Process count and CPU seconds by group between two reads keyed by pid. Only processes present at both reads
+    count, so one that started or exited between them cannot skew the sum."""
+    by_group: dict[str, tuple[int, float]] = {}
+    for pid in before.keys() & after.keys():
+        group, cpu_seconds = after[pid]
+        count, total = by_group.get(group, (0, 0.0))
+        by_group[group] = (count + 1, total + cpu_seconds - before[pid][1])
+    return by_group
+
+
+async def _read_again_after(read: Callable[[], Awaitable[_T]], window_seconds: float) -> tuple[_T, float]:
+    """The second read of a sampling window, and the window measured from the end of the first read."""
     loop = asyncio.get_running_loop()
-    read_before_at = loop.time()
+    started = loop.time()
     await asyncio.sleep(window_seconds)
     after = await read()
-    measured_window = loop.time() - read_before_at
-    # Only processes present at both reads, so a renderer that started or exited mid-window cannot skew the sum.
-    pids = before.keys() & after.keys()
-    cpu_seconds = sum(after[pid] - before[pid] for pid in pids)
-    return {
-        "renderer_os_processes": len(pids),
-        "renderer_os_cpu_seconds": round(cpu_seconds, 3),
-        "renderer_os_cpu_share": round(cpu_seconds / measured_window, 3),
+    return after, loop.time() - started
+
+
+def _process_info_fields(by_type: dict[str, tuple[int, float]], window_seconds: float) -> dict[str, Any]:
+    renderer_processes, renderer_seconds = by_type.get("renderer", (0, 0.0))
+    fields: dict[str, Any] = {
+        "renderer_os_processes": renderer_processes,
+        "renderer_os_cpu_seconds": round(renderer_seconds, 3),
+        "renderer_os_cpu_share": round(renderer_seconds / window_seconds, 3),
     }
+    group_seconds = dict.fromkeys(("browser", "gpu", "utility"), 0.0)
+    utility_seconds: dict[str, float] = {}
+    for process_type, (_, seconds) in by_type.items():
+        group = _CHROMIUM_PROCESS_TYPE_GROUPS.get(process_type, "utility")
+        if group == "utility":
+            utility_seconds[process_type] = seconds
+        if group in group_seconds:
+            group_seconds[group] += seconds
+    for group, seconds in group_seconds.items():
+        fields[f"chromium_{group}_cpu_share"] = round(seconds / window_seconds, 3)
+    top_utility = max(utility_seconds, key=utility_seconds.__getitem__, default=None)
+    if top_utility is not None and round(utility_seconds[top_utility] / window_seconds, 3) > 0:
+        fields["chromium_utility_top_type"] = top_utility
+    return fields
 
 
-async def _collect_process_info_renderer_cpu(
-    browser: Browser, window_seconds: float, step_timeout: float
-) -> dict[str, Any]:
+async def _collect_process_info_cpu(browser: Browser, window_seconds: float, step_timeout: float) -> DiagnosticsReading:
     session: Any = None
 
-    async def read() -> dict[int, float]:
-        return _process_info_renderer_cpu(await _driver_call(session.send(PROCESS_INFO_METHOD), step_timeout))
+    async def read() -> dict[int, tuple[str, float]]:
+        return _process_info_cpu(await _driver_call(session.send(PROCESS_INFO_METHOD), step_timeout))
 
     try:
         session = await _driver_call(browser.new_browser_cdp_session(), step_timeout, on_late_result=_schedule_detach)
-        fields = await _renderer_cpu_across_window(await read(), read, window_seconds)
+        before = await read()
+        after, window = await _read_again_after(read, window_seconds)
     except TimeoutError:
-        return {"renderer_os_cpu": "process_info_timeout"}
+        return DiagnosticsReading({"renderer_os_cpu": "process_info_timeout"})
     except Exception as exc:
-        return {"renderer_os_cpu": f"process_info_error:{type(exc).__name__}"}
+        return DiagnosticsReading({"renderer_os_cpu": f"process_info_error:{type(exc).__name__}"})
     finally:
         if session is not None:
             _schedule_detach(session)
-    return {"renderer_os_cpu": "process_info", **fields}
+    fields = {"renderer_os_cpu": "process_info", **_process_info_fields(_cpu_by_group(before, after), window)}
+    return DiagnosticsReading(fields, frozenset(before.keys() & after.keys()))
 
 
 async def collect_renderer_os_cpu(
@@ -341,39 +411,144 @@ async def collect_renderer_os_cpu(
     *,
     window_seconds: float = RENDERER_LOAD_WINDOW_SECONDS,
     step_timeout: float = _RENDERER_LOAD_STEP_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    """CPU of this run's browser's renderer processes, cross-origin iframe ones included, across ``window_seconds``,
-    read from outside the renderers so a main thread too busy to answer CDP still gets a reading. A context with no
-    Browser object cannot open a browser-level session and reads ``unavailable``; persistent contexts carry one on
-    the pinned drivers. Never raises."""
+) -> DiagnosticsReading:
+    """CPU of this run's browser's renderer processes, cross-origin iframe ones included, and of its browser, GPU and
+    utility processes, across ``window_seconds``, read from outside the renderers so a main thread too busy to answer
+    CDP still gets a reading. A context with no Browser object cannot open a browser-level session and reads
+    ``unavailable``; persistent contexts carry one on the pinned drivers. Never raises."""
     browser_context = browser_state.browser_context
     if browser_context is None or browser_context.browser is None:
-        return {"renderer_os_cpu": "unavailable"}
-    return await _collect_process_info_renderer_cpu(browser_context.browser, window_seconds, step_timeout)
+        return DiagnosticsReading({"renderer_os_cpu": "unavailable"})
+    return await _collect_process_info_cpu(browser_context.browser, window_seconds, step_timeout)
 
 
-async def _collect_working_page_renderer_load(browser_state: BrowserState) -> dict[str, Any]:
+class _ContainerCpuSnapshot(NamedTuple):
+    # By pid: the process's group and its own CPU seconds.
+    own: dict[int, tuple[str, float]]
+    cgroup_usage_usec: int | None
+
+
+def _process_group(pid: int, comm: str) -> str:
+    if pid == os.getpid():
+        return "worker"
+    name = comm.lower()
+    return next((group for prefix, group in _PROCESS_GROUP_BY_COMM_PREFIX if name.startswith(prefix)), "other")
+
+
+def _read_container_process_cpu() -> _ContainerCpuSnapshot | None:
+    """Cumulative CPU of each process in this container's cgroup, from ``/proc/<pid>/stat``, and the cgroup's usage.
+    None outside a private cgroup v2 namespace, as for the container_* stall fields."""
+    if not in_container_cgroup(PROC_PATH / "self" / "cgroup"):
+        return None
+    pids = read_container_pids()
+    if pids is None:
+        # Each /proc/<pid>/cgroup read takes the kernel's global cgroup_mutex, so this is only the fallback.
+        pids = frozenset(
+            int(entry.name)
+            for entry in PROC_PATH.iterdir()
+            if entry.name.isdigit() and in_container_cgroup(entry / "cgroup")
+        )
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    own: dict[int, tuple[str, float]] = {}
+    for pid in pids:
+        try:
+            stat = (PROC_PATH / str(pid) / "stat").read_text()
+            # comm can hold spaces and parentheses, so the fixed fields start after its last ")". utime and stime are
+            # fields 14 and 15 of proc_pid_stat(5).
+            utime, stime = (int(value) for value in stat[stat.rindex(")") + 2 :].split()[11:13])
+        except (OSError, ValueError):
+            continue
+        comm = stat[stat.index("(") + 1 : stat.rindex(")")]
+        own[pid] = (_process_group(pid, comm), (utime + stime) / ticks_per_second)
+    return _ContainerCpuSnapshot(own, read_container_cpu_counters().get("usage_usec"))
+
+
+async def collect_container_process_cpu(
+    *,
+    window_seconds: float = RENDERER_LOAD_WINDOW_SECONDS,
+    step_timeout: float = _RENDERER_LOAD_STEP_TIMEOUT_SECONDS,
+) -> DiagnosticsReading:
+    """CPU across ``window_seconds`` of each process group in this container's cgroup and of the cgroup itself, read
+    from /proc on one dedicated thread. Never raises; ``process_cpu=unavailable`` outside a private cgroup v2
+    namespace."""
+    loop = asyncio.get_running_loop()
+
+    async def read() -> _ContainerCpuSnapshot | None:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_PROCESS_CPU_EXECUTOR, _read_container_process_cpu), step_timeout
+        )
+
+    try:
+        before = await read()
+        if before is None:
+            return DiagnosticsReading({"process_cpu": "unavailable"})
+        after, window = await _read_again_after(read, window_seconds)
+    except TimeoutError:
+        return DiagnosticsReading({"process_cpu": "timeout"})
+    except Exception as exc:
+        return DiagnosticsReading({"process_cpu": f"error:{type(exc).__name__}"})
+    if after is None:
+        return DiagnosticsReading({"process_cpu": "unavailable"})
+    by_group = _cpu_by_group(before.own, after.own)
+    fields: dict[str, Any] = {
+        "process_cpu": "ok",
+        "process_cpu_window_seconds": round(window, 3),
+        "process_cpu_processes": sum(count for count, _ in by_group.values()),
+    }
+    for group in PROCESS_GROUPS:
+        fields[f"process_{group}_cpu_share"] = round(by_group.get(group, (0, 0.0))[1] / window, 3)
+    if before.cgroup_usage_usec is not None and after.cgroup_usage_usec is not None:
+        cgroup_seconds = (after.cgroup_usage_usec - before.cgroup_usage_usec) / 1_000_000
+        attributed_seconds = sum(seconds for _, seconds in by_group.values())
+        fields["process_cpu_cgroup_share"] = round(cgroup_seconds / window, 3)
+        # The cgroup counts the in-window CPU of processes that started or exited inside the window; the per-process
+        # shares cannot, since each needs both reads.
+        fields["process_unattributed_cpu_share"] = round((cgroup_seconds - attributed_seconds) / window, 3)
+    chromium_pids = frozenset(pid for pid in before.own.keys() & after.own.keys() if after.own[pid][0] == "chromium")
+    return DiagnosticsReading(fields, chromium_pids)
+
+
+def _top_cpu_consumer(fields: dict[str, Any], *, browser_in_pod: bool) -> str | None:
+    """The consumer with the largest share in the /proc sample. When this run's browser is in the pod, Chromium's own
+    breakdown names its processes, and ``chromium_other`` is the Chromium share it does not explain."""
+    if fields.get("process_cpu") != "ok":
+        return None
+    shares: dict[str, float] = {group: fields[f"process_{group}_cpu_share"] for group in PROCESS_GROUPS}
+    if "process_unattributed_cpu_share" in fields:
+        shares["unattributed"] = fields["process_unattributed_cpu_share"]
+    if browser_in_pod:
+        chromium = {consumer: fields[name] for consumer, name in _CHROMIUM_SHARE_FIELDS.items()}
+        shares["chromium_other"] = shares.pop("chromium") - sum(chromium.values())
+        shares |= chromium
+    top = max(shares, key=shares.__getitem__)
+    return top if shares[top] > 0 else None
+
+
+async def _collect_working_page_renderer_load(browser_state: BrowserState) -> DiagnosticsReading:
     try:
         page = await asyncio.wait_for(
             browser_state.get_working_page(prune_excess_pages=False), _RENDERER_LOAD_STEP_TIMEOUT_SECONDS
         )
     except TimeoutError:
-        return {"renderer_metrics": "page_timeout"}
+        return DiagnosticsReading({"renderer_metrics": "page_timeout"})
     except Exception as exc:
-        return {"renderer_metrics": f"page_error:{type(exc).__name__}"}
+        return DiagnosticsReading({"renderer_metrics": f"page_error:{type(exc).__name__}"})
     if page is None:
-        return {"renderer_metrics": "no_page"}
-    return await collect_renderer_load(page)
+        return DiagnosticsReading({"renderer_metrics": "no_page"})
+    return DiagnosticsReading(await collect_renderer_load(page))
 
 
 async def collect_degraded_browser_diagnostics(browser_state: BrowserState) -> dict[str, Any]:
-    """Renderer load read over CDP and from the OS side by side within a hard budget; a reading still running at the
-    deadline is ``timeout``. Always sets ``renderer_metrics``. Raises only a cancel."""
+    """Renderer load read over CDP, the browser's processes by type, and the container's processes from /proc, side by
+    side within a hard budget; a reading still running at the deadline is ``timeout``. Always sets
+    ``renderer_metrics``. Raises only a cancel."""
     fields: dict[str, Any] = {}
-    collectors: dict[str, asyncio.Task[dict[str, Any]]] = {}
+    pids: dict[str, frozenset[int]] = {}
+    collectors: dict[str, asyncio.Task[DiagnosticsReading]] = {}
     try:
         collectors["renderer_metrics"] = asyncio.ensure_future(_collect_working_page_renderer_load(browser_state))
         collectors["renderer_os_cpu"] = asyncio.ensure_future(collect_renderer_os_cpu(browser_state))
+        collectors["process_cpu"] = asyncio.ensure_future(collect_container_process_cpu())
         done, _ = await asyncio.wait(collectors.values(), timeout=DEGRADED_BROWSER_DIAGNOSTICS_TIMEOUT_SECONDS)
         for status_field, task in collectors.items():
             if task not in done:
@@ -383,7 +558,17 @@ async def collect_degraded_browser_diagnostics(browser_state: BrowserState) -> d
             elif (error := task.exception()) is not None:
                 fields[status_field] = f"error:{type(error).__name__}"
             else:
-                fields.update(task.result())
+                reading = task.result()
+                fields.update(reading.fields)
+                pids[status_field] = reading.pids
+        # Pids are namespace-local, so a browser on another host can share its pid with an unrelated local Chromium
+        # process; it is in this pod only if every process it reports at both reads is a Chromium process here.
+        cdp_pids = pids.get("renderer_os_cpu", frozenset())
+        if cdp_pids and fields.get("process_cpu") == "ok":
+            fields["chromium_browser_in_pod"] = cdp_pids <= pids["process_cpu"]
+        top_consumer = _top_cpu_consumer(fields, browser_in_pod=fields.get("chromium_browser_in_pod") is True)
+        if top_consumer is not None:
+            fields["cpu_top_consumer"] = top_consumer
     except Exception as exc:
         fields.setdefault("renderer_metrics", f"error:{type(exc).__name__}")
     finally:

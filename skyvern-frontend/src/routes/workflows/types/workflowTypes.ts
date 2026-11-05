@@ -230,6 +230,7 @@ export type WorkflowBlock =
   | EmailInboxBlock
   | GoogleSheetsReadBlock
   | GoogleSheetsWriteBlock
+  | PowerBIQueryBlock
   | PdfFillBlock
   | SplitPdfBlock;
 
@@ -266,6 +267,7 @@ export const WorkflowBlockTypes = {
   EmailInbox: "email_inbox",
   GoogleSheetsRead: "google_sheets_read",
   GoogleSheetsWrite: "google_sheets_write",
+  PowerBIQuery: "powerbi_query",
   PDFFill: "pdf_fill",
   SplitPDF: "split_pdf",
 } as const;
@@ -748,6 +750,8 @@ export type EmailInboxBlock = WorkflowBlockBase & {
   block_type: "email_inbox";
   email_client: "gmail" | "outlook";
   credential_id: string | null;
+  credential_source?: "native" | "nango";
+  connection_id?: string | null;
   folder: string;
   prompt: string;
   sender: string | null;
@@ -779,6 +783,16 @@ export type GoogleSheetsWriteBlock = WorkflowBlockBase & {
   values: string;
   column_mapping: Record<string, string> | null;
   create_sheet_if_missing?: boolean;
+  parameters: Array<WorkflowParameter>;
+};
+
+export type PowerBIQueryBlock = WorkflowBlockBase & {
+  block_type: "powerbi_query";
+  credential_source?: "native" | "nango";
+  connection_id: string;
+  dataset_id: string;
+  query: string;
+  max_rows: number;
   parameters: Array<WorkflowParameter>;
 };
 

@@ -19,7 +19,6 @@ AGENT_STEP_TOOL_NAMES = frozenset(
         "page_fill",
         "page_goto",
         "pdf_fill",
-        "pdf_parser",
         "print_page",
         "read_run_data",
         "send_email",
@@ -30,3 +29,10 @@ AGENT_STEP_TOOL_NAMES = frozenset(
         "web_search",
     }
 )
+# Offered whatever the step's list says: neither changes anything outside the step.
+ALWAYS_OFFERED_TOOLS = frozenset({"finish", "read_run_data"})
+LEGACY_AGENT_STEP_TOOL_NAMES = {"pdf_parser": "file_url_parser"}
+
+
+def current_tool_names(names: list[str]) -> list[str]:
+    return list(dict.fromkeys(LEGACY_AGENT_STEP_TOOL_NAMES.get(name, name) for name in names))

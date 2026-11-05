@@ -24,7 +24,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.workflow_yaml import dump_workflow_yaml
 from skyvern.forge.sdk.schemas.credentials import CredentialType, TotpType
-from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES
+from skyvern.forge.sdk.workflow.models.block import resolve_conditional_merge_edges
 from skyvern.schemas.runs import RunEngine
 from skyvern.utils.strings import join_phrases
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -112,7 +112,7 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     "task": _P(
         _AI_LEAF,
         _WITHOUT_AGENT_BLOCKS,
-        "agent-block authoring",
+        "Browser Task block authoring",
         (
             "The task agent is unavailable while only code may be authored; decompose the goal into focused "
             "code blocks instead."
@@ -173,7 +173,7 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     "agent_step": _P(
         _BANNED,
         _WITHOUT_AGENT_STEP,
-        "an organization with the agent_step block enabled, in a turn that may author agent blocks",
+        "an organization with the agent_step block enabled, in a turn that may author Browser Task blocks",
         (
             "It is not enabled for this organization or this turn; build the step from `web_search`, `navigation` "
             "or `extraction` blocks followed by a `conditional` on their output."
@@ -204,13 +204,16 @@ _COPILOT_BANNED_BLOCK_TYPES: frozenset[str] = _banned_block_types_for_capability
 _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES: frozenset[str] = _banned_block_types_for_capability(CODE_BLOCKS_ONLY)
 # The agent block family: every one of these must be pinned to the Task V3 engine.
 AGENT_FAMILY_BLOCK_SUMMARIES: dict[str, str] = {
-    "task": "one agent step that both acts and extracts; prefer navigation or extraction when the step does only one",
-    "navigation": "one agent step that acts on a page: fills forms, clicks, works through a multi-step flow",
-    "extraction": "one agent step that reads values off a page and returns them",
-    "action": "one agent step that performs a single interaction on a page",
-    "validation": "one agent step that checks a page shows the expected end state",
-    "login": "one agent step that signs in with a bound credential; a `code` block signs in with the same credential",
-    "file_download": "one agent step that downloads a file from a page",
+    "task": "a browser agent run by Task V3 that both acts and extracts; prefer navigation or extraction when the "
+    "block does only one",
+    "navigation": "a browser agent run by Task V3 that acts on a page: fills forms, clicks, works through a multi-step "
+    "flow",
+    "extraction": "a browser agent run by Task V3 that reads values off a page and returns them",
+    "action": "a browser agent run by Task V3 that performs a single interaction on a page",
+    "validation": "a browser agent run by Task V3 that checks a page shows the expected end state",
+    "login": "a browser agent run by Task V3 that signs in with a bound credential; a `code` block signs in with the "
+    "same credential",
+    "file_download": "a browser agent run by Task V3 that downloads a file from a page",
 }
 # Carries its own "when" clause so it still separates from `navigation` in a listing that
 # AUTHORING_FAMILY_GUIDANCE is absent from — ADR-0041 gives that constant a deletion trigger.
@@ -218,20 +221,16 @@ CODE_BLOCK_SUMMARY = (
     "Python that drives the browser directly with Playwright when the steps are the same every run, "
     "and transforms data it already holds"
 )
-AGENT_STEP_BLOCK_SUMMARY = (
-    "one model-driven step that decides and acts with this run's blocks, with or without the browser, "
-    "then returns fields matching its data_schema"
-)
 _AGENT_FAMILY_BLOCK_TYPES: frozenset[str] = frozenset(AGENT_FAMILY_BLOCK_SUMMARIES)
 _AGENT_FAMILY_BLOCK_LIST = join_phrases([f"`{block_type}`" for block_type in AGENT_FAMILY_BLOCK_SUMMARIES], "and")
 
 # Reaches the model on the three authoring tool descriptions, the block-type list and the
 # choosing_a_block knowledge topic, and only when both families may be authored.
 AUTHORING_FAMILY_GUIDANCE = (
-    f"Write a `code` block for browser work: that is the default. Write an agent block (engine `{_TASK_V3_ENGINE}`) "
-    "only when the user asks for one, when the site or page is only known at run time, or when the page has "
-    "been shown to change so much between visits that fixed code is not practical. An unclear item in the "
-    "request is settled by scouting the site or by asking, not by an agent block. "
+    "Write a `code` block for browser work: that is the default. Write a Browser Task block "
+    f"(engine `{_TASK_V3_ENGINE}`) only when the user asks for one, when the site or page is only known at run time, "
+    "or when the page has been shown to change so much between visits that fixed code is not practical. An unclear "
+    "item in the request is settled by scouting the site or by asking, not by a Browser Task block. "
     "Both families belong in one workflow."
 )
 
@@ -403,13 +402,13 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
     """The `code` schema response. Two entries answer "what else may this turn author", so they read
     as a closed list and have to change when the agent family is authorable too."""
     availability = (
-        "Agent blocks and non-browser helper blocks are available alongside `code` in the same workflow."
+        "Browser Task blocks and non-browser helper blocks are available alongside `code` in the same workflow."
         if agent_blocks
         else "Non-browser helper blocks stay available: `conditional`, `for_loop`, `while_loop`, `send_email`, `human_interaction`, S3/Google Sheets helpers, file parsers, and triggers."
     )
     return [
         "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
-        "`code` is async Python with a Playwright `page` object and workflow parameters by key. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Pass the complete workflow to update tools as a `workflow` object; multiline `code` is a plain JSON string.",
+        "`code` is async Python with a Playwright `page` object and, as Python values named by key, each entry of its `parameter_keys`: workflow parameter keys and earlier block outputs as `<label>_output`. A dict key named like a dict method (`values`, `items`, `keys`, `get`) reads with brackets, `x['values']`, in code and in `{{ }}`, because `x.values` is the method. Helper namespaces are pre-injected: no `import` statements, no dunder (`__name__`) names or attributes. Normalize parameter values before page inputs. Pass the complete workflow to update tools as a `workflow` object; multiline `code` is a plain JSON string.",
         WRAPPER_SCOPE_RUNTIME_FACT,
         f"A persisted code block must not use {' or '.join(f'page.{member}' for member in DENIED_PAGE_MEMBERS)}.",
         "For an extraction-intent `code` block, derive a typed `extraction_schema` from the goal and the scouted page, carry it as `code_artifact_metadata.extraction_schema`, and conform the block's `return` to it.",
@@ -696,7 +695,6 @@ def _validator_relevant_fingerprint(block: Mapping[str, object]) -> tuple[object
         condition.get("criteria_type", "jinja2_template") if isinstance(condition, Mapping) else None,
         branch_criteria_types,
         _has_goal_prompt(block),
-        block.get("tools"),
     )
 
 
@@ -876,20 +874,6 @@ def _code_block_goal_findings(changed: list[tuple[str, Mapping[str, object]]]) -
     ]
 
 
-def _agent_step_tools_findings(changed: list[tuple[str, Mapping[str, object]]]) -> list[dict[str, str]]:
-    """A step with no list runs with every tool and succeeds, so a test run never shows the list is missing."""
-    missing = [label for label, block in changed if _is_block_type(block, "agent_step") and not block.get("tools")]
-    if not missing:
-        return []
-    return [
-        {
-            "reason_code": "agent_step_tools_missing",
-            "summary": f"Agent steps {', '.join(sorted(missing))} name no `tools`, so each is offered every tool. "
-            f"A step's `tools` takes names from: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.",
-        }
-    ]
-
-
 @dataclass(frozen=True)
 class AuthoringValidation:
     reject: AuthorTimeBlock | None = None
@@ -1022,7 +1006,7 @@ def reject_authoring_violations(
         _record_authored_families(ctx, changed + rewritten, prior_blocks)
         return AuthoringValidation(
             legacy_engine_blocks=legacy_engine_blocks,
-            findings=(*_code_block_goal_findings(changed), *_agent_step_tools_findings(changed)),
+            findings=tuple(_code_block_goal_findings(changed)),
             workflow_yaml=workflow_yaml,
         )
     for violation in violations:
@@ -1092,21 +1076,68 @@ def _record_authored_families(
         entries.append({"block_type": block_type, "family": family, "after_failed_test": after_failed_test})
 
 
+def _agent_step_neighbours(blocks: list[Any]) -> dict[str, dict[str, list[str]]]:
+    """Each agent_step's label with the types of the blocks that run just before and after it, following the
+    run's edges (next_block_label, the sequential default, conditional branches and merge points) within the
+    list that holds it."""
+    listed = [block for block in blocks if isinstance(block, Mapping) and isinstance(block.get("label"), str)]
+    by_label: dict[str, Any] = {block["label"]: block for block in listed}
+    types: dict[str, str] = {}
+    for label, block in by_label.items():
+        raw_type = block.get("block_type")
+        types[label] = normalize_copilot_block_type_alias(raw_type.strip().lower()) if isinstance(raw_type, str) else ""
+    default_next: dict[str, str | None] = {
+        label: target if isinstance(target := block.get("next_block_label"), str) else None
+        for label, block in by_label.items()
+    }
+    if "conditional" not in types.values():
+        for current, following in zip(listed, listed[1:]):
+            default_next[current["label"]] = default_next[current["label"]] or following["label"]
+    resolve_conditional_merge_edges(listed, by_label, default_next)
+
+    successors: dict[str, set[str]] = {}
+    for label, block in by_label.items():
+        targets = (
+            [
+                branch.get("next_block_label") or default_next[label]
+                for branch in block.get("branch_conditions") or []
+                if isinstance(branch, Mapping)
+            ]
+            if types[label] == "conditional"
+            else [default_next[label]]
+        )
+        successors[label] = {target for target in targets if target in by_label}
+
+    neighbours: dict[str, dict[str, list[str]]] = {}
+    for label in by_label:
+        if types[label] == "agent_step":
+            neighbours[label] = {
+                "before": sorted({types[source] for source, targets in successors.items() if label in targets}),
+                "after": sorted({types[target] for target in successors[label]}),
+            }
+    for block in listed:
+        loop_blocks = block.get("loop_blocks")
+        if isinstance(loop_blocks, list):
+            neighbours.update(_agent_step_neighbours(loop_blocks))
+    return neighbours
+
+
 def authoring_turn_summary(
     turn_start_yaml: str | None,
     final_yaml: str | None,
     authored_block_families: Mapping[str, list[dict[str, object]]] | None = None,
-) -> dict[str, list[str] | dict[str, str] | dict[str, int]]:
+) -> dict[str, list[str] | dict[str, str] | dict[str, int] | dict[str, dict[str, list[str]]]]:
     """What the turn authored, by block family. Log-only."""
     prior = {
         label: block
         for label, block in _walk_labelled_blocks(_parse_workflow_blocks(turn_start_yaml) or [])
         if label is not None
     }
+    final_blocks = _parse_workflow_blocks(final_yaml) or []
     introduced_code: list[str] = []
     introduced_agent: dict[str, str] = {}
     type_changes: dict[str, str] = {}
-    for label, block in _walk_labelled_blocks(_parse_workflow_blocks(final_yaml) or []):
+    for label, block in _walk_labelled_blocks(final_blocks):
         raw_type = block.get("block_type")
         if label is None or not isinstance(raw_type, str):
             continue
@@ -1148,4 +1179,5 @@ def authoring_turn_summary(
         "mid_turn_family_switches": mid_turn_switches,
         "switches_after_failed_test": sorted(switches_after_failed_test),
         "same_family_rewrites_after_failed_test": same_family_rewrites_after_failed_test,
+        "agent_step_blocks": _agent_step_neighbours(final_blocks),
     }

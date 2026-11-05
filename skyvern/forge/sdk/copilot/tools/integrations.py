@@ -17,8 +17,14 @@ from skyvern.forge.sdk.copilot.google_connection_notice import (
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
-from skyvern.forge.sdk.integrations.catalog import copilot_payload, integrations_for_org, serialize_oauth_account
+from skyvern.forge.sdk.integrations.catalog import (
+    copilot_payload,
+    integration_is_live,
+    integrations_for_org,
+    serialize_oauth_account,
+)
 from skyvern.forge.sdk.services import google_oauth_service, google_sheets_service
+from skyvern.forge.sdk.services.request_principal import get_request_principal, human_user_id
 from skyvern.schemas.google_sheets import (
     GoogleSheetsAPIError,
     build_a1,
@@ -46,7 +52,12 @@ SheetConnectionStatus = Literal["opened", "no_access", "token_unavailable", "err
 
 
 async def _list_integrations(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
-    integrations = [copilot_payload(entry) for entry in await integrations_for_org(ctx.organization_id)]
+    user_id = human_user_id(get_request_principal(), ctx.organization_id)
+    integrations = [
+        copilot_payload(entry)
+        for entry in await integrations_for_org(ctx.organization_id, user_id=user_id)
+        if entry.id != "powerbi" or integration_is_live("powerbi")
+    ]
     return {"ok": True, "data": {"integrations": integrations, "count": len(integrations)}}
 
 

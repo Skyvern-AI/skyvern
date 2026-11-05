@@ -259,7 +259,6 @@
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
-                      "yutori_navigator": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
                   },
@@ -542,6 +541,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -553,6 +553,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "default": 10,
               "title": "Page Size"
@@ -954,6 +955,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number",
               "default": 1,
@@ -2977,6 +2979,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -2988,6 +2991,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "default": 10,
               "title": "Page Size"
@@ -4026,6 +4030,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination",
               "examples": [
@@ -4045,6 +4050,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of items per page",
               "examples": [
@@ -4832,6 +4838,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination",
               "examples": [
@@ -4848,6 +4855,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of items per page",
               "examples": [
@@ -5130,6 +5138,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -6031,6 +6040,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination.",
               "default": 1,
@@ -6044,6 +6054,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of runs to return per page.",
               "default": 10,
@@ -6224,6 +6235,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination.",
               "default": 1,
@@ -6237,6 +6249,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of runs to return per page.",
               "default": 10,
@@ -6452,7 +6465,9 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "integer"
+                  "type": "integer",
+                  "maximum": 2147483647,
+                  "minimum": 1
                 },
                 {
                   "type": "null"
@@ -7526,6 +7541,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number.",
               "default": 1,
@@ -9606,15 +9622,14 @@
                 "items": {
                   "type": "string"
                 },
-                "type": "array",
-                "minItems": 1
+                "type": "array"
               },
               {
                 "type": "null"
               }
             ],
             "title": "Tools",
-            "description": "The tools the step may call, at least one. A block it runs through run_block is named by its block type, such as http_request. finish is always offered, and login only when the run has a credential parameter. Without a list the step is offered every tool."
+            "description": "The tools the step may call. A block it runs through run_block is named by its block type, such as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a credential parameter. Without a list the step has no other tools."
           }
         },
         "type": "object",
@@ -10907,6 +10922,7 @@
           "workflow_trigger",
           "google_sheets_read",
           "google_sheets_write",
+          "powerbi_query",
           "pdf_fill",
           "split_pdf",
           "email_inbox",
@@ -11319,7 +11335,7 @@
           "degraded_fresh"
         ],
         "title": "BrowserSeedSource",
-        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved once at run setup, before any browser creation, for all run types (C-semantics).\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
+        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved at run setup, before any browser creation, for all run types (C-semantics). A\nserialized Save & Reuse run re-resolves once more after the sequential wait, so a profile an\nearlier run in its lane saved while it was queued becomes own_memory rather than a stale pick.\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -11418,6 +11434,12 @@
               "http://localhost:9222",
               "https://3.12.10.11/browser/123456"
             ]
+          },
+          "browser_address_redacted": {
+            "type": "boolean",
+            "title": "Browser Address Redacted",
+            "description": "Whether the browser address was withheld because this caller cannot connect",
+            "default": false
           },
           "app_url": {
             "anyOf": [
@@ -13609,7 +13631,8 @@
           "azure_vault",
           "gcp",
           "custom",
-          "onepassword"
+          "onepassword",
+          "bitwarden_connected"
         ],
         "title": "CredentialVaultType"
       },
@@ -14689,6 +14712,26 @@
             ],
             "title": "Email Client"
           },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "credential_id": {
             "anyOf": [
               {
@@ -14897,6 +14940,27 @@
             ],
             "title": "Email Client"
           },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id",
+            "x-skyvern-connected-account": true
+          },
           "credential_id": {
             "anyOf": [
               {
@@ -14906,7 +14970,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "folder": {
             "anyOf": [
@@ -16408,7 +16473,8 @@
                 "type": "null"
               }
             ],
-            "title": "Google Credential Id"
+            "title": "Google Credential Id",
+            "x-skyvern-connected-account": true
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -17542,7 +17608,8 @@
                 "type": "null"
               }
             ],
-            "title": "Google Credential Id"
+            "title": "Google Credential Id",
+            "x-skyvern-connected-account": true
           },
           "google_drive_folder_id": {
             "anyOf": [
@@ -17943,6 +18010,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/PowerBIQueryBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -17982,6 +18052,7 @@
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
@@ -18258,6 +18329,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
                 }
               ],
               "discriminator": {
@@ -18284,6 +18358,7 @@
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlockYAML",
                   "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
                   "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
@@ -18670,7 +18745,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "has_header_row": {
             "type": "boolean",
@@ -18983,7 +19059,8 @@
                 "type": "null"
               }
             ],
-            "title": "Credential Id"
+            "title": "Credential Id",
+            "x-skyvern-connected-account": true
           },
           "write_mode": {
             "type": "string",
@@ -22984,6 +23061,268 @@
         ],
         "title": "PersistentBrowserType"
       },
+      "PowerBIQueryBlock": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier for a block; unique within a workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the next block label when constructing a DAG. Defaults to sequential order when omitted."
+          },
+          "block_type": {
+            "type": "string",
+            "const": "powerbi_query",
+            "title": "Block Type",
+            "default": "powerbi_query"
+          },
+          "output_parameter": {
+            "$ref": "#/components/schemas/OutputParameter"
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "disable_cache": {
+            "type": "boolean",
+            "title": "Disable Cache",
+            "default": false
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "connection_id": {
+            "type": "string",
+            "title": "Connection Id"
+          },
+          "credential_source": {
+            "type": "string",
+            "const": "nango",
+            "title": "Credential Source",
+            "default": "nango"
+          },
+          "dataset_id": {
+            "type": "string",
+            "title": "Dataset Id"
+          },
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "max_rows": {
+            "type": "integer",
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Max Rows",
+            "default": 1000
+          },
+          "parameters": {
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/WorkflowParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/ContextParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AWSSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureSecretParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenLoginCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenSensitiveInformationParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/BitwardenCreditCardDataParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OnePasswordCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/AzureVaultCredentialParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputParameter"
+                },
+                {
+                  "$ref": "#/components/schemas/CredentialParameter"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "parameter_type",
+                "mapping": {
+                  "aws_secret": "#/components/schemas/AWSSecretParameter",
+                  "azure_secret": "#/components/schemas/AzureSecretParameter",
+                  "azure_vault_credential": "#/components/schemas/AzureVaultCredentialParameter",
+                  "bitwarden_credit_card_data": "#/components/schemas/BitwardenCreditCardDataParameter",
+                  "bitwarden_login_credential": "#/components/schemas/BitwardenLoginCredentialParameter",
+                  "bitwarden_sensitive_information": "#/components/schemas/BitwardenSensitiveInformationParameter",
+                  "context": "#/components/schemas/ContextParameter",
+                  "credential": "#/components/schemas/CredentialParameter",
+                  "onepassword": "#/components/schemas/OnePasswordCredentialParameter",
+                  "output": "#/components/schemas/OutputParameter",
+                  "workflow": "#/components/schemas/WorkflowParameter"
+                }
+              }
+            },
+            "type": "array",
+            "title": "Parameters",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "output_parameter",
+          "connection_id",
+          "dataset_id",
+          "query"
+        ],
+        "title": "PowerBIQueryBlock"
+      },
+      "PowerBIQueryBlockYAML": {
+        "properties": {
+          "block_type": {
+            "type": "string",
+            "const": "powerbi_query",
+            "title": "Block Type",
+            "default": "powerbi_query"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label",
+            "description": "Author-facing identifier; must be unique per workflow."
+          },
+          "next_block_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Block Label",
+            "description": "Optional pointer to the label of the next block. When omitted, it will default to sequential order. See [[s-4bnl]]."
+          },
+          "continue_on_failure": {
+            "type": "boolean",
+            "title": "Continue On Failure",
+            "default": false
+          },
+          "model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "ignore_workflow_system_prompt": {
+            "type": "boolean",
+            "title": "Ignore Workflow System Prompt",
+            "default": false
+          },
+          "next_loop_on_failure": {
+            "type": "boolean",
+            "title": "Next Loop On Failure",
+            "default": false
+          },
+          "connection_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Connection Id",
+            "description": "Power BI connection ID for this user.",
+            "x-skyvern-connected-account": true
+          },
+          "credential_source": {
+            "type": "string",
+            "const": "nango",
+            "title": "Credential Source",
+            "default": "nango"
+          },
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Dataset Id"
+          },
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Query",
+            "description": "A single read-only DAX query."
+          },
+          "max_rows": {
+            "type": "integer",
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Max Rows",
+            "default": 1000
+          },
+          "parameter_keys": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Keys"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "connection_id",
+          "dataset_id",
+          "query"
+        ],
+        "title": "PowerBIQueryBlockYAML",
+        "description": "Documented ahead of release; saves are unavailable until the Power BI catalog status is live."
+      },
       "PrintPageBlock": {
         "properties": {
           "label": {
@@ -23508,8 +23847,7 @@
           "skyvern-3.0",
           "openai-cua",
           "anthropic-cua",
-          "ui-tars",
-          "yutori-navigator"
+          "ui-tars"
         ],
         "title": "RunEngine"
       },
@@ -23773,8 +24111,7 @@
           "workflow_run",
           "openai_cua",
           "anthropic_cua",
-          "ui_tars",
-          "yutori_navigator"
+          "ui_tars"
         ],
         "title": "RunType"
       },
@@ -24590,7 +24927,8 @@
               }
             ],
             "title": "Credential Id",
-            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'."
+            "description": "ID of a connected Google account that has send permission. Used only with transport 'gmail'.",
+            "x-skyvern-connected-account": true
           },
           "cc": {
             "items": {
@@ -27322,8 +27660,7 @@
               "task_v3",
               "openai_cua",
               "anthropic_cua",
-              "ui_tars",
-              "yutori_navigator"
+              "ui_tars"
             ],
             "title": "Run Type",
             "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
@@ -30529,6 +30866,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/PowerBIQueryBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -30568,6 +30908,7 @@
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
@@ -30772,6 +31113,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
                 }
               ],
               "discriminator": {
@@ -30798,6 +31142,7 @@
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlockYAML",
                   "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
                   "split_pdf": "#/components/schemas/SplitPdfBlockYAML",
@@ -31723,6 +32068,9 @@
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlock"
                 },
                 {
+                  "$ref": "#/components/schemas/PowerBIQueryBlock"
+                },
+                {
                   "$ref": "#/components/schemas/PdfFillBlock"
                 },
                 {
@@ -31762,6 +32110,7 @@
                   "navigation": "#/components/schemas/NavigationBlock",
                   "pdf_fill": "#/components/schemas/PdfFillBlock",
                   "pdf_parser": "#/components/schemas/PDFParserBlock",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlock",
                   "print_page": "#/components/schemas/PrintPageBlock",
                   "send_email": "#/components/schemas/SendEmailBlock",
                   "split_pdf": "#/components/schemas/SplitPdfBlock",
@@ -32030,6 +32379,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GoogleSheetsWriteBlockYAML"
+                },
+                {
+                  "$ref": "#/components/schemas/PowerBIQueryBlockYAML"
                 }
               ],
               "discriminator": {
@@ -32056,6 +32408,7 @@
                   "navigation": "#/components/schemas/NavigationBlockYAML",
                   "pdf_fill": "#/components/schemas/PdfFillBlockYAML",
                   "pdf_parser": "#/components/schemas/PDFParserBlockYAML",
+                  "powerbi_query": "#/components/schemas/PowerBIQueryBlockYAML",
                   "print_page": "#/components/schemas/PrintPageBlockYAML",
                   "send_email": "#/components/schemas/SendEmailBlockYAML",
                   "split_pdf": "#/components/schemas/SplitPdfBlockYAML",

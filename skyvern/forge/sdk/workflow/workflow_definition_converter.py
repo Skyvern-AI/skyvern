@@ -1,4 +1,3 @@
-import json
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -85,9 +84,9 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     Parameter,
     ParameterType,
     WorkflowParameter,
-    WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
+from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock
@@ -285,11 +284,7 @@ def convert_workflow_definition(
                 modified_at=now,
             )
         elif parameter.parameter_type == ParameterType.WORKFLOW:
-            default_value = parameter.workflow_parameter_type.convert_value(
-                json.dumps(parameter.default_value)
-                if parameter.workflow_parameter_type == WorkflowParameterType.JSON
-                else parameter.default_value
-            )
+            default_value = parameter.workflow_parameter_type.convert_default_value(parameter.default_value)
             parameters[parameter.key] = WorkflowParameter(
                 workflow_parameter_id=generate_workflow_parameter_id(),
                 workflow_parameter_type=parameter.workflow_parameter_type,
@@ -1060,6 +1055,8 @@ def block_yaml_to_block(
         return EmailInboxBlock(
             **base_kwargs,
             email_client=block_yaml.email_client,
+            credential_source=block_yaml.credential_source,
+            connection_id=block_yaml.connection_id,
             credential_id=block_yaml.credential_id,
             folder=block_yaml.folder,
             prompt=block_yaml.prompt,
@@ -1084,6 +1081,17 @@ def block_yaml_to_block(
             column_mapping=block_yaml.column_mapping,
             create_sheet_if_missing=block_yaml.create_sheet_if_missing,
             parameters=google_sheets_write_parameters,
+        )
+    elif block_yaml.block_type == BlockType.POWERBI_QUERY:
+        powerbi_query_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return PowerBIQueryBlock(
+            **base_kwargs,
+            connection_id=block_yaml.connection_id,
+            credential_source=block_yaml.credential_source,
+            dataset_id=block_yaml.dataset_id,
+            query=block_yaml.query,
+            max_rows=block_yaml.max_rows,
+            parameters=powerbi_query_parameters,
         )
 
     raise ValueError(f"Invalid block type {block_yaml.block_type}")

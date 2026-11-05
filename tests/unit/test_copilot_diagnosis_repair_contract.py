@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _code_authoring_repair_context_prompt,
     _prior_run_debug_text,
 )
+from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_TRACE_PER_TASK_LIMIT,
     SOLVER_ATTEMPT_KEY,
@@ -75,11 +76,7 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
 )
-from skyvern.forge.sdk.copilot.runtime import (
-    OriginRunRedactionRegistry,
-    bound_call_browser_session,
-    effective_browser_session_id,
-)
+from skyvern.forge.sdk.copilot.runtime import bound_call_browser_session, effective_browser_session_id
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
     OBSTRUCTION_SUMMARY_MAX_CHARS,
     finalize_runtime_authoring_repair_context_from_page_observation,
@@ -3562,10 +3559,8 @@ def test_sheets_missing_binding_failure_arms_repair_on_the_failed_block() -> Non
                     "label": "append_visitors_to_sheet",
                     "status": "failed",
                     "failure_reason": (
-                        "Failed to format jinja template: block `append_visitors_to_sheet` field `values` "
-                        "references a value no upstream block produced: 'dict object' has no attribute "
-                        "'visitor_count'. Return that key from the producing block, or write an explicit "
-                        "default (e.g. {{ block_label.field | default('') }}) if an empty cell is intended."
+                        "Failed to format jinja template: Missing key or attribute in "
+                        "`collect_visitors.visitor_count` (field values, line 1)."
                     ),
                 },
             ],
@@ -6090,7 +6085,7 @@ def test_a_failed_sign_in_block_names_its_bound_credential_without_changing_the_
     assert _update_lever_ids(contract) == update_levers
 
 
-def test_a_failed_sign_in_on_a_connected_vault_login_offers_no_credential_card_update() -> None:
+def test_a_failed_sign_in_on_a_bitwarden_login_parameter_offers_no_credential_card_update() -> None:
     ctx = _ctx()
     ctx.workflow_yaml = _sign_in_workflow_yaml(binds_credential=True).replace(
         """    parameter_type: workflow

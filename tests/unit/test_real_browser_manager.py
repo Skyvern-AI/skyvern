@@ -86,6 +86,7 @@ def make_workflow_run(
 def patch_browser_manager_app() -> Iterator[MagicMock]:
     with patch.object(real_browser_manager, "app") as mock_app:
         mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
+        mock_app.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
         yield mock_app
 
 
@@ -1077,6 +1078,7 @@ def make_task(
     task.organization_id = organization_id
     task.proxy_location = proxy_location
     task.workflow_run_id = workflow_run_id
+    task.requested_by = None
     task.url = "https://example.com"
     task.workflow_permanent_id = None
     task.extra_http_headers = None
@@ -2107,6 +2109,24 @@ async def test_session_activity_cadence_is_not_reset_by_new_attaches() -> None:
         finally:
             for session_id in ("pbs_steady", "pbs_wakeup_1", "pbs_wakeup_2"):
                 manager.end_session_activity_renewal(session_id)
+            if manager._session_activity_renewer is not None:
+                await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_activity_stamp_still_starts_the_renewer() -> None:
+    manager = RealBrowserManager()
+    touch = AsyncMock(side_effect=[RuntimeError("database is down"), None])
+
+    with patch_browser_manager_app() as mock_app:
+        mock_app.DATABASE.browser_sessions.touch_last_activity = touch
+        try:
+            with pytest.raises(RuntimeError):
+                await manager.begin_session_activity_renewal("pbs_unstamped")
+            await _let_the_renewer_run()
+            assert touch.await_args_list == [call("pbs_unstamped"), call("pbs_unstamped")]
+        finally:
+            manager.end_session_activity_renewal("pbs_unstamped")
             if manager._session_activity_renewer is not None:
                 await asyncio.gather(manager._session_activity_renewer, return_exceptions=True)
 
@@ -4558,6 +4578,7 @@ def _patch_forge_app(monkeypatch: pytest.MonkeyPatch, manager: RealBrowserManage
 
     fake_app = MagicMock(BROWSER_MANAGER=manager, PERSISTENT_SESSIONS_MANAGER=sessions)
     fake_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
+    fake_app.AGENT_FUNCTION.enforce_browser_session_credential_use = AsyncMock()
     configure_browser_context_acquired_hook(fake_app)
     monkeypatch.setattr(forge_module, "app", fake_app)
     monkeypatch.setattr(real_browser_manager, "app", fake_app)

@@ -89,12 +89,43 @@ const BLOCK_TYPE_TO_NODE_TYPE: Record<string, string> = {
   email_inbox: "emailInbox",
   google_sheets_read: "googleSheetsRead",
   google_sheets_write: "googleSheetsWrite",
+  powerbi_query: "powerBIQuery",
 };
 
 function blockIdentity(block: WorkflowBlock): string {
   const nodeType =
     BLOCK_TYPE_TO_NODE_TYPE[block.block_type] ?? block.block_type;
   return `${nodeType}:${block.label}`;
+}
+
+function nextCommonLabel(
+  byLabel: ReadonlyMap<string, WorkflowBlock>,
+  block: WorkflowBlock,
+  common: ReadonlySet<string>,
+  cache: Map<string, string | null>,
+): string | null {
+  if (cache.has(block.label)) return cache.get(block.label) ?? null;
+  const path = [block.label];
+  const seen = new Set(path);
+  let nextLabel: string | null = null;
+  let cursor = block.next_block_label ?? null;
+  while (cursor && !seen.has(cursor)) {
+    const next = byLabel.get(cursor);
+    if (!next) break;
+    if (common.has(blockIdentity(next))) {
+      nextLabel = next.label;
+      break;
+    }
+    if (cache.has(next.label)) {
+      nextLabel = cache.get(next.label) ?? null;
+      break;
+    }
+    path.push(next.label);
+    seen.add(next.label);
+    cursor = next.next_block_label ?? null;
+  }
+  path.forEach((label) => cache.set(label, nextLabel));
+  return nextLabel;
 }
 
 const ACRONYMS = new Set([
@@ -243,6 +274,7 @@ function clone<T>(value: T): T {
 
 type ConditionalLike = {
   branch_conditions?: Array<{
+    id?: string;
     next_block_label?: string | null;
     criteria?: unknown;
     is_default?: boolean;
@@ -325,8 +357,28 @@ type DiffState = {
   merged: Map<string, BlockReview>;
   before: Map<string, BlockReview>;
   after: Map<string, BlockReview>;
+  beforeBlocks: Map<string, WorkflowBlock>;
+  beforeScopes: Map<string, string | null>;
+  afterScopes: Map<string, string | null>;
+  movedIdentities: Set<string>;
   usedLabels: Set<string>;
 };
+
+function collectScopes(
+  blocks: Array<WorkflowBlock>,
+  scopes: Map<string, string | null>,
+  byIdentity?: Map<string, WorkflowBlock>,
+  parent: string | null = null,
+): void {
+  for (const block of blocks) {
+    const identity = blockIdentity(block);
+    byIdentity?.set(identity, block);
+    scopes.set(identity, parent);
+    if (isNestedLoopWorkflowBlock(block)) {
+      collectScopes(block.loop_blocks, scopes, byIdentity, block.label);
+    }
+  }
+}
 
 function uniqueLabel(label: string, used: Set<string>): string {
   let candidate = label;
@@ -487,6 +539,21 @@ function matchingBranch(
     : null;
 }
 
+function matchedBranchId(
+  prior: WorkflowBlock,
+  current: WorkflowBlock,
+  priorBranchId: string,
+): string | null {
+  const priorIndex = branchesOf(prior).findIndex(
+    (branch) => branch.id === priorBranchId,
+  );
+  if (priorIndex < 0) return null;
+  const currentIndex = matchingBranch(prior, current, priorIndex);
+  return currentIndex === null
+    ? null
+    : (branchesOf(current)[currentIndex]?.id ?? null);
+}
+
 // Where a branch leads, read as the first block it reaches that both versions
 // share, so a block added at the head of a branch does not read as a re-route.
 function branchRoute(
@@ -554,18 +621,74 @@ function mergeLevel(
   const beforeByIdentity = new Map(
     beforeLevel.map((block) => [blockIdentity(block), block]),
   );
+  const beforeByLabel = new Map(
+    beforeLevel.map((block) => [block.label, block]),
+  );
+  const afterByLabel = new Map(afterLevel.map((block) => [block.label, block]));
   const afterIdentities = new Set(afterLevel.map(blockIdentity));
+  const commonIdentities = new Set(
+    [...afterIdentities].filter((identity) => beforeByIdentity.has(identity)),
+  );
+  const beforeNextCache = new Map<string, string | null>();
+  const afterNextCache = new Map<string, string | null>();
   const beforeOrder = runOrder(beforeLevel, finallyLabels.before);
   const merged = afterLevel.map((block) => {
-    const prior = beforeByIdentity.get(blockIdentity(block));
+    const identity = blockIdentity(block);
+    const priorInLevel = beforeByIdentity.get(identity);
+    const moved = !priorInLevel && state.movedIdentities.has(identity);
+    const prior =
+      priorInLevel ?? (moved ? state.beforeBlocks.get(identity) : undefined);
     if (!prior) {
-      recordSubtree([block], "new", state);
+      const review: BlockReview = {
+        status: "new",
+        changes: [],
+        containsChanges: false,
+      };
+      state.merged.set(block.label, review);
+      state.after.set(block.label, review);
+      if (isNestedLoopWorkflowBlock(block)) {
+        block.loop_blocks = mergeLevel(
+          [],
+          block.loop_blocks,
+          { before: null, after: null },
+          state,
+        );
+      }
       return block;
     }
     const changes = diffBlockFields(prior, block).map((change) =>
       toReviewChange(change),
     );
-    if (branchesOf(block).length > 0) {
+    if (moved) {
+      changes.push({
+        key: "__scope",
+        label: "Loop scope",
+        before: state.beforeScopes.get(identity) ?? null,
+        after: state.afterScopes.get(identity) ?? null,
+      });
+    } else {
+      const beforeNext = nextCommonLabel(
+        beforeByLabel,
+        prior,
+        commonIdentities,
+        beforeNextCache,
+      );
+      const afterNext = nextCommonLabel(
+        afterByLabel,
+        block,
+        commonIdentities,
+        afterNextCache,
+      );
+      if (beforeNext !== afterNext) {
+        changes.push({
+          key: "__next_common_label",
+          label: "Next step",
+          before: beforeNext,
+          after: afterNext,
+        });
+      }
+    }
+    if (!moved && branchesOf(block).length > 0) {
       const beforeRoutes = branchesOf(prior).map((branch) =>
         branchRoute(
           beforeLevel,
@@ -596,6 +719,23 @@ function mergeLevel(
           after: describeRoutes(block, afterRoutes),
         });
       }
+    }
+    if (
+      isNestedLoopWorkflowBlock(block) &&
+      isNestedLoopWorkflowBlock(prior) &&
+      (prior.loop_blocks.some((child) =>
+        state.movedIdentities.has(blockIdentity(child)),
+      ) ||
+        block.loop_blocks.some((child) =>
+          state.movedIdentities.has(blockIdentity(child)),
+        ))
+    ) {
+      changes.push({
+        key: "__loop_scope",
+        label: "Loop steps",
+        before: prior.loop_blocks.map((child) => child.label).join(", "),
+        after: block.loop_blocks.map((child) => child.label).join(", "),
+      });
     }
     const review: BlockReview = {
       status: changes.length > 0 ? "changed" : "unchanged",
@@ -657,7 +797,11 @@ function mergeLevel(
   };
 
   for (const prior of beforeOrder) {
-    if (afterIdentities.has(blockIdentity(prior))) continue;
+    if (
+      afterIdentities.has(blockIdentity(prior)) ||
+      state.movedIdentities.has(blockIdentity(prior))
+    )
+      continue;
     const removed = removedCopy(prior, state);
     // Its old branch targets are stale; removed blocks from those branches
     // attach again as they are placed.
@@ -889,10 +1033,27 @@ function diffWorkflowVersions(
   );
   const usedLabels = new Set<string>();
   collectLabels(afterBlocks, usedLabels);
+  const beforeBlocksByIdentity = new Map<string, WorkflowBlock>();
+  const beforeScopes = new Map<string, string | null>();
+  const afterScopes = new Map<string, string | null>();
+  collectScopes(beforeBlocks, beforeScopes, beforeBlocksByIdentity);
+  collectScopes(afterBlocks, afterScopes);
+  const movedIdentities = new Set(
+    [...afterScopes]
+      .filter(
+        ([identity, scope]) =>
+          beforeScopes.has(identity) && beforeScopes.get(identity) !== scope,
+      )
+      .map(([identity]) => identity),
+  );
   const state: DiffState = {
     merged: new Map(),
     before: new Map(),
     after: new Map(),
+    beforeBlocks: beforeBlocksByIdentity,
+    beforeScopes,
+    afterScopes,
+    movedIdentities,
     usedLabels,
   };
   const mergedBlocks = mergeLevel(
@@ -1143,4 +1304,5 @@ export {
   diffWorkflowVersions,
   foldUnchangedRuns,
   humanizeKey,
+  matchedBranchId,
 };

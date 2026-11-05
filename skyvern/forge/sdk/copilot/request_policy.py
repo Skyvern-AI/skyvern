@@ -22,10 +22,8 @@ from skyvern.forge.sdk.copilot.ask_user import QuestionInteraction
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import ProposedCredential, StructuredContext
 from skyvern.forge.sdk.copilot.credential_resolution import (
-    ConnectedVault,
     CredentialResolution,
     CredentialResolutionTier,
-    connected_vault_login_sites,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import deduplicate_credentials as _deduplicate_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import (
@@ -33,7 +31,6 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
 )
 from skyvern.forge.sdk.copilot.credential_resolution import load_credentials as _load_credentials
 from skyvern.forge.sdk.copilot.credential_resolution import (
-    load_credentials_by_ids,
     loggable_origin,
     resolve_by_url,
     unresolved_page_url_for_log,
@@ -58,15 +55,15 @@ from skyvern.forge.sdk.copilot.secret_redaction import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.vault_logins import vault_login_credential, vault_login_ref
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
-    CONNECTED_VAULT_ID_PREFIX,
     URL_CANDIDATE_RE,
     bitwarden_secret_bindings,
     parse_workflow_yaml,
     workflow_credential_ids,
     workflow_credential_origins,
 )
-from skyvern.forge.sdk.credential_site_policy import LoginSite, same_release_scope
+from skyvern.forge.sdk.credential_site_policy import same_release_scope
 from skyvern.forge.sdk.schemas.credentials import Credential, TotpType
 from skyvern.forge.sdk.schemas.google_oauth import STATE_ACTIVE
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -77,6 +74,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.services import google_oauth_service
+from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.utils.strings import escape_code_fences
@@ -648,23 +646,12 @@ _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
 _MALFORMED_CREDENTIAL_ID_RE = re.compile(r"\bcred[ \t\-]+([0-9]{12,})\b")
-_JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
-_CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
-    {
-        "parameter_type",
-        "key",
-        "description",
-        "workflow_id",
-        "created_at",
-        "modified_at",
-        "deleted_at",
-    }
-)
-_LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS = ("username_key", "password_key")
-_WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
-    "I couldn't find the required credentials for the existing workflow. "
-    f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
-)
+# The login fields run-context init resolves as required (`_resolve_required_parameter_value` in context_manager).
+_WHOLE_FIELD_INPUT_RE = re.compile(r"\s*\{\{\s*([A-Za-z_]\w*)\s*\}\}\s*|([A-Za-z_]\w*)")
+_INIT_REQUIRED_VAULT_LOGIN_FIELDS: dict[str, tuple[str, ...]] = {
+    ParameterType.AZURE_VAULT_CREDENTIAL.value: ("vault_name", "username_key", "password_key"),
+    ParameterType.ONEPASSWORD.value: ("vault_id", "item_id"),
+}
 _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "into the conditional",
     "inside the conditional",
@@ -1164,11 +1151,40 @@ class RequestPolicy:
     # excluded from traces and comparisons: it must describe only the latest literal user turn,
     # even when the agent input later expands terse replies with earlier context.
     canonical_user_message: str = field(default="", repr=False, compare=False)
-    # This turn's one successful read of the organization's connected Bitwarden vault; each read force-syncs it.
-    connected_vault: ConnectedVault | None = field(default=None, repr=False, compare=False)
-    # Whole-site URIs read from each vault login's own item: the only thing that places it on a site.
-    connected_vault_sites: dict[str, list[LoginSite]] = field(default_factory=dict, repr=False, compare=False)
+    # This turn's listing of the organization's vault logins, by id, and the listing that read them.
+    vault_logins: dict[str, VaultLogin] | None = field(default=None, repr=False, compare=False)
+    vault_listing: VaultLoginListing | None = field(default=None, repr=False, compare=False)
     _authoring_pending: bool = field(default=False, repr=False, compare=False)
+
+    def adopt_imported_vault_login(self, ref: str, credential_id: str) -> None:
+        """Move what this turn recorded for a listed vault login onto the saved credential it was imported as."""
+        if self.vault_logins is not None and ref in self.vault_logins:
+            login = replace(self.vault_logins[ref], credential_id=credential_id)
+            self.vault_logins[ref] = self.vault_logins[credential_id] = login
+        for credentials in (self.resolved_credentials, self.auto_bound_credentials, self.discovered_credentials):
+            for index, credential in enumerate(credentials):
+                if credential.credential_id == ref:
+                    credentials[index] = credential.model_copy(update={"credential_id": credential_id})
+        for ids in (self.current_turn_named_credential_ids, self.seeded_proposal_credential_ids):
+            if ref in ids:
+                ids.discard(ref)
+                ids.add(credential_id)
+        for urls in (self.live_page_admitted_urls, self.carried_credential_urls):
+            if ref in urls:
+                urls[credential_id] = urls.pop(ref)
+
+    def credential_intended_url(self, credential_id: str) -> str | None:
+        admitted_url = self.live_page_admitted_urls.get(credential_id)
+        if admitted_url:
+            return admitted_url
+        return next(
+            (
+                credential.tested_url
+                for credential in self.resolved_credentials
+                if credential.credential_id == credential_id and credential.tested_url
+            ),
+            None,
+        )
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
@@ -4519,9 +4535,7 @@ def _prior_approved_connection_ids(global_llm_context: str) -> set[str]:
 def _prior_approved_credential_ids(global_llm_context: str) -> set[str]:
     structured = StructuredContext.from_json_str(global_llm_context)
     return {
-        record.credential_id
-        for record in structured.approved_credentials
-        if record.credential_id.startswith(("cred_", CONNECTED_VAULT_ID_PREFIX))
+        record.credential_id for record in structured.approved_credentials if record.credential_id.startswith("cred_")
     }
 
 
@@ -4543,7 +4557,7 @@ async def _seed_prior_approved_credentials(
     missing_ids = sorted(approved_ids - {credential.credential_id for credential in policy.resolved_credentials})
     if not missing_ids:
         return
-    credentials = await load_credentials_by_ids(organization_id, missing_ids)
+    credentials = await _load_credentials(organization_id, credential_ids=missing_ids)
     policy.resolved_credentials = _deduplicate_credentials(
         [
             *policy.resolved_credentials,
@@ -4554,7 +4568,7 @@ async def _seed_prior_approved_credentials(
 
 def _proposed_credential_seed(global_llm_context: str) -> ProposedCredential | None:
     seed = StructuredContext.from_json_str(global_llm_context).proposed_credential
-    if seed is None or not seed.credential_id.startswith(("cred_", CONNECTED_VAULT_ID_PREFIX)) or not seed.admitted_url:
+    if seed is None or not seed.credential_id.startswith("cred_") or not seed.admitted_url:
         return None
     return seed
 
@@ -4568,7 +4582,7 @@ async def _seed_proposed_credential(
     seed = _proposed_credential_seed(global_llm_context)
     if seed is None:
         return
-    credentials = await load_credentials_by_ids(organization_id, [seed.credential_id])
+    credentials = await _load_credentials(organization_id, credential_ids=[seed.credential_id])
     credential = next((item for item in credentials if item.credential_id == seed.credential_id), None)
     if credential is None:
         return
@@ -4682,20 +4696,37 @@ async def _resolve_live_page_credentials(
         tiers=("url_exact", "url_path"),
         password_only=True,
     )
-    rivals = _connected_vault_rivals(policy, page_url)
-    if not rivals or resolution.verdict == "unresolved":
+    page_logins = _page_vault_logins(policy, page_url)
+    # An imported login with no tested URL is matched by its item sites, as a tested URL is for any other credential.
+    vouched = [
+        credential
+        for credential in credentials
+        if (login := page_logins.get(credential.credential_id)) is not None
+        and login.credential_id == credential.credential_id
+        and login.tested_url is None
+        and any(site.admits(page_url) for site in login.sites)
+    ]
+    matched = _deduplicate_credentials([*resolution.candidates, *vouched])
+    if not matched:
         return resolution
+    candidates = _deduplicate_credentials(
+        [
+            *matched,
+            *(vault_login_credential(organization_id, ref, login) for ref, login in page_logins.items()),
+        ]
+    )
     return CredentialResolution(
-        "ambiguous", tuple(_deduplicate_credentials([*resolution.candidates, *rivals])), resolution.tier
+        "resolved" if len(candidates) == 1 else "ambiguous", tuple(candidates), resolution.tier or "vault_site"
     )
 
 
-def _connected_vault_rivals(policy: RequestPolicy, page_url: str) -> list[Credential]:
-    """Vault logins listed this turn with any saved URI on the page's site. They only compete; never grant."""
-    vault = policy.connected_vault
-    if vault is None:
-        return []
-    return [login.credential for login in vault.logins if any(same_release_scope(page_url, url) for url in login.urls)]
+def _page_vault_logins(policy: RequestPolicy, page_url: str) -> dict[str, VaultLogin]:
+    """Vault logins listed this turn with any saved URI on the page's site. A raw URI only competes; never grants."""
+    return {
+        vault_login_ref(login): login
+        for login in (policy.vault_logins or {}).values()
+        if any(same_release_scope(page_url, url) for url in login.urls)
+    }
 
 
 def _record_live_page_admission(policy: RequestPolicy, candidates: Sequence[Credential], page_url: str) -> None:
@@ -4847,25 +4878,19 @@ async def admit_credential_for_live_page(
     return LiveCredentialAdmission(False)
 
 
-async def admit_connected_vault_login_for_live_page(
+async def admit_vault_login_for_live_page(
     policy: RequestPolicy,
     *,
     organization_id: str,
     credential_id: str,
+    login: VaultLogin,
     page_url: str,
     load_org_credentials: Callable[[], Awaitable[list[Credential]]],
 ) -> LiveCredentialAdmission:
-    """Grant run authority for a vault login listed this turn when it is the page's sole candidate and its own
-    whole-site URIs cover the page. The listing's first URI only picks candidates; it never grants."""
-    vault = policy.connected_vault
-    login = vault.login(credential_id) if vault is not None else None
-    if (
-        vault is None
-        or login is None
-        or not page_url
-        or _live_page_url_abstains(
-            policy, organization_id=organization_id, page_url=page_url, seam="fill", credential_id=credential_id
-        )
+    """Grant run authority for a listed vault login when it is the page's sole candidate and one of its own sites
+    covers the page. A raw URI only makes a login a candidate; it never grants."""
+    if not page_url or _live_page_url_abstains(
+        policy, organization_id=organization_id, page_url=page_url, seam="fill", credential_id=credential_id
     ):
         return LiveCredentialAdmission(False)
     resolution = await _resolve_live_page_credentials(
@@ -4878,17 +4903,20 @@ async def admit_connected_vault_login_for_live_page(
     )
     if resolution is None:
         return LiveCredentialAdmission(False)
-    candidates = _deduplicate_credentials([*resolution.candidates, *_connected_vault_rivals(policy, page_url)])
-    sites = (
-        await connected_vault_login_sites(organization_id, policy, credential_id)
-        if [candidate.credential_id for candidate in candidates] == [credential_id]
-        else None
+    candidates = _deduplicate_credentials(
+        [
+            *resolution.candidates,
+            *(
+                vault_login_credential(organization_id, ref, rival)
+                for ref, rival in _page_vault_logins(policy, page_url).items()
+            ),
+        ]
     )
-    matched = next((site for site in sites or [] if site.admits(page_url)), None)
-    admitted = matched is not None
+    sole = [candidate.credential_id for candidate in candidates] == [credential_id]
+    matched = next((site for site in login.sites if site.admits(page_url)), None) if sole else None
     LOG.info(
         "copilot credential live-page admission",
-        outcome="admitted" if admitted else ("ambiguous" if len(candidates) > 1 else "no_match"),
+        outcome="admitted" if matched else ("ambiguous" if len(candidates) > 1 else "no_match"),
         seam="fill",
         organization_id=organization_id,
         credential_id=credential_id,
@@ -4898,7 +4926,7 @@ async def admit_connected_vault_login_for_live_page(
     )
     if matched is None:
         return LiveCredentialAdmission(False)
-    _record_live_page_admission(policy, [login.credential], page_url)
+    _record_live_page_admission(policy, [vault_login_credential(organization_id, credential_id, login)], page_url)
     return LiveCredentialAdmission(True, page_url=page_url, whole_site=matched.whole_site)
 
 
@@ -4912,14 +4940,15 @@ def _is_login_credential_param(param: dict[str, Any]) -> bool:
         return False
 
 
-def _iter_login_credential_params(parsed: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+def _iter_login_credential_params(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     workflow_def = parsed.get("workflow_definition")
     if not isinstance(workflow_def, dict):
         return []
-    out: list[tuple[str, dict[str, Any]]] = []
-    for param in workflow_def.get("parameters") or []:
-        if isinstance(param, dict) and _is_login_credential_param(param):
-            out.append(("workflow", param))
+    out: list[dict[str, Any]] = [
+        param
+        for param in workflow_def.get("parameters") or []
+        if isinstance(param, dict) and _is_login_credential_param(param)
+    ]
 
     def _walk(block_list: Any) -> None:
         if not isinstance(block_list, list):
@@ -4927,10 +4956,9 @@ def _iter_login_credential_params(parsed: dict[str, Any]) -> list[tuple[str, dic
         for block in block_list:
             if not isinstance(block, dict):
                 continue
-            label = str(block.get("label") or "<unlabeled>")
             for param in block.get("parameters") or []:
                 if isinstance(param, dict) and _is_login_credential_param(param):
-                    out.append((label, param))
+                    out.append(param)
             _walk(block.get("loop_blocks"))
 
     _walk(workflow_def.get("blocks"))
@@ -4945,62 +4973,44 @@ def _value_resolves_at_init(value: Any) -> bool:
     return True
 
 
-def _workflow_credential_inputs_unbound(workflow_yaml: str) -> list[dict[str, str]]:
+def _workflow_inputs_and_login_params(
+    workflow_yaml: str | None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     if not workflow_yaml:
-        return []
+        return {}, []
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except Exception:
-        return []
-    if not isinstance(parsed, dict):
-        return []
+        return {}, []
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("workflow_definition"), dict):
+        return {}, []
+    inputs = {
+        param["key"]: param
+        for param in parsed["workflow_definition"].get("parameters") or []
+        if isinstance(param, dict) and param.get("parameter_type") == "workflow" and isinstance(param.get("key"), str)
+    }
+    return inputs, _iter_login_credential_params(parsed)
 
-    workflow_def = parsed.get("workflow_definition")
-    if not isinstance(workflow_def, dict):
-        return []
 
-    workflow_param_bound: dict[str, bool] = {}
-    for param in workflow_def.get("parameters") or []:
-        if isinstance(param, dict) and param.get("parameter_type") == "workflow":
-            key = param.get("key")
-            if isinstance(key, str):
-                workflow_param_bound[key] = _value_resolves_at_init(param.get("default_value"))
+def _init_required_login_fields(param: dict[str, Any]) -> tuple[str, ...]:
+    if param.get("parameter_type") == ParameterType.CREDENTIAL.value:
+        # Init selects from a non-empty credential_ids pool and ignores credential_id.
+        return () if param.get("credential_ids") else ("credential_id",)
+    return _INIT_REQUIRED_VAULT_LOGIN_FIELDS.get(str(param.get("parameter_type")), ())
 
-    findings: list[dict[str, str]] = []
-    for location, param in _iter_login_credential_params(parsed):
-        for field_name in _LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS:
+
+def login_credential_input_defaults(workflow_yaml: str | None) -> dict[str, Any]:
+    inputs, login_params = _workflow_inputs_and_login_params(workflow_yaml)
+    referenced = set()
+    for param in login_params:
+        for field_name in _init_required_login_fields(param):
             value = param.get(field_name)
-            if not isinstance(value, str) or value.strip():
-                continue
-            findings.append(
-                {"location": location, "field": field_name, "missing": "<empty>", "kind": "credential_empty"}
-            )
-        for field_name, value in param.items():
-            if field_name in _CREDENTIAL_PARAM_METADATA_FIELDS:
-                continue
-            if not isinstance(value, str):
-                continue
-            for jinja_key in _JINJA_TEMPLATE_VAR_RE.findall(value):
-                if jinja_key in workflow_param_bound:
-                    if not workflow_param_bound[jinja_key]:
-                        findings.append(
-                            {
-                                "location": location,
-                                "field": field_name,
-                                "missing": jinja_key,
-                                "kind": "credential_template_unbound",
-                            }
-                        )
-                else:
-                    findings.append(
-                        {
-                            "location": location,
-                            "field": field_name,
-                            "missing": jinja_key,
-                            "kind": "credential_template_undefined",
-                        }
-                    )
-    return findings
+            # Only a field that is exactly one input is blank whenever that input is; filters like `default` can fill it.
+            match = _WHOLE_FIELD_INPUT_RE.fullmatch(value) if isinstance(value, str) else None
+            key = match.group(1) or match.group(2) if match else None
+            if key in inputs:
+                referenced.add(key)
+    return {key: param.get("default_value") for key, param in inputs.items() if key in referenced}
 
 
 async def _build_request_policy_bootstrap(
@@ -5112,11 +5122,6 @@ async def _build_request_policy_bootstrap(
         redacted_draft_candidate = policy.raw_secret_redacted_draft
         policy.allow_missing_credentials_in_draft = redacted_draft_candidate
         policy.credential_draft_deferred_explicitly = redacted_draft_candidate
-
-    if _workflow_credential_inputs_unbound(workflow_yaml):
-        policy.clarification_reason = "workflow_credential_inputs_unbound"
-        policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = True
 
     trace_data = policy.to_trace_data()
     with copilot_span("request_policy", data=trace_data):

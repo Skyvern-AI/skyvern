@@ -38,6 +38,11 @@ async def test_run_block_response_includes_resolved_browser_session(
     monkeypatch.setattr(agent_protocol.block_service, "ensure_workflow_run", AsyncMock(return_value=workflow_run))
     execute_blocks = AsyncMock()
     monkeypatch.setattr(agent_protocol.block_service, "execute_blocks", execute_blocks)
+    monkeypatch.setattr(
+        agent_protocol.app.AGENT_FUNCTION,
+        "browser_session_ids_authorized_for_connect",
+        AsyncMock(return_value={resolved_browser_session_id}),
+    )
 
     response = await agent_protocol.run_block(
         request=MagicMock(),

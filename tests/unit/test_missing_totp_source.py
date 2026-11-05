@@ -32,6 +32,7 @@ def _make_task(
     task.totp_identifier = totp_identifier
     task.navigation_payload = None
     task.navigation_goal = "log in"
+    task.url = "https://app.example.com/login"
     return task
 
 
@@ -247,7 +248,10 @@ async def test_get_magic_link_with_url_but_poll_returns_none_emits_otp_error(
     step = _make_step()
     _patch_cua_fallback_common(monkeypatch, "get_magic_link")
 
+    captured: dict[str, object] = {}
+
     async def _no_poll(*args, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
         return None
 
     monkeypatch.setattr("skyvern.webeye.actions.parse_actions.poll_otp_value", _no_poll)
@@ -260,6 +264,7 @@ async def test_get_magic_link_with_url_but_poll_returns_none_emits_otp_error(
     assert action.errors
     assert action.errors[0].error_code == "OTP_ERROR"
     assert "No magic link found" in action.reasoning
+    assert captured["task_url"] == "https://app.example.com/login"
 
 
 @pytest.mark.asyncio

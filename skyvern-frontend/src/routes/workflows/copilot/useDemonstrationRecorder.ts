@@ -137,7 +137,8 @@ export function useDemonstrationRecorder({
           ].sort((left, right) => left.seq - right.seq);
           setActions(actionsRef.current);
           setActionCount((current) => Math.max(current, frame.seq));
-          setSensitiveField(null);
+          // A note is not a browser action, so the saved-credential card stays up.
+          if (frame.tool_name !== "note") setSensitiveField(null);
           if (frame.tool_name === "upload_attached_file") {
             setAwaitingFileOutcome(false);
             if (frame.file_id) {
@@ -331,6 +332,32 @@ export function useDemonstrationRecorder({
     [runControl],
   );
 
+  // Done waits on these, so a note sent just before it is queued ahead of the stop.
+  const pendingNotesRef = useRef(new Set<Promise<unknown>>());
+  const addNote = useCallback(
+    async (text: string) => {
+      // A dictation pause or click can land after Done started; the recorder would refuse that note anyway.
+      if (phaseRef.current !== "recording") return false;
+      const request = sendControl({ action: "note", text });
+      pendingNotesRef.current.add(request);
+      try {
+        await request;
+        return true;
+      } catch (error) {
+        toast({
+          title: "Could not add the note",
+          description:
+            error instanceof Error ? error.message : "Please try again.",
+          variant: "destructive",
+        });
+        return false;
+      } finally {
+        pendingNotesRef.current.delete(request);
+      }
+    },
+    [sendControl],
+  );
+
   const fillCredential = useCallback(
     (credentialId: string) => {
       if (
@@ -407,6 +434,7 @@ export function useDemonstrationRecorder({
     updateBusy(true);
     try {
       if (phaseRef.current === "recording") {
+        await Promise.allSettled(pendingNotesRef.current);
         const stopped = await sendControl({ action: "stop" }, id);
         const stream = streamControllerRef.current;
         streamControllerRef.current = null;
@@ -621,6 +649,7 @@ export function useDemonstrationRecorder({
     start,
     resume,
     navigate,
+    addNote,
     fillCredential,
     chooseFile,
     dismissSensitiveField,

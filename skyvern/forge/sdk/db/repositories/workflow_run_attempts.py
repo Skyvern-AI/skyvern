@@ -132,26 +132,6 @@ class WorkflowRunAttemptsRepository(BaseRepository):
             await session.commit()
             return attempt
 
-    @db_operation("pin_first_attempt_browser_session_if_unset")
-    async def pin_first_attempt_browser_session_if_unset(
-        self,
-        workflow_run_id: str,
-        organization_id: str,
-        browser_session_id: str,
-    ) -> None:
-        async with self.Session() as session:
-            await session.execute(
-                update(WorkflowRunAttemptModel)
-                .where(
-                    WorkflowRunAttemptModel.workflow_run_id == workflow_run_id,
-                    WorkflowRunAttemptModel.organization_id == organization_id,
-                    WorkflowRunAttemptModel.attempt_number == 1,
-                    WorkflowRunAttemptModel.pinned_browser_session_id.is_(None),
-                )
-                .values(pinned_browser_session_id=browser_session_id, modified_at=naive_utc_now())
-            )
-            await session.commit()
-
     @db_operation("get_attempts", expected_errors=(AttemptRecoverySuperseded,))
     async def get_attempts(self, workflow_run_id: str) -> list[WorkflowRunAttemptModel]:
         async with self.Session() as session:

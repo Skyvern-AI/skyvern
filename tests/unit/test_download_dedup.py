@@ -10,8 +10,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
+import pytest
+
+from skyvern.config import settings
+from skyvern.forge.sdk.artifact.storage import unique_pdfs
 from skyvern.webeye.actions.handler import _deduplicate_new_downloaded_file_paths
+from tests.unit.helpers import make_pdf
 
 
 def _write_file(directory: str, name: str, content: bytes) -> str:
@@ -185,3 +191,48 @@ def test_named_zero_byte_file_is_preserved_with_non_empty_artifact(tmp_path: Pat
 
     assert set(result) == {empty_export, manifest}
     assert sorted(os.listdir(dir_)) == ["empty_rows.csv", "manifest.csv"]
+
+
+def test_equal_complete_pdfs_are_reported_once_and_both_stay_on_disk(tmp_path: Path) -> None:
+    """Every PDF capture is retained; the run's outputs, not this action, list the content once."""
+    dir_ = str(tmp_path)
+    pdf = make_pdf("Invoice 1001")
+    a = _write_file(dir_, "invoice.pdf", pdf)
+    b = _write_file(dir_, "invoice (1).pdf", pdf)
+
+    result = _deduplicate_new_files({a, b})
+
+    assert result == [b]
+    assert sorted(os.listdir(dir_)) == ["invoice (1).pdf", "invoice.pdf"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(make_pdf("Invoice 1001")[:200], id="cut_off_pdf"),
+        pytest.param(make_pdf("Invoice 1001") + b"%" * 2048, id="above_the_comparison_size_cap"),
+    ],
+)
+def test_every_equal_pdf_capture_stays_on_disk_whatever_its_size_or_completeness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    monkeypatch.setattr(settings, "BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES", 1024)
+    dir_ = str(tmp_path)
+    a = _write_file(dir_, "report.pdf", content)
+    b = _write_file(dir_, "report (1).pdf", content)
+
+    result = _deduplicate_new_files({a, b})
+
+    assert result == [b]
+    assert sorted(os.listdir(dir_)) == ["report (1).pdf", "report.pdf"]
+
+
+def test_a_duplicate_whose_first_bytes_cannot_be_read_stays_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dir_ = str(tmp_path)
+    a, b = _write_file(dir_, "report.bin", b"same bytes"), _write_file(dir_, "report (1).bin", b"same bytes")
+    monkeypatch.setattr(unique_pdfs, "open", MagicMock(side_effect=PermissionError("unreadable")), raising=False)
+
+    assert _deduplicate_new_files({a, b}) == [b]
+    assert sorted(os.listdir(dir_)) == ["report (1).bin", "report.bin"]

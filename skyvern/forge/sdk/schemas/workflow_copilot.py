@@ -11,6 +11,7 @@ from pydantic import (
     Field,
     JsonValue,
     PlainSerializer,
+    PrivateAttr,
     SecretStr,
     StringConstraints,
     field_serializer,
@@ -191,6 +192,16 @@ class CopilotPendingTurn(BaseModel):
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
     superseded_build_test_run_ids: list[str] = Field(default_factory=list)
     steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
+    # Each draft frame overwrites this, never appends, so an entry holds at most one workflow.
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
+
+
+class CopilotInFlightTurn(BaseModel):
+    turn_id: str
+    cancel_token: str | None = None
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -386,6 +397,8 @@ class WorkflowCopilotMessageFeedbackResponse(BaseModel):
 
 class WorkflowCopilotChatMessage(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+    _narrative_payload_unreadable: bool = PrivateAttr(default=False)
 
     workflow_copilot_chat_message_id: str = Field(..., description="ID for the workflow copilot chat message")
     workflow_copilot_chat_id: str = Field(..., description="ID of the parent workflow copilot chat")
@@ -595,8 +608,9 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
 
 class WorkflowCopilotDemonstrationControlRequest(BaseModel):
     demonstration_id: str = Field(max_length=64)
-    action: Literal["navigate", "fill_credential", "upload_file", "stop", "cancel"]
+    action: Literal["navigate", "fill_credential", "upload_file", "note", "stop", "cancel"]
     url: str | None = Field(default=None, max_length=2048)
+    text: str | None = Field(default=None, max_length=2000)
     selector: str | None = Field(default=None, max_length=2000)
     credential_id: str | None = Field(default=None, max_length=128)
     field: Literal["password", "totp"] | None = None
@@ -692,7 +706,7 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
         default_factory=list, description="Uploaded files the user attached to this message"
     )
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
-    narrative_payload: TurnNarrativePayload | None = Field(
+    narrative_payload: dict[str, Any] | None = Field(
         None,
         description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
     )
@@ -866,6 +880,13 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
     timestamp: datetime | None = Field(
         None,
         description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
+    )
+    browser_session_id: str | None = Field(
+        None,
+        description=(
+            "Browser session a page-acting call resolves to when it is emitted; null for other tools and for "
+            "an unavailable target. Not persisted on the activity entry."
+        ),
     )
 
 
@@ -1181,6 +1202,7 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
         None, description="Turn matched by request_cancel_token when recovery requests provide one"
     )
     request_browser_allocations: CopilotRequestBrowserAllocations | None = None
+    in_flight_turn: CopilotInFlightTurn | None = None
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     accepted_turn_ids: list[str] = Field(
         default_factory=list, description="Turns whose manual Accept completed on the server"

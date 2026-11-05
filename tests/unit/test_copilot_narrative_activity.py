@@ -423,6 +423,7 @@ def test_build_narrative_payload_preserves_retry_order_and_binds_each_outcome() 
     payload = _build_narrative_payload(ctx, terminal="response", terminal_message="done", narrative_summary=None)
 
     assert [block["workflowRunBlockId"] for block in payload["blocks"]] == ["wrb_first", "wrb_retry"]
+    assert [block.get("workflowRunId") for block in payload["blocks"]] == ["wr_first", "wr_retry"]
     assert [block.get("outcome") for block in payload["blocks"]] == ["not_demonstrated", "not_evaluated"]
     assert payload["blocks"][0]["activity"] == []
     assert [entry["id"] for entry in payload["blocks"][1]["activity"]] == ["tr-edit"]
@@ -560,7 +561,7 @@ workflow_definition:
   blocks:
     - block_type: task
       label: existing
-      prompt: before
+      navigation_goal: before
 """
     ctx.staged_workflow_yaml = """
 workflow_definition:
@@ -568,10 +569,10 @@ workflow_definition:
   blocks:
     - block_type: task
       label: existing
-      prompt: after
+      navigation_goal: after
     - block_type: task
       label: added
-      prompt: new
+      navigation_goal: new
 """
     ctx.staged_workflow = _staged("existing", "added")  # type: ignore[assignment]
     ctx.has_staged_proposal = True
@@ -598,6 +599,7 @@ workflow_definition:
             },
         ],
         "duplicateWrites": [],
+        "inputs": [],
     }
     assert payload["testedBlockFingerprints"] == {"existing": sorted(ctx.executed_block_fingerprints["existing"])}
 
@@ -641,6 +643,7 @@ workflow_definition:
             },
         ],
         "duplicateWrites": [],
+        "inputs": [],
     }
 
 

@@ -513,10 +513,14 @@ export interface MicrosoftOAuthCredentialListResponse {
   credentials: MicrosoftOAuthCredential[];
 }
 
+export type MicrosoftOAuthScopeProfile =
+  | "outlook_mail"
+  | "powerbi_dataset_read";
+
 export interface CreateMicrosoftOAuthAuthorizeRequest {
   redirect_uri: string;
   credential_name?: string;
-  scope_profile?: "outlook_mail";
+  scope_profile?: MicrosoftOAuthScopeProfile;
   app_origin?: string;
 }
 
@@ -993,7 +997,6 @@ export const TaskRunType = {
   OpenaiCua: "openai_cua",
   AnthropicCua: "anthropic_cua",
   UiTars: "ui_tars",
-  YutoriNavigator: "yutori_navigator",
 } as const;
 
 export type TaskRunType = (typeof TaskRunType)[keyof typeof TaskRunType];
@@ -1059,6 +1062,7 @@ export type WorkflowRunStatusApiResponse = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type WorkflowRunStatusApiResponseWithWorkflow = {
@@ -1104,6 +1108,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   verification_code_polling_started_at?: string | null;
   retried_from_workflow_run_id?: string | null;
   retried_by_workflow_run_id?: string | null;
+  copilot_session_id?: string | null;
 } & WorkflowRunRetryFields;
 
 export type TaskGenerationApiResponse = {
@@ -1238,6 +1243,7 @@ export type CredentialApiResponse = {
     | "gcp"
     | "custom"
     | "onepassword"
+    | "bitwarden_connected"
     | null;
   vault_id?: string | null;
   item_id?: string | null;
@@ -1372,7 +1378,6 @@ export const RunEngine = {
   SkyvernV3: "skyvern-3.0",
   OpenaiCua: "openai-cua",
   AnthropicCua: "anthropic-cua",
-  YutoriNavigator: "yutori-navigator",
 } as const;
 
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];

@@ -316,3 +316,105 @@ test("for Gmail sending, offers only accounts the server says can send and flags
   expect(screen.queryByText("Unverified sender")).toBeNull();
   expect(onChange).not.toHaveBeenCalled();
 });
+
+test("combines native and additional accounts without changing the selected source automatically", () => {
+  const onChange = vi.fn();
+  const onSelect = vi.fn();
+  mocks.useGoogleOAuthCredentials.mockReturnValue({
+    credentials: [
+      {
+        ...googleCredential("goac-connected"),
+        email_address: "SYNTHETIC_EMAIL_LABEL",
+      },
+    ],
+    isLoading: false,
+    isFetching: false,
+    error: null,
+  });
+  const options = [
+    { id: "nc_synthetic", label: "Gmail account · connected yesterday" },
+  ];
+  const { rerender } = render(
+    <GoogleOAuthCredentialSelector
+      nodeId="email"
+      value="goac-connected"
+      onChange={onChange}
+      requiredScopes={[driveScope]}
+      ariaLabel="Gmail account"
+      showEmail
+      additionalAccounts={{ options, onSelect }}
+    />,
+  );
+  expect(mocks.useGoogleOAuthCredentials).toHaveBeenCalledWith({
+    includeEmail: true,
+  });
+  fireEvent.click(screen.getByRole("combobox", { name: "Gmail account" }));
+  expect(screen.getByRole("listbox").hasAttribute("data-private")).toBe(true);
+  expect(screen.getByRole("listbox").textContent).not.toMatch(/nango/i);
+  expect(
+    screen.getByRole("option", { name: "SYNTHETIC_EMAIL_LABEL" }),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByText("Gmail account · connected yesterday"));
+  expect(onSelect).toHaveBeenCalledExactlyOnceWith("nc_synthetic");
+  expect(onChange).not.toHaveBeenCalled();
+  rerender(
+    <GoogleOAuthCredentialSelector
+      nodeId="email"
+      value=""
+      onChange={onChange}
+      requiredScopes={[driveScope]}
+      ariaLabel="Gmail account"
+      showEmail
+      additionalAccounts={{ options, selectedId: "nc_synthetic", onSelect }}
+    />,
+  );
+  expect(onChange).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("combobox", { name: "Gmail account" }));
+  fireEvent.click(
+    screen.getByRole("option", { name: "SYNTHETIC_EMAIL_LABEL" }),
+  );
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("goac-connected");
+});
+
+test("can switch a connected Gmail account to a native template without autofilling", () => {
+  const onChange = vi.fn();
+  function Picker() {
+    const [value, setValue] = useState("");
+    const [connected, setConnected] = useState(true);
+    return (
+      <ReactFlowProvider>
+        <WorkflowScopeContext.Provider
+          value={{ workflowId: "workflow-test", readOnly: false }}
+        >
+          <GoogleOAuthCredentialSelector
+            nodeId="email"
+            value={value}
+            onChange={(id) => {
+              onChange(id);
+              setValue(id);
+              setConnected(false);
+            }}
+            requiredScopes={[driveScope]}
+            ariaLabel="Gmail account"
+            showEmail
+            additionalAccounts={{
+              options: [
+                {
+                  id: "nc_synthetic",
+                  label: "Gmail account · connected yesterday",
+                },
+              ],
+              selectedId: connected ? "nc_synthetic" : undefined,
+              onSelect: () => setConnected(true),
+            }}
+          />
+        </WorkflowScopeContext.Provider>
+      </ReactFlowProvider>
+    );
+  }
+  render(<Picker />);
+  fireEvent.click(screen.getByRole("combobox", { name: "Gmail account" }));
+  fireEvent.click(screen.getByText("Use template expression"));
+  expect(screen.getByRole("textbox", { name: "Gmail account" })).toBeTruthy();
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("");
+});

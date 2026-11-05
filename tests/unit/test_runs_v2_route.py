@@ -9,7 +9,7 @@ import httpx
 import orjson
 import pytest
 import pytest_asyncio
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, HTTPException, Request, Response
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from structlog.testing import capture_logs
@@ -25,7 +25,6 @@ from skyvern.forge.sdk.db.exceptions import RunsListSearchCanceled
 from skyvern.forge.sdk.db.models import WorkflowModel, WorkflowRunAttemptModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes import agent_protocol
-from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import org_auth_service
@@ -35,6 +34,7 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.runs import MAX_SEARCH_FETCH_LIMIT, TaskRunRequest
 from tests.unit.force_stub_app import make_workflow_run_attempts_fake
+from tests.unit.shared_route_app import shared_route_app
 from tests.unit.statement_timeout_fakes import statement_timeout_error
 
 
@@ -696,9 +696,7 @@ async def test_get_workflow_runs_timeout_advises_a_narrower_date_range(
 @pytest.mark.parametrize("path", ["/v1/workflows/runs", "/v1/agents/runs", "/api/v1/workflows/runs"])
 async def test_org_runs_routes_parse_created_at_bounds(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
     mock_service = _org_runs_service(monkeypatch, return_value=[])
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
+    fastapi_app = shared_route_app(monkeypatch)
     register_agent_route_aliases(fastapi_app)
     fastapi_app.dependency_overrides[org_auth_service.get_current_org] = lambda: SimpleNamespace(
         organization_id="org_123"
@@ -720,9 +718,8 @@ async def test_org_runs_routes_parse_created_at_bounds(monkeypatch: pytest.Monke
     assert kwargs["created_at_end"] == datetime(2026, 2, 1, tzinfo=UTC)
 
 
-def test_org_runs_openapi_documents_the_default_search_window() -> None:
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
+def test_org_runs_openapi_documents_the_default_search_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    fastapi_app = shared_route_app(monkeypatch)
     register_agent_route_aliases(fastapi_app)
     operation = fastapi_app.openapi()["paths"]["/v1/agents/runs"]["get"]
 
@@ -843,6 +840,8 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     mock_agent_function = SimpleNamespace(
         get_workflow_run_retry_refusal=AsyncMock(return_value=None),
         is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        browser_session_ids_authorized_for_connect=AsyncMock(return_value={"pbs_123"}),
+        should_redact_unresolved_browser_session_address=AsyncMock(return_value=False),
         on_run_created=AsyncMock(),
     )
     monkeypatch.setattr(app_instance, "AGENT_FUNCTION", mock_agent_function, raising=False)
@@ -1190,7 +1189,10 @@ def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     monkeypatch.setattr(
         app_instance,
         "AGENT_FUNCTION",
-        SimpleNamespace(on_run_created=on_run_created),
+        SimpleNamespace(
+            on_run_created=on_run_created,
+            browser_session_ids_authorized_for_connect=AsyncMock(return_value=set()),
+        ),
         raising=False,
     )
     monkeypatch.setattr(
@@ -1206,7 +1208,13 @@ def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     )
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
     monkeypatch.setattr(agent_protocol, "TaskRunRequest", lambda **kwargs: SimpleNamespace(**kwargs))
-    monkeypatch.setattr(agent_protocol, "TaskRunResponse", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    def task_run_response(**kwargs: Any) -> SimpleNamespace:
+        kwargs.setdefault("browser_session_id", None)
+        kwargs.setdefault("browser_address", None)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(agent_protocol, "TaskRunResponse", task_run_response)
     return on_run_created
 
 
@@ -1437,9 +1445,7 @@ async def creator_harness(
     monkeypatch.setattr(AsyncExecutorFactory, "get_executor", lambda: executor)
 
     current_user = {"id": "user_member"}
-    fastapi_app = FastAPI()
-    fastapi_app.include_router(base_router, prefix="/v1")
-    fastapi_app.include_router(legacy_base_router, prefix="/api/v1")
+    fastapi_app = shared_route_app(monkeypatch)
     fastapi_app.dependency_overrides[org_auth_service.get_current_caller_context] = lambda: SimpleNamespace(
         organization=organization, caller_id=current_user["id"], caller_type=CallerType.USER
     )

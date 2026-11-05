@@ -31,9 +31,9 @@ from urllib.parse import urlsplit
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.errors.errors import resolve_error_code_mapping_key
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     CompletionGateTerminationError,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -53,10 +53,12 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
-from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG, run_arm_enabled
+from skyvern.forge.taskv3.llm_call_params import fallback_error_class, rejects_carried_reasoning
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
+from skyvern.webeye import action_deadline
+from skyvern.webeye.action_deadline import under_action_deadline
 from skyvern.webeye.navigation import clear_task_nav_error_code, redact_url_secrets
 
 LOG = structlog.get_logger()
@@ -229,6 +231,8 @@ ToolOkClass = Literal[
 CoveredBranch = Literal[
     # The layer was named and its controls enumerated into the message.
     "named",
+    # A layer named only by its own text was quoted, with its controls, instead of told to be dismissed and retried.
+    "quoted",
     # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
     "challenge",
     # The walk qualified nothing, the hit was the field's OWN container, AND an ancestor was found
@@ -266,6 +270,10 @@ CoveredLayerKind = Literal[
     # The probe named no element at all.
     "unnamed",
 ]
+
+
+class _RefreshDisposition(Enum):
+    FAILED = "failed"
 
 
 @dataclass
@@ -332,6 +340,40 @@ class ToolRefusal(Exception):
 
     def as_result(self) -> ToolResult:
         return ToolResult("error", str(self), self.data, error_class=self.error_class, refused=True)
+
+
+@dataclass(frozen=True)
+class BlockingLayer:
+    """The live layer that refused a `type`, as the browser named it: an id the typing probe minted for that layer
+    node in its own realm, which the page cannot read or forge, plus a revision number that rises whenever the layer's
+    text or any control's state changes. Neither carries page text, so the loop can hold and compare them."""
+
+    token: str
+    state: str
+
+
+class LayerCheck(Enum):
+    # The target is still refused by the very layer the lease names, in the same state.
+    SAME = "same"
+    # The probe reached the target: nothing covers it now.
+    REACHABLE = "reachable"
+    # Covered by something else, the layer changed state, or the probe could not answer: the lease proves nothing.
+    OTHER = "other"
+
+
+# The `data` key a refused `type` carries its BlockingLayer on.
+BLOCKING_LAYER_DATA_KEY = "blocking_layer"
+
+
+@dataclass
+class _LayerEpisode:
+    """Held types against one lease, counted for a one-time warning and never to end the run. Kept apart from the
+    action-loop ledger, which page change elsewhere clears: a fresh read elsewhere is no evidence this layer went."""
+
+    lease: BlockingLayer
+    first_turn: int
+    count: int = 0
+    warned: bool = False
 
 
 # The tool-result `data` keys the target-name/target-kind capture ride on (written by the browser
@@ -816,6 +858,11 @@ class ToolSpec:
     # The selector, name and kind of the field a type call is about to enter, and whether the name is its placeholder,
     # read before it acts; set on type alone.
     answer_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, str, str, bool]]] | None = None
+    # Whether a type call's target is still refused by the layer an earlier type was refused by, read fresh before it
+    # acts. On SAME it also returns the refusal the full handler would give; set on type alone.
+    layer_probe: Callable[[dict[str, Any], BlockingLayer], Awaitable[tuple[LayerCheck, ToolResult | None]]] | None = (
+        None
+    )
 
     @property
     def touches_page(self) -> bool:
@@ -872,6 +919,8 @@ class LoopOutcome:
     converted_from: NonCompletedStatus | None = None
     converted_from_reason: str = ""
     unlisted_reask: dict[str, Any] | None = None
+    carried_reasoning_turns: int = 0
+    carry_reasoning_stripped: bool = False
     # The finish tool's completion gate approved this verdict, so the caller must not consult it again.
     gate_passed: bool = False
     # The model's own user-defined error code on a failed/terminated finish, re-validated against the mapping.
@@ -919,6 +968,13 @@ def _extract_reasoning_summary(response: Any) -> str | None:
     if message is None:
         return None
     return _get(message, "reasoning_content")
+
+
+def _extract_reasoning_items(response: Any) -> list[dict[str, Any]]:
+    message = _extract_message(response)
+    if message is None:
+        return []
+    return [item for item in _get(message, "reasoning_items") or [] if isinstance(item, dict)]
 
 
 def _extract_tool_calls(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
@@ -1029,6 +1085,13 @@ UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
 # completes such a block on one SUCCESSFUL step after retrying failed ones, and lets that step batch a
 # precursor; a v3 cap of 1 is spent by a hover, a precursor, or a click that failed without moving the page.
 ACTION_BLOCK_TARGET_ACTION_RESERVE = 2
+# Appended to a held type's refusal. The full typing path was not run for it.
+LAYER_HELD_NOTE = (
+    " Not attempted: the same layer refused an earlier type in this run and still covers this field, so every field "
+    "behind it is refused the same way until the layer is dealt with."
+)
+# How the held-retry warning names held types: per lease, whatever field or text each one named.
+LAYER_HELD_GUARD_TARGET = "fields behind the same covering layer"
 # Set on a click result once the driver's click returned, so a later verification error still reads as dispatched.
 CLICK_DISPATCHED_DATA_KEY = "click_dispatched"
 TARGET_ACTION_ROUND_EVENT = "taskv3 loop target action round"
@@ -1112,9 +1175,9 @@ def _dead_end_provenance(urls: tuple[object, ...], task_target_urls: Collection[
 PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 
 # A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
-# removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
-# verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
-# navigation. Facetable sibling of the classes above.
+# removed. Ends the run as `terminated`, matching v1's terminate verdict, for the pre-loop initial-URL
+# navigation and for an in-loop `navigate` on the granted final turn; any other in-loop dead end is returned to
+# the model. Facetable sibling of the classes above.
 NAV_DEAD_END_GUARD = "navigation_dead_end"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
@@ -1677,6 +1740,49 @@ async def _sample_probe(probe: Callable[[], Awaitable[str | None]], deadline_at:
         return await _bounded_probe(probe(), timeout=timeout)
     except Exception:
         return None
+
+
+TOOL_CALL_STARTED_EVENT = "taskv3 tool call started"
+TOOL_CALL_TIMED_OUT_EVENT = "taskv3 tool call timed out"
+# Let self-bounded tools return their own structured errors before the loop stops waiting.
+TOOL_CALL_DEADLINE_MARGIN_SECONDS = 600.0
+
+
+def _tool_call_budget_ms(deadline_at: float | None) -> int | None:
+    """Bound one call by the loop's remaining deadline plus its fixed margin. A missing deadline leaves it unbounded."""
+    if deadline_at is None:
+        return None
+    return round((max(deadline_at - time.monotonic(), 0.0) + TOOL_CALL_DEADLINE_MARGIN_SECONDS) * 1000)
+
+
+def _dispatch_bound_expired(exc: BaseException, started_at: float, budget_ms: int) -> bool:
+    """Distinguish this scope's expiry from a tool-owned one using elapsed time. The context manager's active headroom is part of that elapsed budget."""
+    if not isinstance(exc, ActionDeadlineExceeded):
+        return False
+    return (time.monotonic() - started_at) * 1000 >= budget_ms + action_deadline.ACTION_DEADLINE_HEADROOM_MS
+
+
+def _tool_call_timed_out(tool_name: str, budget_ms: int, *, call_site: str = "dispatch") -> ToolResult:
+    LOG.warning(TOOL_CALL_TIMED_OUT_EVENT, tool=tool_name, budget_ms=budget_ms, call_site=call_site)
+    if call_site == "dispatch":
+        # Only the handler can have partially applied the action before timing out.
+        message = (
+            f"{tool_name} did not finish within {budget_ms // 1000} s and was stopped; it may already have "
+            "taken effect. Observe the page before acting again."
+        )
+        data = {CLICK_DISPATCHED_DATA_KEY: True} if tool_name == "click" else None
+    else:
+        step = "pre-action capture" if call_site == "on_pre_action" else "page refresh"
+        message = (
+            f"{tool_name} was not dispatched because its {step} did not finish within {budget_ms // 1000} s; "
+            "the tool handler did not run. Observe the page before retrying."
+        )
+        data = None
+    return ToolResult.error(
+        message,
+        data=data,
+        error_class="timeout_other",
+    )
 
 
 # The code tool drives the page through Playwright directly, so the loop sees one tool call where an
@@ -2493,6 +2599,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "probe_scrolled",
         "hit_on_document_root",
         "caret_held",
+        "type_held_by_layer",
         "page_state_stall_rounds",
         "page_state_judged",
     }
@@ -4105,6 +4212,13 @@ class LoopState:
     # may only claim the page is unchanged when no sample in the streak left that fingerprint.
     action_counts: dict[tuple[str, str], tuple[int, int, str | None, bool]] = field(default_factory=dict)
     action_warned: set[tuple[str, str]] = field(default_factory=set)
+    # The layer the last refused type named. One at a time: a later refusal by another layer replaces it.
+    layer_lease: BlockingLayer | None = None
+    # The held retries against `layer_lease`. Retired with it, so a changed layer starts its own count and warning.
+    layer_episode: _LayerEpisode | None = None
+    # The args of the latest type the leased layer refused: a target known to sit behind it, rechecked when another
+    # target reads as reachable, so an uncovered field elsewhere is not taken for the layer having gone.
+    layer_witness: dict[str, Any] | None = None
     billable_actions: list[str] = field(default_factory=list)
     # Credential re-submit guard (SKY-16594), keyed on the placeholder token rather than the field:
     # the page re-renders between attempts, so an element-keyed rule is evaded by the very re-render
@@ -4131,6 +4245,8 @@ class LoopState:
     block_reserve_verdict: GoalVerdict | None = None
     target_action_rounds_granted: int = 0
     open_turn: _OpenTurn | None = None
+    carried_reasoning_turns: int = 0
+    carry_reasoning_stripped: bool = False
 
 
 async def run_agent_tool_loop(
@@ -4149,10 +4265,15 @@ async def run_agent_tool_loop(
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: ActionRoundSink | None = None,
     on_turn_start: TurnStart | None = None,
+    # Reads the turn number at each turn start; a returned string is appended as a user message.
+    turn_notice: Callable[[int], str | None] | None = None,
     on_turn_end: TurnEnd | None = None,
     # Awaited after each successful model call, before the turn touches the page.
     on_model_returned: Callable[[], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    # Keep each response's reasoning items on its assistant message; litellm's Responses bridge sends them back right
+    # before that message's calls. Only for a route whose main group can read the reasoning it returns.
+    carry_reasoning: bool = False,
     # Called with every look's images as the tool returns them, superseded ones included.
     on_look_screenshots: Callable[[list[bytes]], None] | None = None,
     # Called before each page-touching tool call is dispatched.
@@ -4230,6 +4351,9 @@ async def run_agent_tool_loop(
     unseen_text: UnseenPageText | None = None,
     anthropic_cache_markers: bool = False,
     initial_messages: list[dict[str, Any]] | None = None,
+    # Hold a type whose target the browser shows is still refused by the layer that refused an earlier type, instead
+    # of re-running the full typing path. Off dispatches every type as before.
+    same_layer_type_hold: bool = False,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -4256,6 +4380,50 @@ async def run_agent_tool_loop(
     def _clear_action_state() -> None:
         st.action_counts.clear()
         st.action_warned.clear()
+
+    async def _layer_check(
+        spec: ToolSpec, args: dict[str, Any], lease: BlockingLayer
+    ) -> tuple[LayerCheck, ToolResult | None]:
+        if spec.layer_probe is None:
+            return LayerCheck.OTHER, None
+        try:
+            return await spec.layer_probe(args, lease)
+        except Exception:
+            LOG.warning("taskv3 loop layer probe failed", tool="type", exc_info=True)
+            return LayerCheck.OTHER, None
+
+    def _retire_layer() -> None:
+        st.layer_lease = None
+        st.layer_episode = None
+        st.layer_witness = None
+
+    async def _held_by_layer(spec: ToolSpec, tool_name: str, args: dict[str, Any]) -> ToolResult | None:
+        """The refusal for a type the browser shows is still refused by the leased layer, or None to dispatch it."""
+        lease = st.layer_lease
+        if not same_layer_type_hold or tool_name != "type" or lease is None or spec.layer_probe is None:
+            return None
+        check, refusal = await _layer_check(spec, args, lease)
+        if check is LayerCheck.SAME and refusal is not None:
+            st.layer_witness = dict(args)
+            return ToolResult(
+                "error",
+                refusal.content + LAYER_HELD_NOTE,
+                refusal.data,
+                error_class=refusal.error_class or "covered",
+                refused=True,
+            )
+        if check is LayerCheck.REACHABLE:
+            # A field outside the layer, or inside it, is reachable while the layer still covers the rest; only a
+            # field the layer refused before, now not refused by it in the same state, shows the layer stopped applying.
+            witness = st.layer_witness
+            if (
+                witness is not None
+                and witness != args
+                and (await _layer_check(spec, witness, lease))[0] is LayerCheck.SAME
+            ):
+                return None
+        _retire_layer()
+        return None
 
     async def _close_turn() -> None:
         open_turn, st.open_turn = st.open_turn, None
@@ -4289,10 +4457,76 @@ async def run_agent_tool_loop(
         st.event_seq += 1
         st.last_change_evidence_seq = st.event_seq
 
-    async def _consume_refresh_signal(
-        ctx: SkyvernContext, tool_name: str, remaining: list[Any], round_actions: list[Any], *, drop: bool
+    def _skip_expired_batch_calls(remaining: list[tuple[str, str, dict[str, Any]]]) -> bool | None:
+        if deadline_at is None or time.monotonic() < deadline_at:
+            return False
+        if st.final_turn_granted and remaining and _is_finish(remaining[0][1]):
+            return False
+        ctx = skyvern_context.current()
+        preserve_refresh_for_finish = (
+            st.final_turn_granted
+            and reload_page is not None
+            and ctx is not None
+            and ctx.refresh_working_page
+            and any(_is_finish(tool_name) for _, tool_name, _ in remaining[1:])
+        )
+        if ctx is not None and not preserve_refresh_for_finish:
+            ctx.refresh_working_page = False
+        if st.final_turn_granted:
+            _append_skipped_tool_results(st.messages, remaining[:1], "the run deadline was reached before dispatch")
+            return None
+        _append_skipped_tool_results(st.messages, remaining, "the run deadline was reached before dispatch")
+        return True
+
+    def _append_timed_out_tool_call(
+        remaining: list[tuple[str, str, dict[str, Any]]],
+        tool_name: str,
+        budget_ms: int,
+        call_site: str,
+        *,
+        pending_tool_call_id: str | None,
     ) -> bool:
+        result = _tool_call_timed_out(tool_name, budget_ms, call_site=call_site)
+        if pending_tool_call_id is not None:
+            st.messages.append(
+                {"role": "tool", "tool_call_id": pending_tool_call_id, "name": tool_name, "content": result.content}
+            )
+            remaining = remaining[1:]
+        if st.final_turn_granted:
+            return False
+        _append_skipped_tool_results(st.messages, remaining, "the run deadline was reached before dispatch")
+        return True
+
+    async def _consume_refresh_signal(
+        ctx: SkyvernContext,
+        tool_name: str,
+        remaining: list[Any],
+        round_actions: list[Any],
+        *,
+        drop: bool,
+        pending_tool_call_id: str | None,
+    ) -> bool | None | _RefreshDisposition:
         """Clear the page-refresh signal and, unless dropped or past the cap, reload and void `remaining`."""
+        if pending_tool_call_id is not None:
+            expired_call = _skip_expired_batch_calls(remaining)
+            if expired_call is not False:
+                if expired_call is None and not drop:
+                    return _RefreshDisposition.FAILED
+                return expired_call
+        elif deadline_at is not None and time.monotonic() >= deadline_at:
+            ctx.refresh_working_page = False
+            LOG.info(
+                "taskv3 loop refresh signal dropped", tool=tool_name, turn=st.turns, reason="deadline_after_dispatch"
+            )
+            if not drop:
+                return _RefreshDisposition.FAILED
+            return False
+        if deadline_at is not None and time.monotonic() >= deadline_at and remaining and _is_finish(remaining[0][1]):
+            LOG.info("taskv3 loop refresh signal dropped", tool=tool_name, turn=st.turns, reason="deadline_finish")
+            if not drop:
+                return _RefreshDisposition.FAILED
+            ctx.refresh_working_page = False
+            return False
         ctx.refresh_working_page = False
         st.refresh_cycles += 1
         if activity is not None:
@@ -4319,9 +4553,27 @@ async def run_agent_tool_loop(
             return True
         if reload_page is not None:
             reload_record = ("reload_page", {"reason": "a page-level handler requested a refresh"})
+            reload_budget_ms = _tool_call_budget_ms(deadline_at)
+            reload_started_at = time.monotonic()
+            LOG.info(TOOL_CALL_STARTED_EVENT, tool=tool_name, call_site="page_refresh")
             try:
-                await reload_page()
-            except Exception:
+                async with under_action_deadline(budget_ms=reload_budget_ms):
+                    await reload_page()
+            except Exception as exc:
+                if reload_budget_ms is not None and _dispatch_bound_expired(exc, reload_started_at, reload_budget_ms):
+                    round_actions.append(RoundAction(*reload_record, False))
+                    ctx.refresh_working_page = pending_tool_call_id is not None
+                    st.reload_failed_nudge_due = True
+                    should_stop_batch = _append_timed_out_tool_call(
+                        remaining,
+                        tool_name,
+                        reload_budget_ms,
+                        "page_refresh",
+                        pending_tool_call_id=(
+                            None if remaining and _is_finish(remaining[0][1]) else pending_tool_call_id
+                        ),
+                    )
+                    return should_stop_batch if should_stop_batch else _RefreshDisposition.FAILED
                 # The page did not change, so nothing is re-baselined; the queued calls are still
                 # voided (they were chosen on a page declared stale), the signal is re-armed for
                 # another attempt (bounded by the cap), and the model is told the reload failed.
@@ -4546,16 +4798,37 @@ async def run_agent_tool_loop(
         active_call_kwargs["caller_owns_exhaustion_receipt"] = True
 
     def _degrade_call_params(exc: BaseException) -> bool:
-        """Drop one optional call param (the reasoning-summary dict, then the Claude cache markers for the rest
-        of the run) and report whether the turn is worth re-issuing.
+        """Drop one optional call param (the carried reasoning, then the reasoning-summary dict, then the Claude cache
+        markers for the rest of this loop) and report whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
-        on a run that was already failing. A context-window overflow or a refusal is excluded because
-        dropping a parameter provably cannot fix it. Dropping reasoning_effort reverts to the config's own
-        value, so a provider that rejects the dict form cannot end the run on turn 1.
+        on a run that was already failing. A refusal is excluded because dropping a parameter provably cannot fix
+        it, and so is a context-window overflow unless carried reasoning is part of the input. Dropping
+        reasoning_effort reverts to the config's own value, so a provider that rejects the dict form cannot end the
+        run on turn 1.
         """
-        nonlocal anthropic_cache_markers
-        if isinstance(exc, (SkyvernContextWindowExceededError, LLMContentFilteredError)):
+        nonlocal anthropic_cache_markers, carry_reasoning
+        if isinstance(exc, LLMContentFilteredError):
+            return False
+        # Before the overflow exclusion: the carried items count as input, so dropping them can fix an overflow.
+        if carry_reasoning and any("reasoning_items" in message for message in st.messages):
+            carry_reasoning = False
+            st.carry_reasoning_stripped = True
+            for message in st.messages:
+                message.pop("reasoning_items", None)
+            llm_caller.message_history = list(st.messages)
+            cause = exc.__cause__ or exc
+            LOG.warning(
+                "taskv3 loop retrying without optional call param",
+                dropped="reasoning_items",
+                carry_reasoning_stripped_on_error=type(cause).__name__,
+                status_code=getattr(cause, "status_code", None),
+                fallback_error=fallback_error_class(cause),
+                turn=st.turns,
+                exc_info=True,
+            )
+            return True
+        if isinstance(exc, SkyvernContextWindowExceededError):
             return False
         for param in ("reasoning_effort", "cache_control_injection_points"):
             if active_call_kwargs.pop(param, None) is not None:
@@ -4800,6 +5073,14 @@ async def run_agent_tool_loop(
                 # Read by the finish tool's hold gates: a hold's retry turn no longer exists.
                 activity.final_turn_active = True
         st.turns += 1
+        if turn_notice is not None:
+            try:
+                notice = turn_notice(st.turns)
+            except Exception:
+                LOG.warning("taskv3 turn_notice callback failed", turn=st.turns, exc_info=True)
+            else:
+                if notice:
+                    st.messages.append({"role": "user", "content": notice})
         if activity is not None:
             activity.deliver_batch_reads()
             activity.refresh_cycles_remaining = max_refresh_cycles - st.refresh_cycles
@@ -4867,6 +5148,16 @@ async def run_agent_tool_loop(
                 break
             except retryable_call_exceptions as exc:
                 call_attempt += 1
+                # A leg that cannot read the carried items rejects them every time; waiting out the transient budget
+                # only re-sends the doomed call.
+                if (
+                    carry_reasoning
+                    and any("reasoning_items" in message for message in st.messages)
+                    and rejects_carried_reasoning(exc.__cause__ or exc)
+                    and _degrade_call_params(exc)
+                ):
+                    call_attempt = max_call_retries
+                    continue
                 if call_attempt > max_call_retries:
                     # A provider rejecting the parameter surfaces here, not in the generic handler
                     # below: litellm's 400s subclass openai.APIError, which the LLM layer maps to
@@ -4938,6 +5229,16 @@ async def run_agent_tool_loop(
                 {"id": tool_call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
                 for tool_call_id, name, args in tool_calls
             ]
+        # Only reasoning the main group is known to have returned: its legs could not read what a fallback leg returned.
+        main_group = getattr(llm_caller.llm_config, "main_model_group", None)
+        served_group = getattr(llm_caller, "last_served_model_group", None)
+        if (
+            carry_reasoning
+            and (main_group is None or served_group == main_group)
+            and (reasoning_items := _extract_reasoning_items(response))
+        ):
+            assistant_message["reasoning_items"] = reasoning_items
+            st.carried_reasoning_turns += 1
         st.messages.append(assistant_message)
 
         if not tool_calls:
@@ -4991,6 +5292,7 @@ async def run_agent_tool_loop(
         # and a verdict written before the failure was seen may be wrong or mis-reasoned.
         failed_selectors: set[str] = set()
         batch_had_failure = False
+        layer_nudge_due = False
         if unseen_text is not None:
             unseen_text.batch.clear()
             unseen_text.held = False
@@ -5060,6 +5362,13 @@ async def run_agent_tool_loop(
                 _append_skipped_tool_results(st.messages, tool_calls[idx:], "run canceled")
                 break
             spec = tool_by_name.get(tool_name)
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
             call_selector = _call_selector(args)
             if marks_stale and call_selector is not None and call_selector.startswith("mark="):
                 if activity is not None:
@@ -5086,24 +5395,6 @@ async def run_agent_tool_loop(
                         "tool_call_id": tool_call_id,
                         "name": tool_name,
                         "content": f"skipped: depends on an earlier call in this batch on {call_selector} that failed",
-                    }
-                )
-                continue
-            if (batch_had_failure or batch_entry_unconfirmed) and _is_finish(tool_name):
-                # Any verdict queued behind the failure was written before the model saw it: a completed
-                # one may be false, and a failed/terminated one carries a reason that predates the error.
-                st.messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "name": tool_name,
-                        "content": (
-                            "skipped: a field in this batch failed before this verdict was reached; "
-                            "re-observe, then finish with a status that reflects the failure"
-                            if batch_had_failure
-                            else "skipped: a field in this batch could not confirm the value it was given before this "
-                            "verdict was reached; check that field, then finish"
-                        ),
                     }
                 )
                 continue
@@ -5404,13 +5695,32 @@ async def run_agent_tool_loop(
                                 "a further action was past the block's step limit"
                             )
                             # Through the real handler, so every guard on a completed verdict still applies.
-                            try:
-                                block_finish = await finish_spec.handler(
-                                    {"status": "completed", "reason": block_reason}
-                                )
-                            except Exception:
-                                LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                            if deadline_at is not None and time.monotonic() >= deadline_at:
                                 block_finish = ToolResult.error("")
+                            else:
+                                block_finish_budget_ms = _tool_call_budget_ms(deadline_at)
+                                block_finish_started_at = time.monotonic()
+                                LOG.info(
+                                    TOOL_CALL_STARTED_EVENT, tool=finish_spec.name, call_site="block_completion_offer"
+                                )
+                                try:
+                                    async with under_action_deadline(budget_ms=block_finish_budget_ms):
+                                        block_finish = await finish_spec.handler(
+                                            {"status": "completed", "reason": block_reason}
+                                        )
+                                except Exception as block_finish_exc:
+                                    if block_finish_budget_ms is not None and _dispatch_bound_expired(
+                                        block_finish_exc, block_finish_started_at, block_finish_budget_ms
+                                    ):
+                                        LOG.warning(
+                                            TOOL_CALL_TIMED_OUT_EVENT,
+                                            tool=finish_spec.name,
+                                            budget_ms=block_finish_budget_ms,
+                                            call_site="block_completion_offer",
+                                        )
+                                    else:
+                                        LOG.warning("taskv3 block completion finish raised", exc_info=True)
+                                    block_finish = ToolResult.error("")
                             if block_finish.status == "ok" and (block_finish.data or {}).get("status") == "completed":
                                 st.outcome = LoopOutcome("completed", block_reason)
                                 break
@@ -5462,20 +5772,67 @@ async def run_agent_tool_loop(
             # gone leaves no artifacts; the recheck right before the handler covers the awaits below.
             hook_ctx = skyvern_context.current()
             if hook_ctx is not None and hook_ctx.refresh_working_page:
-                if await _consume_refresh_signal(
-                    hook_ctx, tool_name, tool_calls[idx:], round_actions, drop=reload_page is None
-                ):
+                refresh_action = await _consume_refresh_signal(
+                    hook_ctx,
+                    tool_name,
+                    tool_calls[idx:],
+                    round_actions,
+                    drop=reload_page is None,
+                    pending_tool_call_id=tool_call_id,
+                )
+                if refresh_action is True:
                     break
+                if refresh_action is _RefreshDisposition.FAILED:
+                    batch_had_failure = True
+                    if not _is_finish(tool_name):
+                        continue
+                    hook_ctx.refresh_working_page = False
+                if refresh_action is None:
+                    if spec is not None and spec.touches_page:
+                        batch_had_failure = True
+                    continue
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
             if (
                 spec is not None
                 and on_pre_action is not None
                 and tool_name != "solve_captcha"
                 and _arms_failure_evidence(tool_name, args, True)
             ):
+                pre_action_budget_ms = _tool_call_budget_ms(deadline_at)
+                pre_action_started_at = time.monotonic()
+                LOG.info(TOOL_CALL_STARTED_EVENT, tool=tool_name, call_site="on_pre_action")
                 try:
-                    await on_pre_action(tool_name, args)
-                except Exception:
+                    async with under_action_deadline(budget_ms=pre_action_budget_ms):
+                        await on_pre_action(tool_name, args)
+                except Exception as exc:
+                    if pre_action_budget_ms is not None and _dispatch_bound_expired(
+                        exc, pre_action_started_at, pre_action_budget_ms
+                    ):
+                        batch_had_failure = True
+                        should_stop_batch = _append_timed_out_tool_call(
+                            tool_calls[idx:],
+                            tool_name,
+                            pre_action_budget_ms,
+                            "on_pre_action",
+                            pending_tool_call_id=tool_call_id,
+                        )
+                        if should_stop_batch:
+                            break
+                        continue
                     LOG.warning("taskv3 on_pre_action callback failed", tool=tool_name, exc_info=True)
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
             # Sampled before dispatch so an error below can be checked for having moved the page even
             # when the tool set no flag (a raised exception carries none). Not billed to the tool's timing.
             probe_before: str | None = None
@@ -5497,10 +5854,56 @@ async def run_agent_tool_loop(
             # legacy per-action check does; the model chose it on a page that is gone.
             pre_ctx = skyvern_context.current()
             if pre_ctx is not None and pre_ctx.refresh_working_page:
-                if await _consume_refresh_signal(
-                    pre_ctx, tool_name, tool_calls[idx:], round_actions, drop=reload_page is None
-                ):
+                refresh_action = await _consume_refresh_signal(
+                    pre_ctx,
+                    tool_name,
+                    tool_calls[idx:],
+                    round_actions,
+                    drop=reload_page is None,
+                    pending_tool_call_id=tool_call_id,
+                )
+                if refresh_action is True:
                     break
+                if refresh_action is _RefreshDisposition.FAILED:
+                    batch_had_failure = True
+                    if not _is_finish(tool_name):
+                        continue
+                    pre_ctx.refresh_working_page = False
+                if refresh_action is None:
+                    if spec is not None and spec.touches_page:
+                        batch_had_failure = True
+                    continue
+            deadline_action = _skip_expired_batch_calls(tool_calls[idx:])
+            if deadline_action is True:
+                break
+            if deadline_action is None:
+                if spec is not None and spec.touches_page:
+                    batch_had_failure = True
+                continue
+            if _is_finish(tool_name):
+                ctx = skyvern_context.current()
+                if ctx is not None and reload_page is not None and ctx.refresh_working_page:
+                    batch_had_failure = True
+                if batch_had_failure or batch_entry_unconfirmed:
+                    # A queued verdict predates a failed page call or required refresh, so none of its statuses
+                    # is grounded in the state the model would have seen afterward.
+                    if ctx is not None and deadline_at is not None and time.monotonic() >= deadline_at:
+                        ctx.refresh_working_page = False
+                    st.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "content": (
+                                "skipped: a call in this batch failed before this verdict was reached; "
+                                "re-observe, then finish with a status that reflects the failure"
+                                if batch_had_failure
+                                else "skipped: a field in this batch could not confirm the value it was given before "
+                                "this verdict was reached; check that field, then finish"
+                            ),
+                        }
+                    )
+                    continue
             # Charged only once the call is really dispatched: a call voided by a refresh spent nothing.
             st.total_tool_calls += 1
             if activity is not None:
@@ -5531,6 +5934,7 @@ async def run_agent_tool_loop(
             st.event_seq += 1
             dispatch_seq = st.event_seq
             browser_gone = False
+            layer_held_call = False
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             elif refuse_navigation and tool_name in URL_CHANGING_TOOLS:
@@ -5546,22 +5950,43 @@ async def run_agent_tool_loop(
             else:
                 if spec.billable:
                     turn_dispatched_billable = True
+                tool_budget_ms = _tool_call_budget_ms(deadline_at)
+                LOG.info(TOOL_CALL_STARTED_EVENT, tool=tool_name, call_site="dispatch")
                 try:
-                    result = await spec.handler(args)
+                    async with under_action_deadline(budget_ms=tool_budget_ms):
+                        held = await _held_by_layer(spec, tool_name, args)
+                        if held is not None:
+                            layer_held_call = True
+                            result = held
+                        else:
+                            result = await spec.handler(args)
                 except ToolRefusal as refusal:
                     result = refusal.as_result()
                 except Exception as exc:
-                    LOG.warning(
-                        "taskv3 tool handler raised",
-                        tool=tool_name,
-                        exc_info=True,
-                        **_navigate_record_fields(tool_name, args, None),
-                    )
-                    browser_gone = _is_browser_gone(exc)
-                    raised_class = _raised_error_class(exc)
-                    result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
+                    if tool_budget_ms is not None and _dispatch_bound_expired(exc, tool_started_at, tool_budget_ms):
+                        if spec.touches_page:
+                            batch_had_failure = True
+                        result = _tool_call_timed_out(tool_name, tool_budget_ms)
+                    else:
+                        LOG.warning(
+                            "taskv3 tool handler raised",
+                            tool=tool_name,
+                            exc_info=True,
+                            **_navigate_record_fields(tool_name, args, None),
+                        )
+                        browser_gone = _is_browser_gone(exc)
+                        raised_class = _raised_error_class(exc)
+                        result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
+            held_lease = st.layer_lease if layer_held_call else None
+            if same_layer_type_hold and tool_name == "type" and not layer_held_call:
+                blocker = (result.data or {}).get(BLOCKING_LAYER_DATA_KEY)
+                if isinstance(blocker, BlockingLayer) and blocker != st.layer_lease:
+                    st.layer_lease = blocker
+                    st.layer_episode = None
+                if isinstance(blocker, BlockingLayer):
+                    st.layer_witness = dict(args)
             news_at = (result.data or {}).get("delta_at")
             # A delta can show only lines an earlier read held back (flushed after this call's read failed, or filling the
             # char budget ahead of this call's own lines): that is the page from before this call, so it counts as a
@@ -5650,6 +6075,8 @@ async def run_agent_tool_loop(
                     cost_fields["covered_branch"] = covered["branch"]
                     cost_fields["covered_controls"] = covered["controls"]
                     cost_fields["covered_layer_kind"] = covered["layer_kind"]
+                    if tool_name == "type":
+                        cost_fields["type_held_by_layer"] = layer_held_call
             elif result.ok_class is not None:
                 # Prefixed for the same flat-index reason as `tool_error_class` above. NOT defaulted
                 # the way that field is: it is emitted only by tools whose `ok` spans distinct
@@ -5944,6 +6371,15 @@ async def run_agent_tool_loop(
                         st.novel_action_seq = dispatch_seq
                 if st.progress is not None:
                     st.progress.on_billable()
+                episode = st.layer_episode if held_lease is not None else None
+                if held_lease is not None and (episode is None or episode.lease != held_lease):
+                    episode = st.layer_episode = _LayerEpisode(held_lease, first_turn=st.turns)
+                if episode is not None:
+                    # Feedback only: the count drives one warning and never ends the run, since fields behind a layer
+                    # being refused says nothing about the rest of the task. The ledger below still sees the actual call.
+                    episode.count += 1
+                    if action_nudge_after is not None and episode.count >= action_nudge_after and not episode.warned:
+                        layer_nudge_due = True
                 # Errored and refused dispatches count too: a repeat-failing action is the same
                 # no-progress pathology. It does not bound refusals (a stale one resets it);
                 # UNCHARGED_REFUSAL_GRACE does.
@@ -6060,14 +6496,18 @@ async def run_agent_tool_loop(
                 # Consumed whether or not it can be acted on: the context outlives this run, and a
                 # signal left set would fire on the first action of the next block.
                 verdict_stands = spec is not None and spec.terminal and result.status == "ok"
-                if await _consume_refresh_signal(
+                refresh_action = await _consume_refresh_signal(
                     skyvern_ctx,
                     tool_name,
                     tool_calls[idx + 1 :],
                     round_actions,
                     drop=reload_page is None or verdict_stands,
-                ):
+                    pending_tool_call_id=None,
+                )
+                if refresh_action is True:
                     break
+                if refresh_action is None or refresh_action is _RefreshDisposition.FAILED:
+                    batch_had_failure = True
 
             dead_end_status = result_data.get("navigation_dead_end")
             if dead_end_status is not None:
@@ -6233,14 +6673,11 @@ async def run_agent_tool_loop(
                 st.final_turn_staged_output = staged
 
         # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
-        # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
-        # failed/terminated choice to the model's finish tool (which does not converge on this class).
+        # recovered): the navigate's result is returned to the model, except on the granted final turn, where
+        # no turn is left to act on it and the run ends terminated rather than budget_exhausted.
         if st.outcome is None and st.pending_nav_dead_end is not None:
             dead = st.pending_nav_dead_end
-            # Not on the granted final turn: with no turn left to act on it, a return would end the run budget_exhausted.
-            returned = not (activity is not None and activity.final_turn_active) and run_arm_enabled(
-                DEAD_END_RETURN_FLAG, settings.TASK_V3_DEAD_END_RETURN
-            )
+            returned = not (activity is not None and activity.final_turn_active)
             LOG.info(
                 "taskv3 loop navigation dead end",
                 http_status=dead.status,
@@ -6394,6 +6831,18 @@ async def run_agent_tool_loop(
                         page_moved=page_moved,
                     )
                 nudge_parts.append(_action_nudge_text(still_stuck, set(tool_by_name), page_moved=page_moved))
+        episode = st.layer_episode
+        if st.outcome is None and layer_nudge_due and episode is not None and not episode.warned:
+            if episode.first_turn < st.turns:
+                episode.warned = True
+                LOG.info("taskv3 loop action repeat nudged", tool="type", repeat_count=episode.count, turn=st.turns)
+                nudge_parts.append(
+                    _action_nudge_text(
+                        [("type", {"selector": LAYER_HELD_GUARD_TARGET}, episode.count)],
+                        set(tool_by_name),
+                        page_moved=None,
+                    )
+                )
         if nudge_parts:
             st.messages.append({"role": "user", "content": "\n\n".join(nudge_parts)})
 
@@ -6462,6 +6911,8 @@ async def run_agent_tool_loop(
     )
 
     st.outcome.turns = st.turns
+    st.outcome.carried_reasoning_turns = st.carried_reasoning_turns
+    st.outcome.carry_reasoning_stripped = st.carry_reasoning_stripped
     st.outcome.no_tool_call_turns = st.no_tool_call_turns
     st.outcome.tool_calls = st.total_tool_calls
     st.outcome.tool_seconds = st.tool_seconds

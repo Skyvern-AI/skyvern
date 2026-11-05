@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -9,7 +11,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import yaml
 from agents import FunctionTool
-from agents.tool_context import ToolContext
 from pydantic import ValidationError
 from structlog.testing import capture_logs
 
@@ -22,13 +23,16 @@ from skyvern.forge.sdk.copilot.agent import _build_narrative_payload
 from skyvern.forge.sdk.copilot.code_block_steps import UserOwnedGoalCarry, user_owned_goal_carry_disclosure
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
-from skyvern.forge.sdk.copilot.output_utils import sanitize_tool_result_for_llm
+from skyvern.forge.sdk.copilot.output_utils import BUILD_TEST_PACKET_KEY, sanitize_tool_result_for_llm
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.tools import _mark_credential_deferred_draft
+from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
 from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
 from skyvern.forge.sdk.copilot.tools.run_execution import _packet_workflow_readback
 from skyvern.forge.sdk.copilot.tools.workflow_update import (
     _PERSISTENCE_MESSAGES,
+    CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+    CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR,
     _update_workflow,
     carry_author_time_findings,
     copilot_workflow_yaml_matches,
@@ -39,6 +43,8 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinit
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.workflows import WorkflowCreateYAMLRequest, WorkflowStatus
 from skyvern.utils.yaml_loader import safe_load_no_dates
+from tests.unit.conftest import invoke_copilot_tool
+from tests.unit.copilot_route_test_support import install_candidate_store
 from tests.unit.copilot_test_helpers import make_copilot_ctx, stub_copilot_agent_loop
 
 
@@ -434,7 +440,7 @@ async def test_a_same_label_type_change_reports_the_saved_note_as_dropped(monkey
 
 
 @pytest.mark.asyncio
-async def test_flag_off_reports_dropped_note_labels_without_returning_note_text(
+async def test_flag_off_says_nothing_about_dropped_notes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def prior(_ctx: CopilotContext) -> None:
@@ -467,8 +473,7 @@ async def test_flag_off_reports_dropped_note_labels_without_returning_note_text(
     )
 
     assert result["ok"] is True
-    assert result["data"]["stored_notes_dropped"] == ["lookup"]
-    assert "stored_notes_dropped_text" not in result["data"]
+    assert not any(key.startswith("stored_notes_dropped") for key in result["data"])
     assert "Check the official page." not in str(result["data"])
 
 
@@ -958,15 +963,6 @@ def _authoring_ctx(workflow_yaml: str = "") -> CopilotContext:
     return ctx
 
 
-async def _invoke(tool: FunctionTool, ctx: CopilotContext, arguments: dict[str, Any]) -> dict[str, Any]:
-    raw_arguments = json.dumps(arguments)
-    raw = await tool.on_invoke_tool(
-        ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call_submit", tool_arguments=raw_arguments),
-        raw_arguments,
-    )
-    return json.loads(raw)
-
-
 @pytest.fixture
 def dispatch(monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None) -> AsyncMock:
     monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
@@ -982,7 +978,7 @@ async def test_first_submission_persists_punctuated_values_and_exact_code_then_d
     submitted = _first_submission()
     ctx = _authoring_ctx()
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.update_and_run_blocks_tool, ctx, {"workflow": submitted, "block_labels": ["collect_members"]}
     )
 
@@ -1005,7 +1001,7 @@ async def test_first_submission_of_an_ordinary_workflow_persists_and_dispatches_
     }
     ctx = _authoring_ctx()
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.update_and_run_blocks_tool, ctx, {"workflow": submitted, "block_labels": ["collect_members"]}
     )
 
@@ -1021,7 +1017,7 @@ async def test_first_submission_with_an_unknown_block_type_keeps_its_validation_
     expected = await _update_workflow({"workflow_yaml": yaml.safe_dump(invalid, sort_keys=False)}, _authoring_ctx())
     ctx = _authoring_ctx()
 
-    result = await _invoke(
+    result = await invoke_copilot_tool(
         tools_module.update_and_run_blocks_tool, ctx, {"workflow": invalid, "block_labels": ["collect_members"]}
     )
 
@@ -1032,17 +1028,383 @@ async def test_first_submission_with_an_unknown_block_type_keeps_its_validation_
     dispatch.assert_not_awaited()
 
 
+_EDIT_ARGUMENTS = {
+    "label": "collect_members",
+    "expected_code": "rows = {\"key\": 'value: x'}",
+    "replacement_code": "rows = {\"key\": 'value: y'}",
+}
+_PUBLISHING_TOOL_CALLS = [
+    pytest.param(tools_module.update_workflow_tool, {"workflow": _first_submission()}, id="update_workflow"),
+    pytest.param(
+        tools_module.update_and_run_blocks_tool,
+        {"workflow": _first_submission(), "block_labels": ["collect_members"]},
+        id="update_and_run_blocks",
+    ),
+    pytest.param(tools_module.edit_block_tool, _EDIT_ARGUMENTS, id="edit_block"),
+    pytest.param(tools_module.edit_block_and_run_tool, _EDIT_ARGUMENTS, id="edit_block_and_run"),
+]
+_UNAVAILABLE_FACTS = {
+    "workflow_permanent_id": "wfp-1",
+    "candidate_published": False,
+    "test_started": False,
+    "detail": CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+}
+_TEST_START_UNAVAILABLE_FACTS = {
+    "workflow_permanent_id": "wfp-1",
+    "test_started": False,
+    "detail": CANONICAL_WORKFLOW_UNAVAILABLE_TEST_ERROR,
+}
+
+
+def _bound_ctx() -> CopilotContext:
+    ctx = _authoring_ctx(yaml.safe_dump(_first_submission(), sort_keys=False))
+    ctx.workflow_copilot_chat_id = "wcc-bound"
+    ctx.turn_id = "turn-1"
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "arguments"), _PUBLISHING_TOOL_CALLS)
+async def test_publication_against_an_active_canonical_publishes_the_candidate(
+    monkeypatch: pytest.MonkeyPatch, dispatch: AsyncMock, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    candidate_store = install_candidate_store(monkeypatch)
+    canonical = await _process_workflow_yaml(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=yaml.safe_dump(_first_submission(), sort_keys=False),
+    )
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=canonical))
+    ctx = _bound_ctx()
+
+    result = await invoke_copilot_tool(tool, ctx, arguments)
+
+    assert result["ok"] is True, result
+    candidate_store.assert_awaited_once()
+    assert ctx.has_staged_proposal is True
+    assert ctx.canonical_workflow_unavailable is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "arguments"), _PUBLISHING_TOOL_CALLS)
+async def test_publication_against_a_missing_canonical_returns_typed_facts_without_staging(
+    monkeypatch: pytest.MonkeyPatch, dispatch: AsyncMock, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    candidate_store = install_candidate_store(monkeypatch)
+    lookup = AsyncMock(return_value=None)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", lookup)
+    ctx = _bound_ctx()
+
+    result = await invoke_copilot_tool(tool, ctx, arguments)
+
+    assert {call.kwargs["workflow_permanent_id"] for call in lookup.await_args_list} == {"wfp-1"}
+    assert result["ok"] is False
+    assert result["canonical_workflow_unavailable"] == _UNAVAILABLE_FACTS
+    assert ctx.canonical_workflow_unavailable == _UNAVAILABLE_FACTS
+    candidate_store.assert_not_awaited()
+    dispatch.assert_not_awaited()
+    assert (ctx.has_staged_proposal, ctx.staged_workflow, ctx.staged_workflow_yaml) == (False, None, None)
+    assert ctx.last_workflow is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "arguments"), _PUBLISHING_TOOL_CALLS)
+async def test_tool_publication_refusal_after_a_failed_test_is_not_rewritten_into_a_draft_claim(
+    monkeypatch: pytest.MonkeyPatch, dispatch: AsyncMock, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    install_candidate_store(monkeypatch)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    ctx = _bound_ctx()
+    ctx.last_test_ok = False
+    ctx.last_update_block_count = 1
+    ctx.last_test_failure_reason = "The page timed out."
+
+    result = await invoke_copilot_tool(tool, ctx, arguments)
+    model_reply = result["error"]
+    agent_result = await copilot_agent._translate_to_agent_result(
+        SimpleNamespace(final_output=json.dumps({"type": "REPLY", "user_response": model_reply}), new_items=[]),
+        ctx,
+        global_llm_context=None,
+        chat_request=SimpleNamespace(
+            workflow_id=ctx.workflow_id,
+            workflow_permanent_id="wfp-1",
+            workflow_copilot_chat_id="wcc-bound",
+            workflow_run_id=None,
+            workflow_yaml="",
+            product_action=None,
+        ),
+        organization_id=ctx.organization_id,
+    )
+
+    assert result["canonical_workflow_unavailable"] == _UNAVAILABLE_FACTS
+    assert agent_result.user_response == model_reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        pytest.param(
+            tools_module.update_and_run_blocks_tool,
+            {"workflow": _first_submission(), "block_labels": ["collect_members"]},
+            id="update_and_run_blocks",
+        ),
+        pytest.param(tools_module.edit_block_and_run_tool, _EDIT_ARGUMENTS, id="edit_block_and_run"),
+    ],
+)
+async def test_agent_removed_after_the_update_half_published_reports_only_the_refused_test(
+    monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None, tool: FunctionTool, arguments: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=None))
+    candidate_store = install_candidate_store(monkeypatch)
+    canonical = await _process_workflow_yaml(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=yaml.safe_dump(_first_submission(), sort_keys=False),
+    )
+
+    async def active_until_published(**_: object) -> Workflow | None:
+        return None if candidate_store.await_count else canonical
+
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", active_until_published)
+    draft_version = AsyncMock()
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "create_copilot_dispatch_draft_version", draft_version)
+    ctx = _bound_ctx()
+
+    result = await invoke_copilot_tool(tool, ctx, arguments)
+
+    candidate_store.assert_awaited_once()
+    draft_version.assert_not_awaited()
+    assert result["canonical_workflow_unavailable"] == _TEST_START_UNAVAILABLE_FACTS
+
+
+async def _test_button_handoff(ctx: CopilotContext) -> dict[str, Any]:
+    items = await copilot_agent._run_end_to_end_test_turn(ctx, workflow_yaml=ctx.workflow_yaml or "")
+    return json.loads(items[-1]["output"])
+
+
+_TestStart = Callable[[CopilotContext], Awaitable[dict[str, Any]]]
+_TEST_STARTS = [
+    pytest.param(
+        lambda ctx: invoke_copilot_tool(tools_module.run_blocks_tool, ctx, {"block_labels": ["collect_members"]}),
+        True,
+        id="run_blocks_and_collect_debug",
+    ),
+    pytest.param(
+        lambda ctx: invoke_copilot_tool(tools_module.test_workflow_from_blank_browser_tool, ctx, {}),
+        True,
+        id="test_workflow_from_blank_browser",
+    ),
+    pytest.param(_test_button_handoff, False, id="test_button_handoff_to_the_model"),
+]
+
+
+async def _test_start_ctx(monkeypatch: pytest.MonkeyPatch, canonical: Workflow | None, staged: bool) -> CopilotContext:
+    ctx = _bound_ctx()
+    if staged:
+        ctx.staged_workflow = await _process_workflow_yaml(
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            organization_id="org-1",
+            workflow_yaml=ctx.workflow_yaml,
+        )
+        ctx.staged_workflow_yaml = ctx.workflow_yaml
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=canonical))
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("start_test", "staged"), _TEST_STARTS)
+async def test_test_start_against_a_missing_canonical_returns_typed_facts_without_a_version_or_run(
+    monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None, start_test: _TestStart, staged: bool
+) -> None:
+    ctx = await _test_start_ctx(monkeypatch, canonical=None, staged=staged)
+    ctx.last_test_ok = True
+    ctx.last_successful_run_blocks_workflow_run_id = "wr_prior"
+    staged_before = (ctx.staged_workflow, ctx.staged_workflow_yaml, ctx.has_staged_proposal)
+    select_snapshot = AsyncMock(return_value=None)
+    draft_version = AsyncMock()
+    monkeypatch.setattr(run_execution_module, "_select_execution_snapshot", select_snapshot)
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "create_copilot_dispatch_draft_version", draft_version)
+
+    result = await start_test(ctx)
+
+    assert result["ok"] is False
+    assert result["canonical_workflow_unavailable"] == _TEST_START_UNAVAILABLE_FACTS
+    assert ctx.canonical_workflow_unavailable == _TEST_START_UNAVAILABLE_FACTS
+    select_snapshot.assert_not_awaited()
+    draft_version.assert_not_awaited()
+    assert not ctx.dispatched_run_ids_this_turn
+    assert (ctx.staged_workflow, ctx.staged_workflow_yaml, ctx.has_staged_proposal) == staged_before
+    assert (ctx.last_test_ok, ctx.last_successful_run_blocks_workflow_run_id) == (True, "wr_prior")
+    assert BUILD_TEST_PACKET_KEY not in result.get("data", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("start_test", "staged"), _TEST_STARTS)
+async def test_test_start_against_an_active_canonical_proceeds_to_snapshot_selection(
+    monkeypatch: pytest.MonkeyPatch, no_saved_workflow: None, start_test: _TestStart, staged: bool
+) -> None:
+    canonical = await _process_workflow_yaml(
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        organization_id="org-1",
+        workflow_yaml=yaml.safe_dump(_first_submission(), sort_keys=False),
+    )
+    ctx = await _test_start_ctx(monkeypatch, canonical=canonical, staged=staged)
+    select_snapshot = AsyncMock(return_value=None)
+    monkeypatch.setattr(run_execution_module, "_select_execution_snapshot", select_snapshot)
+
+    result = await start_test(ctx)
+
+    select_snapshot.assert_awaited()
+    assert "canonical_workflow_unavailable" not in result
+    assert ctx.canonical_workflow_unavailable is None
+
+
 @pytest.mark.asyncio
 async def test_add_block_splices_a_punctuated_multiline_block(dispatch: AsyncMock) -> None:
     ctx = _authoring_ctx(yaml.safe_dump(_first_submission(), sort_keys=False))
     new_block = {"block_type": "code", "label": "report_members", "code": _MULTILINE_CODE}
 
-    result = await _invoke(tools_module.add_block_tool, ctx, {"after_label": "collect_members", "block": new_block})
+    result = await invoke_copilot_tool(
+        tools_module.add_block_tool, ctx, {"after_label": "collect_members", "block": new_block}
+    )
 
     assert result["ok"] is True, result
     assert ctx.staged_workflow is not None
     spliced = ctx.staged_workflow.workflow_definition.blocks[1]
     assert (spliced.label, spliced.code) == ("report_members", _MULTILINE_CODE)
+
+
+_SEEDED_STORED_YAML = """title: Seeded export
+workflow_definition:
+  parameters:
+    - {parameter_type: workflow, key: seed_rows, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: chosen_credential, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: profile_key, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: page_size, workflow_parameter_type: string}
+    - {parameter_type: credential, key: portal_login, credential_id: chosen_credential}
+  blocks:
+    - block_type: code
+      label: Read_Account
+      code: |
+        return {"output": page_size}
+      next_block_label: Seed_Rows
+    - block_type: code
+      label: Seed_Rows
+      parameter_keys: [seed_rows, chosen_credential, profile_key, page_size]
+      code: |
+        return {"output": [seed_rows, chosen_credential, profile_key, page_size]}
+"""
+
+
+@pytest.mark.asyncio
+async def test_delete_block_reports_only_the_inputs_nothing_left_reads(
+    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prior = await _process_workflow_yaml(
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        organization_id="o",
+        workflow_yaml="browser_profile_key: '{{ profile_key }}'\n" + _SEEDED_STORED_YAML,
+    )
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", AsyncMock(return_value=prior))
+    ctx = _authoring_ctx(_SEEDED_STORED_YAML)
+
+    result = await invoke_copilot_tool(
+        tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": None}
+    )
+
+    assert result["ok"] is True, result
+    assert result["data"]["inputs_only_read_by_deleted_block"] == ["seed_rows"]
+    assert "seed_rows" in {p.key for p in ctx.staged_workflow.workflow_definition.parameters}
+
+
+_COLD_START_STORED_YAML = """title: Seeded export
+workflow_definition:
+  parameters:
+    - {parameter_type: workflow, key: seed_rows, workflow_parameter_type: string}
+    - {parameter_type: workflow, key: page_size, workflow_parameter_type: string}
+  blocks:
+    - block_type: code
+      label: Read_Account
+      parameter_keys: [page_size]
+      code: |
+        return {"output": page_size}
+      next_block_label: Seed_Rows
+    - block_type: code
+      label: Seed_Rows
+      code: |
+        return {"output": seed_rows}
+"""
+
+
+@pytest.mark.asyncio
+async def test_delete_block_on_cold_start_names_an_input_only_the_code_read(
+    dispatch: AsyncMock,
+) -> None:
+    ctx = _authoring_ctx(_COLD_START_STORED_YAML)
+
+    result = await invoke_copilot_tool(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
+
+    assert result["ok"] is True, result
+    assert result["data"]["inputs_only_read_by_deleted_block"] == ["seed_rows"]
+
+
+@pytest.mark.asyncio
+async def test_delete_block_counts_a_saved_note_the_write_carries_back_as_a_read(
+    dispatch: AsyncMock,
+) -> None:
+    ctx = _authoring_ctx(_COLD_START_STORED_YAML)
+    ctx.persisted_workflow_yaml = _COLD_START_STORED_YAML.replace(
+        "      label: Read_Account\n", "      label: Read_Account\n      notes: 'Pages through {{ seed_rows }}'\n"
+    )
+
+    result = await invoke_copilot_tool(tools_module.delete_block_tool, ctx, {"label": "Seed_Rows"})
+
+    assert result["ok"] is True, result
+    assert ctx.staged_workflow.workflow_definition.blocks[0].notes == "Pages through {{ seed_rows }}"
+    assert result["data"]["inputs_only_read_by_deleted_block"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_block_removes_an_input_a_remaining_template_still_reads(
+    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stored = _COLD_START_STORED_YAML.replace(
+        "    - block_type: code\n      label: Read_Account\n      parameter_keys: [page_size]\n"
+        '      code: |\n        return {"output": page_size}\n',
+        "    - block_type: goto_url\n      label: Read_Account\n      url: 'https://example.test/{{ page_size }}'\n",
+    )
+    ctx = _authoring_ctx(stored)
+
+    result = await invoke_copilot_tool(
+        tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": ["page_size"]}
+    )
+
+    assert result["ok"] is True, result
+    definition = ctx.staged_workflow.workflow_definition
+    assert "page_size" not in {p.key for p in definition.parameters}
+    assert [b.label for b in definition.blocks] == ["Read_Account"]
+
+
+@pytest.mark.asyncio
+async def test_delete_block_leaves_the_workflow_unwritten_when_a_remaining_block_lists_a_removed_input(
+    dispatch: AsyncMock,
+) -> None:
+    ctx = _authoring_ctx(_COLD_START_STORED_YAML)
+
+    result = await invoke_copilot_tool(
+        tools_module.delete_block_tool, ctx, {"label": "Seed_Rows", "remove_parameters": ["page_size"]}
+    )
+
+    assert result["ok"] is False
+    assert "page_size" in result["error"]
+    assert ctx.staged_workflow is None
+    assert ctx.last_workflow_yaml in (None, "")
 
 
 def test_workflow_write_tools_take_objects_not_yaml_strings() -> None:
@@ -1104,6 +1466,85 @@ async def test_a_proposal_kept_out_only_by_a_canvas_edit_is_recorded_for_the_not
 
     assert await workflow_update_module._validated_pending_workflow_proposal(ctx) is None
     assert ctx.canvas_rejected_proposal_yaml == proposal_yaml
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canvas_edit",
+    [
+        {"blocks": [{"block_type": "code", "label": "typed_on_canvas", "code": "return {}"}]},
+        {"description": "Pulls the monthly statement"},
+        {"enable_self_healing": True},
+    ],
+)
+async def test_a_follow_up_turn_on_a_blank_saved_workflow_deletes_a_block_from_the_retitling_proposal(
+    dispatch: AsyncMock, monkeypatch: pytest.MonkeyPatch, canvas_edit: dict[str, Any]
+) -> None:
+    now = datetime.now(UTC)
+    stored = Workflow(
+        workflow_id="w",
+        organization_id="o",
+        workflow_permanent_id="wp",
+        title="Named agent",
+        description="",
+        version=1,
+        is_saved_task=False,
+        workflow_definition=WorkflowDefinition(parameters=[], blocks=[]),
+        created_at=now,
+        modified_at=now,
+    )
+    proposal_yaml = _COLD_START_STORED_YAML.replace("title: Seeded export", "title: Proposed title")
+    proposal = {
+        "_copilot_yaml": proposal_yaml,
+        "_copilot_proposal": {
+            "owner_turn_id": "turn-1",
+            "revision": 1,
+            "canonical_fingerprint": workflow_update_module.proposal_workflow_fingerprint(stored),
+            "disposition": "review_tested",
+        },
+    }
+    chat = SimpleNamespace(workflow_permanent_id="wp", proposed_workflow=proposal)
+
+    async def publish(**kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            proposed_workflow={
+                **kwargs["proposal"],
+                "_copilot_proposal": {**proposal["_copilot_proposal"], "revision": 2},
+            }
+        )
+
+    monkeypatch.setattr(app.DATABASE.workflow_params, "get_workflow_copilot_chat_by_id", AsyncMock(return_value=chat))
+    monkeypatch.setattr(app.DATABASE.workflow_params, "publish_workflow_copilot_candidate", publish)
+    monkeypatch.setattr(app.DATABASE.workflows, "get_workflow_by_permanent_id", AsyncMock(return_value=stored))
+    monkeypatch.setattr(app.DATABASE.workflows, "acquire_workflow_creation_lock", lambda _key: nullcontext())
+
+    def ctx(blocks: list[dict[str, str]], **fields: Any) -> CopilotContext:
+        canvas = {
+            "title": "Named agent",
+            "description": None,
+            **fields,
+            "workflow_definition": {"parameters": [], "blocks": blocks},
+        }
+        follow_up = _authoring_ctx(yaml.safe_dump(canvas))
+        follow_up.organization_id, follow_up.workflow_id, follow_up.workflow_permanent_id = "o", "w", "wp"
+        follow_up.workflow_copilot_chat_id = "chat"
+        return follow_up
+
+    blank = ctx([])
+    await workflow_update_module.restore_pending_workflow_proposal(blank)
+    result = await invoke_copilot_tool(
+        tools_module.delete_block_tool, blank, {"label": "Seed_Rows", "remove_parameters": ["seed_rows"]}
+    )
+
+    assert result["ok"] is True, result
+    definition = blank.staged_workflow.workflow_definition
+    assert [b.label for b in definition.blocks] == ["Read_Account"]
+    assert "seed_rows" not in {p.key for p in definition.parameters}
+
+    edited = ctx(**{"blocks": [], **canvas_edit})
+    await workflow_update_module.restore_pending_workflow_proposal(edited)
+    assert edited.staged_workflow is None
+    assert edited.canvas_rejected_proposal_yaml == proposal_yaml
 
 
 @pytest.mark.asyncio

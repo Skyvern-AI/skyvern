@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import async_playwright
+from playwright.async_api import Page, async_playwright
 
 from skyvern.forge.sdk.browser_action_policy import AuthorityState, RuntimeOriginAuthority, canonicalize_origin
 from skyvern.forge.sdk.browser_network_egress_monitor import BrowserNetworkEgressMonitor
@@ -44,6 +44,14 @@ def _authority(url: str) -> RuntimeOriginAuthority:
     return RuntimeOriginAuthority(AuthorityState.ESTABLISHED, frozenset({origin}))
 
 
+async def _goto_blocked(page: Page, url: str) -> None:
+    # Chromium fails goto when the request is blocked and only then commits the error page that replaces the
+    # document, so an evaluate sent before that commit can lose its execution context.
+    async with page.expect_event("framenavigated", lambda frame: frame == page.main_frame):
+        with pytest.raises(PlaywrightError, match="ERR_BLOCKED_BY_CLIENT"):
+            await page.goto(url)
+
+
 @pytest.mark.asyncio
 async def test_real_chromium_arbitrates_active_requests_and_contains_passive_egress() -> None:
     allowed_handler = type("AllowedHandler", (_RecordingHandler,), {"received_paths": []})
@@ -53,7 +61,7 @@ async def test_real_chromium_arbitrates_active_requests_and_contains_passive_egr
         ThreadingHTTPServer(("127.0.0.1", 0), blocked_handler),
     ]
     for server in servers:
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     allowed_origin = f"http://127.0.0.1:{servers[0].server_port}"
     blocked_origin = f"http://127.0.0.1:{servers[1].server_port}"
 
@@ -113,14 +121,12 @@ async def test_real_chromium_arbitrates_active_requests_and_contains_passive_egr
                         [f"{allowed_origin}/same-origin-redirect", f"{blocked_origin}/blocked"],
                     )
                     await page.wait_for_timeout(100)
-                    with pytest.raises(PlaywrightError):
-                        await page.goto(f"{allowed_origin}/second")
+                    await _goto_blocked(page, f"{allowed_origin}/second")
 
                     monitor.unregister_active_request_interceptor(page=page, owner=cdp_session)
                     await cdp_session.send("Fetch.disable")
                     await cdp_session.detach()
-                    with pytest.raises(PlaywrightError):
-                        await page.goto(f"{allowed_origin}/unmonitored")
+                    await _goto_blocked(page, f"{allowed_origin}/unmonitored")
                     await page.evaluate(
                         "url => document.body.append(Object.assign(document.createElement('img'), {src: url}))",
                         f"{allowed_origin}/passive-after-detach",

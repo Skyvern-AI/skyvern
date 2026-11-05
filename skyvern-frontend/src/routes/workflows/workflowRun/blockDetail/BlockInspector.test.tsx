@@ -303,3 +303,34 @@ describe("BlockInspector Gmail send outcome", () => {
     expect(screen.queryByText(/not sent|nothing was sent/i)).toBeNull();
   });
 });
+
+describe("BlockInspector Power BI query output", () => {
+  it("renders the direct row array without a response wrapper", () => {
+    render(
+      <BlockInspector
+        block={buildBlock({
+          block_type: "powerbi_query",
+          output: [{ "Product Name": "Widget", "Net Sales": 17 }],
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/Product Name: "Widget"/)).toBeDefined();
+    expect(screen.queryByText(/rows:/i)).toBeNull();
+  });
+
+  it("shows the standard safe failure reason in the summary", () => {
+    const safeFailure = "Power BI query could not be completed.";
+    render(
+      <BlockInspector
+        block={buildBlock({
+          block_type: "powerbi_query",
+          status: Status.Failed,
+          failure_reason: safeFailure,
+        })}
+      />,
+    );
+
+    expect(screen.getByText(safeFailure)).toBeDefined();
+  });
+});

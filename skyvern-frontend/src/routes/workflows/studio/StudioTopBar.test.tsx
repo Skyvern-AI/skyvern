@@ -24,6 +24,7 @@ import {
 import { ProxyLocation, Status } from "@/api/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import {
   clearDeferredEdits,
   deferredEdits,
@@ -57,6 +58,9 @@ vi.mock("../editor/hooks/useSaveWorkflow", () => ({
   useSaveWorkflow: () => saveWorkflowSpy,
 }));
 vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
+vi.mock("../editor/doc/DocRunButton", () => ({
+  DocRunButton: () => <div data-testid="doc-run" />,
+}));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
 }));
@@ -78,7 +82,15 @@ import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
 import { taskNodeDefaultData } from "../editor/nodes/TaskNode/types";
 
-import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
+import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
+import { useDocRunStore } from "../editor/doc/docRunStore";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
+import {
+  RunStopButton,
+  SaveButton,
+  TitleSection,
+  TopBarRunControl,
+} from "./StudioTopBar";
 
 // jsdom lacks ResizeObserver, which Radix's tooltip popper constructs once a
 // tooltip opens. Install it for this suite only and restore afterward.
@@ -391,6 +403,7 @@ function renderSaveButton() {
 // list. Each case here has `contentDirty` stale-false to exercise that gap.
 describe("SaveButton confirmation gating", () => {
   afterEach(() => {
+    useCopilotProposalStore.setState({ proposal: null });
     useWorkflowSnapshotStore.getState().clearSnapshot();
     useWorkflowHasChangesStore.setState({
       getSaveData: () => null,
@@ -442,6 +455,23 @@ describe("SaveButton confirmation gating", () => {
       expect(save.matches(":disabled")).toBe(false);
     },
   );
+
+  test("disables Save while the Doc has a pending Copilot proposal", () => {
+    useCopilotProposalStore.setState({ proposal: {} as never });
+
+    renderSaveButton();
+    const save = screen.getByRole("button", {
+      name: "Save workflow",
+      description: "Resolve the Copilot proposal before saving.",
+    });
+    expect(save.matches(":disabled")).toBe(true);
+
+    fireEvent.click(save);
+    expect(saveWorkflowSpy).not.toHaveBeenCalled();
+
+    act(() => useCopilotProposalStore.setState({ proposal: null }));
+    expect(save.matches(":disabled")).toBe(false);
+  });
 
   test("confirms a dirty draft even when contentDirty is stale-false", () => {
     const clean = saveData([block("a", { url: "x" })]);
@@ -1019,5 +1049,74 @@ describe("RunStopButton on an agent with no blocks", () => {
     fireEvent.click(runButton);
     expect(screen.queryByText("Start a full run?")).toBeNull();
     expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+  });
+});
+
+describe("RunStopButton while the Doc lists problems", () => {
+  afterEach(() => {
+    useRunValidationStore.setState({
+      docProblemCount: 0,
+      docShowFirstProblem: null,
+    });
+  });
+
+  test("Run stays enabled; a click says what to fix, jumps to it and starts nothing", () => {
+    workflowRunQueryMock.mockReturnValue({ data: undefined });
+    const showFirstProblem = vi.fn();
+    useRunValidationStore.setState({
+      docProblemCount: 2,
+      docShowFirstProblem: showFirstProblem,
+    });
+    renderAt("/workflows/wpid_1/studio");
+
+    const runButton = screen.getByRole("button", { name: "Run" });
+    expect(runButton.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(runButton);
+
+    expect(showFirstProblem).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("location")).toBeNull();
+  });
+});
+
+describe("TopBarRunControl with the Doc as the editor", () => {
+  beforeEach(() => {
+    useWorkflowPresentationStore.setState({
+      enabled: true,
+      presentation: "doc",
+    });
+    useDocRunStore.setState({ mounted: true });
+  });
+  afterEach(() => {
+    useWorkflowPresentationStore.setState({
+      enabled: false,
+      presentation: "visual",
+    });
+    useDocRunStore.setState({ mounted: false });
+  });
+
+  test("the Doc owns Run only while its pane is open and no block run is going", () => {
+    mockRun(Status.Completed);
+    renderAt("/workflows/wpid_1/studio?panes=editor", <TopBarRunControl />);
+    expect(screen.queryByTestId("doc-run")).not.toBeNull();
+    cleanup();
+
+    // Watching a run with the editor pane closed: the hidden Doc must not take the shared control.
+    renderAt(
+      "/workflows/wpid_1/studio?wr=wr_1&panes=overview",
+      <TopBarRunControl />,
+    );
+    expect(screen.queryByTestId("doc-run")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Re-run|Run/ })).not.toBeNull();
+    cleanup();
+
+    // A live block run keeps Stop with a full run beside it.
+    mockRun(Status.Running);
+    renderAt(
+      "/workflows/wpid_1/studio?panes=editor&wr=wr_1&bl=Block%201",
+      <TopBarRunControl />,
+    );
+    expect(screen.queryByTestId("doc-run")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
   });
 });

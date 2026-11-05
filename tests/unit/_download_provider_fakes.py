@@ -133,12 +133,16 @@ class _GatedCleanupObservation:
         self.started = asyncio.Event()
         self.cleanup_started = asyncio.Event()
         self.cleanup_finished = False
+        self.poll_finished = False
 
     async def poll_and_materialize(self, *, destination_dir: Path, deadline: float) -> None:
         self.started.set()
         try:
-            await asyncio.Event().wait()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleanup_started.set()
+                await self._gate.wait()
+                self.cleanup_finished = True
         finally:
-            self.cleanup_started.set()
-            await self._gate.wait()
-            self.cleanup_finished = True
+            self.poll_finished = True

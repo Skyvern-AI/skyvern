@@ -63,6 +63,62 @@ describe("UI session refresh", () => {
     );
   }
 
+  it.each([
+    [
+      "/email-forwarding/addresses",
+      "Email 2FA forwarding requires the Pro plan.",
+      false,
+    ],
+    [
+      "/email-forwarding/configs",
+      {
+        error_code: "organization_admin_required",
+        message: "Your role (Builder) can't do this.",
+      },
+      false,
+    ],
+    ["/email-forwarding/addresses", "Invalid authentication method", true],
+    ["/workflows", "Email 2FA forwarding requires the Pro plan.", true],
+  ] as const)(
+    "keeps permission and session failures distinct for %s: %s",
+    async (path, detail, authFailure) => {
+      const fetchMock = vi.fn().mockImplementation(mintedSession);
+      vi.stubGlobal("fetch", fetchMock);
+      const { getClient, initializeUiSession } = await import("./AxiosClient");
+      const { useAuthIssueStore } = await import("@/store/AuthIssueStore");
+      await initializeUiSession();
+      fetchMock.mockClear();
+      const client = await getClient(null, "sans-api-v1");
+      const adapter = vi.fn<AxiosAdapter>(async (config) => {
+        throw new AxiosError(
+          "Forbidden",
+          AxiosError.ERR_BAD_REQUEST,
+          config,
+          undefined,
+          {
+            data: { detail },
+            status: 403,
+            statusText: "Forbidden",
+            headers: {},
+            config,
+          },
+        );
+      });
+      client.defaults.adapter = adapter;
+      await expect(client.get(path)).rejects.toBeInstanceOf(AxiosError);
+      expect(adapter).toHaveBeenCalledTimes(authFailure ? 2 : 1);
+      expect(fetchMock).toHaveBeenCalledTimes(authFailure ? 1 : 0);
+      if (authFailure) {
+        expect(useAuthIssueStore.getState().issue).toMatchObject({
+          statusCode: 403,
+          detail,
+        });
+      } else {
+        expect(useAuthIssueStore.getState().issue).toBeNull();
+      }
+    },
+  );
+
   it("still mints after a single non-JSON response from an endpoint that exists", async () => {
     const fetchMock = vi
       .fn()

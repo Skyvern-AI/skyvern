@@ -60,6 +60,7 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot import enforcement as enforcement_module
 from skyvern.forge.sdk.copilot import runtime as runtime_module
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot import vault_logins as vault_logins_module
 from skyvern.forge.sdk.copilot.agent import (
     _build_goal_satisfied_exit_result,
     _format_chat_history,
@@ -73,6 +74,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_TRACE_PER_TASK_LIMIT,
     BuildTestConnectFailure,
@@ -167,6 +169,7 @@ from skyvern.forge.sdk.copilot.tools.credentials import (
     _credential_run_approval_error,
     _extract_credential_ids_for_labels,
 )
+from skyvern.forge.sdk.copilot.tools.workflow_update import CANONICAL_WORKFLOW_UNAVAILABLE_ERROR
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_halt import (
     CopilotTurnHalt,
@@ -178,9 +181,10 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks, workflow_credential_ids
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.routes.workflow_copilot import CHAT_HISTORY_CONTEXT_MESSAGES
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ConnectedAccountChoice, ResponseKind, TurnOutcome
-from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.schemas.credentials import Credential, CredentialVaultType
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
@@ -190,6 +194,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatSender,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunStatus
 from skyvern.schemas.proxy_location import ProxyLocation
@@ -199,7 +204,7 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
 from tests.unit._copilot_workflow_fakes import fake_workflow
-from tests.unit.copilot_route_test_support import narrative_payload_with_run
+from tests.unit.copilot_route_test_support import install_candidate_store, narrative_payload_with_run
 from tests.unit.copilot_test_helpers import FakeCopilotStream
 from tests.unit.copilot_test_helpers import make_copilot_ctx as _ctx
 from tests.unit.copilot_test_helpers import make_verified_goal_contract as _verified_goal_contract
@@ -491,7 +496,7 @@ async def test_interrupted_draft_turn_restoration_and_run_hydration_stay_coheren
     async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
         seeded.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
-        return SimpleNamespace(finished=True)
+        return SimpleNamespace(finished=True, run=None)
 
     async def hydrate_run(ctx: CopilotContext, *, workflow_run_id: str) -> dict[str, dict[str, str]]:
         hydrated.append((workflow_run_id, ctx.workflow_yaml, ctx.proposal_workflow_run_id))
@@ -587,7 +592,7 @@ async def test_a_plain_continuation_names_reusable_origin_inputs_before_any_run(
     async def seed_run(ctx: CopilotContext, *, workflow_run_id: str | None) -> SimpleNamespace:
         seeded.append(workflow_run_id)
         ctx.repair_origin_input_values = (origin_run_input("resume", "s3://bucket/resume.pdf"),)
-        return SimpleNamespace(finished=True)
+        return SimpleNamespace(finished=True, run=None)
 
     hydrate_run = AsyncMock(return_value=None)
     monkeypatch.setattr(agent_module, "restore_pending_workflow_proposal", AsyncMock(return_value=None))
@@ -723,6 +728,35 @@ class TestFailedTestResponseNormalization:
             "Keep the draft to iterate on, or discard."
         )
 
+    def test_browser_start_capacity_refusal_reports_its_facts_and_never_claims_a_test_ran(self) -> None:
+        refusal = BuildTestConnectFailure(
+            state="browser_start_capacity",
+            starting_sessions=12,
+            max_starting_sessions=10,
+            retry_after_seconds=17,
+        )
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+            last_test_failure_reason=build_test_connect_failure_sentence(refusal),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=refusal,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        for fact in ("12", "10", "17"):
+            assert fact in rewritten
+        assert "I tested the draft" not in rewritten
+
     def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
         ctx = _challenge_failure_ctx()
         ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
@@ -769,11 +803,6 @@ class TestFailedTestResponseNormalization:
         ("branch", "lead"),
         [
             (
-                "credentials_unbound",
-                "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-                "the required credentials. Add them in Credentials, then I can try again.",
-            ),
-            (
                 "billing",
                 "I couldn't start a test. Build test did not start because credits are exhausted. "
                 "No browser or run started. Upgrade your plan in Billing. The draft is untested.",
@@ -798,10 +827,7 @@ class TestFailedTestResponseNormalization:
             last_test_failure_reason="Login rejected.",
             last_test_proxy_owned_failure=True,
         )
-        if branch == "credentials_unbound":
-            ctx.last_test_ok = None
-            ctx.request_policy = RequestPolicy(clarification_reason="workflow_credential_inputs_unbound")
-        elif branch == "billing":
+        if branch == "billing":
             ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -1162,26 +1188,6 @@ workflow_definition:
 
         assert _should_surface_untested_draft_despite_question(ctx, "ASK_QUESTION") is True
         assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
-
-    def test_rewrite_uses_credential_framing_when_policy_flags_unbound_inputs(self) -> None:
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=12,
-            last_test_ok=None,
-            request_policy=RequestPolicy(
-                clarification_reason="workflow_credential_inputs_unbound",
-                allow_run_blocks=False,
-                allow_missing_credentials_in_draft=True,
-            ),
-        )
-        rewritten = _rewrite_failed_test_response("agent text", ctx)
-
-        assert rewritten == (
-            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-            "the required credentials. Add them in Credentials, then I can try again. agent text "
-            "Keep the draft to iterate on, or discard."
-        )
 
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(
@@ -4453,6 +4459,70 @@ class TestTranslateToAgentResultGating:
         assert ctx.last_workflow_yaml == "title: Prior"
         emit.assert_not_awaited()
 
+    @pytest.mark.parametrize("prior_test_failed", [False, True], ids=["first-attempt", "after-failed-test"])
+    def test_inline_replace_canonical_unavailable_replies_without_staging(
+        self, monkeypatch, prior_test_failed: bool
+    ) -> None:
+        prior = SimpleNamespace(name="prior")
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=SimpleNamespace(name="replacement")),
+        )
+        lookup = AsyncMock(return_value=None)
+        monkeypatch.setattr(forge_app.DATABASE.workflows, "get_workflow_by_permanent_id", lookup)
+        candidate_store = install_candidate_store(monkeypatch)
+        emit = AsyncMock()
+        monkeypatch.setattr(agent_module, "emit_workflow_draft", emit)
+        ctx = _ctx(
+            workflow_copilot_chat_id="wcc-test",
+            stream=MagicMock(),
+            last_workflow=prior,
+            last_workflow_yaml="title: Prior",
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+        if prior_test_failed:
+            ctx.last_test_ok = False
+            ctx.last_update_block_count = 2
+            ctx.last_test_failure_reason = "The page timed out."
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                _fake_run_result(
+                    {
+                        "type": "REPLACE_WORKFLOW",
+                        "user_response": "Here is the replacement.",
+                        "workflow_yaml": "title: Replacement",
+                    }
+                ),
+                ctx,
+                global_llm_context=None,
+                chat_request=_chat_request(),
+                organization_id="org-1",
+            )
+        )
+
+        facts = {
+            "workflow_permanent_id": "wfp-1",
+            "candidate_published": False,
+            "test_started": False,
+            "detail": CANONICAL_WORKFLOW_UNAVAILABLE_ERROR,
+        }
+        assert agent_result.response_type == "REPLY"
+        assert CANONICAL_WORKFLOW_UNAVAILABLE_ERROR in agent_result.user_response
+        assert ctx.canonical_workflow_unavailable == facts
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["canonicalWorkflowUnavailable"] == facts
+        assert {call.kwargs["workflow_permanent_id"] for call in lookup.await_args_list} == {"wfp-1"}
+        assert (ctx.last_workflow, ctx.last_workflow_yaml, ctx.has_staged_proposal) == (prior, "title: Prior", False)
+        assert (
+            agent_result.updated_workflow,
+            agent_result.has_staged_proposal,
+            agent_result.proposal_disposition,
+            agent_result.clear_proposed_workflow,
+        ) == (None, False, "no_proposal", True)
+        candidate_store.assert_not_awaited()
+        emit.assert_not_awaited()
+
     def test_inline_replace_workflow_uses_request_policy_authority(self, monkeypatch) -> None:
         replacement = fake_workflow(name="diagnose-repair")
         process_mock = AsyncMock(return_value=replacement)
@@ -4474,6 +4544,101 @@ class TestTranslateToAgentResultGating:
         assert agent_result.response_type == "REPLACE_WORKFLOW"
         assert ctx.last_workflow is replacement
         assert agent_result.updated_workflow is None
+
+    def test_inline_replace_workflow_refuses_a_bitwarden_parameter_moved_off_its_item_sites(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=fake_workflow(name="moved")),
+        )
+        monkeypatch.setattr(vault_logins_module, "list_vault_logins", AsyncMock(return_value=VaultLoginListing()))
+        legacy_id = "bitwarden_login_credential:item_1"
+        ctx = _ctx(
+            request_policy=RequestPolicy(
+                allow_update_workflow=True,
+                existing_workflow_credential_origins={legacy_id: ["https://portal.example.com"]},
+            )
+        )
+        moved = yaml.safe_dump(
+            {
+                "title": "Sign in",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "key": "portal_login",
+                            "parameter_type": "bitwarden_login_credential",
+                            "bitwarden_item_id": "item_1",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "login",
+                            "label": "sign_in",
+                            "url": "https://other.example.com/login",
+                            "parameter_keys": ["portal_login"],
+                        }
+                    ],
+                },
+            }
+        )
+        result = _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Moved it.", "workflow_yaml": moved})
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert agent_result.updated_workflow is None
+        assert ctx.last_workflow is None
+
+    def test_inline_replace_workflow_refuses_a_new_bitwarden_parameter_on_its_item_site(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            AsyncMock(return_value=fake_workflow(name="added")),
+        )
+        listed = VaultLogin(
+            vault_type=CredentialVaultType.BITWARDEN_CONNECTED,
+            vault_id="org_vault",
+            item_id="item_1",
+            title="Portal",
+            urls=("https://portal.example.com/login",),
+            sites=(LoginSite("https://portal.example.com", whole_site=False),),
+        )
+        monkeypatch.setattr(
+            vault_logins_module, "list_vault_logins", AsyncMock(return_value=VaultLoginListing(logins=(listed,)))
+        )
+        ctx = _ctx(request_policy=RequestPolicy(allow_update_workflow=True))
+        added = yaml.safe_dump(
+            {
+                "title": "Sign in",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "key": "portal_login",
+                            "parameter_type": "bitwarden_login_credential",
+                            "bitwarden_item_id": "item_1",
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "login",
+                            "label": "sign_in",
+                            "url": "https://portal.example.com/login",
+                            "parameter_keys": ["portal_login"],
+                        }
+                    ],
+                },
+            }
+        )
+        result = _fake_run_result({"type": "REPLACE_WORKFLOW", "user_response": "Added it.", "workflow_yaml": added})
+
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        assert ctx.last_workflow is None
 
     @pytest.mark.parametrize(
         "request_policy",

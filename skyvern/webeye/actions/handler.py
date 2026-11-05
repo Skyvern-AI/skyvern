@@ -135,6 +135,7 @@ from skyvern.forge.sdk.api.llm.exceptions import BaseLLMError, LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import extraction_shape_matches, validate_and_fill_extraction_result
 from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import starts_like_pdf
 from skyvern.forge.sdk.browser_action_preflight import preflight_action, preflight_derived_action
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.copilot.block_goal_wrapping import unwrap_goal_fields
@@ -624,6 +625,14 @@ def _is_totp_sentinel(value: Any) -> bool:
     return value in {BitwardenConstants.TOTP, OnePasswordConstants.TOTP, AzureVaultConstants.TOTP}
 
 
+def _is_card_secret_parameter(task: Task, parameter: str | None, *, resolved_to_a_secret: bool) -> bool:
+    """A card secret always resolves to a value other than its id, so a parameter that resolved to
+    itself is never one -- checking that first keeps a plain page value off the card-masking path."""
+    if not resolved_to_a_secret:
+        return False
+    return app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(task.workflow_run_id, parameter)
+
+
 async def _apply_secret_visual_mask_if_needed(
     skyvern_element: SkyvernElement,
     *,
@@ -631,23 +640,28 @@ async def _apply_secret_visual_mask_if_needed(
     is_secret_value: bool,
     is_totp_value: bool,
     is_totp_sequence: bool = False,
+    is_card_secret: bool = False,
 ) -> None:
-    if not settings.ENABLE_SECRET_VISUAL_MASKING or not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(
-        workflow_run_id
-    ):
+    if not settings.ENABLE_SECRET_VISUAL_MASKING:
         return
-    if is_secret_value or is_totp_value or is_totp_sequence:
+    # A card number or CVV stays masked even when the workflow never opted in: the mask is CSS-only,
+    # so it cannot change what the page submits, and plaintext card data is legible for as long as
+    # the run's screenshots and recording are retained.
+    if not is_card_secret and not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(workflow_run_id):
+        return
+    if is_secret_value or is_totp_value or is_totp_sequence or is_card_secret:
         await skyvern_element.apply_secret_visual_mask()
 
 
 async def _apply_active_element_secret_visual_mask_if_needed(
-    page: Page, text: str | None, workflow_run_id: str | None
+    page: Page, text: str | None, workflow_run_id: str | None, *, is_card_secret: bool = False
 ) -> None:
-    if (
-        not settings.ENABLE_SECRET_VISUAL_MASKING
-        or not text
-        or not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(workflow_run_id)
-    ):
+    if not settings.ENABLE_SECRET_VISUAL_MASKING or not text:
+        return
+    if is_card_secret:
+        await apply_secret_visual_mask_to_active_element(page)
+        return
+    if not app.WORKFLOW_CONTEXT_MANAGER.mask_secrets_enabled_for_run(workflow_run_id):
         return
     try:
         secret_values = app.WORKFLOW_CONTEXT_MANAGER.get_secret_values_for_run(
@@ -2635,6 +2649,15 @@ def _deduplicate_new_downloaded_file_paths(
             continue
 
         if checksum in seen_checksums:
+            if starts_like_pdf(fp) is not False:
+                # A PDF capture, or one whose first bytes cannot be read, stays on disk; outputs list verified content once.
+                LOG.info(
+                    "Keeping duplicate PDF download from single action",
+                    file=os.path.basename(fp),
+                    duplicate_of=os.path.basename(seen_checksums[checksum]),
+                    checksum=checksum,
+                )
+                continue
             LOG.info(
                 "Removing duplicate downloaded file from single action",
                 file=os.path.basename(fp),
@@ -3805,6 +3828,21 @@ async def _two_frames_passed(
     return frames is True
 
 
+async def _clear_unverified_secret(skyvern_element: SkyvernElement) -> None:
+    # The ActionFailure only skips this step's submit, so a field left holding the unverified value lets a
+    # later step send a wrong credential toward an account lockout, and a non-password field's value reaches
+    # prompts through the scraper (a scramble is a reordering, so exact-value redaction misses it). Clearing
+    # is best effort: the mismatch stands whether or not it lands.
+    try:
+        await skyvern_element.input_clear()
+    except Exception as exc:
+        LOG.warning(
+            "Could not clear the credential field after a read-back mismatch",
+            element_id=skyvern_element.get_id(),
+            error_type=type(exc).__name__,
+        )
+
+
 async def _fill_secret_with_readback(
     *,
     skyvern_element: SkyvernElement,
@@ -3944,6 +3982,7 @@ async def _fill_secret_with_readback(
         "Secret input read-back mismatch after retry",
         element_id=skyvern_element.get_id(),
     )
+    await _clear_unverified_secret(skyvern_element)
     return ActionFailure(SecretInputMismatch())
 
 
@@ -5103,6 +5142,8 @@ class ActionHandler:
                 file_download_false_click_eligible=file_download_false_click_eligible,
                 allow_stale_refresh=allow_stale_refresh,
             )
+            if _browser_dispatch_committed.get():
+                app.AGENT_FUNCTION.note_page_action(page, action)
         except BaseException as exit_error:
             if context is not None:
                 if isinstance(exit_error, Exception):
@@ -6442,6 +6483,7 @@ class ActionHandler:
                     # Setup can interact before returning or raising; exceptions must retain ownership.
                     # Only a normal, explicitly effect-free setup exit clears this commitment.
                     _browser_dispatch_committed.set(True)
+                    app.AGENT_FUNCTION.note_page_action(page, action)
                     # do setup before action handler
                     if setup := ActionHandler._setup_action_types.get(action.action_type):
                         action_phase.mark_action_phase(ActionPhase.SETUP)
@@ -9534,11 +9576,17 @@ async def _handle_input_text_action(
             _register_runtime_otp_value_best_effort(task.workflow_run_id, cua_text)
         elif is_unresolved_totp_value(cua_text):
             return [ActionFailure(NoTOTPSecretFound())]
-        await _apply_active_element_secret_visual_mask_if_needed(page, cua_text, task.workflow_run_id)
+        await _apply_active_element_secret_visual_mask_if_needed(
+            page,
+            cua_text,
+            task.workflow_run_id,
+            is_card_secret=_is_card_secret_parameter(task, action.text, resolved_to_a_secret=cua_text != action.text),
+        )
         await EventStrategyFactory.type_text(page, None, cua_text)
         return [ActionSuccess()]
 
     totp_secret: str | None = None
+    is_card_secret = False
     is_multi_field_totp = bool(action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
     if not is_multi_field_totp:
         text_result = (
@@ -9567,6 +9615,7 @@ async def _handle_input_text_action(
             text = text_result
         current_text_target = text_result
         is_secret_value = is_totp_candidate or resolved_hint is not None or is_totp_value or text != action.text
+        is_card_secret = _is_card_secret_parameter(task, action.text, resolved_to_a_secret=is_secret_value)
 
     if is_multi_field_totp:
         action.set_has_mini_agent()
@@ -9643,6 +9692,14 @@ async def _handle_input_text_action(
             return [ActionFailure(PhoneNumberInputBrowserInteractionFailed())]
         raise
     if not is_totp_value and current_text == current_text_target:
+        # The field can hold the value yet have lost its mask to a re-render or an autofill.
+        await _apply_secret_visual_mask_if_needed(
+            skyvern_element,
+            workflow_run_id=task.workflow_run_id,
+            is_secret_value=is_secret_value,
+            is_totp_value=is_totp_value,
+            is_card_secret=is_card_secret,
+        )
         if tel_outcome is not None:
             tel_outcome.actual_digit_count = len(_phone_digits(current_text))
             tel_outcome.browser_valid = await _probe_tel_browser_validity(skyvern_element.get_locator())
@@ -10002,6 +10059,7 @@ async def _handle_input_text_action(
         is_secret_value=is_secret_value,
         is_totp_value=is_totp_value,
         is_totp_sequence=is_multi_field_totp,
+        is_card_secret=is_card_secret,
     )
 
     # TODO: some elements are supported to use `locator.press_sequentially()` to fill in the data
@@ -10188,6 +10246,7 @@ async def _handle_input_text_action(
                 is_secret_value=is_secret_value,
                 is_totp_value=is_totp_value,
                 is_totp_sequence=is_multi_field_totp,
+                is_card_secret=is_card_secret,
             )
     except Exception:
         LOG.info(
@@ -15565,6 +15624,7 @@ async def select_from_emerging_elements(
             workflow_run_id=task.workflow_run_id,
             is_secret_value=is_dropdown_secret_value,
             is_totp_value=is_dropdown_totp_value,
+            is_card_secret=_is_card_secret_parameter(task, value, resolved_to_a_secret=is_dropdown_secret_value),
         )
         current_text = await get_input_value(
             input_element.get_tag_name(),
@@ -16001,6 +16061,9 @@ async def select_from_dropdown(
                     workflow_run_id=task.workflow_run_id,
                     is_secret_value=is_dropdown_secret_value,
                     is_totp_value=is_dropdown_totp_value,
+                    is_card_secret=_is_card_secret_parameter(
+                        task, value, resolved_to_a_secret=is_dropdown_secret_value
+                    ),
                 )
                 current_text = await get_input_value(
                     input_element.get_tag_name(),

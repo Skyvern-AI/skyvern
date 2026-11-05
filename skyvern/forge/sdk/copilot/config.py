@@ -78,6 +78,7 @@ def block_authoring_policy_from_capability(capability: AuthoringCapability) -> B
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 200
 DEFAULT_TOKEN_BUDGET = 90_000
+TOTAL_TIMEOUT_SECONDS = settings.WORKFLOW_COPILOT_TOTAL_TIMEOUT_SECONDS or 900
 
 SCREENSHOT_DROPPED_NUDGE = (
     "Your previous screenshot was dropped from context to recover from a token-budget overflow. "

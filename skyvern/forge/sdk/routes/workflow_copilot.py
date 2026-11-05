@@ -33,7 +33,12 @@ from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
 from skyvern.forge.sdk.cache.base import BaseCache
-from skyvern.forge.sdk.copilot.agent import run_copilot_agent
+from skyvern.forge.sdk.copilot.agent import (
+    completed_tool_names,
+    run_copilot_agent,
+    stopped_turn_facts,
+    turn_facts_for_context,
+)
 from skyvern.forge.sdk.copilot.ask_user import (
     CREDENTIAL_DELETE_CONCURRENCY,
     CREDENTIAL_DELETE_RECORD_ATTEMPTS,
@@ -140,6 +145,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml as _
 from skyvern.forge.sdk.copilot.workflow_yaml import _process_workflow_yaml as _copilot_process_workflow_yaml
 from skyvern.forge.sdk.copilot.workflow_yaml import _repair_next_block_label_chain as _repair_next_block_label_chain
 from skyvern.forge.sdk.copilot.workflow_yaml import (
+    _runs_in_list_order,
     dump_workflow_yaml,
     inherited_header_settings,
     merge_private_workflow_settings,
@@ -187,6 +193,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
     CopilotCancelSource,
     CopilotFailureKind,
+    CopilotInFlightTurn,
     CopilotPendingTurn,
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
@@ -446,6 +453,9 @@ def _assistant_execution_receipts(
 ) -> dict[str, set[str]]:
     # Each turn writes a cumulative snapshot that already retracts failed runs, so the newest one wins.
     for message in reversed(chat_messages):
+        if message.sender == WorkflowCopilotChatSender.AI and message._narrative_payload_unreadable is True:
+            # Its receipts may have retracted older ones, so an unreadable snapshot is the boundary.
+            return {}
         payload = message.narrative_payload
         if (
             message.sender == WorkflowCopilotChatSender.AI
@@ -1009,11 +1019,31 @@ def _client_visible_proposal(proposal: dict[str, Any], stored: Workflow | None) 
 
 
 async def _client_visible_updated_workflow(updated_workflow: Workflow, agent_result: AgentResult) -> dict[str, Any]:
-    stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=updated_workflow.workflow_permanent_id, organization_id=updated_workflow.organization_id
+    return await _client_visible_response_proposal(
+        _build_proposed_workflow_data(updated_workflow, agent_result),
+        workflow_permanent_id=updated_workflow.workflow_permanent_id,
+        organization_id=updated_workflow.organization_id,
     )
-    visible = _client_visible_proposal(_build_proposed_workflow_data(updated_workflow, agent_result), stored)
+
+
+async def _client_visible_response_proposal(
+    proposal: dict[str, Any], *, workflow_permanent_id: str, organization_id: str
+) -> dict[str, Any]:
+    stored = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id, organization_id=organization_id
+    )
+    visible = _client_visible_proposal(proposal, stored)
     return {key: value for key, value in visible.items() if not key.startswith("_copilot_")}
+
+
+async def _stored_draft_of_turn(chat: WorkflowCopilotChat, turn_id: str) -> dict[str, Any] | None:
+    current_chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+        organization_id=chat.organization_id,
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+    )
+    proposal = current_chat.proposed_workflow if current_chat is not None else None
+    metadata = copilot_proposal_metadata(proposal)
+    return proposal if metadata is not None and metadata.owner_turn_id == turn_id else None
 
 
 def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
@@ -1578,14 +1608,41 @@ async def _persist_cancel_turn(
     narrative_payload: TurnNarrativePayload | None
     workflow_applied = False
     canonical_rolled_back = False
+    published_draft: dict[str, Any] | None = None
+    published_disposition: ProposalDisposition | None = None
     if agent_result is None:
+        # A cancel landing in the agent's own cleanup leaves no result, but the context it built
+        # still holds what the turn's tools completed. An interrupted turn keeps its own record.
+        sink_ctx = ctx_sink[0] if ctx_sink and not record_as_interrupted else None
+        tool_calls = completed_tool_names(sink_ctx) if sink_ctx is not None else []
+        acted_ctx = (
+            sink_ctx
+            if sink_ctx is not None
+            and (tool_calls or sink_ctx.edited_block_labels_this_turn or sink_ctx.dispatched_run_ids_this_turn)
+            else None
+        )
+        # The chat row was read at turn start, so a draft this turn published mid-turn is read back from the store.
+        if (
+            sink_ctx is not None
+            and sink_ctx.has_staged_proposal
+            and turn_id is not None
+            and sink_ctx.proposal_owner_turn_id == turn_id
+        ):
+            published_draft = await asyncio.shield(_stored_draft_of_turn(chat, turn_id))
+            stored_metadata = copilot_proposal_metadata(published_draft)
+            if published_draft is not None and stored_metadata is not None:
+                chat.proposed_workflow = published_draft
+                # The stored disposition is what the review card's pill reads; a stop never auto-applies.
+                published_disposition = (
+                    "review_tested" if stored_metadata.disposition == "review_tested" else "review_untested"
+                )
         user_response = cancel_notice(
             stop_button=cancel_source == "stop_button",
-            # Only a draft that survives the clear below is still awaiting the user.
-            preserved_draft=_preserved_draft_disposition(
-                draft_present=chat.proposed_workflow is not None and keep_pending_proposal
-            ),
+            # Otherwise only a draft that survives the clear below is still awaiting the user.
+            preserved_draft=published_disposition
+            or _preserved_draft_disposition(draft_present=chat.proposed_workflow is not None and keep_pending_proposal),
             canonical_rolled_back=False,
+            stopped=stopped_turn_facts(acted_ctx) if acted_ctx is not None else None,
         )
         updated_workflow = None
         updated_global_llm_context = clear_proposed_credential(prior_global_llm_context)
@@ -1602,11 +1659,14 @@ async def _persist_cancel_turn(
             cancel_source=cancel_source,
             copilot_effective_mode=effective_mode,
             copilot_code_available=code_available or False,
+            tool_calls=tool_calls,
         )
         response_turn_id = turn_id
         narrative_summary = user_response
         narrative_payload = _make_error_narrative_payload(turn_id, None, user_response)
-        if chat.proposed_workflow is not None and not keep_pending_proposal:
+        if acted_ctx is not None:
+            narrative_payload["turnFacts"] = turn_facts_for_context(acted_ctx, None)
+        if chat.proposed_workflow is not None and not keep_pending_proposal and published_draft is None:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
         restored = _should_restore_persisted_workflow(chat.auto_accept, agent_result)
@@ -1668,6 +1728,7 @@ async def _persist_cancel_turn(
                     agent_result, draft_present=chat.proposed_workflow is not None
                 ),
                 canonical_rolled_back=canonical_rolled_back,
+                stopped=agent_result.cancellation_stopped_facts,
             )
         # The reload leg reads the payload text, so it must name the same report the row stores.
         if narrative_payload is not None and narrative_payload.get("terminalMessage") != user_response:
@@ -1713,7 +1774,7 @@ async def _persist_cancel_turn(
     if narrative_payload is not None and receipts is not None:
         narrative_payload = {**narrative_payload, "testedBlockFingerprints": serialize_execution_receipts(receipts)}
 
-    proposal_disposition = _proposal_disposition(agent_result)
+    proposal_disposition = published_disposition or _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         narrative_payload,
         cancelled=True,
@@ -1740,14 +1801,19 @@ async def _persist_cancel_turn(
         # Reading the run facts inside the shield keeps a cancel arriving during that read from
         # taking the terminal frame with it.
         proposed_workflow_run = await _terminal_proposal_run_facts(chat, proposed_workflow_metadata, organization_id)
+        visible_workflow: dict[str, Any] | None = None
+        if updated_workflow is not None and agent_result is not None:
+            visible_workflow = await _client_visible_updated_workflow(updated_workflow, agent_result)
+        elif published_draft is not None:
+            visible_workflow = await _client_visible_response_proposal(
+                published_draft, workflow_permanent_id=chat.workflow_permanent_id, organization_id=organization_id
+            )
         await stream.send(
             WorkflowCopilotStreamResponseUpdate(
                 type=WorkflowCopilotStreamMessageType.RESPONSE,
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 message=user_response,
-                updated_workflow=await _client_visible_updated_workflow(updated_workflow, agent_result)
-                if updated_workflow is not None and agent_result is not None
-                else None,
+                updated_workflow=visible_workflow,
                 response_time=response_time,
                 total_tokens=total_tokens,
                 response_type=response_type,
@@ -2214,6 +2280,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         preserve_completion_contract=False,
         validate_code_block_templates=False,
         preserve_redacted_credential_references_from=original_workflow,
+        prior_definition=original_workflow.workflow_definition,
     )
     # A shielded finalizer runs in a child task with a copied context, so the marker has to be a
     # mutable object shared by reference rather than a value set through the ContextVar.
@@ -2793,6 +2860,7 @@ async def _new_copilot_chat_post(
                 if chat_request.product_action == "test_end_to_end"
                 else strip_copilot_yaml_headers(chat_request.workflow_yaml),
                 persisted_workflow_yaml=persisted_workflow_yaml,
+                saved_workflow=original_workflow,
                 browser_session_id=None,
                 stream=stream,
             )
@@ -3051,6 +3119,7 @@ async def _new_copilot_chat_post(
                         persist_browser_allocation if eval_llm_overrides is not None else None
                     ),
                     persisted_workflow_yaml=persisted_workflow_yaml,
+                    saved_workflow=original_workflow,
                     opening_workflow_title=original_workflow.title,
                     prior_executed_block_fingerprints=prior_executed_block_fingerprints,
                     eval_capture_case_id=(
@@ -3961,13 +4030,16 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
             # credential wait, while an unrelated stale turn must eventually
             # reconcile even if the auxiliary cache remains unavailable.
             continue
-        claimed = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
+        claim = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
             organization_id=organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             turn_id=entry.turn_id,
             claim_before=abandoned_before,
         )
-        if not claimed:
+        if claim == "refused":
+            continue
+        entry.recovering_at = datetime.now(UTC)
+        if claim == "recovering":
             continue
         try:
             await _recover_interrupted_copilot_turn(chat, organization_id, entry)
@@ -4254,11 +4326,33 @@ async def workflow_copilot_chat_history(
             organization.organization_id, chat.workflow_copilot_chat_id, question_interactions
         )
     pending_ids = {item.interaction_id for item in question_interactions if item.status == "pending"}
+    answered_turn_ids = {
+        message.turn_outcome.copilot_turn_id for message in chat_messages if message.turn_outcome is not None
+    }
+    live_entry = max(
+        (
+            entry
+            for entry in (chat.pending_turns.values() if chat else [])
+            if entry.turn_id not in answered_turn_ids and entry.recovering_at is None
+        ),
+        key=lambda entry: _as_utc(entry.started_at),
+        default=None,
+    )
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
         request_browser_allocations=request_browser_allocations,
+        in_flight_turn=(
+            CopilotInFlightTurn(
+                turn_id=live_entry.turn_id,
+                cancel_token=live_entry.cancel_token,
+                latest_draft=live_entry.latest_draft,
+                latest_draft_at=live_entry.latest_draft_at,
+            )
+            if live_entry is not None
+            else None
+        ),
         question_interactions=question_interactions,
         pending_question_cancel_token=next(
             (
@@ -4869,6 +4963,10 @@ async def workflow_copilot_demonstration_control(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)") from exc
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)")
+    if control_request.action == "note" and not (control_request.text or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="text is required when action is 'note'"
+        )
     if control_request.action == "fill_credential" and not (
         control_request.credential_id and control_request.selector and control_request.field
     ):
@@ -5600,7 +5698,7 @@ async def workflow_copilot_convert_yaml_to_blocks(
         parsed_yaml = safe_load_no_dates(request.workflow_definition_yaml)
         workflow_definition_yaml = WorkflowDefinitionYAML.model_validate(parsed_yaml)
 
-        _repair_next_block_label_chain(workflow_definition_yaml.blocks)
+        _repair_next_block_label_chain(workflow_definition_yaml.blocks, list_ordered=_runs_in_list_order(parsed_yaml))
 
         workflow_definition = convert_workflow_definition(
             workflow_definition_yaml=workflow_definition_yaml,

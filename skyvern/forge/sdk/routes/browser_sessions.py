@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -22,6 +23,7 @@ from skyvern.forge.agent_functions import STANDALONE_BROWSER_SESSION_FEATURE_NAM
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
+from skyvern.forge.sdk.routes.agent_protocol import _redact_workflow_run_list
 from skyvern.forge.sdk.routes.code_samples import (
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_PYTHON,
     CLOSE_BROWSER_SESSION_CODE_SAMPLE_TS,
@@ -34,6 +36,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     GET_BROWSER_SESSIONS_CODE_SAMPLE_PYTHON,
     GET_BROWSER_SESSIONS_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
@@ -44,6 +47,10 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     is_final_status,
 )
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.browser_session_redaction import (
+    BrowserSessionAddressResponse,
+    redact_browser_session_addresses,
+)
 from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.action_log import (
@@ -95,12 +102,29 @@ def _browser_session_not_found() -> HTTPException:
     return HTTPException(status_code=404, detail={"code": "browser_session_not_found"})
 
 
+async def _redact_browser_session_addresses(
+    responses: Sequence[BrowserSessionAddressResponse],
+    organization_id: str,
+    *,
+    task_v2_browser_session_id: str | None = None,
+) -> None:
+    await redact_browser_session_addresses(
+        responses,
+        organization_id,
+        app.AGENT_FUNCTION,
+        get_request_principal(),
+        task_v2_browser_session_id=task_v2_browser_session_id,
+    )
+
+
 async def _filter_credential_inaccessible_sessions(
     sessions: list[PersistentBrowserSession], organization_id: str
 ) -> list[PersistentBrowserSession]:
     if not sessions:
         return []
     principal = get_request_principal()
+    if await app.AGENT_FUNCTION.redact_inaccessible_browser_session_artifacts(principal, organization_id):
+        return sessions
     profile_ids = {session.browser_profile_id for session in sessions if session.browser_profile_id}
     try:
         profile_accessible_ids = {session.persistent_browser_session_id for session in sessions}
@@ -202,7 +226,7 @@ def _decode_action_log_cursor(cursor: str | None) -> tuple[datetime | None, str 
 )
 async def get_browser_sessions_all(
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    page: int = Query(1, ge=1, description="Page number for pagination"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination"),
     page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
 ) -> list[BrowserSessionResponse]:
     """Get all browser sessions for the organization"""
@@ -221,7 +245,7 @@ async def get_browser_sessions_all(
             for browser_session in browser_sessions
         ]
     )
-
+    await _redact_browser_session_addresses(responses, current_org.organization_id)
     return responses
 
 
@@ -368,6 +392,7 @@ async def create_browser_session(
         )
     response = await BrowserSessionResponse.from_browser_session(browser_session)
     response.warning = timeout_warning
+    await _redact_browser_session_addresses([response], current_org.organization_id)
     return response
 
 
@@ -439,7 +464,9 @@ async def register_external_browser_session(
         cdp_host=urlparse(request.cdp_url).hostname,
         timeout_minutes=request.timeout,
     )
-    return await BrowserSessionResponse.from_browser_session(browser_session)
+    response = await BrowserSessionResponse.from_browser_session(browser_session)
+    await _redact_browser_session_addresses([response], organization_id)
+    return response
 
 
 @base_router.post(
@@ -576,11 +603,13 @@ async def extend_browser_session(
             f"{ex} Do not retry: the extension was requested and will apply; read the session's timeout "
             "back with a GET."
         )
+        await _redact_browser_session_addresses([unconfirmed], current_org.organization_id)
         return ORJSONResponse(status_code=202, content=unconfirmed.model_dump(mode="json"))
     # No storage: an extension needs neither the download nor the recording listing, and each costs an S3 call.
     response = await BrowserSessionResponse.from_browser_session(extension.session)
     if extension.granted_minutes < request.additional_minutes:
         response.warning = max_lifetime_exceeded_warning(request.additional_minutes, extension.granted_minutes)
+    await _redact_browser_session_addresses([response], current_org.organization_id)
     return response
 
 
@@ -630,7 +659,9 @@ async def update_browser_session(
         organization_id=current_org.organization_id,
         generate_browser_profile=request.generate_browser_profile,
     )
-    return await BrowserSessionResponse.from_browser_session(updated, app.STORAGE)
+    response = await BrowserSessionResponse.from_browser_session(updated, app.STORAGE)
+    await _redact_browser_session_addresses([response], current_org.organization_id)
+    return response
 
 
 @base_router.get(
@@ -697,13 +728,15 @@ async def get_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    return await BrowserSessionResponse.from_browser_session(
+    response = await BrowserSessionResponse.from_browser_session(
         browser_session,
         app.STORAGE,
         fail_download_lookup=True,
         include_stream_transport=True,
         concurrent_listings=True,
     )
+    await _redact_browser_session_addresses([response], current_org.organization_id)
+    return response
 
 
 @base_router.get(
@@ -720,7 +753,7 @@ async def get_workflow_runs_for_browser_session(
     browser_session_id: str = Path(
         ..., description="The ID of the browser session. browser_session_id starts with `pbs_`", examples=["pbs_123456"]
     ),
-    page: int = Query(1, ge=1, description="Page number for pagination"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number for pagination"),
     page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[WorkflowRun]:
@@ -730,12 +763,15 @@ async def get_workflow_runs_for_browser_session(
     )
     if not browser_session:
         raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
-    return await app.WORKFLOW_SERVICE.get_workflow_runs_for_browser_session(
+    workflow_runs = await app.WORKFLOW_SERVICE.get_workflow_runs_for_browser_session(
         browser_session_id=browser_session_id,
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
     )
+    workflow_runs = await _redact_workflow_run_list(workflow_runs, current_org.organization_id)
+    await _redact_browser_session_addresses(workflow_runs, current_org.organization_id)
+    return workflow_runs
 
 
 @base_router.get(
@@ -781,12 +817,14 @@ async def get_browser_sessions(
         if browser_session.persistent_browser_session_id in visible_ids
     ]
     visible_sessions = await _filter_credential_inaccessible_sessions(visible_sessions, current_org.organization_id)
-    return await asyncio.gather(
+    responses = await asyncio.gather(
         *[
             BrowserSessionResponse.from_browser_session(browser_session, app.STORAGE)
             for browser_session in visible_sessions
         ]
     )
+    await _redact_browser_session_addresses(responses, current_org.organization_id)
+    return responses
 
 
 @base_router.post(

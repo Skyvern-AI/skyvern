@@ -17,7 +17,7 @@ from playwright.async_api import Page
 from structlog.testing import capture_logs
 
 from skyvern.cli.core import client as client_mod
-from skyvern.cli.core import hosted_driver
+from skyvern.cli.core import copilot_sessions, hosted_driver
 from skyvern.cli.core import result as result_mod
 from skyvern.cli.core import session_manager, session_ops
 from skyvern.cli.core.result import BrowserContext
@@ -34,7 +34,7 @@ from skyvern.library.skyvern import Skyvern
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.library.skyvern_browser_page_ai import SdkSkyvernPageAi
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
-from skyvern.services import cleanup_service
+from skyvern.services import hosted_driver_sweep
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
 
@@ -55,7 +55,7 @@ def _clear_singletons() -> None:
     session_manager._current_organization_id.set(None)
     session_manager._global_session = None
     session_manager._organization_sessions.clear()
-    session_manager._copilot_sessions.clear()
+    copilot_sessions._copilot_sessions.clear()
     session_manager._session_ref_maps.clear()
     session_manager._session_ref_generations.clear()
     session_manager.set_stateless_http_mode(False)
@@ -561,7 +561,7 @@ async def test_resolve_browser_requires_matching_organization_and_credential_for
         context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
         api_key_hash=session_manager._api_key_hash("sk_copilot_org"),
     )
-    session_manager.register_copilot_session("pbs_copilot", registered_state, organization_id="org_copilot")
+    copilot_sessions.register_copilot_session("pbs_copilot", registered_state, organization_id="org_copilot")
 
     fallback_browser = MagicMock()
     fake_skyvern = MagicMock()
@@ -587,24 +587,24 @@ def test_copilot_session_registry_preserves_each_parallel_registration() -> None
     first = session_manager.SessionState()
     second = session_manager.SessionState()
 
-    session_manager.register_copilot_session("pbs_shared", first, organization_id="org_shared")
-    session_manager.register_copilot_session("pbs_shared", second, organization_id="org_shared")
+    copilot_sessions.register_copilot_session("pbs_shared", first, organization_id="org_shared")
+    copilot_sessions.register_copilot_session("pbs_shared", second, organization_id="org_shared")
 
-    assert session_manager._registered_copilot_session("pbs_shared", organization_id="org_shared") is second
+    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is second
 
-    session_manager.unregister_copilot_session(
+    copilot_sessions.unregister_copilot_session(
         "pbs_shared",
         organization_id="org_shared",
         expected_state=second,
     )
-    assert session_manager._registered_copilot_session("pbs_shared", organization_id="org_shared") is first
+    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is first
 
-    session_manager.unregister_copilot_session(
+    copilot_sessions.unregister_copilot_session(
         "pbs_shared",
         organization_id="org_shared",
         expected_state=first,
     )
-    assert session_manager._registered_copilot_session("pbs_shared", organization_id="org_shared") is None
+    assert copilot_sessions.registered_copilot_session("pbs_shared", organization_id="org_shared") is None
 
 
 @pytest.mark.asyncio
@@ -684,7 +684,7 @@ async def test_tool_calls_disconnect_only_the_stateless_cdp_connections_they_ope
     fake_skyvern.connect_to_cloud_browser_session = AsyncMock(side_effect=connect)
     monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
     copilot_browser = _FakeCloudBrowser()
-    session_manager.register_copilot_session(
+    copilot_sessions.register_copilot_session(
         "pbs_copilot",
         session_manager.SessionState(
             browser=copilot_browser,
@@ -1283,8 +1283,8 @@ async def test_stopping_the_sweep_propagates_the_callers_cancellation_after_stop
     fake_playwright: _FakePlaywright, hosted_mcp: None
 ) -> None:
     await _hosted_call("sk_key_a", "pbs_1")
-    assert cleanup_service.start_hosted_driver_sweep() is not None
-    stopper = asyncio.create_task(cleanup_service.stop_hosted_driver_sweep())
+    assert hosted_driver_sweep.start_hosted_driver_sweep() is not None
+    stopper = asyncio.create_task(hosted_driver_sweep.stop_hosted_driver_sweep())
     await asyncio.sleep(0)
     stopper.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1343,8 +1343,8 @@ async def test_stopping_the_hosted_driver_sweep_stops_every_driver_at_shutdown(
     await _hosted_call("sk_key_b", "pbs_2")
     assert len(fake_playwright.live()) == 2
 
-    assert cleanup_service.start_hosted_driver_sweep() is not None
-    await cleanup_service.stop_hosted_driver_sweep()
+    assert hosted_driver_sweep.start_hosted_driver_sweep() is not None
+    await hosted_driver_sweep.stop_hosted_driver_sweep()
     assert fake_playwright.live() == []
 
     releases["busy"].set()
@@ -1356,19 +1356,19 @@ async def test_hosted_driver_sweep_runs_only_for_the_hosted_stateless_server(
     hosted_mcp: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_manager.set_stateless_http_mode(False)
-    assert cleanup_service.start_hosted_driver_sweep() is None
+    assert hosted_driver_sweep.start_hosted_driver_sweep() is None
 
     session_manager.set_stateless_http_mode(True)
     monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS", 0.0)
-    assert cleanup_service.start_hosted_driver_sweep() is None
+    assert hosted_driver_sweep.start_hosted_driver_sweep() is None
     monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_SWEEP_INTERVAL_SECONDS", 300.0)
     monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_IDLE_SECONDS", 0.0)
-    assert cleanup_service.start_hosted_driver_sweep() is None
+    assert hosted_driver_sweep.start_hosted_driver_sweep() is None
 
     monkeypatch.setattr(settings, "HOSTED_MCP_DRIVER_IDLE_SECONDS", 600.0)
-    task = cleanup_service.start_hosted_driver_sweep()
-    assert task is not None and cleanup_service.start_hosted_driver_sweep() is task
-    await cleanup_service.stop_hosted_driver_sweep()
+    task = hosted_driver_sweep.start_hosted_driver_sweep()
+    assert task is not None and hosted_driver_sweep.start_hosted_driver_sweep() is task
+    await hosted_driver_sweep.stop_hosted_driver_sweep()
     assert task.done()
 
 
@@ -1414,7 +1414,7 @@ async def test_a_registered_copilot_browser_is_borrowed_not_owned(
     fake_playwright: _FakePlaywright, hosted_mcp: None
 ) -> None:
     copilot_browser = _FakeCloudBrowser()
-    session_manager.register_copilot_session(
+    copilot_sessions.register_copilot_session(
         "pbs_copilot",
         session_manager.SessionState(
             browser=cast(SkyvernBrowser, copilot_browser),

@@ -7,6 +7,8 @@ export type EmailClient = "gmail" | "outlook";
 export type EmailInboxNodeData = NodeBaseData & {
   emailClient: EmailClient;
   credentialId: string;
+  credentialSource: "native" | "nango";
+  connectionId: string;
   folder: string;
   prompt: string;
   sender: string;
@@ -28,6 +30,8 @@ export const emailInboxNodeDefaultData: EmailInboxNodeData = {
   model: null,
   emailClient: "gmail",
   credentialId: "",
+  credentialSource: "native",
+  connectionId: "",
   folder: "INBOX",
   prompt: "",
   sender: "",

@@ -903,7 +903,7 @@ Purpose: Write rows to a Google Sheet, appended below existing data or written o
 - Rich cells: `{"cells": [[<Sheets CellData>, ...]], "merges": [{"start_row_index": 0, "end_row_index": 1, "start_column_index": 0, "end_column_index": 2}]}`.
 Every cell is a JSON value, so a string cell must be quoted. `| tojson` quotes and escapes a referenced value: `[[{{ extract_metric.output.metric | tojson }}]]` renders `[["30 %"]]`, while `[[{{ extract_metric.output.metric }}]]` renders `[[30 %]]`, which is not JSON. A bare scalar such as 30 %, 6.97K or 10200 fails with "Invalid values payload".
 A reference must match the producer's output shape. A browser-task block (extraction, navigation, action, login) holds its payload under `.output`: `{{ extract_metric.output.metric }}`. A code or text_prompt block holds its returned fields on the label itself: `{{ compute_metric.metric }}` (a text_prompt without json_schema returns `llm_response`). An http_request block holds the parsed response body under `.body`: `{{ fetch_metric.body.metric }}`.
-A reference to a value no upstream block produced fails the block with "references a value no upstream block produced", and nothing is written.
+A reference to a value no upstream block produced fails the block, and nothing is written.
 
 Use Cases:
 - Write an extracted metric into one cell
@@ -922,9 +922,10 @@ There are TWO types of references:
 
 2. BLOCK OUTPUTS - Reference output from a previous block by its label
    Syntax depends on the upstream block type; see below.
-   Requires: NOTHING - block outputs are automatically available, no parameter_keys needed
+   Requires: nothing in a `{{ }}` field - block outputs are available there, no parameter_keys needed.
+   A code block reads an earlier block's output as a Python value only when `<label>_output` is in its parameter_keys.
 
-IMPORTANT — block output shapes are NOT uniform across block types. Using the wrong shape either raises "dict object has no attribute 'output'" at render time or (worse) silently renders a None value into a URL field, producing `https://None` which fails with `net::ERR_NAME_NOT_RESOLVED`.
+IMPORTANT — block output shapes are NOT uniform across block types. Using the wrong shape either fails the block with "Missing key or attribute in `<the reference>`" at render time or (worse) silently renders a None value into a URL field, producing `https://None` which fails with `net::ERR_NAME_NOT_RESOLVED`.
 
 * Browser-task blocks (navigation, extraction, goto_url, login, action):
   - `{{ label.output }}` — the extracted payload (an alias for extracted_information). Use this in a value field.
@@ -938,7 +939,14 @@ IMPORTANT — block output shapes are NOT uniform across block types. Using the 
 * Non-task blocks (text_prompt, code, file_url_parser):
   - `{{ label.<field> }}` — fields from the returned JSON are on the block directly; there is NO `.output` wrapper.
   - Example: `{{ summarize_notes.summary }}` (NOT `{{ summarize_notes.output.summary }}`).
-  - Writing `{{ summarize_notes.output.summary }}` raises "dict object has no attribute 'output'" because `summarize_notes` IS the dict.
+  - Writing `{{ summarize_notes.output.summary }}` fails with "Missing key or attribute in `summarize_notes.output.summary`" because `summarize_notes` IS the dict.
+
+* Google Sheets read blocks (google_sheets_read):
+  - `{{ read_sheet['values'] }}` — the cells as a list of rows of formatted strings. `{{ read_sheet.rows }}` — one object per data row keyed by the header row when has_header_row is true, otherwise null.
+  - In `rows`, an empty header cell becomes `col_<n>` (n counts from 1 at the first column of the range read, not the sheet's column letter) and a repeated header name gets `_2`, `_3`, ... (`Amount`, `Amount_2`).
+  - `spreadsheet_id`, `range`, `sheet_id`, `sheet_title`, `start_row`, `start_column`, `cells` (Sheets CellData per cell) and `merges` sit beside them. A code block on the secure runner receives the read without `cells`.
+
+* A key named like a dict method (`values`, `items`, `keys`, `get`) reads with brackets: `{{ read_sheet['values'] }}`. `{{ read_sheet.values }}` is the dict's method, not the key.
 
 * HTTP request blocks (http_request):
   - `{{ fetch_metric.body }}` — the response body, parsed as JSON when the response is JSON; `{{ fetch_metric.status_code }}` and `{{ fetch_metric.headers }}` sit beside it.
@@ -956,7 +964,7 @@ parameter_keys: [search_term]
 navigation_goal: "Search for {{ product_name }} and filter by {{ category }}"
 parameter_keys: [product_name, category]
 
-Examples - Block Outputs (no parameter_keys needed):
+Examples - Block Outputs in `{{ }}` fields (no parameter_keys needed):
 
 * Send previous task-block output to webhook (task block → use .output):
 blocks:

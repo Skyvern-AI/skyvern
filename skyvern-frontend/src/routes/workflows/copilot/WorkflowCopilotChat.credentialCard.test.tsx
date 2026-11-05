@@ -20,12 +20,17 @@ import {
   beginYamlCommit,
   createYamlCommitOwner,
   finishYamlCommit,
+  isEditorMutationLocked,
   useWorkflowYamlEditorStore,
 } from "@/store/WorkflowYamlEditorStore";
 import type {
+  CopilotInFlightTurn,
+  ProposalDisposition,
   QuestionInteraction,
   WorkflowCopilotCredentialRequiredUpdate,
 } from "./workflowCopilotTypes";
+import type { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import type { EditorStateSnapshot } from "@/routes/workflows/editor/editorStateSnapshot";
 import { ensureCredentialRecoveryToken } from "./credentialRecovery";
 
 type StreamBody = {
@@ -82,7 +87,7 @@ const {
         owner_turn_id: string;
         revision: number;
         canonical_fingerprint: string;
-        disposition: "accepting";
+        disposition: ProposalDisposition | "accepting";
         workflow_run_id: string | null;
       } | null,
       auto_accept: false,
@@ -90,6 +95,7 @@ const {
         [] as WorkflowCopilotCredentialRequiredUpdate[],
       question_interactions: [] as QuestionInteraction[],
       pending_question_cancel_token: null as string | null,
+      in_flight_turn: null as CopilotInFlightTurn | null,
     },
   };
   const creds = {
@@ -323,13 +329,14 @@ const saveData = {
   blocks: [],
   workflowDefinitionVersion: 1,
 };
+const editorHasChanges = { current: true };
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: Object.assign(
     () => ({ getSaveData: () => saveData }),
     {
       getState: () => ({
-        hasChanges: true,
+        hasChanges: editorHasChanges.current,
         setHasChanges: vi.fn(),
         // The Accept fence publishes its reason here; this harness arms the fence, so the
         // setter has to exist or the component throws on hydration.
@@ -340,6 +347,8 @@ vi.mock("@/store/WorkflowHasChangesStore", () => ({
 }));
 
 vi.mock("@/routes/workflows/hooks/useWorkflowRunQuery", () => ({
+  useWorkflowRunQueries: (ids: readonly string[]) =>
+    ids.map(() => ({ data: undefined })),
   useWorkflowRunQuery: () => ({ data: undefined }),
 }));
 
@@ -541,6 +550,7 @@ beforeEach(() => {
   modalDefaultTestUrl.current = undefined;
   modalEditingCredentialId.current = undefined;
   modalDefaultTotpType.current = undefined;
+  editorHasChanges.current = true;
   historyResponse.data = {
     workflow_copilot_chat_id: "chat-1",
     request_turn_id: undefined,
@@ -552,6 +562,7 @@ beforeEach(() => {
     pending_credential_requests: [],
     question_interactions: [],
     pending_question_cancel_token: null,
+    in_flight_turn: null,
   };
 });
 
@@ -3000,5 +3011,560 @@ describe("WorkflowCopilotChat — auto-bound receipt chronology", () => {
     ).toBe(false);
     expect(screen.queryByRole("button", { name: "Change" })).toBeNull();
     expect(credentialsGets()).toHaveLength(0);
+  });
+});
+
+describe("WorkflowCopilotChat — reload during a running turn", () => {
+  const userRow = {
+    sender: "user",
+    content: "Build it",
+    turn_id: "turn-1",
+    created_at: "2026-11-02T00:00:00Z",
+  };
+  const draft = (title: string) =>
+    ({ ...saveData.workflow, title }) as unknown as WorkflowApiResponse;
+  const inFlight = (title: string, at: string): CopilotInFlightTurn => ({
+    turn_id: "turn-1",
+    cancel_token: "cancel-1",
+    latest_draft: draft(title),
+    latest_draft_at: at,
+  });
+  const answer = (terminalReason: string) => {
+    historyResponse.data = {
+      ...historyResponse.data,
+      in_flight_turn: null,
+      chat_history: [
+        userRow,
+        {
+          sender: "ai",
+          content: "Finished.",
+          created_at: "2026-11-02T00:01:00Z",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: terminalReason,
+          },
+        },
+      ],
+    };
+  };
+  const preTurnCanvas = {
+    workflowPermanentId: "wpid_1",
+    nodes: [],
+    edges: [],
+    parameters: [],
+    title: "Test WF",
+    titleHasBeenGenerated: false,
+    description: null,
+    hasChanges: false,
+    saveGeneration: 0,
+  } as EditorStateSnapshot;
+  const reloadMidTurn = async (
+    overrides: Partial<typeof historyResponse.data> = {},
+  ) => {
+    ensureCredentialRecoveryToken("wpid_1");
+    editorHasChanges.current = false;
+    apiGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    historyResponse.data = {
+      ...historyResponse.data,
+      chat_history: [userRow],
+      in_flight_turn: inFlight("First draft", "2026-11-02T00:00:10Z"),
+      ...overrides,
+    };
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const restore = vi.fn().mockReturnValue("restored");
+    const apply = vi.fn();
+    await renderChat({
+      onWorkflowUpdate: apply,
+      captureEditorState: () => preTurnCanvas,
+      restoreEditorState: restore,
+    });
+    return { apply, restore };
+  };
+  const advance = (ms: number) =>
+    act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+
+  it("locks the editor, applies each newer draft, and unlocks at the outcome row", async () => {
+    const { apply, restore } = await reloadMidTurn();
+    expect(isEditorMutationLocked()).toBe(true);
+
+    await advance(2_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply.mock.calls[0]![0].title).toBe("First draft");
+    expect(apply.mock.calls[0]![1]).toMatchObject({ midTurnDraft: true });
+
+    await advance(5_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+    historyResponse.data = {
+      ...historyResponse.data,
+      in_flight_turn: inFlight("Second draft", "2026-11-02T00:00:20Z"),
+    };
+    await advance(5_000);
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(apply.mock.calls[1]![0].title).toBe("Second draft");
+    expect(isEditorMutationLocked()).toBe(true);
+
+    answer("completed");
+    await advance(5_000);
+    expect(isEditorMutationLocked()).toBe(false);
+    expect(restore).not.toHaveBeenCalled();
+    expect(toastFn).not.toHaveBeenCalled();
+  });
+
+  it("restores the canvas loaded before the first draft when the turn fails", async () => {
+    const { apply, restore } = await reloadMidTurn();
+    await advance(2_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+
+    answer("error");
+    await advance(5_000);
+    expect(restore).toHaveBeenCalledWith(preTurnCanvas);
+    expect(isEditorMutationLocked()).toBe(false);
+  });
+
+  const pendingQuestion = (): Partial<typeof historyResponse.data> => ({
+    question_interactions: [
+      {
+        interaction_id: "question-1",
+        turn_id: "turn-1",
+        tool_call_id: "ask-1",
+        parts: [{ part_id: "p1", prompt: "Which site?", choices: [] }],
+        status: "pending",
+        response: null,
+        created_at: new Date().toISOString(),
+        resolved_at: null,
+      },
+    ],
+    pending_question_cancel_token: "cancel-1",
+  });
+
+  it("applies the latest draft while the turn waits on a question", async () => {
+    const { apply } = await reloadMidTurn(pendingQuestion());
+    await advance(2_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply.mock.calls[0]![0].title).toBe("First draft");
+    expect(isEditorMutationLocked()).toBe(true);
+  });
+
+  it("leaves the editor unlocked when the turn was already interrupted", async () => {
+    const { apply } = await reloadMidTurn({
+      in_flight_turn: null,
+      chat_history: [
+        userRow,
+        {
+          sender: "ai",
+          content: "Interrupted.",
+          created_at: "2026-11-02T00:01:00Z",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "interrupted",
+            interrupted_row_final: true,
+          },
+        },
+      ],
+    });
+    await advance(5_000);
+    expect(isEditorMutationLocked()).toBe(false);
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { owner: "the running turn", ownerTurnId: "turn-1" },
+    { owner: "an earlier turn", ownerTurnId: "turn-0" },
+  ])(
+    "attaches and holds the lock when $owner staged the proposal",
+    async ({ ownerTurnId }) => {
+      const { apply, restore } = await reloadMidTurn({
+        proposed_workflow: draft("Staged proposal"),
+        proposed_workflow_metadata: {
+          owner_turn_id: ownerTurnId,
+          revision: 1,
+          canonical_fingerprint: "fp-0",
+          disposition: "review_untested",
+          workflow_run_id: null,
+        },
+      });
+      await advance(5_000);
+      expect(isEditorMutationLocked()).toBe(true);
+      expect(
+        apply.mock.calls.some(([workflow]) => workflow.title === "First draft"),
+      ).toBe(true);
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+
+      answer("completed");
+      await advance(5_000);
+      expect(isEditorMutationLocked()).toBe(false);
+      expect(restore).not.toHaveBeenCalled();
+      expect(toastFn).not.toHaveBeenCalled();
+      await advance(5_000);
+      expect(screen.queryByRole("button", { name: "Accept" })).not.toBeNull();
+    },
+  );
+
+  const answerQuestion = async () => {
+    const question = pendingQuestion().question_interactions![0]!;
+    sansApiPost.mockResolvedValueOnce({
+      data: { ...question, status: "resolved", response: { text: "a" } },
+    });
+    historyResponse.data = {
+      ...historyResponse.data,
+      question_interactions: [],
+    };
+    fireEvent.change(await screen.findByLabelText("Your response"), {
+      target: { value: "a" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("group", { name: "Question parts" })).getByRole(
+          "button",
+          { name: "Send" },
+        ),
+      );
+    });
+  };
+  const skipCredential = async () => {
+    historyResponse.data = {
+      ...historyResponse.data,
+      pending_credential_requests: [],
+    };
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Skip for now" }),
+      );
+    });
+  };
+
+  it.each([
+    ["a question", pendingQuestion, answerQuestion],
+    [
+      "a credential request",
+      (): Partial<typeof historyResponse.data> => ({
+        pending_credential_requests: [credentialFrame()],
+      }),
+      skipCredential,
+    ],
+  ])(
+    "keeps the normal poll backoff while the turn waits on %s and follows again once answered",
+    async (_wait, overrides, respond) => {
+      const { apply } = await reloadMidTurn(overrides());
+      await advance(30_500);
+      expect(apply).toHaveBeenCalledTimes(1);
+      historyResponse.data = {
+        ...historyResponse.data,
+        in_flight_turn: inFlight("Second draft", "2026-11-02T00:00:20Z"),
+      };
+      await advance(5_000);
+      expect(apply).toHaveBeenCalledTimes(1);
+      await advance(15_000);
+      expect(apply).toHaveBeenCalledTimes(2);
+
+      await respond();
+      historyResponse.data = {
+        ...historyResponse.data,
+        in_flight_turn: inFlight("Third draft", "2026-11-02T00:00:30Z"),
+      };
+      await advance(5_500);
+      expect(apply).toHaveBeenCalledTimes(3);
+      expect(apply.mock.calls[2]![0].title).toBe("Third draft");
+    },
+  );
+
+  it("keeps the draft cadence when a read that began before an answer lands after it", async () => {
+    const { apply } = await reloadMidTurn(pendingQuestion());
+    await advance(30_500);
+    expect(apply.mock.lastCall![0].title).toBe("First draft");
+    const question = pendingQuestion().question_interactions![0]!;
+    let acceptAnswer!: () => void;
+    sansApiPost.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          acceptAnswer = () =>
+            resolve({
+              data: {
+                ...question,
+                status: "resolved",
+                response: { text: "a" },
+              },
+            });
+        }),
+    );
+    fireEvent.change(await screen.findByLabelText("Your response"), {
+      target: { value: "a" },
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("group", { name: "Question parts" })).getByRole(
+          "button",
+          { name: "Send" },
+        ),
+      );
+    });
+    const staleSnapshot = { data: { ...historyResponse.data } };
+    const heldReads: (() => void)[] = [];
+    apiGet.mockImplementation((path: string) =>
+      path === "/workflows/wpid_1"
+        ? Promise.resolve({ data: saveData.workflow })
+        : new Promise((resolve) =>
+            heldReads.push(() => resolve(staleSnapshot)),
+          ),
+    );
+    await advance(5_000);
+    expect(heldReads.length).toBeGreaterThan(0);
+    apiGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+
+    historyResponse.data = {
+      ...historyResponse.data,
+      question_interactions: [],
+      in_flight_turn: inFlight("Third draft", "2026-11-02T00:00:30Z"),
+    };
+    await act(async () => acceptAnswer());
+    await act(async () => heldReads.forEach((finish) => finish()));
+    expect(screen.queryByLabelText("Your response")).toBeNull();
+    await advance(5_500);
+    expect(apply.mock.lastCall![0].title).toBe("Third draft");
+  });
+
+  it("attaches to the turn when a proposal without metadata is already staged", async () => {
+    const { apply } = await reloadMidTurn({
+      proposed_workflow: draft("Staged proposal"),
+      proposed_workflow_metadata: null,
+    });
+    await advance(5_000);
+    expect(isEditorMutationLocked()).toBe(true);
+    expect(
+      apply.mock.calls.some(([workflow]) => workflow.title === "First draft"),
+    ).toBe(true);
+
+    historyResponse.data = {
+      ...historyResponse.data,
+      in_flight_turn: inFlight("Second draft", "2026-11-02T00:00:20Z"),
+    };
+    await advance(5_000);
+    expect(
+      apply.mock.calls.some(([workflow]) => workflow.title === "Second draft"),
+    ).toBe(true);
+    answer("completed");
+    await advance(5_000);
+    expect(isEditorMutationLocked()).toBe(false);
+  });
+
+  it("offers Reload past the poll deadline and rolls back when the turn is cancelled", async () => {
+    const { apply, restore } = await reloadMidTurn();
+    await advance(2_000);
+    expect(apply).toHaveBeenCalledTimes(1);
+
+    await advance(1_500_000);
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    expect(isEditorMutationLocked()).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    answer("cancelled");
+    await advance(5_000);
+    expect(restore).toHaveBeenCalledWith(preTurnCanvas);
+    expect(isEditorMutationLocked()).toBe(false);
+  });
+
+  it("cancels the turn with its own token from the recovery Reject control", async () => {
+    await reloadMidTurn({
+      in_flight_turn: {
+        turn_id: "turn-1",
+        cancel_token: "cancel-1",
+        latest_draft: null,
+        latest_draft_at: null,
+      },
+    });
+    await advance(2_000);
+    expect(
+      screen.getByText(/Copilot is still working on this turn/),
+    ).toBeTruthy();
+    historyResponse.data = {
+      ...historyResponse.data,
+      in_flight_turn: inFlight("First draft", "2026-11-02T00:00:10Z"),
+    };
+    await advance(5_000);
+    expect(
+      screen.getByText(/canvas shows Copilot's latest draft and is read-only/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    await advance(0);
+    expect(sansApiPost).toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.objectContaining({
+        cancel_token: "cancel-1",
+        workflow_copilot_chat_id: "chat-1",
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("waits out a save lock without a toast and attaches when it clears", async () => {
+    const owner = createYamlCommitOwner("wpid_1");
+    expect(beginYamlCommit(owner)).toBe(true);
+    const { apply } = await reloadMidTurn();
+    await advance(5_000);
+    expect(apply).not.toHaveBeenCalled();
+    expect(useWorkflowYamlEditorStore.getState().copilotAcceptance).toBeNull();
+
+    finishYamlCommit(owner);
+    await advance(2_000);
+    expect(
+      useWorkflowYamlEditorStore.getState().copilotAcceptance,
+    ).not.toBeNull();
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(toastFn).not.toHaveBeenCalled();
+  });
+
+  const headerControls = () => useCopilotHeaderStore.getState().controls!;
+  const selectChat = (chatId: string) =>
+    act(async () => {
+      headerControls().onSelectChat({
+        workflow_copilot_chat_id: chatId,
+      } as Parameters<ReturnType<typeof headerControls>["onSelectChat"]>[0]);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+  const startTurnThenOpenNewChat = async () => {
+    editorHasChanges.current = false;
+    apiGet.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === "/workflows/wpid_1"
+          ? { data: saveData.workflow }
+          : historyResponse,
+      ),
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const apply = vi.fn();
+    const restore = vi.fn().mockReturnValue("restored");
+    await renderChat({
+      docked: true,
+      portalTarget: document.body,
+      onWorkflowUpdate: apply,
+      captureEditorState: () => preTurnCanvas,
+      restoreEditorState: restore,
+    });
+    await submit("Build it");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    const stream = streamCalls[0]!;
+    await act(async () => {
+      stream.onMessage(turnStart());
+    });
+    await act(async () => headerControls().onNewChat());
+    const abortStream = () =>
+      act(async () => {
+        stream.reject(new DOMException("aborted", "AbortError"));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    const historyWith = (turn: CopilotInFlightTurn) => {
+      historyResponse.data = {
+        ...historyResponse.data,
+        workflow_copilot_chat_id: "chat-1",
+        chat_history: [userRow],
+        in_flight_turn: turn,
+      };
+    };
+    return {
+      apply,
+      restore,
+      abortStream,
+      historyWith,
+      cancelToken: stream.body.cancel_token!,
+    };
+  };
+  const followingCopy = /canvas shows Copilot's latest draft and is read-only/;
+
+  it.each([
+    { staged: "no proposal", proposal: {} },
+    {
+      staged: "a proposal from that turn",
+      proposal: {
+        proposed_workflow: draft("Staged proposal"),
+        proposed_workflow_metadata: {
+          owner_turn_id: "turn-1",
+          revision: 1,
+          canonical_fingerprint: "fp-0",
+          disposition: "review_untested" as const,
+          workflow_run_id: null,
+        },
+      },
+    },
+  ])(
+    "follows the running turn's draft after switching chats away and back with $staged",
+    async ({ proposal }) => {
+      const { apply, restore, abortStream, historyWith, cancelToken } =
+        await startTurnThenOpenNewChat();
+      await abortStream();
+      expect(isEditorMutationLocked()).toBe(true);
+
+      historyWith({
+        ...inFlight("First draft", "2026-11-02T00:00:10Z"),
+        cancel_token: cancelToken,
+      });
+      historyResponse.data = { ...historyResponse.data, ...proposal };
+      await selectChat("chat-1");
+      await advance(5_000);
+      expect(
+        apply.mock.calls.some(([workflow]) => workflow.title === "First draft"),
+      ).toBe(true);
+      expect(isEditorMutationLocked()).toBe(true);
+      expect(screen.getByText(followingCopy)).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+
+      answer("completed");
+      await advance(5_000);
+      expect(isEditorMutationLocked()).toBe(false);
+      expect(restore).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not follow a different running turn after switching back", async () => {
+    const { apply, abortStream, historyWith } =
+      await startTurnThenOpenNewChat();
+    await abortStream();
+
+    historyWith({
+      ...inFlight("Foreign draft", "2026-11-02T00:00:10Z"),
+      turn_id: "turn-other",
+      cancel_token: "cancel-other",
+    });
+    await selectChat("chat-1");
+    await advance(5_000);
+    expect(
+      apply.mock.calls.some(([workflow]) => workflow.title === "Foreign draft"),
+    ).toBe(false);
+    expect(screen.queryByText(followingCopy)).toBeNull();
+  });
+
+  it("follows the turn when its history loads before the aborted stream settles", async () => {
+    const { apply, abortStream, historyWith, cancelToken } =
+      await startTurnThenOpenNewChat();
+    historyWith({
+      ...inFlight("First draft", "2026-11-02T00:00:10Z"),
+      cancel_token: cancelToken,
+    });
+    await selectChat("chat-1");
+    await abortStream();
+    await advance(5_000);
+    expect(
+      apply.mock.calls.some(([workflow]) => workflow.title === "First draft"),
+    ).toBe(true);
+    expect(isEditorMutationLocked()).toBe(true);
+    expect(screen.getByText(followingCopy)).toBeTruthy();
+
+    answer("completed");
+    await advance(5_000);
+    expect(isEditorMutationLocked()).toBe(false);
   });
 });

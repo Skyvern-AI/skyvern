@@ -24,6 +24,7 @@ import ssl
 import sys
 import tempfile
 import textwrap
+import threading
 import traceback
 import unicodedata
 import uuid
@@ -66,9 +67,10 @@ import filetype
 import pandas as pd
 import structlog
 from charset_normalizer import from_bytes
-from jinja2 import StrictUndefined, TemplateSyntaxError, UndefinedError
+from jinja2 import StrictUndefined, TemplateError, TemplateSyntaxError, UndefinedError
 from jinja2 import meta as jinja2_meta
 from jinja2 import nodes
+from jinja2.exceptions import SecurityError
 from jinja2.sandbox import SandboxedEnvironment
 from jinja2.visitor import NodeTransformer
 from jsonschema import Draft202012Validator
@@ -122,6 +124,7 @@ from skyvern.exceptions import (
     DownloadSaveIncompleteError,
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
+    InvalidUrl,
     MalformedBranchEvaluationError,
     MissingBrowserState,
     MissingBrowserStatePage,
@@ -178,9 +181,14 @@ from skyvern.forge.sdk.api.llm.schema_validator import (
     resolve_schema_type,
     validate_schema,
 )
-from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
+from skyvern.forge.sdk.api.llm.utils import (
+    llm_error_log_metadata,
+    llm_prompt_log_metadata,
+    llm_response_log_metadata,
+)
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at, is_file_from_retry_attempt
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import run_stoppable_comparison, unique_pdf_paths
 from skyvern.forge.sdk.copilot.code_block_security import SlottedReference, is_inert_slot, slot_template
 from skyvern.forge.sdk.copilot.code_block_steps import analyze_code_actions, code_typed_values
 from skyvern.forge.sdk.copilot.reached_download_target import (
@@ -194,7 +202,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.core.hashing import diagnostic_fingerprint
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
-from skyvern.forge.sdk.credential_site_policy import describe_release_scope, origin_of, same_release_scope
+from skyvern.forge.sdk.credential_site_policy import LoginSite, describe_release_scope, origin_of
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -248,9 +256,16 @@ from skyvern.forge.sdk.workflow.code_block_authorized_files import (
     unbound_attach_authorized_file,
 )
 from skyvern.forge.sdk.workflow.code_block_safety import BLOCKED_ATTRS as CODE_BLOCK_BLOCKED_ATTRS
-from skyvern.forge.sdk.workflow.code_block_safety import SANDBOX_MODULES_GLOBAL, BindSandboxModuleImports
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    SANDBOX_MODULES_GLOBAL,
+    BindSandboxModuleImports,
+)
 from skyvern.forge.sdk.workflow.code_block_safety import is_safe_code as _shared_is_safe_code
-from skyvern.forge.sdk.workflow.code_block_safety import json_safe_default, module_shims, safe_builtins
+from skyvern.forge.sdk.workflow.code_block_safety import (
+    json_safe_default,
+    module_shims,
+    safe_builtins,
+)
 from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import (
     NON_SECRET_CREDENTIAL_FIELDS,
@@ -259,6 +274,7 @@ from skyvern.forge.sdk.workflow.context_manager import (
     register_secret_derived_output,
 )
 from skyvern.forge.sdk.workflow.exceptions import (
+    RENDER_FAILURE_OUTPUT_KEY,
     CodeBlockTemplateSyntaxError,
     CustomizedCodeException,
     CustomSMTPAuthenticationFailed,
@@ -274,6 +290,8 @@ from skyvern.forge.sdk.workflow.exceptions import (
     NoValidEmailRecipient,
     PayloadTemplateRenderError,
     PayloadTemplateSyntaxError,
+    RenderFailureKind,
+    TemplateRenderCause,
     WorksheetNotFound,
 )
 from skyvern.forge.sdk.workflow.loop_download_filter import (
@@ -305,6 +323,7 @@ from skyvern.forge.sdk.workflow.models.code_block_recording import CodeBlockActi
 from skyvern.forge.sdk.workflow.models.credential_release import (
     CodeBlockCredentialReleaseError,
     CredentialReleaseGuard,
+    login_release_sites,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -372,7 +391,12 @@ from skyvern.utils.secret_redaction import (
     redact_secrets_from_text,
 )
 from skyvern.utils.strings import generate_random_string
-from skyvern.utils.templating import get_available_keys, get_missing_variables, reject_jinja_transformations_on_variable
+from skyvern.utils.templating import (
+    TransformedPlaceholderError,
+    get_available_keys,
+    get_missing_variables,
+    reject_jinja_transformations_on_variable,
+)
 from skyvern.utils.token_counter import count_tokens, decode_tokens, encode_tokens
 from skyvern.utils.url_validators import (
     prepend_scheme_and_validate_url,
@@ -532,6 +556,10 @@ class DownloadClaimOutcomeRecorder:
         self.outcome = outcome
 
 
+def _is_run_download_dir(path: str, run_id: str | None) -> bool:
+    return bool(run_id) and Path(path).resolve() == get_path_for_workflow_download_directory(run_id).resolve()
+
+
 def bind_downloaded_files_to_output(result: Any, downloaded_files: list[FileInfo]) -> Any:
     """Attach registration evidence to whatever the block's code returned.
 
@@ -651,7 +679,7 @@ def _absent_template_roots(env: SandboxedEnvironment, source: str, template_data
     return sorted(_find_template_roots(env, source) - template_data.keys() - env.globals.keys())
 
 
-def _missing_reference_suffix(exc: BaseException) -> str:
+def _missing_references_text(exc: BaseException) -> str:
     cause = _exception_in_cause_chain(exc, FailedToFormatJinjaStyleParameter) or _exception_in_cause_chain(
         exc, MissingJinjaVariables
     )
@@ -665,7 +693,147 @@ def _missing_reference_suffix(exc: BaseException) -> str:
     label = "Missing reference" if total == 1 else "Missing references"
     hidden = total - len(shown)
     more = f", and {hidden} more" if hidden else ""
-    return f" {label}: {', '.join(shown)}{more}."
+    return f"{label}: {', '.join(shown)}{more}"
+
+
+_MAX_RENDER_CAUSE_EXPRESSION_LENGTH = 120
+_LITERAL_TOKEN_TYPES = frozenset({"string", "integer", "float"})
+
+
+def _failing_template_line(exc: BaseException) -> int | None:
+    if isinstance(exc, TemplateSyntaxError):
+        return exc.lineno
+    template_lines = [
+        frame.lineno for frame in traceback.extract_tb(exc.__traceback__) if frame.filename == "<template>"
+    ]
+    return template_lines[-1] if template_lines else None
+
+
+def _template_expressions_on_line(
+    env: SandboxedEnvironment, source: str, line: int, missing_references: list[str]
+) -> tuple[str, ...]:
+    """The `{{ }}` expressions and `{% %}` tags spanning `line`, rebuilt from lexer tokens with every literal
+    shown as `...`. A bare keyword tag such as `endif` or `else` cannot fail, so it is left out."""
+    found: list[tuple[str, set[str]]] = []
+    tokens: list[str] | None = None
+    names: set[str] = set()
+    start_line = 0
+    is_tag = False
+    try:
+        lexed = list(env.lex(source))
+    except TemplateSyntaxError:
+        return ()
+    for lineno, token_type, value in lexed:
+        if token_type in ("variable_begin", "block_begin"):
+            tokens, names, start_line, is_tag = [], set(), lineno, token_type == "block_begin"
+        elif token_type in ("variable_end", "block_end") and tokens is not None:
+            expression = " ".join("".join(tokens).split())
+            if start_line <= line <= lineno and not (is_tag and expression.isidentifier()):
+                found.append((expression, names))
+            tokens = None
+        elif tokens is not None:
+            if token_type == "name":
+                names.add(value)
+            tokens.append("..." if token_type in _LITERAL_TOKEN_TYPES else value)
+    naming_a_missing_root = [expression for expression, names in found if names & set(missing_references)]
+    return tuple(naming_a_missing_root or [expression for expression, _ in found])
+
+
+def _undefined_kind(missing_references: list[str]) -> RenderFailureKind:
+    return RenderFailureKind.MISSING_REFERENCE if missing_references else RenderFailureKind.MISSING_KEY_OR_ATTRIBUTE
+
+
+def _render_cause(
+    exc: BaseException, source: str, env: SandboxedEnvironment, missing_references: list[str]
+) -> TemplateRenderCause:
+    if isinstance(exc, TemplateSyntaxError):
+        kind = RenderFailureKind.SYNTAX_ERROR
+    elif isinstance(exc, SecurityError):
+        kind = RenderFailureKind.UNSAFE_OPERATION
+    elif isinstance(exc, UndefinedError):
+        kind = _undefined_kind(missing_references)
+    elif isinstance(exc, (TypeError, ValueError)):
+        kind = RenderFailureKind.WRONG_VALUE_TYPE
+    else:
+        kind = RenderFailureKind.RENDER_ERROR
+    line = _failing_template_line(exc)
+    expressions = _template_expressions_on_line(env, source, line, missing_references) if line is not None else ()
+    return TemplateRenderCause(kind, expressions, line)
+
+
+def _template_render_cause(exc: BaseException) -> TemplateRenderCause | None:
+    if isinstance(exc, InvalidUrl):
+        return TemplateRenderCause(RenderFailureKind(f"Invalid URL: {exc.reason}"), field_name=exc.field_name)
+    if isinstance(exc, TransformedPlaceholderError):
+        return TemplateRenderCause(RenderFailureKind.TRANSFORMED_PLACEHOLDER)
+    cause: BaseException | None = exc
+    while cause is not None:
+        if isinstance(cause, (FailedToFormatJinjaStyleParameter, MissingJinjaVariables)) and cause.render_cause:
+            return cause.render_cause
+        cause = cause.__cause__
+    missing_exc = _exception_in_cause_chain(exc, MissingJinjaVariables)
+    if missing_exc is not None:
+        return TemplateRenderCause(_undefined_kind(missing_exc.missing_references))
+    if (
+        _exception_in_cause_chain(exc, FailedToFormatJinjaStyleParameter) is not None
+        or _exception_in_cause_chain(exc, PayloadTemplateRenderError) is not None
+    ):
+        return TemplateRenderCause(RenderFailureKind.RENDER_ERROR)
+    template_exc = _exception_in_cause_chain(exc, TemplateError)
+    if template_exc is not None:
+        return _render_cause(template_exc, "", jinja_sandbox_env, [])
+    return None
+
+
+def _redacted_expressions(expressions: tuple[str, ...], redact: Callable[[str], str]) -> str | None:
+    """Redacts each expression before cutting it, so a secret straddling the cut leaves no prefix behind."""
+    shown = []
+    for expression in expressions:
+        expression = redact(expression)
+        if len(expression) > _MAX_RENDER_CAUSE_EXPRESSION_LENGTH:
+            expression = expression[: _MAX_RENDER_CAUSE_EXPRESSION_LENGTH - 3] + "..."
+        shown.append(expression)
+    return "; ".join(shown) or None
+
+
+def _redacted_payload_path(segments: tuple[str | int, ...], redact: Callable[[str], str]) -> str:
+    path = "payload"
+    for segment in segments:
+        part = f"[{segment}]" if isinstance(segment, int) else _format_payload_path_segment(redact(segment))
+        if len(path) + len(part) > _MAX_RENDER_CAUSE_EXPRESSION_LENGTH:
+            return f"{path}..."
+        path += part
+    return path
+
+
+def render_failure_reason(prefix: str, exc: BaseException, redact: Callable[[str], str]) -> str:
+    """`prefix` plus the render cause; never the exception text or the template, which can carry parameter values."""
+    cause = _template_render_cause(exc) or TemplateRenderCause(RenderFailureKind.RENDER_ERROR)
+    missing = _missing_references_text(exc)
+    expression = _redacted_expressions(cause.expressions, redact)
+    if cause.kind is RenderFailureKind.MISSING_REFERENCE and missing and not expression:
+        reason, missing = f"{prefix} {missing}", ""
+    else:
+        reason = f"{prefix} {cause.kind}" + (f" in `{expression}`" if expression else "")
+    location = [f"field {cause.field_name}"] if cause.field_name else []
+    if cause.line is not None:
+        location.append(f"line {cause.line}")
+    if location:
+        reason += f" ({', '.join(location)})"
+    payload_exc = _exception_in_cause_chain(exc, PayloadTemplateRenderError)
+    if payload_exc is not None:
+        reason += f" at {_redacted_payload_path(payload_exc.segments, redact)}"
+    return redact(f"{reason}." + (f" {missing}." if missing else ""))
+
+
+def render_failure_record(exc: BaseException, redact: Callable[[str], str]) -> dict[str, Any]:
+    cause = _template_render_cause(exc) or TemplateRenderCause(RenderFailureKind.RENDER_ERROR)
+    return {
+        "kind": cause.kind.value,
+        "field": cause.field_name,
+        "expression": _redacted_expressions(cause.expressions, redact),
+        "line": cause.line,
+    }
 
 
 if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
@@ -1078,6 +1246,7 @@ class Block(BaseModel, abc.ABC):
     _prerendered_fields: frozenset[str] = PrivateAttr(default=frozenset())
     # An inline block a cached step's script starts (ai_validate, ai_prompt) reads that step's notes.
     _notes_label: str | None = PrivateAttr(default=None)
+    _agent_smtp_isolation: bool = PrivateAttr(default=False)
 
     # Fields this class renders as Jinja. Declared per class; the effective set is the
     # union over the MRO, so a subclass never shadows what its base renders.
@@ -1137,17 +1306,14 @@ class Block(BaseModel, abc.ABC):
                 extra_template_data=extra_template_data,
             )
         except Exception as exc:
-            if field not in ("totp_identifier", "totp_verification_url"):
-                raise
-            cause = exc.__cause__ or exc
-            failure_class = (
-                "syntax"
-                if isinstance(cause, TemplateSyntaxError)
-                else "missing variable"
-                if isinstance(exc, MissingJinjaVariables) or isinstance(cause, UndefinedError)
-                else "evaluation"
+            cause = replace(
+                _template_render_cause(exc) or TemplateRenderCause(RenderFailureKind.RENDER_ERROR), field_name=field
             )
-            raise SkyvernException(f"Failed to render {field}: {failure_class}.") from None
+            if field in ("totp_identifier", "totp_verification_url"):
+                raise FailedToFormatJinjaStyleParameter(field, field, render_cause=cause) from None
+            if isinstance(exc, (FailedToFormatJinjaStyleParameter, MissingJinjaVariables)):
+                exc.render_cause = cause
+            raise
 
     @staticmethod
     def _registered_secret_values(workflow_run_context: WorkflowRunContext) -> set[str]:
@@ -1183,6 +1349,10 @@ class Block(BaseModel, abc.ABC):
         for secret in sorted(cls._registered_secret_values(workflow_run_context), key=len, reverse=True):
             value = value.replace(secret, "[redacted]")
         return value
+
+    @classmethod
+    def secret_redactor(cls, workflow_run_context: WorkflowRunContext) -> Callable[[str], str]:
+        return partial(cls._redact_registered_secrets, workflow_run_context=workflow_run_context)
 
     def _render_error_code_mapping(
         self,
@@ -1221,13 +1391,31 @@ class Block(BaseModel, abc.ABC):
             rendered_description = self.render_templatable_field(
                 "error_code_mapping", error_description, workflow_run_context
             )
-            rendered_description = self._redact_registered_secrets(rendered_description, workflow_run_context)
-            secret_bearing_key = (
-                self._contains_registered_secret(rendered_code, workflow_run_context)
-                if for_generated_code
-                else self._contains_registered_secret_floored(rendered_code, workflow_run_context)
-            )
-            if secret_bearing_key or workflow_run_context.mask_secrets_in_data(rendered_code) != rendered_code:
+            if self._agent_smtp_isolation:
+                secrets = workflow_run_context.agent_redactable_secret_values()
+                for secret in sorted(secrets, key=len, reverse=True):
+                    rendered_description = rendered_description.replace(secret, "[redacted]")
+                secret_bearing_key = any(
+                    secret in rendered_code
+                    for secret in secrets
+                    if for_generated_code
+                    or (
+                        len(secret) >= MIN_SECRET_LENGTH
+                        and not (secret.isdigit() and len(secret) < MIN_NUMERIC_SECRET_LENGTH)
+                    )
+                )
+                masked_code = workflow_run_context.mask_secrets_in_data(
+                    rendered_code, excluded_secret_ids=workflow_run_context.agent_unmasked_platform_secret_ids()
+                )
+            else:
+                rendered_description = self._redact_registered_secrets(rendered_description, workflow_run_context)
+                secret_bearing_key = (
+                    self._contains_registered_secret(rendered_code, workflow_run_context)
+                    if for_generated_code
+                    else self._contains_registered_secret_floored(rendered_code, workflow_run_context)
+                )
+                masked_code = workflow_run_context.mask_secrets_in_data(rendered_code)
+            if secret_bearing_key or masked_code != rendered_code:
                 dropped_reasons.append("error code keys must not contain a registered secret")
                 continue
             key_reason = error_code_key_error(rendered_code)
@@ -1327,6 +1515,7 @@ class Block(BaseModel, abc.ABC):
         workflow_run_block_id: str | None,
         organization_id: str | None,
         can_continue_after_failure: bool | None = None,
+        render_failure: bool = True,
     ) -> BlockResult:
         failure_reason = self._redact_registered_secrets(failure_reason, workflow_run_context)
         error_codes = self.get_failure_error_codes()
@@ -1341,6 +1530,10 @@ class Block(BaseModel, abc.ABC):
             failure_output["available_keys"] = [
                 self._redact_registered_secrets(key, workflow_run_context) for key in format_exc.available_keys
             ]
+        if render_failure:
+            failure_output[RENDER_FAILURE_OUTPUT_KEY] = render_failure_record(
+                exc, self.secret_redactor(workflow_run_context)
+            )
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, failure_output)
         return await self.build_block_result(
             success=False,
@@ -1590,10 +1783,14 @@ class Block(BaseModel, abc.ABC):
         if not potential_template:
             return potential_template
 
+        workflow_run_context.reject_platform_smtp_template_references(potential_template)
+        render_env = env or jinja_sandbox_env
         try:
-            template = (env or jinja_sandbox_env).from_string(potential_template)
+            template = render_env.from_string(potential_template)
         except Exception as exc:
-            raise FailedToFormatJinjaStyleParameter(potential_template, str(exc)) from exc
+            raise FailedToFormatJinjaStyleParameter(
+                potential_template, str(exc), render_cause=_render_cause(exc, potential_template, render_env, [])
+            ) from exc
 
         template_data = self._build_block_parameter_template_data(
             workflow_run_context, force_include_secrets=force_include_secrets
@@ -1602,17 +1799,45 @@ class Block(BaseModel, abc.ABC):
             # A field-specific binding only fills a gap: a workflow that already has a parameter
             # under the same key keeps rendering its own value.
             template_data = {**extra_template_data, **template_data}
+            if self.block_type == BlockType.AGENT_STEP or self._agent_smtp_isolation:
+                template_data = workflow_run_context.mask_platform_smtp_for_agent(template_data)
 
         # A caller whose environment decides for itself what an absent binding means renders instead of
         # failing here, so `| default(...)` still reaches an undefined the preflight would reject.
+        def format_failure(exc: Exception) -> FailedToFormatJinjaStyleParameter:
+            # Only Jinja's own "'X' is undefined" names a root, so a default-guarded absent root is never blamed.
+            missing_references = (
+                [
+                    root
+                    for root in _absent_template_roots(render_env, potential_template, template_data)
+                    if str(exc) == f"{root!r} is undefined"
+                ]
+                if isinstance(exc, UndefinedError)
+                else []
+            )
+            return FailedToFormatJinjaStyleParameter(
+                potential_template,
+                str(exc),
+                available_keys=get_available_keys(potential_template, template_data),
+                missing_references=missing_references,
+                render_cause=_render_cause(exc, potential_template, render_env, missing_references),
+            )
+
         if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict" and not skip_missing_variable_preflight:
-            if missing_variables := get_missing_variables(potential_template, template_data):
+            try:
+                missing_variables = get_missing_variables(potential_template, template_data)
+            except SkyvernException:
+                raise
+            except Exception as exc:
+                raise format_failure(exc) from exc
+            if missing_variables:
+                absent_roots = _absent_template_roots(render_env, potential_template, template_data)
+                # The preflight can also list references that rendered fine, so a nested miss names no line.
                 raise MissingJinjaVariables(
                     template=potential_template,
                     variables=missing_variables,
-                    missing_references=_absent_template_roots(
-                        env or jinja_sandbox_env, potential_template, template_data
-                    ),
+                    missing_references=absent_roots,
+                    render_cause=TemplateRenderCause(_undefined_kind(absent_roots)),
                 )
 
         try:
@@ -1620,24 +1845,14 @@ class Block(BaseModel, abc.ABC):
         except SkyvernException:
             raise
         except Exception as exc:
-            # Only Jinja's own "'X' is undefined" names a root, so a default-guarded absent root is never blamed.
-            missing_references = (
-                [
-                    root
-                    for root in _absent_template_roots(env or jinja_sandbox_env, potential_template, template_data)
-                    if str(exc) == f"{root!r} is undefined"
-                ]
-                if isinstance(exc, UndefinedError)
-                else []
-            )
-            raise FailedToFormatJinjaStyleParameter(
-                potential_template,
-                str(exc),
-                available_keys=get_available_keys(potential_template, template_data),
-                missing_references=missing_references,
-            ) from exc
+            raise format_failure(exc) from exc
         register_secret_derived_output(
-            workflow_run_context.secrets, template, potential_template, template_data, rendered
+            workflow_run_context.secrets,
+            template,
+            potential_template,
+            template_data,
+            rendered,
+            excluded_secret_ids=workflow_run_context.agent_unmasked_platform_secret_ids(),
         )
         if page_derived_capture is not None:
             page_derived_capture(env or jinja_sandbox_env, template_data, rendered)
@@ -1663,6 +1878,9 @@ class Block(BaseModel, abc.ABC):
         if copy_block_metadata:
             block_reference_data = block_reference_data.copy()
         template_data = workflow_run_context.values.copy()
+        if self.block_type == BlockType.AGENT_STEP or self._agent_smtp_isolation:
+            for key in workflow_run_context.platform_smtp_parameter_keys():
+                template_data.pop(key, None)
 
         include_secrets = workflow_run_context.include_secrets_in_templates or force_include_secrets
 
@@ -1718,6 +1936,8 @@ class Block(BaseModel, abc.ABC):
         template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
         if include_workflow_run_summary:
             template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
+        if self.block_type == BlockType.AGENT_STEP or self._agent_smtp_isolation:
+            template_data = workflow_run_context.mask_platform_smtp_for_agent(template_data)
         return template_data
 
     def _apply_workflow_system_prompt(
@@ -1746,6 +1966,8 @@ class Block(BaseModel, abc.ABC):
         prompt and any inherited prompt from parent workflows.
         """
         notes_section = workflow_run_context.resolve_block_notes_section(self._notes_label or self.label)
+        if self._agent_smtp_isolation and notes_section is not None:
+            notes_section = workflow_run_context.mask_platform_smtp_for_agent(notes_section)
         if self.ignore_workflow_system_prompt:
             # Record the opt-out so the script path (``ai_extract``) reads the
             # same decision instead of re-resolving the flag from the
@@ -1755,9 +1977,33 @@ class Block(BaseModel, abc.ABC):
                 self.workflow_system_prompt = notes_section
             workflow_run_context.record_block_workflow_system_prompt(self.label, notes_section)
             return
-        resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        try:
+            resolved = workflow_run_context.resolve_effective_workflow_system_prompt()
+        except MissingJinjaVariables:
+            raise
+        except Exception as exc:
+            definition = workflow_run_context.workflow.workflow_definition if workflow_run_context.workflow else None
+            sources = [
+                source
+                for source in (
+                    workflow_run_context.inherited_workflow_system_prompt,
+                    definition.workflow_system_prompt if definition else None,
+                )
+                if isinstance(source, str) and source
+            ]
+            # With both an inherited and an own prompt, the expression lookup cannot tell which one the line is in.
+            source = sources[0] if len(sources) == 1 else ""
+            raise FailedToFormatJinjaStyleParameter(
+                "workflow system prompt",
+                type(exc).__name__,
+                render_cause=replace(
+                    _render_cause(exc, source, jinja_sandbox_env, []), field_name="workflow_system_prompt"
+                ),
+            ) from exc
         if notes_section:
             resolved = "\n\n".join(part for part in (resolved, notes_section) if part)
+        if self._agent_smtp_isolation and resolved is not None:
+            resolved = workflow_run_context.mask_platform_smtp_for_agent(resolved)
         if resolved is not None:
             self.workflow_system_prompt = resolved
         workflow_run_context.record_block_workflow_system_prompt(self.label, resolved)
@@ -1769,6 +2015,29 @@ class Block(BaseModel, abc.ABC):
     @staticmethod
     def get_workflow_run_context(workflow_run_id: str) -> WorkflowRunContext:
         return app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+
+    async def _workflow_copilot_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
+        """Whether Copilot wrote any version of this workflow, or None when the lookup failed."""
+        workflow = workflow_run_context.workflow
+        if workflow is None:
+            return False
+        if "copilot" in (workflow.created_by, workflow.edited_by):
+            return True
+        # User saves re-stamp both fields with the user id, so the current version alone is
+        # not durable; fall back to lineage (copilot stamps every version it writes). A lookup
+        # failure must never mask a block failure.
+        try:
+            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return copilot_authored is True
+        except Exception:
+            LOG.warning(
+                "Copilot-lineage lookup failed; failing closed",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+            )
+            return None
 
     @staticmethod
     def get_async_aws_client() -> AsyncAWSClient:
@@ -1951,11 +2220,7 @@ class Block(BaseModel, abc.ABC):
         try:
             if isinstance(self, BaseTaskBlock):
                 engine = self.resolve_engine(workflow_run_id)
-                if (
-                    engine == RunEngine.skyvern_v3
-                    and download_timeout_context is not None
-                    and not download_timeout_context.script_mode
-                ):
+                if download_timeout_context is not None and not download_timeout_context.script_mode:
                     download_timeout_context.download_timeout = self.download_timeout
 
             workflow_run_block = await app.DATABASE.observer.create_workflow_run_block(
@@ -2717,7 +2982,9 @@ class BaseTaskBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -6009,6 +6276,7 @@ async def _poll_code_block_otp(
     budget_seconds: int,
     subject: str,
     expected_otp_type: OTPType,
+    task_url: str | None = None,
 ) -> otp_service.OTPValue:
     if not organization_id:
         raise CodeBlockOTPError("OTP is unavailable: no organization is associated with this code block.")
@@ -6043,6 +6311,7 @@ async def _poll_code_block_otp(
                 expected_otp_type=expected_otp_type,
                 email_context=email_context,
                 raw_context=raw_context,
+                task_url=task_url,
             ),
             timeout=budget_seconds,
         )
@@ -6112,6 +6381,7 @@ async def _resolve_code_block_magic_link(
     workflow_run_id: str | None,
     *,
     budget_seconds: int,
+    task_url: str | None = None,
 ) -> str:
     """Resolve a fresh sign-in link for one credential, for the caller to navigate to.
 
@@ -6138,6 +6408,7 @@ async def _resolve_code_block_magic_link(
         budget_seconds=budget_seconds,
         subject="this credential",
         expected_otp_type=OTPType.MAGIC_LINK,
+        task_url=task_url,
     )
     return polled.value
 
@@ -6214,6 +6485,7 @@ def _bind_code_block_magic_link(
             organization_id,
             workflow_run_id,
             budget_seconds=settings.CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS,
+            task_url=page.url,
         )
         await navigate_with_retry(
             navigate=lambda strategy: page.goto(link, timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy),
@@ -8239,29 +8511,6 @@ async def wrapper({default_args}):
     async def _workflow_is_copilot_authored(self, workflow_run_context: WorkflowRunContext) -> bool:
         return await self._workflow_copilot_lineage(workflow_run_context) is True
 
-    async def _workflow_copilot_lineage(self, workflow_run_context: WorkflowRunContext) -> bool | None:
-        """Whether Copilot wrote any version of this workflow, or None when the lookup failed."""
-        workflow = workflow_run_context.workflow
-        if workflow is None:
-            return False
-        if "copilot" in (workflow.created_by, workflow.edited_by):
-            return True
-        # User saves re-stamp both fields with the user id, so the current version alone is
-        # not durable; fall back to lineage (copilot stamps every version it writes). A lookup
-        # failure must never mask a block failure.
-        try:
-            copilot_authored = await app.DATABASE.workflows.is_workflow_copilot_authored(
-                workflow_permanent_id=workflow.workflow_permanent_id,
-                organization_id=workflow.organization_id,
-            )
-            return copilot_authored is True
-        except Exception:
-            LOG.warning(
-                "Copilot-lineage lookup failed; failing closed",
-                workflow_permanent_id=workflow.workflow_permanent_id,
-            )
-            return None
-
     async def _ai_fallback_enabled(self, workflow_run_context: WorkflowRunContext) -> bool:
         workflow = workflow_run_context.workflow
         if workflow is None or not await code_block_ai_fallback_flag_enabled(workflow.organization_id):
@@ -9009,10 +9258,13 @@ async def wrapper({default_args}):
             # Bounded here, in seconds, because the frame is optional evidence: on the healable
             # arm it is read before recovery runs, so an unbounded read would hold both the heal
             # and the failure fact behind a stalled screenshot.
+            # The current viewport, not a stitched full page: the repair model receives this frame fitted to
+            # 1600x1200, which leaves a long page's text unreadable.
             async with asyncio.timeout(settings.BROWSER_SCREENSHOT_TIMEOUT_MS / 1000):
                 return await SkyvernFrame.take_scrolling_screenshot(
                     page=page,
                     mode=ScreenshotMode.LITE,
+                    scrolling_number=0,
                     engine_selection=browser_state.engine_selection if browser_state is not None else None,
                 )
         except asyncio.CancelledError:
@@ -9416,6 +9668,7 @@ async def wrapper({default_args}):
         authored_code: str | None,
         code_failure_reason: str | None,
         failure_kind: CodeBlockFailureKind | None = None,
+        code_error_codes: list[str] | None = None,
     ) -> BlockResult:
         resolved_redaction_parameters = redaction_parameters or {}
         staged_frame: _StagedFrame | None = None
@@ -9537,15 +9790,25 @@ async def wrapper({default_args}):
                         download_binding_kind=download_binding_of(browser_state).value,
                         result=result.output_parameter_value,
                     )
-                    if failure_output is not None:
+                    # Navigation codes are left to the recovery, which may have replaced or cleared the code's own.
+                    own_error_codes = [code for code in code_error_codes or [] if driver_nav_error_code(code) != code]
+                    error_codes = result.error_codes or None
+                    if own_error_codes:
+                        error_codes = _unique_error_codes(
+                            result.error_codes,
+                            _redact_codeblock_error_codes(own_error_codes, resolved_redaction_parameters, None),
+                        )
+                    if failure_output is not None or error_codes != (result.error_codes or None):
                         result = await self.build_block_result(
                             success=False,
                             failure_reason=result.failure_reason,
-                            output_parameter_value=failure_output,
+                            output_parameter_value=(
+                                failure_output if failure_output is not None else result.output_parameter_value
+                            ),
                             status=result.status or BlockStatus.failed,
                             workflow_run_block_id=workflow_run_block_id,
                             organization_id=organization_id,
-                            error_codes=result.error_codes or None,
+                            error_codes=error_codes,
                             can_continue_after_failure=result.can_continue_after_failure,
                         )
                     result = with_failure_kind(result)
@@ -9904,7 +10167,9 @@ async def wrapper({default_args}):
                 download_log.close()
                 return await self._template_format_failure_result(
                     e,
-                    "Failed to format CodeBlock parameters." + _missing_reference_suffix(e),
+                    render_failure_reason(
+                        "Failed to format CodeBlock parameters.", e, self.secret_redactor(workflow_run_context)
+                    ),
                     workflow_run_context,
                     workflow_run_id,
                     workflow_run_block_id,
@@ -10245,6 +10510,7 @@ async def wrapper({default_args}):
                         # no-op or empty it; fall back to what the runner reported.
                         runner_reason = secure_failure.failure_reason or "Code block failed in the secure runner"
                         secure_failure_reason = scrub_failure_reason(runner_reason, fallback=runner_reason) or ""
+                        secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
 
                         async def build_secure_failure_result() -> BlockResult:
                             engine_block_result = secure_code_block_result.block_result
@@ -10270,7 +10536,6 @@ async def wrapper({default_args}):
                                     organization_id=organization_id,
                                 )
                                 return engine_block_result
-                            secure_error_code = scrub_failure_reason(secure_failure.error_code, fallback="")
                             secure_error_codes = [secure_error_code] if secure_error_code else []
                             if secure_failure.nav_error_code and not is_registered_secret(
                                 secure_failure.nav_error_code, workflow_run_context
@@ -10342,6 +10607,7 @@ async def wrapper({default_args}):
                                 else None
                             ),
                             failure_kind=secure_failure.failure_kind,
+                            code_error_codes=[secure_error_code] if secure_error_code else None,
                         )
                     if secure_code_block_result.block_result is None:
                         LOG.warning(
@@ -11381,12 +11647,12 @@ class TextPromptBlock(Block):
         if isinstance(obj, str):
             try:
                 return self.render_templatable_field("json_schema", obj, workflow_run_context)
-            except Exception:
+            except Exception as exc:
                 LOG.warning(
                     "Failed to render Jinja template in json_schema value, using original value",
                     value=obj,
                     block_label=self.label,
-                    exc_info=True,
+                    render_failure=render_failure_record(exc, self.secret_redactor(workflow_run_context)),
                 )
                 return obj
         elif isinstance(obj, dict):
@@ -11480,8 +11746,8 @@ class TextPromptBlock(Block):
 
         LOG.info(
             "TextPromptBlock Sending prompt to LLM",
-            prompt=prompt,
             llm_key=self.llm_key,
+            **llm_prompt_log_metadata(prompt),
         )
         response: dict[str, Any] | list | str | None = None
         for attempt in range(TEXT_PROMPT_MAX_ATTEMPTS):
@@ -11502,7 +11768,7 @@ class TextPromptBlock(Block):
                         "TextPromptBlock LLM call failed after all retries",
                         block_label=self.label,
                         attempts=attempt + 1,
-                        error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
+                        **llm_error_log_metadata(e),
                     )
                     raise
                 backoff_time = 0.2 * (2**attempt)
@@ -11512,7 +11778,7 @@ class TextPromptBlock(Block):
                     attempt=attempt + 1,
                     max_attempts=TEXT_PROMPT_MAX_ATTEMPTS,
                     backoff_time=backoff_time,
-                    error=data_sanitizer(str(e)) if data_sanitizer is not None else str(e),
+                    **llm_error_log_metadata(e),
                 )
                 await asyncio.sleep(backoff_time)
 
@@ -11593,7 +11859,10 @@ class TextPromptBlock(Block):
                 attempt=attempt + 1,
                 max_attempts=self.schema_validation_max_attempts,
                 will_retry=will_retry,
-                failure_reason=schema_validation_failure,
+                failure_class=_classify_schema_validation_failure(
+                    schema_validation_failure, response, json_schema or {}
+                ),
+                failure_text_length=len(schema_validation_failure),
                 schema_type=json_schema.get("type") if json_schema is not None else None,
             )
             if not will_retry:
@@ -11646,7 +11915,9 @@ class TextPromptBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -11697,11 +11968,12 @@ class TextPromptBlock(Block):
                 resolved_llm_key = self.override_llm_key_for_organization(organization_id) or self.llm_key
             except Exception:
                 resolved_llm_key = self.llm_key
-            LOG.exception(
+            LOG.error(
                 "TextPromptBlock LLM call failed",
                 block_label=self.label,
                 workflow_run_id=workflow_run_id,
                 llm_key=resolved_llm_key,
+                **llm_error_log_metadata(e),
             )
             return await self.build_block_result(
                 success=False,
@@ -11823,7 +12095,9 @@ class DownloadToS3Block(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -11933,7 +12207,9 @@ class UploadToS3Block(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -11973,6 +12249,11 @@ class UploadToS3Block(Block):
                         LOG.warning("UploadToS3Block Skipping directory", file=file)
                         continue
                     file_paths.append(file_path)
+                if _is_run_download_dir(
+                    resolved_path, resolve_run_download_id(context, fallback_run_id=workflow_run_id)
+                ):
+                    listed = file_paths
+                    file_paths = await run_stoppable_comparison(lambda stop: unique_pdf_paths(listed, stop))
                 if len(file_paths) > MAX_UPLOAD_FILE_COUNT:
                     raise ValueError("Too many files in the directory, not uploading")
                 for file_path in file_paths:
@@ -12623,12 +12904,18 @@ class FileDestinationBlock(Block):
             candidate_run_ids.append(context.task_id)
         return candidate_run_ids
 
+    def _selects_files_by_prompt(self) -> bool:
+        # A prompt picks files by name, so every copy stays a candidate; without one the whole directory is sent.
+        return bool(self.prompt and self.prompt.strip())
+
     def _get_files_to_upload_from_download_dir(
         self,
         *,
         download_files_path: str,
         max_file_count: int,
         attempt_started_at: datetime | None = None,
+        unique_pdfs: bool = True,
+        stop: threading.Event | None = None,
     ) -> list[str]:
         files_to_upload = []
         if os.path.isdir(download_files_path):
@@ -12643,6 +12930,8 @@ class FileDestinationBlock(Block):
                     LOG.warning("FileUploadBlock Skipping directory", file=file)
                     continue
                 files_to_upload.append(os.path.join(download_files_path, file))
+            if unique_pdfs:
+                files_to_upload = unique_pdf_paths(files_to_upload, stop)
             if len(files_to_upload) > max_file_count:
                 raise ValueError(f"Too many files in the directory, not uploading. Max: {max_file_count}")
         return files_to_upload
@@ -12775,6 +13064,7 @@ class FileDestinationBlock(Block):
         download_files_path: str,
         max_file_count: int,
         attempt_started_at: datetime | None = None,
+        stop: threading.Event | None = None,
     ) -> tuple[list[str] | None, str]:
         """Return alternate local files plus a failure-reason count label.
 
@@ -12793,6 +13083,8 @@ class FileDestinationBlock(Block):
                     download_files_path=candidate_download_files_path,
                     max_file_count=max_file_count,
                     attempt_started_at=attempt_started_at,
+                    unique_pdfs=not self._selects_files_by_prompt(),
+                    stop=stop,
                 )
             except ValueError:
                 LOG.warning(
@@ -12975,7 +13267,9 @@ class FileUploadBlock(FileDestinationBlock):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -12998,10 +13292,14 @@ class FileUploadBlock(FileDestinationBlock):
             attempt_started_at = await get_download_retry_started_at(
                 organization_id or workflow_run_context.organization_id, run_download_id
             )
-            files_to_upload = self._get_files_to_upload_from_download_dir(
-                download_files_path=download_files_path,
-                max_file_count=max_file_count,
-                attempt_started_at=attempt_started_at,
+            files_to_upload = await run_stoppable_comparison(
+                lambda stop: self._get_files_to_upload_from_download_dir(
+                    download_files_path=download_files_path,
+                    max_file_count=max_file_count,
+                    attempt_started_at=attempt_started_at,
+                    unique_pdfs=not self._selects_files_by_prompt(),
+                    stop=stop,
+                )
             )
 
             if not files_to_upload and not self.continue_on_empty:
@@ -13010,14 +13308,16 @@ class FileUploadBlock(FileDestinationBlock):
                     browser_session_downloaded_files,
                     registered_downloaded_files,
                 ) = await asyncio.gather(
-                    asyncio.to_thread(
-                        self._get_files_in_alternate_candidate_download_dirs,
-                        context=context,
-                        workflow_run_id=workflow_run_id,
-                        run_download_id=run_download_id,
-                        download_files_path=download_files_path,
-                        max_file_count=max_file_count,
-                        attempt_started_at=attempt_started_at,
+                    run_stoppable_comparison(
+                        lambda stop: self._get_files_in_alternate_candidate_download_dirs(
+                            context=context,
+                            workflow_run_id=workflow_run_id,
+                            run_download_id=run_download_id,
+                            download_files_path=download_files_path,
+                            max_file_count=max_file_count,
+                            attempt_started_at=attempt_started_at,
+                            stop=stop,
+                        )
                     ),
                     self._get_browser_session_downloaded_files_for_empty_scan(
                         organization_id=organization_id or workflow_run_context.organization_id,
@@ -13319,9 +13619,25 @@ _GMAIL_AUTHORIZATION_ERROR_CODES: dict[google_oauth_service.GmailSendAuthorizati
 
 
 class _GmailSendRefused(Exception):
-    def __init__(self, error_code: GmailSendErrorCode) -> None:
+    def __init__(
+        self,
+        error_code: GmailSendErrorCode,
+        failure_reason: str | None = None,
+        render_failure: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(error_code.value)
         self.error_code = error_code
+        self.failure_reason = failure_reason or GMAIL_SEND_FAILURE_MESSAGES[error_code]
+        self.render_failure = render_failure
+
+
+def _gmail_template_refusal(exc: Exception, redact: Callable[[str], str]) -> _GmailSendRefused:
+    prefix = GMAIL_SEND_FAILURE_MESSAGES[GmailSendErrorCode.TEMPLATE_ERROR]
+    return _GmailSendRefused(
+        GmailSendErrorCode.TEMPLATE_ERROR,
+        render_failure_reason(prefix, exc, redact),
+        render_failure_record(exc, redact),
+    )
 
 
 class _GmailSendStateUnreadable(Exception):
@@ -13519,14 +13835,10 @@ class SendEmailBlock(Block):
             )
 
     def _decrypt_smtp_parameters(self, workflow_run_context: WorkflowRunContext) -> tuple[str, int, str, str]:
-        obfuscated_smtp_host_value = workflow_run_context.get_value_or_none(self.smtp_host.key)
-        obfuscated_smtp_port_value = workflow_run_context.get_value_or_none(self.smtp_port.key)
-        obfuscated_smtp_username_value = workflow_run_context.get_value_or_none(self.smtp_username.key)
-        obfuscated_smtp_password_value = workflow_run_context.get_value_or_none(self.smtp_password.key)
-        smtp_host_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_host_value)
-        smtp_port_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_port_value)
-        smtp_username_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_username_value)
-        smtp_password_value = workflow_run_context.get_original_secret_value_or_none(obfuscated_smtp_password_value)
+        smtp_host_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_host)
+        smtp_port_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_port)
+        smtp_username_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_username)
+        smtp_password_value = workflow_run_context.resolve_smtp_secret(self, self.smtp_password)
 
         email_config_problems = []
         if smtp_host_value is None:
@@ -13609,6 +13921,7 @@ class SendEmailBlock(Block):
         workflow_run_context: WorkflowRunContext,
         workflow_run_id: str,
         attempt_started_at: datetime | None = None,
+        stop: threading.Event | None = None,
     ) -> list[str]:
         file_paths = []
         context = skyvern_context.current()
@@ -13645,6 +13958,7 @@ class SendEmailBlock(Block):
             # if the file path is a directory, add all files in the directory, skip directories, limit to 10 files
             if os.path.exists(path):
                 if os.path.isdir(path):
+                    directory_files = []
                     for file in os.listdir(path):
                         if attempt_started_at is not None and not is_file_from_retry_attempt(
                             os.path.join(path, file), attempt_started_at
@@ -13653,8 +13967,11 @@ class SendEmailBlock(Block):
                         if os.path.isdir(os.path.join(path, file)):
                             LOG.warning("SendEmailBlock Skipping directory", file=file)
                             continue
-                        file_path = os.path.join(path, file)
-                        file_paths.append(file_path)
+                        directory_files.append(os.path.join(path, file))
+                    # Only the run's own download directory is an automatic collection; other entries are chosen files.
+                    if _is_run_download_dir(path, run_id):
+                        directory_files = unique_pdf_paths(directory_files, stop)
+                    file_paths.extend(directory_files)
                 else:
                     # covers the case where the file path is a single file
                     file_paths.append(path)
@@ -13710,7 +14027,10 @@ class SendEmailBlock(Block):
             organization_id or workflow_run_context.organization_id,
             resolve_run_download_id(skyvern_context.current(), fallback_run_id=workflow_run_id),
         )
-        for filename in self._get_file_paths(workflow_run_context, workflow_run_id, attempt_started_at):
+        file_paths = await run_stoppable_comparison(
+            lambda stop: self._get_file_paths(workflow_run_context, workflow_run_id, attempt_started_at, stop)
+        )
+        for filename in file_paths:
             if filename.startswith(("s3://", "gs://", "azure://", "http://", "https://")):
                 path = await download_file(filename, organization_id=organization_id)
             else:
@@ -13800,8 +14120,8 @@ class SendEmailBlock(Block):
                 entry = value
             try:
                 entry = self.render_templatable_field("file_attachments", entry, workflow_run_context)
-            except Exception:
-                raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+            except Exception as exc:
+                raise _gmail_template_refusal(exc, self.secret_redactor(workflow_run_context)) from None
             if not entry.strip() or entry == settings.WORKFLOW_DOWNLOAD_DIRECTORY_PARAMETER_KEY:
                 raise _GmailSendRefused(GmailSendErrorCode.ATTACHMENT_INVALID)
             try:
@@ -13854,8 +14174,8 @@ class SendEmailBlock(Block):
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
-        except Exception:
-            raise _GmailSendRefused(GmailSendErrorCode.TEMPLATE_ERROR) from None
+        except Exception as exc:
+            raise _gmail_template_refusal(exc, self.secret_redactor(workflow_run_context)) from None
 
         credential_id = (self.credential_id or "").strip()
         if not credential_id:
@@ -13973,6 +14293,8 @@ class SendEmailBlock(Block):
         organization_id: str | None,
     ) -> BlockResult:
         replayed = False
+        refusal_reason: str | None = None
+        render_failure: dict[str, Any] | None = None
         try:
             if not organization_id:
                 raise _GmailSendRefused(GmailSendErrorCode.CONFIGURATION)
@@ -13981,6 +14303,8 @@ class SendEmailBlock(Block):
             )
         except _GmailSendRefused as refusal:
             result = GmailSendResult(GmailSendOutcome.FAILED, error_code=refusal.error_code)
+            refusal_reason = refusal.failure_reason
+            render_failure = refusal.render_failure
         except _GmailSendStateUnreadable:
             result = GmailSendResult(GmailSendOutcome.UNKNOWN, error_code=GmailSendErrorCode.OUTCOME_UNKNOWN)
         except Exception as exc:
@@ -14004,7 +14328,7 @@ class SendEmailBlock(Block):
             provider_reason=result.provider_reason,
             replayed=replayed,
         )
-        result_dict = {
+        result_dict: dict[str, Any] = {
             "success": accepted,
             "transport": EmailTransport.GMAIL.value,
             "outcome": result.outcome.value,
@@ -14012,12 +14336,14 @@ class SendEmailBlock(Block):
             "error_code": result.error_code.value if result.error_code else None,
             "replayed": replayed,
         }
+        if render_failure is not None:
+            result_dict[RENDER_FAILURE_OUTPUT_KEY] = render_failure
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result_dict)
         return await self.build_block_result(
             success=accepted,
             failure_reason=None
             if accepted
-            else GMAIL_SEND_FAILURE_MESSAGES[result.error_code or GmailSendErrorCode.INTERNAL_ERROR],
+            else refusal_reason or GMAIL_SEND_FAILURE_MESSAGES[result.error_code or GmailSendErrorCode.INTERNAL_ERROR],
             output_parameter_value=result_dict,
             status=BlockStatus.completed if accepted else BlockStatus.failed,
             workflow_run_block_id=workflow_run_block_id,
@@ -14050,7 +14376,9 @@ class SendEmailBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -15464,7 +15792,9 @@ class FileParserBlock(Block):
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
-            failure_reason = f"Failed to format jinja template: {str(e)}"
+            failure_reason = render_failure_reason(
+                "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+            )
             self._log_failure(
                 failure_reason,
                 self.get_failure_error_codes(),
@@ -15722,7 +16052,9 @@ class PDFParserBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -16033,7 +16365,9 @@ class HumanInteractionBlock(BaseTaskBlock):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -16420,6 +16754,7 @@ class ExtractionBlock(ParquetExportMixin, BaseTaskBlock):
                 workflow_run_id,
                 workflow_run_block_id,
                 organization_id,
+                render_failure=False,
             )
 
         merged_output = {**result.output_parameter_value, "export": export_output}
@@ -17073,6 +17408,10 @@ class FileDownloadBlock(BaseTaskBlock, FileDestinationBlock):
             if not files_to_upload:
                 return result
 
+            if not (self.prompt and self.prompt.strip()):
+                # Automatic delivery sends each PDF content once; a prompt's explicit selection keeps duplicates.
+                scoped_files = files_to_upload
+                files_to_upload = await run_stoppable_comparison(lambda stop: unique_pdf_paths(scoped_files, stop))
             if len(files_to_upload) > max_file_count:
                 raise ValueError(f"Too many scoped downloaded files to upload. Max: {max_file_count}")
 
@@ -17253,7 +17592,9 @@ class TaskV2Block(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -17546,7 +17887,8 @@ class HttpRequestBlock(Block):
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
 
-    _confined_references: list[tuple[str, str | None, str, str]] = PrivateAttr(default_factory=list)
+    _confined_references: list[tuple[str, str | None, str, tuple[LoginSite, ...]]] = PrivateAttr(default_factory=list)
+    _enforce_vault_sites: bool = PrivateAttr(default=True)
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"body", "download_filename", "files", "headers", "url"})
 
@@ -17618,7 +17960,7 @@ class HttpRequestBlock(Block):
                 # the template, is what says which credential this field carries.
                 if field != "download_filename":
                     self._confine_placeholder_owner(field, entry, token, workflow_run_context)
-                secret_value = str(workflow_run_context.secrets[token])
+                secret_value = str(workflow_run_context.get_original_secret_value_or_none(token))
                 rendered = re.sub(
                     re.escape(token) + r"(?![A-Za-z0-9_])",
                     secret_value.replace("\\", "\\\\"),
@@ -17642,8 +17984,8 @@ class HttpRequestBlock(Block):
                 # the file's own URL, so it is confined without an entry.
                 rendered_entry = _render_string("files", entry)
                 self._confined_references = [
-                    (field, rendered_entry if field == "files" and ref_entry == entry else ref_entry, key, tested_url)
-                    for field, ref_entry, key, tested_url in self._confined_references
+                    (field, rendered_entry if field == "files" and ref_entry == entry else ref_entry, key, sites)
+                    for field, ref_entry, key, sites in self._confined_references
                 ]
 
                 def _render_entry_value(text: str, entry: str = rendered_entry) -> str:
@@ -17669,10 +18011,15 @@ class HttpRequestBlock(Block):
         except Exception:
             return False
 
+    def _release_sites(self, workflow_run_context: WorkflowRunContext, key: str) -> tuple[LoginSite, ...] | None:
+        vault_sites = workflow_run_context.bitwarden_login_sites.get(key) if self._enforce_vault_sites else None
+        sites = login_release_sites(workflow_run_context.credential_tested_urls.get(key), vault_sites)
+        return None if sites is None else tuple(sites)
+
     def _confined_credential_references(
         self, workflow_run_context: WorkflowRunContext
-    ) -> list[tuple[str, str | None, str, str]]:
-        """(field, files entry, parameter key, tested_url) for every credential a raw template references whose
+    ) -> list[tuple[str, str | None, str, tuple[LoginSite, ...]]]:
+        """(field, files entry, parameter key, sites) for every credential a raw template references whose
         saved site confines it. Read from the templates, not the rendered text, so a value that
         merely resembles a credential field never counts and an unarmed credential sharing a value
         with an armed one is never misattributed."""
@@ -17697,7 +18044,7 @@ class HttpRequestBlock(Block):
                 if key in names or f"{key}_real_username" in names or f"{key}_real_password" in names
             }
 
-        references: list[tuple[str, str | None, str, str]] = []
+        references: list[tuple[str, str | None, str, tuple[LoginSite, ...]]] = []
         unarmed: set[str] = set()
         templates: list[tuple[str, str | None, object]] = [
             ("url", None, self.url),
@@ -17709,9 +18056,9 @@ class HttpRequestBlock(Block):
         for field, entry, value in templates:
             for template in _iter_template_strings(value):
                 for key in _referenced(template):
-                    tested_url = workflow_run_context.credential_tested_urls.get(key)
-                    if tested_url and describe_release_scope(tested_url) is not None:
-                        references.append((field, entry, key, tested_url))
+                    sites = self._release_sites(workflow_run_context, key)
+                    if sites is not None:
+                        references.append((field, entry, key, sites))
                     else:
                         unarmed.add(key)
         for key in sorted(unarmed):
@@ -17731,17 +18078,17 @@ class HttpRequestBlock(Block):
         for key, fields in workflow_run_context.values.items():
             if not isinstance(fields, dict) or "context" not in fields or token not in fields.values():
                 continue
-            tested_url = workflow_run_context.credential_tested_urls.get(key)
-            if tested_url and describe_release_scope(tested_url) is not None:
-                reference = (field, entry, key, tested_url)
+            sites = self._release_sites(workflow_run_context, key)
+            if sites is not None:
+                reference = (field, entry, key, sites)
                 if reference not in self._confined_references:
                     self._confined_references.append(reference)
             return
 
-    def _off_site_credential_release(self) -> tuple[str, str, str | None] | None:
-        """(parameter key, tested_url, destination) for the first confined credential this request
+    def _off_site_credential_release(self) -> tuple[str, tuple[LoginSite, ...], str | None] | None:
+        """(parameter key, sites, destination) for the first confined credential this request
         would send outside its site. Runs after rendering, so destinations are the real URLs."""
-        for field, entry, key, tested_url in self._confined_references:
+        for field, entry, key, sites in self._confined_references:
             destinations: list[str | None] = [self.url]
             if field == "files" and entry is not None:
                 # A file entry holding an http(s) URL is fetched from there, and the fetched
@@ -17750,20 +18097,20 @@ class HttpRequestBlock(Block):
                 if _is_remote_file_url(file_value):
                     destinations.append(file_value)
             for destination in destinations:
-                if not (destination and same_release_scope(destination, tested_url)):
-                    return key, tested_url, destination
+                if not (destination and any(site.admits(destination) for site in sites)):
+                    return key, sites, destination
         return None
 
     def _authorize_redirect(self, next_url: str) -> bool:
-        return all(same_release_scope(next_url, tested_url) for _, _, _, tested_url in self._confined_references)
+        return all(any(site.admits(next_url) for site in sites) for _, _, _, sites in self._confined_references)
 
     def _authorize_file_redirect(self, entry: str) -> Callable[[str], bool] | None:
-        tested_urls = [t for field, e, _, t in self._confined_references if field == "files" and e == entry]
-        if not tested_urls:
+        site_lists = [sites for field, e, _, sites in self._confined_references if field == "files" and e == entry]
+        if not site_lists:
             return None
 
         def authorize(next_url: str) -> bool:
-            return all(same_release_scope(next_url, tested_url) for tested_url in tested_urls)
+            return all(any(site.admits(next_url) for site in sites) for sites in site_lists)
 
         return authorize
 
@@ -17867,13 +18214,18 @@ class HttpRequestBlock(Block):
         """Execute the HTTP request and return the response"""
 
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if workflow_run_context.bitwarden_login_sites:
+            # As on the code-block seam, vault sites bind only Copilot-written workflows; others keep the tested URL.
+            self._enforce_vault_sites = await self._workflow_copilot_lineage(workflow_run_context) is not False
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to format jinja template: {str(e)}",
+                render_failure_reason(
+                    "Failed to format jinja template:", e, self.secret_redactor(workflow_run_context)
+                ),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -17913,8 +18265,13 @@ class HttpRequestBlock(Block):
 
         off_site_release = self._off_site_credential_release()
         if off_site_release is not None:
-            parameter_key, tested_url, destination = off_site_release
-            allowed_scope = describe_release_scope(tested_url) or "an unreadable saved login site"
+            parameter_key, sites, destination = off_site_release
+            allowed_scope = (
+                ", ".join(
+                    sorted({describe_release_scope(site.url, whole_site=site.whole_site) or site.url for site in sites})
+                )
+                or "no website a scope can be read from"
+            )
             actual_scope = describe_release_scope(destination) or "a destination whose site could not be identified"
             actual_origin = origin_of(destination)
             LOG.warning(
@@ -20182,6 +20539,7 @@ class WorkflowTriggerBlock(Block):
                 "The '| json' filter can only be used for complete value replacement. "
                 "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
                 "Remove the surrounding text or remove the '| json' filter.",
+                render_cause=TemplateRenderCause(RenderFailureKind.JSON_FILTER_WITH_OTHER_TEXT),
             )
         return rendered
 
@@ -20244,6 +20602,7 @@ class WorkflowTriggerBlock(Block):
         value: str,
         workflow_run_context: WorkflowRunContext,
         path: str,
+        segments: tuple[str | int, ...] = (),
     ) -> Any:
         # Wrap render errors with JSON-pointer-style payload path + template so
         # the failure reason surfaces where to look in the workflow.
@@ -20252,24 +20611,26 @@ class WorkflowTriggerBlock(Block):
         except PayloadTemplateRenderError:
             raise
         except Exception as exc:
-            raise PayloadTemplateRenderError(path=path, template=value, original=exc) from exc
+            raise PayloadTemplateRenderError(path=path, template=value, original=exc, segments=segments) from exc
 
     def _render_templates_in_payload(
         self,
         payload: dict[str, Any],
         workflow_run_context: WorkflowRunContext,
         _path: str = "payload",
+        _segments: tuple[str | int, ...] = (),
     ) -> dict[str, Any]:
         """Recursively render Jinja2 templates in payload values."""
         resolved: dict[str, Any] = {}
         for key, value in payload.items():
             current_path = f"{_path}{_format_payload_path_segment(key)}"
+            segments = (*_segments, key)
             if isinstance(value, str):
-                resolved[key] = self._render_scalar_with_path(value, workflow_run_context, current_path)
+                resolved[key] = self._render_scalar_with_path(value, workflow_run_context, current_path, segments)
             elif isinstance(value, dict):
-                resolved[key] = self._render_templates_in_payload(value, workflow_run_context, current_path)
+                resolved[key] = self._render_templates_in_payload(value, workflow_run_context, current_path, segments)
             elif isinstance(value, list):
-                resolved[key] = self._render_templates_in_list(value, workflow_run_context, current_path)
+                resolved[key] = self._render_templates_in_list(value, workflow_run_context, current_path, segments)
             else:
                 resolved[key] = value
         return resolved
@@ -20279,17 +20640,19 @@ class WorkflowTriggerBlock(Block):
         items: list[Any],
         workflow_run_context: WorkflowRunContext,
         _path: str = "payload",
+        _segments: tuple[str | int, ...] = (),
     ) -> list[Any]:
         """Recursively render Jinja2 templates in list items (strings, nested dicts, and nested lists)."""
         result: list[Any] = []
         for idx, item in enumerate(items):
             current_path = f"{_path}[{idx}]"
+            segments = (*_segments, idx)
             if isinstance(item, str):
-                result.append(self._render_scalar_with_path(item, workflow_run_context, current_path))
+                result.append(self._render_scalar_with_path(item, workflow_run_context, current_path, segments))
             elif isinstance(item, dict):
-                result.append(self._render_templates_in_payload(item, workflow_run_context, current_path))
+                result.append(self._render_templates_in_payload(item, workflow_run_context, current_path, segments))
             elif isinstance(item, list):
-                result.append(self._render_templates_in_list(item, workflow_run_context, current_path))
+                result.append(self._render_templates_in_list(item, workflow_run_context, current_path, segments))
             else:
                 result.append(item)
         return result
@@ -20366,7 +20729,7 @@ class WorkflowTriggerBlock(Block):
         except Exception as e:
             return await self._template_format_failure_result(
                 e,
-                f"Failed to resolve templates: {str(e)}",
+                render_failure_reason("Failed to resolve templates:", e, self.secret_redactor(workflow_run_context)),
                 workflow_run_context,
                 workflow_run_id,
                 workflow_run_block_id,
@@ -20504,6 +20867,7 @@ class WorkflowTriggerBlock(Block):
                 skyvern_context.SkyvernContext(
                     run_id=parent_context.run_id if parent_context else None,
                     root_workflow_run_id=parent_context.root_workflow_run_id if parent_context else None,
+                    requested_by=parent_context.requested_by if parent_context else None,
                     copilot_session_id=parent_context.copilot_session_id if parent_context else None,
                     trigger_type=inherited_trigger_type,
                 )
@@ -20655,6 +21019,7 @@ class WorkflowTriggerBlock(Block):
                         root_workflow_run_id=async_parent_context.root_workflow_run_id
                         if async_parent_context
                         else None,
+                        requested_by=async_parent_context.requested_by if async_parent_context else None,
                         copilot_session_id=async_parent_context.copilot_session_id if async_parent_context else None,
                         trigger_type=async_inherited_trigger_type,
                     )
@@ -20873,6 +21238,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsWriteBlock,
 )
 from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
+from skyvern.forge.sdk.workflow.models.powerbi_query_block import PowerBIQueryBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.split_pdf_block import SplitPdfBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.terminate_block import TerminateBlock  # noqa: E402
 from skyvern.forge.sdk.workflow.models.web_search_block import WebSearchBlock  # noqa: E402
@@ -20907,6 +21273,7 @@ BlockSubclasses = Union[
     GoogleSheetsReadBlock,
     EmailInboxBlock,
     GoogleSheetsWriteBlock,
+    PowerBIQueryBlock,
     PdfFillBlock,
     SplitPdfBlock,
     DataExportBlock,

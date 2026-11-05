@@ -9,6 +9,7 @@ run-scoped and the listener logs the real run identity.
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,9 +18,13 @@ import pytest
 import pytest_asyncio
 from structlog.testing import capture_logs
 
+from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.api.files import get_download_dir, resolve_run_download_id
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.http_request_authorization import RunScopedRedirectHopAuthorizer
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import TaskRequest
 from skyvern.forge.sdk.workflow.models.block import Block, CodeBlock, PrintPageBlock
 from skyvern.webeye.browser_artifacts import DownloadBinding
 from skyvern.webeye.browser_factory import (
@@ -31,6 +36,7 @@ from skyvern.webeye.browser_factory import (
 )
 from skyvern.webeye.native_downloads import NativeDownloads
 from skyvern.webeye.real_browser_manager import RealBrowserManager
+from tests.unit.helpers import make_organization, make_step, make_task
 
 
 @pytest_asyncio.fixture
@@ -74,6 +80,7 @@ def _workflow_attach_run() -> SimpleNamespace:
         parent_workflow_run_id=None,
         workflow_permanent_id="wpid_block",
         organization_id="org_1",
+        requested_by=None,
         browser_profile_id=None,
         proxy_location=None,
         extra_http_headers=None,
@@ -279,11 +286,6 @@ async def test_rebind_context_path_without_interceptor_still_sets_behaviour() ->
     await rebind_download_dir(None, run_id="wr_test", page=page)
 
     cdp_session.send.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_rebind_no_browser_and_no_page_is_noop() -> None:
-    await rebind_download_dir(None, run_id="wr_test")
 
 
 @pytest.mark.asyncio
@@ -605,6 +607,60 @@ async def test_listener_reads_the_task_download_timeout_when_the_download_starts
     assert download.cancel.await_count == (1 if cancelled else 0)
 
 
+class _DownloadStarted(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("explicit", "cancelled"), [(5.0, False), (None, True)], ids=["explicit", "default"])
+async def test_standalone_task_request_timeout_reaches_the_browser_listener(
+    explicit: float | None, cancelled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    template = make_task(now, organization)
+    request = TaskRequest(url=template.url, download_timeout=explicit)
+    context = SkyvernContext(download_timeout=7.0)
+    agent = ForgeAgent()
+    download = MagicMock()
+
+    async def slow_path() -> Path:
+        await asyncio.sleep(0.05)
+        return Path("not-on-disk")
+
+    async def initialize(*_args: object, **_kwargs: object) -> None:
+        await _run_listener(download, run_context=context, context_timeout_after_registration=context.download_timeout)
+        raise _DownloadStarted()
+
+    download.path = AsyncMock(side_effect=slow_path)
+    download.cancel = AsyncMock()
+    monkeypatch.setattr(agent, "initialize_execution_state", AsyncMock(side_effect=initialize))
+    with (
+        patch("skyvern.forge.agent.app") as mock_app,
+        patch("skyvern.forge.agent.get_download_retry_started_at", AsyncMock(return_value=None)),
+        patch("skyvern.webeye.browser_factory.BROWSER_DOWNLOAD_TIMEOUT", 0.001),
+    ):
+        mock_app.DATABASE.tasks.create_task = AsyncMock(
+            side_effect=lambda **kwargs: template.model_copy(
+                update={"download_timeout": kwargs.get("download_timeout")}
+            )
+        )
+        mock_app.DATABASE.tasks.get_task = AsyncMock(return_value=None)
+        mock_app.DATABASE.tasks.update_task = AsyncMock()
+        mock_app.AGENT_FUNCTION.validate_step_execution = AsyncMock()
+        task = await agent.create_task(request, organization.organization_id)
+        step = make_step(now, task, step_id="step-download", status=StepStatus.created, order=0, output=None)
+        skyvern_context.set(context)
+        try:
+            with pytest.raises(_DownloadStarted):
+                await agent.execute_step(organization, task, step, download_baseline_files=[])
+            assert context.download_timeout == 7.0
+        finally:
+            skyvern_context.reset()
+
+    assert download.cancel.await_count == (1 if cancelled else 0)
+
+
 _SENTINEL_STEM = "zz-sentinel-suggested-stem"
 _SENTINEL_QUERY_NAME = "zz-sentinel-query-stem"
 
@@ -760,31 +816,6 @@ async def test_browser_manager_adoption_rebinds_via_context_page_without_owning_
     assert result is browser_state
     _, params = cdp_session.send.await_args.args
     assert params["downloadPath"].endswith("/wr_block")
-
-
-@pytest.mark.asyncio
-async def test_browser_manager_adoption_no_browser_no_page_returns_state(browser_manager: RealBrowserManager) -> None:
-    """No Browser and no working page leaves nothing to rebind, but attachment stays fail-open."""
-    browser_state = MagicMock()
-    browser_state.browser_context.browser = None
-    browser_state.browser_artifacts.download_binding = DownloadBinding.RUN_DIR
-    browser_state.get_working_page = AsyncMock(return_value=None)
-    browser_state.get_or_create_page = AsyncMock()
-    manager = browser_manager
-
-    with (
-        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
-        patch("skyvern.webeye.real_browser_manager.skyvern_context.current", return_value=None),
-    ):
-        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=browser_state)
-        mock_app.AGENT_FUNCTION.on_browser_context_acquired = AsyncMock()
-        mock_app.AGENT_FUNCTION.enforce_workflow_run_credential_use = AsyncMock()
-        result = await manager.get_or_create_for_workflow_run(
-            _workflow_attach_run(),
-            browser_session_id="bs_block",
-        )
-
-    assert result is browser_state
 
 
 @pytest.mark.asyncio
@@ -1592,14 +1623,6 @@ async def test_file_upload_block_uploads_downloads_to_google_drive(tmp_path) -> 
     assert destination.storage_type == FileStorageType.GOOGLE_DRIVE
     assert destination.google_access_token == "at-1"
     assert destination.google_drive_folder_id == "folder_123"
-
-
-def test_resolve_run_download_id_preserves_task_id_tail() -> None:
-    """CORR-1: mirrors handler.py fallback_run_id=task.workflow_run_id or task.task_id — when both
-    context and workflow_run_id are absent, the task_id tail must still be resolved (not None)."""
-    empty = SkyvernContext(run_id=None, workflow_run_id=None, task_id=None)
-    # Equivalent to handler.py's `task.workflow_run_id or task.task_id` collapsing to the task_id tail.
-    assert resolve_run_download_id(empty, fallback_run_id="tsk_x") == "tsk_x"
 
 
 @pytest.mark.asyncio

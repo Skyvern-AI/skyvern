@@ -14,6 +14,7 @@ const base = {
   inspectingRun: true,
   blockRunInDebugSession: false,
   systemFocused: false,
+  copilotBrowserFocused: false,
   runInDebugSession: false,
   running: false,
   hasRecording: false,
@@ -230,6 +231,44 @@ describe("resolveBrowserPaneView", () => {
     ).toBe("screenshots");
   });
 
+  it("shows Copilot's own browser live over the failed run it focused", () => {
+    const failedRun = {
+      ...base,
+      systemFocused: true,
+      hasRecording: true,
+      failed: true,
+    };
+    expect(resolveBrowserPaneView(failedRun)).toBe("screenshots");
+    expect(
+      resolveBrowserPaneView({ ...failedRun, copilotBrowserFocused: true }),
+    ).toBe("live");
+  });
+
+  it("lets pills, scrubbing and the recorder outrank Copilot's browser", () => {
+    const copilotBrowser = {
+      ...base,
+      systemFocused: true,
+      copilotBrowserFocused: true,
+    };
+    expect(
+      resolveBrowserPaneView({ ...copilotBrowser, intent: "recording" }),
+    ).toBe("recording");
+    expect(
+      resolveBrowserPaneView({ ...copilotBrowser, intent: "screenshots" }),
+    ).toBe("screenshots");
+    expect(resolveBrowserPaneView({ ...copilotBrowser, scrubbing: true })).toBe(
+      "screenshots",
+    );
+    expect(
+      resolveLiveSurface({
+        ...liveBase,
+        recording: true,
+        copilotBrowserSurface: "run",
+        hasRunId: true,
+      }),
+    ).toBe("debug");
+  });
+
   it("stays live for a block run in the debug session, even finalized", () => {
     expect(
       resolveBrowserPaneView({
@@ -309,6 +348,7 @@ describe("resolveBrowserPaneView", () => {
 
 const liveBase = {
   recording: false,
+  copilotBrowserSurface: null,
   running: false,
   runInDebugSession: false,
   hasRunId: false,
@@ -336,6 +376,24 @@ describe("resolveLiveSurface", () => {
         hasRunId: true,
       }),
     ).toBe("debug");
+  });
+
+  it("shows the browser Copilot's latest call named, over the run's own default", () => {
+    expect(
+      resolveLiveSurface({
+        ...liveBase,
+        copilotBrowserSurface: "debug",
+        running: true,
+        hasRunId: true,
+      }),
+    ).toBe("debug");
+    expect(
+      resolveLiveSurface({
+        ...liveBase,
+        copilotBrowserSurface: "run",
+        hasRunId: true,
+      }),
+    ).toBe("run");
   });
 
   it("stays on the debug session while recording", () => {

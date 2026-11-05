@@ -6,7 +6,11 @@ from fastapi import Depends
 from starlette.requests import HTTPConnection
 
 from skyvern.forge import app
-from skyvern.forge.sdk.services.request_principal import get_request_principal, pending_route_action
+from skyvern.forge.sdk.services.request_principal import (
+    get_request_principal,
+    pending_route_action,
+    pending_stream_authorization,
+)
 
 LOG = structlog.get_logger()
 
@@ -88,7 +92,7 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.retry_webhook": "task.retry",
     "skyvern.forge.sdk.routes.agent_protocol.retry_workflow_run": "workflow.retry",
     "skyvern.forge.sdk.routes.agent_protocol.run_block": "workflow.run",
-    "skyvern.forge.sdk.routes.agent_protocol.run_task": "workflow_run.run",
+    "skyvern.forge.sdk.routes.agent_protocol.run_task": "task.run",
     "skyvern.forge.sdk.routes.agent_protocol.run_task_v1": "task.run",
     "skyvern.forge.sdk.routes.agent_protocol.run_task_v2": "task.run",
     "skyvern.forge.sdk.routes.agent_protocol.run_workflow": "workflow.run",
@@ -103,6 +107,10 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.agent_protocol.update_workflow_folder": "workflow.update",
     "skyvern.forge.sdk.routes.agent_protocol.update_workflow_legacy": "workflow.update",
     "skyvern.forge.sdk.routes.agent_protocol.upload_file": "file.create",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_saved_workflow": "workflow.read",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_saved_workflow_trailing_slash": "workflow.read",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_workflow": "workflow.read",
+    "skyvern.forge.sdk.routes.agent_protocol.validate_workflow_trailing_slash": "workflow.read",
     "skyvern.forge.sdk.routes.agent_protocol.webhook": "webhook.execute",
     "skyvern.forge.sdk.routes.browser_profiles.create_browser_profile": "browser_profile.create",
     "skyvern.forge.sdk.routes.browser_profiles.delete_browser_profile": "browser_profile.delete",
@@ -169,6 +177,18 @@ ROUTE_ACTIONS: Mapping[str, str] = {
     "skyvern.forge.sdk.routes.debug_sessions.get_or_create_debug_session_by_user_and_workflow_permanent_id": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.new_debug_session": "debug_session.execute",
     "skyvern.forge.sdk.routes.debug_sessions.prewarm_debug_session": "debug_session.execute",
+    "skyvern.forge.sdk.routes.email_forwarding.create_email_config": "email_forwarding_config.create",
+    "skyvern.forge.sdk.routes.email_forwarding.create_forwarding_address": "email_forwarding.create",
+    "skyvern.forge.sdk.routes.email_forwarding.delete_email_config": "email_forwarding_config.delete",
+    "skyvern.forge.sdk.routes.email_forwarding.disable_forwarding_address": "email_forwarding.update",
+    "skyvern.forge.sdk.routes.email_forwarding.enable_forwarding_address": "email_forwarding.update",
+    "skyvern.forge.sdk.routes.email_forwarding.list_email_configs": "email_forwarding_config.list",
+    "skyvern.forge.sdk.routes.email_forwarding.list_forwarded_emails": "email_forwarding.read",
+    "skyvern.forge.sdk.routes.email_forwarding.list_forwarding_addresses": "email_forwarding.list",
+    "skyvern.forge.sdk.routes.email_forwarding.receive_inbound_email": "email.webhook",
+    "skyvern.forge.sdk.routes.email_forwarding.revoke_forwarding_address": "email_forwarding.delete",
+    "skyvern.forge.sdk.routes.email_forwarding.rotate_email_config_secret": "email_forwarding_config.rotate_secret",
+    "skyvern.forge.sdk.routes.email_forwarding.rotate_forwarding_address": "email_forwarding.update",
     "skyvern.forge.sdk.routes.feedback.get_run_feedback": "feedback.read",
     "skyvern.forge.sdk.routes.feedback.submit_agent_feedback": "feedback.create",
     "skyvern.forge.sdk.routes.feedback.submit_run_feedback": "feedback.create",
@@ -343,9 +363,21 @@ async def observe_request_authorization(connection: HTTPConnection) -> AsyncIter
     except Exception:  # noqa: BLE001 - observation failures are logged after the handler, never raised here.
         action = None
     token = pending_route_action.set(action)
+    endpoint = getattr(connection.scope.get("route"), "endpoint", None)
+    # Task screenshots do not yet reauthorize, so they retain the ordinary role check.
+    task_screenshot = (
+        getattr(endpoint, "__module__", None) == "skyvern.forge.sdk.routes.streaming.screenshot"
+        and getattr(endpoint, "__name__", None) == "task_stream"
+    )
+    stream_token = pending_stream_authorization.set(
+        connection.scope.get("type") == "websocket"
+        and action in {"browser_session.connect", "stream.connect"}
+        and not task_screenshot
+    )
     try:
         yield
     finally:
+        pending_stream_authorization.reset(stream_token)
         pending_route_action.reset(token)
         await _authorize_connection(connection)
 

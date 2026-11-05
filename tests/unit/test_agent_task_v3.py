@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from structlog.testing import capture_logs
 
 import skyvern.webeye.cdp_download_interceptor as cdp_module
@@ -102,8 +103,9 @@ from skyvern.forge.taskv3.loop import (
 )
 from skyvern.forge.taskv3.run_arms import (
     ANSWER_AUDIT_LOG_ONLY_FLAG,
+    APPLICATION_CONTEXT_FLAG,
+    CARRY_REASONING_FLAG,
     DATE_SEGMENT_AIM_FLAG,
-    DEAD_END_RETURN_FLAG,
     LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
     TURN_DOM_FLAG,
@@ -138,6 +140,7 @@ from tests.unit._download_provider_fakes import (
     _StallingActionDownloadObservation,
 )
 from tests.unit._task_block_fakes import run_bound_browser_state
+from tests.unit.conftest import chromium_context, requires_chromium
 from tests.unit.helpers import (
     make_action_row,
     make_browser_state,
@@ -146,6 +149,7 @@ from tests.unit.helpers import (
     make_task,
 )
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import SkewedTime
 from tests.unit.test_taskv3_loop import _ScriptedCaller
 from tests.unit.test_taskv3_tools import _FakePage
 
@@ -157,6 +161,7 @@ async def _run_execute_task_v3(
     action_rounds: list[list[RoundAction]] | None = None,
     action_round_texts: list[str | None] | None = None,
     screenshot_raises: bool = False,
+    screenshot_side_effect: Callable[..., Awaitable[bytes]] | None = None,
     # Records what the post-action capture path does, in order: "settle" per page settle,
     # "screenshot" per capture. Also stubs SkyvernFrame so the settle needs no real frame.
     capture_order: list[str] | None = None,
@@ -229,7 +234,7 @@ async def _run_execute_task_v3(
         browser_state.get_working_page = AsyncMock(side_effect=real_browser_state.get_working_page)
     browser_state.take_post_action_screenshot = AsyncMock(
         return_value=b"png-bytes",
-        side_effect=RuntimeError("screenshot boom") if screenshot_raises else None,
+        side_effect=RuntimeError("screenshot boom") if screenshot_raises else screenshot_side_effect,
     )
     if capture_order is not None:
 
@@ -468,7 +473,12 @@ async def test_execute_task_v3_buckets_the_date_segment_aim_arm_per_run(monkeypa
     )
 
     assert loop_mock.date_segment_aim_enabled_during_loop is True
-    for flag in (DATE_SEGMENT_AIM_FLAG, DEAD_END_RETURN_FLAG, ANSWER_AUDIT_LOG_ONLY_FLAG):
+    for flag in (
+        DATE_SEGMENT_AIM_FLAG,
+        APPLICATION_CONTEXT_FLAG,
+        ANSWER_AUDIT_LOG_ONLY_FLAG,
+        CARRY_REASONING_FLAG,
+    ):
         assert loop_mock.context.run_arms[flag] == (task.workflow_run_id, "treatment")
         provider.assert_any_await(flag, task.workflow_run_id, properties={"organization_id": task.organization_id})
 
@@ -1666,6 +1676,162 @@ async def test_execute_task_v3_settles_the_page_before_each_post_action_screensh
     assert capture_order[:4] == ["settle", "screenshot", "settle", "screenshot"]
 
 
+@requires_chromium
+@pytest.mark.asyncio
+async def test_execute_task_v3_recaptures_a_page_that_paints_after_the_first_screenshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with chromium_context() as context:
+        page = await context.new_page()
+        await page.route("https://example.test/**", lambda route: route.fulfill(body="<body></body>"))
+        await page.goto("https://example.test/")
+        visual_pages = {
+            "controls": "<input><button aria-label='Next'></button>",
+            "open_shadow": (
+                "<div id='host'></div><script>host.attachShadow({mode: 'open'}).innerHTML = '<button>Ready</button>'</script>"
+            ),
+            "closed_shadow": (
+                "<div id='host'></div><script>host.attachShadow({mode: 'closed'}).innerHTML = '<button>Ready</button>'</script>"
+            ),
+            "iframe": "<iframe srcdoc='<p>Ready</p>'></iframe>",
+            "canvas": "<canvas width='100' height='100'></canvas>",
+            "image": "<img width='100' height='100' src='data:image/gif;base64,R0lGODlhAQABAAAAACw='>",
+        }
+        scenarios = [
+            "delayed",
+            "ready",
+            "transient",
+            "capture_navigation",
+            "paint_during_capture",
+            "blank",
+            "blank_again",
+            "blank_navigation",
+            *visual_pages,
+            "retry_error",
+        ]
+        screenshots: dict[str, list[bytes]] = {scenario: [] for scenario in scenarios}
+        body_text: dict[str, str] = {}
+        stage = -1
+        finished = False
+        real_evaluate = page.evaluate
+        navigation_probe_failed = False
+        retry_failed = False
+
+        async def evaluate(expression: str, *args: Any, **kwargs: Any) -> Any:
+            nonlocal navigation_probe_failed
+            if (
+                expression == agent_module._V3_SCREENSHOT_PAINTED_JS
+                and scenarios[stage] == "transient"
+                and not navigation_probe_failed
+            ):
+                navigation_probe_failed = True
+                raise PlaywrightError("Execution context was destroyed during navigation")
+            return await real_evaluate(expression, *args, **kwargs)
+
+        monkeypatch.setattr(page, "evaluate", evaluate)
+
+        async def screenshot(**_kwargs: Any) -> bytes:
+            nonlocal retry_failed
+            if finished:
+                return await page.screenshot()
+            scenario = scenarios[stage]
+            if scenario == "retry_error" and screenshots[scenario]:
+                retry_failed = True
+                raise RuntimeError("recapture failed")
+            if scenario in ("capture_navigation", "paint_during_capture") and not screenshots[scenario]:
+                await page.goto(f"https://example.test/{scenario}")
+            png = await page.screenshot()
+            screenshots[scenario].append(png)
+            if scenario == "paint_during_capture" and len(screenshots[scenario]) == 1:
+                await real_evaluate("() => document.body.textContent = 'Painted'")
+            if (
+                scenario in ("delayed", "transient", "capture_navigation", "blank_navigation", "retry_error")
+                and len(screenshots[scenario]) == 1
+            ):
+                await real_evaluate("() => setTimeout(() => document.body.textContent = 'Painted', 75)")
+            return png
+
+        async def settle(**_kwargs: Any) -> None:
+            nonlocal stage
+            stage += 1
+            scenario = scenarios[stage]
+            if scenario == "blank_navigation":
+                await page.goto(page.url)
+            else:
+                ready = scenario in ("ready", "capture_navigation", "paint_during_capture")
+                await page.set_content(visual_pages.get(scenario, "<body>Ready</body>" if ready else ""))
+            if scenario in visual_pages:
+                body_text[scenario] = await real_evaluate("() => document.body.innerText.trim()")
+
+        def finish_loop(_kwargs: dict[str, Any]) -> None:
+            nonlocal finished
+            finished = True
+
+        frame = MagicMock()
+        frame.safe_wait_for_animation_end = AsyncMock(side_effect=settle)
+        monkeypatch.setattr("skyvern.forge.agent.SkyvernFrame.create_instance", AsyncMock(return_value=frame))
+        monkeypatch.setattr("skyvern.forge.agent._V3_SCREENSHOT_PAINT_TIMEOUT_SECONDS", 1.5)
+        monkeypatch.setattr("skyvern.forge.agent._V3_SCREENSHOT_PAINT_RUN_BUDGET_SECONDS", 30.0)
+        rounds = [[RoundAction("click", {"selector": "#next"}, True, billable=True)] for _ in scenarios]
+        rounds[1] = [RoundAction("navigate", {"url": "https://example.test"}, True)]
+        rounds[2] = [RoundAction("type", {"selector": "#field", "text": "value"}, True, billable=True)]
+        with capture_logs() as logs:
+            async with asyncio.timeout(45):
+                _step, task, _loop, _post = await _run_execute_task_v3(
+                    monkeypatch,
+                    LoopOutcome(status="completed", reason="done"),
+                    action_rounds=rounds,
+                    working_page=page,
+                    screenshot_side_effect=screenshot,
+                    on_loop=finish_loop,
+                    data_extraction_goal=None,
+                    extracted_information_schema=None,
+                )
+
+        saved = [call.kwargs["data"] for call in app.ARTIFACT_MANAGER.create_artifact.await_args_list]
+        for scenario in ("delayed", "transient", "capture_navigation", "paint_during_capture", "blank_navigation"):
+            first, recaptured = screenshots[scenario]
+            assert first != recaptured
+            assert saved[scenarios.index(scenario)] == recaptured
+        for scenario in ("ready", "blank", "blank_again", *visual_pages, "retry_error"):
+            (first,) = screenshots[scenario]
+            assert saved[scenarios.index(scenario)] == first
+        assert all(not text for text in body_text.values())
+        assert navigation_probe_failed
+        assert retry_failed
+        assert [
+            entry["outcome"] for entry in logs if entry["event"] == "taskv3 post-action screenshot paint retry"
+        ] == [
+            "painted",
+            "painted",
+            "painted",
+            "painted",
+            "timeout",
+            "painted",
+            "retry_failed",
+        ]
+        assert task.status == TaskStatus.completed
+
+        await page.set_content("")
+        state = agent_module._V3ScreenshotPaintState(remaining_seconds=0.25)
+        browser_state = MagicMock()
+        browser_state.get_working_page = AsyncMock(return_value=page)
+
+        async def capture_for_budget(**_kwargs: Any) -> bytes:
+            return await page.screenshot()
+
+        browser_state.take_post_action_screenshot = AsyncMock(side_effect=capture_for_budget)
+        monkeypatch.setattr(agent_module, "_settle_before_post_action_screenshot", AsyncMock())
+        with capture_logs() as budget_logs:
+            first = await agent_module._take_v3_post_action_screenshot(browser_state, state)
+            second = await agent_module._take_v3_post_action_screenshot(browser_state, state)
+        assert first == second
+        assert state.remaining_seconds == 0
+        assert [
+            entry["outcome"] for entry in budget_logs if entry["event"] == "taskv3 post-action screenshot paint retry"
+        ] == ["timeout"]
+
+
 _GOTO_OUTCOME = {
     "requested_url": "https://forms.example.test/contact-us",
     "url": "https://forms.example.test/contact",
@@ -2756,6 +2922,10 @@ async def _run_execute_task_v3_download(
     loop_mock = AsyncMock(side_effect=_loop)
     monkeypatch.setattr("skyvern.forge.taskv3.engine.run_task_v3_agent_loop", loop_mock)
     monkeypatch.setattr("skyvern.forge.agent.LLMCaller", MagicMock())
+    # The provider read-back polls and admission grace run at a tenth of production; tests scale their
+    # download_timeout to match.
+    monkeypatch.setattr(taskv3_provider_downloads, "POLL_INTERVAL_SECONDS", 0.1)
+    monkeypatch.setattr(taskv3_provider_downloads, "EVENT_ADMISSION_GRACE_SECONDS", 0.025)
     # get_path_for_workflow_download_directory (imported by agent.py) resolves through this same
     # module-level name at call time, so patching it here also redirects that call.
     monkeypatch.setattr("skyvern.forge.sdk.api.files.get_download_dir", lambda *_a, **_k: str(tmp_path))
@@ -4917,7 +5087,7 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
 
     async def fake_create_step(**kwargs: Any) -> Any:
         created.append(kwargs)
-        return SimpleNamespace(step_id=f"turn-{kwargs['order']}")
+        return SimpleNamespace(step_id=f"turn-{kwargs['order']}", order=kwargs["order"], created_at=datetime.now(UTC))
 
     monkeypatch.setattr("skyvern.forge.agent.app.DATABASE.tasks.create_step", fake_create_step)
     finish_turn = AsyncMock()
@@ -4929,7 +5099,14 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         click = RoundAction("click", {"selector": "#go"}, True, billable=True)
         await kwargs["on_action_round"]([click], "clicking", round_done=True)
         await kwargs["on_turn_end"](
-            TurnRecord(turn=1, llm_seconds=1.5, tool_calls=[StepToolCall(tool="click", status="ok", billable=True)])
+            TurnRecord(
+                turn=1,
+                llm_seconds=1.5,
+                tool_calls=[
+                    StepToolCall(tool="click", status="ok", billable=True, duration_seconds=0.75),
+                    StepToolCall(tool="type", status="skipped"),
+                ],
+            )
         )
         steps_by_turn.append(await kwargs["on_turn_start"](2))
         await kwargs["on_turn_end"](
@@ -4937,13 +5114,14 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         )
 
     outcome = LoopOutcome(status="completed", reason="done", billable_actions=["click"])
-    step, _task, _loop_mock, post_step = await _run_execute_task_v3(
-        monkeypatch,
-        outcome,
-        on_loop_async=drive_turns,
-        data_extraction_goal=None,
-        extracted_information_schema=None,
-    )
+    with capture_logs() as logs:
+        step, _task, _loop_mock, post_step = await _run_execute_task_v3(
+            monkeypatch,
+            outcome,
+            on_loop_async=drive_turns,
+            data_extraction_goal=None,
+            extracted_information_schema=None,
+        )
 
     assert [(c["order"], c["retry_index"], c["status"], c["created_by"]) for c in created] == [
         (1, step.retry_index, StepStatus.running, TASK_V3_TURN_STEP_CREATED_BY),
@@ -4954,7 +5132,17 @@ async def test_execute_task_v3_writes_a_step_per_turn_beside_the_billed_block_st
         (c.kwargs["step_id"], c.kwargs["status"], [t.tool for t in c.kwargs["output"].tool_calls])
         for c in finish_turn.await_args_list
     ]
-    assert finished == [("turn-1", StepStatus.completed, ["click"]), ("turn-2", StepStatus.completed, ["finish"])]
+    assert finished == [
+        ("turn-1", StepStatus.completed, ["click", "type"]),
+        ("turn-2", StepStatus.completed, ["finish"]),
+    ]
+    # Each finished turn writes its own timing line: a call the loop never dispatched counts, but adds no time.
+    timings = [log for log in logs if log["event"] == "Task V3 turn duration metrics"]
+    assert [
+        (t["turn"], t["turn_step_id"], t["step_status"], t["llm_seconds"], t["tool_seconds"], t["tool_call_count"])
+        for t in timings
+    ] == [(1, "turn-1", StepStatus.completed, 1.5, 0.75, 2), (2, "turn-2", StepStatus.completed, None, 0, 1)]
+    assert all(t["duration_seconds"] >= 0 for t in timings)
     # The click row and the finish decision sit on their turns' steps, still stamped with the round index.
     rows = [c.kwargs["action"] for c in agent_module.app.DATABASE.workflow_params.create_action.await_args_list]
     assert [(row.step_id, row.step_order) for row in rows] == [("turn-1", 0), ("turn-2", 0)]
@@ -8047,7 +8235,7 @@ async def test_native_quiescence_never_overrides_an_unknown_download_owner(monke
         tmp_path,
         drop_file=False,
         provider_source=source,
-        download_timeout=1.2,
+        download_timeout=0.3,
         loop_fn=run_loop,
     )
     assert waits == [(False, {str(tmp_path / "retained.crdownload")})]
@@ -8319,13 +8507,13 @@ async def test_v3_download_provider_wait_ends_at_the_block_download_timeout(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=2.0,
+        download_timeout=0.2,
         loop_fn=_click_then_probe(tmp_path, monitor, source),
     )
 
     assert captured["probe_reason"] is None
     assert observation.poll_deadlines
-    # The block's 2 s timeout, not the 30 s default, set the read deadline; no poll started past it.
+    # The block's own timeout, not the 30 s default, set the read deadline; no poll started past it.
     assert observation.poll_deadlines[0] - captured["probe_started_at"] < (
         taskv3_provider_downloads.PROVIDER_DOWNLOAD_WAIT_SECONDS
     )
@@ -8495,7 +8683,7 @@ async def test_v3_download_still_reads_the_provider_after_the_monitor_outlasted_
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _settle),
     )
 
@@ -8521,7 +8709,7 @@ async def test_v3_download_still_reads_the_provider_after_an_empty_first_window(
         drop_file=False,
         provider_source=source,
         download_monitor=monitor,
-        download_timeout=1.0,
+        download_timeout=0.1,
         loop_fn=_probe_twice(monitor, _list_late),
     )
 
@@ -8541,7 +8729,7 @@ async def test_v3_download_cancellation_returns_only_after_the_provider_poll_cle
 
     async def _loop(kwargs: dict[str, Any], captured: dict[str, Any]) -> LoopOutcome:
         monitor.browser_download_event_count += 1
-        asyncio.get_running_loop().call_later(2.0, gate.set)
+        asyncio.get_running_loop().call_later(0.4, gate.set)
         captured["probe_reason"] = await kwargs["download_settle"](frozenset())
         captured["cleanup_finished_at_return"] = observation.cleanup_finished
         return LoopOutcome(status="budget_exhausted", reason="no download detected", billable_actions=[])
@@ -8857,27 +9045,20 @@ async def test_v3_download_block_keeps_a_replacement_context_held_through_cleanu
 
 # A replay its hold admitted, in flight at finish (the original one past the 2.5 s request settle), is offered before
 # the task is written completed; one a download timeout or cancel leaves in flight blocks completion and stays running.
-class _SkewedClock:
-    skew = 0.0
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(time, name)
-
-    def monotonic(self) -> float:
-        return time.monotonic() + self.skew
-
-
 @pytest.mark.parametrize("mode", ["original-selected", "replacement-empty", "timed-out", "canceled", "fresh-window"])
 @pytest.mark.asyncio
 async def test_a_replay_in_flight_at_finish_is_settled_before_the_task_is_written(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
-    release_after = {"original-selected": 2.6, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
+    # The original replay is released after the request settle gave up, half a second apart so a slow runner cannot
+    # reorder them.
+    monkeypatch.setattr(taskv3_tools, "_DOWNLOAD_FAILURE_SETTLE_SECONDS", 0.25)
+    release_after = {"original-selected": 0.75, "replacement-empty": 0.05, "fresh-window": 0.05}.get(mode)
     selection = {"original-selected": ["c1"], "fresh-window": ["c2"]}.get(mode, [])
-    harness = {"timed-out": {"download_timeout": 0.5}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
+    harness = {"timed-out": {"download_timeout": 0.2}, "canceled": {"cancel_after_checks": 0}}.get(mode, {})
     if mode == "fresh-window":
         harness = {"download_timeout": 2.0}
-    monkeypatch.setattr(agent_module, "time", clock := _SkewedClock())
+    monkeypatch.setattr(agent_module, "time", clock := SkewedTime())
     steps = [{}, *([{}] if mode == "fresh-window" else []), {"accept_download_candidates": selection}]
     entry = _replay_interceptor(tmp_path, monkeypatch)
     released = asyncio.Event()

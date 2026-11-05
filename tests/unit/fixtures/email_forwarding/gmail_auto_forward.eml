@@ -1,0 +1,19 @@
+From: Security <security@bank.example>
+To: user@customer.example
+Delivered-To: forward@inbound.example
+Subject: Your verification code
+Message-ID: <gmail-transport-1>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="fixture"
+
+--fixture
+Content-Type: text/plain; charset="utf-8"
+
+Your one-time verification code is 482913.
+--fixture
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="ignored.txt"
+Content-Transfer-Encoding: base64
+
+VGhlIG90aGVyIGNvZGUgaXMgOTk5OTk5
+--fixture--

@@ -1,5 +1,6 @@
 import { AxiosError, AxiosHeaders } from "axios";
 import {
+  focusManager,
   QueryClient,
   QueryClientProvider,
   QueryObserver,
@@ -25,9 +26,11 @@ import { useStudioRunSignals } from "@/routes/workflows/studio/useStudioRunSigna
 
 import {
   getRunStatusRefetchInterval,
+  getWatchedRunRefetchInterval,
   POLL_OUTAGE_BUDGET_MS,
   RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS,
   RUN_STATUS_POLL_INTERVAL_MS,
+  useWorkflowRunQueries,
   useWorkflowRunQuery,
 } from "./useWorkflowRunQuery";
 import { useWorkflowRunWithWorkflowQuery } from "./useWorkflowRunWithWorkflowQuery";
@@ -133,6 +136,34 @@ describe("getRunStatusRefetchInterval", () => {
         data: undefined,
         dataUpdatedAt: 0,
         errorUpdatedAt: 0,
+      }),
+    ).toBe(false);
+  });
+
+  test("only a watched run retries a failed first read, and never a missing or forbidden run", () => {
+    const failedFirstRead = {
+      status: "error" as const,
+      data: undefined,
+      dataUpdatedAt: 0,
+      errorUpdatedAt: 1_000_000,
+    };
+    expect(getRunStatusRefetchInterval(failedFirstRead)).toBe(false);
+    expect(
+      getWatchedRunRefetchInterval({
+        ...failedFirstRead,
+        error: httpError(503),
+      }),
+    ).toBe(RUN_STATUS_OUTAGE_RETRY_INTERVAL_MS);
+    expect(
+      getWatchedRunRefetchInterval({
+        ...failedFirstRead,
+        error: httpError(404),
+      }),
+    ).toBe(false);
+    expect(
+      getWatchedRunRefetchInterval({
+        ...failedFirstRead,
+        error: httpError(403),
       }),
     ).toBe(false);
   });
@@ -295,6 +326,37 @@ describe("run read path", () => {
       expect(result.current.withWorkflow.data?.workflow_run_id).toBe(RUN_A_ID);
     });
     expect(get.mock.calls).toHaveLength(1);
+  });
+
+  test("watching a final run the pane already read neither re-reads it on mount nor on focus", async () => {
+    const get = vi.fn(() =>
+      Promise.resolve({ data: buildRun(RUN_A_ID, Status.Completed) }),
+    );
+    getClientMock.mockResolvedValue({ get, post: vi.fn() });
+    const client = makeClient();
+    const wrapper = harness(client, "/agents/wpid_1/studio");
+    const pane = renderHook(
+      () => useWorkflowRunQuery({ workflowRunId: RUN_A_ID }),
+      { wrapper },
+    );
+    await waitFor(() =>
+      expect(pane.result.current.data?.workflow_run_id).toBe(RUN_A_ID),
+    );
+
+    const watcher = renderHook(() => useWorkflowRunQueries([RUN_A_ID]), {
+      wrapper,
+    });
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(watcher.result.current[0]?.data?.workflow_run_id).toBe(RUN_A_ID);
+    expect(get).toHaveBeenCalledTimes(1);
+    focusManager.setFocused(undefined);
   });
 });
 

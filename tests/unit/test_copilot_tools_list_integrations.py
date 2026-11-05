@@ -28,6 +28,9 @@ from skyvern.forge.sdk.copilot.tools import (
     _build_skyvern_mcp_overlays,
     copilot_native_tools,
     get_skyvern_mcp_alias_map,
+)
+from skyvern.forge.sdk.copilot.tools import integrations as copilot_integrations
+from skyvern.forge.sdk.copilot.tools import (
     list_integrations_tool,
     offer_demonstration_tool,
 )
@@ -44,6 +47,7 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOut
 from skyvern.forge.sdk.schemas.google_oauth import GoogleOAuthCredentialBase
 from skyvern.forge.sdk.schemas.microsoft_oauth import MicrosoftOAuthCredentialBase
 from skyvern.forge.sdk.schemas.organizations import BitwardenCredential, BitwardenOrganizationAuthToken
+from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
@@ -104,6 +108,7 @@ SKYVERN_ENTRY_IDS = [
     "bitwarden",
     "azure_key_vault",
     "custom_credential_service",
+    "email_forwarding",
 ]
 SENTINELS = (
     "SENTINEL-gmail-access-token",
@@ -139,7 +144,7 @@ def org(monkeypatch: pytest.MonkeyPatch) -> _OrgState:
             raise RuntimeError("google listing failed")
         return state.google
 
-    async def microsoft(organization_id: str) -> list[MicrosoftOAuthCredentialBase]:
+    async def microsoft(organization_id: str, *, user_id: str | None = None) -> list[MicrosoftOAuthCredentialBase]:
         assert organization_id == ORGANIZATION_ID
         if "microsoft" in state.failing:
             raise RuntimeError("microsoft listing failed")
@@ -222,6 +227,7 @@ async def test_lists_every_entry_with_gmail_and_bitwarden_accounts_and_no_secret
     assert entries["bitwarden"]["accounts"] == [{"provider": "bitwarden", "state": "active"}]
     assert entries["google_sheets"]["accounts"] == []
     assert entries["azure_key_vault"]["accounts"] == []
+    assert "powerbi" not in entries
     assert entries["mcp"]["accounts"] is None
     for serialized in (json.dumps(result), json.dumps(page)):
         for sentinel in SENTINELS:
@@ -268,6 +274,88 @@ async def test_a_failing_or_stalled_account_source_marks_only_its_own_entries(or
     assert entries["outlook"]["accounts_unavailable"] == "read_failed"
     assert [account["connection_id"] for account in entries["google_sheets"]["accounts"]] == ["goac_1"]
     assert "accounts_unavailable" not in entries["google_sheets"]
+
+
+@pytest.mark.asyncio
+async def test_copilot_passes_only_the_trusted_human_to_microsoft_account_lookup(
+    org: _OrgState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    org.microsoft = []
+    monkeypatch.setattr(
+        catalog,
+        "SKYVERN_INTEGRATIONS",
+        tuple(
+            entry.model_copy(update={"status": "live"}) if entry.id == "powerbi" else entry
+            for entry in catalog.SKYVERN_INTEGRATIONS
+        ),
+    )
+    microsoft_reader = AsyncMock(return_value=[])
+    monkeypatch.setattr(catalog.microsoft_oauth_service, "get_credentials_for_org", microsoft_reader)
+    monkeypatch.setattr(
+        copilot_integrations,
+        "get_request_principal",
+        lambda: RequestPrincipal(ORGANIZATION_ID, AuthKind.bearer, user_id="trusted_user"),
+    )
+
+    result = await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID))
+
+    microsoft_reader.assert_awaited_once_with(ORGANIZATION_ID, user_id="trusted_user")
+    assert _by_id(result)["powerbi"]["accounts"] == []
+
+
+@pytest.mark.asyncio
+async def test_copilot_keeps_org_outlook_and_hides_unowned_powerbi_for_synthetic_principal(
+    org: _OrgState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        catalog,
+        "SKYVERN_INTEGRATIONS",
+        tuple(
+            entry.model_copy(update={"status": "live"}) if entry.id == "powerbi" else entry
+            for entry in catalog.SKYVERN_INTEGRATIONS
+        ),
+    )
+    outlook = _microsoft(id="msoac_outlook", scopes_requested=["Mail.Read"], scopes_granted=["Mail.Read"])
+    microsoft_reader = AsyncMock(return_value=[outlook])
+    monkeypatch.setattr(catalog.microsoft_oauth_service, "get_credentials_for_org", microsoft_reader)
+    monkeypatch.setattr(
+        copilot_integrations,
+        "get_request_principal",
+        lambda: RequestPrincipal(ORGANIZATION_ID, AuthKind.api_key, user_id=f"{ORGANIZATION_ID}_user"),
+    )
+
+    result = await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID))
+
+    microsoft_reader.assert_awaited_once_with(ORGANIZATION_ID, user_id=None)
+    entries = _by_id(result)
+    assert [account["connection_id"] for account in entries["outlook"]["accounts"]] == [outlook.id]
+    assert entries["powerbi"]["accounts"] == []
+    assert "powerbi_owner" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_copilot_hides_only_unavailable_powerbi_from_coming_soon_integrations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    google_sheets = next(entry for entry in catalog.SKYVERN_INTEGRATIONS if entry.id == "google_sheets")
+    powerbi = next(entry for entry in catalog.SKYVERN_INTEGRATIONS if entry.id == "powerbi")
+    monkeypatch.setattr(
+        copilot_integrations,
+        "integrations_for_org",
+        AsyncMock(
+            return_value=[
+                google_sheets.model_copy(update={"status": "comingSoon"}),
+                powerbi.model_copy(update={"status": "comingSoon"}),
+            ]
+        ),
+    )
+    monkeypatch.setattr(copilot_integrations, "integration_is_live", lambda _: False)
+    monkeypatch.setattr(copilot_integrations, "get_request_principal", lambda: None)
+
+    entries = _by_id(await _list_integrations({}, SimpleNamespace(organization_id=ORGANIZATION_ID)))
+
+    assert "google_sheets" in entries
+    assert "powerbi" not in entries
 
 
 @pytest.mark.parametrize(
@@ -622,7 +710,7 @@ async def test_read_google_sheet_keeps_the_opened_connection_and_no_token_when_t
 async def test_read_google_sheet_bounds_an_oversized_sheet_and_says_so(
     sheets_api: SheetsApiInstaller, cell_character: str
 ) -> None:
-    sheets_api([_google(id="goac_opens")], {"goac_opens": OPENING_TOKEN}, rows=[[cell_character * 5_000] * 60] * 400)
+    sheets_api([_google(id="goac_opens")], {"goac_opens": OPENING_TOKEN}, rows=[[cell_character * 300] * 30] * 60)
 
     result = await _read_google_sheet({"spreadsheet_url": SHEET_URL, "range": "A1:ZZ400"}, _sheet_ctx())
 

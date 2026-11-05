@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { AxiosError } from "axios";
 import { useEffect, useState, type ReactNode } from "react";
 import {
@@ -26,6 +27,7 @@ import {
   QueryClientProvider,
   useQuery,
 } from "@tanstack/react-query";
+import { queryClient } from "@/api/QueryClient";
 import { parse as parseYaml } from "yaml";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -635,6 +637,197 @@ describe("workflow save reservation", () => {
       expect(beginSaveTransaction(owner)).toBe(true);
     },
   );
+
+  it("releases a restored save when the server still has its base version", async () => {
+    sessionStorage.setItem(
+      "workflow-pending-save:wpid-1",
+      JSON.stringify({
+        workflowPermanentId: "wpid-1",
+        baseVersion: 1,
+        timestamp: Date.now() - 30_000,
+      }),
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    const owner = createYamlCommitOwner("wpid-1");
+    registerEditorOwner(owner);
+    const hydrate = vi.fn();
+    useWorkflowHasChangesStore.setState({ hydrateSavedSettings: hydrate });
+    const canonical = {
+      ...saveData.workflow,
+      title: saveData.title,
+      description: saveData.description,
+    };
+    mocks.get.mockResolvedValueOnce({ data: canonical });
+
+    renderHook(() => usePendingWorkflowSaveRecovery(canonical), {
+      wrapper,
+    });
+
+    await waitFor(() =>
+      expect(hydrate).toHaveBeenCalledExactlyOnceWith(canonical, {
+        hydrateGraph: true,
+      }),
+    );
+    expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().commitInProgress).toBe(false);
+    expect(beginSaveTransaction(owner)).toBe(true);
+    expect(toast).toHaveBeenCalledExactlyOnceWith({
+      title: "Previous save was not saved",
+      description:
+        "The workflow was reloaded from the server. Your previous changes were not saved.",
+      variant: "destructive",
+    });
+  });
+
+  it("rechecks a fresh restored save when it reaches the slow-save threshold", async () => {
+    vi.useFakeTimers();
+    sessionStorage.setItem(
+      "workflow-pending-save:wpid-1",
+      JSON.stringify({
+        workflowPermanentId: "wpid-1",
+        baseVersion: 1,
+        timestamp: Date.now(),
+      }),
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    const owner = createYamlCommitOwner("wpid-1");
+    registerEditorOwner(owner);
+    const hydrate = vi.fn();
+    useWorkflowHasChangesStore.setState({ hydrateSavedSettings: hydrate });
+    const canonical = {
+      ...saveData.workflow,
+      title: saveData.title,
+      description: saveData.description,
+    };
+    mocks.get.mockResolvedValueOnce({ data: canonical });
+
+    renderHook(() => usePendingWorkflowSaveRecovery(canonical), { wrapper });
+
+    expect(hydrate).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(hydrate).toHaveBeenCalledExactlyOnceWith(canonical, {
+      hydrateGraph: true,
+    });
+    expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().commitInProgress).toBe(false);
+  });
+
+  it("loads the version that lands after the initial recovery check", async () => {
+    vi.useFakeTimers();
+    sessionStorage.setItem(
+      "workflow-pending-save:wpid-1",
+      JSON.stringify({
+        workflowPermanentId: "wpid-1",
+        baseVersion: 1,
+        timestamp: Date.now(),
+      }),
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    const owner = createYamlCommitOwner("wpid-1");
+    registerEditorOwner(owner);
+    const hydrate = vi.fn();
+    useWorkflowHasChangesStore.setState({ hydrateSavedSettings: hydrate });
+    const initial = {
+      ...saveData.workflow,
+      title: saveData.title,
+      description: saveData.description,
+    };
+    const saved = { ...initial, version: 2, title: "Saved after reload" };
+    mocks.get.mockResolvedValueOnce({ data: saved });
+
+    renderHook(() => usePendingWorkflowSaveRecovery(initial), { wrapper });
+
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(mocks.get).toHaveBeenCalledWith("/workflows/wpid-1");
+    expect(hydrate).toHaveBeenCalledExactlyOnceWith(saved, {
+      hydrateGraph: true,
+    });
+    expect(toast).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem("workflow-pending-save:wpid-1")).toBeNull();
+  });
+
+  it("updates the cached baseline when recovery finds a landed save", async () => {
+    sessionStorage.setItem(
+      "workflow-pending-save:wpid-1",
+      JSON.stringify({
+        workflowPermanentId: "wpid-1",
+        baseVersion: 1,
+        timestamp: Date.now() - 30_000,
+      }),
+    );
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    registerEditorOwner(createYamlCommitOwner("wpid-1"));
+    useWorkflowHasChangesStore.setState({ hydrateSavedSettings: vi.fn() });
+    const initial = {
+      ...saveData.workflow,
+      title: saveData.title,
+      description: saveData.description,
+    };
+    const saved = { ...initial, version: 2, title: "Saved after reload" };
+    queryClient.setQueryData(["workflow", "wpid-1"], {
+      ...initial,
+      effective_default_engine: "skyvern-3.0",
+    });
+    mocks.get.mockResolvedValueOnce({ data: saved });
+
+    renderHook(() => usePendingWorkflowSaveRecovery(initial), { wrapper });
+
+    await waitFor(() =>
+      expect(queryClient.getQueryData(["workflow", "wpid-1"])).toMatchObject({
+        ...saved,
+        effective_default_engine: "skyvern-3.0",
+      }),
+    );
+  });
+
+  it("does not abandon a live save when the slow-save threshold passes", async () => {
+    vi.useFakeTimers();
+    let resolvePut!: (value: unknown) => void;
+    mocks.put.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePut = resolve;
+        }),
+    );
+    const hydrate = vi.fn();
+    useWorkflowHasChangesStore.setState({ hydrateSavedSettings: hydrate });
+    const canonical = {
+      ...saveData.workflow,
+      title: saveData.title,
+      description: saveData.description,
+    };
+    const hook = renderHook(
+      () => {
+        usePendingWorkflowSaveRecovery(canonical);
+        return useWorkflowSave();
+      },
+      { wrapper },
+    );
+
+    let saving!: Promise<unknown>;
+    await act(async () => {
+      saving = hook.result.current.mutateAsync(undefined);
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+
+    expect(hydrate).not.toHaveBeenCalled();
+    expect(
+      sessionStorage.getItem("workflow-pending-save:wpid-1"),
+    ).not.toBeNull();
+    expect(useWorkflowYamlEditorStore.getState().commitInProgress).toBe(true);
+    await act(async () => {
+      resolvePut({ data: canonical });
+      await saving;
+    });
+  });
 
   it.each([200, 422, 500])(
     "writes the save marker before PUT and removes it on HTTP %s",
@@ -2036,6 +2229,30 @@ describe("blocked saves", () => {
     expect(mocks.put).not.toHaveBeenCalled();
     expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
     useWorkflowHasChangesStore.setState({ saveBlockedReason: null });
+  });
+
+  // Every Save button, the leave-page dialog, Save as Template and Save inputs go through this save.
+  it("refuses to write a staged Copilot proposal, so only Accept can make it durable", async () => {
+    mocks.put.mockClear();
+    mocks.getClient.mockResolvedValue({ put: mocks.put });
+    useWorkflowHasChangesStore.setState({
+      getSaveData: () => saveData,
+      hasChanges: true,
+    });
+    useCopilotProposalStore.setState({ proposal: {} as never });
+    const { result } = renderHook(() => useWorkflowSave(), { wrapper });
+
+    try {
+      await act(async () => {
+        await expect(result.current.mutateAsync(undefined)).rejects.toThrow(
+          "Resolve the Copilot proposal before saving.",
+        );
+      });
+      expect(mocks.put).not.toHaveBeenCalled();
+      expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(true);
+    } finally {
+      useCopilotProposalStore.setState({ proposal: null });
+    }
   });
 });
 
