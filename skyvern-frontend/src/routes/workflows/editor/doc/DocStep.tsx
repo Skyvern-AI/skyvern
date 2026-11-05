@@ -41,7 +41,6 @@ import {
   getDocProseFields,
   getDocSettingSummary,
   getDocStepSummary,
-  docStepCanRun,
 } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
 import { docTagState, type DocTagState } from "./docRunState";
@@ -87,10 +86,10 @@ const tagClass = (
   state: DocTagState | null = null,
 ) =>
   cn(
-    "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded pl-[5px] pr-[7px] text-[12.5px] font-semibold",
+    "inline-flex h-[21px] shrink-0 items-center gap-1 whitespace-nowrap rounded px-[6px] text-[12.5px] font-semibold leading-none",
     docTagClasses[docTagColor(blockType)],
     pending &&
-      "border border-dashed border-current bg-transparent pl-1 pr-1.5 opacity-80 dark:bg-transparent",
+      "border border-dashed border-current bg-transparent px-[5px] opacity-80 dark:bg-transparent",
     state && tagStateClasses[state],
   );
 
@@ -360,16 +359,15 @@ export function DocTag({
 export function DocSettingsButton({
   node,
   editable,
-  inline = false,
 }: {
   node: WorkflowBlockNode;
   editable: boolean;
-  inline?: boolean;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   if (!editable) return null;
   const changed = getDocSettingsChips(node).length;
-  const button = (
+  // Without a changed count the gear is not rendered at rest (display: none), so nothing is reserved for it.
+  return (
     <button
       type="button"
       aria-label={`Settings for ${node.data.label}${changed ? `, ${changed} changed` : ""}`}
@@ -380,21 +378,32 @@ export function DocSettingsButton({
       }
       onClick={() => actions.openSettings(node.id)}
       className={cn(
-        "inline-flex items-center gap-[3px] rounded-[5px] py-0.5 text-xs font-semibold leading-4 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring",
+        "items-center gap-[3px] rounded-[5px] py-0.5 text-xs font-semibold leading-4 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
         changed
-          ? "bg-muted pl-1 pr-1.5 text-foreground"
-          : "px-1 opacity-0 group-focus-within/line:opacity-100 group-hover/line:opacity-100",
+          ? "inline-flex px-1"
+          : "hidden px-1 focus-visible:inline-flex group-focus-within/line:inline-flex group-hover/line:inline-flex [@media(hover:none)]:inline-flex",
       )}
     >
       <GearIcon className="size-[15px]" />
       {changed > 0 && <span>{changed}</span>}
     </button>
   );
-  if (changed || inline) return button;
-  // Shown only on hover or focus, so it takes no width: on a narrow pane it must not wrap the row onto a blank line.
+}
+
+/** Run/stop then settings, as one group: a control that is absent leaves no gap, and the gear trails so Run never moves. */
+export function DocStepControls({
+  node,
+  editable,
+  showRunControl,
+}: {
+  node: WorkflowBlockNode;
+  editable: boolean;
+  showRunControl: boolean;
+}) {
   return (
-    <span className="relative -ml-2 h-5 w-0 shrink-0 self-center">
-      <span className="absolute left-2 top-0">{button}</span>
+    <span className="inline-flex items-center gap-0.5">
+      {showRunControl && <DocRunStepButton node={node} disabled={!editable} />}
+      <DocSettingsButton node={node} editable={editable} />
     </span>
   );
 }
@@ -435,27 +444,25 @@ export function DocStepHeader({
       <DocTag node={node} place={editable ? place : undefined} />
       {extra}
       {docStepProducesData(node) && (
-        <span className="flex min-w-0 items-center gap-1 text-[12.5px] text-muted-foreground">
+        <span className="flex min-w-0 items-baseline gap-1 text-[12.5px] text-muted-foreground">
           saves{" "}
           {editable && place ? (
             <DocOutputName id={node.id} label={node.data.label} />
           ) : (
             <span
               title={`${node.data.label}_output`}
-              className="min-w-0 truncate rounded bg-muted px-[5px] font-medium leading-[1.25]"
+              className="inline-block min-w-0 max-w-full rounded bg-muted px-[5px] align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]"
             >
               {node.data.label}_output
             </span>
           )}
         </span>
       )}
-      {/* With a Run button the row already reserves width, so the gear takes its own slot instead of overlapping Run. */}
-      <DocSettingsButton
+      <DocStepControls
         node={node}
         editable={editable}
-        inline={editable && docStepCanRun(node)}
+        showRunControl={showRunControl}
       />
-      {showRunControl && <DocRunStepButton node={node} disabled={!editable} />}
     </div>
   );
 }
@@ -611,7 +618,7 @@ export function DocStepBody({
                   description ?? "",
                   stringOf("loopVariableReference") ||
                     stringOf("loopValue") ||
-                    "type @ to pick the list",
+                    "@ pick a list",
                   "",
                 )
               ) : (

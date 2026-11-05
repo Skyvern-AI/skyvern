@@ -19,10 +19,9 @@ import { stripJinjaReferences } from "./docTextUtils";
 import { type AppNode, type WorkflowBlockNode } from "../nodes";
 import type { DocBranch, DocItem } from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
-import { docStepCanRun, docStepTitle } from "./docStepRegistry";
-import { DocRunStepButton } from "./DocRunStepButton";
+import { docStepTitle } from "./docStepRegistry";
 import { DocStepResult } from "./DocStepResult";
-import { DocSettingsButton, DocTag, type DocStepPlace } from "./DocStep";
+import { DocStepControls, DocTag, type DocStepPlace } from "./DocStep";
 import { runStepByKey, type LineSplit } from "./docKeys";
 import type { DocScopeRef } from "./docGraphEdits";
 import { DocText } from "./DocText";
@@ -86,9 +85,8 @@ function BranchTab({
       onDrop={stopHover}
       title={branch.condition || undefined}
       className={cn(
-        "flex min-w-0 max-w-[min(240px,100%)] items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
-        selected &&
-          "bg-[#F3EEF8] text-foreground hover:bg-[#F3EEF8] dark:bg-[rgba(183,147,218,.15)] dark:hover:bg-[rgba(183,147,218,.15)]",
+        "flex min-w-0 max-w-[min(240px,100%)] items-center gap-1.5 whitespace-nowrap border-b-2 border-transparent px-0.5 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+        selected && "border-[#8456A8] text-foreground dark:border-[#B793DA]",
       )}
     >
       <span className="shrink-0 font-semibold text-[#8456A8] dark:text-[#B793DA]">
@@ -205,6 +203,11 @@ export function DocConditional({
   const empty = selected.children.length === 0 && !selected.jumpTo;
   const [confirmingRemove, setConfirmingRemove] = useState(false);
   const conditionIndex = conditions.indexOf(selected);
+  const canMoveEarlier = conditionIndex > 0;
+  const canMoveLater =
+    conditionIndex >= 0 && conditionIndex < conditions.length - 1;
+  const canRemove = conditions.length > 1;
+  const hasBranchActions = canMoveEarlier || canMoveLater || canRemove;
   // Steps outside the branch that use outputs of steps inside it.
   const outsideUsers = () => {
     const inside = new Set(selectedStepIds(selected.children));
@@ -220,13 +223,8 @@ export function DocConditional({
     else branchEdits.removeBranch(node.id, selected.branchId);
   };
   return (
-    <div className="group/line relative my-0.5 rounded-lg border border-border pb-2 pl-3 pr-2.5 pt-1.5">
-      <div
-        className={cn(
-          "mb-1.5 mt-0.5 flex min-h-[26px] flex-wrap items-center gap-2",
-          editable && "pr-16",
-        )}
-      >
+    <div className="group/line rounded py-[3px]">
+      <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
         <DocTag node={node} place={editable ? place : undefined} />
         <button
           type="button"
@@ -245,17 +243,11 @@ export function DocConditional({
           {conditions.length} condition{conditions.length === 1 ? "" : "s"} +
           Otherwise · checked left to right
         </span>
-        {/* Pinned to the corner: in a narrow pane the hidden controls would otherwise wrap onto a blank line. */}
-        <span className="absolute right-2.5 top-2 flex items-center gap-2">
-          <DocSettingsButton
-            node={node}
-            editable={editable}
-            inline={editable && docStepCanRun(node)}
-          />
-          {showRunControl && (
-            <DocRunStepButton node={node} disabled={!editable} />
-          )}
-        </span>
+        <DocStepControls
+          node={node}
+          editable={editable}
+          showRunControl={showRunControl}
+        />
       </div>
       {open && (
         <>
@@ -276,7 +268,7 @@ export function DocConditional({
           <div
             role="tablist"
             aria-label={`Branches of ${node.data.label}`}
-            className="mb-1.5 flex flex-wrap gap-1 border-b border-border pb-1.5"
+            className="mb-1 mt-1 flex flex-wrap items-center gap-x-3 gap-y-1"
           >
             {visible.map((branch) => (
               <BranchTab
@@ -326,7 +318,7 @@ export function DocConditional({
             )}
             {branchEdits && (
               <>
-                {selected.kind !== "otherwise" && (
+                {selected.kind !== "otherwise" && hasBranchActions && (
                   <DocDeleteConfirm
                     id={confirmingRemove ? selected.branchId : null}
                     onClose={() => setConfirmingRemove(false)}
@@ -349,7 +341,7 @@ export function DocConditional({
                           </button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="start">
-                          {conditionIndex > 0 && (
+                          {canMoveEarlier && (
                             <DropdownMenuItem
                               onSelect={() =>
                                 branchEdits.moveBranch(
@@ -362,7 +354,7 @@ export function DocConditional({
                               Move earlier
                             </DropdownMenuItem>
                           )}
-                          {conditionIndex < conditions.length - 1 && (
+                          {canMoveLater && (
                             <DropdownMenuItem
                               onSelect={() =>
                                 branchEdits.moveBranch(
@@ -375,7 +367,7 @@ export function DocConditional({
                               Move later
                             </DropdownMenuItem>
                           )}
-                          {conditions.length > 1 && (
+                          {canRemove && (
                             <DropdownMenuItem
                               className="text-destructive focus:text-destructive"
                               onSelect={() => setTimeout(removeSelected, 0)}
@@ -391,7 +383,7 @@ export function DocConditional({
                 <button
                   type="button"
                   onClick={() => branchEdits.addBranch(node.id)}
-                  className="rounded-md px-2 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                  className="rounded-md px-1 py-[3px] text-[12.5px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   + Branch
                 </button>
@@ -406,7 +398,7 @@ export function DocConditional({
                 <>
                   {kindLabel[selected.kind]}{" "}
                   {conditionEditable && branchEdits ? (
-                    <span className="inline-block min-w-[12ch] align-top">
+                    <span className="inline-block min-w-[12ch] align-baseline">
                       <DocEditableLine
                         key={selected.branchId}
                         value={selected.condition}

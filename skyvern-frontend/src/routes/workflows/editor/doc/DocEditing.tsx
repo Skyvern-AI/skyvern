@@ -564,7 +564,7 @@ export function DocEditableLine({
             onDone?.(ref.current?.innerText ?? value);
           }}
           className={cn(
-            "block min-h-[1.55em] whitespace-pre-wrap rounded outline-none [overflow-wrap:anywhere] empty:before:font-normal empty:before:text-muted-foreground empty:before:content-[attr(data-placeholder)] focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-4 focus-visible:ring-offset-background",
+            "block min-h-[1.55em] whitespace-pre-wrap rounded outline-none [overflow-wrap:anywhere] empty:before:font-normal empty:before:text-muted-foreground empty:before:content-[attr(data-placeholder)]",
             className,
           )}
         />
@@ -647,7 +647,7 @@ export function DocOutputName({ id, label }: { id: string; label: string }) {
   const [draft, setDraft] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const pill =
-    "inline-block max-w-full truncate whitespace-nowrap rounded bg-muted px-[5px] text-left align-bottom font-medium leading-[1.25]";
+    "inline-block max-w-full rounded bg-muted px-[5px] text-left align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]";
   if (!edit)
     return (
       <span className={pill} title={`${label}_output`}>
