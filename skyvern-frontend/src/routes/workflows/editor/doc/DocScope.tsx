@@ -114,9 +114,8 @@ function DocStepProblem({
           {fix.message.split("\n").map((message) => (
             <li
               key={message}
-              className="flex items-baseline gap-1.5 text-[13px] leading-[1.55] text-[#C0392B] dark:text-[#F08A7E]"
+              className="text-[13px] leading-[1.55] text-muted-foreground"
             >
-              <span aria-hidden>✕</span>
               {message}
             </li>
           ))}

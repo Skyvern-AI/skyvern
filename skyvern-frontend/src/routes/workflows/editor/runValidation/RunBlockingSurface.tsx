@@ -281,7 +281,8 @@ export function RunBlockingSurface() {
     (state) => state.enabled && state.presentation === "doc" && !yamlActive,
   );
 
-  if (blocks.length === 0) {
+  // In the Doc the same problem already shows once on its step and in the problem chip.
+  if (blocks.length === 0 || doc) {
     return null;
   }
 
