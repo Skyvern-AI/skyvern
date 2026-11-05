@@ -950,43 +950,50 @@ describe("PromptBox", () => {
     );
   });
 
-  test("Upload an SOP creates a blank agent and hands the PDF to the editor once", async () => {
-    mockPost.mockResolvedValue({
-      data: {
-        workflow_permanent_id: "wpid_sop",
-        workflow_definition: { blocks: [] },
-      },
-    });
-    const pdf = new File(["%PDF"], "procedure.pdf", {
-      type: "application/pdf",
-    });
+  test.each([
+    ["procedure.pdf", "application/pdf"],
+    [
+      "procedure.docx",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+  ])(
+    "Upload an SOP creates a blank agent and hands %s to the editor once",
+    async (filename, type) => {
+      mockPost.mockResolvedValue({
+        data: {
+          workflow_permanent_id: "wpid_sop",
+          workflow_definition: { blocks: [] },
+        },
+      });
+      const sop = new File(["PK"], filename, { type });
 
+      renderPromptBox(true);
+      expect(screen.queryByLabelText("Add files and more")).toBeNull();
+      expect(screen.queryByText("Paste an SOP")).toBeNull();
+      fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
+        target: { files: [sop] },
+      });
+
+      await waitFor(() =>
+        expect(mockNavigate).toHaveBeenCalledWith(
+          "/agents/wpid_sop/studio?sop=1",
+        ),
+      );
+      expect(mockPost).toHaveBeenCalledTimes(1);
+      expect(mockPost.mock.calls[0]![0]).toBe("/workflows");
+      expect(mockPost.mock.calls[0]![1]).toContain("title: New Agent");
+      expect(takeSopHandoffFile("wpid_sop")).toBe(sop);
+      expect(takeSopHandoffFile("wpid_sop")).toBeNull();
+      expect(mockPostHogCapture).toHaveBeenCalledWith(
+        "home.upload_sop_selected",
+        expect.any(Object),
+      );
+    },
+  );
+
+  test("rejects an SOP that is neither a PDF nor a .docx without creating an agent", () => {
     renderPromptBox(true);
-    expect(screen.queryByLabelText("Add files and more")).toBeNull();
-    expect(screen.queryByText("Paste an SOP")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
-      target: { files: [pdf] },
-    });
-
-    await waitFor(() =>
-      expect(mockNavigate).toHaveBeenCalledWith(
-        "/agents/wpid_sop/studio?sop=1",
-      ),
-    );
-    expect(mockPost).toHaveBeenCalledTimes(1);
-    expect(mockPost.mock.calls[0]![0]).toBe("/workflows");
-    expect(mockPost.mock.calls[0]![1]).toContain("title: New Agent");
-    expect(takeSopHandoffFile("wpid_sop")).toBe(pdf);
-    expect(takeSopHandoffFile("wpid_sop")).toBeNull();
-    expect(mockPostHogCapture).toHaveBeenCalledWith(
-      "home.upload_sop_selected",
-      expect.any(Object),
-    );
-  });
-
-  test("rejects a non-PDF SOP without creating an agent", () => {
-    renderPromptBox(true);
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+    fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
       target: {
         files: [new File(["steps"], "procedure.txt", { type: "text/plain" })],
       },
@@ -1013,7 +1020,7 @@ describe("PromptBox", () => {
     const big = new File(["%PDF"], "huge.pdf", { type: "application/pdf" });
     Object.defineProperty(big, "size", { value: 31 * 1024 * 1024 });
     renderPromptBox(true);
-    fireEvent.change(screen.getByLabelText("Choose an SOP PDF"), {
+    fireEvent.change(screen.getByLabelText("Choose an SOP file"), {
       target: { files: [big] },
     });
 
