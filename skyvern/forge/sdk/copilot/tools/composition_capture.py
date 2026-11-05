@@ -54,7 +54,9 @@ from skyvern.forge.sdk.copilot.runtime import (
     bound_call_browser_session,
     browser_evidence_commit_lock,
     browser_session_turn,
+    carries_browser_session_acquisition_failure,
     effective_browser_session_id,
+    ensure_browser_session,
     resolve_browser_state_for_context,
 )
 from skyvern.forge.sdk.copilot.runtime_authoring_repair import (
@@ -1253,6 +1255,11 @@ async def _inspect_page_for_composition_under_custody(
     authority_error = _authority_tool_error(copilot_ctx, "inspect_page_for_composition")
     if authority_error:
         return {"ok": False, "error": authority_error}
+    use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
+    if use_current_page and isinstance(copilot_ctx, AgentContext) and effective_browser_session_id(copilot_ctx) is None:
+        session_error = await ensure_browser_session(copilot_ctx)
+        if session_error:
+            return session_error
     capture_session_id = effective_browser_session_id(copilot_ctx) if isinstance(copilot_ctx, AgentContext) else None
     capture_tracks_debug_session = (
         isinstance(copilot_ctx, AgentContext) and capture_session_id == copilot_ctx.browser_session_id
@@ -1261,7 +1268,6 @@ async def _inspect_page_for_composition_under_custody(
         copilot_ctx.browser_session_continuity_generation if capture_tracks_debug_session else None
     )
 
-    use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     if not use_current_page:
         _clear_pending_browser_interaction_observation(copilot_ctx)
@@ -1326,6 +1332,8 @@ async def _inspect_page_for_composition_under_custody(
                 timeout_seconds=_COMPOSITION_NAVIGATE_TIMEOUT_SECONDS,
             )
             if not nav_result.get("ok"):
+                if carries_browser_session_acquisition_failure(nav_result):
+                    return nav_result
                 nav_error = str(nav_result.get("error") or "unknown")
                 failure_capture = await _composition_evidence_after_navigation_failure(
                     copilot_ctx,

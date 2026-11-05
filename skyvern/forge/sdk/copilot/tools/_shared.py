@@ -1087,7 +1087,10 @@ async def on_working_page(
         except (CopilotBrowserGenerationRetired, CopilotBrowserSessionUnavailable) as exc:
             disposition = await _browser_session_error_disposition(ctx, exc, tool_name=tool_name, call_path="model")
             return _browser_session_loss_result(
-                {}, disposition=disposition, deadline_expired=ctx.browser_session_continuity_deadline_expired
+                {},
+                disposition=disposition,
+                deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
             )
         except Exception as exc:
             if entered_browser:

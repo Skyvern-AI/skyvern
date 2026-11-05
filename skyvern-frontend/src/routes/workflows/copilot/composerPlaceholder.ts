@@ -21,7 +21,7 @@ export function composerPlaceholder({
   // What the picked choice still needs typed, which outranks the generic invitations.
   detailPrompt?: string | null;
 }): string {
-  if (isDemonstrating) return "Show Copilot the task";
+  if (isDemonstrating) return "Add context Copilot can't see…";
   if (queuedPrompt === "add") return "Add to the queued message…";
   if (queuedPrompt === "replace") return "Type to replace the queued message…";
   if (isLoading) return "Type to queue a message…";

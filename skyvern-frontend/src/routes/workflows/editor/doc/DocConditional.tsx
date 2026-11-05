@@ -175,14 +175,16 @@ export function DocConditional({
   const open = actions.conditionalOpen(node.id);
   const conditions = item.branches.filter((b) => b.kind !== "otherwise");
   const otherwise = item.branches.find((b) => b.kind === "otherwise");
-  const { blocksByLabel } = useDocRun();
-  const { selected, ranBranch } = docBranchSelection(
+  const { blocksByLabel, unknownLabels } = useDocRun();
+  const { selected, ranBranch: ranOnRun } = docBranchSelection(
     item,
     node.data.label,
     actions.selectedBranch(node.id),
     byId,
     blocksByLabel,
   );
+  // A conditional edited since the run cannot say which branch ran.
+  const ranBranch = unknownLabels.has(node.data.label) ? undefined : ranOnRun;
   let visible = conditions;
   let overflow: DocBranch[] = [];
   if (conditions.length > MAX_VISIBLE_CONDITIONS) {
@@ -256,7 +258,14 @@ export function DocConditional({
       </div>
       {open && (
         <>
-          <DocStepResult label={node.data.label} />
+          <DocStepResult
+            label={node.data.label}
+            completedText={
+              ranBranch
+                ? `Took ${ranBranch.kind === "otherwise" ? "Otherwise" : `${kindLabel[ranBranch.kind]} ${shortLabel(ranBranch.condition)}`.trim()}`
+                : undefined
+            }
+          />
           {typeof node.data.description === "string" &&
             node.data.description.trim() && (
               <p className="mb-1.5 text-base font-medium leading-[1.55]">
@@ -447,6 +456,18 @@ export function DocConditional({
               ) : null}
             </div>
             <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
+              {ranBranch &&
+                selected !== ranBranch &&
+                selected.stepCount > 0 && (
+                  <p
+                    className="my-1 text-[13px] text-muted-foreground"
+                    data-testid="doc-branch-skipped"
+                  >
+                    {selected.kind === "otherwise"
+                      ? "Not taken, so these steps were skipped"
+                      : "No, so these steps were skipped"}
+                  </p>
+                )}
               {renderChildren(
                 selected.children,
                 selected.synthetic || selected.jumpTo

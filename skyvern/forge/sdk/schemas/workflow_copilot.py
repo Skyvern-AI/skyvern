@@ -608,8 +608,9 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
 
 class WorkflowCopilotDemonstrationControlRequest(BaseModel):
     demonstration_id: str = Field(max_length=64)
-    action: Literal["navigate", "fill_credential", "upload_file", "stop", "cancel"]
+    action: Literal["navigate", "fill_credential", "upload_file", "note", "stop", "cancel"]
     url: str | None = Field(default=None, max_length=2048)
+    text: str | None = Field(default=None, max_length=2000)
     selector: str | None = Field(default=None, max_length=2000)
     credential_id: str | None = Field(default=None, max_length=128)
     field: Literal["password", "totp"] | None = None

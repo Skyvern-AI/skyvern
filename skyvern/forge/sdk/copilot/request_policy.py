@@ -646,23 +646,12 @@ _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 # A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
 # digit-only body and length floor keep this off prose like `cred and the password`.
 _MALFORMED_CREDENTIAL_ID_RE = re.compile(r"\bcred[ \t\-]+([0-9]{12,})\b")
-_JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
-_CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
-    {
-        "parameter_type",
-        "key",
-        "description",
-        "workflow_id",
-        "created_at",
-        "modified_at",
-        "deleted_at",
-    }
-)
-_LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS = ("username_key", "password_key")
-_WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
-    "I couldn't find the required credentials for the existing workflow. "
-    f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
-)
+# The login fields run-context init resolves as required (`_resolve_required_parameter_value` in context_manager).
+_WHOLE_FIELD_INPUT_RE = re.compile(r"\s*\{\{\s*([A-Za-z_]\w*)\s*\}\}\s*|([A-Za-z_]\w*)")
+_INIT_REQUIRED_VAULT_LOGIN_FIELDS: dict[str, tuple[str, ...]] = {
+    ParameterType.AZURE_VAULT_CREDENTIAL.value: ("vault_name", "username_key", "password_key"),
+    ParameterType.ONEPASSWORD.value: ("vault_id", "item_id"),
+}
 _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
     "into the conditional",
     "inside the conditional",
@@ -1183,6 +1172,19 @@ class RequestPolicy:
         for urls in (self.live_page_admitted_urls, self.carried_credential_urls):
             if ref in urls:
                 urls[credential_id] = urls.pop(ref)
+
+    def credential_intended_url(self, credential_id: str) -> str | None:
+        admitted_url = self.live_page_admitted_urls.get(credential_id)
+        if admitted_url:
+            return admitted_url
+        return next(
+            (
+                credential.tested_url
+                for credential in self.resolved_credentials
+                if credential.credential_id == credential_id and credential.tested_url
+            ),
+            None,
+        )
 
     def project_question_response_sites(self, interaction: QuestionInteraction) -> None:
         project_question_response_sites(self, interaction)
@@ -4938,14 +4940,15 @@ def _is_login_credential_param(param: dict[str, Any]) -> bool:
         return False
 
 
-def _iter_login_credential_params(parsed: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+def _iter_login_credential_params(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     workflow_def = parsed.get("workflow_definition")
     if not isinstance(workflow_def, dict):
         return []
-    out: list[tuple[str, dict[str, Any]]] = []
-    for param in workflow_def.get("parameters") or []:
-        if isinstance(param, dict) and _is_login_credential_param(param):
-            out.append(("workflow", param))
+    out: list[dict[str, Any]] = [
+        param
+        for param in workflow_def.get("parameters") or []
+        if isinstance(param, dict) and _is_login_credential_param(param)
+    ]
 
     def _walk(block_list: Any) -> None:
         if not isinstance(block_list, list):
@@ -4953,10 +4956,9 @@ def _iter_login_credential_params(parsed: dict[str, Any]) -> list[tuple[str, dic
         for block in block_list:
             if not isinstance(block, dict):
                 continue
-            label = str(block.get("label") or "<unlabeled>")
             for param in block.get("parameters") or []:
                 if isinstance(param, dict) and _is_login_credential_param(param):
-                    out.append((label, param))
+                    out.append(param)
             _walk(block.get("loop_blocks"))
 
     _walk(workflow_def.get("blocks"))
@@ -4971,62 +4973,44 @@ def _value_resolves_at_init(value: Any) -> bool:
     return True
 
 
-def _workflow_credential_inputs_unbound(workflow_yaml: str) -> list[dict[str, str]]:
+def _workflow_inputs_and_login_params(
+    workflow_yaml: str | None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     if not workflow_yaml:
-        return []
+        return {}, []
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except Exception:
-        return []
-    if not isinstance(parsed, dict):
-        return []
+        return {}, []
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("workflow_definition"), dict):
+        return {}, []
+    inputs = {
+        param["key"]: param
+        for param in parsed["workflow_definition"].get("parameters") or []
+        if isinstance(param, dict) and param.get("parameter_type") == "workflow" and isinstance(param.get("key"), str)
+    }
+    return inputs, _iter_login_credential_params(parsed)
 
-    workflow_def = parsed.get("workflow_definition")
-    if not isinstance(workflow_def, dict):
-        return []
 
-    workflow_param_bound: dict[str, bool] = {}
-    for param in workflow_def.get("parameters") or []:
-        if isinstance(param, dict) and param.get("parameter_type") == "workflow":
-            key = param.get("key")
-            if isinstance(key, str):
-                workflow_param_bound[key] = _value_resolves_at_init(param.get("default_value"))
+def _init_required_login_fields(param: dict[str, Any]) -> tuple[str, ...]:
+    if param.get("parameter_type") == ParameterType.CREDENTIAL.value:
+        # Init selects from a non-empty credential_ids pool and ignores credential_id.
+        return () if param.get("credential_ids") else ("credential_id",)
+    return _INIT_REQUIRED_VAULT_LOGIN_FIELDS.get(str(param.get("parameter_type")), ())
 
-    findings: list[dict[str, str]] = []
-    for location, param in _iter_login_credential_params(parsed):
-        for field_name in _LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS:
+
+def login_credential_input_defaults(workflow_yaml: str | None) -> dict[str, Any]:
+    inputs, login_params = _workflow_inputs_and_login_params(workflow_yaml)
+    referenced = set()
+    for param in login_params:
+        for field_name in _init_required_login_fields(param):
             value = param.get(field_name)
-            if not isinstance(value, str) or value.strip():
-                continue
-            findings.append(
-                {"location": location, "field": field_name, "missing": "<empty>", "kind": "credential_empty"}
-            )
-        for field_name, value in param.items():
-            if field_name in _CREDENTIAL_PARAM_METADATA_FIELDS:
-                continue
-            if not isinstance(value, str):
-                continue
-            for jinja_key in _JINJA_TEMPLATE_VAR_RE.findall(value):
-                if jinja_key in workflow_param_bound:
-                    if not workflow_param_bound[jinja_key]:
-                        findings.append(
-                            {
-                                "location": location,
-                                "field": field_name,
-                                "missing": jinja_key,
-                                "kind": "credential_template_unbound",
-                            }
-                        )
-                else:
-                    findings.append(
-                        {
-                            "location": location,
-                            "field": field_name,
-                            "missing": jinja_key,
-                            "kind": "credential_template_undefined",
-                        }
-                    )
-    return findings
+            # Only a field that is exactly one input is blank whenever that input is; filters like `default` can fill it.
+            match = _WHOLE_FIELD_INPUT_RE.fullmatch(value) if isinstance(value, str) else None
+            key = match.group(1) or match.group(2) if match else None
+            if key in inputs:
+                referenced.add(key)
+    return {key: param.get("default_value") for key, param in inputs.items() if key in referenced}
 
 
 async def _build_request_policy_bootstrap(
@@ -5138,11 +5122,6 @@ async def _build_request_policy_bootstrap(
         redacted_draft_candidate = policy.raw_secret_redacted_draft
         policy.allow_missing_credentials_in_draft = redacted_draft_candidate
         policy.credential_draft_deferred_explicitly = redacted_draft_candidate
-
-    if _workflow_credential_inputs_unbound(workflow_yaml):
-        policy.clarification_reason = "workflow_credential_inputs_unbound"
-        policy.allow_run_blocks = False
-        policy.allow_missing_credentials_in_draft = True
 
     trace_data = policy.to_trace_data()
     with copilot_span("request_policy", data=trace_data):

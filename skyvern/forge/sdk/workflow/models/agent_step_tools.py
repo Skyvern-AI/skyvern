@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from skyvern.cli.mcp_tools.blocks import BLOCK_SUMMARIES
-from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES, ALWAYS_OFFERED_TOOLS
+from skyvern.schemas.agent_step_tool_names import (
+    AGENT_STEP_TOOL_NAMES,
+    ALWAYS_OFFERED_TOOLS,
+    LEGACY_AGENT_STEP_TOOL_NAMES,
+)
 from skyvern.schemas.workflows import (
     BlockType,
     BlockYAML,
@@ -26,7 +30,6 @@ from skyvern.schemas.workflows import (
     HumanInteractionBlockYAML,
     LoginBlockYAML,
     PdfFillBlockYAML,
-    PDFParserBlockYAML,
     PrintPageBlockYAML,
     SendEmailBlockYAML,
     SplitPdfBlockYAML,
@@ -61,7 +64,7 @@ _OVERLAPS = "Covered by browser_task or the page commands; overlapping tools mak
 AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
     BlockType.TASK: BlockTool(
         TaskBlockYAML,
-        ("url", "navigation_goal", "data_extraction_goal", "data_schema"),
+        ("url", "navigation_goal", "data_extraction_goal", "data_schema", "files"),
         tool_name="browser_task",
         description="Act on this run's browser: open url if given, work toward navigation_goal, and return data "
         "matching data_schema when data_extraction_goal is set." + _NESTED_AGENT,
@@ -139,7 +142,7 @@ AGENT_BLOCK_TOOLS: dict[BlockType, BlockTool | str] = {
         description="Download a file from a page." + _NESTED_AGENT,
         nested_agent=True,
     ),
-    BlockType.PDF_PARSER: BlockTool(PDFParserBlockYAML, ("file_url", "json_schema")),
+    BlockType.PDF_PARSER: "Covered by file_url_parser, which also OCRs scanned PDFs.",
     BlockType.HTTP_REQUEST: BlockTool(
         HttpRequestBlockYAML,
         (
@@ -238,10 +241,19 @@ RUN_TOOL_DESCRIPTIONS: dict[str, str] = {
     "page_extract": "Read what prompt asks for from the page, shaped by schema, a JSON schema. For a yes/no check, "
     'pass {"type": "boolean"}.' + _NO_SECOND_AGENT,
 }
+FILES_DESCRIPTION = (
+    "files: names of this run's files (see read_run_data) to hand to the browser agent; it receives their values and "
+    "can upload them."
+)
 FINISH_DESCRIPTION = "Return this step's answer. The arguments are the answer."
 
 if {*DEDICATED_BLOCK_TOOLS, *RUN_BLOCK_TYPES, *RUN_TOOL_DESCRIPTIONS, "finish"} != AGENT_STEP_TOOL_NAMES:
     raise RuntimeError("AGENT_STEP_TOOL_NAMES must list exactly the agent step's tool table.")
+if (
+    set(LEGACY_AGENT_STEP_TOOL_NAMES) & AGENT_STEP_TOOL_NAMES
+    or not set(LEGACY_AGENT_STEP_TOOL_NAMES.values()) <= AGENT_STEP_TOOL_NAMES
+):
+    raise RuntimeError("LEGACY_AGENT_STEP_TOOL_NAMES must map retired tool names to current ones.")
 
 
 def block_description(block_type: BlockType, tool: BlockTool) -> str:

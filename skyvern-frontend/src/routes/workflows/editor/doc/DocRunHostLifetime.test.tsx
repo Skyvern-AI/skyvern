@@ -33,6 +33,7 @@ vi.mock("./useDocRun", () => ({
     runId: null,
     blocksByLabel: control.blocksByLabel,
     live: false,
+    unknownLabels: new Set(),
   }),
 }));
 vi.mock("./DocStepResult", () => ({ DocStepResult: () => null }));

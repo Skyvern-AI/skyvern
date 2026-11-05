@@ -426,6 +426,8 @@ const RECOVERY_POLL_BUDGET_MS = 1_500_000;
 const CANONICAL_READ_TIMEOUT_MS = 5_000;
 // Matches the server's MANUAL_SIGN_IN_CLAIM_SECONDS, which bounds a Generate and save.
 const REGISTRATION_SAVE_WINDOW_MS = 120_000;
+// Silence after dictated speech that ends one spoken demonstration note.
+const DICTATED_NOTE_PAUSE_MS = 1_500;
 const REGISTRATION_SAVE_POLL_MS = 2_000;
 const INTERRUPTED_TERMINAL_REASON = "interrupted";
 // Taking the Copilot lock under a save, YAML commit or Accept would toast.
@@ -1795,6 +1797,9 @@ export function WorkflowCopilotChat({
     setAutoAccept(value);
   };
   const [inputValue, setInputValue] = useState("");
+  const lastDictatedTextRef = useRef("");
+  const takenNoteTextRef = useRef<string | null>(null);
+  const addDemonstrationNoteRef = useRef<() => Promise<void>>(async () => {});
   // The prompt being written when a question arrived. It waits here while the composer answers
   // the question, so neither text can land in the other's place.
   const [promptHeldForQuestion, setPromptHeldForQuestion] = useState("");
@@ -3191,11 +3196,16 @@ export function WorkflowCopilotChat({
     isListening: isSpeechListening,
     isHearingSpeech: isSpeechHearing,
     stop: stopSpeech,
+    cancel: cancelSpeech,
     toggle: toggleSpeech,
     takeAudioBlob: takeSpeechAudioBlob,
+    clearTranscript: clearSpeechTranscript,
   } = useSpeechToTextField({
     value: inputValue,
-    onChange: setInputValue,
+    onChange: (text) => {
+      lastDictatedTextRef.current = text;
+      setInputValue(text);
+    },
     // Dictation follows the textarea: it stays live while a prompt is parked,
     // because that text is now editable and replaceable rather than frozen.
     enabled: isOpen,
@@ -7384,6 +7394,53 @@ export function WorkflowCopilotChat({
         : "",
     );
   }
+  const demonstrationRecording = demonstrationRecorder.phase === "recording";
+  useEffect(() => {
+    if (inputValue === "") takenNoteTextRef.current = null;
+  }, [inputValue]);
+  // The composer text only counts as dictated while it is exactly what speech last wrote.
+  const composerIsDictated =
+    isSpeechListening &&
+    inputValue.trim().length > 0 &&
+    inputValue === lastDictatedTextRef.current;
+  useEffect(() => {
+    if (!demonstrationRecording || !composerIsDictated) return;
+    const timer = setTimeout(
+      () => void addDemonstrationNoteRef.current(),
+      DICTATED_NOTE_PAUSE_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [composerIsDictated, demonstrationRecording, inputValue]);
+  useEffect(() => {
+    if (!demonstrationRecording || !composerIsDictated) return;
+    // What was said before a click in the live browser belongs before the step it records.
+    const sendBeforeBrowserClick = (event: PointerEvent) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest(".browser-stream")
+      )
+        void addDemonstrationNoteRef.current();
+    };
+    window.addEventListener("pointerdown", sendBeforeBrowserClick, true);
+    return () =>
+      window.removeEventListener("pointerdown", sendBeforeBrowserClick, true);
+  }, [composerIsDictated, demonstrationRecording]);
+  const wasDemonstrationRecordingRef = useRef(demonstrationRecording);
+  useEffect(() => {
+    const wasRecording = wasDemonstrationRecordingRef.current;
+    wasDemonstrationRecordingRef.current = demonstrationRecording;
+    if (!wasRecording || demonstrationRecording || !isSpeechListening) return;
+    // Narration belongs to the recording; cancel drops results still in flight, which would
+    // otherwise land in the chat composer after the recording ends.
+    cancelSpeech();
+    takeSpeechAudioBlob();
+    setInputValue("");
+  }, [
+    cancelSpeech,
+    demonstrationRecording,
+    isSpeechListening,
+    takeSpeechAudioBlob,
+  ]);
   const dictatedQuestionIdRef = useRef(trayQuestionId);
   useEffect(() => {
     const previous = dictatedQuestionIdRef.current;
@@ -9507,7 +9564,8 @@ export function WorkflowCopilotChat({
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      if (isDemonstrating) void addDemonstrationNote();
+      else handleSend();
     }
   };
 
@@ -10390,8 +10448,31 @@ export function WorkflowCopilotChat({
                   : hasComposerText
                     ? "Queue for next turn"
                     : "Stop";
-  const demonstrationSendButtonLabel =
-    demonstrationRecorder.phase === "recording"
+  const demonstrationNoteReady =
+    demonstrationRecorder.phase === "recording" && inputValue.trim().length > 0;
+  const addDemonstrationNote = async () => {
+    const text = inputValue.trim();
+    // The pause timer, a browser click and Enter can all fire before React re-renders the cleared composer.
+    if (!demonstrationNoteReady || takenNoteTextRef.current === inputValue)
+      return;
+    takenNoteTextRef.current = inputValue;
+    // Dictation keeps running across notes; this only takes what was heard so far.
+    if (isSpeechListening) clearSpeechTranscript();
+    lastDictatedTextRef.current = "";
+    setInputValue("");
+    if (!(await demonstrationRecorder.addNote(text))) {
+      takenNoteTextRef.current = null;
+      // Dictation rewrites the composer on every result, so it stops here to keep the failed note for a retry.
+      if (isSpeechListening) cancelSpeech();
+      setInputValue((current) =>
+        [text, current.trim()].filter(Boolean).join(" "),
+      );
+    }
+  };
+  addDemonstrationNoteRef.current = addDemonstrationNote;
+  const demonstrationSendButtonLabel = demonstrationNoteReady
+    ? "Add note"
+    : demonstrationRecorder.phase === "recording"
       ? "Done, build the workflow"
       : "Build the workflow";
   // While recording, typing still in a focused field is only counted once Done flushes it.
@@ -10399,7 +10480,8 @@ export function WorkflowCopilotChat({
     demonstrationRecorder.phase !== "recording" &&
     demonstrationRecorder.actionCount === 0;
   const demonstrationSendButtonDisabled =
-    demonstrationRecorder.busy || demonstrationNothingRecorded;
+    !demonstrationNoteReady &&
+    (demonstrationRecorder.busy || demonstrationNothingRecorded);
   const demonstrationSendButtonReason = demonstrationNothingRecorded
     ? "Do something in the browser first"
     : null;
@@ -11840,7 +11922,9 @@ export function WorkflowCopilotChat({
                     : QUESTION_PROMPT_ID
                   : undefined
               }
-              disabled={isDemonstrating}
+              disabled={
+                isDemonstrating && demonstrationRecorder.phase !== "recording"
+              }
               rows={1}
               className="min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
               style={{
@@ -11877,8 +11961,11 @@ export function WorkflowCopilotChat({
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
                 isHearingSpeech={isSpeechHearing}
-                disabled={isDemonstrating}
+                disabled={
+                  isDemonstrating && demonstrationRecorder.phase !== "recording"
+                }
                 onToggle={toggleSpeech}
+                label={isDemonstrating ? "Dictate context" : undefined}
                 className="h-8 w-8 rounded-full border-0 bg-transparent"
                 iconClassName="h-3.5 w-3.5"
               />
@@ -11921,7 +12008,9 @@ export function WorkflowCopilotChat({
                     }
                     onClick={() => {
                       if (isDemonstrating) {
-                        void demonstrationRecorder.done();
+                        void (demonstrationNoteReady
+                          ? addDemonstrationNote()
+                          : demonstrationRecorder.done());
                         return;
                       }
                       if (turnObservablyRunning && !hasComposerText) {
@@ -11949,7 +12038,8 @@ export function WorkflowCopilotChat({
                       />
                     ) : null}
                     {isDemonstrating ? (
-                      demonstrationRecorder.phase === "recording" ? (
+                      demonstrationRecorder.phase === "recording" &&
+                      !demonstrationNoteReady ? (
                         <span
                           aria-hidden
                           className="h-2 w-2 rounded-[1.5px] bg-current"

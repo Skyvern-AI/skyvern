@@ -577,7 +577,7 @@ export function DocOutputName({ id, label }: { id: string; label: string }) {
   const [draft, setDraft] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const pill =
-    "inline-block max-w-full rounded bg-muted px-[5px] text-left font-medium leading-[1.25] [overflow-wrap:anywhere]";
+    "inline-block max-w-full truncate whitespace-nowrap rounded bg-muted px-[5px] text-left align-bottom font-medium leading-[1.25]";
   if (!edit)
     return (
       <span className={pill} title={`${label}_output`}>
@@ -766,13 +766,14 @@ export function DocMoveToDialog({
 }
 
 /** Unsaved marker, undo/redo and Save. Each shows only when it applies. */
-// `reserve` keeps the bar's row when it has nothing to show, so the doc doesn't jump on the first edit or on Save.
+// `floating` (sm and up) lays the bar over the page's top padding (the parent positions it), so it adds no height
+// and the Inputs row sits where v26 puts it, while the doc still doesn't jump on the first edit or on Save.
 // While a Copilot proposal is pending its Accept / Reject bar is the one decision, so this bar steps aside.
 export function DocEditBar({
-  reserve = false,
+  floating = false,
   proposalPending = false,
 }: {
-  reserve?: boolean;
+  floating?: boolean;
   proposalPending?: boolean;
 }) {
   const hasChanges = useWorkflowHasChangesStore((s) => s.hasChanges);
@@ -811,15 +812,26 @@ export function DocEditBar({
     if (!hasChanges) setSaveFailure(null);
   }, [hasChanges]);
   if (proposalPending || (!hasChanges && !canUndo && !canRedo))
-    return reserve ? <div aria-hidden className="mb-3 h-[28px]" /> : null;
+    return floating ? (
+      <div aria-hidden className="mb-3 h-[28px] sm:hidden" />
+    ) : null;
   return (
-    <div className="mb-3 flex min-h-[28px] flex-wrap items-center gap-x-2.5 gap-y-1.5 text-[12.5px] text-muted-foreground">
+    <div
+      className={cn(
+        "mb-3 flex min-h-[28px] flex-wrap items-center gap-x-2.5 gap-y-1.5 text-[12.5px] text-muted-foreground",
+        floating && "sm:mb-0 sm:flex-nowrap",
+      )}
+    >
       {hasChanges && saveFailure && !saving ? (
-        <span role="alert" className="text-xs font-normal text-destructive">
+        <span
+          role="alert"
+          className="min-w-0 truncate text-xs font-normal text-destructive"
+          title={saveFailure}
+        >
           Couldn't save: {saveFailure}
         </span>
       ) : hasChanges ? (
-        <span className="text-xs font-normal text-[#B45B0A] dark:text-[#E79A55]">
+        <span className="min-w-0 truncate text-xs font-normal text-[#B45B0A] dark:text-[#E79A55]">
           Unsaved changes
         </span>
       ) : (
@@ -830,7 +842,7 @@ export function DocEditBar({
         <Button
           size="sm"
           variant="ghost"
-          className="h-7 gap-1 px-2"
+          className="h-7 shrink-0 gap-1 px-2"
           title={`Undo (${undoShortcutLabel})`}
           onClick={() => runHistory(false)}
         >
@@ -842,7 +854,7 @@ export function DocEditBar({
         <Button
           size="sm"
           variant="ghost"
-          className="h-7 gap-1 px-2"
+          className="h-7 shrink-0 gap-1 px-2"
           title={`Redo (${redoShortcutLabel})`}
           onClick={() => runHistory(true)}
         >
@@ -853,7 +865,7 @@ export function DocEditBar({
       {hasChanges && (
         <Button
           size="sm"
-          className="h-7 px-3"
+          className="h-7 shrink-0 px-3"
           disabled={saving}
           onClick={() => {
             // Same check as the studio Save: a new Goal whose code isn't regenerated is applied or undone first.

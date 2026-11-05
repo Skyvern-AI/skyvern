@@ -3329,6 +3329,7 @@ def _acquisitions_before_fill(events: list[str]) -> int:
     return events[: events.index("fill")].count("acquire")
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "auto_submit_totp",
@@ -3396,6 +3397,7 @@ async def test_acquisition_arm_pays_one_acquisition_per_target_read(
         assert secret not in retained
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 async def test_acquisition_arm_counts_a_padded_role_name_as_the_name_it_records(
     monkeypatch: pytest.MonkeyPatch,
@@ -3408,6 +3410,7 @@ async def test_acquisition_arm_counts_a_padded_role_name_as_the_name_it_records(
     assert (probe.role, probe.accessible_name, probe.role_name_match_count) == ("button", "Sign in", 1)
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 async def test_acquisition_arm_origin_departure_before_the_fill_releases_nothing_to_the_new_origin(
     monkeypatch: pytest.MonkeyPatch,
@@ -3437,6 +3440,7 @@ async def test_acquisition_arm_origin_departure_before_the_fill_releases_nothing
     assert later["data"]["result"] == "sso.example.com"
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retired_at", ["probe", "after_mint"])
 async def test_acquisition_arm_retired_generation_types_nothing_and_leaves_later_reads_working(

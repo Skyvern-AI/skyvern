@@ -1,13 +1,16 @@
+import asyncio
 from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import BaseModel
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.services import browser_session_artifacts as artifacts
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.schemas.runs import TaskRunRequest
 
 
 def test_denied_redaction_handles_signed_urls_and_file_info_by_shape() -> None:
@@ -26,7 +29,7 @@ def test_denied_redaction_handles_signed_urls_and_file_info_by_shape() -> None:
     }
     redacted = artifacts.BrowserSessionArtifactAccess(False).redact_output(original)
     assert redacted["values"] == ["[redacted]"] * 6 + ["https://example.test/page", "ordinary"]
-    assert redacted["file"].url == "[redacted]" and redacted["file"].artifact_id is None
+    assert redacted["file"].url == "https://redacted.invalid/" and redacted["file"].artifact_id is None
     assert redacted["nested"] == {"artifact_id": None, "recording_url": None}
     assert artifacts.BrowserSessionArtifactAccess(True).redact_output(original) is original
     assert file_info.url == "https://files.example/a" and file_info.artifact_id == "art_1"
@@ -37,6 +40,41 @@ def test_denied_redaction_handles_signed_urls_and_file_info_by_shape() -> None:
     legacy_file = FileInfo(url="https://files.example/legacy", filename="a.pdf").model_dump()
     assert artifacts.BrowserSessionArtifactAccess(False).redact_output(legacy_file)["url"] is None
     assert artifacts.BrowserSessionArtifactAccess(False).redact_output(str(legacy_file)) == "[redacted]"
+
+
+def test_denied_redaction_keeps_url_fields_valid_for_revalidation() -> None:
+    class UrlFields(BaseModel):
+        url: str
+        webhook_url: str | None = None
+        required_optional_url: str | None
+        default_url: str = "https://example.test/default"
+
+    signed = "https://example.test/start?signature=sample"
+    original = UrlFields(url=signed, webhook_url=signed, required_optional_url=signed, default_url=signed)
+    redacted = artifacts.BrowserSessionArtifactAccess(False).redact_output(original)
+    assert redacted.url == redacted.default_url == "https://redacted.invalid/"
+    assert redacted.webhook_url is None and redacted.required_optional_url is None
+    assert UrlFields.model_validate(redacted.model_dump()) == redacted
+    TaskRunRequest(prompt="", url=redacted.url, webhook_url=redacted.webhook_url)
+    assert original.url == signed
+
+
+def test_descendant_entity_redaction_defaults_new_content_fields_to_hidden() -> None:
+    class Entity(BaseModel):
+        id: str
+        new_text: str
+        new_data: dict[str, str] | None = None
+        new_url: str | None = None
+        steps: list[str] = []
+
+    value = Entity(
+        id="id", new_text="private", new_data={"value": "private"}, new_url="https://example.test", steps=["private"]
+    )
+    redacted = artifacts.redact_descendant_entity(value, preserve=frozenset({"id"}))
+    assert "private" not in redacted.model_dump_json()
+    assert redacted.new_text == "[redacted]" and redacted.new_data is None and redacted.new_url is None
+    assert redacted.steps == [] and Entity.model_validate(redacted.model_dump()) == redacted
+    assert value.new_text == "private"
 
 
 @pytest.mark.parametrize("separator", ["", ","])
@@ -130,6 +168,34 @@ async def test_system_scope_and_non_enforcing_fast_path_skip_session_lookups(mon
         assert (await artifacts.browser_session_artifact_access("org", workflow_run_id="run")).allowed
     assert check.await_count == 1
     lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cached_descendant_decisions_are_single_flight_and_principal_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    viewer = RequestPrincipal("org", AuthKind.bearer, user_id="viewer")
+    editor = RequestPrincipal("org", AuthKind.bearer, user_id="editor")
+
+    async def check(_org: str, _run: str) -> artifacts.BrowserSessionArtifactAccess:
+        await asyncio.sleep(0.01)
+        scope = artifacts.browser_session_artifact_read_scope()
+        assert scope is not None and scope[0] is not None
+        return artifacts.BrowserSessionArtifactAccess(scope[0].user_id == "editor")
+
+    lookup = AsyncMock(side_effect=check)
+    monkeypatch.setattr(artifacts, "_child_run_artifact_access", lookup)
+    with artifacts.cache_child_run_artifact_access({}):
+        with artifacts.browser_session_artifact_read(viewer):
+            decisions = await asyncio.gather(*(artifacts.child_run_artifact_access("org", "run") for _ in range(8)))
+            assert not any(decision.allowed for decision in decisions)
+            with artifacts.browser_session_artifact_system_read():
+                assert (await artifacts.child_run_artifact_access("org", "run")).allowed
+        with artifacts.browser_session_artifact_read(editor):
+            assert (await artifacts.child_run_artifact_access("org", "run")).allowed
+        with artifacts.browser_session_artifact_read(viewer):
+            assert not (await artifacts.child_run_artifact_access("org", "run")).allowed
+    assert lookup.await_count == 2
 
 
 @pytest.mark.asyncio

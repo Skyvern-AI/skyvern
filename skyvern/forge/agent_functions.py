@@ -2157,6 +2157,9 @@ class AgentFunction:
     def is_residential_browser_egress(self, browser_context: BrowserContext) -> bool:
         return False
 
+    def note_page_action(self, page: Page, action: Action) -> None:
+        return None
+
     async def on_browser_context_acquired(
         self,
         browser_context: Any,
@@ -2268,7 +2271,9 @@ class AgentFunction:
     ) -> None:
         return
 
-    def browser_session_create_admission(self, organization_id: str) -> AbstractAsyncContextManager[None]:
+    def browser_session_create_admission(
+        self, organization_id: str, *, copilot: bool = False
+    ) -> AbstractAsyncContextManager[None]:
         """Held around a browser-session create; a deployment refuses it by raising TooManyStartingBrowserSessions."""
         return nullcontext()
 
@@ -2330,7 +2335,7 @@ class AgentFunction:
         db_credential: Credential,
         credential_item: CredentialItem,
     ) -> CredentialItem:
-        return credential_item
+        return credential_item.model_copy(update={"passkeys": []})
 
     async def get_extra_extract_action_guidance(self, task: Task) -> str | None:
         return None

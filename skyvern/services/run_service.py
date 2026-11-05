@@ -11,7 +11,11 @@ from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNo
 from skyvern.forge import app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
-from skyvern.forge.sdk.services.browser_session_artifacts import browser_session_artifact_read_scope
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    REDACTED_ARTIFACT,
+    REDACTED_URL,
+    browser_session_artifact_read_scope,
+)
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.response_value_caps import (
@@ -148,7 +152,9 @@ async def get_run_response(
                 # An extraction-only task has no navigation goal, so resolve the prompt the same
                 # way the agent resolves its first-turn goal instead of failing validation.
                 prompt=task_v1_response.request.navigation_goal or task_v1_response.request.data_extraction_goal or "",
-                url=task_v1_response.request.url,
+                url=None
+                if task_v1_response.request.url in {REDACTED_ARTIFACT, REDACTED_URL}
+                else task_v1_response.request.url,
                 webhook_url=task_v1_response.request.webhook_callback_url,
                 totp_identifier=task_v1_response.request.totp_identifier,
                 totp_url=task_v1_response.request.totp_verification_url,

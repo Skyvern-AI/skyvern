@@ -25,6 +25,11 @@ function readStored(workflowPermanentId: string | null): WorkflowPresentation {
   }
 }
 
+// An agent born from a demonstration opens in the Doc the first time; any later choice replaces this.
+export function openNewAgentInDoc(workflowPermanentId: string) {
+  writeStored(workflowPermanentId, "doc");
+}
+
 function writeStored(
   workflowPermanentId: string | null,
   presentation: WorkflowPresentation,
