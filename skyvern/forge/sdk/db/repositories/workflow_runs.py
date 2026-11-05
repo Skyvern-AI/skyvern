@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequ
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from typing import cast as typing_cast
 
 import structlog
@@ -189,6 +189,17 @@ def _is_bounded_runs_list_read(session: AsyncSession, search_key: str | None) ->
     if not search_key or is_indexed_runs_list_search_key(search_key):
         return False
     return session.bind.dialect.name == "postgresql"
+
+
+class WorkflowRunBlockErrorRow(NamedTuple):
+    workflow_run_block_id: str
+    error_codes: list[str]
+    failure_reason: str | None
+    output: Any
+    block_type: str
+    label: str | None = None
+    current_index: int | None = None
+    final_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -511,7 +522,13 @@ async def _hidden_workflow_ids(organization_id: str) -> frozenset[str] | None:
 async def _folder_access_filter(
     organization_id: str, workflow_permanent_id: ColumnElement[str | None]
 ) -> ColumnElement[bool] | None:
-    hidden = await _hidden_workflow_ids(organization_id)
+    principal = get_request_principal()
+    scoped_folder_ceiling = (
+        principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+    )
+    hidden = await app.AGENT_FUNCTION.hidden_workflow_permanent_ids(principal, organization_id)
+    if scoped_folder_ceiling:
+        return and_(workflow_permanent_id.is_not(None), workflow_permanent_id.not_in(hidden or frozenset()))
     if not hidden:
         return None
     # Runs with no workflow (standalone tasks) stay org-wide, as before folder ACLs.
@@ -1097,6 +1114,10 @@ class WorkflowRunsRepository(BaseRepository):
                     created_by, requested_by = source
             if browser_settings is not None and requested_timezone_id(browser_settings) is not None:
                 kwargs["browser_settings"] = browser_settings.model_dump(mode="json")
+            principal = get_request_principal()
+            api_key_actor = api_key_actor_id(organization_id)
+            if principal is not None and principal.api_key_access_mode == "scoped":
+                requested_by = api_key_actor
             workflow_run = WorkflowRunModel(
                 workflow_permanent_id=workflow_permanent_id,
                 workflow_id=workflow_id,
@@ -1134,7 +1155,7 @@ class WorkflowRunsRepository(BaseRepository):
                 copilot_session_id=copilot_session_id,
                 created_by=created_by,
                 # created_by names who to show; run start judges the actor that authorized the request instead.
-                requested_by=requested_by or api_key_actor_id(organization_id),
+                requested_by=requested_by or api_key_actor,
                 **kwargs,
             )
             session.add(workflow_run)
@@ -3770,8 +3791,34 @@ class WorkflowRunsRepository(BaseRepository):
                 PersistentBrowserSessionModel.created_for_workflow_run_id.is_not(None),
             ),
         )
+        association_roots = associations.subquery()
+        session_runs = (
+            select(
+                association_roots.c.browser_session_id,
+                association_roots.c.workflow_run_id,
+                WorkflowRunModel.browser_address,
+            )
+            .outerjoin(WorkflowRunModel, WorkflowRunModel.workflow_run_id == association_roots.c.workflow_run_id)
+            .cte("session_workflow_runs", recursive=True)
+        )
+        session_runs = session_runs.union(
+            select(
+                session_runs.c.browser_session_id,
+                WorkflowRunModel.workflow_run_id,
+                WorkflowRunModel.browser_address,
+            )
+            .join(WorkflowRunModel, WorkflowRunModel.parent_workflow_run_id == session_runs.c.workflow_run_id)
+            .where(
+                WorkflowRunModel.organization_id == organization_id,
+                WorkflowRunModel.browser_session_id.is_(None),
+                session_runs.c.browser_address.is_not(None),
+                WorkflowRunModel.browser_address == session_runs.c.browser_address,
+            )
+        )
         async with self.Session() as session:
-            rows = (await session.execute(associations)).all()
+            rows = (
+                await session.execute(select(session_runs.c.browser_session_id, session_runs.c.workflow_run_id))
+            ).all()
 
         runs_by_session: dict[str, set[str]] = {}
         for browser_session_id, workflow_run_id in rows:
@@ -4188,7 +4235,7 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         organization_id: str | None = None,
         attempt_number: int | None = None,
-    ) -> list[tuple[str, list[str], str | None, Any, str]]:
+    ) -> list[WorkflowRunBlockErrorRow]:
         """Return block provenance and error details for errored blocks in stable creation order."""
         async with self.Session() as session:
             query = select(
@@ -4197,6 +4244,9 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowRunBlockModel.failure_reason,
                 WorkflowRunBlockModel.output,
                 WorkflowRunBlockModel.block_type,
+                WorkflowRunBlockModel.label,
+                WorkflowRunBlockModel.current_index,
+                WorkflowRunBlockModel.final_url,
             ).filter_by(workflow_run_id=workflow_run_id)
             if organization_id is not None:
                 query = query.filter_by(organization_id=organization_id)
@@ -4210,6 +4260,15 @@ class WorkflowRunsRepository(BaseRepository):
             query = query.order_by(WorkflowRunBlockModel.created_at, WorkflowRunBlockModel.workflow_run_block_id)
             rows = (await session.execute(query)).all()
             return [
-                (row.workflow_run_block_id, row.error_codes, row.failure_reason, row.output, row.block_type)
+                WorkflowRunBlockErrorRow(
+                    row.workflow_run_block_id,
+                    row.error_codes,
+                    row.failure_reason,
+                    row.output,
+                    row.block_type,
+                    row.label,
+                    row.current_index,
+                    row.final_url,
+                )
                 for row in rows
             ]

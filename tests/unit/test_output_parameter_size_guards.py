@@ -1048,9 +1048,15 @@ async def test_get_task_v2_caps_output_for_the_app_only(monkeypatch: pytest.Monk
     stored_output = {"rows": ["x" * 1024 for _ in range(200)]}
     task_v2 = SimpleNamespace(
         observer_cruise_id="tsk_v2_1",
+        browser_session_id=None,
+        workflow_run_id=None,
+        browser_address=None,
         output=stored_output,
         model_copy=lambda update: SimpleNamespace(
             observer_cruise_id="tsk_v2_1",
+            browser_session_id=None,
+            workflow_run_id=None,
+            browser_address=None,
             output=update["output"],
             model_dump=lambda by_alias: {"output": update["output"]},
         ),
@@ -1079,12 +1085,16 @@ async def test_get_task_v1_caps_extracted_information_for_the_app_only(monkeypat
     def model_copy(update: dict[str, Any]) -> SimpleNamespace:
         return SimpleNamespace(
             task_id="tsk_1",
+            browser_session_id=None,
+            browser_address=None,
             extracted_information=update["extracted_information"],
             failure_reason=update["failure_reason"],
         )
 
     task_response = SimpleNamespace(
         task_id="tsk_1",
+        browser_session_id=None,
+        browser_address=None,
         extracted_information=stored_output,
         failure_reason="f" * (cap * 2),
         model_copy=model_copy,
@@ -1328,7 +1338,11 @@ async def test_get_thought_timelines_caps_text_fields_when_opted_in(monkeypatch:
     monkeypatch.setattr(
         task_v2_service.app,
         "DATABASE",
-        SimpleNamespace(observer=SimpleNamespace(get_thoughts=AsyncMock(return_value=[thought]))),
+        SimpleNamespace(
+            observer=SimpleNamespace(
+                get_thoughts=AsyncMock(return_value=[thought]), get_task_v2=AsyncMock(return_value=None)
+            )
+        ),
     )
     monkeypatch.setattr(response_value_caps, "RUN_RESPONSE_MAX_VALUE_BYTES", cap)
 

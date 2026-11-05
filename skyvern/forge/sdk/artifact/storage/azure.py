@@ -1,8 +1,9 @@
 import os
 import shutil
 import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import structlog
 
@@ -25,6 +26,8 @@ from skyvern.forge.sdk.artifact.storage.base import (
     FILE_EXTENTSION_MAP,
     SENSITIVE_SHARE_URL_EXPIRY_HOURS,
     BaseStorage,
+    StoredObjectVersion,
+    StreamingArtifactStorage,
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
     dedupe_run_scoped_download_artifacts,
@@ -34,6 +37,7 @@ from skyvern.forge.sdk.artifact.storage.base import (
     presign_with_sensitive_cap,
     resolve_download_attempt_fail_open,
 )
+from skyvern.forge.sdk.artifact.storage.browser_profile_archive import extract_profile_archive, write_profile_archive
 from skyvern.forge.sdk.artifact.storage.run_recording_clips import RUN_RECORDING_PATH_SEGMENT, sync_run_recording_clips
 from skyvern.forge.sdk.artifact.utils import replace_file_extension
 from skyvern.forge.sdk.models import Step
@@ -63,7 +67,21 @@ async def _get_object_info_safe(storage: "AzureStorage", uri: str) -> dict | Non
         return None
 
 
-class AzureStorage(BaseStorage):
+class _AzureBlobStream:
+    def __init__(self, download: Any) -> None:
+        self._download = download
+        self.content_length: int = download.size
+
+    async def iter_chunks(self, chunk_size: int) -> AsyncIterator[bytes]:
+        # The SDK sets the size of each ranged read; every one is conditioned on the pinned ETag.
+        async for chunk in self._download.chunks():
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
+
+
+class AzureStorage(BaseStorage, StreamingArtifactStorage):
     _PATH_VERSION = "v1"
 
     def __init__(
@@ -160,6 +178,24 @@ class AzureStorage(BaseStorage):
     async def _get_tags_for_org(self, organization_id: str) -> dict[str, str]:
         return {}
 
+    def can_stream_artifact(self, artifact: Artifact) -> bool:
+        # Content comparison reads pinned whole objects only; the content route serves retrieved bytes.
+        return False
+
+    def can_verify_artifact(self, artifact: Artifact) -> bool:
+        return not artifact.bundle_key
+
+    async def stat_artifact(self, artifact: Artifact) -> StoredObjectVersion | None:
+        props = await self.async_client.get_blob_properties(artifact.uri)
+        return StoredObjectVersion(size=props["size"], etag=props["etag"]) if props else None
+
+    async def open_artifact_stream(
+        self, artifact: Artifact, *, byte_range: tuple[int, int] | None = None, etag: str | None = None
+    ) -> _AzureBlobStream | None:
+        if byte_range is not None or etag is None:
+            return None
+        return _AzureBlobStream(await self.async_client.open_blob_download(artifact.uri, etag))
+
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await self.async_client.download_file(artifact.uri)
 
@@ -252,7 +288,8 @@ class AzureStorage(BaseStorage):
     async def store_browser_profile(self, organization_id: str, profile_id: str, directory: str) -> None:
         """Store browser profile to Azure."""
         temp_zip_file = create_named_temporary_file()
-        zip_file_path = shutil.make_archive(temp_zip_file.name, "zip", directory)
+        zip_file_path = f"{temp_zip_file.name}.zip"
+        write_profile_archive(directory, zip_file_path, organization_id=organization_id, profile_id=profile_id)
         profile_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
         tier = await self._get_storage_tier_for_org(organization_id)
         tags = await self._get_tags_for_org(organization_id)
@@ -279,7 +316,7 @@ class AzureStorage(BaseStorage):
         downloaded_zip_bytes = await self.async_client.download_file(profile_uri, log_exception=True)
         if not downloaded_zip_bytes:
             return None
-        return unzip_bytes_to_temp_directory(downloaded_zip_bytes, prefix="skyvern_browser_profile_")
+        return extract_profile_archive(downloaded_zip_bytes, organization_id=organization_id, profile_id=profile_id)
 
     async def browser_profile_exists(self, organization_id: str, profile_id: str) -> bool:
         """Non-destructive existence check via blob metadata — avoids downloading the whole archive."""

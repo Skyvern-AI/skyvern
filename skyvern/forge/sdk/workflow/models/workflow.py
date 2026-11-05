@@ -39,6 +39,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import (
+    normalize_blank_totp_identifier,
     normalize_run_metadata,
     normalize_run_with,
 )
@@ -81,6 +82,8 @@ class WorkflowRequestBody(BaseModel):
     browser_type: str | None = None
     ai_fallback: bool | None = None
     run_metadata: dict[str, str] | None = None
+
+    _normalize_totp_identifier = field_validator("totp_identifier")(normalize_blank_totp_identifier)
 
     @field_validator("max_elapsed_time_minutes", mode="before")
     @classmethod
@@ -411,6 +414,8 @@ class WorkflowRun(BaseModel):
     workflow_schedule_id: str | None = None
     ignore_inherited_workflow_system_prompt: bool = False
     copilot_session_id: str | None = None
+    # Internal actor marker used to recheck scoped-key grants before runtime secret access.
+    requested_by: str | None = Field(default=None, exclude=True)
     created_by: str | None = Field(default=None, description="ID of the user who started the run")
     credits_used: int = 0
     cached_credits_used: int = 0

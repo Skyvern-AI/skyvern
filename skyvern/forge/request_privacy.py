@@ -36,12 +36,27 @@ class _GeneratorAwaitable(Generic[_Result]):
 class PrivateRequestPolicy:
     classifier: Callable[[str], bool]
     audit_path: str
+    additional_policies: tuple[PrivateRequestPolicy, ...] = ()
 
 
 def register_private_request_classifier(app: Starlette, classifier: Callable[[str], bool], *, audit_path: str) -> None:
     if not callable(classifier) or re.fullmatch(r"/[a-z0-9_/-]{1,120}", audit_path) is None:
         raise ValueError("Private request classification requires a callable and a static audit path")
-    app.state.private_request_policy = PrivateRequestPolicy(classifier, audit_path)
+    policy = PrivateRequestPolicy(classifier, audit_path)
+    try:
+        existing = app.state.private_request_policy
+    except AttributeError:
+        app.state.private_request_policy = policy
+        return
+    if (
+        not isinstance(existing, PrivateRequestPolicy)
+        or not isinstance(existing.additional_policies, tuple)
+        or not all(isinstance(item, PrivateRequestPolicy) for item in existing.additional_policies)
+    ):
+        raise ValueError("Invalid existing private request policy")
+    app.state.private_request_policy = PrivateRequestPolicy(
+        existing.classifier, existing.audit_path, (*existing.additional_policies, policy)
+    )
 
 
 def private_request_path(scope: Scope) -> str | None:
@@ -52,15 +67,18 @@ def private_request_path(scope: Scope) -> str | None:
         policy = application.state.private_request_policy
     except AttributeError:
         return None
-    if not isinstance(policy, PrivateRequestPolicy):
+    if not isinstance(policy, PrivateRequestPolicy) or not isinstance(policy.additional_policies, tuple):
         return "/private"
-    try:
-        private = policy.classifier(scope["path"])
-    except Exception:
-        return policy.audit_path
-    if type(private) is not bool:
-        return policy.audit_path
-    return policy.audit_path if private else None
+    for candidate in (policy, *policy.additional_policies):
+        if not isinstance(candidate, PrivateRequestPolicy):
+            return "/private"
+        try:
+            private = candidate.classifier(scope["path"])
+        except Exception:  # noqa: BLE001 - classifier failures must fail closed.
+            return candidate.audit_path
+        if type(private) is not bool or private:
+            return candidate.audit_path
+    return None
 
 
 @contextmanager

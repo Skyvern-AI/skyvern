@@ -36,6 +36,7 @@ from mcp.types import (
     TextContent,
 )
 from playwright.async_api import Browser, BrowserContext, Page
+from pydantic import ValidationError
 
 from skyvern.cli.core.client import reset_api_key_override, set_api_key_override
 from skyvern.cli.core.result import ErrorCode
@@ -52,6 +53,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     stash_blocker_signal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.context import USER_FACING_REASON_PARAM
 from skyvern.forge.sdk.copilot.enforcement import requested_output_paths_for_derivation
 from skyvern.forge.sdk.copilot.hooks import _copilot_log_fields
@@ -73,8 +75,10 @@ from skyvern.forge.sdk.copilot.runtime import (
     RunSecretsNotRegistered,
     bound_call_browser_session,
     browser_evidence_commit_lock,
+    browser_session_acquisition_failure_sentence,
     browser_session_recovery,
     browser_session_turn,
+    carries_browser_session_acquisition_failure,
     close_browser_session_quietly,
     current_call_browser_session_override,
     current_demonstrated_action,
@@ -175,6 +179,7 @@ class _BrowserCallOutcome:
     # Carried beside the disposition because the projection is the only thing the primary browser
     # tools return, and it has no context to read the cause from.
     session_loss_deadline_expired: bool = False
+    session_loss_acquisition_failure: BuildTestConnectFailure | None = None
     replacement_browser_session_id: str | None = None
     completion_browser_session_id: str | None = None
     completion_browser_session_generation: int | None = None
@@ -616,6 +621,7 @@ def _not_dispatched_browser_call_outcome(
         ),
         session_loss_disposition=session_loss_disposition,
         session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
+        session_loss_acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
         replacement_browser_session_id=(
             ctx.browser_session_id if session_loss_disposition == "reestablished" else None
         ),
@@ -729,6 +735,7 @@ def _project_browser_call_outcome(
             result,
             disposition=outcome.session_loss_disposition,
             deadline_expired=outcome.session_loss_deadline_expired,
+            acquisition_failure=outcome.session_loss_acquisition_failure,
         )
     # A cancelled or timed-out call projects no continuity block of its own, and that is the shape
     # the other browser matters most on, so the carrier is made rather than skipped.
@@ -840,13 +847,12 @@ _EFFECT_UNKNOWN_GUIDANCE = "The call timed out before its result was confirmed; 
 _BROWSER_GENERATION_RETIRED_ERROR_CODE = "BROWSER_GENERATION_RETIRED"
 BROWSER_SESSION_LOSS_ERROR_CODES = frozenset({_SESSION_EXPIRED_ERROR_CODE, _BROWSER_GENERATION_RETIRED_ERROR_CODE})
 _CONTINUITY_COORDINATION_TTL = timedelta(minutes=45)
-_SESSION_LOST_USER_FACING_REASON = (
-    "The browser session was lost, and I couldn't re-establish it. Please retry this turn."
+_SESSION_LOST_FACT = "The browser session was lost, and I couldn't re-establish it."
+_SESSION_DEADLINE_EXPIRED_FACT = (
+    "The browser session reached the time limit fixed for it and was ended, and I couldn't re-establish it."
 )
-_SESSION_DEADLINE_EXPIRED_USER_FACING_REASON = (
-    "The browser session reached the time limit fixed for it and was ended, and I couldn't "
-    "re-establish it. Please retry this turn."
-)
+_SESSION_LOST_USER_FACING_REASON = f"{_SESSION_LOST_FACT} Please retry this turn."
+_SESSION_DEADLINE_EXPIRED_USER_FACING_REASON = f"{_SESSION_DEADLINE_EXPIRED_FACT} Please retry this turn."
 _FALLBACK_LOGGER = logging.getLogger(__name__)
 
 
@@ -865,6 +871,24 @@ class _BrowserSessionContinuityOutcome:
     replacement_session_id: str | None
     # The session reached the deadline its infrastructure fixes rather than failing unexplained.
     deadline_expired: bool = False
+    acquisition_failure: BuildTestConnectFailure | None = None
+
+
+def _validated_acquisition_failure(payload: object) -> BuildTestConnectFailure | None:
+    # The shared cache can hold an outcome an older deploy wrote.
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return BuildTestConnectFailure.model_validate(payload)
+    except ValidationError:
+        return None
+
+
+def _session_loss_reason(*, deadline_expired: bool, acquisition_failure: BuildTestConnectFailure | None) -> str:
+    if acquisition_failure is None:
+        return _SESSION_DEADLINE_EXPIRED_USER_FACING_REASON if deadline_expired else _SESSION_LOST_USER_FACING_REASON
+    loss_fact = _SESSION_DEADLINE_EXPIRED_FACT if deadline_expired else _SESSION_LOST_FACT
+    return f"{loss_fact} {browser_session_acquisition_failure_sentence(acquisition_failure)}"
 
 
 @dataclass
@@ -945,6 +969,7 @@ def _decode_continuity_outcome(raw: object) -> _BrowserSessionContinuityOutcome 
         disposition=disposition,
         replacement_session_id=replacement,
         deadline_expired=data.get("deadline_expired") is True,
+        acquisition_failure=_validated_acquisition_failure(data.get("acquisition_failure")),
     )
 
 
@@ -980,6 +1005,11 @@ async def _store_continuity_outcome(organization_id: str, outcome: _BrowserSessi
                 "disposition": outcome.disposition,
                 "replacement_session_id": outcome.replacement_session_id,
                 "deadline_expired": outcome.deadline_expired,
+                "acquisition_failure": (
+                    None
+                    if outcome.acquisition_failure is None
+                    else outcome.acquisition_failure.model_dump(mode="json", exclude_none=True)
+                ),
             }
         ),
         ex=_CONTINUITY_COORDINATION_TTL,
@@ -1290,6 +1320,7 @@ def _browser_session_loss_result(
     *,
     disposition: _BrowserSessionLossDisposition,
     deadline_expired: bool = False,
+    acquisition_failure: BuildTestConnectFailure | None = None,
 ) -> dict[str, Any]:
     data = result.get("data")
     continuity = {
@@ -1329,7 +1360,11 @@ def _browser_session_loss_result(
             "Continue from the evidence the run already returned, or run the blocks again."
         )
     else:
-        error = _SESSION_DEADLINE_EXPIRED_USER_FACING_REASON if deadline_expired else _SESSION_LOST_USER_FACING_REASON
+        error = _session_loss_reason(deadline_expired=deadline_expired, acquisition_failure=acquisition_failure)
+        if acquisition_failure is not None:
+            result_data["browser_session_acquisition_failure"] = acquisition_failure.model_dump(
+                mode="json", exclude_none=True
+            )
     return {
         **result,
         "ok": False,
@@ -1349,7 +1384,16 @@ def _browser_session_loss_blocker_signal(
     call_path: Literal["model", "internal"],
     lost_session_id: str,
     deadline_expired: bool = False,
+    acquisition_failure: BuildTestConnectFailure | None = None,
 ) -> CopilotToolBlockerSignal:
+    extra: dict[str, Any] = {
+        "call_path": call_path,
+        "continuity_source": "direct_mcp",
+        "continuity_disposition": "failed",
+        "lost_browser_session_id": lost_session_id,
+    }
+    if acquisition_failure is not None:
+        extra["browser_session_acquisition_failure"] = acquisition_failure.model_dump(mode="json", exclude_none=True)
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text=(
@@ -1359,20 +1403,15 @@ def _browser_session_loss_blocker_signal(
             else "The browser session was confirmed lost and one replacement attempt failed. "
             "End the turn from the recorded session-loss evidence."
         ),
-        user_facing_reason=(
-            _SESSION_DEADLINE_EXPIRED_USER_FACING_REASON if deadline_expired else _SESSION_LOST_USER_FACING_REASON
+        user_facing_reason=_session_loss_reason(
+            deadline_expired=deadline_expired, acquisition_failure=acquisition_failure
         ),
         recovery_hint="report_blocker_to_user",
         preserves_workflow_draft=True,
         renders_final_reply=True,
         internal_reason_code=BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
         blocked_tool=tool_name,
-        extra={
-            "call_path": call_path,
-            "continuity_source": "direct_mcp",
-            "continuity_disposition": "failed",
-            "lost_browser_session_id": lost_session_id,
-        },
+        extra=extra,
     )
 
 
@@ -1476,6 +1515,11 @@ async def _handle_browser_session_loss_under_context_lock(
             except Exception:
                 recovery_error = {"ok": False, "error": "Failed to create browser session"}
             replacement_session_id = ctx.browser_session_id if recovery_error is None else None
+            acquisition_failure: BuildTestConnectFailure | None = None
+            if recovery_error is not None and carries_browser_session_acquisition_failure(recovery_error):
+                acquisition_failure = _validated_acquisition_failure(
+                    recovery_error["data"]["browser_session_acquisition_failure"]
+                )
             if recovery_error is not None and ctx.browser_session_id is not None:
                 await close_browser_session_quietly(ctx.organization_id, ctx.browser_session_id)
                 await retire_browser_session_id(ctx, ctx.browser_session_id)
@@ -1485,6 +1529,7 @@ async def _handle_browser_session_loss_under_context_lock(
                 disposition="reestablished" if replacement_session_id is not None else "failed",
                 replacement_session_id=replacement_session_id,
                 deadline_expired=deadline_expired,
+                acquisition_failure=acquisition_failure,
             )
 
         await _store_continuity_outcome(ctx.organization_id, outcome)
@@ -1579,6 +1624,7 @@ async def _apply_continuity_outcome(
         ctx.browser_session_continuity_generation = getattr(ctx, "browser_session_continuity_generation", 0) + 1
         ctx.browser_session_continuity_disposition = outcome.disposition
         ctx.browser_session_continuity_deadline_expired = outcome.deadline_expired
+        ctx.browser_session_continuity_acquisition_failure = outcome.acquisition_failure
         if outcome.disposition == "failed":
             stash_blocker_signal(
                 ctx,
@@ -1587,6 +1633,7 @@ async def _apply_continuity_outcome(
                     call_path=call_path,
                     lost_session_id=outcome.lost_session_id,
                     deadline_expired=outcome.deadline_expired,
+                    acquisition_failure=outcome.acquisition_failure,
                 ),
             )
 
@@ -1620,6 +1667,7 @@ async def _prepare_browser_session_for_dispatch(
                     {},
                     disposition=disposition,
                     deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
                 ),
                 disposition,
             )
@@ -1638,6 +1686,7 @@ async def _prepare_browser_session_for_dispatch(
                         {},
                         disposition=recorded.disposition,
                         deadline_expired=recorded.deadline_expired,
+                        acquisition_failure=recorded.acquisition_failure,
                     ),
                     recorded.disposition,
                 )
@@ -1865,6 +1914,9 @@ class SkyvernOverlayMCPServer(MCPServer):
     @property
     def name(self) -> str:
         return "skyvern"
+
+    def requires_browser(self, tool_name: str) -> bool:
+        return self._overlays.get(tool_name, SchemaOverlay()).requires_browser
 
     async def connect(self) -> None:
         with _reporting_lifecycle_failure("connect"):
@@ -2335,6 +2387,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         browser_outcome.with_raw_result(raw_mcp),
                         session_loss_disposition=disposition,
                         session_loss_deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                        session_loss_acquisition_failure=copilot_ctx.browser_session_continuity_acquisition_failure,
                         replacement_browser_session_id=(
                             copilot_ctx.browser_session_id if disposition == "reestablished" else None
                         ),
@@ -2344,6 +2397,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         mcp_to_copilot(raw_mcp),
                         disposition=disposition,
                         deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=copilot_ctx.browser_session_continuity_acquisition_failure,
                     )
 
             if browser_outcome is not None:
@@ -2589,6 +2643,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     outcome,
                     session_loss_disposition=disposition,
                     session_loss_deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                    session_loss_acquisition_failure=copilot_ctx.browser_session_continuity_acquisition_failure,
                     replacement_browser_session_id=(
                         copilot_ctx.browser_session_id if disposition == "reestablished" else None
                     ),
@@ -2607,6 +2662,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         {},
                         disposition=disposition,
                         deadline_expired=copilot_ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=copilot_ctx.browser_session_continuity_acquisition_failure,
                     ),
                 )
             await _stamp_page_state(err, probe=False)
@@ -2908,6 +2964,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     outcome,
                     session_loss_disposition=disposition,
                     session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    session_loss_acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
                     replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
                     completion_browser_session_id=ctx.browser_session_id,
                     completion_browser_session_generation=ctx.browser_session_continuity_generation,
@@ -2925,6 +2982,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                         {},
                         disposition=disposition,
                         deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                        acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
                     ),
                 )
             )
@@ -3001,6 +3059,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     browser_outcome.with_raw_result(scrubbed),
                     session_loss_disposition=disposition,
                     session_loss_deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    session_loss_acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
                     replacement_browser_session_id=ctx.browser_session_id if disposition == "reestablished" else None,
                 )
                 browser_outcome = replace(
@@ -3018,6 +3077,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                     mcp_to_copilot(scrubbed),
                     disposition=disposition,
                     deadline_expired=ctx.browser_session_continuity_deadline_expired,
+                    acquisition_failure=ctx.browser_session_continuity_acquisition_failure,
                 )
             )
         if browser_outcome is not None:

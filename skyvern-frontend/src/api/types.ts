@@ -997,7 +997,6 @@ export const TaskRunType = {
   OpenaiCua: "openai_cua",
   AnthropicCua: "anthropic_cua",
   UiTars: "ui_tars",
-  YutoriNavigator: "yutori_navigator",
 } as const;
 
 export type TaskRunType = (typeof TaskRunType)[keyof typeof TaskRunType];
@@ -1137,6 +1136,7 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  created_at?: string | null;
   // On the base Action, so it survives the timeline's `list[Action]` serialization. Subclass-only
   // fields (url, keys) do not and must not be declared here.
   file_name?: string | null;
@@ -1379,7 +1379,6 @@ export const RunEngine = {
   SkyvernV3: "skyvern-3.0",
   OpenaiCua: "openai-cua",
   AnthropicCua: "anthropic-cua",
-  YutoriNavigator: "yutori-navigator",
 } as const;
 
 export type RunEngine = (typeof RunEngine)[keyof typeof RunEngine];

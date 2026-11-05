@@ -311,12 +311,20 @@ export interface WorkflowCopilotChatHistoryMessage {
   narrative_payload?: Record<string, unknown> | null;
 }
 
+export interface CopilotInFlightTurn {
+  turn_id: string;
+  cancel_token?: string | null;
+  latest_draft?: WorkflowApiResponse | null;
+  latest_draft_at?: string | null;
+}
+
 export interface WorkflowCopilotChatHistoryResponse {
   pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
   request_turn_id?: string | null;
+  in_flight_turn?: CopilotInFlightTurn | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   accepted_turn_ids?: string[];
   proposed_workflow?: WorkflowApiResponse | null;
@@ -560,7 +568,9 @@ export interface WorkflowCopilotDemonstrationActionUpdate {
     | "drag"
     | "navigate_browser"
     | "upload_attached_file"
-    | "fill_credential_field";
+    | "fill_credential_field"
+    | "note"
+    | "skyvern_tab_switch";
   // Present only on an upload the recorder attached; a skipped file request has none.
   file_id?: string;
   filename?: string;
@@ -600,8 +610,15 @@ export interface WorkflowCopilotDemonstrationStoppedUpdate {
 
 export interface WorkflowCopilotDemonstrationControlRequest {
   demonstration_id: string;
-  action: "navigate" | "fill_credential" | "upload_file" | "stop" | "cancel";
+  action:
+    | "navigate"
+    | "fill_credential"
+    | "upload_file"
+    | "note"
+    | "stop"
+    | "cancel";
   url?: string | null;
+  text?: string | null;
   selector?: string | null;
   credential_id?: string | null;
   field?: "password" | "totp" | null;
@@ -674,6 +691,9 @@ export interface WorkflowCopilotToolCallUpdate {
   iteration: number;
   tool_call_id: string;
   timestamp?: string | null;
+  // The browser this call resolved to when it was emitted; null for calls that
+  // act in no page. Not persisted, so a reloaded chat never sees it.
+  browser_session_id?: string | null;
 }
 
 // One changed code block's line delta. `patch` is absent when the server dropped

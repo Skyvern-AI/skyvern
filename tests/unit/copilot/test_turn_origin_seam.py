@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from structlog.testing import capture_logs
 
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ensure_browser_session,
@@ -70,7 +71,9 @@ async def test_ensure_browser_session_self_heal_requires_injected_state_no_auto_
         side_effect=AssertionError("get_browser_state must not run for code_block_ai_fallback")
     )
     mock_manager = SimpleNamespace(create_session=create_session, get_browser_state=get_browser_state)
-    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=mock_manager))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=mock_manager)
+    )
 
     ctx = _make_ctx(
         turn_origin=origin,
@@ -94,7 +97,9 @@ async def test_synthetic_session_unregisters_when_context_body_raises(
         browser_context=_FakeBrowserContext(),
         get_working_page=AsyncMock(return_value=MagicMock()),
     )
-    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=SimpleNamespace()))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=SimpleNamespace())
+    )
     monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
     monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *a, **kw: MagicMock())
     monkeypatch.setattr(runtime, "get_active_api_key", lambda: "sk-test-key")
@@ -138,7 +143,9 @@ async def test_self_heal_injected_state_assigns_synthetic_session_and_mcp_regist
             side_effect=AssertionError("persistent lookup must not run for code_block_ai_fallback")
         )
     )
-    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
     monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *a, **kw: MagicMock())
     monkeypatch.setattr(runtime, "get_active_api_key", lambda: "sk-test-key")
@@ -200,7 +207,9 @@ async def test_self_heal_mcp_session_preserves_adopted_working_page_when_not_las
         browser_context=fake_context,
         get_working_page=AsyncMock(return_value=pinned_page),
     )
-    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=SimpleNamespace()))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=SimpleNamespace())
+    )
     monkeypatch.setattr(runtime, "get_skyvern", lambda: MagicMock())
     monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *a, **kw: MagicMock())
     monkeypatch.setattr(runtime, "get_active_api_key", lambda: "sk-test-key")
@@ -236,7 +245,9 @@ async def test_ensure_browser_session_prefix_guard_never_resolves_a_selfheal_id(
         create_session=AsyncMock(return_value=created),
         get_browser_state=AsyncMock(return_value=ready_state),
     )
-    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
 
     ctx = _make_ctx(turn_origin=TurnOrigin.interactive, browser_session_id="selfheal:wr_old")
@@ -258,7 +269,9 @@ async def test_ensure_browser_session_interactive_still_auto_creates(monkeypatch
         create_session=AsyncMock(return_value=created),
         get_browser_state=AsyncMock(return_value=ready_state),
     )
-    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
 
     ctx = _make_ctx(turn_origin=TurnOrigin.interactive, browser_session_id=None)
@@ -290,7 +303,9 @@ async def test_resolve_browser_state_for_context_skips_persistent_lookup_for_sel
     )
     persistent_lookup = AsyncMock(side_effect=AssertionError("persistent lookup must not run for self-heal paths"))
     manager = SimpleNamespace(get_browser_state=persistent_lookup)
-    monkeypatch.setattr(runtime, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
 
     ctx = _make_ctx(
         turn_origin=origin,

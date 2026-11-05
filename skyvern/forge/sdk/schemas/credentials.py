@@ -1,9 +1,9 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from fastapi import status
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge.sdk.credential_site_policy import LoginSite
@@ -220,6 +220,17 @@ class SecretCredential(BaseModel):
     secret_label: str | None = Field(default=None, description="Optional label describing the secret")
 
 
+class VaultPasskey(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    rp_id: str
+    credential_id: str
+    private_key: SecretStr = Field(repr=False, exclude=True)
+    user_handle: str | None
+    counter: int
+    discoverable: bool
+
+
 class CredentialItem(BaseModel):
     """Model representing a credential item in the system."""
 
@@ -235,6 +246,12 @@ class CredentialItem(BaseModel):
     )
     # Set only by a vault whose items scope each site by match mode; a fill or release must then match one.
     login_sites: list[LoginSite] | None = Field(default=None, exclude=True)
+    passkeys: list[VaultPasskey] = Field(default_factory=list, exclude=True, repr=False)
+
+    def __getstate__(self) -> dict[Any, Any]:
+        state = super().__getstate__()
+        state["__dict__"] = {**state["__dict__"], "passkeys": []}
+        return state
 
 
 class CreateCredentialRequest(BaseModel):

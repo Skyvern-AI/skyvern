@@ -2,34 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, AsyncGenerator
-
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
-from skyvern.forge.sdk.db.models import Base
 from skyvern.forge.sdk.workflow.models.workflow import (
     MIXED_RUN_DEFINITION_DIGEST,
     WorkflowRunStatus,
     workflow_definition_sha256,
 )
-
-
-@pytest_asyncio.fixture
-async def db_engine() -> AsyncGenerator[Any]:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield engine
-    await engine.dispose()
-
-
-@pytest_asyncio.fixture
-async def agent_db(db_engine: Any) -> AsyncGenerator[AgentDB]:
-    yield AgentDB(database_string="sqlite+aiosqlite:///:memory:", debug_enabled=True, db_engine=db_engine)
 
 
 @pytest_asyncio.fixture

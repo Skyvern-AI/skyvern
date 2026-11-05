@@ -27,6 +27,12 @@ from skyvern.forge import app
 # share one exact-match sensitive-key policy.
 from skyvern.forge.log_redaction import redact_sensitive_fields
 from skyvern.forge.sdk.artifact.models import ArtifactType, LogEntityType
+from skyvern.forge.sdk.copilot.browser_target import (
+    BROWSER_TARGET_PARAM_NAME,
+    DEBUG_BROWSER_TOOL_NAMES,
+    resolve_browser_session_binding,
+    tool_accepts_target,
+)
 from skyvern.forge.sdk.copilot.code_write_diff import CODE_WRITE_TOOL_NAMES, CodeWriteDiff
 from skyvern.forge.sdk.copilot.context import (
     REPLY_TOOL_NAME,
@@ -77,6 +83,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotToolResultUpdate,
     WorkflowCopilotTurnStartUpdate,
     WorkflowCopilotWorkflowDraftUpdate,
+    client_visible_proposed_workflow,
 )
 
 if TYPE_CHECKING:
@@ -90,6 +97,8 @@ LOG = structlog.get_logger()
 # One budget for a whole batch: the save runs inside the stream consumer, so slow storage would
 # otherwise hold back every later frame.
 _CHAT_SCREENSHOT_SAVE_TIMEOUT_SECONDS = 5.0
+# The draft write waits on a chat-row lock that heartbeats also take; past this budget the draft is dropped.
+_PENDING_TURN_DRAFT_SAVE_TIMEOUT_SECONDS = 2.0
 
 _OBSERVATION_TOOLS = {
     "evaluate",
@@ -495,6 +504,7 @@ async def stream_to_sse(
                             iteration=iteration,
                             tool_call_id=call_id,
                             timestamp=presentation.started_at or tool_call_ts,
+                            browser_session_id=_call_browser_session_id(ctx, event.item, tool_name, tool_input),
                         )
                     )
 
@@ -1055,6 +1065,30 @@ def _update_enforcement_from_tool(
         ctx.observation_after_navigate = True
 
 
+def _call_browser_session_id(
+    ctx: CopilotContext, item: RunItem, tool_name: str, tool_input: dict[str, Any]
+) -> str | None:
+    """The page browser this call binds to as of now; dispatch resolves again, so this is display-only."""
+    server = ctx.discovery_mcp_server
+    if tool_name in DEBUG_BROWSER_TOOL_NAMES:
+        native = next(
+            (tool for tool in item.agent.tools if isinstance(tool, FunctionTool) and tool.name == tool_name), None
+        )
+        if native is None:
+            return None
+        arguments = (
+            {BROWSER_TARGET_PARAM_NAME: tool_input.get(BROWSER_TARGET_PARAM_NAME)}
+            if tool_accepts_target(native)
+            else {}
+        )
+    elif server is not None and server.requires_browser(tool_name):
+        arguments = tool_input
+    else:
+        return None
+    binding = resolve_browser_session_binding(ctx, arguments)
+    return None if binding.unavailable_reason else binding.session_id_for(ctx)
+
+
 def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
     # Drop the submitted workflow or block definition (displayed elsewhere), then redact sensitive fields.
     # Distinct from output_utils.sanitize_tool_result_for_llm, which shapes tool results for LLM context.
@@ -1139,14 +1173,29 @@ async def emit_workflow_draft(
             workflow_dump = workflow.model_dump(mode="json")
         except Exception as dump_err:
             LOG.warning("copilot_workflow_draft_serialization_failed", error=str(dump_err))
+    drafted_at = datetime.now(timezone.utc)
     await stream.send(
         WorkflowCopilotWorkflowDraftUpdate(
             block_count=block_count,
             block_labels=block_labels,
             summary=None,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=drafted_at,
             workflow=workflow_dump,
             code_diffs=[dict(diff) for diff in code_diffs] if code_diffs else None,
             tool_call_id=tool_call_id,
         )
     )
+    if workflow_dump is not None and ctx.workflow_copilot_chat_id:
+        draft = client_visible_proposed_workflow(workflow_dump)
+        # A lost draft only costs a reloaded editor its mid-turn canvas, so it must never fail the turn.
+        try:
+            async with asyncio.timeout(_PENDING_TURN_DRAFT_SAVE_TIMEOUT_SECONDS):
+                await app.DATABASE.workflow_params.record_pending_copilot_turn_draft(
+                    organization_id=ctx.organization_id,
+                    workflow_copilot_chat_id=ctx.workflow_copilot_chat_id,
+                    turn_id=ctx.turn_id,
+                    draft=draft,
+                    drafted_at=drafted_at,
+                )
+        except Exception:
+            LOG.warning("copilot_pending_turn_draft_save_failed", turn_id=ctx.turn_id, exc_info=True)

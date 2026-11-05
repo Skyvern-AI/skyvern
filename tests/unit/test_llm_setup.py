@@ -40,7 +40,7 @@ def test_setup_explicitly_configures_copilot_safety_model(
         env_path.parent.mkdir()
         env_path.write_text(f"WORKFLOW_COPILOT_LITE_LLM_KEY='{existing_model}'\n")
 
-    confirmations = iter([False, False, False, False, True, False, False])
+    confirmations = iter([False, False, False, False, True, False])
     monkeypatch.setattr(llm_setup.Confirm, "ask", lambda *_args, **_kwargs: next(confirmations))
     monkeypatch.setattr(llm_setup, "ask_secret", lambda *_args, **_kwargs: "test-gemini-key")
     monkeypatch.setattr(llm_setup, "capture_setup_event", MagicMock())
@@ -62,7 +62,6 @@ def test_setup_explicitly_configures_copilot_safety_model(
     assert values["LLM_KEY"] == "GEMINI_3.1_PRO"
     assert values["WORKFLOW_COPILOT_LITE_LLM_KEY"] == (selected_model or expected_default)
     assert values["GEMINI_API_KEY"] == "test-gemini-key"
-    assert values["ENABLE_YUTORI"] == "false"
     assert len(prompts) == 1
     assert prompts[0]["default"] == expected_default
     assert expected_default in prompts[0]["choices"]

@@ -231,3 +231,62 @@ class TestBlockCreationCountTracking:
             )
 
             assert result.blocks_failed > 0, "blocks_failed should be > 0 when block creation fails"
+
+    @pytest.mark.asyncio
+    async def test_a_block_that_has_not_executed_gets_no_script_block(self) -> None:
+        """A queued block with no task and no actions must not become a script_block row (SKY-8443)."""
+        from skyvern.core.script_generations.generate_script import generate_workflow_script_python_code
+
+        def task_block(label: str, task_id: str) -> dict:
+            return {
+                "block_type": "task",
+                "label": label,
+                "task_id": task_id,
+                "title": label,
+                "url": "https://example.com",
+                "navigation_goal": "Do something",
+                "workflow_run_block_id": f"wrb_{label}",
+            }
+
+        click = {
+            "action_type": "click",
+            "element_id": "e_123",
+            "xpath": "//button[@type='submit']",
+            "reasoning": "Click the button",
+            "skyvern_element_data": {
+                "id": "e_123",
+                "tag_name": "button",
+                "attributes": {"type": "submit"},
+                "text": "Submit",
+                "option_index": None,
+                "children": [],
+            },
+        }
+
+        with (
+            patch(
+                "skyvern.core.script_generations.generate_script.generate_workflow_parameters_schema",
+                new_callable=AsyncMock,
+                return_value=("", {}),
+            ),
+            patch(
+                "skyvern.core.script_generations.generate_script.create_or_update_script_block",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as create_block,
+        ):
+            result = await generate_workflow_script_python_code(
+                file_name="test.py",
+                workflow_run_request={"workflow_id": "wpid_test"},
+                workflow={"workflow_id": "wpid_test", "workflow_definition": {"parameters": []}},
+                blocks=[task_block("executed", "t_123"), task_block("queued", "")],
+                actions_by_task={"t_123": [click]},
+                script_id="script_123",
+                script_revision_id="rev_123",
+                organization_id="org_123",
+            )
+
+        created_labels = [call.kwargs["block_label"] for call in create_block.await_args_list]
+        assert "executed" in created_labels
+        assert "queued" not in created_labels
+        assert result.blocks_failed == 0

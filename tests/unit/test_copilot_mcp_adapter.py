@@ -41,7 +41,9 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
+from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -75,6 +77,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     DemonstratedAction,
     bound_call_browser_session,
     browser_session_lock,
+    effective_browser_session_id,
     mcp_to_copilot,
     staged_demonstrated_action,
 )
@@ -2445,6 +2448,63 @@ class TestBrowserSessionContinuity:
         assert ctx.blocker_signal.internal_reason_code == "tool_error_browser_session_lost"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failure", "facts"),
+        [
+            (
+                BuildTestConnectFailure(
+                    state="browser_start_capacity",
+                    starting_sessions=10,
+                    max_starting_sessions=10,
+                    retry_after_seconds=7,
+                ),
+                {
+                    "state": "browser_start_capacity",
+                    "starting_sessions": 10,
+                    "max_starting_sessions": 10,
+                    "retry_after_seconds": 7,
+                },
+            ),
+            (
+                BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None),
+                {"state": "billing_credit_admission_refusal"},
+            ),
+        ],
+    )
+    async def test_a_refused_replacement_start_reports_its_facts(
+        self, monkeypatch: pytest.MonkeyPatch, failure: BuildTestConnectFailure, facts: dict[str, Any]
+    ) -> None:
+        refusal = copilot_runtime._browser_session_acquisition_failure_result(failure)
+
+        async def _ensure(_ctx: AgentContext, **_kwargs: Any) -> dict[str, Any]:
+            return refusal
+
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
+        ctx = make_copilot_ctx(browser_session_id="pbs_lost")
+        sibling = make_copilot_ctx(browser_session_id="pbs_lost")
+
+        for loss_ctx in (ctx, sibling):
+            disposition = await _handle_browser_session_loss(
+                loss_ctx, tool_name="evaluate", call_path="model", lost_session_id="pbs_lost"
+            )
+
+            assert disposition == "failed"
+            assert loss_ctx.browser_session_id is None
+            signal = loss_ctx.blocker_signal
+            assert signal is not None
+            assert signal.internal_reason_code == "tool_error_browser_session_lost"
+            assert facts.items() <= signal.extra["browser_session_acquisition_failure"].items()
+            assert "Build test" not in signal.user_facing_reason
+            assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool=signal.blocked_tool)
+
+            _, loss_result, _ = await mcp_adapter._prepare_browser_session_for_dispatch(
+                loss_ctx, tool_name="evaluate", call_path="model", observed_generation=0
+            )
+            assert loss_result is not None
+            assert facts.items() <= loss_result["data"]["browser_session_acquisition_failure"].items()
+            assert "Please retry this turn" not in loss_result["error"]
+
+    @pytest.mark.asyncio
     async def test_session_lost_during_attach_reestablishes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         ctx = make_copilot_ctx(browser_session_id="pbs_lost")
 
@@ -2681,6 +2741,43 @@ def test_a_run_that_shared_the_chats_browser_binds_no_override() -> None:
 
     assert (binding.target, binding.session_id_override) == ("last_run", None)
     assert binding.unavailable_reason is None
+
+
+@pytest.mark.parametrize(
+    ("properties", "expected"),
+    [({}, "pbs_debug"), ({BROWSER_TARGET_PARAM_NAME: {"type": "string"}}, "pbs_run")],
+    ids=["target-less-tool-ignores-target", "target-bearing-tool-honors-target"],
+)
+@pytest.mark.asyncio
+async def test_a_native_page_state_tool_runs_on_the_target_only_when_its_schema_offers_one(
+    properties: dict[str, Any], expected: str
+) -> None:
+    ctx = make_copilot_ctx(
+        browser_session_id="pbs_debug",
+        last_run_blocks_browser_session_id="pbs_run",
+        last_run_blocks_workflow_run_id="wr_1",
+    )
+    ran_on: list[str | None] = []
+
+    async def act(tool_ctx: ToolContext[AgentContext], _arguments: str) -> str:
+        ran_on.append(effective_browser_session_id(tool_ctx.context))
+        return "{}"
+
+    tool = _with_page_state(
+        FunctionTool(
+            name="solve_page_challenge",
+            description="",
+            params_json_schema={"type": "object", "properties": properties},
+            on_invoke_tool=act,
+        )
+    )
+    arguments = json.dumps({BROWSER_TARGET_PARAM_NAME: "last_run"})
+
+    await tool.on_invoke_tool(
+        ToolContext(context=ctx, tool_name=tool.name, tool_call_id="call-1", tool_arguments=arguments), arguments
+    )
+
+    assert ran_on == [expected]
 
 
 def test_every_browser_overlay_offers_the_target_param() -> None:

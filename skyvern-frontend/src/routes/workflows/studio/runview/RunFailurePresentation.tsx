@@ -154,3 +154,33 @@ export function RunFailureLine({
     </div>
   );
 }
+
+// Neutral, not a failure banner: the run's status stays completed and is not retitled.
+export function ContinuedFailuresLine({
+  count,
+  firstLabel,
+  onJump,
+}: {
+  count: number;
+  firstLabel: string | null;
+  onJump: () => void;
+}) {
+  return (
+    <div
+      data-testid="run-continued-failures-line"
+      className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 text-xs text-muted-foreground"
+    >
+      <span>
+        Completed. {count} block {count === 1 ? "run" : "runs"} failed and the
+        run continued past {count === 1 ? "it" : "them"}.
+      </span>
+      <button
+        type="button"
+        onClick={onJump}
+        className="shrink-0 font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        {firstLabel ? `Show ${firstLabel}` : "Show the first failed block"}
+      </button>
+    </div>
+  );
+}

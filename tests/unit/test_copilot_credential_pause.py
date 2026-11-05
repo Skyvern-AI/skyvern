@@ -45,6 +45,8 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
 from skyvern.forge.sdk.copilot import credential_resolution
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
+from skyvern.forge.sdk.copilot import human_input_wait as human_input_wait_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _finalize_result_with_blocker_override,
@@ -73,6 +75,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseResolution,
     _decode_active_pause,
     _encode_active_pause,
+    _encode_record,
     await_pending_credential_pause,
     claim_credential_generation,
     credential_pause_active_key,
@@ -98,7 +101,11 @@ from skyvern.forge.sdk.copilot.enforcement import (
     run_with_enforcement,
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait, pause_human_input
+from skyvern.forge.sdk.copilot.human_input_wait import (
+    CHARGED_WAIT_BACKSTOP_GRACE_SECONDS,
+    HumanInputWait,
+    pause_human_input,
+)
 from skyvern.forge.sdk.copilot.narration import NarratorState, build_tool_call_activity
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_BINDING_FACTS,
@@ -142,6 +149,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import wire_credential_vault
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import ScopedTime
 from tests.unit.test_copilot_make_agent_result_backfill import _payload as _backfill_payload
 
 
@@ -1052,16 +1060,22 @@ def test_elapsed_run_seconds_subtracts_pause_time() -> None:
 
 @pytest.mark.asyncio
 async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fails on old code: a slow pause would consume the real timeout budget.
+    """Fails on old code: a slow pause would consume the turn's timeout budget.
 
-    Four values must stay ordered: non-pause work < TOTAL_TIMEOUT_SECONDS < pause <
-    credential_pause_timeout_seconds. Non-pause work was measured at ~2s on a cold CI shard
-    (whichever test imports the agent SDK first pays for it), so a sub-second budget only
-    ever passed on a warm runner. The pause must still exceed the budget or the assertion
-    proves nothing, and must stay under the pause timeout or it resolves as a timeout
-    instead of a response.
+    The turn clock is fake, so non-pause work costs nothing and the three values that must stay ordered are exact:
+    TOTAL_TIMEOUT_SECONDS < pause < credential_pause_timeout_seconds.
     """
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 4.0)
+    turn_time = ScopedTime()
+    turn_time.now = 1000.0
+    for module in (enforcement_module, human_input_wait_module, credential_pause_module):
+        monkeypatch.setattr(module, "time", turn_time)
+
+    async def advance_turn_clock(seconds: float) -> None:
+        turn_time.now += seconds
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(credential_pause_module, "asyncio", ScopedAsyncio(sleep=advance_turn_clock))
 
     ctx = make_copilot_context()
     ctx.organization_id = "org-1"
@@ -1076,7 +1090,12 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
     monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.5)
 
     async def _populate_after_first_poll() -> None:
-        await asyncio.sleep(4.5)
+        for _ in range(100_000):
+            if turn_time.now >= 1004.5:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("the pause never advanced the turn clock")
         cache.store[credential_response_cache_key("org-1", "chat-1", "turn-credit")] = encode_credential_response(
             "skip", None, "tok-1"
         )
@@ -2000,6 +2019,7 @@ async def test_a_settled_card_leaves_the_models_next_ask_free_to_open_a_fresh_ca
     assert ctx.credential_pause_outcome == "connected"
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("first_card", "credited"), [("unanswered", False), ("start_sign_in", True)], ids=["nobody_there", "signing_in"]
@@ -2015,17 +2035,30 @@ async def test_an_unanswered_card_returns_past_the_deadline_and_counts_against_t
     _stub_credential_lookup(monkeypatch, _make_credential())
     ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [(first_card, None), ("connected", "cred_1")]))
 
-    # The turn's backstop is shorter than the card's wait.
-    async with asyncio.timeout(0.3) as deadline:
+    # Far past the fake-clock card, so it only fires on a real hang, and short of the grace a spent wait reschedules it
+    # to (so the pause still takes the one-shot grace path). The test reads the backstop itself: it must be suspended
+    # while the card waits and pushed out to the grace once the wait ends.
+    suspended_while_waiting: list[float | None] = []
+    card_clock_sleep = credential_pause_module.asyncio.sleep
+
+    async def watch_the_backstop(seconds: float) -> None:
+        suspended_while_waiting.append(deadline.when())
+        await card_clock_sleep(seconds)
+
+    monkeypatch.setattr(credential_pause_module, "asyncio", ScopedAsyncio(sleep=watch_the_backstop))
+    async with asyncio.timeout(10) as deadline:
+        original_backstop = deadline.when()
+        assert original_backstop is not None
         ctx.model_stream_deadline = deadline
         first = await _call_ask_tool(ctx)
         credited_after_first = ctx.copilot_credential_pause_seconds
-        backstop_after_first = deadline.when() or 0.0
-        backstop_still_ahead = backstop_after_first > asyncio.get_running_loop().time()
+        backstop_after_first = deadline.when()
         second = await _call_ask_tool(ctx)
 
     assert (first["status"], first["outcome"]) == ("unanswered", "timeout")
-    assert backstop_still_ahead
+    assert suspended_while_waiting and set(suspended_while_waiting) == {None}
+    assert backstop_after_first is not None
+    assert backstop_after_first >= original_backstop + (CHARGED_WAIT_BACKSTOP_GRACE_SECONDS - 10)
     # The backstop's grace is one-shot: a later card in a spent turn no longer pushes it out.
     assert deadline.when() == backstop_after_first
     assert (credited_after_first > 0.0) is credited
@@ -4470,16 +4503,27 @@ async def test_registration_card_reopened_after_its_deadline_passed_mid_save_is_
 ) -> None:
     cache = _FakeCache()
     monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
-    _seed_registration_pause(cache, expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=50))
+    _seed_registration_pause(cache)
     _registration_database(monkeypatch, _make_credential())
-    vault = _RegistrationVault(
-        _make_credential(), reject=failure == "rejected", fail=failure == "vault_error", delay=0.1
-    )
+    vault = _RegistrationVault(_make_credential(), reject=failure == "rejected", fail=failure == "vault_error")
     vault.install(monkeypatch)
+    active_key = credential_pause_active_key("org-1", "chat-1", "turn-1")
+    prepare = vault.prepare
+
+    async def prepare_once_the_deadline_has_passed(
+        organization_id: str, data: CreateCredentialRequest
+    ) -> _RegistrationVault:
+        record = _decode_active_pause(cache.store[active_key])
+        assert record is not None and record.status == "resolving"
+        lapsed = replace(record, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        cache.store[active_key] = _encode_record(lapsed)
+        return await prepare(organization_id, data)
+
+    monkeypatch.setattr(copilot_routes, "prepare_credential_create", prepare_once_the_deadline_has_passed)
 
     result = await _generate()
 
-    record = _decode_active_pause(cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")])
+    record = _decode_active_pause(cache.store[active_key])
     assert record is not None and record.status == "pending"
     assert result.expires_at == record.expires_at
     assert record.expires_at > datetime.now(timezone.utc) + timedelta(
@@ -4567,6 +4611,7 @@ async def test_registration_password_quoted_by_a_vault_error_is_scrubbed_from_re
     assert password not in rendered
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("answer", ["skip", "timeout"])
 async def test_registration_card_reopened_after_an_unconfirmed_save_reports_it_when_skipped_or_unanswered(
@@ -4609,6 +4654,7 @@ async def test_registration_card_reopened_after_an_unconfirmed_save_reports_it_w
     assert vault.passwords[0] not in json.dumps(result)
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 async def test_registration_card_that_ran_out_mid_create_reports_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _FakeCache()

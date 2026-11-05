@@ -12,11 +12,16 @@ import pytest
 from fastapi import HTTPException
 
 from skyvern.exceptions import (
+    ActionDeadlineExceeded,
     ConcurrencyLimitExceeded,
+    FailedToTakeScreenshot,
     MissingBrowserStatePage,
+    MissingElement,
     ScrapingFailed,
+    ScreenshotPageHasNoDrawnArea,
     ScreenshotTargetClosed,
     SkyvernActionFailed,
+    SkyvernHTTPException,
     TaskTerminationError,
 )
 from skyvern.forge import app as forge_app
@@ -321,18 +326,38 @@ async def test_handler_returns_400_when_action_raises_scraping_failed(
 
 
 @pytest.mark.asyncio
-async def test_handler_returns_422_when_browser_target_closed(
-    mock_request: Any, mock_organization: Any, mock_app: Any
+@pytest.mark.parametrize(
+    ("error", "expected_detail_fragment"),
+    [
+        (
+            ScreenshotTargetClosed(error_message="Page.screenshot: Target page, context or browser has been closed"),
+            "was closed before the action could complete",
+        ),
+        (
+            ScreenshotPageHasNoDrawnArea(
+                error_message="Page.screenshot: Protocol error (Page.captureScreenshot): Cannot take screenshot with 0 width."
+            ),
+            "no drawn area to capture",
+        ),
+        (MissingElement(selector="//div[1]", element_id="CATO"), "not found on the page"),
+        (ActionDeadlineExceeded("The browser did not answer within 5000 ms"), "before the action's deadline"),
+    ],
+    ids=["closed-target", "zero-width-screenshot", "missing-element", "action-deadline"],
+)
+async def test_page_and_action_failures_answer_422(
+    mock_request: Any, mock_organization: Any, mock_app: Any, error: Exception, expected_detail_fragment: str
 ) -> None:
+    """The page or the requested action caused each of these, not the server, so none may reach the
+    catch-all and surface as a 500. The closed-target case also pins the clause ordering: it
+    subclasses FailedToTakeScreenshot, so it must keep its own message rather than the generic one.
+    """
     with (
         patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
         patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
         patch(
             "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
             new_callable=AsyncMock,
-            side_effect=ScreenshotTargetClosed(
-                error_message="Page.screenshot: Target page, context or browser has been closed"
-            ),
+            side_effect=error,
         ),
     ):
         mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
@@ -340,7 +365,8 @@ async def test_handler_returns_422_when_browser_target_closed(
             await run_sdk_action(mock_request, organization=mock_organization)
 
     assert exc_info.value.status_code == 422
-    mock_app.DATABASE.tasks.update_task.assert_awaited()
+    assert expected_detail_fragment in str(exc_info.value.detail)
+    assert mock_app.DATABASE.tasks.update_task.await_args.kwargs["status"] == TaskStatus.failed
 
 
 @pytest.mark.asyncio
@@ -367,18 +393,32 @@ async def test_handler_returns_422_when_browser_state_page_is_missing(
 
 
 @pytest.mark.asyncio
-async def test_handler_propagates_unknown_exception(mock_request: Any, mock_organization: Any, mock_app: Any) -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("db connection pool exhausted"),
+        FailedToTakeScreenshot(error_message="Page.screenshot: Target crashed"),
+    ],
+    ids=["unknown-error", "renderer-crash"],
+)
+async def test_handler_propagates_server_side_failures(
+    mock_request: Any, mock_organization: Any, mock_app: Any, error: Exception
+) -> None:
+    """Only the page's own conditions earn a 422. A renderer crash also arrives as
+    FailedToTakeScreenshot, so the 422 branch must be the narrower subclass — downgrading a crash
+    would hide the 5xx that callers and monitors rely on.
+    """
     with (
         patch("skyvern.forge.sdk.routes.sdk.app", mock_app),
         patch("skyvern.forge.sdk.routes.sdk.skyvern_context") as mock_ctx,
         patch(
             "skyvern.core.script_generations.script_skyvern_page.ScriptSkyvernPage.create_scraped_page",
             new_callable=AsyncMock,
-            side_effect=RuntimeError("db connection pool exhausted"),
+            side_effect=error,
         ),
     ):
         mock_ctx.ensure_context.return_value = MagicMock(request_id="req_test", tz_info=None, prompt=None)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(type(error)):
             await run_sdk_action(mock_request, organization=mock_organization)
 
     mock_app.DATABASE.tasks.update_task.assert_awaited()
@@ -851,3 +891,16 @@ async def test_credit_refusal_creates_no_task(mock_request: Any, mock_organizati
 
     assert exc_info.value.status_code == 402
     mock_app.DATABASE.tasks.create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_context_authorization_failure_marks_inline_task_failed(
+    mock_request: Any, mock_organization: Any, mock_app: Any
+) -> None:
+    mock_app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context = AsyncMock(
+        side_effect=SkyvernHTTPException("Credential not accessible", status_code=403)
+    )
+    with patch("skyvern.forge.sdk.routes.sdk.app", mock_app):
+        with pytest.raises(SkyvernHTTPException):
+            await run_sdk_action(mock_request, organization=mock_organization)
+    assert mock_app.DATABASE.tasks.update_task.await_args.kwargs["status"] == TaskStatus.failed

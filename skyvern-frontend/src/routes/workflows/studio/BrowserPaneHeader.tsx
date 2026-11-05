@@ -43,6 +43,7 @@ import { cn } from "@/util/utils";
 
 import { PANE_HEADER_ICON_BUTTON_CLASS } from "./constants";
 import { browserIsLive } from "./browserLiveStatus";
+import { runStartupPlaceholder } from "./browserPaneView";
 import { ControlTooltip } from "./ControlTooltip";
 import { useBrowserPaneView } from "./useBrowserPaneView";
 import { useStudioPaneCompact } from "./StudioShellContext";
@@ -53,6 +54,8 @@ const MENU_ITEM_CLASS =
 
 const FINISHED_RUN_BROWSER_LABEL =
   "This run has finished — shows the agent's debug browser, not the run";
+const FINISHED_RUN_OWN_BROWSER_LABEL =
+  "This run has finished — shows its browser, still open while Copilot works in it";
 
 // Status, not a switch: with no run open there is nothing to toggle to, but
 // the user still needs to know whether the browser they see is up yet.
@@ -60,10 +63,14 @@ function BrowserLiveStatus({
   state,
   stoppedHint,
   stoppedLabel = "Browser stopped",
+  startingLabel = "Starting browser…",
+  startingPending = true,
 }: {
   state: "starting" | "live" | "stopped";
   stoppedHint?: string;
   stoppedLabel?: string;
+  startingLabel?: string;
+  startingPending?: boolean;
 }) {
   return (
     <span
@@ -72,7 +79,7 @@ function BrowserLiveStatus({
       title={state === "stopped" ? stoppedHint : undefined}
       className="inline-flex h-7 shrink-0 items-center gap-1.5 px-1.5 text-xs font-medium text-muted-foreground"
     >
-      {state === "starting" ? (
+      {state === "starting" && startingPending ? (
         <ReloadIcon aria-hidden className="h-3 w-3 motion-safe:animate-spin" />
       ) : (
         <span
@@ -81,12 +88,14 @@ function BrowserLiveStatus({
             "h-1.5 w-1.5 rounded-full",
             state === "live"
               ? "bg-success motion-safe:animate-pulse"
-              : "bg-muted-foreground/50",
+              : state === "starting"
+                ? "bg-success"
+                : "bg-muted-foreground/50",
           )}
         />
       )}
       {state === "starting"
-        ? "Starting browser…"
+        ? startingLabel
         : state === "live"
           ? "Live"
           : stoppedLabel}
@@ -108,6 +117,7 @@ export function BrowserPaneViewPills() {
     visuals,
     inspectingRun,
     liveSurface,
+    copilotBrowserFocused,
     debugBrowserSessionId,
     runId,
     recordingAvailable,
@@ -140,6 +150,12 @@ export function BrowserPaneViewPills() {
       const runStarting =
         visuals.provisioning ||
         (visuals.workflowRun != null && runIsRetryWaiting(visuals.workflowRun));
+      const startup =
+        visuals.provisioning &&
+        visuals.workflowRun &&
+        !runIsRetryWaiting(visuals.workflowRun)
+          ? runStartupPlaceholder(visuals.workflowRun)
+          : null;
       // Run status alone says Live while the stream is still connecting or
       // after it dropped; only the stream knows whether frames are painting.
       const runState = runStarting
@@ -161,6 +177,8 @@ export function BrowserPaneViewPills() {
           </span>
           <BrowserLiveStatus
             state={runState}
+            startingLabel={startup?.title}
+            startingPending={startup?.pending}
             stoppedHint={
               runBrowserExternal
                 ? EXTERNAL_BROWSER_DIAGNOSTIC.title
@@ -194,6 +212,18 @@ export function BrowserPaneViewPills() {
   // the run's own status. Once that run is over this view is the debug browser
   // — a surface the run left behind — so it has to say so.
   const finishedRun = visuals.finalized;
+  // Only Copilot's pin puts a finished run's own browser on the Live view.
+  const liveLabel =
+    liveSurface === "run"
+      ? finishedRun
+        ? "Run browser"
+        : "Live"
+      : finishedRun
+        ? "Debug browser"
+        : copilotBrowserFocused
+          ? "Copilot browser"
+          : "Live";
+  const showsDebugBrowserAfterRun = finishedRun && liveSurface === "debug";
 
   return (
     <>
@@ -219,10 +249,16 @@ export function BrowserPaneViewPills() {
             active={view === "live"}
             onClick={() => setView("live")}
             compact={compact}
-            label={finishedRun ? "Debug browser" : "Live"}
-            title={finishedRun ? FINISHED_RUN_BROWSER_LABEL : undefined}
+            label={liveLabel}
+            title={
+              showsDebugBrowserAfterRun
+                ? FINISHED_RUN_BROWSER_LABEL
+                : finishedRun && liveSurface === "run"
+                  ? FINISHED_RUN_OWN_BROWSER_LABEL
+                  : undefined
+            }
             icon={
-              finishedRun ? (
+              showsDebugBrowserAfterRun ? (
                 <GlobeIcon className="h-3 w-3" />
               ) : (
                 <span className="h-1.5 w-1.5 rounded-full bg-success motion-safe:animate-pulse" />

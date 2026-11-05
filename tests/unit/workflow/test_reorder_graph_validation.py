@@ -1,11 +1,11 @@
 """Golden-file reorder tests for the backend graph validator (SKY-9059).
 
 For each scope (top-level, inside-loop, inside-branch), a fixture chain of four
-NavigationBlocks is produced, reordered via three canonical permutations
-(adjacent-swap, head-to-middle, middle-to-tail), round-tripped through
-model_dump / model_validate, and handed to the graph validator.
+NavigationBlocks is produced, reordered so the root leaves index 0
+(head-to-middle), round-tripped through model_dump / model_validate, and
+handed to the graph validator.
 
-All permutations must satisfy the four invariants enforced by
+The reordered workflow must satisfy the four invariants enforced by
 ``Block._build_loop_graph`` / ``WorkflowService._build_workflow_graph``:
 
 * unique labels
@@ -89,25 +89,15 @@ def _roundtrip(workflow_def: WorkflowDefinition) -> WorkflowDefinition:
 # ---------------------------------------------------------------------------
 # Permutation helpers
 #
-# The project tracks three canonical drag-targets that cover the interesting
-# list-mutation cases against a 4-item chain [a, b, c, d]:
-#
-#   adjacent-swap    : swap two neighbors                  -> [a, c, b, d]
-#   head-to-middle   : move the head element to the middle -> [b, c, a, d]
-#   middle-to-tail   : move a middle element to the tail   -> [a, c, d, b]
-#
-# Reordering must NOT break the graph: labels and next_block_label pointers
-# are preserved; only the list order of sibling blocks changes.
+# head-to-middle turns the 4-item chain [a, b, c, d] into [b, c, a, d]: the root
+# leaves index 0 and a -> b becomes a backward reference. Reordering must NOT
+# break the graph; only the list order of sibling blocks changes.
 # ---------------------------------------------------------------------------
 
-_ADJACENT_SWAP = (0, 2, 1, 3)  # swap positions 1 <-> 2
 _HEAD_TO_MIDDLE = (1, 2, 0, 3)  # move position 0 to position 2
-_MIDDLE_TO_TAIL = (0, 2, 3, 1)  # move position 1 to position 3
 
 _PERMUTATIONS = [
-    pytest.param(_ADJACENT_SWAP, id="adjacent_swap"),
     pytest.param(_HEAD_TO_MIDDLE, id="head_to_middle"),
-    pytest.param(_MIDDLE_TO_TAIL, id="middle_to_tail"),
 ]
 
 

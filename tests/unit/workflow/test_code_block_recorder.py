@@ -1298,10 +1298,15 @@ class FakeWorkflowRunContext:
     workflow = None
     mask_secrets = True
 
+    reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+    agent_unmasked_platform_secret_ids = staticmethod(set)
+
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
+        self.parameters: dict[str, object] = {}
         self.credential_tested_urls: dict[str, str] = {}
         self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
+        self.succeeded_code_block_labels: set[str] = set()
         self._failure_evidence_capture = None
 
     start_failure_evidence_capture = WorkflowRunContext.start_failure_evidence_capture

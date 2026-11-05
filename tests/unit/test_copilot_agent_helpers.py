@@ -74,6 +74,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_TRACE_PER_TASK_LIMIT,
     BuildTestConnectFailure,
@@ -727,6 +728,35 @@ class TestFailedTestResponseNormalization:
             "Keep the draft to iterate on, or discard."
         )
 
+    def test_browser_start_capacity_refusal_reports_its_facts_and_never_claims_a_test_ran(self) -> None:
+        refusal = BuildTestConnectFailure(
+            state="browser_start_capacity",
+            starting_sessions=12,
+            max_starting_sessions=10,
+            retry_after_seconds=17,
+        )
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+            last_test_failure_reason=build_test_connect_failure_sentence(refusal),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=refusal,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        for fact in ("12", "10", "17"):
+            assert fact in rewritten
+        assert "I tested the draft" not in rewritten
+
     def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
         ctx = _challenge_failure_ctx()
         ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
@@ -773,11 +803,6 @@ class TestFailedTestResponseNormalization:
         ("branch", "lead"),
         [
             (
-                "credentials_unbound",
-                "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-                "the required credentials. Add them in Credentials, then I can try again.",
-            ),
-            (
                 "billing",
                 "I couldn't start a test. Build test did not start because credits are exhausted. "
                 "No browser or run started. Upgrade your plan in Billing. The draft is untested.",
@@ -802,10 +827,7 @@ class TestFailedTestResponseNormalization:
             last_test_failure_reason="Login rejected.",
             last_test_proxy_owned_failure=True,
         )
-        if branch == "credentials_unbound":
-            ctx.last_test_ok = None
-            ctx.request_policy = RequestPolicy(clarification_reason="workflow_credential_inputs_unbound")
-        elif branch == "billing":
+        if branch == "billing":
             ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -1166,26 +1188,6 @@ workflow_definition:
 
         assert _should_surface_untested_draft_despite_question(ctx, "ASK_QUESTION") is True
         assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
-
-    def test_rewrite_uses_credential_framing_when_policy_flags_unbound_inputs(self) -> None:
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=12,
-            last_test_ok=None,
-            request_policy=RequestPolicy(
-                clarification_reason="workflow_credential_inputs_unbound",
-                allow_run_blocks=False,
-                allow_missing_credentials_in_draft=True,
-            ),
-        )
-        rewritten = _rewrite_failed_test_response("agent text", ctx)
-
-        assert rewritten == (
-            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-            "the required credentials. Add them in Credentials, then I can try again. agent text "
-            "Keep the draft to iterate on, or discard."
-        )
 
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(

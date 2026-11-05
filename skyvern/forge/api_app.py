@@ -24,8 +24,8 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import OperationalError
-from starlette.datastructures import MutableHeaders
+from sqlalchemy.exc import DataError, OperationalError
+from starlette.datastructures import MutableHeaders, QueryParams
 from starlette.requests import ClientDisconnect, HTTPConnection, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette_context.middleware import RawContextMiddleware
@@ -115,6 +115,24 @@ def register_db_unavailable_handlers(fastapi_app: FastAPI) -> None:
         fastapi_app.add_exception_handler(exc_type, db_unavailable_handler)
 
 
+async def invalid_data_handler(request: Request, exc: Exception) -> JSONResponse:
+    """DataError means a value could not be represented in its target type (out-of-range
+    integer, NUL byte in text), which is malformed input rather than a server fault.
+
+    A backstop for request-body fields, which the param bounds and the query-string check
+    cannot reach. `@db_operation` has already logged the traceback, so the failure stays
+    visible; `str(exc)` is withheld because it carries the raw SQL.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"detail": "A value in the request cannot be stored: out of range, or containing a NUL byte."},
+    )
+
+
+def register_invalid_data_handler(fastapi_app: FastAPI) -> None:
+    fastapi_app.add_exception_handler(DataError, invalid_data_handler)
+
+
 SECURITY_HEADERS = {
     # CSP is frame-ancestors-only: Swagger /docs pulls CDN assets that a broader policy would block.
     "X-Frame-Options": "DENY",
@@ -149,6 +167,49 @@ class SecurityHeadersMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
+
+
+class RejectNulByteQueryMiddleware:
+    """Postgres cannot store a NUL byte in text, so a `?search=%00` reaching a query raises
+    a driver error instead of being rejected. No query param has a legitimate use for one,
+    so refuse it here rather than validating every free-text param separately.
+
+    Pure ASGI (not BaseHTTPMiddleware) so streaming responses pass through unwrapped.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        raw_query: bytes = scope.get("query_string", b"")
+        # Cheap pre-check: a NUL can only arrive percent-encoded or, from a non-conforming
+        # client, raw. Skip decoding the query string for the overwhelming majority.
+        if b"%00" in raw_query.lower() or b"\x00" in raw_query:
+            offending = next(
+                (key for key, value in QueryParams(raw_query).multi_items() if "\x00" in key or "\x00" in value),
+                None,
+            )
+            if offending is not None:
+                response = JSONResponse(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    content={
+                        "detail": [
+                            {
+                                "type": "string_contains_nul",
+                                "loc": ["query", offending],
+                                "msg": "Input should not contain a NUL byte",
+                            }
+                        ]
+                    },
+                )
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
 
 
 def add_credentialed_cors_middleware(fastapi_app: FastAPI) -> None:
@@ -628,6 +689,8 @@ def create_api_app() -> FastAPI:
 
     register_db_unavailable_handlers(fastapi_app)
 
+    register_invalid_data_handler(fastapi_app)
+
     @fastapi_app.exception_handler(ValidationError)
     async def handle_pydantic_validation_error(request: Request, exc: ValidationError) -> JSONResponse:
         detail = format_validation_errors(exc)
@@ -690,6 +753,10 @@ def create_api_app() -> FastAPI:
 
     if forge_app_instance.setup_api_app:
         forge_app_instance.setup_api_app(fastapi_app)
+
+    # Inside RequestLoggingMiddleware (added next, so outside this one) to keep the
+    # rejections it short-circuits visible in request logs.
+    fastapi_app.add_middleware(RejectNulByteQueryMiddleware)
 
     # Register after extensions so it stays outside cloud BaseHTTPMiddleware
     # layers, whose child tasks do not propagate request ContextVars upstream.

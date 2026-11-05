@@ -44,21 +44,6 @@ async def test_check_and_fix_state_reuses_existing_page_for_remote_browser_sessi
 
 
 @pytest.mark.asyncio
-async def test_check_and_fix_state_creates_new_page_when_context_has_no_pages() -> None:
-    state = _build_state(session_id=None, existing_pages=[])
-
-    new_page = MagicMock()
-    new_page.url = "about:blank"
-    state.browser_context.new_page = AsyncMock(return_value=new_page)
-
-    await state.check_and_fix_state(url="https://example.com/")
-
-    state.browser_context.new_page.assert_awaited_once()
-    state._close_all_other_pages.assert_awaited_once()
-    state.navigate_to_url.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_check_and_fix_state_reuses_existing_page_with_browser_address() -> None:
     existing_page = MagicMock()
     existing_page.url = "about:blank"

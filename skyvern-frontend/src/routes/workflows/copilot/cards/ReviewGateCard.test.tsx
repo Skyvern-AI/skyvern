@@ -206,40 +206,44 @@ describe("ReviewGateCard — untested proposals stay actionable", () => {
 describe("ReviewGateCard — Test end-to-end recourse", () => {
   const noop = () => {};
 
-  it("labels the typed connection-failure action as a fresh-session retry", () => {
-    render(
-      <ReviewGateCard
-        latestTurnCause="already_closed"
-        turn={turn({
-          proposalDisposition: "review_untested",
-          turnFacts: {
-            factsAvailable: true,
-            evaluationState: null,
-            runId: null,
-            runCompleted: null,
-            terminalCause: "already_closed",
-            blocksRunThisTurn: null,
-            ranCleanOnCurrentSource: false,
-            authoredBlockCount: 0,
-            matchingSourceBlockCount: 0,
-          },
-        })}
-        pending
-        verdict="untested"
-        actionsEnabled
-        hasProposal
-        onAccept={noop}
-        onAlwaysAccept={noop}
-        onReject={noop}
-        onReview={noop}
-        onTestEndToEnd={noop}
-      />,
-    );
+  it.each(["already_closed", "browser_start_capacity"])(
+    "offers a fresh-session retry in the card body after %s",
+    (cause) => {
+      render(
+        <ReviewGateCard
+          latestTurnCause={cause}
+          turn={turn({
+            proposalDisposition: "review_untested",
+            turnFacts: {
+              factsAvailable: true,
+              evaluationState: null,
+              runId: null,
+              runCompleted: null,
+              terminalCause: cause,
+              blocksRunThisTurn: null,
+              ranCleanOnCurrentSource: false,
+              authoredBlockCount: 0,
+              matchingSourceBlockCount: 0,
+            },
+          })}
+          pending
+          verdict="untested"
+          actionsEnabled
+          hasProposal
+          onAccept={noop}
+          onAlwaysAccept={noop}
+          onReject={noop}
+          onReview={noop}
+          onTestEndToEnd={noop}
+        />,
+      );
 
-    expect(
-      screen.getByRole("button", { name: "Retry in a fresh session" }),
-    ).not.toBeNull();
-  });
+      expect(
+        screen.getByRole("button", { name: "Retry in a fresh session" }),
+      ).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "More actions" })).toBeNull();
+    },
+  );
 
   it("offers Billing instead of a fresh-session retry after credit admission refusal", () => {
     let testRuns = 0;

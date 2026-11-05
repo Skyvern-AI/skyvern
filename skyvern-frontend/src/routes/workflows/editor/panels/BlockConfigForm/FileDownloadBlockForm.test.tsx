@@ -247,11 +247,19 @@ vi.mock("@/components/ui/switch", () => ({
 // Force the Accordion content to always render so we can test advanced
 // settings without needing to click the trigger. Mirrors the strategy from
 // ValidationBlockForm.test.tsx where Radix collapses children when closed.
+// AccordionItem keeps a DOM boundary so tests can assert which section a
+// field was rendered into.
 vi.mock("@/components/ui/accordion", () => {
   const Pass = ({ children }: { children?: ReactNode }) => <>{children}</>;
   return {
     Accordion: Pass,
-    AccordionItem: Pass,
+    AccordionItem: ({
+      value,
+      children,
+    }: {
+      value?: string;
+      children?: ReactNode;
+    }) => <div data-testid={`accordion-item-${value}`}>{children}</div>,
     AccordionTrigger: ({ children }: { children?: ReactNode }) => (
       <button data-testid="accordion-trigger">{children}</button>
     ),
@@ -670,6 +678,40 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(
       screen.queryByText("Google Drive Source Account (Optional)"),
     ).toBeNull();
+  });
+
+  test("keeps the SFTP source under Advanced Settings instead of its own top-level section", () => {
+    setFileDownloadNode("d1", { sftpSourcePath: "/reports/report.csv" });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    const advanced = screen.getByTestId("accordion-item-advanced");
+    expect(screen.queryByTestId("accordion-item-sftp-source")).toBeNull();
+    expect(advanced.contains(screen.getByText("SFTP Source Path"))).toBe(true);
+    // The connection the source reads over belongs with the source path.
+    expect(advanced.contains(screen.getByText("SFTP Host (Source)"))).toBe(
+      true,
+    );
+    // ...but a reshaped top-level form still has to explain itself.
+    expect(
+      screen.getByText(
+        "This block reads from SFTP, configured under Advanced Settings, so it does not need a URL.",
+      ),
+    ).toBeDefined();
+  });
+
+  test("keeps SFTP connection fields beside Download Target when SFTP is the destination", () => {
+    setFileDownloadNode("d1", {
+      downloadTarget: "sftp",
+      sftpSourcePath: "/reports/report.csv",
+    });
+    render(<FileDownloadBlockForm blockId="d1" />);
+
+    const advanced = screen.getByTestId("accordion-item-advanced");
+    const host = screen.getByText("SFTP Host (Source and Destination)");
+    expect(advanced.contains(host)).toBe(false);
+    expect(advanced.contains(screen.getByText("SFTP Source Path"))).toBe(true);
+    // Rendered once, not duplicated across both placements.
+    expect(document.querySelectorAll('[name="sftpHost"]').length).toBe(1);
   });
 
   test("offers SFTP source fields and requires its host key", () => {

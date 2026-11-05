@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -31,8 +31,15 @@ from skyvern.cli.core.session_manager import (
     scoped_session,
 )
 from skyvern.config import settings
+from skyvern.exceptions import TooManyStartingBrowserSessions
 from skyvern.forge import app
-from skyvern.forge.sdk.copilot.agent_context import AgentContext, AttachedBrowserDriver, SdkActionWorkflowRunCacheKey
+from skyvern.forge.sdk.copilot.agent_context import (
+    AgentContext,
+    AttachedBrowserDriver,
+    BuildTestPrestart,
+    PrestartedBrowser,
+    SdkActionWorkflowRunCacheKey,
+)
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     SUPERSEDED_BY_NEWER_TEST_REASON,
     BuildTestConnectFailure,
@@ -54,7 +61,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.enums import WorkflowRunStatus
 from skyvern.library.skyvern_browser import SkyvernBrowser
 from skyvern.schemas.browser_session_close import BrowserSessionCloseReason
-from skyvern.schemas.browser_session_kind import BrowserSessionKind
+from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE, BrowserSessionKind
 from skyvern.schemas.proxy_location import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_engine import is_any_engine_error
 from skyvern.webeye.browser_errors import (
@@ -83,7 +90,7 @@ _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 # a vendor replacement was measured booting in 13.5s, so this leaves room to have one ready.
 _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS = 60.0
 _ABANDONED_BROWSER_STATE_RESOLVES: set[asyncio.Task[BrowserState | None]] = set()
-_ABANDONED_DRIVER_RELEASES: set[asyncio.Task[bool] | asyncio.Task[None]] = set()
+_DETACHED_TASKS: set[asyncio.Task[bool] | asyncio.Task[None] | asyncio.Task[PrestartedBrowser | None]] = set()
 # Per session: attached turns in this process, and the newest generation any of them attached.
 # Only the last one out releases, and it retires that newest generation rather than its own.
 _ATTACHED_TURNS_PER_SESSION: dict[str, tuple[int, BrowserState]] = {}
@@ -667,8 +674,8 @@ def start_browser_driver_release(
     release = asyncio.ensure_future(
         release_browser_driver_quietly(organization_id, attached, unwinding_operations=unwinding_operations)
     )
-    _ABANDONED_DRIVER_RELEASES.add(release)
-    release.add_done_callback(_discard_finished_driver_release)
+    _DETACHED_TASKS.add(release)
+    release.add_done_callback(_discard_finished_detached_task)
     return release
 
 
@@ -679,13 +686,36 @@ async def wait_for_driver_releases(releases: Iterable[asyncio.Task[None]]) -> No
         await asyncio.wait(pending, timeout=_SESSION_CLEANUP_TIMEOUT_SECONDS)
 
 
-def _close_session_once_created(organization_id: str, create: asyncio.Future[PersistentBrowserSession]) -> None:
+_Created = TypeVar("_Created")
+
+
+async def _admitted_create(organization_id: str, start: Callable[[], Awaitable[_Created]]) -> _Created:
+    # Run inside the caller's shielded future, so a cancelled turn keeps its slot until the create itself returns.
+    async with app.AGENT_FUNCTION.browser_session_create_admission(organization_id, copilot=True):
+        return await start()
+
+
+def _start_capacity_failure(refusal: TooManyStartingBrowserSessions) -> BuildTestConnectFailure:
+    return BuildTestConnectFailure(
+        state="browser_start_capacity",
+        starting_sessions=refusal.starting_sessions,
+        max_starting_sessions=refusal.max_starting_sessions,
+        retry_after_seconds=refusal.retry_after_seconds,
+    )
+
+
+def _close_session_once_created(
+    organization_id: str,
+    create: asyncio.Future[_Created],
+    session_id_of: Callable[[_Created], str | None],
+) -> None:
     async def _close() -> None:
         try:
-            session = await create
+            session_id = session_id_of(await create)
         except Exception:
             return
-        session_id = session.persistent_browser_session_id
+        if session_id is None:
+            return
         closed = await close_browser_session_quietly(
             organization_id, session_id, reason=BrowserSessionCloseReason.turn_ended
         )
@@ -698,8 +728,8 @@ def _close_session_once_created(organization_id: str, create: asyncio.Future[Per
         )
 
     closer = asyncio.ensure_future(_close())
-    _ABANDONED_DRIVER_RELEASES.add(closer)
-    closer.add_done_callback(_discard_finished_driver_release)
+    _DETACHED_TASKS.add(closer)
+    closer.add_done_callback(_discard_finished_detached_task)
 
 
 async def close_browser_session_quietly(
@@ -731,8 +761,10 @@ def _clear_closed_session_scrub_values(session_id: str) -> None:
         clear_session_scrub_values(session_id)
 
 
-def _discard_finished_driver_release(task: asyncio.Task[bool] | asyncio.Task[None]) -> None:
-    _ABANDONED_DRIVER_RELEASES.discard(task)
+def _discard_finished_detached_task(
+    task: asyncio.Task[bool] | asyncio.Task[None] | asyncio.Task[PrestartedBrowser | None],
+) -> None:
+    _DETACHED_TASKS.discard(task)
     if not task.cancelled():
         task.exception()
 
@@ -798,8 +830,8 @@ async def release_browser_driver_quietly(
                 only_if_unleased=True,
             )
         )
-        _ABANDONED_DRIVER_RELEASES.add(evict)
-        evict.add_done_callback(_discard_finished_driver_release)
+        _DETACHED_TASKS.add(evict)
+        evict.add_done_callback(_discard_finished_detached_task)
         # The marker must outlive this wait: a resolve admitted after a timed-out wait but before
         # the evict pops the entry would still be handed the generation being retired.
         _DRIVER_RELEASE_EPOCHS[attached.session_id] = _DRIVER_RELEASE_EPOCHS.get(attached.session_id, 0) + 1
@@ -1212,11 +1244,12 @@ async def acquire_fresh_exit_browser_session(
     denial = _browser_session_denial(ctx)
     if denial is not None:
         return _browser_session_acquisition_failure_result(denial)
-    try:
-        allocation_id = uuid.uuid4().hex
+    allocation_id = uuid.uuid4().hex
+
+    async def _start() -> FreshExitReceipt:
         if ctx.browser_allocation_recorder is not None:
             await ctx.browser_allocation_recorder(allocation_id, None)
-        receipt = await app.PERSISTENT_SESSIONS_MANAGER.create_fresh_exit_session(
+        return await app.PERSISTENT_SESSIONS_MANAGER.create_fresh_exit_session(
             organization_id=ctx.organization_id,
             prior_browser_session_id=prior_browser_session_id,
             proxy_location=proxy_location,
@@ -1224,6 +1257,14 @@ async def acquire_fresh_exit_browser_session(
             session_kind=BrowserSessionKind.copilot,
             created_for_workflow_permanent_id=ctx.workflow_permanent_id,
         )
+
+    try:
+        create = asyncio.ensure_future(_admitted_create(ctx.organization_id, _start))
+        try:
+            receipt = await asyncio.shield(create)
+        except asyncio.CancelledError:
+            _close_session_once_created(ctx.organization_id, create, lambda receipt: receipt.new_browser_session_id)
+            raise
         if receipt.new_browser_session_id:
             await _record_minted_browser(ctx, receipt.new_browser_session_id)
             if ctx.browser_allocation_recorder is not None:
@@ -1233,19 +1274,30 @@ async def acquire_fresh_exit_browser_session(
         return _browser_session_acquisition_failure_result(
             BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None)
         )
+    except TooManyStartingBrowserSessions as refusal:
+        return _browser_session_acquisition_failure_result(_start_capacity_failure(refusal))
     except Exception:
         LOG.warning("Failed to create a fresh-exit browser session for a build test", exc_info=True)
         return _browser_session_acquisition_failure_result(BuildTestConnectFailure(state="provisioning_unavailable"))
 
 
+def browser_session_acquisition_failure_sentence(failure: BuildTestConnectFailure) -> str:
+    if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
+        return failure.diagnostic
+    if failure.state == "billing_credit_admission_refusal":
+        return "Browser session did not start because credits are exhausted. Upgrade your plan in Billing."
+    if failure.state == "browser_start_capacity":
+        return build_test_connect_failure_sentence(failure)
+    return "Failed to create browser session"
+
+
 def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure) -> dict[str, Any]:
     """Keep the generic acquisition envelope while retaining its typed, actionable cause."""
-    if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
-        return {"ok": False, "error": failure.diagnostic}
+    sentence = browser_session_acquisition_failure_sentence(failure)
     if failure.state == "billing_credit_admission_refusal":
         return {
             "ok": False,
-            "error": ("Browser session did not start because credits are exhausted. Upgrade your plan in Billing."),
+            "error": sentence,
             "data": {
                 "browser_session_acquisition_failure": {
                     "state": failure.state,
@@ -1253,7 +1305,18 @@ def _browser_session_acquisition_failure_result(failure: BuildTestConnectFailure
                 }
             },
         }
-    return {"ok": False, "error": "Failed to create browser session"}
+    if failure.state == "browser_start_capacity":
+        return {
+            "ok": False,
+            "error": sentence,
+            "data": {"browser_session_acquisition_failure": failure.model_dump(mode="json", exclude_none=True)},
+        }
+    return {"ok": False, "error": sentence}
+
+
+def carries_browser_session_acquisition_failure(result: Mapping[str, object]) -> bool:
+    data = result.get("data")
+    return isinstance(data, Mapping) and "browser_session_acquisition_failure" in data
 
 
 @dataclass(frozen=True)
@@ -1269,6 +1332,7 @@ class _SeededCreateSessionKwargs(TypedDict, total=False):
     proxy_session_id: str
     proxy_location: ProxyLocationInput
     inherit_profile_proxy: bool
+    runnable_type: str
 
 
 def _seeded_create_session_kwargs(seed: BuildTestBrowserSeed | None) -> _SeededCreateSessionKwargs:
@@ -1323,12 +1387,12 @@ def _check_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
         started_at is not None
         and turn_clock_seconds(ctx, started_at, time.monotonic()) >= MINTED_BROWSER_RENEWAL_TURN_SECONDS
     ):
-        _end_minted_browser_renewal(ctx, session_id)
+        end_minted_browser_renewal(ctx, session_id)
     else:
         _arm_minted_browser_renewal_check(ctx, session_id)
 
 
-def _end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
+def end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
     check = ctx.minted_browser_renewal_checks.pop(session_id, None)
     if check is None:
         return
@@ -1338,11 +1402,15 @@ def _end_minted_browser_renewal(ctx: AgentContext, session_id: str) -> None:
 
 def end_minted_browser_renewals(ctx: AgentContext) -> None:
     for session_id in list(ctx.minted_browser_renewal_checks):
-        _end_minted_browser_renewal(ctx, session_id)
+        end_minted_browser_renewal(ctx, session_id)
 
 
 async def _provision_browser_session(
-    ctx: AgentContext, *, seed: BuildTestBrowserSeed | None = None, proxy_location: ProxyLocationInput = None
+    ctx: AgentContext,
+    *,
+    seed: BuildTestBrowserSeed | None = None,
+    proxy_location: ProxyLocationInput = None,
+    runnable_type: str | None = None,
 ) -> BuildTestConnectFailure | None:
     """Create a browser session if the context holds none.
 
@@ -1382,15 +1450,24 @@ async def _provision_browser_session(
     installed_session_id: str | None = None
     try:
         allocation_id = uuid.uuid4().hex
-        if ctx.browser_allocation_recorder is not None:
-            await ctx.browser_allocation_recorder(allocation_id, None)
-        with copilot_span("browser_session_create", data={"organization_id": ctx.organization_id}):
+        with copilot_span(
+            "browser_session_create",
+            data={
+                "organization_id": ctx.organization_id,
+                "prestart": runnable_type == COPILOT_PRESTART_RUNNABLE_TYPE,
+            },
+        ):
             creation_kwargs = _seeded_create_session_kwargs(seed)
             if proxy_location is not None:
                 creation_kwargs.setdefault("proxy_location", proxy_location)
-            # The manager may apply a shorter budget for copilot-kind sessions.
-            create = asyncio.ensure_future(
-                app.PERSISTENT_SESSIONS_MANAGER.create_session(
+            if runnable_type is not None:
+                creation_kwargs["runnable_type"] = runnable_type
+
+            async def _start() -> PersistentBrowserSession:
+                if ctx.browser_allocation_recorder is not None:
+                    await ctx.browser_allocation_recorder(allocation_id, None)
+                # The manager may apply a shorter budget for copilot-kind sessions.
+                return await app.PERSISTENT_SESSIONS_MANAGER.create_session(
                     organization_id=ctx.organization_id,
                     timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
                     created_by="copilot",
@@ -1398,13 +1475,16 @@ async def _provision_browser_session(
                     created_for_workflow_permanent_id=ctx.workflow_permanent_id,
                     **creation_kwargs,
                 )
-            )
+
+            create = asyncio.ensure_future(_admitted_create(ctx.organization_id, _start))
             # The manager does not clean up a create cancelled mid-startup, so the browser it still
             # produces is closed here once the id exists.
             try:
                 session = await asyncio.shield(create)
             except asyncio.CancelledError:
-                _close_session_once_created(ctx.organization_id, create)
+                _close_session_once_created(
+                    ctx.organization_id, create, lambda session: session.persistent_browser_session_id
+                )
                 raise
         if ctx.browser_allocation_recorder is not None:
             await ctx.browser_allocation_recorder(allocation_id, session.persistent_browser_session_id)
@@ -1464,6 +1544,8 @@ async def _provision_browser_session(
             state="billing_credit_admission_refusal",
             retry_action=None,
         )
+    except TooManyStartingBrowserSessions as refusal:
+        return _start_capacity_failure(refusal)
     except Exception as e:
         LOG.warning("Failed to auto-create browser session", error=str(e), exc_info=True)
         # Cleanup keys off the local `session`, not ctx.browser_session_id --
@@ -1499,6 +1581,179 @@ async def ensure_build_test_browser_session(
     async with browser_session_recovery(ctx):
         failure = await _provision_browser_session(ctx, seed=seed, proxy_location=proxy_location)
         return None if failure is None else _build_test_connect_failure_result(failure)
+
+
+def start_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLocationInput) -> None:
+    # ENV=local: the session manager closes every open session in the org before a create, the failed test's included.
+    if (
+        ctx.build_test_prestart is not None
+        or ctx.prestart_teardown_started
+        or settings.ENV == "local"
+        or ctx.turn_origin == TurnOrigin.code_block_ai_fallback
+    ):
+        return
+    prestart_ctx = replace(ctx)
+    prestart_ctx.browser_session_id = None
+    task = asyncio.create_task(_prestart_build_test_browser(ctx, prestart_ctx, proxy_location))
+    _DETACHED_TASKS.add(task)
+    task.add_done_callback(_discard_finished_detached_task)
+    ctx.pending_build_test_prestarts[task] = prestart_ctx
+    task.add_done_callback(lambda done: ctx.pending_build_test_prestarts.pop(done, None))
+    ctx.build_test_prestart = BuildTestPrestart(task=task, proxy_location=proxy_location)
+
+
+def cancel_ledgered_build_test_prestarts(ctx: AgentContext) -> None:
+    # Only once its browser is ledgered: a cancel that lands mid-close then still leaves the turn-end sweep to close it.
+    for task, prestart_ctx in list(ctx.pending_build_test_prestarts.items()):
+        session_id = prestart_ctx.browser_session_id
+        if not task.done() and session_id is not None and session_id in ctx.minted_browser_sessions:
+            ctx.cancelled_build_test_prestarts[task] = session_id
+            task.cancel()
+
+
+async def _prestart_build_test_browser(
+    ctx: AgentContext, prestart_ctx: AgentContext, proxy_location: ProxyLocationInput
+) -> PrestartedBrowser | None:
+    chat_context = skyvern_context.current()
+    # Its own context, so the provision's run_id write never lands on the chat's.
+    with skyvern_context.scoped(
+        skyvern_context.SkyvernContext(
+            organization_id=ctx.organization_id,
+            copilot_session_id=chat_context.copilot_session_id if chat_context else None,
+        )
+    ):
+        try:
+            failure = await _provision_browser_session(
+                prestart_ctx, proxy_location=proxy_location, runnable_type=COPILOT_PRESTART_RUNNABLE_TYPE
+            )
+        except Exception:
+            LOG.warning(
+                "copilot_build_test_browser_prestart_failed",
+                prestart_browser_session_id=prestart_ctx.browser_session_id,
+                exc_info=True,
+            )
+            raise
+    session_id = prestart_ctx.browser_session_id if failure is None else failure.browser_session_id
+    # No await since the provision's last registration, so a teardown that has not started yet will sweep it.
+    if ctx.prestart_teardown_started:
+        if session_id:
+            await _close_build_test_prestart(ctx, session_id, reason=BrowserSessionCloseReason.turn_ended)
+        return None
+    if failure is not None or session_id is None:
+        LOG.info(
+            "copilot_build_test_browser_prestart_failed",
+            state=failure.state if failure is not None else None,
+            prestart_browser_session_id=session_id,
+        )
+        return None
+    LOG.info("copilot_build_test_browser_prestarted", prestart_browser_session_id=session_id)
+    return PrestartedBrowser(session_id=session_id, ready_monotonic=time.monotonic())
+
+
+async def _close_build_test_prestart(ctx: AgentContext, session_id: str, *, reason: BrowserSessionCloseReason) -> None:
+    end_minted_browser_renewal(ctx, session_id)
+    attached = ctx.attached_browser_drivers.pop(session_id, None)
+    if attached is not None:
+        await wait_for_driver_releases([start_browser_driver_release(ctx.organization_id, attached)])
+    await close_browser_session_quietly(ctx.organization_id, session_id, reason=reason)
+    ctx.minted_browser_sessions.pop(session_id, None)
+
+
+def discard_build_test_prestart(ctx: AgentContext, reason: str) -> None:
+    """Closes the pending pre-start in the background; the caller never waits on its start."""
+    prestart = ctx.build_test_prestart
+    if prestart is None:
+        return
+    ctx.build_test_prestart = None
+    _start_prestart_discard(ctx, prestart.task, reason)
+
+
+def _start_prestart_discard(ctx: AgentContext, started: asyncio.Task[PrestartedBrowser | None], reason: str) -> None:
+    async def _discard() -> None:
+        session_id: str | None = None
+        try:
+            prestarted = await started
+        except asyncio.CancelledError:
+            if not started.cancelled():
+                raise
+            prestarted = None
+            session_id = ctx.cancelled_build_test_prestarts.pop(started, None)
+        except Exception:
+            prestarted = None
+        if prestarted is not None:
+            session_id = prestarted.session_id
+            await _close_build_test_prestart(ctx, session_id, reason=BrowserSessionCloseReason.aborted)
+        LOG.info("copilot_build_test_browser_prestart_discarded", reason=reason, prestart_browser_session_id=session_id)
+
+    cleanup = asyncio.ensure_future(_discard())
+    _DETACHED_TASKS.add(cleanup)
+    cleanup.add_done_callback(_discard_finished_detached_task)
+
+
+async def claim_build_test_prestart(ctx: AgentContext, proxy_location: ProxyLocationInput) -> str | None:
+    # Only the swap takes the recovery lock: the start runs on a ctx copy sharing it, so awaiting it there deadlocks.
+    prestart = ctx.build_test_prestart
+    if prestart is None:
+        return None
+    if prestart.proxy_location != proxy_location:
+        discard_build_test_prestart(ctx, "proxy_change")
+        return None
+    ctx.build_test_prestart = None
+    prestarted: PrestartedBrowser | None = None
+    try:
+        # Shielded so a cancelled test leaves the start to finish and be closed with the turn's other minted browsers.
+        prestarted = await asyncio.shield(prestart.task)
+        if prestarted is None:
+            LOG.info(
+                "copilot_build_test_browser_prestart_discarded", reason="start_failed", prestart_browser_session_id=None
+            )
+            return None
+        try:
+            remaining_seconds = await app.PERSISTENT_SESSIONS_MANAGER.seconds_until_fixed_deadline(
+                prestarted.session_id, ctx.organization_id
+            )
+        except Exception:
+            LOG.warning(
+                "Could not read the pre-started browser's deadline; claiming it anyway",
+                prestart_browser_session_id=prestarted.session_id,
+                exc_info=True,
+            )
+            remaining_seconds = None
+        if remaining_seconds is not None and remaining_seconds < _FIXED_DEADLINE_REPLACEMENT_MARGIN_SECONDS:
+            _start_prestart_discard(ctx, prestart.task, "unavailable")
+            return None
+        async with browser_session_recovery(ctx):
+            claimed = await app.DATABASE.browser_sessions.claim_copilot_prestart(
+                session_id=prestarted.session_id, organization_id=ctx.organization_id
+            )
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        # A start cancelled by turn end surfaces here through the shield; the test itself was not cancelled.
+        if prestart.task.cancelled() and current is not None and not current.cancelling():
+            LOG.info(
+                "copilot_build_test_browser_prestart_discarded", reason="turn_ended", prestart_browser_session_id=None
+            )
+            return None
+        # The pre-start is already off ctx, so without this a later failed test could start a second one.
+        _start_prestart_discard(ctx, prestart.task, "cancelled")
+        raise
+    except Exception:
+        LOG.warning(
+            "copilot_build_test_browser_prestart_claim_failed",
+            prestart_browser_session_id=prestarted.session_id if prestarted is not None else None,
+            exc_info=True,
+        )
+        _start_prestart_discard(ctx, prestart.task, "start_failed" if prestarted is None else "claim_error")
+        return None
+    if not claimed:
+        _start_prestart_discard(ctx, prestart.task, "unavailable")
+        return None
+    LOG.info(
+        "copilot_build_test_browser_prestart_claimed",
+        prestart_browser_session_id=prestarted.session_id,
+        idle_seconds=round(max(0.0, time.monotonic() - prestarted.ready_monotonic), 1),
+    )
+    return prestarted.session_id
 
 
 @dataclass(frozen=True)
@@ -1548,6 +1803,7 @@ async def replace_browser_session(ctx: AgentContext) -> BrowserSessionReplacemen
         ctx.browser_session_continuity_generation += 1
         ctx.browser_session_continuity_disposition = "reestablished"
         ctx.browser_session_continuity_deadline_expired = False
+        ctx.browser_session_continuity_acquisition_failure = None
         LOG.info(
             "Copilot replaced its browser session",
             old_session_id=old_session_id,

@@ -480,6 +480,16 @@ async def test_verification_and_speculation_that_never_finish_do_not_hold_the_st
     assert all(child.cancelled() for child in running)
 
 
+def _stop_the_step_for_budget(
+    monkeypatch: pytest.MonkeyPatch, agent: ForgeAgent, kwargs: dict[str, Any], budget: str
+) -> None:
+    monkeypatch.setattr(
+        "skyvern.forge.agent.ForgeAgent._check_workflow_run_step_budget",
+        AsyncMock(return_value=(5, 5)) if budget == "exhausted" else AsyncMock(side_effect=RuntimeError("down")),
+    )
+    monkeypatch.setattr(agent, "_terminate_for_workflow_run_step_budget", AsyncMock(return_value=kwargs["step"]))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("budget", ["exhausted", "preflight_failed"])
 async def test_a_cancelled_speculative_plan_that_holds_its_cancellation_does_not_hold_the_step(
@@ -491,11 +501,7 @@ async def test_a_cancelled_speculative_plan_that_holds_its_cancellation_does_not
     agent, kwargs, _next_step = _setup_hung_parallel_phase(
         monkeypatch, verification=None, speculation=_never_finishes(running, holds_cancellation=True)
     )
-    monkeypatch.setattr(
-        "skyvern.forge.agent.ForgeAgent._check_workflow_run_step_budget",
-        AsyncMock(return_value=(5, 5)) if budget == "exhausted" else AsyncMock(side_effect=RuntimeError("down")),
-    )
-    monkeypatch.setattr(agent, "_terminate_for_workflow_run_step_budget", AsyncMock(return_value=kwargs["step"]))
+    _stop_the_step_for_budget(monkeypatch, agent, kwargs, budget)
 
     handled = asyncio.ensure_future(agent._handle_completed_step_with_parallel_verification(**kwargs))
     done, _ = await asyncio.wait({handled}, timeout=5)
@@ -509,6 +515,30 @@ async def test_a_cancelled_speculative_plan_that_holds_its_cancellation_does_not
     assert len(running) == 1
     await asyncio.wait(running, timeout=5)
     assert running[0].cancelled()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["exhausted", "preflight_failed"])
+async def test_a_step_with_no_budget_left_stops_without_waiting_for_the_speculative_plan(
+    budget: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The parallel deadline outlasts the wait below, so only checking the budget before awaiting the plan ends the step.
+    monkeypatch.setattr("skyvern.forge.agent.PARALLEL_VERIFICATION_TIMEOUT_SECONDS", 60)
+    running: list[asyncio.Task] = []
+    agent, kwargs, _next_step = _setup_hung_parallel_phase(
+        monkeypatch, verification=None, speculation=_never_finishes(running)
+    )
+    _stop_the_step_for_budget(monkeypatch, agent, kwargs, budget)
+
+    handled = asyncio.ensure_future(agent._handle_completed_step_with_parallel_verification(**kwargs))
+    try:
+        done, _ = await asyncio.wait({handled}, timeout=5)
+        assert handled in done, "the step waited on the speculative plan before checking the budget"
+    finally:
+        handled.cancel()
+    await asyncio.gather(handled, return_exceptions=True)
+    await asyncio.wait(running, timeout=5)
+    assert len(running) == 1 and running[0].cancelled()
 
 
 @pytest.mark.asyncio

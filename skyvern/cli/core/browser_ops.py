@@ -11,18 +11,18 @@ import json
 import os
 import re
 import string
+import sys
 import time
 from contextlib import suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator, Literal, Sequence
 
 import structlog
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from skyvern.core.script_generations.skyvern_page import SkyvernPage
 from skyvern.exceptions import BlockedHost, SkyvernHTTPException
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.utils.url_validators import validate_fetch_url
@@ -33,7 +33,19 @@ from .js_dispatch import under_action_deadline
 from .page_change import is_page_change_error
 from .perception_telemetry import track_perception_probe
 
+if TYPE_CHECKING:
+    from skyvern.core.script_generations.skyvern_page import SkyvernPage
+
 LOG = structlog.get_logger(__name__)
+
+_SKYVERN_PAGE_MODULE = "skyvern.core.script_generations.skyvern_page"
+
+
+def is_skyvern_page(page: Any) -> bool:
+    # Importing skyvern_page loads the whole server graph, and an instance cannot exist before its module does.
+    module = sys.modules.get(_SKYVERN_PAGE_MODULE)
+    return module is not None and isinstance(page, module.SkyvernPage)
+
 
 TYPE_PASSWORD_REFUSAL_MESSAGE = "Cannot type into password fields — credentials must not be passed through tool calls"
 COORDINATE_TYPE_TARGET_REFUSAL_MESSAGE = "could not verify the coordinate target; refusing to type"
@@ -1411,7 +1423,7 @@ def _merge_dom_observe_elements(
 
 async def get_observe_document_id(page: Any) -> str | None:
     """Read the current document revision marker without taking an observe snapshot."""
-    scope = page.locator_scope if isinstance(page, SkyvernPage) else None
+    scope = page.locator_scope if is_skyvern_page(page) else None
     target = scope if scope is not None else page
     raw_page = getattr(page, "page", page)
     session_target: Any = scope if scope is not None else raw_page
@@ -2222,7 +2234,13 @@ async def do_select_option(
         raise CustomSelectMatchError(selector, value, observed_options)
 
     matched = matches[0]
-    matched_label = str(matched.get("name") or matched.get("label") or value)
+    # `name` comes from the earlier DOM scan and `label` from the live re-read at the same positional selector, so a
+    # list that re-renders in between leaves a stale `name`; report the one that matched, else the live `label`.
+    matched_label = str(matched.get("label") or matched.get("name") or value)
+    for candidate in (matched.get("name"), matched.get("label")):
+        if _normalized_option(candidate) == requested:
+            matched_label = str(candidate)
+            break
     matched_value = str(matched.get("value") or "")
     expected_values = {requested, _normalized_option(matched_value)} - {""}
     display_labels = {

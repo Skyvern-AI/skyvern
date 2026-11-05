@@ -202,7 +202,6 @@ function renderPromptBox(
   enableCopilotHandoff = false,
   ref?: Ref<PromptBoxHandle>,
   minimal = false,
-  handoffFlagLoading = false,
   siblingBusy = false,
 ) {
   const queryClient = new QueryClient({
@@ -220,7 +219,6 @@ function renderPromptBox(
           ref={ref}
           enableCopilotHandoff={enableCopilotHandoff}
           minimal={minimal}
-          handoffFlagLoading={handoffFlagLoading}
           siblingBusy={siblingBusy}
         />
       </QueryClientProvider>
@@ -592,25 +590,6 @@ describe("PromptBox", () => {
 
     renderPromptBox(false);
     expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
-  });
-
-  test("holds back the legacy toolbar controls while the handoff flag loads, then falls back to flag-off", () => {
-    vi.useFakeTimers();
-    try {
-      renderPromptBox(false, undefined, false, true);
-      expect(screen.queryByLabelText("Add files and more")).toBeNull();
-      expect(screen.queryByLabelText("Dictate message")).toBeNull();
-      expect(screen.queryByLabelText(/^Advanced settings/)).toBeNull();
-      expect(screen.getByLabelText("submit-prompt")).toBeTruthy();
-
-      act(() => {
-        vi.advanceTimersByTime(3000);
-      });
-      expect(screen.getByLabelText("Dictate message")).toBeTruthy();
-      expect(screen.getByLabelText("Advanced settings")).toBeTruthy();
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   test("clears the selected legacy example once its prompt is edited", () => {
@@ -1021,7 +1000,7 @@ describe("PromptBox", () => {
   });
 
   test("start cards wait while the blank-canvas link is creating an agent", () => {
-    renderPromptBox(true, undefined, false, false, true);
+    renderPromptBox(true, undefined, false, true);
     expect(
       (screen.getByLabelText("Upload an SOP") as HTMLButtonElement).disabled,
     ).toBe(true);

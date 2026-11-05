@@ -239,7 +239,8 @@ type BuildTestConnectFailureState =
   | "provisioning_unavailable"
   | "cdp_connect_failed"
   | "occupied"
-  | "billing_credit_admission_refusal";
+  | "billing_credit_admission_refusal"
+  | "browser_start_capacity";
 
 export function isBuildTestConnectFailureState(
   value: unknown,
@@ -249,7 +250,8 @@ export function isBuildTestConnectFailureState(
     value === "provisioning_unavailable" ||
     value === "cdp_connect_failed" ||
     value === "occupied" ||
-    value === "billing_credit_admission_refusal"
+    value === "billing_credit_admission_refusal" ||
+    value === "browser_start_capacity"
   );
 }
 
@@ -907,7 +909,11 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
+  create_webhook_trigger: "Creating a webhook trigger",
+  test_trigger_mapping: "Testing the trigger mapping",
+  list_workflow_triggers: "Checking this workflow's triggers",
   extend_browser_session: "Extending the browser session",
+  read_chat_history: "Reading earlier messages in this chat",
   run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
@@ -958,7 +964,11 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   offer_demonstration: "other",
   read_google_sheet: "other",
   read_attached_pdf: "other",
+  read_chat_history: "other",
   get_organization_usage_quota: "other",
+  create_webhook_trigger: "other",
+  test_trigger_mapping: "other",
+  list_workflow_triggers: "other",
   extend_browser_session: "other",
   search_web: "other",
   list_org_workflows: "other",

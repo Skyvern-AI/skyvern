@@ -50,6 +50,8 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotStreamMessageType,
 )
 from tests.unit.copilot_test_helpers import make_copilot_ctx, stub_copilot_agent_loop
+from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import ScopedTime
 from tests.unit.test_copilot_credential_pause import (
     _answered_cache,
     _make_credential,
@@ -1175,8 +1177,9 @@ async def _trust_floor(message: str, handler: _SafetyLeg) -> RequestPolicy:
 async def test_hung_primary_is_answered_by_the_fallback_inside_the_screen_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
     primary = _SafetyLeg("PRIMARY", hang=True)
-    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT, delay=0.5)
+    fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT, delay=0.05)
     builds = _route_with_fallback(monkeypatch, fallback)
 
     screen = await screen_raw_secret_safety(_CLEAN_MESSAGE, primary, organization_id="org-1")
@@ -1276,6 +1279,20 @@ async def test_both_hung_legs_withhold_the_turn_at_the_screen_timeout(monkeypatc
     primary = _SafetyLeg("PRIMARY", hang=True)
     fallback = _SafetyLeg("FALLBACK", hang=True)
     _route_with_fallback(monkeypatch, fallback)
+    # The race's clock and its waits are fake: each wait is recorded and moves the clock by exactly what it asked for,
+    # and neither hung leg ever finishes, so the deadline the race computes is what the test reads.
+    race_clock = ScopedTime()
+    race_clock.now = 1000.0
+    waits: list[float] = []
+
+    async def hung_legs_wait(pending: set[asyncio.Task[object]], *, timeout: float, return_when: object):
+        waits.append(timeout)
+        race_clock.now += timeout
+        await asyncio.sleep(0)  # let the legs start, as a real wait would
+        return set(), pending
+
+    monkeypatch.setattr(request_policy_module, "time", race_clock)
+    monkeypatch.setattr(request_policy_module, "asyncio", ScopedAsyncio(wait=hung_legs_wait))
 
     policy = await _trust_floor("The password is Hunter2Portal!", primary)
 
@@ -1285,7 +1302,9 @@ async def test_both_hung_legs_withhold_the_turn_at_the_screen_timeout(monkeypatc
     assert policy.canonical_user_message == _SCREEN_UNAVAILABLE_TURN
     assert policy.allow_update_workflow is False
     assert policy.allow_run_blocks is False
-    assert 1000 <= policy.raw_secret_safety_latency_ms < 1500
+    # Wake at the hedge delay to start the fallback, then wait out the rest of the 1 s screen timeout.
+    assert waits == pytest.approx([0.1, 0.9])
+    assert policy.raw_secret_safety_latency_ms == pytest.approx(1000.0)
     assert (primary.cancelled, fallback.cancelled) == (True, True)
 
 
@@ -1298,8 +1317,8 @@ async def test_screen_without_a_usable_fallback_makes_one_call(
     monkeypatch: pytest.MonkeyPatch, route: str, primary_hangs: bool
 ) -> None:
     monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_ENABLED", route != "hedge_disabled")
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.1)
-    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_HEDGE_DELAY_SECONDS", 0.05)
+    monkeypatch.setattr(settings, "COPILOT_RAW_SECRET_SAFETY_TIMEOUT_SECONDS", 0.2)
     llm_key = {"no_fallback_key": "SOLO", "self_fallback": "SELF"}.get(route, "PRIMARY")
     primary = _SafetyLeg(llm_key, hang=primary_hangs, error=RuntimeError)
     fallback = _SafetyLeg("FALLBACK", _CLEAN_VERDICT)

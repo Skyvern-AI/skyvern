@@ -63,6 +63,8 @@ type UseWorkflowHistoryResult = {
    * being coalesced into the reorder snapshot.
    */
   captureImmediately: () => void;
+  // A Copilot draft that lands while an internal update is open would otherwise be absorbed into its drift.
+  captureNextAsUserEdit: () => void;
   canUndo: boolean;
   canRedo: boolean;
   /**
@@ -112,6 +114,7 @@ export function useWorkflowHistory({
   // fire to force a synchronous user-edit push for atomic composite
   // mutations like a reorder drop.
   const immediateCaptureRequestedRef = useRef(false);
+  const forceNextCaptureRef = useRef(false);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestNodesRef = useRef(nodes);
   const latestEdgesRef = useRef(edges);
@@ -160,6 +163,9 @@ export function useWorkflowHistory({
   // (because it was cloned before the begin/end subscribe fired).
   const commitSnapshot = useCallback(
     (snapshot: WorkflowSnapshot, options?: { forceAsUserEdit?: boolean }) => {
+      const forceAsUserEdit =
+        options?.forceAsUserEdit || forceNextCaptureRef.current;
+      forceNextCaptureRef.current = false;
       const current = historyRef.current;
 
       if (current.present === null) {
@@ -183,7 +189,7 @@ export function useWorkflowHistory({
       }
 
       if (
-        !options?.forceAsUserEdit &&
+        !forceAsUserEdit &&
         (wasInternalUpdateRef.current || storeState.internalUpdateCount > 0)
       ) {
         historyRef.current = replacePresent(current, snapshot);
@@ -281,6 +287,20 @@ export function useWorkflowHistory({
     flushPendingCapture();
     immediateCaptureRequestedRef.current = true;
   }, [flushPendingCapture]);
+
+  const captureNextAsUserEdit = useCallback(() => {
+    if (useWorkflowHasChangesStore.getState().internalUpdateCount === 0) return;
+    if (historyRef.current.present !== null)
+      historyRef.current = replacePresent(
+        historyRef.current,
+        cloneSnapshot(
+          latestNodesRef.current,
+          latestEdgesRef.current,
+          latestParametersRef.current,
+        ),
+      );
+    forceNextCaptureRef.current = true;
+  }, []);
 
   useEffect(() => {
     if (isApplyingRef.current) {
@@ -482,6 +502,7 @@ export function useWorkflowHistory({
       undo,
       redo,
       captureImmediately,
+      captureNextAsUserEdit,
       canUndo: flags.canUndo,
       canRedo: flags.canRedo,
       historyApplyTrigger,
@@ -490,6 +511,7 @@ export function useWorkflowHistory({
       undo,
       redo,
       captureImmediately,
+      captureNextAsUserEdit,
       flags.canUndo,
       flags.canRedo,
       historyApplyTrigger,

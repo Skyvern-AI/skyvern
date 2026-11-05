@@ -57,12 +57,6 @@ const engineOptions: Array<EngineOption & { value: RunEngine }> = [
     badge: "Enterprise",
     badgeVariant: "warning",
   },
-  {
-    value: RunEngine.YutoriNavigator,
-    label: "Yutori Navigator",
-    badge: "Deprecated",
-    badgeVariant: "default",
-  },
 ];
 
 const defaultEngines: Array<RunEngine> = [

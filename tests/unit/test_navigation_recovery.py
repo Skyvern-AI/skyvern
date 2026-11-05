@@ -233,6 +233,26 @@ class TestEvaluateWithNavigationRecovery:
         assert frame.evaluate.await_count == 2
 
 
+class TestEvaluateOnElement:
+    @pytest.mark.asyncio
+    async def test_destroyed_element_context_raises_without_recovering_the_frame(self) -> None:
+        frame = AsyncMock()
+        element = MagicMock()
+        element.evaluate = AsyncMock(
+            side_effect=PlaywrightError(
+                "ElementHandle.evaluate: Execution context was destroyed, most likely because of a navigation."
+            )
+        )
+
+        with pytest.raises(PlaywrightError, match="Execution context was destroyed"):
+            await SkyvernFrame.evaluate_on_element(
+                frame=frame, element=element, expression="(element) => element.id", timeout_ms=30000
+            )
+
+        frame.wait_for_load_state.assert_not_awaited()
+        frame.evaluate.assert_not_awaited()
+
+
 class TestGetElementVisible:
     @pytest.mark.asyncio
     async def test_stale_locator_context_reinjects_and_reresolves(self) -> None:

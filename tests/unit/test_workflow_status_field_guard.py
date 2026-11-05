@@ -15,6 +15,7 @@ status-write helpers call it.
 from __future__ import annotations
 
 import ast
+import unicodedata
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -51,7 +52,11 @@ def test_no_production_log_emits_workflow_status() -> None:
     offenders: list[str] = []
     for path in _python_files():
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            source = path.read_text(encoding="utf-8")
+            # The parser NFKC-normalizes identifiers, so a keyword spelled with compatibility forms matches too.
+            if _BANNED_KEYWORD not in unicodedata.normalize("NFKC", source):
+                continue
+            tree = ast.parse(source)
         except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - not our source
             continue
         for lineno, keyword in _log_call_keywords(tree):

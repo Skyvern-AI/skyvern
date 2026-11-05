@@ -143,14 +143,14 @@ Each person in an organization is an **Admin** or a **Member**, set on [Members]
 | **Admin** | Everything in the organization, including the admin-only actions below. |
 | **Member** | All day-to-day work: build, run and edit agents, manage credentials, and view runs and results. The app hides **Billing** and **API keys** from Members; opening either page shows **Organization admin access is required**. |
 
-These actions are refused for Members with `403`:
+By default, these actions are refused for Members with `403`:
 
 | Action | Who can do it |
 |---|---|
 | Create, change, enable, disable, replay or delete [event triggers](/developers/event-triggers), and rotate their signing secrets | An Admin signed in to the app |
 | Create, list, revoke or reissue additional organization API keys | An Admin signed in to the app |
 | Change or remove the organization's 1Password connection | An Admin, or a request with the organization API key |
-| Export the organization's audit log | An Admin, or a request with the organization API key |
+| Export the organization's [audit log](#audit-log) | An Admin, or a request with the organization API key |
 
 An API key can't manage API keys, event triggers or member roles, so a leaked key can't create a replacement for itself.
 
@@ -274,8 +274,11 @@ One credit is $0.001. Credits are charged for what the browser does:
 | Cached action, replayed from code without the AI | 15 ($0.015) |
 | Browser uptime | 200 per hour ($0.20) |
 | One-time code read from an email or text message | 10 ($0.01) |
+| Agent block tool call, including reads of the run's data (not counting `finish`) | 30 ($0.03) |
 
-A short login takes a few actions; a long multi-page run takes many more. Two job recipes have their own prices: applying to a job costs 200 credits per application (400 when it signs in with a saved login), and extracting a job posting costs 50 credits per attempt. Other recipes are billed like any other run.
+A short login takes a few actions; a long multi-page run takes many more. Two job recipes have their own prices: applying to a job costs 200 credits per application (400 when it signs in with a saved login), and extracting a job posting costs 50 credits per attempt. Other recipes are billed like any other run. The blocks an Agent block runs are billed as usual.
+
+A Code block that performs no browser actions is charged one cached action (15 credits) the first time it runs successfully in a workflow run. Later executions of the same block in that workflow run, such as loop iterations, that perform no browser actions are free. A retried run can be charged this minimum again.
 
 Under **Credit Usage** you see credits used and remaining for the current period, your daily burn rate, and when your balance will run out at that rate. Expand **Usage Breakdown** to split usage into **Regular Actions**, **Cached Actions**, **Browser Uptime** and **OTP Parses**.
 
@@ -343,6 +346,32 @@ When someone leaves, remove them here and [rotate the API key](#rotate-your-key)
 - **Labels** appears when labels are turned on for your organization.
 
 Vault connections (1Password, Bitwarden, Azure Key Vault, Custom Credential Service) are on [Integrations](/cloud/integrations#password-vaults), not in Settings.
+
+## Audit log
+
+Go to **Settings → Audit log**. By default, only Admins can open it; Members don't see it. Access requires `audit.export`, so another role with that grant can also use it when your organization enforces custom role grants.
+
+- **Changes** lists organization configuration and membership activity, including who acted, the action, the resource and the time.
+- **Runs** lists top-level workflow runs, including when they were created, who started them and their trigger.
+
+Many change events are best effort: a successful change can lack a row if the audit store fails or times out. RBAC role, grant and RBAC settings changes write their audit events in the same transaction as the change. Ordinary workflow and credential reads are not audited, so a missing entry is not proof that no activity occurred.
+
+Rows show who, what and when, where available. They are designed not to include request payloads, workflow parameter values or credential secrets; resource identifiers can include tag keys and values. Open **Details** on a row for more information.
+
+Choose **Date range** to view the last 24 hours, 7 days, 30 days or 90 days, or a **Custom range** within the last 90 days. The default is 30 days. On **Changes**, you can also filter by **Person**, **Action** and **Resource**; these filters aren't available on **Runs**. Use **Load more** to see further results.
+
+Click **Export CSV** to download the filtered tab. Downloads stop at 25,000 rows; narrow the date range or use the [paginated API](#export-with-the-api) for larger exports.
+
+### Export with the API
+
+Use an Admin session, a role granted `audit.export`, or your organization API key:
+
+- `GET /v1/audit-events/export` exports changes.
+- `GET /v1/audit-events/runs/export` exports runs.
+
+Both return JSON by default, or CSV with `format=csv`, newest first. The default window is the last 90 days. Both endpoints clamp an earlier `since` to the 90-day cutoff; a range entirely before it returns no rows. Change events are purged after 90 days, so export them before they age out. Set timezone-aware `since` and `until` to filter by time; the changes endpoint also accepts `actor_user_id`, `action` and `resource_type`.
+
+Pages default to 100 rows and contain at most 500 (`limit`). For the next page, pass the JSON `next` value or CSV `X-Next-Cursor` header as `cursor`. Keep the same filters and time bounds while paging.
 
 ## Your account
 

@@ -155,6 +155,31 @@ async def execute_blocks(
         block_output_count=len(block_outputs or {}),
     )
 
+    try:
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization.organization_id,
+        )
+        saved_workflow = await app.DATABASE.workflows.get_workflow_for_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization.organization_id,
+        )
+        if (
+            workflow_run is not None
+            and saved_workflow is not None
+            and workflow_run.workflow_run_id == workflow_run_id
+            and workflow_run.organization_id == organization.organization_id
+            and saved_workflow.organization_id == organization.organization_id
+            and saved_workflow.workflow_id == workflow_run.workflow_id
+            and not workflow_run.row_write_unconfirmed
+        ):
+            await app.AGENT_FUNCTION.prepare_powerbi_query_hop_tokens(
+                workflow_run=workflow_run, workflow=saved_workflow
+            )
+            await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=saved_workflow)
+    except Exception as exc:  # noqa: BLE001 - a missing capability must not prevent editor dispatch.
+        LOG.warning("Could not prepare Power BI hop for block run", error_type=type(exc).__name__)
+
     await AsyncExecutorFactory.get_executor().execute_workflow(
         request=request,
         background_tasks=background_tasks,

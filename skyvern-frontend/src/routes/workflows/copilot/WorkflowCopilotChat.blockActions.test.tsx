@@ -14,6 +14,7 @@ import {
 } from "./WorkflowCopilotChat";
 
 import { FeatureFlagContext } from "@/hooks/useFeatureFlag";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 
 type StreamBody = {
   message: string;
@@ -89,13 +90,20 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
 }));
 
-const { switchStudioRun } = vi.hoisted(() => ({
+const { switchStudioRun, navigate } = vi.hoisted(() => ({
   switchStudioRun: vi.fn(),
+  navigate: vi.fn(),
 }));
 
-vi.mock("@/routes/workflows/studio/runSwitchNavigation", () => ({
-  useSwitchStudioRun: () => switchStudioRun,
-}));
+vi.mock(
+  "@/routes/workflows/studio/runSwitchNavigation",
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import("@/routes/workflows/studio/runSwitchNavigation")
+    >()),
+    useSwitchStudioRun: () => switchStudioRun,
+  }),
+);
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
@@ -105,7 +113,7 @@ vi.mock("react-router-dom", async (importOriginal) => {
     ...actual,
     useParams: () => routeParams.current,
     useSearchParams: () => [new URLSearchParams(), vi.fn()],
-    useNavigate: () => vi.fn(),
+    useNavigate: () => navigate,
     useLocation: () => ({
       pathname: "/",
       search: "",
@@ -259,6 +267,7 @@ const runStartedFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
 
 beforeEach(() => {
   switchStudioRun.mockClear();
+  navigate.mockClear();
   reopenEditor.mockClear();
   focusedRun.current = undefined;
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -646,6 +655,123 @@ describe("WorkflowCopilotChat — studio run focus", () => {
     streamCalls[0]!.onMessage(blockProgressFrame({ workflow_run_id: "wr_1" }));
     await waitFor(() => expect(timelineGet).toHaveBeenCalledTimes(1));
     expect(switchStudioRun).toHaveBeenCalledTimes(1);
+  });
+});
+
+const toolCallFrame = (overrides: Partial<Record<string, unknown>> = {}) => ({
+  type: "tool_call",
+  tool_name: "run_browser_code",
+  display_label: "Working in the browser",
+  tool_input: {},
+  iteration: 0,
+  tool_call_id: "call_1",
+  timestamp: "2026-06-10T00:00:00Z",
+  browser_session_id: "pbs_debug",
+  ...overrides,
+});
+
+describe("WorkflowCopilotChat — Copilot's own browser in the studio pane", () => {
+  beforeEach(() =>
+    useStudioBrowserStore.setState({ copilotTurnActive: false }),
+  );
+  afterEach(() => {
+    window.history.replaceState(null, "", "/");
+    navigate.mockReset();
+  });
+
+  it("pins the pane to the browser a tool call acts in, replacing the entry", async () => {
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=copilot");
+    await renderChat(makeDockedProps());
+    await submit("build a workflow");
+
+    streamCalls[0]!.onMessage(toolCallFrame());
+
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ search: "?wr=wr_1&wrs=pbs_debug" }),
+      expect.objectContaining({ replace: true }),
+    );
+  });
+
+  it("moves the pin to the run's browser when a later call names it", async () => {
+    navigate.mockImplementation((to: { search: string }) =>
+      window.history.replaceState(null, "", `/${to.search}`),
+    );
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=copilot");
+    await renderChat(makeDockedProps());
+    await submit("build a workflow");
+
+    streamCalls[0]!.onMessage(toolCallFrame());
+    streamCalls[0]!.onMessage(
+      toolCallFrame({ tool_call_id: "call_2", browser_session_id: "pbs_run" }),
+    );
+
+    expect(window.location.search).toBe("?wr=wr_1&wrs=pbs_run");
+  });
+
+  it.each([
+    ["undocked", {}, "?wr=wr_1&wrs=copilot", {}],
+    [
+      "carrying no browser id",
+      makeDockedProps(),
+      "?wr=wr_1&wrs=copilot",
+      { browser_session_id: null },
+    ],
+    ["on a run the user opened", makeDockedProps(), "?wr=wr_user", {}],
+  ])(
+    "leaves the URL alone for a tool call %s",
+    async (_case, props, search, frame) => {
+      window.history.replaceState(null, "", `/${search}`);
+      await renderChat(props);
+      await submit("build a workflow");
+
+      streamCalls[0]!.onMessage(toolCallFrame(frame));
+
+      expect(navigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("drops a pin an earlier turn left in the URL when a new turn starts", async () => {
+    window.history.replaceState(null, "", "/?wr=wr_1&wrs=pbs_debug");
+    await renderChat(makeDockedProps());
+    expect(navigate).not.toHaveBeenCalled();
+
+    await submit("build a workflow");
+
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ search: "?wr=wr_1&wrs=copilot" }),
+      expect.objectContaining({ replace: true }),
+    );
+  });
+
+  it("tells the pane a docked turn is active only while it runs", async () => {
+    await renderChat(makeDockedProps());
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false);
+
+    await submit("build a workflow");
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(true);
+
+    await act(async () => {
+      streamCalls[0]!.resolve();
+    });
+    await waitFor(() =>
+      expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false),
+    );
+  });
+
+  it("clears the active turn when the chat unmounts mid-turn", async () => {
+    const view = await renderChat(makeDockedProps());
+    await submit("build a workflow");
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(true);
+
+    view.unmount();
+
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false);
+  });
+
+  it("never reports an undocked turn to the pane", async () => {
+    await renderChat({});
+    await submit("build a workflow");
+    expect(useStudioBrowserStore.getState().copilotTurnActive).toBe(false);
   });
 });
 

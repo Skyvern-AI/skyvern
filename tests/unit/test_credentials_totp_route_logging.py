@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 import structlog.testing
 from fastapi import HTTPException, Response
+from fastapi.openapi.utils import get_openapi
+from fastapi.routing import APIRoute
 
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.routes import credentials
@@ -278,8 +280,13 @@ async def test_send_totp_code_insufficient_credits_persists_raw_within_cap(
 
 def test_send_totp_code_openapi_declares_200_totp_code_and_402_no_202(monkeypatch: pytest.MonkeyPatch) -> None:
     fastapi_app = shared_route_app(monkeypatch)
+    totp_route = next(
+        route for route in fastapi_app.routes if isinstance(route, APIRoute) and route.path == "/v1/credentials/totp"
+    )
 
-    responses = fastapi_app.openapi()["paths"]["/v1/credentials/totp"]["post"]["responses"]
+    responses = get_openapi(title="totp", version="0", routes=[totp_route])["paths"]["/v1/credentials/totp"]["post"][
+        "responses"
+    ]
     assert responses["200"]["content"]["application/json"]["schema"]["$ref"].endswith("/TOTPCode")
     assert "202" not in responses
     assert responses["402"]["description"] == "Insufficient credits to parse OTP content"

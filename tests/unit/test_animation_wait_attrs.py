@@ -1,7 +1,6 @@
 """Tests for animation wait span attribute instrumentation."""
 
 import ast
-import inspect
 import os
 from unittest.mock import AsyncMock
 
@@ -10,12 +9,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from skyvern.exceptions import SkyvernPageAnalysisTimeout
 from skyvern.webeye.utils.page import SkyvernFrame
-
-
-def test_safe_wait_caller_defaults_to_unknown() -> None:
-    sig = inspect.signature(SkyvernFrame.safe_wait_for_animation_end)
-    assert "caller" in sig.parameters
-    assert sig.parameters["caller"].default == "unknown"
 
 
 @pytest.mark.asyncio

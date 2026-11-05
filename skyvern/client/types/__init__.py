@@ -284,7 +284,6 @@ if typing.TYPE_CHECKING:
         GetRunResponse_TaskV3,
         GetRunResponse_UiTars,
         GetRunResponse_WorkflowRun,
-        GetRunResponse_YutoriNavigator,
     )
     from .google_sheets_read_block import GoogleSheetsReadBlock
     from .google_sheets_read_block_parameters_item import (
@@ -1089,7 +1088,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "GetRunResponse_TaskV3": ".get_run_response",
     "GetRunResponse_UiTars": ".get_run_response",
     "GetRunResponse_WorkflowRun": ".get_run_response",
-    "GetRunResponse_YutoriNavigator": ".get_run_response",
     "GoogleSheetsReadBlock": ".google_sheets_read_block",
     "GoogleSheetsReadBlockParametersItem": ".google_sheets_read_block_parameters_item",
     "GoogleSheetsReadBlockParametersItem_AwsSecret": ".google_sheets_read_block_parameters_item",
@@ -1871,7 +1869,6 @@ __all__ = [
     "GetRunResponse_TaskV3",
     "GetRunResponse_UiTars",
     "GetRunResponse_WorkflowRun",
-    "GetRunResponse_YutoriNavigator",
     "GoogleSheetsReadBlock",
     "GoogleSheetsReadBlockParametersItem",
     "GoogleSheetsReadBlockParametersItem_AwsSecret",

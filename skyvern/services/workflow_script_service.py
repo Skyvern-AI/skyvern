@@ -25,6 +25,7 @@ from skyvern.core.script_generations.transform_workflow_run import (
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.services.browser_session_artifacts import browser_session_artifact_system_read
 from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, is_adaptive_caching
 from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate, ScriptStatus
@@ -1000,10 +1001,11 @@ async def generate_workflow_script(
             cached_block_sources = await _load_cached_script_block_sources(cached_script, workflow.organization_id)
 
         adaptive = is_adaptive_caching(workflow, workflow_run)
-        codegen_input = await transform_workflow_run_to_code_gen_input(
-            workflow_run_id=workflow_run.workflow_run_id,
-            organization_id=workflow.organization_id,
-        )
+        with browser_session_artifact_system_read():
+            codegen_input = await transform_workflow_run_to_code_gen_input(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=workflow.organization_id,
+            )
 
         block_labels = [block.get("label") for block in codegen_input.workflow_blocks if block.get("label")]
 

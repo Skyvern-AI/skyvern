@@ -61,6 +61,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     resolve_terminal_status,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from skyvern.schemas.browser_session_kind import COPILOT_PRESTART_RUNNABLE_TYPE
 from skyvern.schemas.browser_settings import BrowserSettings, BrowserSettingsReceipt, requested_timezone_id
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, parse_proxy_location_input
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
@@ -925,6 +926,24 @@ class BrowserSessionsRepository(BaseRepository):
             return None
 
     @read_retry()
+    @db_operation("get_persistent_browser_session_ids_by_runnable_ids", log_errors=False)
+    async def get_persistent_browser_session_ids_by_runnable_ids(
+        self, runnable_ids: set[str], organization_id: str
+    ) -> set[str]:
+        if not runnable_ids:
+            return set()
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(PersistentBrowserSessionModel.persistent_browser_session_id).where(
+                    PersistentBrowserSessionModel.runnable_id.in_(runnable_ids),
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                    PersistentBrowserSessionModel.completed_at.is_(None),
+                )
+            )
+            return set(rows)
+
+    @read_retry()
     @db_operation("get_persistent_browser_session", log_errors=False)
     async def get_persistent_browser_session(
         self,
@@ -1154,6 +1173,28 @@ class BrowserSessionsRepository(BaseRepository):
                     PersistentBrowserSessionModel.status.in_(("created", "running", "retry")),
                 )
                 .values(runnable_type=dispatched_runnable_type)
+                .returning(PersistentBrowserSessionModel.persistent_browser_session_id)
+            )
+            await session.commit()
+            return result.first() is not None
+
+    @db_operation("claim_copilot_prestart")
+    async def claim_copilot_prestart(self, *, session_id: str, organization_id: str) -> bool:
+        async with self.Session() as session:
+            result = await session.scalars(
+                update(PersistentBrowserSessionModel)
+                .where(
+                    PersistentBrowserSessionModel.persistent_browser_session_id == session_id,
+                    PersistentBrowserSessionModel.organization_id == organization_id,
+                    PersistentBrowserSessionModel.runnable_type == COPILOT_PRESTART_RUNNABLE_TYPE,
+                    PersistentBrowserSessionModel.runnable_id.is_(None),
+                    PersistentBrowserSessionModel.deleted_at.is_(None),
+                    PersistentBrowserSessionModel.completed_at.is_(None),
+                    PersistentBrowserSessionModel.close_requested_at.is_(None),
+                    PersistentBrowserSessionModel.cdp_unreachable_at.is_(None),
+                    PersistentBrowserSessionModel.status.in_(("created", "running", "retry")),
+                )
+                .values(runnable_type=None, claimed_at=naive_utc_now())
                 .returning(PersistentBrowserSessionModel.persistent_browser_session_id)
             )
             await session.commit()

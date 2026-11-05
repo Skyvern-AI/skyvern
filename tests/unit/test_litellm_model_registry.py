@@ -4,15 +4,7 @@ import litellm
 import pytest
 from litellm.utils import _invalidate_model_cost_lowercase_map
 
-from tests.unit.litellm_model_registry import (
-    GPT56_LITELLM_MODELS,
-    RESTORED_PROVIDERS,
-    registered_gpt56_litellm_models,
-)
-
-
-def test_gpt56_models_use_only_providers_whose_registry_is_restored() -> None:
-    assert {entry["litellm_provider"] for entry in GPT56_LITELLM_MODELS.values()} <= RESTORED_PROVIDERS
+from tests.unit.litellm_model_registry import GPT56_LITELLM_MODELS, registered_gpt56_litellm_models
 
 
 def test_registered_gpt56_models_resolve_inside_and_leave_no_trace(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -193,6 +193,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
     CopilotCancelSource,
     CopilotFailureKind,
+    CopilotInFlightTurn,
     CopilotPendingTurn,
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
@@ -452,6 +453,9 @@ def _assistant_execution_receipts(
 ) -> dict[str, set[str]]:
     # Each turn writes a cumulative snapshot that already retracts failed runs, so the newest one wins.
     for message in reversed(chat_messages):
+        if message.sender == WorkflowCopilotChatSender.AI and message._narrative_payload_unreadable is True:
+            # Its receipts may have retracted older ones, so an unreadable snapshot is the boundary.
+            return {}
         payload = message.narrative_payload
         if (
             message.sender == WorkflowCopilotChatSender.AI
@@ -2276,6 +2280,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         preserve_completion_contract=False,
         validate_code_block_templates=False,
         preserve_redacted_credential_references_from=original_workflow,
+        prior_definition=original_workflow.workflow_definition,
     )
     # A shielded finalizer runs in a child task with a copied context, so the marker has to be a
     # mutable object shared by reference rather than a value set through the ContextVar.
@@ -4025,13 +4030,16 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
             # credential wait, while an unrelated stale turn must eventually
             # reconcile even if the auxiliary cache remains unavailable.
             continue
-        claimed = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
+        claim = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
             organization_id=organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             turn_id=entry.turn_id,
             claim_before=abandoned_before,
         )
-        if not claimed:
+        if claim == "refused":
+            continue
+        entry.recovering_at = datetime.now(UTC)
+        if claim == "recovering":
             continue
         try:
             await _recover_interrupted_copilot_turn(chat, organization_id, entry)
@@ -4318,11 +4326,33 @@ async def workflow_copilot_chat_history(
             organization.organization_id, chat.workflow_copilot_chat_id, question_interactions
         )
     pending_ids = {item.interaction_id for item in question_interactions if item.status == "pending"}
+    answered_turn_ids = {
+        message.turn_outcome.copilot_turn_id for message in chat_messages if message.turn_outcome is not None
+    }
+    live_entry = max(
+        (
+            entry
+            for entry in (chat.pending_turns.values() if chat else [])
+            if entry.turn_id not in answered_turn_ids and entry.recovering_at is None
+        ),
+        key=lambda entry: _as_utc(entry.started_at),
+        default=None,
+    )
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
         request_browser_allocations=request_browser_allocations,
+        in_flight_turn=(
+            CopilotInFlightTurn(
+                turn_id=live_entry.turn_id,
+                cancel_token=live_entry.cancel_token,
+                latest_draft=live_entry.latest_draft,
+                latest_draft_at=live_entry.latest_draft_at,
+            )
+            if live_entry is not None
+            else None
+        ),
         question_interactions=question_interactions,
         pending_question_cancel_token=next(
             (
@@ -4933,6 +4963,10 @@ async def workflow_copilot_demonstration_control(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)") from exc
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)")
+    if control_request.action == "note" and not (control_request.text or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="text is required when action is 'note'"
+        )
     if control_request.action == "fill_credential" and not (
         control_request.credential_id and control_request.selector and control_request.field
     ):

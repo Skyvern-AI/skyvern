@@ -14,6 +14,7 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
+from skyvern.forge.sdk.copilot.agent_context import RegisteredDownloadTextError
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
     BuildTestConnectFailure,
     build_test_connect_failure_sentence,
@@ -113,6 +114,7 @@ TerminalCause = Literal[
     "saved_profile_unresolved",
     "saved_profile_not_applied",
     "unsaved_browser_profile_pick",
+    "browser_start_capacity",
 ]
 BuildTestPacketLocatorUnobservedReason = Literal[
     "worker_owned_run",
@@ -416,6 +418,36 @@ class BuildTestPacketDownload(BaseModel):
     file_name: str | None = None
     # Rendered by the run's own code, so it is not evidence that a site delivered a file.
     generated: Literal[True] | None = None
+    text: str | None = None
+    page_count: int | None = None
+    char_count: int | None = None
+    truncated: bool | None = None
+    text_layer_problem: str | None = None
+    error: RegisteredDownloadTextError | None = None
+
+
+DOWNLOAD_TEXT_PAST_FILE_LIMIT = "downloads[].text omitted for registered downloads past the per-run file limit."
+DOWNLOAD_TEXT_OVER_SIZE_LIMIT = "downloads[].text omitted for a registered download over the per-file size limit."
+DOWNLOAD_TEXT_PAST_CHAR_LIMIT = "downloads[].text omitted past the per-run download text limit."
+DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT = (
+    "downloads[].text omitted for registered downloads read after one exceeded its parse time limit."
+)
+DOWNLOAD_TEXT_AFTER_TIME_LIMIT = (
+    "downloads[].text omitted for registered downloads not read before the copilot time limit."
+)
+DOWNLOAD_TEXT_WITHHELD = "downloads[].text withheld: this run's secret values are not registered for redaction yet."
+DOWNLOAD_TEXT_OVER_PACKET_LIMIT = "downloads[].text shortened to keep the packet under its character limit."
+DOWNLOAD_TEXT_OMISSION_NOTICES = frozenset(
+    {
+        DOWNLOAD_TEXT_PAST_FILE_LIMIT,
+        DOWNLOAD_TEXT_OVER_SIZE_LIMIT,
+        DOWNLOAD_TEXT_PAST_CHAR_LIMIT,
+        DOWNLOAD_TEXT_AFTER_PARSE_TIMEOUT,
+        DOWNLOAD_TEXT_AFTER_TIME_LIMIT,
+        DOWNLOAD_TEXT_WITHHELD,
+        DOWNLOAD_TEXT_OVER_PACKET_LIMIT,
+    }
+)
 
 
 class BuildTestPacketScreenshot(BaseModel):
@@ -1575,6 +1607,8 @@ def _required_input_unbound_outcome(
         key_provenance={
             "structural_failure_identity": (
                 "resolution-seam unbound required parameter keys referenced by the failed block"
+                if failed_block is not None
+                else "blank inputs that run-context init resolves as required login credential fields"
             )
         },
     )
@@ -1595,6 +1629,7 @@ def recorded_outcome_from_run_blocks_result(
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
     runtime_failure_class: str | None = None,
+    blank_login_credential_input_keys: Sequence[str] = (),
 ) -> RecordedBuildTestOutcome | None:
     outcome = _recorded_outcome_from_run_blocks_result(
         result,
@@ -1610,6 +1645,7 @@ def recorded_outcome_from_run_blocks_result(
         block_shape_hashes=block_shape_hashes,
         block_associations_by_label=block_associations_by_label,
         runtime_failure_class=runtime_failure_class,
+        blank_login_credential_input_keys=blank_login_credential_input_keys,
     )
     if outcome is None:
         return None
@@ -1636,6 +1672,7 @@ def _recorded_outcome_from_run_blocks_result(
     block_shape_hashes: Mapping[str, str] | None = None,
     block_associations_by_label: Mapping[str, str] | None = None,
     runtime_failure_class: str | None = None,
+    blank_login_credential_input_keys: Sequence[str] = (),
 ) -> RecordedBuildTestOutcome | None:
     data = _dict(result.get("data"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
@@ -1685,6 +1722,7 @@ def _recorded_outcome_from_run_blocks_result(
         failed_block,
         unbound_required_parameter_keys or [],
         block_parameter_keys or {},
+        blank_login_credential_input_keys,
     )
     graded_page_evidence = page_evidence if _post_run_page_evidence_matches_result(data, page_evidence) else None
     page_refs = _page_evidence_refs(graded_page_evidence)
@@ -2433,8 +2471,15 @@ def _referenced_unbound_input_keys(
     failed_block: Mapping[str, object] | None,
     unbound_required_parameter_keys: Sequence[str],
     block_parameter_keys: Mapping[str, Sequence[str]],
+    blank_login_credential_input_keys: Sequence[str],
 ) -> list[str]:
-    if bool(result.get("ok")) is not False or failed_block is None:
+    if bool(result.get("ok")) is not False:
+        return []
+    if failed_block is None:
+        data = _dict(result.get("data"))
+        # Login credentials resolve at run-context init, which fails before any block runs or a watchdog acts.
+        if data.get("blocks") == [] and data.get("control_signal") is None:
+            return list(dict.fromkeys(blank_login_credential_input_keys))
         return []
     label = _safe_str(failed_block.get("label"))
     referenced = block_parameter_keys.get(label) if label else None

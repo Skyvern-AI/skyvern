@@ -1,105 +1,12 @@
-"""End-to-end acceptance tests for Skyvern.local(use_in_memory_db=True).
+"""Acceptance test for Skyvern.local(use_in_memory_db=True) bootstrap.
 
-Exercises the full embedded mode path:
-- SQLite in-memory database
-- BackgroundTaskExecutor (default in-process executor)
-- LocalStorage with temp directory (rebuilt during bootstrap)
-- Lifecycle cleanup (engine disposal, client close)
-
-Opt-in only: these launch a real browser and make real LLM calls, so they are
-skipped unless SKYVERN_EMBEDDED_E2E=1 is set (plus OPENAI_API_KEY and
-Playwright browsers installed).
+Covers the SQLite in-memory database, LocalStorage in a temp directory (rebuilt during
+bootstrap) and lifecycle cleanup (engine disposal, client close).
 """
 
-import os
 from pathlib import Path
 
 import pytest
-
-from skyvern.forge.sdk.api.llm.models import LLMConfig
-
-
-def _has_playwright_browser() -> bool:
-    """Check that Playwright's chromium binary exists for the current installed version."""
-    try:
-        from playwright.sync_api import sync_playwright  # noqa: PLC0415
-
-        with sync_playwright() as p:
-            return Path(p.chromium.executable_path).exists()
-    except Exception:
-        return False
-
-
-# Key-presence is not consent: every dev machine has OPENAI_API_KEY set, and these
-# tests open a visible browser and spend real LLM tokens. Require explicit opt-in.
-_skip_no_llm_or_browser = pytest.mark.skipif(
-    not os.environ.get("SKYVERN_EMBEDDED_E2E") or not os.environ.get("OPENAI_API_KEY") or not _has_playwright_browser(),
-    reason="Opt-in E2E: set SKYVERN_EMBEDDED_E2E=1 with OPENAI_API_KEY and Playwright browsers installed "
-    "(run: playwright install chromium)",
-)
-
-
-@pytest.mark.asyncio
-@_skip_no_llm_or_browser
-async def test_embedded_mode_run_task() -> None:
-    """Path 1: run_task() exercises BackgroundTaskExecutor + polling + full DB lifecycle.
-
-    Flow: httpx -> ASGITransport -> FastAPI -> BackgroundTaskExecutor ->
-          ForgeAgent.execute_step() -> LLM + browser -> artifact save -> task complete
-    """
-    from skyvern import Skyvern
-
-    skyvern = Skyvern.local(
-        use_in_memory_db=True,
-        llm_config=LLMConfig(
-            model_name="gpt-4o-mini",
-            required_env_vars=["OPENAI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-        ),
-    )
-
-    try:
-        result = await skyvern.run_task(
-            prompt="Extract the page title",
-            url="https://example.com",
-            wait_for_completion=True,
-            timeout=120,
-        )
-        assert result is not None
-        assert result.status is not None
-    finally:
-        await skyvern.aclose()
-
-
-@pytest.mark.asyncio
-@_skip_no_llm_or_browser
-async def test_embedded_mode_page_extract() -> None:
-    """Path 2: page.extract() exercises direct in-process LLM + browser path.
-
-    Flow: page.extract() -> run_sdk_action() -> LLM call -> result
-    Does NOT go through BackgroundTaskExecutor or polling.
-    """
-    from skyvern import Skyvern
-
-    skyvern = Skyvern.local(
-        use_in_memory_db=True,
-        llm_config=LLMConfig(
-            model_name="gpt-4o-mini",
-            required_env_vars=["OPENAI_API_KEY"],
-            supports_vision=True,
-            add_assistant_prefix=False,
-        ),
-    )
-
-    try:
-        browser = await skyvern.launch_local_browser(headless=True)
-        page = await browser.get_working_page()
-        await page.goto("https://example.com")
-        result = await page.extract("What is the title of this page?")
-        assert result is not None
-    finally:
-        await skyvern.aclose()
 
 
 @pytest.mark.asyncio

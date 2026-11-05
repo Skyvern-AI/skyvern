@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.browser_target import (
     BROWSER_TARGET_PARAM_NAME,
     BrowserTarget,
     resolve_browser_session_binding,
+    tool_accepts_target,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_missing as composition_page_evidence_missing,
@@ -106,6 +107,11 @@ from skyvern.forge.sdk.copilot.tools.credential_deletion import (
     credential_delete_enabled,
     delete_saved_credentials,
 )
+from skyvern.forge.sdk.copilot.tools.event_triggers import (
+    create_webhook_trigger_tool,
+    list_workflow_triggers_tool,
+    test_trigger_mapping_tool,
+)
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_DESCRIPTION as LOCATOR_INSPECTION_TOOL_DESCRIPTION
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_NAME as LOCATOR_INSPECTION_TOOL_NAME
 from skyvern.forge.sdk.copilot.tools.locator_inspection import TOOL_SCHEMA as LOCATOR_INSPECTION_TOOL_SCHEMA
@@ -167,6 +173,11 @@ from .browser_code import (
 from .browser_session_extension import TOOL_DESCRIPTION as SESSION_EXTENSION_TOOL_DESCRIPTION
 from .browser_session_extension import TOOL_NAME as SESSION_EXTENSION_TOOL_NAME
 from .browser_session_extension import extend_browser_session
+from .chat_history import DEFAULT_LIMIT as CHAT_HISTORY_DEFAULT_LIMIT
+from .chat_history import EARLIER_UNAVAILABLE_ERROR as CHAT_HISTORY_UNAVAILABLE_ERROR
+from .chat_history import TOOL_DESCRIPTION as CHAT_HISTORY_TOOL_DESCRIPTION
+from .chat_history import TOOL_NAME as CHAT_HISTORY_TOOL_NAME
+from .chat_history import read_chat_history
 from .completion import _build_run_evidence_snapshot as _build_run_evidence_snapshot
 from .completion import _completion_verification_handler as _completion_verification_handler
 from .completion import _is_outcome_evidence_candidate as _is_outcome_evidence_candidate
@@ -1480,10 +1491,6 @@ async def run_blocks_tool(
     and return compact debug output (status, failure reason, visible elements).
     The workflow must be saved before running blocks.
     Block labels must match labels in the saved workflow.
-    A run that starts at the first block opens a fresh browser loaded with the saved browser
-    profile, if any, that a normal run of the saved workflow would load. A profile that is only
-    staged in a proposal is not loaded until the workflow is saved with it, except the profile the
-    user saved by signing in from the credential card this turn: a draft that selects it loads it now.
 
     If an existing saved block can establish the state you need, run that
     block unchanged before scouting the resulting page.
@@ -2184,6 +2191,35 @@ async def read_attached_pdf_tool(ctx: RunContextWrapper, file_id: str, offset: i
 
 
 @function_tool(
+    failure_error_function=copilot_tool_failure,
+    name_override=CHAT_HISTORY_TOOL_NAME,
+    description_override=CHAT_HISTORY_TOOL_DESCRIPTION,
+)
+async def read_chat_history_tool(
+    ctx: RunContextWrapper, cursor: str | None = None, limit: int = CHAT_HISTORY_DEFAULT_LIMIT
+) -> str:
+    authority_error = _authority_tool_error(ctx.context, CHAT_HISTORY_TOOL_NAME)
+    if authority_error:
+        return _diagnosis_repair_tool_error(ctx.context, CHAT_HISTORY_TOOL_NAME, authority_error)
+    rows = ctx.context.earlier_chat_history_rows()
+    result: dict[str, Any] = (
+        {"ok": False, "error": CHAT_HISTORY_UNAVAILABLE_ERROR}
+        if ctx.context.earlier_chat_history_unavailable
+        else read_chat_history(rows, cursor, limit, ctx.context.chat_history_oldest_shown_id)
+    )
+    LOG.info(
+        "copilot_chat_history_read",
+        ok=result["ok"],
+        snapshot_rows=len(rows),
+        returned_rows=len(result.get("messages", [])),
+        with_cursor=cursor is not None,
+        turn_id=ctx.context.turn_id,
+    )
+    record_tool_step_result_for_ctx(ctx.context, CHAT_HISTORY_TOOL_NAME, {"cursor": cursor, "limit": limit}, result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@function_tool(
     failure_error_function=copilot_tool_failure, name_override="inspect_page_for_composition", strict_mode=False
 )
 async def inspect_page_for_composition_tool(
@@ -2498,6 +2534,9 @@ NATIVE_TOOLS = [
     offer_demonstration_tool,
     read_google_sheet_tool,
     get_organization_usage_quota_tool,
+    list_workflow_triggers_tool,
+    test_trigger_mapping_tool,
+    create_webhook_trigger_tool,
     run_blocks_tool,
     test_workflow_from_blank_browser_tool,
     get_run_results_tool,
@@ -2514,6 +2553,7 @@ NATIVE_TOOLS = [
     extend_browser_session_tool,
     upload_attached_file_tool,
     read_attached_pdf_tool,
+    read_chat_history_tool,
     run_workflow_for_accounts_tool,
     get_account_group_status_tool,
     cancel_account_group_tool,
@@ -2555,8 +2595,7 @@ _PAGE_STATE_TOOL_NAMES = (
 def _with_page_state(tool: FunctionTool) -> FunctionTool:
     """Stamp the page the call's browser shows once the tool returns onto its JSON object result."""
     invoke = tool.on_invoke_tool
-    properties = tool.params_json_schema.get("properties")
-    accepts_target = isinstance(properties, dict) and BROWSER_TARGET_PARAM_NAME in properties
+    accepts_target = tool_accepts_target(tool)
 
     # Annotated ToolContext for the same reason as current_page_inspection_tool: the runner forks a bare
     # context for a RunContextWrapper annotation, and the delegate reads tool_name off it.
@@ -2648,6 +2687,24 @@ def _with_executed_source_param(tool: FunctionTool, *, browser_code_available: b
     return dataclasses.replace(tool, params_json_schema=schema)
 
 
+BUILD_TEST_BROWSER_START = (
+    "A test that starts at the workflow's first block runs in a new browser with no cookies or storage, unless a "
+    "normal run of the saved workflow would load a saved browser profile; then it loads that profile. A profile "
+    "that is only staged in a proposal is not loaded until the workflow is saved with it, except the profile the "
+    "user saved by signing in from the credential card this turn: a draft that selects it loads it now. A test "
+    "whose first blocks are already verified and unchanged may start at the first block that is not. A test that "
+    "starts at a later block with the earlier blocks verified continues in the browser that ran them when that "
+    "browser is where the test starts. A later-block test instead runs every block it asked for in a new browser "
+    "when that browser is not where it starts. It does the same when the tested blocks sign in or fill a "
+    "credential. It does the same when a block before its start branches or jumps, or a later block jumps back "
+    "before it. That new browser starts as described above when the blocks it asked for begin at the first "
+    "block, and with no cookies or storage otherwise. In every other case a later-block test runs in this chat's "
+    "browser."
+)
+_BUILD_TEST_TOOL_NAMES = frozenset(
+    {EDIT_BLOCK_AND_RUN_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, run_blocks_tool.name}
+)
+
 _LIST_INTEGRATIONS_RUN_GUIDANCE = (
     "For a build-and-test request, pass the completed workflow and the bound block label to "
     f"`{UPDATE_AND_RUN_BLOCKS_TOOL_NAME}` in the same turn; do not stop at `{UPDATE_WORKFLOW_TOOL_NAME}`."
@@ -2693,6 +2750,8 @@ def copilot_native_tools(
             )
         if tool.name in _EXECUTED_SOURCE_PARAMS:
             tool = _with_executed_source_param(tool, browser_code_available=browser_code_available)
+        if tool.name in _BUILD_TEST_TOOL_NAMES:
+            tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{BUILD_TEST_BROWSER_START}")
         if tool.name == list_integrations_tool.name and run_tools_available:
             tool = dataclasses.replace(tool, description=f"{tool.description}\n\n{_LIST_INTEGRATIONS_RUN_GUIDANCE}")
         if tool.name in AUTHORING_GUIDANCE_TOOL_NAMES:

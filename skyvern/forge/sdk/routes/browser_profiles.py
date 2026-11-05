@@ -35,6 +35,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_BROWSER_PROFILE_CODE_SAMPLE_PYTHON,
     UPDATE_BROWSER_PROFILE_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.browser_profiles import (
     BrowserProfile,
@@ -55,7 +56,11 @@ from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy
 from skyvern.schemas.proxy_pinning import should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.utils.contained_effects import contained_effect
-from skyvern.webeye.browser_profile_utils import FRESH_PROFILE_COPY_IGNORE, valid_operator_profile_generation
+from skyvern.webeye.browser_profile_utils import (
+    FRESH_PROFILE_COPY_IGNORE,
+    ROOT_STORE_COMPONENT_DIRS,
+    valid_operator_profile_generation,
+)
 from skyvern.webeye.profile_cookie_merge import cookies_for_login_urls, sanitize_cookies, write_signin_cookies
 
 try:
@@ -229,8 +234,8 @@ async def create_browser_profile(
     include_in_schema=False,
 )
 async def list_browser_profiles(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(10, ge=1, le=MAX_PAGE_SIZE),
     include_deleted: bool = Query(default=False, description="Include deleted browser profiles"),
     search_key: str | None = Query(
         None,
@@ -717,7 +722,8 @@ def _clear_directory(directory: FilePath) -> None:
 
 def _copy_browser_profile_template(source_dir: FilePath, destination_dir: FilePath) -> None:
     for source_child in source_dir.iterdir():
-        if source_child.name in FRESH_PROFILE_COPY_IGNORE:
+        # The new profile is not tied to a browser yet, so it does not inherit the template browser's root store.
+        if source_child.name in FRESH_PROFILE_COPY_IGNORE or source_child.name in ROOT_STORE_COMPONENT_DIRS:
             continue
 
         destination_child = destination_dir / source_child.name

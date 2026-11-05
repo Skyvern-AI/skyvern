@@ -15,6 +15,8 @@ def test_copy_browser_profile_template_excludes_cookie_sidecars(tmp_path: Path) 
     (source / SESSION_COOKIES_FILENAME).write_text("[]")
     (source / BANKED_COOKIES_FILENAME).write_text("[]")
     (source / SIGNIN_COOKIES_FILENAME).write_text("[]")
+    # The new profile is not tied to a browser, so it must not inherit the template browser's root store either.
+    (source / "PKIMetadata" / "72.0.0.0").mkdir(parents=True)
 
     dest = tmp_path / "profile"
     dest.mkdir()
@@ -24,5 +26,6 @@ def test_copy_browser_profile_template_excludes_cookie_sidecars(tmp_path: Path) 
     assert SESSION_COOKIES_FILENAME not in copied
     assert BANKED_COOKIES_FILENAME not in copied
     assert SIGNIN_COOKIES_FILENAME not in copied
+    assert "PKIMetadata" not in copied
     assert "Local State" in copied  # a normal file still copies, so the exclusion is targeted
     assert (dest / "Default" / "Preferences").exists()

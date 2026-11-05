@@ -32,6 +32,8 @@ function EmailInboxBlockFormBody({
     () => ({
       emailClient: data.emailClient,
       credentialId: data.credentialId,
+      credentialSource: data.credentialSource,
+      connectionId: data.connectionId,
       folder: data.folder,
       prompt: data.prompt,
       sender: data.sender,
@@ -45,6 +47,8 @@ function EmailInboxBlockFormBody({
     [
       data.emailClient,
       data.credentialId,
+      data.credentialSource,
+      data.connectionId,
       data.folder,
       data.prompt,
       data.sender,

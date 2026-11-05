@@ -10,9 +10,18 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { useContext } from "react";
 
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { AxiosError } from "axios";
+
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
+import {
+  useWorkflowYamlEditorStore,
+  type YamlCommitOwner,
+} from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 
 import { DocEditBar, DocStepPicker } from "./DocEditing";
+import { caretOnEdge } from "./docCaret";
 import { DocStepHeader } from "./DocStep";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { createDocEditApi, TOP_SCOPE } from "./docEditApi";
@@ -28,6 +37,17 @@ const catalogState = vi.hoisted(() => ({
     | undefined,
 }));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
+vi.mock("./useDocRun", () => ({
+  useDocRun: () => ({
+    runId: undefined,
+    run: undefined,
+    blocksByLabel: new Map(),
+    loopsByLabel: new Map(),
+    live: false,
+    blockRun: false,
+    unknownLabels: new Set(),
+  }),
+}));
 vi.mock("@/hooks/useIntegrationCatalogQuery", () => ({
   useIntegrationCatalogQuery: () => ({ data: catalogState.data }),
 }));
@@ -37,6 +57,18 @@ afterEach(() => {
   save.mockClear();
   catalogState.data = undefined;
   useCopilotActionStore.setState({ pendingGoalChanges: [] });
+  useWorkflowHistoryAccessStore.getState().reset();
+  useWorkflowSnapshotStore.getState().clearSnapshot();
+  useWorkflowHasChangesStore.setState({ hasChanges: false });
+});
+
+describe("Doc edit bar row", () => {
+  test("an idle bar reserves its phone row only when it floats", () => {
+    const { container, rerender } = render(<DocEditBar floating />);
+    expect(container.querySelector('[aria-hidden="true"]')).toBeTruthy();
+    rerender(<DocEditBar />);
+    expect(container.querySelector('[aria-hidden="true"]')).toBe(null);
+  });
 });
 
 describe("Doc Save", () => {
@@ -47,7 +79,7 @@ describe("Doc Save", () => {
         { label: "read_total", goal: "Read the total", previousGoal: "Old" },
       ],
     });
-    render(<DocEditBar problems={0} />);
+    render(<DocEditBar />);
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -57,11 +89,86 @@ describe("Doc Save", () => {
 
   test("saves straight away when no Goal is pending", () => {
     useWorkflowHasChangesStore.setState({ hasChanges: true });
-    render(<DocEditBar problems={0} />);
+    render(<DocEditBar />);
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  test("Cmd+S saves the Doc and keeps the browser's own save out", () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    render(<DocEditBar />);
+
+    const proceeded = fireEvent.keyDown(document.body, {
+      key: "s",
+      metaKey: true,
+    });
+
+    expect(proceeded).toBe(false);
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failed save says why, keeps the edit and offers Try again", async () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    save.mockRejectedValueOnce(new AxiosError("Network Error", "ERR_NETWORK"));
+    render(<DocEditBar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(
+      await screen.findByText(/Couldn't save: can't reach the server/),
+    ).toBeTruthy();
+    expect(screen.queryByText("Unsaved changes")).toBe(null);
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText(/Couldn't save/)).toBe(null));
+  });
+
+  test("a failed save releases its own workflow's lock, not the one now open", async () => {
+    const a: YamlCommitOwner = { workflowPermanentId: "wpid_a", active: true };
+    const b: YamlCommitOwner = { workflowPermanentId: "wpid_b", active: true };
+    const pending = (owner: YamlCommitOwner) => ({
+      owner,
+      kind: "save" as const,
+      persisting: true,
+    });
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: a,
+      pendingSaves: { wpid_a: pending(a), wpid_b: pending(b) },
+    });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    save.mockImplementationOnce(async () => {
+      useWorkflowYamlEditorStore.setState({ editorOwner: b });
+      throw new AxiosError("Network Error", "ERR_NETWORK");
+    });
+    render(<DocEditBar />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await screen.findByText(/Couldn't save/);
+    const pendingSaves = useWorkflowYamlEditorStore.getState().pendingSaves;
+    expect(pendingSaves.wpid_a).toBeUndefined();
+    expect(pendingSaves.wpid_b?.persisting).toBe(true);
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: null,
+      pendingSaves: {},
+    });
+  });
+
+  test("says Saved, not Unsaved, once the doc is back at the saved version", async () => {
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    useWorkflowSnapshotStore.setState({
+      snapshot: {} as never,
+      userHasEdited: true,
+      contentDirty: false,
+    });
+    useWorkflowHistoryAccessStore.setState({ canRedo: true });
+    render(<DocEditBar floating />);
+
+    await waitFor(() => expect(screen.getByText("Saved")).toBeTruthy());
+    expect(useWorkflowHasChangesStore.getState().hasChanges).toBe(false);
+    expect(screen.queryByText("Unsaved changes")).toBe(null);
   });
 });
 
@@ -159,5 +266,50 @@ describe("Add a step search", () => {
     const options = screen.getAllByRole("option");
     expect(options[0]!.textContent).toMatch(/^Wait/);
     expect(options[0]!.getAttribute("aria-selected")).toBe("true");
+  });
+
+  test("the words the Doc shows put Conditional and Loop first, even when another group mentions them", () => {
+    render(<DocStepPicker onPick={() => {}} />);
+    const input = screen.getByPlaceholderText("Add a step…");
+    fireEvent.change(input, { target: { value: "If" } });
+    expect(screen.getAllByRole("option")[0]!.textContent).toMatch(
+      /^Conditional/,
+    );
+    fireEvent.change(input, { target: { value: "For" } });
+    expect(screen.getAllByRole("option")[0]!.textContent).toMatch(/^Loop/);
+  });
+});
+
+describe("caretOnEdge", () => {
+  test("a caret with no box in the middle of wrapped text is not on an edge", () => {
+    const rect = (top: number, height: number) =>
+      ({ top, bottom: top + height, height }) as DOMRect;
+    const el = document.createElement("div");
+    el.contentEditable = "true";
+    el.textContent = "first wrapped line second wrapped line";
+    el.getBoundingClientRect = () => rect(0, 40);
+    document.body.appendChild(el);
+    const proto = Range.prototype as unknown as Record<string, unknown>;
+    const saved = [proto.getClientRects, proto.getBoundingClientRect];
+    // jsdom has no layout: a collapsed caret has no box, and the one character next to it sits on the second line.
+    proto.getBoundingClientRect = () => rect(0, 0);
+    proto.getClientRects = function (this: Range) {
+      return this.startOffset === 25 && this.endOffset === 26
+        ? [rect(20, 20)]
+        : [];
+    };
+    try {
+      const text = el.firstChild as Text;
+      const range = document.createRange();
+      range.setStart(text, 25);
+      range.collapse(true);
+      window.getSelection()!.removeAllRanges();
+      window.getSelection()!.addRange(range);
+      expect(caretOnEdge(el, "first")).toBe(false);
+      expect(caretOnEdge(el, "last")).toBe(true);
+    } finally {
+      [proto.getClientRects, proto.getBoundingClientRect] = saved;
+      el.remove();
+    }
   });
 });

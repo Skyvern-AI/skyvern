@@ -12,9 +12,15 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import record_request_audit_event
 from skyvern.forge.sdk.artifact.models import Artifact
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.routes.pagination import MAX_INT4, MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    browser_session_artifact_read,
+    redact_workflow_run_artifact_rows,
+)
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.schemas.scripts import (
     ClearCacheResponse,
     CreateScriptRequest,
@@ -379,7 +385,7 @@ async def get_script_versions(
 )
 async def get_script_version_code(
     script_id: str = Path(..., description="The script ID"),
-    version: int = Path(..., description="The version number"),
+    version: int = Path(..., ge=1, le=MAX_INT4, description="The version number"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ScriptBlocksResponse:
     """Get a specific version's code blocks."""
@@ -476,7 +482,7 @@ async def compare_script_versions(
 )
 async def get_script_version_detail(
     script_id: str = Path(..., description="The script ID"),
-    version: int = Path(..., description="The version number"),
+    version: int = Path(..., ge=1, le=MAX_INT4, description="The version number"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ScriptVersionDetailResponse:
     """Get full detail for a specific script version, including code blocks and metadata."""
@@ -539,12 +545,14 @@ async def get_scripts(
     page: int = Query(
         1,
         ge=1,
+        le=MAX_PAGE,
         description="Page number for pagination",
         examples=[1],
     ),
     page_size: int = Query(
         10,
         ge=1,
+        le=MAX_PAGE_SIZE,
         description="Number of items per page",
         examples=[10],
     ),
@@ -887,12 +895,14 @@ async def get_workflow_cache_key_values(
     page: int = Query(
         1,
         ge=1,
+        le=MAX_PAGE,
         description="Page number for pagination",
         examples=[1],
     ),
     page_size: int = Query(
         100,
         ge=1,
+        le=MAX_PAGE_SIZE,
         description="Number of items per page",
         examples=[100],
     ),
@@ -1044,7 +1054,7 @@ async def list_workflow_scripts(
 async def get_script_runs(
     script_id: str = Path(..., description="The script ID"),
     page_size: int = Query(50, ge=1, le=100),
-    version: int | None = Query(None, description="Filter runs to a specific script version"),
+    version: int | None = Query(None, ge=1, le=MAX_INT4, description="Filter runs to a specific script version"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> ScriptRunsResponse:
     """Get workflow runs associated with a specific script, with status counts."""
@@ -1085,18 +1095,21 @@ async def get_script_runs(
         created_before=created_before,
     )
 
+    summaries = [
+        ScriptRunSummary(
+            workflow_run_id=r.workflow_run_id,
+            status=r.status or "unknown",
+            started_at=r.started_at,
+            finished_at=r.finished_at,
+            created_at=r.created_at,
+            failure_reason=r.failure_reason,
+        )
+        for r in runs
+    ]
+    with browser_session_artifact_read(get_request_principal()):
+        summaries = await redact_workflow_run_artifact_rows(summaries, organization_id)
     return ScriptRunsResponse(
-        runs=[
-            ScriptRunSummary(
-                workflow_run_id=r.workflow_run_id,
-                status=r.status or "unknown",
-                started_at=r.started_at,
-                finished_at=r.finished_at,
-                created_at=r.created_at,
-                failure_reason=r.failure_reason,
-            )
-            for r in runs
-        ],
+        runs=summaries,
         total_count=total_count,
         status_counts=status_counts,
         avg_fallbacks_per_run=avg_fallbacks_per_run,
@@ -1500,7 +1513,7 @@ async def review_script_with_instructions(
 async def get_fallback_episodes(
     workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
-    page: int = Query(1, ge=1, description="Page number"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Page size"),
     workflow_run_id: str | None = Query(None, description="Filter by workflow run ID"),
     block_label: str | None = Query(None, description="Filter by block label"),

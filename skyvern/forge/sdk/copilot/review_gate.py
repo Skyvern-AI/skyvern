@@ -59,7 +59,9 @@ class NarrativeReviewInput(TypedDict):
 class NarrativeReviewProjection(TypedDict):
     blocks: list[NarrativeReviewBlock]
     duplicateWrites: list[NarrativeDuplicateWrite]
-    inputs: list[NarrativeReviewInput]
+    # Payload keys are additive: a card persisted before a key existed must still validate on read,
+    # so every key added after the first release stays NotRequired even though the writer always emits it.
+    inputs: NotRequired[list[NarrativeReviewInput]]
     keptNotes: NotRequired[list[str]]
     keptDescriptions: NotRequired[list[str]]
 

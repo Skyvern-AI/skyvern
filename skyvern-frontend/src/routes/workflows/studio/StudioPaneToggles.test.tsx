@@ -27,6 +27,8 @@ import { useStudioRunSignals } from "./useStudioRunSignals";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPanes } from "./useStudioPanes";
 import { StudioPaneToggles } from "./StudioPaneToggles";
+import { type StudioPaneId } from "./panes";
+import { StudioShellContext } from "./StudioShellContext";
 import { claimRunCompletionNotice } from "../workflowRun/runCompletionNotices";
 
 test("completion claims retain the 500 most recently used run IDs", () => {
@@ -355,6 +357,125 @@ describe("StudioPaneToggles run selector", () => {
     expect(currentPanes()?.split(",")).not.toContain("overview");
   });
 
+  test("at phone width the run control shows an open run pane instead of closing it", () => {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches: query === "(max-width: 719px)",
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    );
+    const showPane = vi.fn();
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/workflows/wpid_abc/studio?panes=copilot,overview&wr=wr_current",
+        ]}
+      >
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <StudioShellContext.Provider
+            value={{
+              copilotPortalEl: null,
+              panelPortalEl: null,
+              setEditorStreamSlot: () => {},
+              setBrowserStreamSlot: () => {},
+              setRunStreamSlot: () => {},
+              showPane,
+            }}
+          >
+            <ToggleHarness />
+          </StudioShellContext.Provider>
+        </StudioPaneDefaultsProvider>
+      </MemoryRouter>,
+    );
+
+    try {
+      fireEvent.click(tab("View Run: wr_current"));
+
+      expect(currentPanes()?.split(",")).toContain("overview");
+      expect(showPane).toHaveBeenCalledWith("overview");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  test("a pane folded for the Doc is shown, not closed, by its toggle", () => {
+    const showPane = vi.fn();
+    render(
+      <MemoryRouter
+        initialEntries={["/workflows/wpid_abc/studio?panes=copilot,browser"]}
+      >
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <StudioShellContext.Provider
+            value={{
+              copilotPortalEl: null,
+              panelPortalEl: null,
+              setEditorStreamSlot: () => {},
+              setBrowserStreamSlot: () => {},
+              setRunStreamSlot: () => {},
+              showPane,
+              isPaneFolded: (id) => id === "browser",
+            }}
+          >
+            <ToggleHarness />
+          </StudioShellContext.Provider>
+        </StudioPaneDefaultsProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(tab(/^Browser/));
+
+    expect(currentPanes()?.split(",")).toContain("browser");
+    expect(showPane).toHaveBeenCalledWith("browser");
+  });
+
+  const renderFolded = (
+    path: string,
+    showPane: (id: StudioPaneId) => void,
+    folded: StudioPaneId[] = ["browser"],
+  ) =>
+    render(
+      <MemoryRouter initialEntries={[path]}>
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <StudioShellContext.Provider
+            value={{
+              copilotPortalEl: null,
+              panelPortalEl: null,
+              setEditorStreamSlot: () => {},
+              setBrowserStreamSlot: () => {},
+              setRunStreamSlot: () => {},
+              showPane,
+              isPaneFolded: (id) => folded.includes(id),
+            }}
+          >
+            <ToggleHarness />
+          </StudioShellContext.Provider>
+        </StudioPaneDefaultsProvider>
+      </MemoryRouter>,
+    );
+
+  test("opening a closed pane from its toggle asks to show it, since it may fold as it opens", () => {
+    const showPane = vi.fn();
+    // Closed, so not folded yet: only the render after the open can fold it.
+    renderFolded("/workflows/wpid_abc/studio?panes=copilot", showPane, []);
+
+    fireEvent.click(tab(/^Browser/));
+
+    expect(currentPanes()?.split(",")).toContain("browser");
+    expect(showPane).toHaveBeenCalledWith("browser");
+  });
+
+  test("a folded Browser's toggle flags new activity", () => {
+    useStudioBrowserStore.setState({ hasUnseenActivity: true });
+    try {
+      renderFolded("/workflows/wpid_abc/studio?panes=copilot,browser", vi.fn());
+      expect(tab("Browser, new activity")).toBeTruthy();
+    } finally {
+      useStudioBrowserStore.setState({ hasUnseenActivity: false });
+    }
+  });
+
   test("the separate Past runs button opens the selector without toggling the run pane", async () => {
     renderAt("/workflows/wpid_abc/studio?panes=copilot&wr=wr_current");
 
@@ -383,6 +504,45 @@ describe("StudioPaneToggles run selector", () => {
     expect(urlPanes()).toBeNull();
     expect(screen.getByTestId("search").textContent).toBe("?wr=wr_pick");
     await waitFor(() => expect(screen.queryByText("wr_pick")).toBeNull());
+  });
+
+  test("selecting a run asks the shell to show the Run pane (phone view)", async () => {
+    infiniteRunsMock.mockReturnValue(
+      infiniteRuns([
+        {
+          workflow_run_id: "wr_pick",
+          status: Status.Completed,
+          created_at: "2026-07-20T00:00:00Z",
+        },
+      ]),
+    );
+    const showPane = vi.fn();
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/workflows/wpid_abc/studio?panes=overview&wr=wr_other",
+        ]}
+      >
+        <StudioPaneDefaultsProvider hasBlocks={true}>
+          <StudioShellContext.Provider
+            value={{
+              copilotPortalEl: null,
+              panelPortalEl: null,
+              setEditorStreamSlot: () => {},
+              setBrowserStreamSlot: () => {},
+              setRunStreamSlot: () => {},
+              showPane,
+            }}
+          >
+            <ToggleHarness />
+          </StudioShellContext.Provider>
+        </StudioPaneDefaultsProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(tab("Past Runs"));
+    fireEvent.click(await screen.findByText("wr_pick"));
+
+    expect(showPane).toHaveBeenCalledWith("overview");
   });
 
   test("does not carry the previous run's route state through a switch-then-open", async () => {

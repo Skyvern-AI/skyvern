@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.core.script_generations.real_skyvern_page_ai import _render_template_with_label
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
 from skyvern.forge import app
@@ -51,19 +52,34 @@ from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
+from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models import agent_step_loop, agent_step_tools
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
+from skyvern.forge.sdk.workflow.models.block import ConditionalBlock, ExtractionBlock, HttpRequestBlock, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import (
     PLATFORM_SMTP_AWS_KEYS,
     AWSSecretParameter,
     WorkflowParameter,
     WorkflowParameterType,
 )
-from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
 from skyvern.schemas.llm import LLMConfig
-from skyvern.schemas.workflows import AgentStepBlockYAML, BlockResult, BlockStatus, BlockType
+from skyvern.schemas.workflows import (
+    AgentStepBlockYAML,
+    AWSSecretParameterYAML,
+    BlockResult,
+    BlockStatus,
+    BlockType,
+    BranchConditionYAML,
+    BranchCriteriaYAML,
+    ConditionalBlockYAML,
+    SendEmailBlockYAML,
+    WorkflowDefinitionYAML,
+)
+from skyvern.services import script_service
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.copilot_test_helpers import scripted_call, scripted_text, tool_outputs_for
+from tests.unit.test_context_manager import _initialize_smtp_workflow, _make_workflow, _platform_email
 from tests.unit.test_send_email_block import offline_address_validation  # noqa: F401
 
 RUN = "wr_agent_step"
@@ -232,6 +248,8 @@ async def _run_agent_block(
     max_turns: int = 25,
     prompt: str = "Find the answer.",
     tools: list[str] | None = sorted(agent_step_tools.tool_descriptions()),
+    parameter_keys: list[str] | None = None,
+    stored_tools: list[str] | None = None,
     **block_fields: bool,
 ) -> tuple[BlockResult, _FlagProvider]:
     """With no model, the block resolves the variant's real model, which sends through litellm.acompletion."""
@@ -242,9 +260,21 @@ async def _run_agent_block(
             agent_step_loop, "resolve_agent_model", lambda _key: (model, RunConfig(tracing_disabled=True))
         )
     block = block_yaml_to_block(
-        AgentStepBlockYAML(label="agent", prompt=prompt, max_turns=max_turns, tools=tools, **block_fields),
-        {"agent_output": make_block_output_parameter("agent_output")},
+        AgentStepBlockYAML(
+            label="agent",
+            prompt=prompt,
+            max_turns=max_turns,
+            tools=tools,
+            parameter_keys=parameter_keys,
+            **block_fields,
+        ),
+        {
+            "agent_output": make_block_output_parameter("agent_output"),
+            **app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters,
+        },
     )
+    if stored_tools is not None:
+        block = AgentStepBlock.model_validate({**block.model_dump(), "tools": stored_tools})
     return await block.execute_safe(workflow_run_id=RUN, organization_id=ORG), provider
 
 
@@ -438,19 +468,21 @@ def _credential_parameter() -> WorkflowParameter:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tools", "credential", "offered", "block_types"),
+    ("tools", "credential", "listed", "offered", "block_types"),
     [
         (
             ["http_request", "web_search"],
             False,
+            False,
             ["web_search", "run_block", "read_run_data", "finish"],
             ["http_request"],
         ),
-        (None, False, ["read_run_data", "finish"], None),
-        ([], False, ["read_run_data", "finish"], None),
-        (["web_search"], False, ["web_search", "read_run_data", "finish"], None),
-        (["login", "page_goto"], False, ["read_run_data", "page_goto", "finish"], None),
-        (["login", "page_goto"], True, ["login", "read_run_data", "page_goto", "finish"], None),
+        (None, False, False, ["read_run_data", "finish"], None),
+        ([], False, False, ["read_run_data", "finish"], None),
+        (["web_search"], False, False, ["web_search", "read_run_data", "finish"], None),
+        (["login", "page_goto"], False, False, ["read_run_data", "page_goto", "finish"], None),
+        (["login", "page_goto"], True, False, ["read_run_data", "page_goto", "finish"], None),
+        (["login", "page_goto"], True, True, ["login", "read_run_data", "page_goto", "finish"], None),
     ],
 )
 async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_run_data(
@@ -458,6 +490,7 @@ async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_ru
     database: AgentDB,
     tools: list[str] | None,
     credential: bool,
+    listed: bool,
     offered: list[str],
     block_types: list[str] | None,
 ) -> None:
@@ -466,7 +499,9 @@ async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_ru
         app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters["login_credential"] = _credential_parameter()
     model = _ScriptedModel([VALID_FINISH])
 
-    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=tools)
+    await _run_agent_block(
+        monkeypatch, LUNA_MEDIUM, model, tools=tools, parameter_keys=["login_credential"] if listed else None
+    )
 
     (given,) = model.tools
     assert [tool.name for tool in given] == offered
@@ -478,6 +513,32 @@ async def test_a_step_is_offered_only_the_tools_it_lists_with_finish_and_read_ru
     assert run_block.params_json_schema["properties"]["block_type"]["enum"] == block_types
     described = {name for name in agent_step_tools.RUN_BLOCK_TYPES if f"- {name}(" in run_block.description}
     assert described == set(block_types)
+
+
+@pytest.mark.asyncio
+async def test_a_stored_step_listing_pdf_parser_is_offered_file_url_parser(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    model = _ScriptedModel([VALID_FINISH])
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=[], stored_tools=["pdf_parser"])
+
+    (given,) = model.tools
+    assert [tool.name for tool in given] == ["run_block", "read_run_data", "finish"]
+    run_block = next(tool for tool in given if isinstance(tool, FunctionTool) and tool.name == "run_block")
+    assert run_block.params_json_schema["properties"]["block_type"]["enum"] == ["file_url_parser"]
+    offered = [
+        [tool.name, tool.description, tool.params_json_schema] for tool in given if isinstance(tool, FunctionTool)
+    ]
+    assert len(offered) == len(given)
+    assert "pdf_parser" not in json.dumps(offered)
+
+
+def test_a_saved_list_naming_pdf_parser_reads_as_file_url_parser() -> None:
+    block = AgentStepBlockYAML(label="agent", prompt="Find the answer.", tools=["pdf_parser", "file_url_parser"])
+
+    assert block.tools == ["file_url_parser"]
 
 
 @pytest.mark.asyncio
@@ -508,6 +569,7 @@ def test_a_tool_the_step_cannot_be_given_fails_at_save_and_the_error_lists_the_v
     message = str(error.value)
     assert f"Unknown tools [{name!r}]" in message
     assert ", ".join(sorted(agent_step_tools.tool_descriptions())) in message
+    assert "pdf_parser" not in message
 
 
 def test_a_tools_list_validates_without_openai_agents() -> None:
@@ -703,7 +765,90 @@ def test_every_block_type_is_an_agent_tool_or_says_why_not() -> None:
             assert tool
             continue
         assert tool.yaml_class.model_fields["block_type"].default == block_type
-        assert set(tool.fields) - {"credential"} <= set(tool.yaml_class.model_fields)
+        assert set(tool.fields) - {"credential", "files"} <= set(tool.yaml_class.model_fields)
+
+
+CHILD_OUTPUT = "agent_text_prompt_1_output"
+UPLOAD = {"url": "https://example.com", "navigation_goal": "Upload the file"}
+HTTP_UPLOAD = {
+    "block_type": "http_request",
+    "arguments": {"method": "POST", "url": "https://example.com", "files": {"document": "{{ fax_file }}"}},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_child", "call", "handed", "allowed"),
+    [
+        (None, ("browser_task", {**UPLOAD, "files": ["fax_file"]}), (["fax_file"], None), None),
+        (None, ("browser_task", {**UPLOAD, "files": ["nope"]}), None, ["fax_file"]),
+        (None, ("browser_task", {**UPLOAD, "files": ["login_credential"]}), None, ["fax_file"]),
+        ("completed", ("browser_task", {**UPLOAD, "files": [CHILD_OUTPUT]}), ([CHILD_OUTPUT], None), None),
+        ("completed", ("browser_task", {**UPLOAD, "files": ["agent_text_prompt_1"]}), None, ["fax_file", CHILD_OUTPUT]),
+        ("failed", ("browser_task", {**UPLOAD, "files": [CHILD_OUTPUT]}), None, ["fax_file"]),
+        (None, ("run_block", HTTP_UPLOAD), ([], HTTP_UPLOAD["arguments"]["files"]), None),
+    ],
+)
+async def test_browser_task_hands_over_only_this_runs_files_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    first_child: str | None,
+    call: tuple[str, dict[str, Any]],
+    handed: tuple[list[str], dict[str, str] | None] | None,
+    allowed: list[str] | None,
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    now = datetime.now(UTC)
+    fax_file = WorkflowParameter(
+        key="fax_file",
+        workflow_parameter_id="wp_fax",
+        workflow_parameter_type=WorkflowParameterType.FILE_URL,
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+    context.parameters |= {"fax_file": fax_file, "login_credential": _credential_parameter()}
+    # A value left by an earlier execution of this step, whose child labels repeat.
+    context.values |= {"fax_file": "file_123", CHILD_OUTPUT: {"llm_response": "stale"}}
+    declared = dict(context.parameters)
+    if first_child == "failed":
+
+        async def fail(*_: object, **__: object) -> NoReturn:
+            raise RuntimeError("model unavailable")
+
+        monkeypatch.setattr(app, "SECONDARY_LLM_API_HANDLER", fail)
+    handed_over: list[tuple[list[str], dict[str, str] | None]] = []
+
+    async def capture(block: TaskBlock | HttpRequestBlock, *_: object, **__: object) -> BlockResult:
+        files = block.files if isinstance(block, HttpRequestBlock) else None
+        handed_over.append(([parameter.key for parameter in block.parameters], files))
+        return BlockResult(
+            success=True,
+            output_parameter=block.output_parameter,
+            output_parameter_value={},
+            status=BlockStatus.completed,
+        )
+
+    monkeypatch.setattr(TaskBlock, "execute", capture)
+    monkeypatch.setattr(HttpRequestBlock, "execute", capture)
+    script: list[_Turn] = [[scripted_call(*call, call_id="task")], VALID_FINISH]
+    if first_child:
+        run = {"block_type": "text_prompt", "arguments": {"prompt": "Split the fax"}}
+        script.insert(0, [scripted_call("run_block", run, call_id="split")])
+    model = _ScriptedModel(script)
+
+    await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task", "text_prompt", "http_request"])
+
+    report = json.loads(tool_outputs_for(model.inputs[-1][1], "task")[0])
+    if allowed is None:
+        assert report["status"] == "completed"
+        assert handed_over == [handed]
+    else:
+        assert report["status"] == "invalid_arguments"
+        assert str(allowed) in report["error"]
+        assert handed_over == []
+    assert context.parameters == declared
 
 
 EMAIL = {"sender": "agent@example.com", "subject": "Report", "body": "Done."}
@@ -711,10 +856,346 @@ EMAIL = {"sender": "agent@example.com", "subject": "Report", "body": "Done."}
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("offline_address_validation")
-async def test_a_send_email_child_sends_through_the_platform_smtp_secrets(
+@pytest.mark.parametrize("scope_platform_smtp", [False, True])
+@pytest.mark.parametrize("alias", [False, True])
+async def test_static_platform_email_and_unrelated_agent_run_without_exposing_smtp(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, page: SimpleNamespace, scope_platform_smtp: bool, alias: bool
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "platform_smtp_scoping_required", AsyncMock(return_value=scope_platform_smtp)
+    )
+    enforce = AsyncMock(side_effect=PermissionError("credential not accessible") if scope_platform_smtp else None)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_workflow_context_credential_use", enforce)
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+    workflow = _make_workflow([])
+    secret_key = "mail_password" if alias else "smtp_password"
+    parameters = (
+        [AWSSecretParameterYAML(key=secret_key, aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"])] if alias else []
+    )
+    static_email = _platform_email()
+    if alias:
+        static_email = static_email.model_copy(update={"smtp_password_secret_parameter_key": secret_key})
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=parameters,
+            workflow_system_prompt="Rules: {{ incoming }}",
+            blocks=[static_email, AgentStepBlockYAML(label="agent", prompt="Read {{ incoming }}")],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    platform_values = dict(
+        zip(PLATFORM_SMTP_AWS_KEYS.values(), ("smtp.example.com", "587", "sender-user", "smtp-password"), strict=True)
+    )
+    aws_client = MagicMock(get_secret=AsyncMock(side_effect=platform_values.get))
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+    context.workflow_run_id = RUN
+    context.organization_id = ORG
+    app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN] = context
+    placeholder = context.values[secret_key]
+    original_values = {key: context.values[key] for key in context.platform_smtp_parameter_keys()}
+    context.values["incoming"] = {
+        secret_key: placeholder,
+        "text": f"prefix {placeholder} suffix",
+        "literal": "smtp-password",
+    }
+    context.workflow_run_outputs["snapshot"] = {
+        secret_key: placeholder,
+        "nested": {"token": placeholder},
+        "snapshot_text": json.dumps({secret_key: placeholder}),
+        "plaintext_snapshot": json.dumps({secret_key: "smtp-password"}),
+        "count": 1587,
+    }
+    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_downloaded_files=AsyncMock(return_value=[])))
+    child_system_prompts: list[str | None] = []
+
+    async def child_llm(prompt: str, prompt_name: str, system_prompt: str | None = None, **_: object) -> dict[str, str]:
+        if prompt_name == "generate-workflow-run-block-description":
+            return {"summary": "description"}
+        child_system_prompts.append(system_prompt)
+        return {"llm_response": "done"}
+
+    async def extract(prompt: str, schema: dict[str, Any] | None = None, **kwargs: str | None) -> str:
+        child_system_prompts.append(kwargs.get("system_prompt", context.resolve_effective_workflow_system_prompt()))
+        return "done"
+
+    monkeypatch.setattr(app, "SECONDARY_LLM_API_HANDLER", child_llm)
+    page.extract.side_effect = extract
+    model = _ScriptedModel(
+        [
+            [scripted_call("read_run_data", {}, call_id="index")],
+            [scripted_call("read_run_data", {"name": "snapshot"}, call_id="snapshot")],
+            [
+                scripted_call(
+                    "run_block", {"block_type": "text_prompt", "arguments": {"prompt": "Continue"}}, call_id="text"
+                )
+            ],
+            [scripted_call("page_extract", {"prompt": "the title"}, call_id="extract")],
+            [scripted_call("run_block", {"block_type": "wait", "arguments": {"wait_sec": 1}}, call_id="wait")],
+            [
+                scripted_call(
+                    "run_block",
+                    {"block_type": "send_email", "arguments": {**EMAIL, "recipients": ["ops@example.com"]}},
+                    call_id="email",
+                )
+            ],
+            [scripted_call("finish", {"answer": "done"}, call_id="finish")],
+        ]
+    )
+
+    with (
+        skyvern_context.scoped(SkyvernContext(workflow_run_id=RUN, organization_id=ORG)),
+        patch("smtplib.SMTP") as smtp,
+    ):
+        result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, prompt="Read {{ incoming }}")
+        static_result = await workflow.workflow_definition.blocks[0].execute_safe(
+            workflow_run_id=RUN, organization_id=ORG
+        )
+
+    assert result.status == BlockStatus.completed
+    assert static_result.status == BlockStatus.completed
+    assert smtp.call_count == 2
+    assert {key: context.values[key] for key in original_values} == original_values
+    assert not set(original_values) & set(_tool_output(model, "index")["parameters"])
+    assert _tool_output(model, "snapshot")["output"]["count"] == 1587
+    exposed = json.dumps(model.inputs, default=str)
+    assert not any(value in exposed for value in original_values.values())
+    assert "smtp-password" not in exposed
+    assert len(child_system_prompts) == 2
+    assert placeholder not in json.dumps(child_system_prompts)
+    assert "smtp-password" not in json.dumps(child_system_prompts)
+    enforce.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["smtp_password", "mail_password"])
+async def test_agent_tool_cannot_read_platform_smtp_parameters(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, name: str
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    now = datetime.now(UTC)
+    parameter = AWSSecretParameter(
+        key=name,
+        aws_secret_parameter_id="asp_test",
+        workflow_id="w_1",
+        aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"],
+        created_at=now,
+        modified_at=now,
+    )
+    placeholder = context.register_secret_value("platform-password")
+    context.parameters[name] = parameter
+    context.values[name] = placeholder
+    context._platform_smtp_secret_ids[placeholder] = parameter.aws_key
+    model = _ScriptedModel([[scripted_call("read_run_data", {"name": name}, call_id="read")]])
+
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+
+    assert result.status == BlockStatus.failed
+    assert placeholder not in json.dumps(model.inputs, default=str)
+    assert "platform-password" not in json.dumps(model.inputs, default=str)
+
+
+def _register_platform_parameter(context: WorkflowRunContext, key: str, field: str, secret: str) -> str:
+    now = datetime.now(UTC)
+    parameter = AWSSecretParameter(
+        key=key,
+        aws_secret_parameter_id="asp_test",
+        workflow_id="w_1",
+        aws_key=PLATFORM_SMTP_AWS_KEYS[field],
+        created_at=now,
+        modified_at=now,
+    )
+    placeholder = context.register_secret_value(secret)
+    context.parameters[key] = parameter
+    context.values[key] = placeholder
+    context._platform_smtp_secret_ids[placeholder] = parameter.aws_key
+    return placeholder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("port_value", ["587", 587])
+@pytest.mark.parametrize("short_secret", ["abc", "abcdefg"])
+async def test_smtp_port_does_not_mask_unrelated_agent_values(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, port_value: str | int, short_secret: str
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    port_placeholder = _register_platform_parameter(context, "smtp_port", "smtp_port", "587")
+    context.secrets[port_placeholder] = port_value
+    _register_platform_parameter(context, "short_password", "smtp_password", short_secret)
+    context.values.update(amount=587, ordinary=short_secret)
+    context.inherited_workflow_system_prompt = "System {{ ordinary | upper }}"
+    context.workflow_run_outputs["snapshot"] = {
+        "amount": 587,
+        "port_text": "587",
+        "ordinary": short_secret,
+        "uppercase": short_secret.upper(),
+    }
+    model = _ScriptedModel(
+        [
+            [scripted_call("read_run_data", {"name": "snapshot"}, call_id="snapshot")],
+            [scripted_call("finish", {"answer": "done"}, call_id="finish")],
+        ]
+    )
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=RUN, organization_id=ORG)):
+        previous = TaskBlock(
+            label="previous", output_parameter=make_block_output_parameter("previous_output"), title=""
+        )
+        assert (
+            previous.format_block_parameter_template_from_workflow_run_context("{{ ordinary | upper }}", context)
+            == short_secret.upper()
+        )
+        assert script_service.render_template("{{ ordinary | upper }}") == short_secret.upper()
+        assert real_skyvern_page_ai.render_template("{{ ordinary | upper }}") == short_secret.upper()
+        result, _ = await _run_agent_block(
+            monkeypatch,
+            LUNA_MEDIUM,
+            model,
+            prompt="Amount {{ amount }}, next {{ amount + 1 }}, literal 587, {{ ordinary }}, {{ ordinary | upper }}",
+        )
+
+    assert result.status == BlockStatus.completed
+    assert f"Amount 587, next 588, literal 587, {short_secret}, {short_secret.upper()}" in str(model.inputs[0][1])
+    assert f"System {short_secret.upper()}" in str(model.inputs[0][0])
+    assert _tool_output(model, "snapshot")["output"] == {
+        "amount": 587,
+        "port_text": "587",
+        "ordinary": short_secret,
+        "uppercase": short_secret.upper(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_platform_alias_does_not_remove_nested_customer_keys(
     monkeypatch: pytest.MonkeyPatch, database: AgentDB
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    placeholder = _register_platform_parameter(context, "status", "smtp_password", "platform-password")
+    context.values["incoming"] = {"status": "ready"}
+    context.workflow_run_outputs["snapshot"] = {
+        "status": "customer-status",
+        "nested": {"status": "ready", "token": placeholder},
+    }
+    monkeypatch.setattr(app, "STORAGE", SimpleNamespace(get_downloaded_files=AsyncMock(return_value=[])))
+    model = _ScriptedModel(
+        [
+            [scripted_call("read_run_data", {}, call_id="index")],
+            [scripted_call("read_run_data", {"name": "snapshot"}, call_id="snapshot")],
+            [scripted_call("finish", {"answer": "done"}, call_id="finish")],
+        ]
+    )
+
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, prompt="Use {{ incoming.status }}")
+
+    assert result.status == BlockStatus.completed
+    assert "Use ready" in str(model.inputs[0][1])
+    assert "status" not in _tool_output(model, "index")["parameters"]
+    (text,) = tool_outputs_for(model.inputs[-1][1], "snapshot")
+    report = json.loads(text)
+    assert report["status"] == "completed"
+    assert report["output"]["output"] == {"status": "customer-status", "nested": {"status": "ready", "token": "*****"}}
+    assert placeholder not in text
+
+
+@pytest.mark.asyncio
+async def test_agent_browser_task_filters_conditional_snapshot_from_error_mapping(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[],
+            error_code_mapping={
+                "SNAPSHOT": '{{ decision_output.llm_prompt.split("Use this context to understand variable values:")[1] }}',
+                "PORT_TEXT": "Port 587 is ordinary.",
+            },
+            blocks=[
+                _platform_email(),
+                ConditionalBlockYAML(
+                    label="decision",
+                    branch_conditions=[
+                        BranchConditionYAML(
+                            criteria=BranchCriteriaYAML(criteria_type="prompt", expression="Continue?")
+                        ),
+                        BranchConditionYAML(is_default=True),
+                    ],
+                ),
+                AgentStepBlockYAML(label="agent", prompt="Continue", tools=["browser_task"]),
+            ],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    platform_values = dict(
+        zip(PLATFORM_SMTP_AWS_KEYS.values(), ("smtp.example.com", "587", "sender-user", "smtp-password"), strict=True)
+    )
+    aws_client = MagicMock(get_secret=AsyncMock(side_effect=platform_values.get))
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+    context.workflow_run_id = RUN
+    context.organization_id = ORG
+    context.values["ordinary"] = "visible data"
+    app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN] = context
+    placeholders = {context.values[key] for key in PLATFORM_SMTP_AWS_KEYS}
+
+    async def evaluate(extraction: ExtractionBlock, **_: object) -> BlockResult:
+        return BlockResult(
+            success=True,
+            output_parameter=extraction.output_parameter,
+            output_parameter_value={"evaluations": [{"condition_index": 1, "reasoning": "ok", "result": True}]},
+        )
+
+    mappings: list[dict[str, str] | None] = []
+
+    async def capture_task(
+        block: TaskBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object
+    ) -> BlockResult:
+        block.format_potential_template_parameters(context)
+        mappings.append(block.error_code_mapping)
+        return BlockResult(success=True, output_parameter=block.output_parameter, output_parameter_value={})
+
+    monkeypatch.setattr(ExtractionBlock, "execute", evaluate)
+    monkeypatch.setattr(TaskBlock, "execute", capture_task)
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call(
+                    "browser_task", {"url": "https://example.com", "navigation_goal": "Continue"}, call_id="task"
+                )
+            ],
+            [scripted_call("finish", {"answer": "done"}, call_id="finish")],
+        ]
+    )
+    conditional = workflow.workflow_definition.blocks[1]
+    assert isinstance(conditional, ConditionalBlock)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id=RUN, organization_id=ORG)):
+        await conditional.execute_safe(workflow_run_id=RUN, organization_id=ORG)
+        assert any(token in context.values["decision_output"]["llm_prompt"] for token in placeholders)
+        result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task"])
+
+    assert result.status == BlockStatus.completed
+    assert len(mappings) == 1 and mappings[0] is not None
+    assert "visible data" in mappings[0]["SNAPSHOT"]
+    assert mappings[0]["PORT_TEXT"] == "Port 587 is ordinary."
+    assert all(token not in json.dumps(mappings) for token in placeholders)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("offline_address_validation")
+@pytest.mark.parametrize("scope_platform_smtp", [False, True])
+async def test_a_send_email_child_sends_through_the_platform_smtp_secrets(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, scope_platform_smtp: bool
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "platform_smtp_scoping_required", AsyncMock(return_value=scope_platform_smtp)
+    )
     platform_secrets = {
         PLATFORM_SMTP_AWS_KEYS["smtp_host"]: "smtp.example.com",
         PLATFORM_SMTP_AWS_KEYS["smtp_port"]: "587",
@@ -726,7 +1207,8 @@ async def test_a_send_email_child_sends_through_the_platform_smtp_secrets(
     model = _ScriptedModel(
         [
             [scripted_call("run_block", {"block_type": "send_email", "arguments": email}, call_id="c1")],
-            [scripted_call("finish", {"answer": "sent"}, call_id="c2")],
+            [scripted_call("run_block", {"block_type": "send_email", "arguments": email}, call_id="c2")],
+            [scripted_call("finish", {"answer": "sent"}, call_id="c3")],
         ]
     )
 
@@ -735,8 +1217,68 @@ async def test_a_send_email_child_sends_through_the_platform_smtp_secrets(
 
     rows = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
     children = [(row.block_type, row.status) for row in rows if row.parent_workflow_run_block_id]
-    assert children == [(BlockType.SEND_EMAIL, "completed")]
+    assert children == [(BlockType.SEND_EMAIL, "completed")] * 2
+    retained = set(PLATFORM_SMTP_AWS_KEYS) & app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN].parameters.keys()
+    assert not retained
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    assert context._platform_smtp_secret_ids
+    for placeholder in context._platform_smtp_secret_ids:
+        with pytest.raises(InvalidWorkflowDefinition):
+            context.get_original_secret_value_or_none(placeholder)
+    assert smtp.call_count == 2
     assert smtp.call_args.args[0] == "smtp.example.com"
+    assert "smtp-password" not in json.dumps(model.inputs, default=str)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("offline_address_validation")
+@pytest.mark.parametrize("preexisting", [False, True])
+async def test_agent_email_child_cannot_use_platform_smtp_as_its_body(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB, preexisting: bool
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "platform_smtp_scoping_required", AsyncMock(return_value=False))
+    platform_secrets = {
+        PLATFORM_SMTP_AWS_KEYS["smtp_host"]: "smtp.example.com",
+        PLATFORM_SMTP_AWS_KEYS["smtp_port"]: "587",
+        PLATFORM_SMTP_AWS_KEYS["smtp_username"]: "skyvern",
+        PLATFORM_SMTP_AWS_KEYS["smtp_password"]: "smtp-password",
+    }
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    context._aws_client.get_secret.side_effect = platform_secrets.get
+    email = {**EMAIL, "recipients": ["ops@example.com"]}
+    turns = []
+    if preexisting:
+        parameters = {"seed_output": make_block_output_parameter("seed_output")}
+        block_yaml_to_block(SendEmailBlockYAML(label="seed", **email), parameters)
+        for parameter in parameters.values():
+            if isinstance(parameter, AWSSecretParameter):
+                placeholder = context.generate_random_secret_id()
+                context.parameters[parameter.key] = parameter
+                context.values[parameter.key] = placeholder
+                context.secrets[placeholder] = platform_secrets[parameter.aws_key]
+    else:
+        turns.append([scripted_call("run_block", {"block_type": "send_email", "arguments": email}, call_id="c1")])
+    turns.append(
+        [
+            scripted_call(
+                "run_block",
+                {"block_type": "send_email", "arguments": {**email, "body": "smtp_password"}},
+                call_id="c2",
+            )
+        ]
+    )
+    model = _ScriptedModel(turns)
+
+    with patch("smtplib.SMTP") as smtp:
+        result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model)
+
+    assert result.status == BlockStatus.failed
+    assert smtp.call_count == (0 if preexisting else 1)
+    if preexisting:
+        assert set(PLATFORM_SMTP_AWS_KEYS).issubset(context.parameters)
+    else:
+        assert not set(PLATFORM_SMTP_AWS_KEYS) & context.parameters.keys()
     assert "smtp-password" not in json.dumps(model.inputs, default=str)
 
 
