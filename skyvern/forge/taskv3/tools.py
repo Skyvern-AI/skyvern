@@ -1249,16 +1249,39 @@ def _without_split_hidden_tail(text: str, tidy: Callable[[str], str] | None = No
 
 
 # Removed from a quoted layer's text after it is masked: the page script's label set, plus the marks below.
-_FORGEABLE_TEXT = re.compile(
-    "[\x00-\x08\x0e-\x1f\x7f\u0085\u2028\u2029\u200b-\u200f\u202a-\u202e\u2066-\u2069"
-    # Default-ignorable marks a page can hide inside a value: they render as nothing but split it for the mask.
-    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180e\u2060\ufeff\uffa0\ufe00-\ufe0f"
-    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+# A str.translate delete table rather than a regex character class, because the same ranges inside a
+# character class trip CodeQL's py/overly-large-range check.
+_FORGEABLE_TEXT = dict.fromkeys(
+    code_point
+    for first, last in (
+        (0x00, 0x08),
+        (0x0E, 0x1F),
+        (0x7F, 0x7F),
+        (0x85, 0x85),
+        (0x2028, 0x2029),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2066, 0x2069),
+        # Default-ignorable marks a page can hide inside a value: they render as nothing but split it for the mask.
+        (0xAD, 0xAD),
+        (0x34F, 0x34F),
+        (0x61C, 0x61C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180E),
+        (0x2060, 0x2060),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xE0000, 0xE007F),
+        (0xE0100, 0xE01EF),
+    )
+    for code_point in range(first, last + 1)
 )
 
 
 def _tidied_layer_text(text: str) -> str:
-    return " ".join(_FORGEABLE_TEXT.sub("", text).split())
+    return " ".join(text.translate(_FORGEABLE_TEXT).split())
 
 
 def _layer_text_clause(occluder: dict[str, Any] | None, layer_selector: str | None) -> str:

@@ -35,6 +35,9 @@ FRESH_PROFILE_COPY_IGNORE = DEFAULT_PROFILE_COPY_IGNORE | {
     BANKED_COOKIES_FILENAME,
     SIGNIN_COOKIES_FILENAME,
 }
+# A browser's root store and pin data: Edge and Chrome both load a profile's copy under this name with unrelated
+# version numbering, so a copy the other browser may launch must leave it out.
+ROOT_STORE_COMPONENT_DIRS = frozenset({"PKIMetadata"})
 
 
 def operator_profile_generation(path: str) -> str | None:
