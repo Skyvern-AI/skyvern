@@ -482,7 +482,7 @@ function PromptBoxImpl(
     },
   });
 
-  // The editor stages the PDF in Copilot once it opens (`?sop=1`), the same path as the Copilot card.
+  // The editor stages the SOP file in Copilot once it opens (`?sop=1`), the same path as the Copilot card.
   const startFromSopMutation = useMutation({
     mutationFn: async (file: File) => ({
       file,
