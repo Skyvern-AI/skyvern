@@ -39,6 +39,7 @@ class FakeWorkflowRunContext:
         self.workflow_run_outputs: dict[str, Any] = dict(workflow_run_outputs or {})
         self.block_outcomes: dict[str, BlockOutcome] = {}
         self.carried_block_labels: set[str] = set()
+        self.succeeded_code_block_labels: set[str] = set()
         self.parameters: dict[str, Any] = {}
         self._powerbi_hop_tokens: dict[str, str] = {}
         self.workflow = None

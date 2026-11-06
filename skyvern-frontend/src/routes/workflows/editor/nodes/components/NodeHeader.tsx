@@ -87,6 +87,21 @@ import {
 import { ControlTooltip } from "@/routes/workflows/studio/ControlTooltip";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import {
+  demonstrationPrefixFromGraph,
+  useDemonstrateFromBlockStore,
+  type DemonstrateFromBlockTarget,
+} from "@/store/useDemonstrateFromBlockStore";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
 
 import {
   useWorkflowSettingsStore,
@@ -115,6 +130,7 @@ import {
   isMissingRequiredStartUrl,
 } from "../../workflowEditorUtils";
 import { getNodeBrowserUrlError } from "../../browserBlockUrl";
+import { demonstrationInsertionFromNodes } from "../../workspaceAuthoringActions";
 import { NodeGripHandle } from "./NodeGripHandle";
 import {
   getDragGateReason,
@@ -138,6 +154,11 @@ class ValidationFailureError extends Error {
     super("workflow validation failed");
     this.name = "ValidationFailureError";
   }
+}
+
+function formatLabelList(labels: string[]): string {
+  if (labels.length <= 1) return labels[0] ?? "";
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
 }
 
 function isWorkflowParameter(param: Parameter): param is WorkflowParameter {
@@ -194,7 +215,7 @@ type Payload = Record<string, unknown> & {
 };
 
 const getPayload = (opts: {
-  blockLabel: string;
+  blockLabels: string[];
   blockOutputs: Record<string, unknown>;
   browserSessionId: string | null;
   debugSessionId: string;
@@ -238,7 +259,7 @@ const getPayload = (opts: {
   }
 
   const payload: Payload = {
-    block_labels: [opts.blockLabel],
+    block_labels: opts.blockLabels,
     block_outputs: opts.blockOutputs,
     browser_session_id: opts.browserSessionId,
     debug_session_id: opts.debugSessionId,
@@ -360,6 +381,14 @@ function NodeHeader({
   const [currentParamValues, setCurrentParamValues] = useState<
     Record<string, unknown>
   >({});
+  const [paramsDemonstration, setParamsDemonstration] = useState<
+    DemonstrateFromBlockTarget | undefined
+  >();
+  const [demonstrationTarget, setDemonstrationTarget] =
+    useState<DemonstrateFromBlockTarget | null>(null);
+  const startDemonstration = useRecordingLauncherStore(
+    (state) => state.startDemonstration,
+  );
   const { getAutoplay, setAutoplay } = useAutoplayStore();
 
   useEffect(() => {
@@ -405,8 +434,36 @@ function NodeHeader({
       codeGen: boolean;
       parameterOverrides?: Record<string, unknown>;
       prompted?: boolean;
+      // Runs the blocks before this one to bring the browser to it for a demonstration.
+      demonstration?: DemonstrateFromBlockTarget;
     }) => {
       closeWorkflowPanel();
+      let demonstration = opts?.demonstration;
+      let runLabels = [blockLabel];
+      // The node the start-URL checks apply to: the first block that runs.
+      let firstRunNodeId = nodeId;
+      let firstRunLabel = blockLabel;
+      if (demonstration) {
+        // Read the graph the run is about to save, so edits since the dialog opened are what runs.
+        const prefix = demonstrationPrefixFromGraph(
+          reactFlow.getNodes(),
+          reactFlow.getEdges(),
+          nodeId,
+        );
+        if (!prefix || prefix.length === 0) {
+          toast({
+            variant: "destructive",
+            title: "Can't run the blocks before this one",
+            description:
+              "Use Start from current page to demonstrate from where the browser is.",
+          });
+          throw new ValidationFailureError();
+        }
+        runLabels = prefix.map((block) => block.label);
+        demonstration = { ...demonstration, prefixLabels: runLabels };
+        firstRunNodeId = prefix[0]!.id;
+        firstRunLabel = prefix[0]!.label;
+      }
 
       // Compute errors against the full graph so per-block validators that
       // reference siblings/edges (loops, conditionals, validation block
@@ -415,23 +472,29 @@ function NodeHeader({
       // one. Filter relies on the implicit contract that every validator
       // formats errors as `${label}: ${message}` - if that ever drifts,
       // errors for this block would silently slip past this gate.
-      const blockErrors = blockRunErrors(reactFlow.getNodes(), blockLabel);
+      const blockErrors = runLabels.flatMap((runLabel) =>
+        blockRunErrors(reactFlow.getNodes(), runLabel),
+      );
       if (
         isMissingRequiredStartUrl(
           reactFlow.getNodes(),
           reactFlow.getEdges(),
-          nodeId,
+          firstRunNodeId,
         )
       ) {
-        useMissingStartUrlStore.getState().flag(nodeId);
+        useMissingStartUrlStore.getState().flag(firstRunNodeId);
         blockErrors.push(
-          `${blockLabel}: URL is required. No earlier block opens a page, so the run would start on a blank page.`,
+          `${firstRunLabel}: URL is required. No earlier block opens a page, so the run would start on a blank page.`,
         );
       }
-      const thisNode = reactFlow.getNode(nodeId) as AppNode | undefined;
-      const urlError = thisNode ? getNodeBrowserUrlError(thisNode) : null;
+      const firstRunNode = reactFlow.getNode(firstRunNodeId) as
+        | AppNode
+        | undefined;
+      const urlError = firstRunNode
+        ? getNodeBrowserUrlError(firstRunNode)
+        : null;
       if (urlError) {
-        blockErrors.push(`${blockLabel}: ${urlError}`);
+        blockErrors.push(`${firstRunLabel}: ${urlError}`);
       }
       if (blockErrors.length > 0) {
         toast({
@@ -511,13 +574,21 @@ function NodeHeader({
           ? new Set(Object.keys(opts.parameterOverrides ?? {}))
           : new Set<string>();
         const merged = { ...parameters, ...opts?.parameterOverrides };
-        const missing = getBlockParameterDependencies(
-          findWorkflowBlockByLabel(
-            workflow?.workflow_definition.blocks ?? [],
-            blockLabel,
-          ) ?? undefined,
-          workflowParameters ?? [],
-        ).filter((parameter) => {
+        const missing = [
+          ...new Map(
+            runLabels
+              .flatMap((runLabel) =>
+                getBlockParameterDependencies(
+                  findWorkflowBlockByLabel(
+                    workflow?.workflow_definition.blocks ?? [],
+                    runLabel,
+                  ) ?? undefined,
+                  workflowParameters ?? [],
+                ),
+              )
+              .map((parameter) => [parameter.key, parameter]),
+          ).values(),
+        ].filter((parameter) => {
           if (answered.has(parameter.key)) return false;
           const value = merged[parameter.key];
           if (value === undefined || value === null) return true;
@@ -528,6 +599,7 @@ function NodeHeader({
         if (missing.length > 0) {
           setCurrentParamValues(merged);
           setParametersToPrompt(missing);
+          setParamsDemonstration(opts?.demonstration);
           setShowParamsDialog(true);
           throw new ValidationFailureError();
         }
@@ -541,7 +613,7 @@ function NodeHeader({
       const client = await getClient(credentialGetter, "sans-api-v1");
 
       const body = getPayload({
-        blockLabel,
+        blockLabels: runLabels,
         blockOutputs:
           blockOutputsStore.getOutputsWithOverrides(workflowPermanentId),
         browserSessionId: debugSession.browser_session_id,
@@ -585,6 +657,8 @@ function NodeHeader({
         mergedParameters,
         organizationId: workflow.organization_id,
         blockType: type,
+        demonstration,
+        browserSessionId: body.browser_session_id,
       };
     },
     onSuccess: (result) => {
@@ -603,7 +677,23 @@ function NodeHeader({
         return;
       }
 
-      const { response, mergedParameters, organizationId, blockType } = result;
+      const {
+        response,
+        mergedParameters,
+        organizationId,
+        blockType,
+        demonstration,
+        browserSessionId,
+      } = result;
+      const demonstrating = Boolean(demonstration);
+      if (demonstration) {
+        useDemonstrateFromBlockStore.getState().setPending({
+          ...demonstration,
+          runId: response.data.run_id,
+          browserSessionId,
+          retry: () => runBlock.mutate({ codeGen: false, demonstration }),
+        });
+      }
 
       postHog.capture("builder.block.run", {
         org_id: organizationId,
@@ -625,7 +715,7 @@ function NodeHeader({
         runId: response.data.run_id,
       });
 
-      if (!docShowing) {
+      if (!docShowing && !demonstrating) {
         toast({
           variant: "success",
           title: "Agent block run started",
@@ -641,10 +731,12 @@ function NodeHeader({
         const panes = docShowing
           ? resolveLivePanes()
           : withPanesOpen(resolveLivePanes(), RUN_APPEND_PANES);
-        const search = new URLSearchParams({
-          wr: response.data.run_id,
-          bl: label,
-        });
+        // A run of several blocks has no single block to mark, so it names none.
+        const search = new URLSearchParams(
+          demonstrating
+            ? { wr: response.data.run_id }
+            : { wr: response.data.run_id, bl: label },
+        );
         preserveNextEntry(`?${search.toString()}`, panes);
         // Under the short /runs/{wr} URL the run id is the pathname, so keep it
         // and only swap the search; from the editor it is a full studio path.
@@ -780,6 +872,7 @@ function NodeHeader({
       if (parametersToRun.length > 0) {
         setCurrentParamValues(currentValues);
         setParametersToPrompt(parametersToRun);
+        setParamsDemonstration(undefined);
         setShowParamsDialog(true);
         return;
       }
@@ -980,6 +1073,42 @@ function NodeHeader({
   const saveBlockedReason = useWorkflowHasChangesStore(
     (state) => state.saveBlockedReason,
   );
+  const isContainedNode = Boolean(reactFlow.getNode(nodeId)?.parentId);
+  const canDemonstrate = Boolean(
+    workflowPermanentId &&
+    !headless &&
+    !isReadOnlyScope &&
+    isDebuggable &&
+    !isContainedNode,
+  );
+  // Read at click time so the target follows the current graph, unsaved edits included.
+  const buildDemonstrationTarget = (): DemonstrateFromBlockTarget | null => {
+    if (!workflowPermanentId || !canDemonstrate) return null;
+    const nodes = reactFlow.getNodes();
+    const edges = reactFlow.getEdges();
+    const bounds = demonstrationInsertionFromNodes(nodes, {
+      previous: edges.find((edge) => edge.target === nodeId)?.source ?? null,
+      next: edges.find((edge) => edge.source === nodeId)?.target ?? null,
+    });
+    if (!bounds) return null;
+    const prefix = demonstrationPrefixFromGraph(nodes, edges, nodeId);
+    const finallyBlockLabel = workflowSettingsStore.finallyBlockLabel;
+    return {
+      workflowPermanentId,
+      blockLabel,
+      prefixLabels: prefix?.map((block) => block.label) ?? [],
+      insertion: { ...bounds, replace_label: blockLabel },
+      // A block run also runs the agent's finally block, which would move the browser off this step.
+      runUnavailableReason: finallyBlockLabel
+        ? `This agent's finally block (${finallyBlockLabel}) runs after the blocks before this one and would move the browser off this step.`
+        : prefix === null
+          ? "A condition or branch comes before this block, so Skyvern can't run the earlier blocks on their own."
+          : null,
+    };
+  };
+  const demonstrationPending = useDemonstrateFromBlockStore(
+    (state) => state.pending !== null,
+  );
   // Running a block saves the workflow first.
   const playInert =
     workflowRunIsRunningOrQueued ||
@@ -1053,6 +1182,21 @@ function NodeHeader({
       </TooltipProvider>
     ) : null;
 
+  const demonstrateDisabledReason =
+    playInert || demonstrationPending || runBlock.isPending
+      ? "Wait for the current run to finish"
+      : !startDemonstration
+        ? "Copilot can't start a demonstration right now"
+        : null;
+  const canRunDemonstrationPrefix = Boolean(
+    demonstrationTarget &&
+    demonstrationTarget.prefixLabels.length > 0 &&
+    !demonstrationTarget.runUnavailableReason,
+  );
+  const prefixList = demonstrationTarget
+    ? formatLabelList(demonstrationTarget.prefixLabels)
+    : "";
+
   const runDialogs = (
     <>
       <BlockParametersDialog
@@ -1067,9 +1211,10 @@ function NodeHeader({
           ).length;
           runBlock.mutate(
             {
-              codeGen: numBlocksInWorkflow === 1,
+              codeGen: paramsDemonstration ? false : numBlocksInWorkflow === 1,
               parameterOverrides: values,
               prompted: true,
+              demonstration: paramsDemonstration,
             },
             {
               onSuccess: () => {
@@ -1092,6 +1237,67 @@ function NodeHeader({
         }}
         onCancel={() => setProfileIncompatibilityReason(null)}
       />
+      {demonstrationTarget && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setDemonstrationTarget(null);
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Demonstrate {blockLabel}</DialogTitle>
+              <DialogDescription>
+                {canRunDemonstrationPrefix
+                  ? `Skyvern runs ${prefixList} in the browser first. When ${
+                      demonstrationTarget.prefixLabels.length === 1
+                        ? "it finishes"
+                        : "they finish"
+                    }, the browser is yours: show how to do ${blockLabel}, then press Done. Copilot rewrites this block from what you show.`
+                  : `${
+                      demonstrationTarget.runUnavailableReason
+                        ? `${demonstrationTarget.runUnavailableReason} Get the browser to ${blockLabel} yourself, then`
+                        : "In the browser,"
+                    } show how to do ${blockLabel} and press Done. Copilot rewrites this block from what you show.`}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="ghost"
+                onClick={() => setDemonstrationTarget(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant={canRunDemonstrationPrefix ? "secondary" : "default"}
+                onClick={() => {
+                  setDemonstrationTarget(null);
+                  startDemonstration?.({
+                    insertion: demonstrationTarget.insertion,
+                  });
+                }}
+              >
+                {demonstrationTarget.prefixLabels.length > 0
+                  ? "Start from current page"
+                  : "Start demonstrating"}
+              </Button>
+              {canRunDemonstrationPrefix && (
+                <Button
+                  onClick={() => {
+                    setDemonstrationTarget(null);
+                    runBlock.mutate({
+                      codeGen: false,
+                      demonstration: demonstrationTarget,
+                    });
+                  }}
+                >
+                  Run and demonstrate
+                </Button>
+              )}
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </>
   );
 
@@ -1308,6 +1514,24 @@ function NodeHeader({
                 })}
               >
                 <NodeActionMenu
+                  demonstrateDisabledReason={demonstrateDisabledReason}
+                  onDemonstrate={
+                    canDemonstrate
+                      ? () => {
+                          const target = buildDemonstrationTarget();
+                          if (!target) {
+                            toast({
+                              variant: "destructive",
+                              title: "Can't demonstrate this block",
+                              description:
+                                "Skyvern couldn't find where this block sits in the agent. Save the agent and try again.",
+                            });
+                            return;
+                          }
+                          setDemonstrationTarget(target);
+                        }
+                      : undefined
+                  }
                   duplicateDisabledReason={duplicateDisabledReason}
                   isDuplicable={
                     !isReadOnlyScope && Boolean(duplicateNodeCallback)

@@ -938,6 +938,29 @@ class UnresolvableNavigationHost(FailedToNavigateToUrl):
         )
 
 
+# Leads the error_message below for the same reason NO_ADDRESS_RECORD_NAV_ERROR_MARKER leads its own.
+UNREACHABLE_HOST_NAV_ERROR_MARKER = "did not accept a connection in time"
+
+
+class UnreachableNavigationHost(FailedToNavigateToUrl):
+    """The run's proxy provider reported that its connection to the target host timed out in this attempt, so the
+    tunnel failure the browser reports is recorded as the site's. It keeps the browser's own code, so every retry and
+    recovery path that reads codes still treats it as that tunnel failure; only the recorded category moves.
+    """
+
+    def __init__(
+        self, url: str, host: str, upstream_status: int, error_message: str, nav_error_code: str | None
+    ) -> None:
+        self.host = host
+        # Kept off the message: it reaches the run's failure_reason, and the status is one provider's private code.
+        self.upstream_status = upstream_status
+        super().__init__(
+            url=url,
+            error_message=f"{host} {UNREACHABLE_HOST_NAV_ERROR_MARKER}: {error_message}",
+            nav_error_code=nav_error_code,
+        )
+
+
 class FailedToReloadPage(SkyvernException):
     def __init__(self, url: str, error_message: str) -> None:
         self.url = url

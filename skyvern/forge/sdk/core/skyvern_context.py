@@ -674,6 +674,26 @@ class PendingFileChooserListener:
             self.handler = None
 
 
+@dataclass(slots=True)
+class EgressConnectOutcomes:
+    """For one host, the time.monotonic() of the latest CONNECT the upstream proxy answered with a target connect
+    timeout, and of the latest CONNECT to it that ended any other way."""
+
+    target_timeout_at: float | None = None
+    other_at: float | None = None
+
+
+@dataclass(slots=True)
+class EgressConnectRecord:
+    """Per host, what the run's own egress proxy last saw its upstream answer to a CONNECT, least recently touched host
+    first, and the newest time.monotonic() of any host dropped to keep it bounded."""
+
+    hosts: dict[str, EgressConnectOutcomes] = field(default_factory=dict)
+    evicted_through: float | None = None
+    # Which upstream exit the hosts above were seen through. A launch that draws another exit starts a new record.
+    exit_key: tuple[str | int | None, ...] | None = None
+
+
 def compute_org_age(created_at: datetime.datetime | None, *, now: datetime.datetime | None = None) -> int | None:
     """Whole days since the organization was created, or None for a missing or invalid timestamp."""
     if not isinstance(created_at, datetime.datetime):
@@ -737,6 +757,8 @@ class SkyvernContext:
     task_nav_error_codes: dict[str, str] = field(default_factory=dict)
     download_failure_reasons: dict[str, list[str]] = field(default_factory=dict)
     download_failure_reasons_by_key: dict[str, dict[str, list[str]]] = field(default_factory=dict, repr=False)
+    # The browser reports every refused CONNECT as the same tunnel failure; this keeps the upstream's own answers.
+    egress_connect_outcomes: EgressConnectRecord = field(default_factory=EgressConnectRecord)
     navigation_goal: str | None = None
     navigation_payload: dict[str, Any] | list | str | None = None
     complete_criterion_is_untrusted: bool = False

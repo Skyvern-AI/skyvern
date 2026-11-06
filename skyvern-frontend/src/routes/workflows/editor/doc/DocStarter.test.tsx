@@ -67,11 +67,21 @@ describe("doc starter placement", () => {
     expect(screen.queryByText("0 of 4")).toBeNull();
   });
 
-  test("the checklist makes room for a toast", () => {
-    const { container } = render(
-      <DocGettingStarted progress={fresh} onHide={() => {}} raised />,
+  test("the card folds to its pill while a toast or run result needs the corner, and never moves up or opens", () => {
+    const { container, rerender } = render(
+      <DocGettingStarted progress={fresh} onHide={() => {}} />,
     );
-    expect(container.querySelector("aside")?.className).toContain("bottom-36");
+    expect(container.querySelector("aside")?.className).toContain("bottom-4");
+    rerender(<DocGettingStarted progress={fresh} onHide={() => {}} folded />);
+    expect(container.querySelector("aside")).toBeNull();
+    const pill = screen.getByRole("button", { name: /Getting started/ });
+    expect(pill.className).toContain("bottom-4");
+    expect(pill.className).not.toContain("bottom-36");
+    expect((pill as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(pill);
+    expect(container.querySelector("aside")).toBeNull();
+    rerender(<DocGettingStarted progress={fresh} onHide={() => {}} compact />);
+    expect(container.querySelector("aside")).toBeNull();
   });
 
   test("a tip is pending until seen, so the checklist can wait for it", () => {

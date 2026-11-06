@@ -32,7 +32,6 @@ from websockets import ConnectionClosedError, ConnectionClosedOK, Data
 from skyvern.config import settings
 from skyvern.exceptions import MissingRoutedVncAddressError
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
-from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
 from skyvern.forge.sdk.routes.streaming.run_stream_outcome import RunStreamConnection
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
@@ -50,7 +49,6 @@ from skyvern.forge.sdk.streaming.registries import (
     get_message_channel,
     get_vnc_channel,
 )
-from skyvern.forge.sdk.utils.aio import collect
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.webeye.cdp_connection import redact_cdp_url
 from skyvern.webeye.cdp_credentials import LIVE_VIEW_PATH_PREFIX
@@ -94,7 +92,6 @@ class Keys:
         Cmd = b"\x04\x01\x00\x00\x00\x00\xff\xe9"
         Super = b"\x04\x01\x00\x00\x00\x00\xff\xeb"  # Cmd, from current frontends
         Alt = b"\x04\x01\x00\x00\x00\x00\xff~"  # option
-        CKey = b"\x04\x01\x00\x00\x00\x00\x00c"
         OKey = b"\x04\x01\x00\x00\x00\x00\x00o"
         VKey = b"\x04\x01\x00\x00\x00\x00\x00v"
 
@@ -131,12 +128,6 @@ class KeyState:
         Do not allow the opening of files.
         """
         return self.ctrl_is_down and data == Keys.Down.OKey
-
-    def is_copy(self, data: bytes) -> bool:
-        """
-        Detect Ctrl+C or Cmd+C for copy.
-        """
-        return (self.ctrl_is_down or self.cmd_is_down) and data == Keys.Down.CKey
 
     def is_paste(self, data: bytes) -> bool:
         """
@@ -389,6 +380,10 @@ class VncChannel:
         if self.websocket.client_state != WebSocketState.CONNECTED:
             return False
 
+        # A server-side close leaves client_state CONNECTED until the peer's close frame is read.
+        if self.websocket.application_state != WebSocketState.CONNECTED:
+            return False
+
         if not self.task and not self.workflow_run and not self.browser_session:
             return False
 
@@ -439,28 +434,6 @@ class VncChannel:
         if self.remote_clipboard_synced_at is None:
             return False
         return time.monotonic() - self.remote_clipboard_synced_at <= REMOTE_CLIPBOARD_SYNC_PASTE_GRACE_SECONDS
-
-
-async def copy_text(vnc_channel: VncChannel) -> None:
-    class_name = vnc_channel.class_name
-    LOG.info(f"{class_name} Retrieving selected text via CDP", **vnc_channel.identity)
-
-    try:
-        async with execution_channel(vnc_channel) as execute:
-            copied_text = await execute.get_selected_text()
-
-            message_channel = get_message_channel(vnc_channel.client_id)
-
-            if message_channel:
-                await message_channel.send_copied_text(copied_text)
-            else:
-                LOG.info(
-                    f"{class_name} No message channel found for client, or it is not open",
-                    message_channel=message_channel,
-                    **vnc_channel.identity,
-                )
-    except Exception:
-        LOG.exception(f"{class_name} Failed to retrieve selected text via CDP", **vnc_channel.identity)
 
 
 async def ask_for_clipboard(vnc_channel: VncChannel) -> None:
@@ -582,9 +555,6 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                         if message_type == MessageType.Keyboard.value:
                             vnc_channel.update_key_state(data)
 
-                            if vnc_channel.key_state.is_copy(data):
-                                await copy_text(vnc_channel)
-
                             if (
                                 vnc_channel.key_state.is_paste(data)
                                 and not vnc_channel.remote_clipboard_was_recently_synced()
@@ -622,7 +592,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     LOG.debug(f"{class_name} Frontend closed the vnc channel cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
-                    pass
+                    data = None
                 except Exception:
                     vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(f"{class_name} An unexpected exception occurred.", **vnc_channel.identity)
@@ -682,7 +652,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     LOG.debug(f"{class_name} Browser closed the vnc channel session cleanly.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed-ok")
                 except asyncio.CancelledError:
-                    pass
+                    data = None
                 except Exception:
                     vnc_channel.live_stream.end_first("stream_error")
                     LOG.exception(
@@ -696,7 +666,10 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     continue
 
                 try:
-                    if vnc_channel.websocket.client_state != WebSocketState.CONNECTED:
+                    if (
+                        vnc_channel.websocket.client_state != WebSocketState.CONNECTED
+                        or vnc_channel.websocket.application_state != WebSocketState.CONNECTED
+                    ):
                         continue
                     await vnc_channel.websocket.send_bytes(data)
                     # The first relayed message is the display server's handshake: the browser is on the wire.
@@ -728,7 +701,18 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         ]
 
         try:
-            await collect(loops)
+            # Either loop returning normally (e.g. its channel was displaced) must close the viewer socket so the
+            # viewer redials.
+            done, pending = await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
+            vnc_channel.live_stream.end_first("stream_error")
+            await vnc_channel.close(reason="vnc-relay-loop-exited")
+            await novnc_ws.close()
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                if exc := task.exception():
+                    raise exc
         except WebSocketDisconnect:
             pass
         except ConnectionClosedOK:

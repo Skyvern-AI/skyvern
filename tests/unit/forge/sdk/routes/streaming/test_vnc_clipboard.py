@@ -63,13 +63,13 @@ def rfb_key(keysym: int, down: bool) -> bytes:
 
 # Current frontends send macOS Cmd as Super_L; older ones sent left Cmd as Alt_L.
 @pytest.mark.parametrize("cmd_keysym", [0xFFEB, 0xFFE9])
-def test_cmd_c_is_copy_for_either_cmd_keysym(cmd_keysym: int) -> None:
+def test_cmd_v_is_paste_for_either_cmd_keysym(cmd_keysym: int) -> None:
     channel = make_vnc_channel()
     channel.key_state = KeyState()
-    c_down = rfb_key(ord("c"), True)
+    v_down = rfb_key(ord("v"), True)
 
     channel.update_key_state(rfb_key(cmd_keysym, True))
-    assert channel.key_state.is_copy(c_down) is True
+    assert channel.key_state.is_paste(v_down) is True
 
     channel.update_key_state(rfb_key(cmd_keysym, False))
-    assert channel.key_state.is_copy(c_down) is False
+    assert channel.key_state.is_paste(v_down) is False

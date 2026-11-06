@@ -19,6 +19,7 @@ from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.repositories.observer import ObserverRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
 from skyvern.forge.sdk.db.repositories.workflows import WorkflowsRepository
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
@@ -239,7 +240,11 @@ async def test_cached_creation_and_termination_persist_contract(
     )
     errors = _merge_workflow_run_errors(
         finalized.errors,
-        [(block_id, block.error_codes or [], block.failure_reason, block.output, block.block_type.value)],
+        [
+            WorkflowRunBlockErrorRow(
+                block_id, block.error_codes or [], block.failure_reason, block.output, block.block_type.value
+            )
+        ],
     )
     assert [error["error_code"] for error in errors].count("unavailable") == 1
 

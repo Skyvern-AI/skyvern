@@ -88,7 +88,7 @@ from skyvern.forge.sdk.services.request_principal import (
     scoped_api_key_id_from_actor,
 )
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
@@ -298,7 +298,7 @@ class CopilotTriggerSummary:
 
 
 TriggerMappingReasonCode = Literal[
-    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed"
+    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed", "owner_not_authorized"
 ]
 
 
@@ -354,6 +354,7 @@ class CodeBlockEngineFailure:
     native_exception_class: str | None = None
     # Decided by the executor from the runner's typed code, so it survives when redaction empties the reason.
     failure_kind: CodeBlockFailureKind | None = None
+    code_failure: CodeFailure | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -1522,6 +1523,11 @@ class AgentFunction:
         """Clear navigation-failure strikes after a server-assigned browser address navigates."""
         return None
 
+    async def proxy_unreachable_target_status(self, *, host: str, since: float) -> int | None:
+        """The upstream status the run's proxy provider refused a CONNECT to ``host`` with at or after ``since``
+        (``time.monotonic()``), when that status says the host did not accept the provider's connection."""
+        return None
+
     async def capture_workflow_run_created(
         self,
         *,
@@ -1851,6 +1857,7 @@ class AgentFunction:
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
         download_log: BlockDownloadLog | None = None,
+        authored_code: str | None = None,
     ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner, or return None for legacy.
 
@@ -2460,8 +2467,9 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
-    async def post_code_block_execution(self, task: Task, step: Step) -> None:
-        """Billing seam for a code block's container task; called only after a successful execution."""
+    async def post_code_block_execution(self, task: Task, step: Step, *, is_first_successful_execution: bool) -> None:
+        """Billing seam for a code block's container task, called only after a successful execution.
+        is_first_successful_execution is True the first time the block's label reaches this hook in a run attempt."""
         return
 
     async def post_agent_step_execution(

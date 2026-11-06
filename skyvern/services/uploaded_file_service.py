@@ -171,7 +171,7 @@ _OOXML_EXTENSIONS = frozenset({"docx", "xlsx", "pptx"})
 _IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "gif", "webp"})
 
 
-def _upload_extension(filename: str | None) -> str:
+def upload_extension(filename: str | None) -> str:
     # Windows drops trailing dots and spaces, so "x.exe. " opens as an .exe.
     name = os.path.basename(filename or "").rstrip(" .")
     return os.path.splitext(name)[1].lstrip(".").lower()
@@ -285,7 +285,7 @@ def _declared_type_mismatch(head: bytes, extension: str) -> bool:
 
 
 def _upload_type_rejection_reason(file: UploadFile) -> str | None:
-    extension = _upload_extension(file.filename)
+    extension = upload_extension(file.filename)
     if extension in DENIED_UPLOAD_EXTENSIONS:
         return f".{extension} files are not allowed"
     try:
@@ -314,7 +314,7 @@ def validate_upload_type(file: UploadFile) -> UploadFile:
     """
     reason = _upload_type_rejection_reason(file)
     if reason is not None:
-        LOG.info("Rejected upload by file type", extension=_upload_extension(file.filename), reason=reason)
+        LOG.info("Rejected upload by file type", extension=upload_extension(file.filename), reason=reason)
         raise HTTPException(status_code=415, detail=f"File type not allowed: {reason}")
     return file
 
@@ -335,7 +335,7 @@ async def validate_passthrough_upload(file: UploadFile, *, max_size_bytes: int |
     if reason is not None:
         LOG.info(
             "Accepted a restricted file type for pass-through",
-            extension=_upload_extension(file.filename),
+            extension=upload_extension(file.filename),
             reason=reason,
             purpose=purpose,
         )

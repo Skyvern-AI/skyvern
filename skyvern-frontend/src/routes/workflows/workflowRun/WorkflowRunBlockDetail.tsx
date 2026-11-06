@@ -66,6 +66,8 @@ type Props = {
   workflowRunId: string | undefined;
   onThoughtSelect?: (thought: ObserverThought) => void;
   onViewScreenshot?: (workflowRunBlockId: string) => void;
+  // Opens Copilot on this run for the given block label; the card offers it only once the run is final.
+  onFix?: (blockLabel: string | null) => void;
   // The block the run-level line's headline is actually about, and that
   // headline's exact text. Both must match — the ID alone (a block can fail
   // with different text than the run's own failure_reason) and the text
@@ -290,6 +292,7 @@ function WorkflowRunBlockDetail({
   workflowRunId,
   onThoughtSelect,
   onViewScreenshot,
+  onFix,
   statedFailureBlockId = null,
   statedFailureHeadline = null,
 }: Props) {
@@ -301,6 +304,7 @@ function WorkflowRunBlockDetail({
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery({
     workflowRunId,
   });
+  const runFinal = Boolean(workflowRun) && runIsLogicallyFinal(workflowRun!);
 
   // Cold-start: timeline data hasn't arrived yet. Check data === undefined
   // rather than isLoading because the timeline query is gated on the
@@ -390,9 +394,7 @@ function WorkflowRunBlockDetail({
             <BlockDetailHeader
               block={resolvedBlock}
               iterationOverride={effectiveIteration}
-              runFinalized={
-                Boolean(workflowRun) && runIsLogicallyFinal(workflowRun!)
-              }
+              runFinalized={runFinal}
             />
           </>
         )}
@@ -412,6 +414,15 @@ function WorkflowRunBlockDetail({
                 resolvedBlock.workflow_run_block_id === statedFailureBlockId
                   ? statedFailureHeadline
                   : null
+              }
+              onFix={
+                onFix &&
+                runFinal &&
+                resolvedBlock.workflow_run_block_id !== statedFailureBlockId &&
+                // diagnose_run targets this run; a block from a child run would send the wrong one.
+                resolvedBlock.workflow_run_id === workflowRunId
+                  ? () => onFix(resolvedBlock!.label)
+                  : undefined
               }
             />
           )}

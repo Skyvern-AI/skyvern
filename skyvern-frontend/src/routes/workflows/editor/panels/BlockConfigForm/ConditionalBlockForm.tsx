@@ -15,6 +15,7 @@ import {
   defaultBranchCriteria,
 } from "../../nodes/ConditionalNode/types";
 import { useUpdate } from "../../useUpdate";
+import { inferBranchCriteriaTypeFromExpression } from "../../workflowEditorUtils";
 import { useDebouncedSidebarSave } from "../useDebouncedSidebarSave";
 
 function ConditionalBlockForm({ blockId }: { blockId: string }) {
@@ -98,6 +99,7 @@ function ConditionalBlockFormBody({
           criteria: {
             ...(branch.criteria ?? { ...defaultBranchCriteria }),
             expression,
+            criteria_type: inferBranchCriteriaTypeFromExpression(expression),
           },
         };
       }),

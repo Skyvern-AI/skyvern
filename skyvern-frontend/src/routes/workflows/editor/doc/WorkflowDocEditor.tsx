@@ -1422,8 +1422,8 @@ export function WorkflowDocEditor({
             progress={starterProgress}
             kept={starter.done}
             onHide={starter.hide}
-            raised={toastShowing}
-            compact={!wide}
+            folded={toastShowing}
+            compact={!wide || Boolean(docRun.runId)}
             clearOfPanel={panelOpen}
           />
         )}

@@ -2145,8 +2145,8 @@ class DebugSessionModel(Base):
 
 class BlockRunModel(Base):
     """
-    When a block is run in the debugger, it runs "as a 'workflow run'", but that
-    workflow run has just a single block in it. This table ties a block run to
+    When a block is run in the debugger, it runs "as a 'workflow run'". A run of
+    several blocks records only its last block here. This table ties a block run to
     the workflow run, and a particular output parameter id (which gets
     overwritten on each run.)
 

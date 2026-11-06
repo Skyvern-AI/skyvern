@@ -12,8 +12,10 @@ import structlog
 from skyvern.constants import PROXY_TRANSPORT_NAV_ERRORS
 from skyvern.exceptions import (
     NO_ADDRESS_RECORD_NAV_ERROR_MARKER,
+    UNREACHABLE_HOST_NAV_ERROR_MARKER,
     CaptchaSolveError,
     FailedToNavigateToUrl,
+    UnreachableNavigationHost,
 )
 from skyvern.forge.sdk.schemas.har_evidence import (
     FINAL_HAR_USER_MATCH_REASON_CODE,
@@ -63,6 +65,7 @@ _SELECTOR_PAYLOAD_RE = re.compile(r"(?:locator|get_by_[a-z_]+|wait_for_selector)
 
 _PROXY_TRANSPORT_CODES_LOWER = tuple(code.lower() for code in PROXY_TRANSPORT_NAV_ERRORS)
 _NO_ADDRESS_RECORD_MARKER_LOWER = NO_ADDRESS_RECORD_NAV_ERROR_MARKER.lower()
+_UNREACHABLE_HOST_MARKER_LOWER = UNREACHABLE_HOST_NAV_ERROR_MARKER.lower()
 # Without the exception, only the driver message inside FailedToNavigateToUrl's own sentence counts: other
 # text (a model-written outcome reason, the navigated URL) can mention a transport code the proxy never raised.
 _NAV_FAILURE_DRIVER_MESSAGE_RE = re.compile(r"failed to navigate to url \S+\. error message: (.*)", re.DOTALL)
@@ -136,8 +139,21 @@ def _is_pageless_failure(reason: str) -> bool:
     return inner_reason.startswith(_PRE_TASK_FAILURE_PREFIXES)
 
 
+def _is_proxy_unreachable_target(reason: str, exception: Exception | None) -> bool:
+    """Whether the run's proxy provider reported that the navigation target's host did not accept its connection."""
+    # Same evidence split as the transport code below: the exception's type when it carries the code, else the marker
+    # only where the driver message sits, since other text (a model-written reason) can quote the marker.
+    if isinstance(exception, FailedToNavigateToUrl) and exception.nav_error_code:
+        return isinstance(exception, UnreachableNavigationHost)
+    driver_message = _NAV_FAILURE_DRIVER_MESSAGE_RE.search(reason)
+    return driver_message is not None and _UNREACHABLE_HOST_MARKER_LOWER in driver_message.group(1)
+
+
 def _proxy_transport_evidence(reason: str, exception: Exception | None) -> str | None:
     """The evidence source when a proxy transport error ended the navigation, else None."""
+    # Checked before the code, which this failure keeps as the browser reported it.
+    if _is_proxy_unreachable_target(reason, exception):
+        return None
     if isinstance(exception, FailedToNavigateToUrl) and exception.nav_error_code:
         return "code_level" if exception.nav_error_code in PROXY_TRANSPORT_NAV_ERRORS else None
     if _NO_ADDRESS_RECORD_MARKER_LOWER in reason:
@@ -323,13 +339,14 @@ def classify_from_failure_reason(
         "FailedToNavigateToUrl" in exc_name
         or any(kw in reason for kw in ["failed to navigate", "404", "redirect loop"])
     ):
-        categories.append(
-            {
-                "category": FailureCategory.NAVIGATION_FAILURE.value,
-                "confidence_float": 0.9,
-                "reasoning": f"Exception: {exc_name}" if "FailedToNavigate" in exc_name else "Keywords matched",
-            }
-        )
+        navigation_failure = {
+            "category": FailureCategory.NAVIGATION_FAILURE.value,
+            "confidence_float": 0.9,
+            "reasoning": f"Exception: {exc_name}" if "FailedToNavigate" in exc_name else "Keywords matched",
+        }
+        if _is_proxy_unreachable_target(reason, exception):
+            navigation_failure["reason_code"] = PROXY_TARGET_UNREACHABLE_REASON_CODE
+        categories.append(navigation_failure)
 
     # Infrastructure timeout — a Temporal activity / heartbeat timeout finalizes the run from
     # the worker layer (a stalled activity or worker interruption), not a site/page-load issue.
@@ -600,7 +617,7 @@ def classify_from_failure_reason(
 
 # Bump when the taxonomy or the category->component mapping below changes, so a frozen
 # coverage baseline stays reproducible per classifier_version.
-CLASSIFIER_VERSION = 10
+CLASSIFIER_VERSION = 11
 FAILURE_ATTRIBUTION_SCHEMA_VERSION = 1
 
 # Bounded sentinels — neither is an infra component id.
@@ -659,6 +676,7 @@ BROWSER_SESSION_CLOSED_REASON_CODE = "browser_session_closed"
 BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE = "browser_session_startup_timeout"
 BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE = "browser_session_expired_before_run"
 PROXY_TRANSPORT_FAILED_REASON_CODE = "proxy_transport_failed"
+PROXY_TARGET_UNREACHABLE_REASON_CODE = "proxy_target_unreachable"
 WORKER_CONTAINER_RESTARTED_REASON_CODE = "worker_container_restarted"
 UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE = "unsolved_captcha_before_browser_loss"
 SITE_THROTTLE_REASON_CODE = "site_throttle"
@@ -885,6 +903,7 @@ _REASON_CODE_LITERALS = frozenset(
         BROWSER_SESSION_STARTUP_TIMEOUT_REASON_CODE,
         BROWSER_SESSION_EXPIRED_BEFORE_RUN_REASON_CODE,
         PROXY_TRANSPORT_FAILED_REASON_CODE,
+        PROXY_TARGET_UNREACHABLE_REASON_CODE,
         SITE_THROTTLE_REASON_CODE,
         EXTERNAL_SERVICE_THROTTLE_REASON_CODE,
         UNSOLVED_CAPTCHA_BEFORE_BROWSER_LOSS_REASON_CODE,

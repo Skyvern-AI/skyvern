@@ -11,6 +11,7 @@ import {
   failingCodeLineFromActions,
   failureSupportsScreenshot,
   findRunCodeBlockFailure,
+  lastBrowserStep,
 } from "./codeBlockFailure";
 
 type FailedBlock = Pick<
@@ -122,11 +123,38 @@ describe("describeCodeBlockFailure", () => {
       kind: "limit",
       code: "memory_limit_exceeded",
       recovery: "fix",
-      guidance: expect.stringContaining("Process data in smaller batches"),
+      guidance: expect.stringContaining("smaller batches"),
     });
   });
 
-  test("names the exception and line for a user code error", () => {
+  test("leads with the code's own message when the run recorded it", () => {
+    const failure = describeCodeBlockFailure(
+      block({
+        error_codes: ["user_code_error"],
+        failure_reason:
+          "CodeBlock failed with ValueError at line 4: Could not find the expiration input.",
+        output: {
+          code_failure: {
+            exception_class: "ValueError",
+            message: "Could not find the expiration input.",
+            line: 4,
+            source_line:
+              'raise ValueError("Could not find the expiration input.")',
+          },
+        },
+      }),
+    );
+    expect(failure).toMatchObject({
+      kind: "user-code",
+      title: "Could not find the expiration input.",
+      exceptionClass: "ValueError",
+      line: 4,
+      sourceLine: 'raise ValueError("Could not find the expiration input.")',
+      recovery: "fix",
+    });
+  });
+
+  test("an older row without recorded facts shows the template title, never a message parsed from the reason", () => {
     const failure = describeCodeBlockFailure(
       block({
         error_codes: ["user_code_error"],
@@ -136,10 +164,123 @@ describe("describeCodeBlockFailure", () => {
     );
     expect(failure).toMatchObject({
       kind: "user-code",
-      title: "The block's code raised NameError",
+      title: "The block's code raised an error",
+      message: null,
+      exceptionClass: "NameError",
       line: 6,
       recovery: "fix",
     });
+    expect(failure?.title).not.toContain("min");
+  });
+
+  test("an empty recorded message falls back to the template title", () => {
+    for (const message of ["", "   ", null]) {
+      expect(
+        describeCodeBlockFailure(
+          block({
+            error_codes: ["user_code_error"],
+            failure_reason: "CodeBlock failed with ValueError at line 2.",
+            output: {
+              code_failure: { exception_class: "ValueError", message, line: 2 },
+            },
+          }),
+        )?.title,
+      ).toBe("The block's code raised an error");
+    }
+  });
+
+  test.each([
+    ["insecure_code_detected", "a runner refusal"],
+    ["unsupported_page_operation", "a runner refusal"],
+    ["unsupported_skyvern_helper", "a runner refusal"],
+    ["user_code_error", "a class-less inline raise"],
+  ])(
+    "%s keeps its template title for %s, even with a recorded message",
+    (code) => {
+      const failure = describeCodeBlockFailure(
+        block({
+          error_codes: [code],
+          failure_reason:
+            "CodeBlock failed at line 3: page.evaluate is blocked.",
+          output: {
+            code_failure: {
+              exception_class: null,
+              message: "page.evaluate is blocked.",
+              line: 3,
+            },
+          },
+        }),
+      );
+      expect(failure?.title).not.toBe("page.evaluate is blocked.");
+      expect(failure?.message).toBe("page.evaluate is blocked.");
+    },
+  );
+
+  test("a browser failure keeps its plain title even with a recorded message", () => {
+    expect(
+      describeCodeBlockFailure(
+        block({
+          error_codes: ["browser_operation_failed"],
+          failure_reason:
+            "CodeBlock failed because a browser operation failed at line 3: Timeout 3000ms exceeded.",
+          output: {
+            code_failure: {
+              exception_class: null,
+              message: "Timeout 3000ms exceeded.",
+              line: 3,
+            },
+          },
+        }),
+      )?.title,
+    ).toBe("A browser operation failed");
+  });
+
+  test("every fix or either guidance points to Fix with Copilot, never to editing code", () => {
+    const failures = [
+      ...[
+        "user_code_error",
+        "insecure_code_detected",
+        "unsupported_page_operation",
+        "unsupported_skyvern_helper",
+        "browser_operation_failed",
+        "timeout",
+        "output_limit_exceeded",
+        "result_limit_exceeded",
+        "memory_limit_exceeded",
+        "parameter_limit_exceeded",
+        "unspecified",
+      ].map((code) =>
+        describeCodeBlockFailure(
+          block({ error_codes: [code], failure_reason: "failed" }),
+        ),
+      ),
+      ...[
+        "codeblock.page_operation_broker.PageOperationLimitExceeded",
+        "codeblock.page_operation_broker.HandleLimitExceeded",
+        "codeblock.page_operation_broker.BlockedEgressError",
+      ].map((runnerClass) =>
+        describeCodeBlockFailure(
+          block({
+            error_codes: ["unsupported_page_operation"],
+            failure_reason: "denied",
+            output: { runner_exception_class: runnerClass },
+          }),
+        ),
+      ),
+      describeCodeBlockFailure(
+        block({
+          failure_reason:
+            "Failed to execute code block. Reason: ErrorCode is not declared in the effective error_code_mapping",
+        }),
+      ),
+    ];
+    for (const failure of failures) {
+      expect(failure?.recovery).not.toBe("retry");
+      expect(failure?.guidance).toContain("Fix with Copilot");
+      expect(failure?.guidance).not.toMatch(
+        /open the block|fix the line|your code|\b(edit|rewrite)\b/i,
+      );
+    }
   });
 
   test("a page failure reads as a browser problem, not a code defect", () => {
@@ -230,7 +371,7 @@ describe("describeCodeBlockFailure", () => {
     });
   });
 
-  test("keeps code-specific guidance when the reason names an exception", () => {
+  test("keeps the code-specific title when the reason names an exception", () => {
     const failure = describeCodeBlockFailure(
       block({
         error_codes: ["insecure_code_detected"],
@@ -239,9 +380,9 @@ describe("describeCodeBlockFailure", () => {
       }),
     );
     expect(failure).toMatchObject({
-      title: "The block's code raised InsecureCodeError",
-      guidance:
-        "Code blocks run in a locked-down sandbox. Rewrite the step using a supported Skyvern helper instead.",
+      title: "The code used a blocked operation",
+      exceptionClass: "InsecureCodeError",
+      line: 4,
     });
   });
 
@@ -266,7 +407,7 @@ describe("describeCodeBlockFailure", () => {
       ),
     ).toMatchObject({
       kind: "user-code",
-      title: "The block's code raised RuntimeError",
+      exceptionClass: "RuntimeError",
       recovery: "fix",
     });
   });
@@ -296,7 +437,7 @@ describe("describeCodeBlockFailure", () => {
       ),
     ).toMatchObject({
       kind: "user-code",
-      title: "The block's code raised SyntaxError",
+      exceptionClass: "SyntaxError",
     });
   });
 
@@ -438,6 +579,9 @@ describe("failureSupportsScreenshot", () => {
           guidance: "g",
           line: null,
           recovery: "fix",
+          message: null,
+          exceptionClass: null,
+          sourceLine: null,
         }),
       ).toBe(supported);
     });
@@ -523,5 +667,51 @@ describe("guard denials under unsupported_page_operation", () => {
       }),
     );
     expect(failure?.code).toBe("no_tables_available");
+  });
+});
+
+describe("lastBrowserStep", () => {
+  function recorded(
+    actionType: ActionsApiResponse["action_type"],
+    status: Status,
+    createdAt: string,
+  ): ActionsApiResponse {
+    return {
+      ...failedAction(null),
+      action_type: actionType,
+      status,
+      created_at: createdAt,
+    };
+  }
+
+  test("names the last browser step and how long before the error it ran", () => {
+    expect(
+      lastBrowserStep([
+        recorded(
+          ActionTypes.NullAction,
+          Status.Failed,
+          "2026-11-04T20:06:13.66Z",
+        ),
+        recorded(
+          ActionTypes.Click,
+          Status.Completed,
+          "2026-11-04T20:06:10.11Z",
+        ),
+        recorded(
+          ActionTypes.InputText,
+          Status.Completed,
+          "2026-11-04T20:06:05Z",
+        ),
+      ]),
+    ).toEqual({ label: "Click", secondsBeforeError: 3.55 });
+  });
+
+  test("is absent when no browser step was recorded", () => {
+    expect(
+      lastBrowserStep([
+        recorded(ActionTypes.NullAction, Status.Failed, "2026-11-04T20:06:13Z"),
+      ]),
+    ).toBeNull();
+    expect(lastBrowserStep(null)).toBeNull();
   });
 });

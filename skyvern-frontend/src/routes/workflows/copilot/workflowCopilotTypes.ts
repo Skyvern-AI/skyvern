@@ -13,6 +13,7 @@ export type CopilotProductAction = {
 export interface WorkflowCopilotDemonstrationInsertion {
   after_label: string | null;
   before_label: string | null;
+  replace_label?: string | null;
 }
 export type ProposalDisposition =
   | "no_proposal"

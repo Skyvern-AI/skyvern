@@ -23,7 +23,10 @@ import { cn } from "@/util/utils";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useUpdate } from "../../useUpdate";
 import { AppNode, isWorkflowBlockNode } from "..";
-import { updateNodeAndDescendantsVisibility } from "../../workflowEditorUtils";
+import {
+  inferBranchCriteriaTypeFromExpression,
+  updateNodeAndDescendantsVisibility,
+} from "../../workflowEditorUtils";
 import { applyEdgeVisibility } from "./applyEdgeVisibility";
 import {
   getConditionLabel,
@@ -399,6 +402,7 @@ function BranchesEditor({ nodeId, data }: Props) {
           criteria: {
             ...(branch.criteria ?? { ...defaultBranchCriteria }),
             expression,
+            criteria_type: inferBranchCriteriaTypeFromExpression(expression),
           },
         };
       }),

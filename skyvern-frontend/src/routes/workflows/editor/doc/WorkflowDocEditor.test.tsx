@@ -27,6 +27,7 @@ import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
+import { splitAtCaret } from "./docCaret";
 import { block, conditional, forLoop, settings } from "./docTestBlocks";
 import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
@@ -193,6 +194,69 @@ describe("WorkflowDocEditor navigation", () => {
 
       expect(proceeded).toBe(true);
       expect(edits.addStep).not.toHaveBeenCalled();
+    });
+
+    test("a save while the caret is in a step leaves its text on screen", () => {
+      // jsdom has no innerText; the line reads and writes its text through it.
+      const innerText = Object.getOwnPropertyDescriptor(
+        HTMLElement.prototype,
+        "innerText",
+      );
+      Object.defineProperty(HTMLElement.prototype, "innerText", {
+        configurable: true,
+        get(this: HTMLElement) {
+          return this.textContent ?? "";
+        },
+        set(this: HTMLElement, text: string) {
+          this.textContent = text;
+        },
+      });
+      try {
+        const goal = "Find the book and return its price";
+        renderDoc(
+          [
+            block("extraction", "find_it", null, {
+              data_extraction_goal: goal,
+            }),
+          ],
+          editsWithAdd(),
+        );
+        fireEvent.focus(
+          screen.getByRole("textbox", { name: "find_it dataExtractionGoal" }),
+        );
+        const typing = screen.getByRole("textbox", {
+          name: "find_it dataExtractionGoal",
+        });
+        expect(typing.textContent).toBe(goal);
+        const caret = document.createRange();
+        caret.setStart(typing.firstChild!, "Find the ".length);
+        caret.setEnd(typing.firstChild!, "Find the book".length);
+        window.getSelection()?.removeAllRanges();
+        window.getSelection()?.addRange(caret);
+        fireEvent.keyDown(typing, { key: "s", metaKey: true });
+
+        // Saving holds the editor lock until the request settles.
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: true }),
+        );
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: false }),
+        );
+
+        const line = screen.getByRole("textbox", {
+          name: "find_it dataExtractionGoal",
+        });
+        expect(line.textContent).toBe(goal);
+        expect(document.activeElement).toBe(line);
+        expect(splitAtCaret(line)).toEqual([
+          "Find the ",
+          " and return its price",
+        ]);
+      } finally {
+        if (innerText)
+          Object.defineProperty(HTMLElement.prototype, "innerText", innerText);
+        else delete (HTMLElement.prototype as { innerText?: string }).innerText;
+      }
     });
 
     test("Tab on a note under an empty loop opens the step menu and picks no type", () => {
@@ -791,6 +855,52 @@ describe("a step that was just added", () => {
       "1 problem",
     );
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
+  });
+
+  test("a loop over a whole extraction result holds Run; the typed list path does not", () => {
+    const steps = (reference: string) => [
+      block("extraction", "extraction_1", "books", {
+        data_extraction_goal: "List the titles",
+        data_schema: null,
+      }),
+      forLoop("books", null, [block("navigation", "open_book", null)], {
+        loop_over: null,
+        loop_variable_reference: reference,
+      }),
+    ];
+    renderDoc(steps("{{ extraction_1_output }}"));
+    expect(
+      screen.getByText(/^Pick the list inside extraction_1_output/),
+    ).toBeTruthy();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+    cleanup();
+    renderDoc(steps("{{ extraction_1_output.extracted_information.titles }}"));
+    expect(screen.queryByText(/Pick the list/)).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+  });
+
+  test("a freshly added loop over a picked whole result holds Run once the user leaves it", () => {
+    const nodes = renderDoc([
+      block("extraction", "extraction_1", "books", {
+        data_extraction_goal: "List the titles",
+        data_schema: null,
+      }),
+      forLoop("books", null, [block("navigation", "open_book", null)], {
+        loop_over: null,
+        loop_variable_reference: "{{extraction_1_output}}",
+      }),
+    ]);
+    const loop = nodes.find((n) => n.type === "loop")!;
+    act(() => useDocUnfinishedStore.getState().add(loop.id));
+    expect(screen.queryByText(/^Pick the list inside/)).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+
+    fireEvent.pointerDown(document.body);
+
+    expect(
+      screen.getByText(/^Pick the list inside extraction_1_output/),
+    ).toBeTruthy();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
   });
 
   test("a click inside a floating menu does not count as leaving the new step", () => {
