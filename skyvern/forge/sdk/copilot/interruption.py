@@ -83,7 +83,7 @@ class StoppedTurnFacts(BaseModel):
 
 def _recorded_run_sentence(run: str, stopped: StoppedTurnFacts) -> str:
     if not stopped.run_result_recorded:
-        return f"{run} started and has no recorded result."
+        return f"{run} started, and I had not received its result."
     if stopped.block_rows:
         rows = join_phrases([f"{label} {status}" for label, status in stopped.block_rows], "and")
         return f"{run} recorded {rows}."

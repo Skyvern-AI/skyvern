@@ -251,6 +251,7 @@ class BuildTestPacketRun(BaseModel):
     execution_source: dict[str, Any] | None = None
     browser_start: dict[str, Any] | None = None
     loop_inputs: LoopInputs | LoopInputsUnavailable | None = None
+    credits_used: int | None = None
 
 
 class BuildTestPacketPageState(BaseModel):
