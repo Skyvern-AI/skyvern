@@ -3,6 +3,7 @@ import {
   buildTemplateGuidanceMessage,
   withoutTemplateViaParam,
 } from "../templateGuidance";
+import { removeBlock } from "./doc/docGraphEdits";
 import {
   bindCopilotReviewClose,
   captureEditorState,
@@ -370,6 +371,8 @@ export type AddNodeProps = {
   // Used when free; otherwise a generated name.
   label?: string;
   select?: boolean;
+  // A step that leaves the graph in the same pass that adds this one.
+  replacing?: string;
 };
 
 interface Dom {
@@ -1918,10 +1921,23 @@ function Workspace({
     branch,
     label,
     select = true,
+    replacing,
   }: AddNodeProps): string | undefined {
     if (refuseMutationDuringYamlCommit()) return;
     const newNodes: Array<AppNode> = [];
     const newEdges: Array<Edge> = [];
+    const replacingFinallyId =
+      nodes.find(
+        (n) =>
+          isWorkflowBlockNode(n) &&
+          !n.parentId &&
+          n.data.label === finallyBlockLabel,
+      )?.id ?? null;
+    const base = (replacing &&
+      removeBlock({ nodes, edges }, replacing, replacingFinallyId)) || {
+      nodes,
+      edges,
+    };
     const id = nanoid();
     // Use global label tracking instead of just current nodes
     const existingLabels = Array.from(usedLabelsRef.current);
@@ -2052,7 +2068,7 @@ function Workspace({
 
     // The Doc adds into whichever branch it shows; on the canvas only the active branch is drawn.
     const parentNode = computedParentId
-      ? nodes.find((n) => n.id === computedParentId)
+      ? base.nodes.find((n) => n.id === computedParentId)
       : undefined;
     const addedHidden =
       Boolean(parentNode?.hidden) ||
@@ -2068,20 +2084,20 @@ function Workspace({
     }
 
     const editedEdges = previous
-      ? edges.filter((edge) =>
+      ? base.edges.filter((edge) =>
           shouldKeepExistingEdgeForInsertion(edge, { branch, next, previous }),
         )
-      : edges;
+      : base.edges;
 
-    const previousNode = nodes.find((node) => node.id === previous);
+    const previousNode = base.nodes.find((node) => node.id === previous);
     const previousNodeIndex = previousNode
-      ? nodes.indexOf(previousNode)
-      : nodes.length - 1;
+      ? base.nodes.indexOf(previousNode)
+      : base.nodes.length - 1;
 
     const newNodesAfter = [
-      ...nodes.slice(0, previousNodeIndex + 1),
+      ...base.nodes.slice(0, previousNodeIndex + 1),
       ...newNodes,
-      ...nodes.slice(previousNodeIndex + 1),
+      ...base.nodes.slice(previousNodeIndex + 1),
     ];
     workflowChangesStore.setHasChanges(true);
     postHog.capture("builder.block.added", {

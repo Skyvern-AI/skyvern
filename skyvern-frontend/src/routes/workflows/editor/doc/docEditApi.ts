@@ -26,6 +26,7 @@ import {
   getDocProseFields,
 } from "./docStepRegistry";
 import { withLineSetting } from "./docLineSettings";
+import { useDocUnfinishedStore } from "./docUnfinished";
 import {
   addBranch,
   checkLabel,
@@ -34,6 +35,7 @@ import {
   moveBlock,
   moveBranch,
   newStepLabel,
+  labelStem,
   branchMembers,
   contextInputsFedBy,
   findOutputUsers,
@@ -252,12 +254,24 @@ export function createDocEditApi({
     }
     return to;
   };
-  const insertStep = (place: DocPlace, nodeType: NodeType): string | null => {
-    const point = insertionPoint(graph, place.scope, place.index, finallyId);
+  const insertStep = (
+    place: DocPlace,
+    nodeType: NodeType,
+    replacing?: string,
+  ): string | null => {
+    // A replaced step leaves the graph in the same pass that adds its successor: one layout, one undo step.
+    const base = replacing ? removeBlock(graph, replacing, finallyId) : null;
+    const point = insertionPoint(
+      base ?? graph,
+      place.scope,
+      place.index,
+      finallyId,
+    );
     if (!point) return null;
     const added = edits.addStep({
       nodeType,
       ...point,
+      replacing: base ? replacing : undefined,
       label: newStepLabel(
         nodes,
         availableNodeLibraryItems().find((i) => i.nodeType === nodeType)
@@ -268,7 +282,10 @@ export function createDocEditApi({
       ),
       select: false,
     });
-    if (added) edits.update((current) => clearLongDefaultText(current, added));
+    if (added) {
+      useDocUnfinishedStore.getState().add(added);
+      edits.update((current) => clearLongDefaultText(current, added));
+    }
     return added;
   };
 
@@ -459,6 +476,14 @@ export function createDocEditApi({
       return added;
     },
     insertStep,
+    // The empty step `id` becomes a step of `nodeType` in the same place.
+    replaceStep: (id: string, nodeType: NodeType): string | null => {
+      const node = nodes.find((n) => n.id === id);
+      if (!node || id === finallyId) return null;
+      const scope = scopeOfNode(node);
+      const index = readChain(graph, scope, finallyId)?.ids.indexOf(id) ?? -1;
+      return index < 0 ? null : insertStep({ scope, index }, nodeType, id);
+    },
     duplicate: (id: string) => edits.duplicate(id),
     remove: (id: string) => {
       if (refuseIfFeedsInputs([id])) return;
@@ -481,9 +506,53 @@ export function createDocEditApi({
             : "Deleted",
       });
     },
+    // A step still named for its old type, with nothing using its output, is renamed for the new type.
     turnInto: (id: string, nodeType: NodeType) => {
       const next = turnInto(graph, id, nodeType);
-      if (next) edits.apply(next);
+      if (!next) return;
+      const node = nodes.find((n) => n.id === id);
+      const titleOf = (type: string) =>
+        availableNodeLibraryItems().find((i) => i.nodeType === type)?.title ??
+        type;
+      const old = node && isWorkflowBlockNode(node) ? node : null;
+      const autoNamed =
+        old &&
+        new RegExp(
+          `^${labelStem(titleOf(old.type)).replace(/[^a-z0-9_]/g, "")}_\\d+$`,
+        ).test(old.data.label);
+      if (
+        !old ||
+        !autoNamed ||
+        id === finallyId ||
+        findOutputUsers(nodes, id).length
+      )
+        return edits.apply(next);
+      const parameterKeys = useWorkflowParametersStore
+        .getState()
+        .parameters.map((parameter) => parameter.key);
+      const label = newStepLabel(
+        next.nodes.filter((n) => n.id !== id),
+        titleOf(nodeType),
+        parameterKeys,
+      );
+      if (checkLabel(next.nodes, id, label, parameterKeys))
+        return edits.apply(next);
+      const parameters = useWorkflowParametersStore.getState();
+      parameters.setParameters(
+        getUpdatedParametersAfterLabelUpdateForSourceParameterKey(
+          id,
+          label,
+          next.nodes,
+          parameters.parameters,
+        ),
+      );
+      useNodeCollapseStore
+        .getState()
+        .renameBlock(workflowId, old.data.label, label);
+      edits.apply({
+        nodes: renameStep(next.nodes, id, label).nodes,
+        edges: next.edges,
+      });
     },
     move,
     // Tab nests a step in the loop or branch just above it; Shift+Tab puts it after the step that holds it.
@@ -519,6 +588,32 @@ export function createDocEditApi({
         });
       }
       return false;
+    },
+    // A step with no text, no note and no setting: "/" can replace it outright.
+    isEmptyStep: (id: string) => {
+      const node = nodes.find((n) => n.id === id);
+      if (
+        !node ||
+        !isWorkflowBlockNode(node) ||
+        hasSettingsBeyondText(node) ||
+        findOutputUsers(nodes, id).length ||
+        contextInputsFedBy(
+          nodes,
+          useWorkflowParametersStore.getState().parameters,
+          id,
+        ).length
+      )
+        return false;
+      const data = node.data as Record<string, unknown>;
+      return [
+        ...getDocProseFields(node).map((f) => f.key),
+        "description",
+        "notes",
+        "trailingNotes",
+      ].every((key) => {
+        const value = data[key];
+        return typeof value !== "string" || !value.trim();
+      });
     },
     // Only a step whose whole content is text can become text without losing anything.
     canBePlainText: (id: string) => {
