@@ -950,7 +950,7 @@ async def _read_failure_attribution(sqlite_db: AgentDB, workflow_run_id: str) ->
 async def _failure_attribution_is_sql_null(sqlite_db: AgentDB, workflow_run_id: str) -> bool:
     """SQL-grain check: distinguishes real SQL NULL from the JSON token 'null'.
 
-    ORM ``is None`` cannot tell them apart, but CDC/Redshift and ``IS NULL`` predicates can.
+    ORM ``is None`` cannot tell them apart, but downstream readers and ``IS NULL`` predicates can.
     """
     async with sqlite_db.Session() as session:
         result = await session.execute(
@@ -2078,7 +2078,7 @@ async def test_reset_clear_wipes_reason_category_and_attribution_when_created(sq
         # not derive attribution from the stale category.
         assert cleared.failure_category is None
         assert cleared.failure_attribution is None
-    # SQL grain: a reset row must be SQL NULL so it never enters the Redshift projection.
+    # SQL grain: a reset row must be SQL NULL so it never enters a downstream projection.
     assert await _failure_attribution_is_sql_null(sqlite_db, workflow_run_id)
 
 
