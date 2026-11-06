@@ -66,7 +66,7 @@ _FAKE_JWT = ".".join(
 def _credential(
     credential_id: str = "cred_safe", tested_url: str | None = "https://login.example.test/login"
 ) -> SimpleNamespace:
-    return SimpleNamespace(credential_id=credential_id, name="Saved Login", tested_url=tested_url)
+    return SimpleNamespace(credential_id=credential_id, name="Saved Login", tested_url=tested_url, extra_site_urls=[])
 
 
 def _policy(**overrides: object) -> RequestPolicy:
@@ -851,6 +851,29 @@ def test_existing_workflow_credential_with_known_prior_origin_ignores_current_re
     )
 
     assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+def test_existing_workflow_block_on_a_site_added_to_its_login_does_not_broaden_scope() -> None:
+    policy = _policy(
+        existing_workflow_credential_ids=["cred_safe"],
+        existing_workflow_credential_origins={},
+        credential_input_kind="none",
+    )
+    workflow_yaml = _workflow_yaml(url="https://account.example.org/login")
+
+    before = evaluate_output_policy(request_policy=policy, workflow_yaml=workflow_yaml)
+    policy.refresh_credential(
+        SimpleNamespace(
+            credential_id="cred_safe",
+            name="Saved Login",
+            tested_url="https://login.example.test/login",
+            extra_site_urls=["https://account.example.org/login"],
+        )
+    )
+    after = evaluate_output_policy(request_policy=policy, workflow_yaml=workflow_yaml)
+
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in before.reason_codes
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED not in after.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -1891,7 +1914,7 @@ workflow_definition:
 
 
 def _discovered(credential_id: str, tested_url: str | None) -> object:
-    return SimpleNamespace(credential_id=credential_id, name=credential_id, tested_url=tested_url)
+    return SimpleNamespace(credential_id=credential_id, name=credential_id, tested_url=tested_url, extra_site_urls=[])
 
 
 def test_rejects_discovered_credential_bound_to_new_origin() -> None:

@@ -4203,6 +4203,37 @@ async def test_recovery_guard_refuses_the_block_credential_off_site_and_admits_i
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("extra_sites", "refused_on_added_site"),
+    [(["https://idp-example.org/login"], False), ([], True)],
+    ids=["added-site", "no-added-site"],
+)
+async def test_recovery_guard_admits_a_site_added_to_the_login_and_still_refuses_others(
+    monkeypatch: pytest.MonkeyPatch, extra_sites: list[str], refused_on_added_site: bool
+) -> None:
+    context = _stub_recovery_run_context(monkeypatch, tested_url="https://portal-example.com/login")
+    if extra_sites:
+        context.credential_extra_site_urls["portal_credential"] = extra_sites
+    task = make_task(datetime.now(UTC), make_organization(datetime.now(UTC)), workflow_run_id="wr_test")
+
+    guard = agent_module.recovery_credential_release_guard(task, ["portal_credential"], enforce_vault_sites=True)
+
+    assert guard is not None
+    armed = guard.matches("s3cret-value")
+
+    def release_to(url: str) -> None:
+        guard.check_release(armed[0], url, operation="taskv3.type", alternatives=armed[1:])
+
+    if refused_on_added_site:
+        with pytest.raises(CodeBlockCredentialReleaseError):
+            release_to("https://accounts.idp-example.org/signin")
+    else:
+        release_to("https://accounts.idp-example.org/signin")
+    with pytest.raises(CodeBlockCredentialReleaseError):
+        release_to("https://phisher-signin.net/login")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("sites", "enforced", "page_url", "refused"),
     [
         ([LoginSite("https://portal-example.com", whole_site=True)], True, "https://phisher-signin.net/login", True),
