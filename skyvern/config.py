@@ -878,6 +878,11 @@ class Settings(BaseSettings):
     GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
     GCP_CREDENTIAL_VAULT_PREFIX: str = "skyvern-cred-"  # secret-id prefix; must be unique per deployment
 
+    # AWS Secrets Manager credential vault settings
+    AWS_CREDENTIAL_VAULT_REGION: str | None = None  # region holding the secrets; setting it enables the vault
+    AWS_CREDENTIAL_VAULT_PREFIX: str = "skyvern-credentials/"  # secret-name prefix; must be unique per deployment
+    AWS_CREDENTIAL_VAULT_KMS_KEY_ID: str | None = None  # KMS key for new secrets; unset uses aws/secretsmanager
+
     # Azure Setting
     AZURE_TENANT_ID: str | None = None
     AZURE_CLIENT_ID: str | None = None
