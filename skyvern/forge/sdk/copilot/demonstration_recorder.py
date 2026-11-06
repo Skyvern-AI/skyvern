@@ -793,6 +793,9 @@ class DemonstrationRecorder:
         if kind == "file_chooser":
             await self._request_file(event, frame)
             return
+        if kind == "click_navigation_unconfirmed":
+            await self._record_gap_event(event, frame, "click_navigation_unconfirmed", label="Click not recorded")
+            return
         if kind == "secret_focus":
             field = payload.get("field")
             if isinstance(selector, str):
