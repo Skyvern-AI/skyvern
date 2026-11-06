@@ -6,6 +6,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
+import { isWaitAmountLine } from "./docLineSettings";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { stripJinjaReferences } from "./docTextUtils";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -690,7 +691,9 @@ export function DocStepBody({
   const keyFields = getDocKeyFields(node);
   const unfinished = useDocUnfinishedStore((state) => state.ids.has(node.id));
   const missing = unfinished ? [] : getDocMissingSettings(node);
-  const noteOnly = docStepIsNoteOnly(node);
+  const noteOnly =
+    docStepIsNoteOnly(node) &&
+    !(node.type === "wait" && isWaitAmountLine(description ?? ""));
   // A description sits under a prompt-driven step's text; on other steps it is the main line, with the setting it would hide underneath.
   // A loop's line that already names its list says what "For each of …" would, so the summary is left out.
   const loopSource = stripJinjaReferences(

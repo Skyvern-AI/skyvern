@@ -16,7 +16,11 @@ import { isWorkflowBlockNode, type AppNode } from "../nodes";
 import { workflowBlockTitle } from "../nodes/types";
 import { countDocSteps, type DocItem, type DocNoteItem } from "./buildDocTree";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
-import { docBlockType } from "./docStepRegistry";
+import {
+  docBlockType,
+  getDocMissingSettings,
+  getDocProseFields,
+} from "./docStepRegistry";
 import { DocConditional } from "./DocConditional";
 import { DocStepBody, DocStepHeader, type DocStepPlace } from "./DocStep";
 import {
@@ -813,8 +817,9 @@ export function DocScope({
       : { ownerNodeId: nodeId, placement: "trailing" as const };
     actions.setPendingNote(note);
   };
-  // Enter on a step makes a step of the same type below, splitting its text at the caret. Enter on an empty step
-  // turns it back into a note, as Enter leaves an empty list item. Loops and Ifs start the note under them.
+  // Enter on a step makes a step of the same type below, splitting its text at the caret. Enter on an empty step that
+  // needs text turns it back into a note, as Enter leaves an empty list item. Loops, Ifs and steps that need no text
+  // (Print Page, a Wait with its amount) keep the step and open an empty line below.
   const enterAfter = (
     nodeId: string,
     split: LineSplit | null,
@@ -834,6 +839,10 @@ export function DocScope({
       node.type === "conditional"
     )
       return noteBelow(nodeId);
+    const needsText =
+      getDocProseFields(node).length > 0 ||
+      getDocMissingSettings(node).length > 0;
+    if (!needsText) return noteBelow(nodeId);
     if (
       split &&
       !split.before.trim() &&
