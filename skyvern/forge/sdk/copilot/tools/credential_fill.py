@@ -1469,13 +1469,16 @@ async def fill_credential_field(
     credential_id: str,
     field: str,
     submit_selector: str | None = None,
+    frame: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     lock = getattr(copilot_ctx, "credential_fill_lock", None)
     if not isinstance(lock, asyncio.Lock):
         lock = asyncio.Lock()
         copilot_ctx.credential_fill_lock = lock
     async with lock, browser_session_turn(copilot_ctx), browser_evidence_commit_lock(copilot_ctx):
-        return await _fill_credential_field_impl_serial(copilot_ctx, selector, credential_id, field, submit_selector)
+        return await _fill_credential_field_impl_serial(
+            copilot_ctx, selector, credential_id, field, submit_selector, frame
+        )
 
 
 async def _fill_credential_field_impl_serial(
@@ -1484,6 +1487,7 @@ async def _fill_credential_field_impl_serial(
     credential_id: str,
     field: str,
     submit_selector: str | None = None,
+    frame: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     arguments: dict[str, Any] = {"selector": selector, "credential_id": credential_id, "field": field}
     if submit_selector:
@@ -1581,6 +1585,11 @@ async def _fill_credential_field_impl_serial(
         session_id = effective_browser_session_id(copilot_ctx)
         async with mcp_browser_context(copilot_ctx, session_id_override=session_id):
             page, _ = await get_page(session_id=session_id)
+            # The page wrapper is per call, so this scopes only this fill and its readback.
+            if frame and frame.get("name"):
+                await page.frame_switch(name=frame["name"])
+            elif frame and frame.get("owner_selector"):
+                await page.frame_switch(selector=frame["owner_selector"])
             await page.fill(
                 selector,
                 value,
