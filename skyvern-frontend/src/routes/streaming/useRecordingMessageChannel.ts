@@ -202,8 +202,9 @@ function handleMessage(
     case "copied-text": {
       const text = message.text;
       // Copying with nothing selected must leave the local clipboard alone, as a
-      // native Cmd/Ctrl+C does.
-      if (clipboard === "none" || !text) {
+      // native Cmd/Ctrl+C does. VNC streams copy through the VNC server's own
+      // clipboard instead.
+      if (clipboard !== "message" || !text) {
         break;
       }
 

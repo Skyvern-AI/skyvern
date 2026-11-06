@@ -265,6 +265,7 @@ import {
   sopAttachmentDraft,
   stageSopFile,
 } from "./workspaceAuthoringActions";
+import { DemonstrateFromBlockStatus } from "./DemonstrateFromBlockStatus";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
@@ -3504,6 +3505,7 @@ function Workspace({
         </div>
       )}
 
+      <DemonstrateFromBlockStatus />
       {withStudioPaneBoundary(
         "copilot",
         <WorkflowCopilotChat

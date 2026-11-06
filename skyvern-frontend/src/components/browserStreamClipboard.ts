@@ -18,6 +18,7 @@ export type PasteShortcutEvent = Pick<
 >;
 
 const VNC_CONTROL_LEFT_KEYSYM = 0xffe3;
+const VNC_C_KEYSYM = 0x0063;
 const VNC_V_KEYSYM = 0x0076;
 // noVNC maps macOS right Cmd to Super_L; BrowserStream sends left Cmd as Super_L too instead of noVNC's Alt_L.
 const VNC_SUPER_L_KEYSYM = 0xffeb;
@@ -45,8 +46,20 @@ function isClipboardPasteShortcut(event: PasteShortcutEvent) {
   );
 }
 
-function sendVncPasteShortcut(
+function isClipboardCopyShortcut(event: PasteShortcutEvent) {
+  // Ctrl+C already reaches the remote browser as Ctrl+C; only Cmd+C needs rewriting.
+  return (
+    event.metaKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    event.key.toLowerCase() === "c"
+  );
+}
+
+function sendVncControlShortcut(
   rfb: VncClipboardRfb,
+  keysym: number,
+  code: string,
   releaseMetaModifiers = false,
 ) {
   if (releaseMetaModifiers) {
@@ -55,9 +68,93 @@ function sendVncPasteShortcut(
     }
   }
   rfb.sendKey(VNC_CONTROL_LEFT_KEYSYM, "ControlLeft", true);
-  rfb.sendKey(VNC_V_KEYSYM, "KeyV", true);
-  rfb.sendKey(VNC_V_KEYSYM, "KeyV", false);
+  rfb.sendKey(keysym, code, true);
+  rfb.sendKey(keysym, code, false);
   rfb.sendKey(VNC_CONTROL_LEFT_KEYSYM, "ControlLeft", false);
+}
+
+function sendVncPasteShortcut(
+  rfb: VncClipboardRfb,
+  releaseMetaModifiers = false,
+) {
+  sendVncControlShortcut(rfb, VNC_V_KEYSYM, "KeyV", releaseMetaModifiers);
+}
+
+// The remote browser runs on Linux, where Cmd means nothing: send the Ctrl
+// shortcut with Cmd lifted, then put back whichever Cmd keys are still held.
+function sendVncControlShortcutForChord(
+  event: Pick<KeyboardEvent, "metaKey">,
+  rfb: VncClipboardRfb,
+  keysym: number,
+  code: string,
+  getHeldMetaSides?: () => HeldMetaSides,
+) {
+  if (!event.metaKey) {
+    sendVncControlShortcut(rfb, keysym, code);
+    return;
+  }
+
+  const sides = getHeldMetaSides?.();
+  if (!sides?.left && !sides?.right) {
+    sendVncControlShortcut(rfb, keysym, code, true);
+    return;
+  }
+
+  if (sides.left) {
+    rfb.sendKey(VNC_CMD_LEFT_RELEASE_KEYSYM, "MetaLeft", false);
+  }
+  if (sides.right) {
+    rfb.sendKey(VNC_CMD_RIGHT_RELEASE_KEYSYM, "MetaRight", false);
+  }
+
+  sendVncControlShortcut(rfb, keysym, code);
+
+  const currentMetaSides = getHeldMetaSides?.();
+  if (currentMetaSides?.left) {
+    rfb.sendKey(VNC_CMD_LEFT_RELEASE_KEYSYM, "MetaLeft", true);
+  }
+  if (currentMetaSides?.right) {
+    rfb.sendKey(VNC_CMD_RIGHT_RELEASE_KEYSYM, "MetaRight", true);
+  }
+}
+
+// The remote browser copies into its own clipboard, which the VNC server then
+// sends back; the stream turns that into a local clipboard write.
+function handleVncClipboardCopyShortcut(
+  event: PasteShortcutEvent,
+  rfb: VncClipboardRfb | null,
+  getHeldMetaSides?: () => HeldMetaSides,
+) {
+  if (!rfb || !isClipboardCopyShortcut(event)) {
+    return false;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+  sendVncControlShortcutForChord(
+    event,
+    rfb,
+    VNC_C_KEYSYM,
+    "KeyC",
+    getHeldMetaSides,
+  );
+  return true;
+}
+
+// x11vnc sends the remote clipboard as UTF-8 bytes, which noVNC hands over one
+// character per byte. Text that is not valid UTF-8 is kept as Latin-1.
+function decodeVncClipboardText(text: string) {
+  const codes = Array.from(text, (char) => char.charCodeAt(0));
+  if (codes.some((code) => code > 0xff)) {
+    return text;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(codes),
+    );
+  } catch {
+    return text;
+  }
 }
 
 async function syncTextToVnc(
@@ -120,39 +217,20 @@ async function handleVncClipboardPasteShortcut(
     return true;
   }
   onPasted?.(text);
-
-  if (!event.metaKey) {
-    sendVncPasteShortcut(rfb);
-    return true;
-  }
-
-  const sides = getHeldMetaSides?.();
-  if (!sides?.left && !sides?.right) {
-    sendVncPasteShortcut(rfb, true);
-    return true;
-  }
-
-  if (sides.left) {
-    rfb.sendKey(VNC_CMD_LEFT_RELEASE_KEYSYM, "MetaLeft", false);
-  }
-  if (sides.right) {
-    rfb.sendKey(VNC_CMD_RIGHT_RELEASE_KEYSYM, "MetaRight", false);
-  }
-
-  sendVncPasteShortcut(rfb);
-
-  const currentMetaSides = getHeldMetaSides?.();
-  if (currentMetaSides?.left) {
-    rfb.sendKey(VNC_CMD_LEFT_RELEASE_KEYSYM, "MetaLeft", true);
-  }
-  if (currentMetaSides?.right) {
-    rfb.sendKey(VNC_CMD_RIGHT_RELEASE_KEYSYM, "MetaRight", true);
-  }
+  sendVncControlShortcutForChord(
+    event,
+    rfb,
+    VNC_V_KEYSYM,
+    "KeyV",
+    getHeldMetaSides,
+  );
   return true;
 }
 
 export {
   VNC_SUPER_L_KEYSYM,
+  decodeVncClipboardText,
+  handleVncClipboardCopyShortcut,
   handleVncClipboardPasteShortcut,
   isClipboardPasteShortcut,
   pasteTextIntoVnc,

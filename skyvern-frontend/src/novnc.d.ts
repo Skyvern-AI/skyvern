@@ -7,6 +7,8 @@ declare module "@novnc/novnc/lib/rfb.js" {
         message: string;
       };
       message: string;
+      // "clipboard" events: the VNC server's clipboard text.
+      text?: string;
     };
   }
 

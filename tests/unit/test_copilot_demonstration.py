@@ -320,7 +320,7 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
             owner_seen_at=None,
             final_url="https://example.test/done",
             stop_reason="disconnected",
-            insertion={"after_label": "Saved step", "before_label": None},
+            insertion={"after_label": "Saved step", "before_label": None, "replace_label": "Fill form"},
         )
     )
     for seq, event in enumerate(events, 1):
@@ -410,6 +410,7 @@ async def test_replay_contract_never_touches_a_browser_and_consumes_once(monkeyp
     assert "swordfish" not in json.dumps(ctx.demonstration_items)
     assert any("#unlabelled" in label for label in ctx.demonstration_items)
     assert "Saved step" in serialized
+    assert "Fill form" in serialized
     assert "Ignored request step" not in serialized
     record = decode_demonstration_record(cache.store[demonstration_record_key("org-1", "demo-1")])
     assert record is not None and record.status == "consumed"

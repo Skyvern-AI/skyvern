@@ -109,6 +109,7 @@ const mocks = vi.hoisted(() => {
     wsUrls,
     settingsStore,
     toast: vi.fn(),
+    copyText: vi.fn(async () => true),
   };
 });
 
@@ -186,6 +187,10 @@ vi.mock("@/store/SettingsStore", () => ({
 
 vi.mock("@/components/ui/use-toast", () => ({
   toast: mocks.toast,
+}));
+
+vi.mock("@/util/copyText", () => ({
+  copyText: mocks.copyText,
 }));
 
 const respondWithRunningSession = mocks.apiGet.getMockImplementation()!;
@@ -391,6 +396,79 @@ describe("BrowserStream", () => {
       0xffeb,
       "MetaLeft",
       true,
+    );
+  });
+
+  it("copies with a remote Ctrl+C and mirrors the remote clipboard only while in control", async () => {
+    const { container } = renderBrowserStream();
+    const takeControlButton = await screen.findByRole(
+      "button",
+      { name: /take control/i },
+      { timeout: 10000 },
+    );
+    const stream = container.querySelector(".browser-stream");
+    const canvas = container.querySelector("canvas");
+    const rfb = mocks.rfbInstances[0]!;
+    const emit = (
+      rfb as unknown as {
+        emit: (type: string, detail?: unknown) => void;
+      }
+    ).emit.bind(rfb);
+
+    // The agent's own copies must not reach the user's clipboard.
+    emit("clipboard", { text: "agent copy" });
+    expect(mocks.copyText).not.toHaveBeenCalled();
+
+    fireEvent.click(takeControlButton);
+    fireEvent.keyDown(canvas!, { key: "Meta", code: "MetaLeft" });
+    fireEvent.keyDown(stream!, { key: "c", metaKey: true });
+
+    expect(rfb.sendKey.mock.calls).toEqual([
+      [0xffeb, "MetaLeft", false],
+      [0xffe3, "ControlLeft", true],
+      [0x0063, "KeyC", true],
+      [0x0063, "KeyC", false],
+      [0xffe3, "ControlLeft", false],
+      [0xffeb, "MetaLeft", true],
+    ]);
+
+    // x11vnc sends UTF-8 bytes, which noVNC hands over one character per byte.
+    emit("clipboard", { text: "CONF-12345 \u00c3\u00a9" });
+    await waitFor(() => {
+      expect(mocks.copyText).toHaveBeenCalledWith("CONF-12345 \u00e9");
+    });
+    await waitFor(() => {
+      expect(mocks.toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Copied to Clipboard" }),
+      );
+    });
+
+    // Copying the same text again changes nothing remotely, so no clipboard
+    // event comes back; the last remote text is written again.
+    mocks.copyText.mockClear();
+    fireEvent.keyDown(stream!, { key: "c", metaKey: true });
+    await waitFor(
+      () => {
+        expect(mocks.copyText).toHaveBeenCalledWith("CONF-12345 \u00e9");
+      },
+      { timeout: 3000 },
+    );
+
+    // A paste sets the remote clipboard silently; copying that text back must
+    // return it, not the earlier copy.
+    fireEvent.keyDown(stream!, { key: "v", metaKey: true });
+    await waitFor(() => {
+      expect(rfb.clipboardPasteFrom).toHaveBeenCalledWith(
+        "https://example.test",
+      );
+    });
+    mocks.copyText.mockClear();
+    fireEvent.keyDown(stream!, { key: "c", metaKey: true });
+    await waitFor(
+      () => {
+        expect(mocks.copyText).toHaveBeenCalledWith("https://example.test");
+      },
+      { timeout: 3000 },
     );
   });
 

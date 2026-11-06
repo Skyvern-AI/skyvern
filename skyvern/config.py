@@ -1359,6 +1359,14 @@ class Settings(BaseSettings):
             ),
             "label": "Anthropic Claude Opus 5.5",
         }
+        mapping["claude-haiku-5-5"] = {
+            "llm_key": (
+                "BEDROCK_ANTHROPIC_CLAUDE5_5_HAIKU_INFERENCE_PROFILE"
+                if self.ENABLE_BEDROCK_ANTHROPIC
+                else "ANTHROPIC_CLAUDE5_5_HAIKU"
+            ),
+            "label": "Anthropic Claude Haiku 5.5",
+        }
 
         try:
             from skyvern.forge.sdk.api.llm.custom_llm_registry import (  # noqa: PLC0415

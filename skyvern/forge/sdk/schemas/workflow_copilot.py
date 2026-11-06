@@ -422,6 +422,7 @@ class WorkflowCopilotChatMessage(BaseModel):
 class WorkflowCopilotDemonstrationInsertion(BaseModel):
     after_label: str | None = Field(default=None, max_length=200)
     before_label: str | None = Field(default=None, max_length=200)
+    replace_label: str | None = Field(default=None, max_length=200)
 
 
 class WorkflowCopilotChatRequest(BaseModel):
