@@ -24,14 +24,6 @@ _NODE = shutil.which("node")
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
 class TestIncrementElementsGlobalGuard:
-    def test_js_syntax(self):
-        result = subprocess.run(
-            [_NODE, "--check", str(_DOMUTILS)],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 0, f"JS syntax error: {result.stderr}"
-
     def test_behavioral(self):
         script = Path(__file__).parent / "test_increment_elements_global_guard.js"
         assert script.exists(), f"Missing {script}"

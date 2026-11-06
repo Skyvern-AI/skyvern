@@ -56,11 +56,26 @@ keywords:
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
 <a id="week-oct-26-2026"></a>
-<Update label="Week of October 26, 2026" description="Reliability fix for browser extension tab recovery">
+<Update label="Week of October 26, 2026" description="Settings audit log, consistent Copilot integrations, and run/download reliability fixes">
+
+## New features
+
+- **Settings Audit Log** — Organization Admins now have an audit log in Settings with separate Changes and Runs tabs, 90-day filtering, CSV export, and cursor-based pagination, giving them one place to review configuration changes and run activity. ([#9138](https://github.com/Skyvern-AI/skyvern/pull/9138))
+
+## Improvements
+
+- **Copilot Knows All Your Integrations** — Copilot and the Integrations page now share the same list of available integrations, so asking Copilot which integrations you can use returns the same accounts — including vaults, MCP, and SMS — shown on the Integrations page.
+- **Specific Anti-Bot Error Codes** — Runs blocked by bot protection now automatically report a specific error code (reCAPTCHA, hCaptcha, Cloudflare Turnstile, or a general anti-bot error) in the run's errors list, without needing a custom error-code mapping.
 
 ## Bug fixes
 
 - Fixed an issue where another browser extension (such as a password manager) adding a frame to an agent's tab could cause Skyvern to lose that tab mid-task instead of recovering it automatically.
+- Fixed a regression that caused clicks to fail on some pages. ([#9113](https://github.com/Skyvern-AI/skyvern/pull/9113))
+- Fixed a race condition that could leave a run showing as still running in the runs list after it had already failed or been canceled. ([#9122](https://github.com/Skyvern-AI/skyvern/pull/9122))
+- Fixed file downloads being marked successful even when the response was an error page instead of the requested file. ([#9114](https://github.com/Skyvern-AI/skyvern/pull/9114))
+- Fixed download blocks reporting success when one of several requested files failed to download or save. ([#9110](https://github.com/Skyvern-AI/skyvern/pull/9110))
+- Fixed file download blocks taking up to 45 minutes to fail when the server returned a server error; they now fail fast.
+- Fixed automations built with Copilot sometimes getting stuck on tabs and similar elements.
 
 </Update>
 

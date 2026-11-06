@@ -15,7 +15,9 @@ from skyvern.config import settings
 from skyvern.forge import app as forge_app
 from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.forge_app import ForgeApp
+from skyvern.forge.sdk.credential_site_policy import MAX_EXTRA_SITE_URLS, MAX_SITE_URL_LENGTH
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.routes import credentials as credentials_routes
@@ -37,6 +39,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.services.credential import credential_creation_service
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.services.credential.skyvern_credential_vault_service import SkyvernCredentialVaultService
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.proxy_pinning import apply_proxy_pin_update as _apply_proxy_pin_update
 from skyvern.schemas.proxy_pinning import (
@@ -1367,6 +1370,131 @@ async def test_rename_credential_route_passes_tested_url(monkeypatch: pytest.Mon
     update_credential.assert_awaited_once()
     assert update_credential.await_args.kwargs["tested_url"] == "https://example.com/new"
     assert response.tested_url == "https://example.com/new"
+
+
+def _vault_naming(monkeypatch: pytest.MonkeyPatch, existing: Credential, login_uris: list[str]) -> None:
+    item = CredentialItem(
+        item_id=existing.item_id,
+        name=existing.name,
+        credential_type=CredentialType.PASSWORD,
+        credential=PasswordCredential(username="user@example.com", password="pw"),
+        login_uris=login_uris,
+    )
+    vault_service = SimpleNamespace(get_credential_item=AsyncMock(return_value=item))
+    monkeypatch.setattr(ForgeApp, "CREDENTIAL_VAULT_SERVICES", {existing.vault_type: vault_service}, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_an_extra_sites_edit_from_a_stale_copy_of_the_login_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _make_password_credential(tested_url="https://example.com/login")
+    _vault_naming(monkeypatch, existing, [])
+    update_credential = AsyncMock(side_effect=CredentialSitesChangedError("cred_123"))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await credentials_routes.rename_credential(
+            credential_id="cred_123",
+            data=credentials_routes.UpdateCredentialRequest(
+                extra_site_urls=[
+                    "https://example.org/login?next=1#x",
+                    "https://www.example.com/",
+                    "https://example.org/",
+                ],
+                expected_site_urls=["https://example.com/login"],
+            ),
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert excinfo.value.status_code == 409
+    assert update_credential.await_args.kwargs["extra_site_urls"] == ["https://example.org/login"]
+    assert update_credential.await_args.kwargs["expected_site_urls"] == ["https://example.com/login"]
+
+
+@pytest.mark.asyncio
+async def test_extra_sites_on_a_login_without_a_tested_url_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    update_credential = AsyncMock()
+    existing = _make_password_credential(tested_url=None)
+    _vault_naming(monkeypatch, existing, [])
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await credentials_routes.rename_credential(
+            credential_id="cred_123",
+            data=credentials_routes.UpdateCredentialRequest(extra_site_urls=["https://example.org/login"]),
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert excinfo.value.status_code == 422
+    update_credential.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "site_url",
+    ["ftp://example.org/login", "https://user:pw@example.org/login", "javascript:alert(1)"],
+    ids=["not-http", "userinfo", "script-url"],
+)
+async def test_an_extra_site_that_is_not_a_plain_web_url_is_refused(
+    monkeypatch: pytest.MonkeyPatch, site_url: str
+) -> None:
+    update_credential = AsyncMock()
+    existing = _make_password_credential(tested_url="https://example.com/login")
+    _vault_naming(monkeypatch, existing, [])
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await credentials_routes.rename_credential(
+            credential_id="cred_123",
+            data=credentials_routes.UpdateCredentialRequest(extra_site_urls=[site_url]),
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert excinfo.value.status_code == 422
+    update_credential.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "extra_site_urls",
+    [
+        [f"https://login.example{index}.test/login" for index in range(MAX_EXTRA_SITE_URLS + 1)],
+        ["https://login.example.test/" + "a" * MAX_SITE_URL_LENGTH],
+    ],
+    ids=["too-many-sites", "site-url-too-long"],
+)
+def test_an_extra_sites_edit_over_the_limits_is_refused_before_any_work(extra_site_urls: list[str]) -> None:
+    allowed = [f"https://login.example{index}.test/login" for index in range(MAX_EXTRA_SITE_URLS)]
+    assert credentials_routes.UpdateCredentialRequest(extra_site_urls=allowed).extra_site_urls == allowed
+    with pytest.raises(ValidationError):
+        credentials_routes.UpdateCredentialRequest(extra_site_urls=extra_site_urls)
+
+
+def test_adding_a_site_past_the_limit_is_refused() -> None:
+    full = [f"https://login.example{index}.test/login" for index in range(MAX_EXTRA_SITE_URLS)]
+    assert normalize_extra_site_urls("https://portal.example.com/login", full) == full
+    with pytest.raises(ValueError, match="at most"):
+        normalize_extra_site_urls("https://portal.example.com/login", [*full, "https://login.example.org/login"])
+
+
+@pytest.mark.asyncio
+async def test_extra_sites_on_a_login_whose_vault_names_its_sites_are_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    existing = _make_password_credential(tested_url="https://example.com/login")
+    _vault_naming(monkeypatch, existing, ["https://example.com/"])
+    update_credential = AsyncMock()
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "get_credential", AsyncMock(return_value=existing))
+    monkeypatch.setattr(forge_app.DATABASE.credentials, "update_credential", update_credential)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await credentials_routes.rename_credential(
+            credential_id="cred_123",
+            data=credentials_routes.UpdateCredentialRequest(extra_site_urls=["https://example.org/login"]),
+            current_org=SimpleNamespace(organization_id="org_123"),
+        )
+
+    assert excinfo.value.status_code == 422
+    update_credential.assert_not_awaited()
 
 
 def test_generate_proxy_session_id_rejects_empty_entity_id() -> None:

@@ -74,6 +74,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_TRACE_PER_TASK_LIMIT,
     BuildTestConnectFailure,
@@ -107,6 +108,7 @@ from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
 )
+from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -191,6 +193,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotRunOutcomeUpdate,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
@@ -727,6 +730,59 @@ class TestFailedTestResponseNormalization:
             "Keep the draft to iterate on, or discard."
         )
 
+    def test_browser_start_capacity_refusal_reports_its_facts_and_never_claims_a_test_ran(self) -> None:
+        refusal = BuildTestConnectFailure(
+            state="browser_start_capacity",
+            starting_sessions=12,
+            max_starting_sessions=10,
+            retry_after_seconds=17,
+        )
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+            last_test_failure_reason=build_test_connect_failure_sentence(refusal),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=refusal,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        for fact in ("12", "10", "17"):
+            assert fact in rewritten
+        assert "I tested the draft" not in rewritten
+
+    def test_a_browser_lost_after_the_run_started_never_claims_the_draft_was_tested(self) -> None:
+        lost = BuildTestConnectFailure(state="provisioning_unavailable", workflow_run_id="wr_lost")
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_test_run_started=True,
+            last_test_failure_reason=build_test_connect_failure_sentence(lost),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                workflow_run_id="wr_lost",
+                connect_failure=lost,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        assert build_test_connect_failure_sentence(lost) in rewritten
+        assert "I tested the draft" not in rewritten
+
     def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
         ctx = _challenge_failure_ctx()
         ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
@@ -773,11 +829,6 @@ class TestFailedTestResponseNormalization:
         ("branch", "lead"),
         [
             (
-                "credentials_unbound",
-                "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-                "the required credentials. Add them in Credentials, then I can try again.",
-            ),
-            (
                 "billing",
                 "I couldn't start a test. Build test did not start because credits are exhausted. "
                 "No browser or run started. Upgrade your plan in Billing. The draft is untested.",
@@ -802,10 +853,7 @@ class TestFailedTestResponseNormalization:
             last_test_failure_reason="Login rejected.",
             last_test_proxy_owned_failure=True,
         )
-        if branch == "credentials_unbound":
-            ctx.last_test_ok = None
-            ctx.request_policy = RequestPolicy(clarification_reason="workflow_credential_inputs_unbound")
-        elif branch == "billing":
+        if branch == "billing":
             ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -1089,16 +1137,22 @@ workflow_definition:
         assert verdict.reason_codes == []
 
     @pytest.mark.parametrize(
-        ("card", "expected"),
+        ("card", "site_answer", "expected"),
         [
-            ("skipped", "You chose not to connect a saved credential"),
-            ("timeout", "The credential card went unanswered"),
-            ("declined", "The credential card could not be shown"),
-            ("not_admitted", "saved for a different site"),
+            ("skipped", None, "You chose not to connect a saved credential"),
+            ("timeout", None, "The credential card went unanswered"),
+            ("declined", None, "The credential card could not be shown"),
+            ("not_admitted", None, "saved for a different site"),
+            (
+                "not_admitted",
+                SiteAnswer("no", "https://a.example.com", "https://b.example.com"),
+                "You chose not to use",
+            ),
+            ("not_admitted", SiteAnswer("add", "https://a.example.com", "https://b.example.com"), "a different site"),
         ],
     )
     def test_rewrite_states_why_no_credential_connected_on_a_redacted_secret_draft(
-        self, card: str, expected: str
+        self, card: str, site_answer: SiteAnswer | None, expected: str
     ) -> None:
         ctx = _ctx(
             last_workflow=object(),
@@ -1106,6 +1160,7 @@ workflow_definition:
             last_update_block_count=2,
             last_test_ok=None,
             credential_pause_outcome=card,
+            credential_pause_site_answer=site_answer,
             request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
         )
 
@@ -1166,26 +1221,6 @@ workflow_definition:
 
         assert _should_surface_untested_draft_despite_question(ctx, "ASK_QUESTION") is True
         assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
-
-    def test_rewrite_uses_credential_framing_when_policy_flags_unbound_inputs(self) -> None:
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=12,
-            last_test_ok=None,
-            request_policy=RequestPolicy(
-                clarification_reason="workflow_credential_inputs_unbound",
-                allow_run_blocks=False,
-                allow_missing_credentials_in_draft=True,
-            ),
-        )
-        rewritten = _rewrite_failed_test_response("agent text", ctx)
-
-        assert rewritten == (
-            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-            "the required credentials. Add them in Credentials, then I can try again. agent text "
-            "Keep the draft to iterate on, or discard."
-        )
 
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(
@@ -1368,8 +1403,9 @@ workflow_definition:
         prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
 
         assert "select_option timed out" in prompt
-        assert "browser_acquisition_failed:" in prompt
-        assert "cdp_connect_failed" in prompt
+        sentence = build_test_connect_failure_sentence(BuildTestConnectFailure(state="cdp_connect_failed"))
+        assert len(sentence) > 160
+        assert f"browser_acquisition_failed: {sentence}" in prompt
 
     def test_recorded_build_test_outcome_prompt_says_what_to_do_about_an_occupied_browser(self) -> None:
         """The bare state does not say what to do. The occupying run id stays out of prompt text, and
@@ -3074,7 +3110,11 @@ workflow_definition:
         assert isinstance(captured["persisted_yaml"], str)
         assert captured["persisted_yaml"].replace('"#amount"', '"#total"') == workflow_yaml
         assert ctx.workflow_yaml == captured["persisted_yaml"], "a failed run must retain the edited draft"
-        assert captured["run_params"] == {"block_labels": ["read_total"], "parameters": {}}
+        assert captured["run_params"] == {
+            "block_labels": ["read_total"],
+            "parameters": {},
+            "run_every_loop_iteration": False,
+        }
 
     @pytest.mark.asyncio
     async def test_unbound_credentials_persist_draft_and_skip_run(self, monkeypatch) -> None:
@@ -6757,6 +6797,135 @@ class TestRunBlocksCredentialApproval:
         )
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
 
+    @staticmethod
+    def _ctx_after_a_real_run(resolved_credentials: list[object]) -> CopilotContext:
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=resolved_credentials), stream=FakeCopilotStream())
+        ctx.last_run_outcome = RecordedRunOutcome(
+            verdict="not_evaluated", workflow_run_id="wr_prior", run_completed=True
+        )
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="run_blocks_and_collect_debug",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_prior",
+        )
+        ctx.last_run_blocks_workflow_run_id = "wr_prior"
+        ctx.last_run_blocks_browser_session_id = "pbs_prior"
+        return ctx
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("refusal", ["credential_approval", "google_account", "credential_not_found"])
+    async def test_refused_dispatch_records_the_attempt_but_no_run_outcome(self, monkeypatch, refusal: str) -> None:
+        if refusal == "google_account":
+            workflow = self._workflow(
+                parameters=[],
+                blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_staged"}],
+            )
+            stored_credentials: list[object] = []
+            resolved_credentials: list[object] = []
+        else:
+            workflow = self._workflow("cred_login")
+            login = SimpleNamespace(credential_id="cred_login")
+            stored_credentials = [login] if refusal == "credential_approval" else []
+            resolved_credentials = [] if refusal == "credential_approval" else [login]
+        monkeypatch.setattr(
+            run_execution_module.app, "DATABASE", self._db(workflow=workflow, credentials=stored_credentials)
+        )
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=AsyncMock(side_effect=AssertionError("prepare_workflow called")),
+                execute_workflow=AsyncMock(side_effect=AssertionError("execute_workflow called")),
+            ),
+        )
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_visible_credentials_for_org",
+            AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        id="goac_choice", credential_name="Google Sheets", state="active", email_address=None
+                    )
+                ]
+            ),
+        )
+        log = MagicMock()
+        monkeypatch.setattr(run_execution_module, "LOG", log)
+        ctx = self._ctx_after_a_real_run(resolved_credentials)
+        prior_outcome = ctx.last_run_outcome
+        prior_build_outcome = ctx.latest_recorded_build_test_outcome
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+        assert recorded is None
+        assert [frame for frame in ctx.stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)] == []
+        assert "copilot_run_outcome_recorded" not in [call.args[0] for call in log.info.call_args_list if call.args]
+        assert ctx.latest_recorded_build_test_outcome is prior_build_outcome
+        assert ctx.run_outcome_trace == [prior_outcome]
+        assert (ctx.last_test_ok, ctx.last_test_run_started) == (False, False)
+        ctx.last_update_block_count = 1
+        reply = _rewrite_failed_test_response("The workflow is ready.", ctx)
+        assert reply.startswith("I couldn't start a test run:")
+        if refusal != "credential_not_found":
+            assert "Reason codes" not in reply and "Ask the user" not in reply
+        assert result["ok"] is False
+        if refusal == "credential_approval":
+            assert "unapproved_credential_reference" in result["error"]
+        elif refusal == "credential_not_found":
+            assert "cred_login" in result["error"]
+        else:
+            assert ctx.blocker_signal is not None
+            assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+            assert [choice.connection_id for choice in ctx.connected_account_recovery_choices] == ["goac_choice"]
+
+    @pytest.mark.asyncio
+    async def test_refused_dispatch_still_reaches_the_model_as_a_credential_ask(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "DATABASE",
+            self._db(workflow=self._workflow("cred_login"), credentials=[SimpleNamespace(credential_id="cred_login")]),
+        )
+        ctx = self._ctx_after_a_real_run([])
+        ctx.last_test_non_retriable_nav_error = "Failed to navigate to url https://typo.invalid"
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+        run_execution_module.finalize_build_test_result(
+            ctx, source_tool="run_blocks_and_collect_debug", result=result, recorded_outcome=recorded
+        )
+
+        contract = ctx.latest_diagnosis_repair_contract
+        assert contract.repair_decision.next_action == RepairNextAction.ASK
+        assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+        packet = result["data"][run_execution_module.BUILD_TEST_PACKET_KEY]
+        assert packet["run"] == {}
+        assert "unapproved_credential_reference" in packet["failure"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_refused_dispatch_controls(self) -> None:
+        ctx = self._ctx_after_a_real_run([])
+        sandbox = run_execution_module._copilot_sandbox_unavailable_result(
+            organization_id="org-1", workflow_permanent_id="wfp-1"
+        )
+
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, sandbox, time.monotonic())
+        run_execution_module.finalize_build_test_result(
+            ctx, source_tool="run_blocks_and_collect_debug", result=sandbox, recorded_outcome=recorded
+        )
+        assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == RepairNextAction.STOP
+
+        saved_profile_failure = run_execution_module._saved_profile_start_failure(
+            "saved_profile_unresolved", requested_block_labels=["login"]
+        )
+        await run_execution_module._verify_and_record_run_blocks_result(ctx, saved_profile_failure, time.monotonic())
+        frames = [frame for frame in ctx.stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)]
+        assert len(frames) == 2
+        assert ctx.last_run_outcome is not None and ctx.last_run_outcome.workflow_run_id != "wr_prior"
+
     @pytest.mark.asyncio
     async def test_unapproved_google_connection_halts_with_verified_account_rows(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
@@ -6879,7 +7048,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_sheet"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is None
         assert ctx.latest_tool_blocker_signal is None
         assert ctx.tool_blocker_signals == []
@@ -6911,7 +7080,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_replacement"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is None
         assert ctx.connected_account_recovery_choices == []
 
@@ -6946,7 +7115,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.connected_account_recovery_choices
@@ -7007,7 +7176,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.tool_blocker_signals
@@ -7043,7 +7212,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.connected_account_recovery_choices
@@ -7093,7 +7262,7 @@ class TestRunBlocksCredentialApproval:
             _ctx(request_policy=policy),
         )
 
-        assert result == {"ok": False, "error": "Organization not found"}
+        assert result == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         approval.assert_awaited_once()
         assert approval.await_args.args[0] == [
             ("nested_write", "goac_nested"),

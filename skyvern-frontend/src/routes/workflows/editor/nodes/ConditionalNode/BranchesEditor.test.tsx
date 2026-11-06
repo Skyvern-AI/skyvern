@@ -51,10 +51,18 @@ vi.mock("@/components/WorkflowBlockInputTextarea", () => ({
   WorkflowBlockInputTextarea: ({
     value,
     disabled,
+    onChange,
   }: {
     value: string;
     disabled?: boolean;
-  }) => <textarea value={value} disabled={disabled} readOnly />,
+    onChange?: (value: string) => void;
+  }) => (
+    <textarea
+      value={value}
+      disabled={disabled}
+      onChange={(e) => onChange?.(e.target.value)}
+    />
+  ),
 }));
 
 function makeData(
@@ -124,6 +132,40 @@ afterEach(() => {
 });
 
 describe("BranchesEditor", () => {
+  test("typing a sentence in Visual stores an AI check, a lone {{ }} an exact one", () => {
+    const data = makeData({
+      activeBranchId: "branch_a",
+      branches: [
+        {
+          id: "branch_a",
+          description: null,
+          is_default: false,
+          next_block_label: null,
+          criteria: {
+            criteria_type: "jinja2_template",
+            expression: "",
+            description: null,
+          },
+        },
+        { id: "branch_b", description: null, is_default: true },
+      ] as ConditionalNodeData["branches"],
+    });
+    nodes = [
+      { id: "cond_1", type: "conditional", position: { x: 0, y: 0 }, data },
+    ];
+    render(<BranchesEditor nodeId="cond_1" data={data} />);
+    const box = screen.getByRole("textbox");
+    const typeInto = (value: string) => {
+      fireEvent.change(box, { target: { value } });
+      return updateNodeData.mock.lastCall![1].branches[0].criteria
+        .criteria_type;
+    };
+    expect(typeInto("the price in {{ p }} is below {{ limit }}")).toBe(
+      "prompt",
+    );
+    expect(typeInto("{{ p < limit }}")).toBe("jinja2_template");
+  });
+
   describe.each(["yaml", "save", "copilot"] as const)("%s lock", (kind) => {
     function renderLockedGraph() {
       const data = makeData();

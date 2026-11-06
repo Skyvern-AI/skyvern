@@ -265,6 +265,7 @@ import {
   sopAttachmentDraft,
   stageSopFile,
 } from "./workspaceAuthoringActions";
+import { DemonstrateFromBlockStatus } from "./DemonstrateFromBlockStatus";
 import { paneWidthsKey } from "../studio/paneLayout";
 import { useStudioPanes } from "../studio/useStudioPanes";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
@@ -737,6 +738,7 @@ function Workspace({
     undo: applyUndo,
     redo: applyRedo,
     captureImmediately: captureWorkflowEditImmediately,
+    captureNextAsUserEdit: captureNextWorkflowEditAsUserEdit,
     canUndo: canUndoWorkflowEdit,
     canRedo: canRedoWorkflowEdit,
     historyApplyTrigger,
@@ -1835,7 +1837,7 @@ function Workspace({
     authoringBlocked,
     startRecordingAtEnd,
   ]);
-  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the PDF in Copilot once its
+  // `/discover`'s "Upload an SOP" lands here with ?sop=1; stage the SOP file in Copilot once its
   // composer can take a file.
   const sopHandoffRequested = searchParams.get("sop") === "1";
   const sopHandoffHandledRef = useRef(false);
@@ -1863,7 +1865,7 @@ function Workspace({
           variant: "destructive",
           title: "SOP not received",
           description:
-            "The PDF did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
+            "The SOP file did not reach the editor. Use Upload an SOP in the Copilot panel to try again.",
         });
       // After staging: opening the Copilot pane navigates with the current URL, which would
       // put the marker back if it ran after this rewrite.
@@ -2168,6 +2170,7 @@ function Workspace({
         ),
       );
       updateEdges(elements.edges);
+      if (options?.midTurnDraft) captureNextWorkflowEditAsUserEdit();
       useWorkflowParametersStore
         .getState()
         .setParameters(getInitialParameters(workflowData), options);
@@ -3502,6 +3505,7 @@ function Workspace({
         </div>
       )}
 
+      <DemonstrateFromBlockStatus />
       {withStudioPaneBoundary(
         "copilot",
         <WorkflowCopilotChat

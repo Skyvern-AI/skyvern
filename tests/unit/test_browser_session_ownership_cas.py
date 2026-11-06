@@ -30,29 +30,34 @@ def _repository(session: AsyncMock) -> BrowserSessionsRepository:
     return BrowserSessionsRepository(session_factory=lambda: MockAsyncSessionCtx(session))
 
 
+_OCCUPY_STATES = [
+    ("created", True),
+    ("running", True),
+    ("retry", True),
+    ("legacy-null", True),
+    ("completed", False),
+    ("failed", False),
+    ("timeout", False),
+    ("deleted_at", False),
+    ("completed_at", False),
+    ("close_requested_at", False),
+    ("retired", False),
+    ("other-owner", False),
+]
+# A denied state paired with a generation guard that also denies (an obsolete one, or a current one on an unleased row)
+# is denied twice, so no single-predicate regression can pass there and fail elsewhere. Those pairings are left out.
+_DENIED_TWICE = {("current", "unleased"), ("obsolete", "unleased"), ("obsolete", "same-owner")}
+_OCCUPY_CASES = [
+    pytest.param(state, allowed, same_owner, generation, id=f"{state}-{allowed}-{generation_id}-{owner_id}")
+    for state, allowed in _OCCUPY_STATES
+    for generation_id, generation in (("unguarded", None), ("current", "gen_old"), ("obsolete", "gen_obsolete"))
+    for owner_id, same_owner in (("unleased", False), ("same-owner", True))
+    if allowed or (generation_id, owner_id) not in _DENIED_TWICE
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("same_owner", [False, True], ids=["unleased", "same-owner"])
-@pytest.mark.parametrize(
-    "expected_generation", [None, "gen_old", "gen_obsolete"], ids=["unguarded", "current", "obsolete"]
-)
-@pytest.mark.parametrize(
-    "state,allowed",
-    [
-        ("created", True),
-        ("running", True),
-        ("retry", True),
-        ("legacy-null", True),
-        ("completed", False),
-        ("failed", False),
-        ("timeout", False),
-        ("deleted_at", False),
-        ("completed_at", False),
-        ("close_requested_at", False),
-        ("retired", False),
-        ("other-owner", False),
-    ],
-    ids=lambda value: value if isinstance(value, str) else None,
-)
+@pytest.mark.parametrize(("state", "allowed", "same_owner", "expected_generation"), _OCCUPY_CASES)
 async def test_occupy_persists_only_live_lease_admission(
     sqlite_engine: AsyncEngine, state: str, allowed: bool, same_owner: bool, expected_generation: str | None
 ) -> None:

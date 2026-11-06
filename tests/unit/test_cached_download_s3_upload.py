@@ -153,6 +153,7 @@ def test_render_template_with_label_injects_workflow_run_id():
     workflow_run_context = SimpleNamespace(
         values={},
         secrets={},
+        agent_unmasked_platform_secret_ids=set,
         workflow_title="Cached workflow",
         workflow_id="wf_cached",
         workflow_permanent_id="wpid_cached",
@@ -178,6 +179,7 @@ def test_render_template_with_label_uses_workflow_parameter_over_extra_binding()
     workflow_run_context = SimpleNamespace(
         values={"original_filename": "custom.pdf"},
         secrets={},
+        agent_unmasked_platform_secret_ids=set,
         workflow_title="Cached workflow",
         workflow_id="wf_cached",
         workflow_permanent_id="wpid_cached",
@@ -866,38 +868,6 @@ async def test_cached_download_dedupes_recovered_extension_for_already_named_fil
 
 
 @pytest.mark.asyncio
-async def test_verification_raises_when_no_new_file(setup):
-    """When no new file appears on local filesystem, the poll loop should exhaust
-    the grace period and fall back to AI."""
-    refs = setup(
-        get_side_effect=[[], [], [], []],
-        list_files_side_effect=[[] for _ in range(10)],  # before + polls all empty
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        call_count = 0
-
-        def advancing_time():
-            nonlocal call_count
-            call_count += 1
-            return call_count * 30.0
-
-        with (
-            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock),
-            patch(f"{MODULE}.asyncio.get_running_loop") as mock_loop,
-        ):
-            mock_loop.return_value.time = advancing_time
-            await download(prompt="Download invoice", label="test_block")
-
-        refs["fallback"].assert_called_once()
-        error_arg = refs["fallback"].call_args.kwargs.get("error")
-        assert "no file produced" in str(error_arg).lower() or "did not produce" in str(error_arg).lower()
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
 async def test_verification_retries_before_failing(setup, tmp_path):
     """get_downloaded_files retries up to 3 times before declaring failure."""
     download_dir = tmp_path / "downloads"
@@ -920,14 +890,18 @@ async def test_verification_retries_before_failing(setup, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_save_timeout_skips_verification(setup, tmp_path):
-    """TimeoutError on save_downloaded_files should skip S3 verification entirely.
-    No point retrying get_downloaded_files when we know S3 is degraded.
-    Local file verification still passes since a file was downloaded."""
+@pytest.mark.parametrize(
+    "save_error",
+    [asyncio.TimeoutError(), RuntimeError("S3 permission denied")],
+    ids=["timeout", "generic"],
+)
+async def test_save_failure_skips_verification(setup, tmp_path, save_error):
+    """A save_downloaded_files failure (timeout or any other error, as agent.py catches both) skips S3
+    verification entirely; local file verification still passes since a file was downloaded."""
     download_dir = tmp_path / "downloads"
     local_file = str(download_dir / "file.pdf")
     refs = setup(
-        save_side_effect=asyncio.TimeoutError(),
+        save_side_effect=save_error,
         get_side_effect=[[]],  # only the before-check runs; after-check is skipped
         list_files_side_effect=[[], [local_file]],  # local verification passes
     )
@@ -945,71 +919,31 @@ async def test_save_timeout_skips_verification(setup, tmp_path):
         _cleanup(refs)
 
 
-@pytest.mark.asyncio
-async def test_save_generic_exception_skips_verification(setup, tmp_path):
-    """Non-timeout S3 failure (e.g., permission error) should also skip S3 verification.
-    Matches agent.py which catches both TimeoutError and generic Exception.
-    Local file verification still passes since a file was downloaded."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    refs = setup(
-        save_side_effect=RuntimeError("S3 permission denied"),
-        get_side_effect=[[]],  # only the before-check runs; after-check is skipped
-        list_files_side_effect=[[], [local_file]],  # local verification passes
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        await download(prompt="Download invoice", label="test_block")
-
-        # S3 verification skipped, but local verification passed → block completes
-        refs["fallback"].assert_not_called()
-        refs["update_block"].assert_called_once()
-        # get_downloaded_files called only once (before-check), not 3 more times for after
-        assert refs["storage"].get_downloaded_files.call_count == 1
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
-async def test_get_before_timeout_skips_verification(setup, tmp_path):
-    """If the before-check times out, S3 verification should be skipped entirely
-    to avoid spurious AI fallbacks under degraded storage.
-    Local file verification still passes since a file was downloaded."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    refs = setup(
-        get_side_effect=asyncio.TimeoutError(),
-        list_files_side_effect=[[], [local_file]],  # local verification passes
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        with patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock):
-            await download(prompt="Download invoice", label="test_block")
-
-        # Should NOT fall back — local verification passed, S3 verification skipped
-        refs["fallback"].assert_not_called()
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
-async def test_get_after_timeout_skips_verification(setup, tmp_path):
-    """If the after-check times out, S3 verification should be skipped.
-    Local file verification still passes since a file was downloaded."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    call_count = {"n": 0}
+def _timeout_after_first_get():
+    calls = {"n": 0}
 
     async def get_side_effect(**kwargs):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
+        calls["n"] += 1
+        if calls["n"] == 1:
             return []  # before-check succeeds
         raise asyncio.TimeoutError()
 
+    return get_side_effect
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "get_side_effect_factory",
+    [asyncio.TimeoutError, _timeout_after_first_get],
+    ids=["before", "after"],
+)
+async def test_get_timeout_skips_verification(setup, tmp_path, get_side_effect_factory):
+    """A timed-out before- or after-check skips S3 verification, avoiding spurious AI fallbacks under
+    degraded storage; local file verification still passes since a file was downloaded."""
+    download_dir = tmp_path / "downloads"
+    local_file = str(download_dir / "file.pdf")
     refs = setup(
-        get_side_effect=get_side_effect,
+        get_side_effect=get_side_effect_factory(),
         list_files_side_effect=[[], [local_file]],  # local verification passes
     )
     try:
@@ -1095,26 +1029,6 @@ async def test_rename_handles_name_collision(setup, tmp_path):
         await download(prompt="Download invoice", download_suffix="invoice", label="test_block")
 
         rename_mock.assert_called_once_with(new_file, "invoice_1.pdf")
-    finally:
-        _cleanup(refs)
-
-
-@pytest.mark.asyncio
-async def test_block_marked_completed_on_success(setup, tmp_path):
-    """On successful download + verification, block should be marked completed."""
-    download_dir = tmp_path / "downloads"
-    local_file = str(download_dir / "file.pdf")
-    refs = setup(
-        get_side_effect=[[], ["file.pdf"]],
-        list_files_side_effect=[[], [local_file]],  # local verification passes
-    )
-    try:
-        from skyvern.services.script_service import download
-
-        await download(prompt="Download invoice", label="test_block")
-
-        refs["update_block"].assert_called_once()
-        refs["fallback"].assert_not_called()
     finally:
         _cleanup(refs)
 

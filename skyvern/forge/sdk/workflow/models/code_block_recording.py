@@ -398,7 +398,12 @@ class CodeBlockActionRecording:
         # Billing counts the action rows persist() wrote, so this must stay after persist on every
         # success path; best-effort like the rest of recording — never change the block outcome.
         try:
-            await app.AGENT_FUNCTION.post_code_block_execution(self._task, self._step)
+            succeeded_labels = self._workflow_run_context.succeeded_code_block_labels
+            is_first_successful_execution = self._code_block.label not in succeeded_labels
+            succeeded_labels.add(self._code_block.label)
+            await app.AGENT_FUNCTION.post_code_block_execution(
+                self._task, self._step, is_first_successful_execution=is_first_successful_execution
+            )
         except Exception:
             LOG.warning(
                 "Code block billing hook failed",

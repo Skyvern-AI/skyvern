@@ -706,10 +706,15 @@ def build_auth_tools(
             else None
         )
         started = time.monotonic()
+        charged: float | None = None
 
         def _charged() -> float:
             # An instant answer still costs a slice, so repeated calls reach the spent status in a bounded number.
-            return max(time.monotonic() - started, _MIN_SLICE_SECONDS)
+            # Read once, so the time left the model is told matches the spend `finally` records.
+            nonlocal charged
+            if charged is None:
+                charged = max(time.monotonic() - started, _MIN_SLICE_SECONDS)
+            return charged
 
         try:
             otp_value = await resolve_otp_value(

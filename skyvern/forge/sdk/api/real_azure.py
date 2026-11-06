@@ -6,11 +6,12 @@ from mimetypes import add_type, guess_type
 from typing import IO, Self
 
 import structlog
+from azure.core import MatchConditions
 from azure.core.exceptions import ResourceNotFoundError
 from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.keyvault.secrets.aio import SecretClient
 from azure.storage.blob import BlobSasPermissions, ContentSettings, StandardBlobTier, generate_blob_sas
-from azure.storage.blob.aio import BlobServiceClient
+from azure.storage.blob.aio import BlobServiceClient, StorageStreamDownloader
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.azure import (
@@ -247,6 +248,13 @@ class RealAsyncAzureStorageClient(AsyncAzureStorageClient):
             if log_exception:
                 LOG.exception("Failed to download from Azure", uri=uri)
             return None
+
+    async def open_blob_download(self, uri: str, etag: str) -> StorageStreamDownloader[bytes]:
+        """A chunked download that fails once the blob is no longer the ``etag`` version."""
+        parsed = AzureUri(uri)
+        container_client = self._get_blob_service_client().get_container_client(parsed.container)
+        blob_client = container_client.get_blob_client(parsed.blob_path)
+        return await blob_client.download_blob(etag=etag, match_condition=MatchConditions.IfNotModified)
 
     async def get_blob_properties(self, uri: str) -> dict | None:
         parsed = AzureUri(uri)

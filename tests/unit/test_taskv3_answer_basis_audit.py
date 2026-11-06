@@ -4,6 +4,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from skyvern.forge.taskv3.answer_basis_audit import RecordedAnswer, apply_answer_basis_audit
+from skyvern.forge.taskv3.application_context import ApplicationContext
 from skyvern.forge.taskv3.loop import (
     CODE_TOOL_NAME,
     PICKED_OPTION_DATA_KEY,
@@ -211,6 +212,75 @@ async def test_reads_add_no_audit_and_an_audit_that_raises_never_blocks() -> Non
     await _by_name(tools, "observe").handler({})
     await _by_name(tools, "click").handler({"selector": "#next"})
     assert ("click", {"selector": "#next"}) in dispatched and len(audit.seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unarmed_audit_records_nothing_reads_nothing_and_holds_nothing() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    probes: list[dict[str, Any]] = []
+
+    async def probe(args: dict[str, Any]) -> tuple[str, str, str, bool]:
+        probes.append(args)
+        return "#q1", DEBARMENT, "textbox", False
+
+    _by_name(tools, "type").answer_probe = probe
+    apply_answer_basis_audit(tools, audit, armed=lambda: False)
+    click = _by_name(tools, "click").handler
+    with capture_logs() as logs:
+        await click({"selector": "#q1"})
+        await click({"selector": '[data-tv3-menu="2"]', "_row": "No"})
+        await _by_name(tools, "type").handler({"selector": "#q1", "text": "No", "press_enter": True})
+        await click({"selector": "#submit"})
+    assert audit.seen == [] and probes == [] and logs == []
+    assert ("click", {"selector": "#submit"}) in dispatched
+
+
+@pytest.mark.asyncio
+async def test_a_declared_yes_arms_the_audit_for_answers_entered_after_it_only() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    audit = _Audit(flag={"No"})
+    context = ApplicationContext("defaults")
+    apply_answer_basis_audit(tools, audit, armed=context.audit_armed)
+    click = _by_name(tools, "click").handler
+    submit = {"selector": "#submit"}
+
+    await click({"selector": "#q1"})
+    await click({"selector": '[data-tv3-menu="2"]', "_row": "No"})
+    await context.tool.handler({"is_job_application": True})
+    # The answer entered before the yes was never recorded, so it holds nothing.
+    await click(submit)
+    assert audit.seen == []
+
+    await click({"selector": "#q1"})
+    await click({"selector": '[data-tv3-menu="2"]', "_row": "No"})
+    await _held(tools, "click", submit)
+    assert [args for name, args in dispatched if name == "click"].count(submit) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_log_only_audit_armed_by_a_yes_logs_the_hold_and_lets_the_call_through() -> None:
+    dispatched: list[tuple[str, dict[str, Any]]] = []
+    tools = _tools(dispatched)
+    context = ApplicationContext("defaults")
+    apply_answer_basis_audit(
+        tools,
+        _Audit(flag={"No"}),
+        log_only=True,
+        log_fields={"answer_audit_trigger": "declaration"},
+        armed=context.audit_armed,
+    )
+    await context.tool.handler({"is_job_application": True})
+    click = _by_name(tools, "click").handler
+    await click({"selector": "#q1"})
+    await click({"selector": '[data-tv3-menu="2"]', "_row": "No"})
+    with capture_logs() as logs:
+        await click({"selector": "#submit"})
+    hold = next(e for e in logs if e["event"] == "taskv3 answer basis hold")
+    assert (hold["would_hold"], hold["answer_audit_trigger"]) == (True, "declaration")
+    assert ("click", {"selector": "#submit"}) in dispatched
 
 
 @pytest.mark.parametrize("log_only", [False, True])

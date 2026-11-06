@@ -25,6 +25,13 @@ import {
   PaginationNext,
   PaginationPrevious,
 } from "@/components/ui/pagination";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -302,22 +309,25 @@ function BrowserProfilesList({ searchKey, managed }: Props = {}) {
             <span className="text-neutral-600 dark:text-slate-400">
               Items per page
             </span>
-            <select
-              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
-              value={itemsPerPage}
-              onChange={(e) => {
-                const next = Number(e.target.value);
+            <Select
+              value={String(itemsPerPage)}
+              onValueChange={(size) => {
                 const params = new URLSearchParams(searchParams);
-                params.set("page_size", String(next));
+                params.set("page_size", size);
                 params.set("page", "1");
                 setSearchParams(params, { replace: true });
               }}
             >
-              <option value={5}>5</option>
-              <option value={10}>10</option>
-              <option value={20}>20</option>
-              <option value={50}>50</option>
-            </select>
+              <SelectTrigger className="w-[65px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="5">5</SelectItem>
+                <SelectItem value="10">10</SelectItem>
+                <SelectItem value="20">20</SelectItem>
+                <SelectItem value="50">50</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
           <Pagination className="pt-0">
             <PaginationContent>

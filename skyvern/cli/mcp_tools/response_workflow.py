@@ -13,6 +13,8 @@ from .response_distillation import TransformResult, TransformTier, distill_value
 
 WorkflowToolName = Literal["skyvern_workflow_run", "skyvern_workflow_status"]
 _OUTPUT_FIELDS = ("output", "outputs", "extracted_information")
+# Bounded where it is built (a few capped rows), and a key summary would clip its messages and signed URL.
+_VERBATIM_STATUS_FIELDS = ("block_failures",)
 
 
 def _passthrough(value: Any, reason: str) -> TransformResult[Any]:
@@ -64,7 +66,7 @@ def _recovery_marker(run_id: Any, reason: str) -> dict[str, Any]:
 def _format_status_response(response: dict[str, Any], data: dict[str, Any]) -> TransformResult[Any]:
     compacted_data: dict[str, Any] | None = None
     for field, value in data.items():
-        if not _field_exceeds_generic_threshold(field, value):
+        if field in _VERBATIM_STATUS_FIELDS or not _field_exceeds_generic_threshold(field, value):
             continue
         if compacted_data is None:
             compacted_data = dict(data)
@@ -86,6 +88,7 @@ def _format_status_response(response: dict[str, Any], data: dict[str, Any]) -> T
         complete=False,
         fallback_reason="workflow_status_field_summarized",
         owns_completeness_marker=True,
+        protected_paths=tuple(("data", field) for field in _VERBATIM_STATUS_FIELDS if field in compacted_data),
     )
 
 

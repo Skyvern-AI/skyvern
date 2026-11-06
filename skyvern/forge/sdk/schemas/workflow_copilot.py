@@ -11,6 +11,7 @@ from pydantic import (
     Field,
     JsonValue,
     PlainSerializer,
+    PrivateAttr,
     SecretStr,
     StringConstraints,
     field_serializer,
@@ -191,6 +192,16 @@ class CopilotPendingTurn(BaseModel):
     # the run row's failure_reason carries the same fact but a later finalizer can overwrite it.
     superseded_build_test_run_ids: list[str] = Field(default_factory=list)
     steer_messages: list[CopilotSteerMessage] = Field(default_factory=list)
+    # Each draft frame overwrites this, never appends, so an entry holds at most one workflow.
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
+
+
+class CopilotInFlightTurn(BaseModel):
+    turn_id: str
+    cancel_token: str | None = None
+    latest_draft: ClientVisibleProposedWorkflow | None = None
+    latest_draft_at: datetime | None = None
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -387,6 +398,8 @@ class WorkflowCopilotMessageFeedbackResponse(BaseModel):
 class WorkflowCopilotChatMessage(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    _narrative_payload_unreadable: bool = PrivateAttr(default=False)
+
     workflow_copilot_chat_message_id: str = Field(..., description="ID for the workflow copilot chat message")
     workflow_copilot_chat_id: str = Field(..., description="ID of the parent workflow copilot chat")
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
@@ -409,6 +422,7 @@ class WorkflowCopilotChatMessage(BaseModel):
 class WorkflowCopilotDemonstrationInsertion(BaseModel):
     after_label: str | None = Field(default=None, max_length=200)
     before_label: str | None = Field(default=None, max_length=200)
+    replace_label: str | None = Field(default=None, max_length=200)
 
 
 class WorkflowCopilotChatRequest(BaseModel):
@@ -579,6 +593,17 @@ class WorkflowCopilotCredentialDeletionRequest(BaseModel):
     credential_ids: list[str] = Field(min_length=1)
 
 
+CredentialSiteAnswer = Literal["add", "move", "no"]
+
+
+class WorkflowCopilotCredentialSiteQuestion(BaseModel):
+    credential_id: str
+    name: str
+    site: str = Field(..., description="The origin this card signs in on")
+    saved_sites: list[str] = Field(..., description="Origins the login is saved for")
+    vault_sourced: bool = Field(..., description="The sites come from a connected vault, so only the vault can add one")
+
+
 class WorkflowCopilotCredentialResponseRequest(BaseModel):
     turn_id: str = Field(..., description="turn_id from the matching credential_required frame")
     workflow_copilot_chat_id: str = Field(..., description="chat ID from the matching credential_required frame")
@@ -591,12 +616,17 @@ class WorkflowCopilotCredentialResponseRequest(BaseModel):
         ),
     )
     credential_id: str | None = Field(None, description="Saved credential ID; required when action is 'connected'")
+    asks_site: bool = Field(False, description="Ask before connecting a login saved for another site than the card's")
+    site_answer: CredentialSiteAnswer | None = Field(
+        None, description="The answer to the site question this card asked about the same credential"
+    )
 
 
 class WorkflowCopilotDemonstrationControlRequest(BaseModel):
     demonstration_id: str = Field(max_length=64)
-    action: Literal["navigate", "fill_credential", "upload_file", "stop", "cancel"]
+    action: Literal["navigate", "fill_credential", "upload_file", "note", "stop", "cancel"]
     url: str | None = Field(default=None, max_length=2048)
+    text: str | None = Field(default=None, max_length=2000)
     selector: str | None = Field(default=None, max_length=2000)
     credential_id: str | None = Field(default=None, max_length=128)
     field: Literal["password", "totp"] | None = None
@@ -650,7 +680,22 @@ class WorkflowCopilotCredentialGenerateResult(BaseModel):
 
 
 class WorkflowCopilotCredentialResponseResult(BaseModel):
-    result: Literal["accepted", "signed_in", "no_sign_in_found", "save_failed"]
+    result: Literal[
+        "accepted",
+        "signed_in",
+        "no_sign_in_found",
+        "save_failed",
+        "site_question",
+        "site_changed_not_connected",
+        "site_change_unknown",
+    ] = Field(
+        ...,
+        description=(
+            "'site_question' asks the user first; 'site_changed_not_connected' saved the site after the pause "
+            "ended; 'site_change_unknown' could not confirm the save, and the paused turn reads the login back"
+        ),
+    )
+    site_question: WorkflowCopilotCredentialSiteQuestion | None = None
     expires_at: datetime | None = Field(None, description="The pause's new deadline after 'signing_in'")
     host: str | None = Field(None, description="The sign-in site the browser cookies were read for")
     browser_profile_id: str | None = Field(None, description="The profile saved from the user's sign-in")
@@ -692,7 +737,7 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
         default_factory=list, description="Uploaded files the user attached to this message"
     )
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
-    narrative_payload: TurnNarrativePayload | None = Field(
+    narrative_payload: dict[str, Any] | None = Field(
         None,
         description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
     )
@@ -866,6 +911,13 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
     timestamp: datetime | None = Field(
         None,
         description="Server timestamp for this event; the same clock read is persisted on the matching activity entry.",
+    )
+    browser_session_id: str | None = Field(
+        None,
+        description=(
+            "Browser session a page-acting call resolves to when it is emitted; null for other tools and for "
+            "an unavailable target. Not persisted on the activity entry."
+        ),
     )
 
 
@@ -1148,6 +1200,9 @@ class WorkflowCopilotCredentialRequiredUpdate(BaseModel):
     registration: WorkflowCopilotCredentialRegistration | None = Field(
         None, description="Account details a Generate and save answer would store; never a password"
     )
+    site_question: WorkflowCopilotCredentialSiteQuestion | None = Field(
+        None, description="The site question asked about a picked login, so a reloaded card asks it again"
+    )
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -1169,6 +1224,10 @@ class WorkflowCopilotCredentialPauseResolvedUpdate(BaseModel):
         None, description="Display name of the connected credential, or of the profile saved from a sign-in"
     )
     browser_profile_id: str | None = Field(None, description="The profile saved from the user's own sign-in")
+    site_answer: CredentialSiteAnswer | None = Field(None, description="The user's answer to the site question")
+    site_a: str | None = Field(None, description="The origin the login was saved for before the answer")
+    saved_sites: list[str] | None = Field(None, description="Every origin the login was saved for before the answer")
+    site_b: str | None = Field(None, description="The origin the card signs in on")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 
@@ -1181,6 +1240,7 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
         None, description="Turn matched by request_cancel_token when recovery requests provide one"
     )
     request_browser_allocations: CopilotRequestBrowserAllocations | None = None
+    in_flight_turn: CopilotInFlightTurn | None = None
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     accepted_turn_ids: list[str] = Field(
         default_factory=list, description="Turns whose manual Accept completed on the server"

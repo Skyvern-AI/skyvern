@@ -14,6 +14,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 def _make_context(secrets: dict[str, str]) -> WorkflowRunContext:
     ctx = WorkflowRunContext.__new__(WorkflowRunContext)
     ctx.secrets = dict(secrets)
+    ctx._platform_smtp_secret_ids = {}
     ctx.values = {}
     ctx.parameters = {}
     ctx.workflow_run_outputs = {}

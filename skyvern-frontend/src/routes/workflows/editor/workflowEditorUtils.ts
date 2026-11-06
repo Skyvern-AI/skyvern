@@ -332,7 +332,7 @@ function serializeLoopNodeWhileBranchToYAML(
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
 // Mirrors the backend settings.WORKFLOW_WAIT_BLOCK_MAX_SEC (30 minutes).
-const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
+export const WORKFLOW_WAIT_BLOCK_MAX_SEC = 30 * 60;
 
 function serializeSecretResponsePaths(
   secretResponsePaths: Array<string>,
@@ -1516,6 +1516,8 @@ function convertToNode(
           ...commonData,
           emailClient: block.email_client ?? "gmail",
           credentialId: block.credential_id ?? "",
+          credentialSource: block.credential_source ?? "native",
+          connectionId: block.connection_id ?? "",
           folder: block.folder ?? "INBOX",
           prompt: block.prompt ?? "",
           sender: block.sender ?? "",
@@ -1552,6 +1554,7 @@ function convertToNode(
         data: {
           ...commonData,
           connectionId: block.connection_id ?? "",
+          credentialSource: block.credential_source ?? "native",
           datasetId: block.dataset_id ?? "",
           query: block.query ?? "",
           maxRows: block.max_rows ?? POWERBI_QUERY_DEFAULT_MAX_ROWS,
@@ -3995,6 +3998,8 @@ function getWorkflowBlock(
         block_type: "email_inbox",
         email_client: node.data.emailClient,
         credential_id: node.data.credentialId || null,
+        credential_source: node.data.credentialSource ?? "native",
+        connection_id: node.data.connectionId || null,
         folder: node.data.folder,
         prompt: node.data.prompt,
         sender: node.data.sender || null,
@@ -4022,6 +4027,7 @@ function getWorkflowBlock(
       return {
         ...base,
         block_type: "powerbi_query",
+        credential_source: node.data.credentialSource ?? "nango",
         connection_id: node.data.connectionId,
         dataset_id: node.data.datasetId,
         query: node.data.query,
@@ -5565,6 +5571,8 @@ function convertBlocksToBlockYAML(
           block_type: "email_inbox",
           email_client: block.email_client,
           credential_id: block.credential_id,
+          credential_source: block.credential_source ?? "native",
+          connection_id: block.connection_id ?? null,
           folder: block.folder,
           prompt: block.prompt,
           sender: block.sender,
@@ -5594,6 +5602,7 @@ function convertBlocksToBlockYAML(
         const blockYaml: PowerBIQueryBlockYAML = {
           ...base,
           block_type: "powerbi_query",
+          credential_source: block.credential_source ?? "native",
           connection_id: block.connection_id,
           dataset_id: block.dataset_id,
           query: block.query,
@@ -5705,6 +5714,43 @@ function pendingGoalChangesOf(nodes: Array<AppNode>): Array<PendingGoalChange> {
     }
   }
   return changes;
+}
+
+/** What the Goal field changes when its text becomes `value`, shared by the visual editor and the Doc. */
+function goalTextEditPatch(
+  data: CodeBlockNodeData,
+  value: string,
+): Partial<CodeBlockNodeData> | null {
+  if (value === (data.prompt ?? "")) {
+    return null;
+  }
+  const undoPatch = goalChangeUndoPatch(data);
+  if (undoPatch && value === (data.goalBeforeEdit?.prompt ?? "")) {
+    return undoPatch;
+  }
+  const goalChangePending = goalChangeIsPending(data);
+  if (value.trim().length > 0) {
+    return {
+      prompt: value,
+      userOwnedGoal: true,
+      goalNeedsRegeneration: true,
+      ...(!goalChangePending && {
+        goalBeforeEdit: {
+          prompt: data.prompt,
+          userOwnedGoal: data.userOwnedGoal,
+          goalNeedsRegeneration: data.goalNeedsRegeneration,
+        },
+      }),
+    };
+  }
+  return {
+    prompt: value,
+    ...(data.userOwnedGoal === true && { userOwnedGoal: false }),
+    ...(goalChangePending && {
+      goalNeedsRegeneration: false,
+      goalBeforeEdit: null,
+    }),
+  };
 }
 
 function goalChangeUndoPatch(
@@ -6358,6 +6404,7 @@ export {
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   getWorkflowBlocks,
   goalChangeIsPending,
+  goalTextEditPatch,
   goalChangeUndoPatch,
   keepCodeWithGoalPatch,
   codeEditedNoticeIsShown,

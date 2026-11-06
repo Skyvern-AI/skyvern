@@ -48,10 +48,12 @@ from skyvern.forge.sdk.executor.run_liveness import run_write_authority
 from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
-from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext, _is_platform_smtp_aws_key
+from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.agent_step_tools import (
     DEDICATED_BLOCK_TOOLS,
+    FILES_DESCRIPTION,
     FINISH_DESCRIPTION,
     RUN_BLOCK_TYPES,
     RUN_TOOL_DESCRIPTIONS,
@@ -61,17 +63,22 @@ from skyvern.forge.sdk.workflow.models.agent_step_tools import (
 )
 from skyvern.forge.sdk.workflow.models.block import Block, _validate_response_against_json_schema
 from skyvern.forge.sdk.workflow.models.parameter import (
+    PARAMETER_TYPE,
     AWSSecretParameter,
     OutputParameter,
     ParameterType,
     WorkflowParameter,
+    WorkflowParameterType,
     is_sensitive_workflow_parameter,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.forge.taskv3.handoff_redaction import sanitize_handoff_url, string_leaves
+from skyvern.forge.taskv3.opaque_refs import _TOKEN_PREFIX, mask_opaque_urls
 from skyvern.schemas.agent_step_tool_names import ALWAYS_OFFERED_TOOLS
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.utils.secret_redaction import redact_secrets_from_text
+from skyvern.webeye.actions.actions import UploadFileAction
 
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
@@ -79,6 +86,7 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
 _MASK = "*****"
+_Fact = str | list[dict[str, str]]
 
 _INSTRUCTIONS = (
     "You are one step of an unattended workflow run; nobody can answer questions. "
@@ -109,7 +117,11 @@ class _RunState:
     run_context: WorkflowRunContext
     credential_keys: list[str]
     ignore_workflow_system_prompt: bool
+    workflow_system_prompt: str | None = None
     tools: list[str] | None = None
+    file_keys: list[str] = field(default_factory=list)
+    # Kept out of run_context.parameters, which outlives this execution while child labels repeat in the next one.
+    child_outputs: dict[str, OutputParameter] = field(default_factory=dict)
     calls: list[dict[str, Any]] = field(default_factory=list)
     # The report each child block returned, by label, so read_run_data can page the text the model was shown.
     results: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -213,11 +225,24 @@ class _LoopHooks(RunHooks[Any]):
             )
 
 
-def _record_call(state: _RunState, written: object, **call: str) -> None:
+def _record_call(state: _RunState, written: object, facts: dict[str, _Fact] | None = None, **call: str) -> None:
+    secrets = state.run_context.agent_redactable_secret_values()
     arguments = redact_secrets_from_text(
-        json.dumps(written, default=str), Block._registered_secret_values(state.run_context)
+        json.dumps(
+            state.run_context.mask_platform_smtp_for_agent(written),
+            default=lambda value: state.run_context.mask_platform_smtp_for_agent(str(value)),
+        ),
+        secrets,
     )
-    state.calls.append({**call, "arguments": arguments})
+
+    def scrub(text: str) -> str:
+        return redact_secrets_from_text(state.run_context.mask_platform_smtp_for_agent(text), secrets)
+
+    redacted = {
+        key: scrub(fact) if isinstance(fact, str) else [{k: scrub(v) for k, v in row.items()} for row in fact]
+        for key, fact in (facts or {}).items()
+    }
+    state.calls.append({**call, "arguments": arguments, **redacted})
 
 
 def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
@@ -259,17 +284,25 @@ def _finish_tool(schema: dict[str, Any], state: _RunState) -> FunctionTool:
     )
 
 
+def _pseudo_fields(tool: BlockTool) -> set[str]:
+    # A real YAML field of the same name wins: http_request has its own `files` dict, which must not become a name list.
+    return {"credential", "files"} & set(tool.fields) - set(tool.yaml_class.model_fields)
+
+
 def _arguments_schema(tool: BlockTool, state: _RunState) -> dict[str, Any]:
     schema = tool.yaml_class.model_json_schema()
+    pseudo = _pseudo_fields(tool)
     params: dict[str, Any] = {
         "type": "object",
-        "properties": {name: schema["properties"][name] for name in tool.fields if name != "credential"},
+        "properties": {name: schema["properties"][name] for name in tool.fields if name not in pseudo},
         "required": [name for name in tool.fields if name in schema.get("required", [])],
         "additionalProperties": False,
     }
-    if "credential" in tool.fields:
+    if "credential" in pseudo:
         params["properties"]["credential"] = {"type": "string", "enum": state.credential_keys}
         params["required"].append("credential")
+    if "files" in pseudo:
+        params["properties"]["files"] = {"type": "array", "items": {"type": "string"}, "description": FILES_DESCRIPTION}
     # Only the definitions a kept field reaches; the rest describe fields the model never sees.
     defs = schema.get("$defs", {})
     used: dict[str, Any] = {}
@@ -286,11 +319,19 @@ def _yaml_arguments(tool: BlockTool, written: dict[str, Any], state: _RunState) 
     if unknown := sorted(set(written) - set(tool.fields)):
         raise ValueError(f"Unknown arguments {unknown}; the allowed arguments are {list(tool.fields)}.")
     arguments = dict(written)
-    if "credential" in tool.fields:
+    pseudo = _pseudo_fields(tool)
+    parameter_keys: list[str] = []
+    if "credential" in pseudo:
         credential = arguments.pop("credential", None)
         if credential not in state.credential_keys:
             raise ValueError(f"credential must be one of {state.credential_keys}.")
-        arguments["parameter_keys"] = [credential]
+        parameter_keys.append(credential)
+    files = arguments.pop("files", []) if "files" in pseudo else []
+    if not isinstance(files, list) or not all(isinstance(name, str) and name in state.file_keys for name in files):
+        raise ValueError(f"files must be names from {state.file_keys}.")
+    parameter_keys += dict.fromkeys(files)
+    if parameter_keys:
+        arguments["parameter_keys"] = parameter_keys
     if tool.nested_agent:
         arguments |= {"engine": RunEngine.skyvern_v3, "engine_pinned": True}
     return arguments
@@ -344,8 +385,13 @@ def _run_block_tool(state: _RunState, block_types: list[str]) -> FunctionTool:
 
 
 def _masked_text(report: dict[str, Any], run_context: WorkflowRunContext) -> str:
+    data = run_context.mask_secrets_in_data(
+        run_context.mask_platform_smtp_for_agent(report),
+        excluded_secret_ids=run_context.agent_unmasked_platform_secret_ids(),
+    )
     return redact_secrets_from_text(
-        json.dumps(run_context.mask_secrets_in_data(report), default=str), Block._registered_secret_values(run_context)
+        json.dumps(data, default=lambda value: run_context.mask_platform_smtp_for_agent(str(value))),
+        run_context.agent_redactable_secret_values(),
     )
 
 
@@ -379,7 +425,10 @@ def _run_tool(
         except json.JSONDecodeError as e:
             return f"Arguments are not valid JSON ({e})."
         try:
+            state.run_context.reject_platform_smtp_references(written)
             report = {"status": "completed", "output": await run(state, **written), "error": None}
+        except InvalidWorkflowDefinition:
+            raise
         except Exception as e:
             report = {"status": "failed", "output": None, "error": f"{type(e).__name__}: {e}"}
         _record_call(state, written, tool=name, status=report["status"])
@@ -404,10 +453,11 @@ def _run_tool(
 
 async def _read_run_data(state: _RunState, name: str | None = None) -> object:
     run_context = state.run_context
+    platform_keys = run_context.platform_smtp_parameter_keys()
     parameters = {
         key: parameter
         for key, parameter in run_context.parameters.items()
-        if parameter.parameter_type != ParameterType.OUTPUT
+        if parameter.parameter_type != ParameterType.OUTPUT and key not in platform_keys
     }
     if name in run_context.workflow_run_outputs:
         outcome = run_context.get_block_outcome(name)
@@ -515,7 +565,13 @@ async def _page_extract(
     state: _RunState, prompt: str, schema: dict[str, Any] | None = None
 ) -> dict[str, Any] | list | str | None:
     # The page's AI has no block label, so an omitted system prompt resolves to the run-wide one.
-    opt_out = {"system_prompt": None} if state.ignore_workflow_system_prompt else {}
+    opt_out: dict[str, str | None] = (
+        {"system_prompt": None}
+        if state.ignore_workflow_system_prompt
+        else {"system_prompt": state.workflow_system_prompt}
+        if state.workflow_system_prompt is not None
+        else {}
+    )
     async with _run_page(state) as page:
         return await page.extract(prompt=_template_literal(prompt), schema=schema, **opt_out)
 
@@ -542,7 +598,7 @@ def _tools(state: _RunState) -> list[FunctionTool]:
         *(
             _dedicated_tool(block_type, tool, state)
             for name, (block_type, tool) in DEDICATED_BLOCK_TOOLS.items()
-            if _offers(state, name) and ("credential" not in tool.fields or state.credential_keys)
+            if _offers(state, name) and ("credential" not in _pseudo_fields(tool) or state.credential_keys)
         ),
         *([_run_block_tool(state, block_types)] if block_types else []),
         *(
@@ -566,17 +622,21 @@ async def _run_child_block(
         modified_at=now,
     )
     report: dict[str, Any]
+    facts: dict[str, _Fact] = {}
     try:
         if not isinstance(written, dict):
             raise ValueError("arguments must be a JSON object.")
+        state.run_context.reject_platform_smtp_references(written)
         block_yaml = tool.yaml_class(
             **_yaml_arguments(tool, written, state),
             label=label,
             ignore_workflow_system_prompt=state.ignore_workflow_system_prompt,
         )
         # The send-email converter adds the platform SMTP parameters to this dict.
-        parameters = {**state.run_context.parameters, output_parameter.key: output_parameter}
+        parameters = {**state.child_outputs, **state.run_context.parameters, output_parameter.key: output_parameter}
         child = block_yaml_to_block(block_yaml, parameters)  # type: ignore[arg-type]
+    except InvalidWorkflowDefinition:
+        raise
     except Exception as e:
         report = {
             "status": "invalid_arguments",
@@ -592,16 +652,56 @@ async def _run_child_block(
         }
     else:
         # A run resolves its secret parameters when it starts, before the converter added these.
-        for parameter in parameters.values():
-            if isinstance(parameter, AWSSecretParameter) and not state.run_context.has_parameter(parameter.key):
-                await state.run_context.register_aws_secret_parameter_value(parameter)
-        report = await _execute_child(child, written, state)
-    _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
+        temporary_smtp_keys = [
+            parameter.key
+            for parameter in parameters.values()
+            if isinstance(parameter, AWSSecretParameter)
+            and _is_platform_smtp_aws_key(parameter.aws_key)
+            and not state.run_context.has_parameter(parameter.key)
+        ]
+        try:
+            for parameter in parameters.values():
+                if not isinstance(parameter, AWSSecretParameter):
+                    continue
+                if _is_platform_smtp_aws_key(parameter.aws_key) and state.run_context.has_parameter(parameter.key):
+                    if block_type == BlockType.SEND_EMAIL and not state.run_context._platform_smtp_only_usage(
+                        parameter, child
+                    ):
+                        raise InvalidWorkflowDefinition(
+                            "Platform-managed secrets are restricted to platform email delivery."
+                        )
+                elif not state.run_context.has_parameter(parameter.key):
+                    await state.run_context.register_aws_secret_parameter_value(parameter, platform_smtp_block=child)
+            page_url = await _page_url_at_start(state) if tool.nested_agent else None
+            report, child_block_id = await _execute_child(child, written, state)
+            if page_url is not None:
+                facts["page_url_at_start"] = page_url
+            if "files" in tool.fields:
+                attempts = await _upload_attempts(state, child_block_id, written.get("files") or [])
+                if attempts is not None:
+                    facts["upload_attempts"] = attempts
+            # Ahead of output, so the window that cuts a long output keeps them.
+            report = {"status": report["status"], **facts, **report}
+            if (
+                report["status"] == BlockStatus.completed
+                and state.run_context.has_value(output_parameter.key)
+                and output_parameter.key not in state.run_context.parameters
+            ):
+                state.child_outputs[output_parameter.key] = output_parameter
+                state.file_keys.append(output_parameter.key)
+        finally:
+            for key in temporary_smtp_keys:
+                state.run_context.parameters.pop(key, None)
+                state.run_context.values.pop(key, None)
+    _record_call(
+        state, written, facts, tool=tool_name, block_type=block_type.value, label=label, status=report["status"]
+    )
     state.results[label] = report
     return _window(_masked_text(report, state.run_context), 0, label)
 
 
-async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> tuple[dict[str, Any], str | None]:
+    child._agent_smtp_isolation = True
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
     with copilot_usage_observer(None):
@@ -611,13 +711,66 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
             organization_id=state.organization_id,
             browser_session_id=state.browser_session_id,
         )
-    return {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    report = {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    return report, result.workflow_run_block_id
 
 
-def _credential_keys(run_context: WorkflowRunContext) -> list[str]:
+def _url_fact(url: str) -> str:
+    if url == "about:blank" or url.startswith(_TOKEN_PREFIX):
+        return url
+    return sanitize_handoff_url(url) or "unparseable url"
+
+
+async def _page_url_at_start(state: _RunState) -> str | None:
+    try:
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(state.workflow_run_id)
+        page = await browser_state.get_working_page(prune_excess_pages=False) if browser_state else None
+        return _url_fact(page.url) if page else None
+    except Exception:
+        LOG.warning("Could not read the page url before a nested agent", label=state.label, exc_info=True)
+        return None
+
+
+async def _upload_attempts(
+    state: _RunState, workflow_run_block_id: str | None, files: list[str]
+) -> list[dict[str, str]] | None:
+    try:
+        if workflow_run_block_id is None:
+            return None
+        run_block = await app.DATABASE.observer.get_workflow_run_block(
+            workflow_run_block_id, organization_id=state.organization_id
+        )
+        if run_block.task_id is None:
+            return None
+        actions = await app.DATABASE.tasks.get_task_actions_hydrated(
+            run_block.task_id, organization_id=state.organization_id
+        )
+        handed = {key: state.run_context.values.get(key) for key in files}
+        attempts = []
+        for action in actions:
+            if not isinstance(action, UploadFileAction):
+                continue
+            # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
+            parameter = next(
+                (
+                    key
+                    for key, value in handed.items()
+                    if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
+                ),
+                None,
+            )
+            named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
+            attempts.append({**named, "status": action.status.value})
+        return attempts
+    except Exception:
+        LOG.warning("Could not read a nested agent's uploads", label=state.label, exc_info=True)
+        return None
+
+
+def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
     return [
-        key
-        for key, parameter in run_context.parameters.items()
+        parameter.key
+        for parameter in parameters
         if parameter.parameter_type.is_login_credential()
         or (isinstance(parameter, WorkflowParameter) and parameter.workflow_parameter_type.is_credential_type())
     ]
@@ -642,8 +795,15 @@ async def run_agent_step(
         organization_id=organization_id,
         browser_session_id=browser_session_id,
         run_context=run_context,
-        credential_keys=_credential_keys(run_context),
+        credential_keys=_credential_keys(block.parameters),
+        file_keys=[
+            key
+            for key, parameter in run_context.parameters.items()
+            if isinstance(parameter, WorkflowParameter)
+            and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
+        ],
         ignore_workflow_system_prompt=block.ignore_workflow_system_prompt,
+        workflow_system_prompt=block.workflow_system_prompt,
         tools=block.tools,
     )
     effort = LLMConfigRegistry.get_config(llm_key).reasoning_effort
@@ -786,7 +946,7 @@ async def run_agent_step(
     return await block.build_block_result(
         success=status == BlockStatus.completed,
         failure_reason=failure_reason
-        and redact_secrets_from_text(failure_reason, Block._registered_secret_values(run_context)),
+        and redact_secrets_from_text(failure_reason, run_context.agent_redactable_secret_values()),
         output_parameter_value=value,
         status=status,
         workflow_run_block_id=workflow_run_block_id,

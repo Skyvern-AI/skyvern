@@ -6262,7 +6262,7 @@ async def test_changed_dispatch_snapshot_restores_requested_labels_before_acquis
         frontier_start_label=start,
         execution_snapshot=run_execution_module._declared_execution_snapshot(dispatched),
     )
-    assert result == {"ok": False, "error": "Organization not found"}
+    assert result == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
     assert ctx.last_executed_block_labels == requested and ctx.last_frontier_start_label == "approval"
     assert ctx.frontier_selected_output_sources == {} and ctx.frontier_resume_session_id is None
 
@@ -6995,8 +6995,10 @@ def _name_output_source(monkeypatch: pytest.MonkeyPatch, source: CompletedOutput
     monkeypatch.setattr(repair_origin_run_module, "_named_output_source", ContextVar("named", default=source))
 
 
-def _approval_source(workflow: Workflow, run_id: str, value: dict[str, Any] | None) -> CompletedOutputSource:
-    rows, outputs = origin_block_rows(workflow, "approval", value=value)
+def _approval_source(
+    workflow: Workflow, run_id: str, value: dict[str, Any] | None, label: str = "approval"
+) -> CompletedOutputSource:
+    rows, outputs = origin_block_rows(workflow, label, value=value)
     snapshot = origin_block_outputs_from_rows(
         workflow.workflow_definition,
         [row.model_copy(update={"workflow_run_id": run_id}) for row in rows],
@@ -7244,6 +7246,125 @@ async def test_a_named_run_is_consulted_before_legacy_verified_outputs(
     else:
         assert (labels, seed) == (["source_status"], {"approval": {"from": "named"}}) and refusal is None
         assert ctx.frontier_selected_output_sources["approval"].source == "named"
+
+
+_SPLIT_SIGN_IN_YAML = """
+title: split sign in
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: code
+      label: open_site
+      code: "await page.goto('https://example.test/')"
+    - block_type: code
+      label: read_value
+      code: "result = {'value': 1}"
+    - block_type: code
+      label: sign_in
+      code: "await page.locator('#pw').fill(creds.password)\\nresult = read_value_output"
+      parameter_keys:
+        - read_value_output
+"""
+_READ_VALUE = {"value": 1}
+
+
+async def _split_sign_in_turn(
+    monkeypatch: pytest.MonkeyPatch, source: str, verified: list[str], yaml: str = _SPLIT_SIGN_IN_YAML
+) -> tuple[CopilotContext, WorkflowDefinition]:
+    monkeypatch.setattr(app.WORKFLOW_SERVICE, "get_workflow_by_permanent_id", AsyncMock(return_value=None))
+    workflow = await inert_approval_workflow(yaml, workflow_id="w_split")
+    recorded = _approval_source(workflow, f"wr_{source}", _READ_VALUE, label="read_value")
+    ctx = make_copilot_ctx()
+    if source == "named":
+        _name_output_source(monkeypatch, recorded)
+    elif source != "none":
+        carrier = RunOutputCarrier(sources={recorded.workflow_run_id: recorded})
+        if source == "verified":
+            carrier.verified_sources["read_value"] = SelectedOutputSource(
+                "read_value", recorded.workflow_run_id, "verified", recorded.snapshot
+            )
+        ctx.repair_origin_outputs = carrier
+    ctx.verified_prefix_labels = list(verified)
+    ctx.verified_block_outputs = {label: {} for label in verified}
+    if "read_value" in verified:
+        ctx.verified_block_outputs["read_value"] = _READ_VALUE
+    return ctx, workflow.workflow_definition
+
+
+@pytest.mark.parametrize("source", ["none", "named", "banked", "verified"])
+@pytest.mark.asyncio
+async def test_a_sign_in_block_tested_alone_in_its_own_browser_keeps_the_output_it_reads(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    verified = ["open_site", "read_value"] if source in ("none", "verified") else []
+    yaml = _SPLIT_SIGN_IN_YAML
+    if source == "none":
+        # The same-turn seed only follows template references, not parameter_keys.
+        yaml = yaml.replace("result = read_value_output", "result = {{ read_value_output.value }}")
+    ctx, definition = await _split_sign_in_turn(monkeypatch, source, verified, yaml)
+
+    labels, seed, start, _ = _plan_frontier(ctx, ["sign_in"], definition, definition)
+
+    assert ctx.frontier_requires_own_browser is True and ctx.frontier_resume_session_id is None
+    assert (labels, start, seed) == (["sign_in"], "sign_in", {"read_value": _READ_VALUE})
+    assert [receipt.as_payload() for receipt in ctx.frontier_selected_output_sources.values()] == (
+        []
+        if source == "none"
+        else [{"block_label": "read_value", "source_workflow_run_id": f"wr_{source}", "source": source}]
+    )
+
+
+@pytest.mark.parametrize("source", ["named", "banked", "verified"])
+@pytest.mark.asyncio
+async def test_a_sign_in_block_tested_with_its_producer_in_its_own_browser_reruns_the_producer(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    ctx, definition = await _split_sign_in_turn(monkeypatch, source, ["open_site", "read_value"])
+
+    labels, seed, start, _ = _plan_frontier(ctx, ["read_value", "sign_in"], definition, definition)
+
+    assert ctx.frontier_requires_own_browser is True
+    assert (labels, start, seed) == (["read_value", "sign_in"], "read_value", {})
+    assert ctx.frontier_selected_output_sources == {} and ctx.frontier_origin_reused_labels == []
+
+
+@pytest.mark.asyncio
+async def test_a_restored_request_drops_an_output_its_own_start_cannot_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The output was chosen for `sign_in`; the restored request starts at `open_site`, before its producer runs.
+    ctx, definition = await _split_sign_in_turn(monkeypatch, "banked", ["open_site"])
+
+    labels, seed, start, _ = _plan_frontier(ctx, ["open_site", "sign_in"], definition, definition)
+
+    assert ctx.frontier_requires_own_browser is True
+    assert (labels, start, seed) == (["open_site", "sign_in"], "open_site", {})
+    assert ctx.frontier_selected_output_sources == {} and ctx.frontier_origin_reused_labels == []
+
+
+@pytest.mark.parametrize("source", ["none", "banked"])
+@pytest.mark.asyncio
+async def test_a_restored_request_keeps_a_same_turn_output_it_reads(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    yaml = _SPLIT_SIGN_IN_YAML.replace("result = read_value_output", "result = {{ read_value_output.value }}")
+    ctx, definition = await _split_sign_in_turn(monkeypatch, source, ["open_site", "read_value"], yaml)
+
+    labels, seed, start, _ = _plan_frontier(ctx, ["open_site", "sign_in"], definition, definition)
+
+    assert ctx.frontier_requires_own_browser is True
+    assert (labels, start, seed) == (["open_site", "sign_in"], "open_site", {"read_value": _READ_VALUE})
+    assert ctx.frontier_selected_output_sources == {} and ctx.frontier_origin_reused_labels == []
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_fallback_planned_without_seeds_stays_unseeded(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx, definition = await _split_sign_in_turn(monkeypatch, "verified", ["open_site", "read_value"])
+
+    labels, seed, _, _ = frontier_module._anchored_plan(
+        ctx, (["sign_in"], {}, "sign_in"), definition, None, ["sign_in"]
+    )
+
+    assert ctx.frontier_requires_own_browser is True
+    assert (labels, seed) == (["sign_in"], {})
 
 
 @pytest.mark.parametrize("recheck", ["input", "settings"])

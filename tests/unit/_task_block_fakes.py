@@ -79,6 +79,7 @@ def mock_block_execute_deps(
         organization_id="o_test",
         browser_profile_id=None,
         browser_address=None,
+        requested_by=None,
     )
 
     working_page = SimpleNamespace(url=working_page_url)

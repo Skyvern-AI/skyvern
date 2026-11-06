@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/tooltip";
 
 type Props = {
+  demonstrateDisabledReason?: string | null;
   duplicateDisabledReason?: string | null;
   isDeletable?: boolean;
   isDuplicable?: boolean;
@@ -23,11 +24,13 @@ type Props = {
   isCanvasLocked?: boolean;
   showScriptText?: string;
   onDelete?: () => void;
+  onDemonstrate?: () => void;
   onDuplicate?: () => void;
   onShowScript?: () => void;
 };
 
 function NodeActionMenu({
+  demonstrateDisabledReason = null,
   duplicateDisabledReason = null,
   isDeletable = true,
   isDuplicable = true,
@@ -35,6 +38,7 @@ function NodeActionMenu({
   isCanvasLocked = false,
   showScriptText,
   onDelete,
+  onDemonstrate,
   onDuplicate,
   onShowScript,
 }: Props) {
@@ -127,6 +131,30 @@ function NodeActionMenu({
         ) : (
           deleteItem
         )}
+        {onDemonstrate &&
+          (demonstrateDisabledReason ? (
+            <TooltipProvider delayDuration={200}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="block">
+                    <DropdownMenuItem
+                      disabled
+                      onSelect={(event) => event.preventDefault()}
+                    >
+                      Demonstrate this block
+                    </DropdownMenuItem>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="left">
+                  {demonstrateDisabledReason}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          ) : (
+            <DropdownMenuItem onSelect={() => onDemonstrate()}>
+              Demonstrate this block
+            </DropdownMenuItem>
+          ))}
         {isScriptable && onShowScript && (
           <DropdownMenuItem
             onSelect={() => {

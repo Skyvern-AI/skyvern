@@ -37,6 +37,7 @@ import structlog
 from agents import RunConfig
 from agents.tool_context import ToolContext
 from fastapi import BackgroundTasks, HTTPException, status
+from pydantic import TypeAdapter
 from structlog.testing import capture_logs
 
 from skyvern.config import settings
@@ -45,6 +46,9 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache.base import NoopLock
 from skyvern.forge.sdk.copilot import credential_pause as credential_pause_module
 from skyvern.forge.sdk.copilot import credential_resolution
+from skyvern.forge.sdk.copilot import enforcement as enforcement_module
+from skyvern.forge.sdk.copilot import human_input_wait as human_input_wait_module
+from skyvern.forge.sdk.copilot import output_policy as output_policy_module
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.agent import (
     _finalize_result_with_blocker_override,
@@ -65,6 +69,7 @@ from skyvern.forge.sdk.copilot.context import (
     CopilotContext,
     ProposedCredential,
     StructuredContext,
+    TurnNarrativePayload,
     record_approved_credentials_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.credential_generation import SAFE_SYMBOLS, generate_registration_password
@@ -73,6 +78,7 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     CredentialPauseResolution,
     _decode_active_pause,
     _encode_active_pause,
+    _encode_record,
     await_pending_credential_pause,
     claim_credential_generation,
     credential_pause_active_key,
@@ -98,8 +104,13 @@ from skyvern.forge.sdk.copilot.enforcement import (
     run_with_enforcement,
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-from skyvern.forge.sdk.copilot.human_input_wait import HumanInputWait, pause_human_input
+from skyvern.forge.sdk.copilot.human_input_wait import (
+    CHARGED_WAIT_BACKSTOP_GRACE_SECONDS,
+    HumanInputWait,
+    pause_human_input,
+)
 from skyvern.forge.sdk.copilot.narration import NarratorState, build_tool_call_activity
+from skyvern.forge.sdk.copilot.output_policy import evaluate_output_policy
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_BINDING_FACTS,
     RequestPolicy,
@@ -114,6 +125,7 @@ from skyvern.forge.sdk.copilot.turn_origin import TurnOrigin
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.event_source_stream import EventSourceStream
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.forge_log import setup_logger
 from skyvern.forge.sdk.routes import workflow_copilot as copilot_routes
 from skyvern.forge.sdk.routes.workflow_copilot import (
@@ -121,7 +133,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     workflow_copilot_credential_generate,
     workflow_copilot_credential_response,
 )
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import OutputPolicyReason, ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.credentials import (
     CreateCredentialRequest,
     Credential,
@@ -137,11 +149,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCredentialPauseResolvedUpdate,
     WorkflowCopilotCredentialRegistration,
     WorkflowCopilotCredentialRequiredUpdate,
+    WorkflowCopilotCredentialResponseResult,
     WorkflowCopilotStreamMessageType,
 )
+from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard, saved_site_urls
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import wire_credential_vault
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import ScopedTime
 from tests.unit.test_copilot_make_agent_result_backfill import _payload as _backfill_payload
 
 
@@ -1052,16 +1067,22 @@ def test_elapsed_run_seconds_subtracts_pause_time() -> None:
 
 @pytest.mark.asyncio
 async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fails on old code: a slow pause would consume the real timeout budget.
+    """Fails on old code: a slow pause would consume the turn's timeout budget.
 
-    Four values must stay ordered: non-pause work < TOTAL_TIMEOUT_SECONDS < pause <
-    credential_pause_timeout_seconds. Non-pause work was measured at ~2s on a cold CI shard
-    (whichever test imports the agent SDK first pays for it), so a sub-second budget only
-    ever passed on a warm runner. The pause must still exceed the budget or the assertion
-    proves nothing, and must stay under the pause timeout or it resolves as a timeout
-    instead of a response.
+    The turn clock is fake, so non-pause work costs nothing and the three values that must stay ordered are exact:
+    TOTAL_TIMEOUT_SECONDS < pause < credential_pause_timeout_seconds.
     """
     monkeypatch.setattr("skyvern.forge.sdk.copilot.enforcement.TOTAL_TIMEOUT_SECONDS", 4.0)
+    turn_time = ScopedTime()
+    turn_time.now = 1000.0
+    for module in (enforcement_module, human_input_wait_module, credential_pause_module):
+        monkeypatch.setattr(module, "time", turn_time)
+
+    async def advance_turn_clock(seconds: float) -> None:
+        turn_time.now += seconds
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(credential_pause_module, "asyncio", ScopedAsyncio(sleep=advance_turn_clock))
 
     ctx = make_copilot_context()
     ctx.organization_id = "org-1"
@@ -1076,7 +1097,12 @@ async def test_paused_loop_does_not_trip_total_timeout_on_resume(monkeypatch: py
     monkeypatch.setattr(credential_pause_module, "CREDENTIAL_RESPONSE_POLL_SECONDS", 0.5)
 
     async def _populate_after_first_poll() -> None:
-        await asyncio.sleep(4.5)
+        for _ in range(100_000):
+            if turn_time.now >= 1004.5:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("the pause never advanced the turn clock")
         cache.store[credential_response_cache_key("org-1", "chat-1", "turn-credit")] = encode_credential_response(
             "skip", None, "tok-1"
         )
@@ -2000,6 +2026,7 @@ async def test_a_settled_card_leaves_the_models_next_ask_free_to_open_a_fresh_ca
     assert ctx.credential_pause_outcome == "connected"
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("first_card", "credited"), [("unanswered", False), ("start_sign_in", True)], ids=["nobody_there", "signing_in"]
@@ -2015,17 +2042,30 @@ async def test_an_unanswered_card_returns_past_the_deadline_and_counts_against_t
     _stub_credential_lookup(monkeypatch, _make_credential())
     ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [(first_card, None), ("connected", "cred_1")]))
 
-    # The turn's backstop is shorter than the card's wait.
-    async with asyncio.timeout(0.3) as deadline:
+    # Far past the fake-clock card, so it only fires on a real hang, and short of the grace a spent wait reschedules it
+    # to (so the pause still takes the one-shot grace path). The test reads the backstop itself: it must be suspended
+    # while the card waits and pushed out to the grace once the wait ends.
+    suspended_while_waiting: list[float | None] = []
+    card_clock_sleep = credential_pause_module.asyncio.sleep
+
+    async def watch_the_backstop(seconds: float) -> None:
+        suspended_while_waiting.append(deadline.when())
+        await card_clock_sleep(seconds)
+
+    monkeypatch.setattr(credential_pause_module, "asyncio", ScopedAsyncio(sleep=watch_the_backstop))
+    async with asyncio.timeout(10) as deadline:
+        original_backstop = deadline.when()
+        assert original_backstop is not None
         ctx.model_stream_deadline = deadline
         first = await _call_ask_tool(ctx)
         credited_after_first = ctx.copilot_credential_pause_seconds
-        backstop_after_first = deadline.when() or 0.0
-        backstop_still_ahead = backstop_after_first > asyncio.get_running_loop().time()
+        backstop_after_first = deadline.when()
         second = await _call_ask_tool(ctx)
 
     assert (first["status"], first["outcome"]) == ("unanswered", "timeout")
-    assert backstop_still_ahead
+    assert suspended_while_waiting and set(suspended_while_waiting) == {None}
+    assert backstop_after_first is not None
+    assert backstop_after_first >= original_backstop + (CHARGED_WAIT_BACKSTOP_GRACE_SECONDS - 10)
     # The backstop's grace is one-shot: a later card in a spent turn no longer pushes it out.
     assert deadline.when() == backstop_after_first
     assert (credited_after_first > 0.0) is credited
@@ -3337,20 +3377,24 @@ async def test_origin_recovery_raises_no_second_card_while_one_is_in_flight(monk
 
 
 @pytest.mark.asyncio
-async def test_an_authenticator_update_ask_neither_spends_nor_resolves_origin_recovery(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("rejected_by_site", [False, True])
+async def test_an_authenticator_update_ask_for_another_login_neither_spends_nor_resolves_origin_recovery(
+    monkeypatch: pytest.MonkeyPatch, rejected_by_site: bool
 ) -> None:
     cache = _FakeCache()
     ctx = _recovery_ctx(monkeypatch, cache)
-    service = wire_credential_vault(
-        monkeypatch, PasswordCredential(username="u", password="p", totp=None), credential_id="cred_service"
+    other = wire_credential_vault(
+        monkeypatch, PasswordCredential(username="u", password="p", totp=None), credential_id="cred_other"
     )
-    ctx.request_policy.resolved_credentials = [service]
+    ctx.request_policy.resolved_credentials = [other]
     ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("skip", None)]))
 
-    await _request_credential(f"{_IDP_ORIGIN}/login", "Add 2FA.", ctx, credential_id="cred_service")
+    await _request_credential(
+        f"{_IDP_ORIGIN}/login", "Add 2FA.", ctx, credential_id="cred_other", rejected_by_site=rejected_by_site
+    )
 
-    assert len(_sent_cards(ctx)) == 1
+    [card] = _sent_cards(ctx)
+    assert card.credential_refs == ["cred_other"]
     assert ctx.credential_origin_recovery == _PENDING
     assert ctx.credential_origin_refusals == set()
 
@@ -4470,16 +4514,27 @@ async def test_registration_card_reopened_after_its_deadline_passed_mid_save_is_
 ) -> None:
     cache = _FakeCache()
     monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
-    _seed_registration_pause(cache, expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=50))
+    _seed_registration_pause(cache)
     _registration_database(monkeypatch, _make_credential())
-    vault = _RegistrationVault(
-        _make_credential(), reject=failure == "rejected", fail=failure == "vault_error", delay=0.1
-    )
+    vault = _RegistrationVault(_make_credential(), reject=failure == "rejected", fail=failure == "vault_error")
     vault.install(monkeypatch)
+    active_key = credential_pause_active_key("org-1", "chat-1", "turn-1")
+    prepare = vault.prepare
+
+    async def prepare_once_the_deadline_has_passed(
+        organization_id: str, data: CreateCredentialRequest
+    ) -> _RegistrationVault:
+        record = _decode_active_pause(cache.store[active_key])
+        assert record is not None and record.status == "resolving"
+        lapsed = replace(record, expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        cache.store[active_key] = _encode_record(lapsed)
+        return await prepare(organization_id, data)
+
+    monkeypatch.setattr(copilot_routes, "prepare_credential_create", prepare_once_the_deadline_has_passed)
 
     result = await _generate()
 
-    record = _decode_active_pause(cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")])
+    record = _decode_active_pause(cache.store[active_key])
     assert record is not None and record.status == "pending"
     assert result.expires_at == record.expires_at
     assert record.expires_at > datetime.now(timezone.utc) + timedelta(
@@ -4567,6 +4622,7 @@ async def test_registration_password_quoted_by_a_vault_error_is_scrubbed_from_re
     assert password not in rendered
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("answer", ["skip", "timeout"])
 async def test_registration_card_reopened_after_an_unconfirmed_save_reports_it_when_skipped_or_unanswered(
@@ -4609,6 +4665,7 @@ async def test_registration_card_reopened_after_an_unconfirmed_save_reports_it_w
     assert vault.passwords[0] not in json.dumps(result)
 
 
+@pytest.mark.usefixtures("card_clock")
 @pytest.mark.asyncio
 async def test_registration_card_that_ran_out_mid_create_reports_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     cache = _FakeCache()
@@ -4652,3 +4709,666 @@ async def test_registration_outcome_from_an_earlier_ask_is_not_reported_on_the_n
 
     assert result["status"] == "unanswered"
     assert "registration_outcome" not in result
+
+
+_SITE_A = "https://portal.example.com/login"
+_SITE_B_ORIGIN = "https://account.example.org"
+_SITE_B_ASK = f"{_SITE_B_ORIGIN}/login?next=%2Fhome#step-2"
+
+
+class _CredentialRows:
+    """The credentials table as the card's site write reaches it, with the repository's compare-and-set."""
+
+    def __init__(self, *credentials: Credential) -> None:
+        self.rows = {credential.credential_id: credential for credential in credentials}
+        self.updates: list[dict[str, str | list[str]]] = []
+        self.fail_after_write = False
+
+    async def get_credentials_by_ids(self, ids: list[str], **_: object) -> list[Credential]:
+        return [self.rows[credential_id] for credential_id in ids if credential_id in self.rows]
+
+    async def get_credential(self, credential_id: str, organization_id: str | None = None) -> Credential | None:
+        return self.rows.get(credential_id)
+
+    async def update_credential(
+        self,
+        credential_id: str,
+        organization_id: str,
+        *,
+        expected_site_urls: list[str] | None = None,
+        tested_url: str | None = None,
+        extra_site_urls: list[str] | None = None,
+    ) -> Credential:
+        row = self.rows[credential_id]
+        if expected_site_urls is not None and expected_site_urls != saved_site_urls(
+            row.tested_url, row.extra_site_urls
+        ):
+            raise CredentialSitesChangedError(credential_id)
+        update: dict[str, str | list[str]] = {}
+        if tested_url is not None:
+            update["tested_url"] = tested_url
+        if extra_site_urls is not None:
+            update["extra_site_urls"] = extra_site_urls
+        self.rows[credential_id] = row.model_copy(update=update)
+        self.updates.append(update)
+        if self.fail_after_write:
+            raise RuntimeError("connection reset after commit")
+        return self.rows[credential_id]
+
+
+def _site_a_login(credential_id: str = "cred_svc", **update: object) -> Credential:
+    return _make_credential(credential_id, "Service Login").model_copy(update={"tested_url": _SITE_A, **update})
+
+
+def _site_question_ctx(
+    monkeypatch: pytest.MonkeyPatch, rows: _CredentialRows, *, recovery: bool = True
+) -> tuple[CopilotContext, _FakeCache]:
+    cache = _FakeCache()
+    ctx = _recovery_ctx(monkeypatch, cache) if recovery else _tool_ctx(monkeypatch, cache)
+    if recovery:
+        ctx.credential_origin_recovery = CredentialOriginRecovery(
+            _SITE_B_ORIGIN, "pending", refused_credential_id="cred_svc"
+        )
+    ctx.request_policy.resolved_credentials.append(rows.rows["cred_svc"])
+    monkeypatch.setattr(
+        app,
+        "DATABASE",
+        SimpleNamespace(
+            credentials=rows,
+            workflow_params=SimpleNamespace(record_pending_copilot_turn_credential_resume=AsyncMock()),
+        ),
+    )
+    vault_item = CredentialItem(
+        item_id="item_1",
+        name="Service Login",
+        credential_type=CredentialType.PASSWORD,
+        credential=PasswordCredential(username="user@example.com", password="synthetic-password"),
+    )
+    monkeypatch.setattr(
+        app._inst,
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.SKYVERN: SimpleNamespace(get_credential_item=AsyncMock(return_value=vault_item))},
+        raising=False,
+    )
+    monkeypatch.setattr(copilot_routes, "get_request_principal", lambda: SimpleNamespace(organization_id="org-1"))
+    monkeypatch.setattr(
+        credential_pause_module, "get_request_principal", lambda: SimpleNamespace(organization_id="org-1")
+    )
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    return ctx, cache
+
+
+async def _post_card_answer(
+    frame: WorkflowCopilotCredentialRequiredUpdate,
+    credential_id: str,
+    site_answer: str | None = None,
+    **extra: object,
+) -> WorkflowCopilotCredentialResponseResult:
+    return await workflow_copilot_credential_response(
+        WorkflowCopilotCredentialResponseRequest.model_validate(
+            {
+                "turn_id": frame.turn_id,
+                "workflow_copilot_chat_id": frame.workflow_copilot_chat_id,
+                "resume_token": frame.resume_token,
+                "action": "connected",
+                "credential_id": credential_id,
+                "asks_site": True,
+                "site_answer": site_answer,
+                **extra,
+            }
+        ),
+        organization=SimpleNamespace(organization_id="org-1"),  # type: ignore[arg-type]
+    )
+
+
+def _answer_site_question(
+    answer: str | None, posted: list[WorkflowCopilotCredentialResponseResult], credential_id: str = "cred_svc"
+) -> Callable[[WorkflowCopilotCredentialRequiredUpdate], Awaitable[bool]]:
+    """Pick the login on the card through the route, then answer the site question it asks."""
+
+    async def send(frame: WorkflowCopilotCredentialRequiredUpdate) -> bool:
+        if frame.type != WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED:
+            return True
+        # A site the client sends is ignored: the pause record holds the card's site.
+        posted.append(await _post_card_answer(frame, credential_id, site="https://elsewhere.example.com/"))
+        if answer is not None:
+            posted.append(await _post_card_answer(frame, credential_id, answer))
+        return True
+
+    return send
+
+
+@pytest.mark.asyncio
+async def test_a_recovery_card_opens_with_the_site_question_for_the_refused_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows)
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+
+    async def answer_first_frame(frame: WorkflowCopilotCredentialRequiredUpdate) -> bool:
+        if frame.type == WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED:
+            posted.append(await _post_card_answer(frame, "cred_svc", "move"))
+        return True
+
+    ctx.stream.send = AsyncMock(side_effect=answer_first_frame)
+
+    result = await _ask(ctx, _SITE_B_ASK)
+
+    [card] = _sent_cards(ctx)
+    assert card.site_question is not None
+    assert (card.site_question.credential_id, card.site_question.site) == ("cred_svc", _SITE_B_ORIGIN)
+    assert card.site_question.saved_sites == ["https://portal.example.com"]
+    assert [answer.result for answer in posted] == ["accepted"]
+    assert rows.rows["cred_svc"].tested_url == f"{_SITE_B_ORIGIN}/login"
+    assert result["status"] == "connected"
+
+
+def _page_on(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    monkeypatch.setattr(credential_fill_module, "_live_working_page_url", AsyncMock(return_value=url))
+    monkeypatch.setattr(credential_pause_module, "live_working_page", AsyncMock(return_value=SimpleNamespace(url=url)))
+
+
+@pytest.mark.asyncio
+async def test_moving_a_login_to_the_recovery_site_saves_that_site_and_fills_there_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows)
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("move", posted))
+
+    with capture_logs() as logs:
+        result = await _ask(ctx, _SITE_B_ASK)
+
+    asked, moved = posted
+    assert asked.result == "site_question"
+    assert asked.site_question.site == _SITE_B_ORIGIN
+    assert asked.site_question.saved_sites == ["https://portal.example.com"]
+    assert asked.site_question.vault_sourced is False
+    assert asked.site_question.name == "Service Login"
+    assert moved.result == "accepted"
+    assert rows.rows["cred_svc"].tested_url == f"{_SITE_B_ORIGIN}/login"
+    assert rows.rows["cred_svc"].extra_site_urls == []
+    assert result["status"] == "connected"
+    assert "saved_site_change" in result
+    assert ctx.credential_origin_recovery is None
+    [resolved] = _sent_resolutions(ctx)
+    assert (resolved.outcome, resolved.site_answer, resolved.site_a, resolved.site_b) == (
+        "connected",
+        "move",
+        "https://portal.example.com",
+        _SITE_B_ORIGIN,
+    )
+    receipt = credential_pause_module.credential_pause_receipt(ctx)
+    assert (receipt["siteAnswer"], receipt["name"]) == ("move", "Service Login")
+    TypeAdapter(TurnNarrativePayload).validate_python(
+        copilot_routes._make_error_narrative_payload(None, 0, "done")
+        | {"credentialPause": receipt, "credentialPauses": [receipt, receipt]}
+    )
+    [changed] = [line for line in logs if line["event"] == "copilot_credential_site_changed"]
+    assert (changed["action"], changed["site_a"], changed["site_b"]) == (
+        "move",
+        "https://portal.example.com",
+        _SITE_B_ORIGIN,
+    )
+
+    _page_on(monkeypatch, f"{_SITE_B_ORIGIN}/login")
+    grant, error = await credential_fill_module._credential_fill_origin_grant(ctx, "cred_svc")
+    assert error is None and grant is not None
+    assert credential_fill_module._within_grant(f"{_SITE_B_ORIGIN}/password", grant)
+    assert not credential_fill_module._within_grant(_SITE_A, grant)
+    [armed] = CredentialReleaseGuard().arm_login(
+        ["synthetic-password"],
+        "service_login",
+        tested_url=rows.rows["cred_svc"].tested_url,
+        vault_sites=None,
+        enforce_vault_sites=True,
+        extra_site_urls=rows.rows["cred_svc"].extra_site_urls,
+    )
+    assert armed.admits(f"{_SITE_B_ORIGIN}/home") and not armed.admits(_SITE_A)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected_by_site", [False, True])
+@pytest.mark.parametrize("refusal", ["open_recovery", "refusals_only"])
+async def test_an_update_ask_for_the_refused_login_opens_the_recovery_card_until_move_saves_it_there(
+    monkeypatch: pytest.MonkeyPatch, rejected_by_site: bool, refusal: str
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, cache = _site_question_ctx(monkeypatch, rows)
+    if refusal == "refusals_only":
+        ctx.credential_origin_recovery = None
+        ctx.credential_origin_refusals = {(_SITE_B_ORIGIN, "cred_svc")}
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("move", posted))
+
+    result = await _request_credential(
+        _SITE_B_ASK, "Add 2FA.", ctx, credential_id="cred_svc", rejected_by_site=rejected_by_site
+    )
+
+    [card] = _sent_cards(ctx)
+    assert card.reason == "login_credentials_unresolved"
+    assert card.credential_refs == []
+    assert card.message == credential_fill_module._refused_login_recovery_card_text(_SITE_B_ORIGIN)
+    assert posted[0].result == "site_question"
+    assert result["status"] == "connected"
+    assert "update_card" in result
+    assert rows.rows["cred_svc"].tested_url == f"{_SITE_B_ORIGIN}/login"
+    assert ctx.credential_origin_recovery is None
+    assert ctx.credential_origin_refusals == set()
+
+    ctx.stream.send = AsyncMock(side_effect=_answer_each_card(cache, [("skip", None)]))
+    await _request_credential(_SITE_B_ASK, "Add 2FA.", ctx, credential_id="cred_svc", rejected_by_site=rejected_by_site)
+
+    [update_card] = _sent_cards(ctx)
+    assert update_card.reason == ("credential_rejected_by_site" if rejected_by_site else "credential_missing_totp")
+    assert update_card.credential_refs == ["cred_svc"]
+
+
+@pytest.mark.asyncio
+async def test_adding_the_recovery_site_keeps_the_first_and_later_turns_fill_on_each_saved_origin_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows)
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("add", posted))
+
+    result = await _ask(ctx, _SITE_B_ASK)
+
+    assert result["status"] == "connected"
+    assert rows.rows["cred_svc"].tested_url == _SITE_A
+    assert rows.rows["cred_svc"].extra_site_urls == [f"{_SITE_B_ORIGIN}/login"]
+    [held] = [c for c in ctx.request_policy.resolved_credentials if c.credential_id == "cred_svc"]
+    assert held.extra_site_urls == [f"{_SITE_B_ORIGIN}/login"]
+
+    later = RequestPolicy(resolved_credentials=[rows.rows["cred_svc"]])
+    ctx.request_policy = later
+    for page, admitted in [
+        (f"{_SITE_B_ORIGIN}/login", f"{_SITE_B_ORIGIN}/next"),
+        ("https://portal.example.com/login", "https://portal.example.com/next"),
+    ]:
+        _page_on(monkeypatch, page)
+        grant, error = await credential_fill_module._credential_fill_origin_grant(ctx, "cred_svc")
+        assert error is None and grant is not None
+        assert credential_fill_module._within_grant(admitted, grant)
+    _page_on(monkeypatch, "https://other.example.org/login")
+    grant, _ = await credential_fill_module._credential_fill_origin_grant(ctx, "cred_svc")
+    assert grant is None or not credential_fill_module._within_grant("https://other.example.org/login", grant)
+    assert output_policy_module._approved_origins_by_id(later)["cred_svc"] == {
+        "https://portal.example.com",
+        _SITE_B_ORIGIN,
+    }
+    ctx.credential_origin_refusals.clear()
+    recovery = CredentialOriginRecovery(_SITE_B_ORIGIN, "pending", refused_credential_id="cred_other")
+    assert await credential_fill_module._credential_evidence_admits_origin(ctx, recovery, rows.rows["cred_svc"])
+
+
+@pytest.mark.asyncio
+async def test_no_on_the_site_question_leaves_the_login_and_reports_the_missing_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows)
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("no", posted))
+
+    result = await _ask(ctx, _SITE_B_ASK)
+
+    assert rows.updates == []
+    assert result["status"] == "connected_other_site"
+    assert ctx.blocker_signal.internal_reason_code == CREDENTIAL_ORIGIN_RECOVERY_DECLINED_REASON_CODE
+    [resolved] = _sent_resolutions(ctx)
+    assert (resolved.outcome, resolved.site_answer, resolved.site_b) == ("not_admitted", "no", _SITE_B_ORIGIN)
+    receipt = credential_pause_module.credential_pause_receipt(ctx)
+    assert receipt["outcome"] == "not_admitted"
+    assert (receipt["siteAnswer"], receipt["siteA"], receipt["siteB"]) == (
+        "no",
+        "https://portal.example.com",
+        _SITE_B_ORIGIN,
+    )
+
+
+_EXISTING_WORKFLOW_ON_SITE_B = f"""
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_svc
+  blocks:
+    - block_type: login
+      label: login
+      url: {_SITE_B_ORIGIN}/login
+      parameter_keys:
+        - login_credentials
+"""
+
+
+def _existing_workflow_on_site_b_broadens_scope(ctx: CopilotContext) -> bool:
+    ctx.request_policy.existing_workflow_credential_ids = ["cred_svc"]
+    ctx.request_policy.existing_workflow_credential_origins = {"cred_svc": ["https://portal.example.com"]}
+    verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy, response_type="REPLY", workflow_yaml=_EXISTING_WORKFLOW_ON_SITE_B
+    )
+    return OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("answer", "broadens"), [("add", False), ("move", False), ("no", True)])
+async def test_an_existing_workflow_moves_onto_the_site_only_after_the_user_saved_the_login_there(
+    monkeypatch: pytest.MonkeyPatch, answer: str, broadens: bool
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows)
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question(answer, []))
+
+    await _ask(ctx, _SITE_B_ASK)
+
+    assert _existing_workflow_on_site_b_broadens_scope(ctx) is broadens
+
+
+@pytest.mark.asyncio
+async def test_a_plain_card_pick_of_a_login_saved_for_another_site_asks_before_binding_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows, recovery=False)
+    _page_on(monkeypatch, f"{_SITE_B_ORIGIN}/login")
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("no", posted))
+
+    result = await _ask(ctx, _SITE_B_ASK)
+
+    assert posted[0].result == "site_question"
+    assert result["status"] == "declined_site"
+    assert "cred_svc" not in ctx.request_policy.live_page_admitted_urls
+    assert rows.updates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", [True, False])
+async def test_a_site_with_userinfo_is_never_recorded_for_a_site_question(
+    monkeypatch: pytest.MonkeyPatch, recovery: bool
+) -> None:
+    ctx = _tool_ctx(monkeypatch)
+    site = "https://user:pw@account.example.org/login"
+    _page_on(monkeypatch, site)
+    ctx.request_policy.user_provided_site_urls = [site]
+
+    assert await credential_pause_module._site_question_url(ctx, site, recovery=recovery) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_gave_site", [False, True])
+async def test_a_plain_card_off_the_site_asks_the_site_question_only_when_the_user_gave_the_site(
+    monkeypatch: pytest.MonkeyPatch, user_gave_site: bool
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows, recovery=False)
+    _page_on(monkeypatch, "https://unrelated.example.net/home")
+    if user_gave_site:
+        ctx.request_policy.user_provided_site_urls = [f"{_SITE_B_ORIGIN}/"]
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question(None, posted))
+
+    await _ask(ctx, _SITE_B_ASK)
+
+    assert posted[0].result == ("site_question" if user_gave_site else "accepted")
+    assert rows.updates == []
+
+
+def _asked_cache_for(
+    rows: _CredentialRows, *, vault_sourced: bool = False, site_url: str = f"{_SITE_B_ORIGIN}/login"
+) -> _FakeCache:
+    cache = _FakeCache()
+    question = credential_pause_module.SiteQuestion(
+        credential_id="cred_svc", saved_site_urls=(_SITE_A,), vault_sourced=vault_sourced
+    )
+    cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")] = _encode_record(
+        credential_pause_module._ActivePauseRecord(
+            resume_token="tok-1",
+            status="pending",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            site_url=site_url,
+            site_question=question,
+        )
+    )
+    return cache
+
+
+_ASKED_FRAME = SimpleNamespace(turn_id="turn-1", workflow_copilot_chat_id="chat-1", resume_token="tok-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "answer"),
+    [
+        ("other_login", "move"),
+        ("vault_sourced", "move"),
+        ("sites_changed", "move"),
+        ("no_question", "move"),
+        ("userinfo_site", "move"),
+        ("userinfo_site", "add"),
+    ],
+)
+async def test_a_site_answer_the_card_did_not_ask_for_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, case: str, answer: str
+) -> None:
+    rows = _CredentialRows(_site_a_login(), _site_a_login("cred_other"))
+    _site_question_ctx(monkeypatch, rows)
+    cache = _asked_cache_for(
+        rows,
+        vault_sourced=case == "vault_sourced",
+        site_url="https://user:pw@account.example.org/login" if case == "userinfo_site" else f"{_SITE_B_ORIGIN}/login",
+    )
+    if case == "sites_changed":
+        rows.rows["cred_svc"] = rows.rows["cred_svc"].model_copy(update={"tested_url": "https://example.net/login"})
+    if case == "no_question":
+        _seed_active_pause(cache, "org-1", "chat-1", "turn-1", "tok-1")
+    monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _post_card_answer(_ASKED_FRAME, "cred_other" if case == "other_login" else "cred_svc", answer)
+
+    expected = status.HTTP_422_UNPROCESSABLE_ENTITY if case == "userinfo_site" else status.HTTP_409_CONFLICT
+    assert excinfo.value.status_code == expected
+    assert rows.updates == []
+    record = _decode_active_pause(cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")])
+    assert record is not None and record.status == "pending"
+    assert credential_response_cache_key("org-1", "chat-1", "turn-1") not in cache.store
+
+
+@pytest.mark.asyncio
+async def test_a_caller_who_cannot_edit_the_login_changes_no_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = _CredentialRows(_site_a_login())
+    _site_question_ctx(monkeypatch, rows)
+    cache = _asked_cache_for(rows)
+    monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
+    denied = AsyncMock(side_effect=HTTPException(status_code=403, detail="credential.update denied"))
+    monkeypatch.setattr(app.AGENT_FUNCTION, "enforce_request_role", denied)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _post_card_answer(_ASKED_FRAME, "cred_svc", "add")
+
+    assert excinfo.value.status_code == 403
+    assert denied.await_args.args[1] == "credential.update"
+    assert rows.updates == []
+    record = _decode_active_pause(cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")])
+    assert record is not None and record.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_a_caller_who_cannot_use_the_login_is_asked_nothing_and_the_card_stays_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    _site_question_ctx(monkeypatch, rows)
+    cache = _FakeCache()
+    _seed_active_pause(cache, "org-1", "chat-1", "turn-1", "tok-1")
+    active_key = credential_pause_active_key("org-1", "chat-1", "turn-1")
+    record = _decode_active_pause(cache.store[active_key])
+    cache.store[active_key] = _encode_record(replace(record, site_url=f"{_SITE_B_ORIGIN}/login"))
+    monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
+    monkeypatch.setattr(
+        app.AGENT_FUNCTION, "enforce_credential_use", AsyncMock(side_effect=PermissionError("not accessible"))
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _post_card_answer(_ASKED_FRAME, "cred_svc")
+
+    assert excinfo.value.status_code == status.HTTP_403_FORBIDDEN
+    record = _decode_active_pause(cache.store[active_key])
+    assert record is not None and record.status == "pending" and record.site_question is None
+    assert credential_response_cache_key("org-1", "chat-1", "turn-1") not in cache.store
+
+
+@pytest.mark.parametrize("name", [None, 7])
+def test_a_site_record_written_without_a_login_name_decodes_with_an_empty_name(name: int | None) -> None:
+    question: dict[str, object] = {
+        "credential_id": "cred_svc",
+        "saved_site_urls": [_SITE_A],
+        "vault_sourced": False,
+    }
+    answer: dict[str, object] = {"action": "no", "site_a": "https://portal.example.com", "site_b": _SITE_B_ORIGIN}
+    if name is not None:
+        question["name"], answer["name"] = name, name
+    record = json.loads(_encode_active_pause("tok-1", datetime.now(timezone.utc) + timedelta(minutes=5)))
+    record["site_question"] = question
+    response = {"action": "connected", "credential_id": "cred_svc", "resume_token": "tok-1", "site_answer": answer}
+
+    decoded_record = _decode_active_pause(json.dumps(record))
+    decoded_response = credential_pause_module._decode_credential_response(json.dumps(response))
+
+    assert decoded_record is not None and decoded_record.site_question is not None
+    assert decoded_record.site_question.name == ""
+    assert decoded_response is not None and decoded_response.site_answer is not None
+    assert decoded_response.site_answer.name == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("landed", [True, False])
+async def test_an_unconfirmed_site_write_connects_only_when_the_login_reads_back_saved_for_the_site(
+    monkeypatch: pytest.MonkeyPatch, landed: bool
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    ctx, _ = _site_question_ctx(monkeypatch, rows)
+    rows.fail_after_write = True
+    original_update = rows.update_credential
+
+    async def update(credential_id: str, organization_id: str, **kwargs: list[str] | str | None) -> Credential:
+        before = rows.rows["cred_svc"]
+        try:
+            return await original_update(credential_id, organization_id, **kwargs)
+        finally:
+            if not landed:
+                rows.rows["cred_svc"] = before
+
+    rows.update_credential = update  # type: ignore[method-assign]
+    audit = AsyncMock()
+    monkeypatch.setattr(app.AGENT_FUNCTION, "record_audit_event", audit)
+    posted: list[WorkflowCopilotCredentialResponseResult] = []
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("add", posted))
+
+    result = await _ask(ctx, _SITE_B_ASK)
+
+    assert posted[1].result == "site_change_unknown"
+    [(_, event)] = [call.args for call in audit.await_args_list]
+    assert (event.action, event.resource_id, event.metadata) == (
+        "credential.update",
+        "cred_svc",
+        {"confirmed": "false", "action": "add", "site": _SITE_B_ORIGIN},
+    )
+    [resolved] = _sent_resolutions(ctx)
+    assert resolved.outcome == ("connected" if landed else "not_admitted")
+    assert result["status"] == ("connected" if landed else "connected_other_site")
+    assert _existing_workflow_on_site_b_broadens_scope(ctx) is not landed
+
+
+@pytest.mark.asyncio
+async def test_a_site_saved_after_the_pause_ended_reports_the_login_not_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login())
+    _site_question_ctx(monkeypatch, rows)
+    cache = _asked_cache_for(rows)
+    monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
+    original_update = rows.update_credential
+    active_key = credential_pause_active_key("org-1", "chat-1", "turn-1")
+
+    async def update_as_the_pause_ends(
+        credential_id: str, organization_id: str, **kwargs: list[str] | str | None
+    ) -> Credential:
+        cache.store[active_key] = _encode_active_pause("tok-1", datetime.now(timezone.utc), consumed=True)
+        return await original_update(credential_id, organization_id, **kwargs)
+
+    rows.update_credential = update_as_the_pause_ends  # type: ignore[method-assign]
+
+    answered = await _post_card_answer(_ASKED_FRAME, "cred_svc", "add")
+
+    assert answered.result == "site_changed_not_connected"
+    assert rows.rows["cred_svc"].extra_site_urls == [f"{_SITE_B_ORIGIN}/login"]
+    assert credential_response_cache_key("org-1", "chat-1", "turn-1") not in cache.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "vault_item",
+    [
+        CredentialItem.model_construct(login_uris=["https://portal.example.com/"], login_sites=None),
+        CredentialItem.model_construct(login_uris=[], login_sites=[]),
+    ],
+    ids=["vault_uris", "connected_vault_without_sites"],
+)
+async def test_a_login_whose_sites_come_from_a_vault_is_asked_without_add_or_move(
+    monkeypatch: pytest.MonkeyPatch, vault_item: CredentialItem
+) -> None:
+    rows = _CredentialRows(_site_a_login(tested_url=None))
+    _site_question_ctx(monkeypatch, rows)
+    monkeypatch.setattr(
+        app._inst,
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.SKYVERN: SimpleNamespace(get_credential_item=AsyncMock(return_value=vault_item))},
+        raising=False,
+    )
+    cache = _FakeCache()
+    cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")] = _encode_active_pause(
+        "tok-1", datetime.now(timezone.utc) + timedelta(minutes=5), site_url=f"{_SITE_B_ORIGIN}/login"
+    )
+    monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
+
+    asked = await _post_card_answer(_ASKED_FRAME, "cred_svc")
+
+    assert asked.result == "site_question"
+    assert asked.site_question.vault_sourced is True
+    with pytest.raises(HTTPException) as excinfo:
+        await _post_card_answer(_ASKED_FRAME, "cred_svc", "move")
+    assert excinfo.value.status_code == status.HTTP_409_CONFLICT
+    assert rows.updates == []
+
+
+@pytest.mark.asyncio
+async def test_a_vault_login_that_lists_the_card_site_among_others_connects_without_a_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = _CredentialRows(_site_a_login(tested_url=None))
+    _site_question_ctx(monkeypatch, rows)
+    vault_item = CredentialItem.model_construct(
+        login_uris=["https://portal.example.com/", f"{_SITE_B_ORIGIN}/"], login_sites=None
+    )
+    monkeypatch.setattr(
+        app._inst,
+        "CREDENTIAL_VAULT_SERVICES",
+        {CredentialVaultType.SKYVERN: SimpleNamespace(get_credential_item=AsyncMock(return_value=vault_item))},
+        raising=False,
+    )
+    cache = _FakeCache()
+    cache.store[credential_pause_active_key("org-1", "chat-1", "turn-1")] = _encode_active_pause(
+        "tok-1", datetime.now(timezone.utc) + timedelta(minutes=5), site_url=f"{_SITE_B_ORIGIN}/login"
+    )
+    monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
+
+    picked = await _post_card_answer(_ASKED_FRAME, "cred_svc")
+
+    assert (picked.result, picked.site_question) == ("accepted", None)

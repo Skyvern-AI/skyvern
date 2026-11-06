@@ -4,6 +4,8 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  searchWithCopilotBrowserFocus,
+  searchWithCopilotBrowserReleased,
   searchWithoutRun,
   searchWithRunSwitched,
   useSwitchStudioRun,
@@ -77,6 +79,64 @@ describe("searchWithRunSwitched system focus", () => {
     expect(
       searchWithRunSwitched("?active=act_1", "wr_9", { systemFocus: true }),
     ).toBe("?wr=wr_9");
+  });
+});
+
+describe("searchWithCopilotBrowserFocus", () => {
+  it("pins a Copilot-focused run's pane to the browser the call names", () => {
+    expect(
+      searchWithCopilotBrowserFocus("?wr=wr_1&wrs=copilot", "pbs_debug"),
+    ).toBe("?wr=wr_1&wrs=pbs_debug");
+  });
+
+  it("follows the latest call when it names a different browser", () => {
+    const onDebug = searchWithCopilotBrowserFocus(
+      "?wr=wr_1&wrs=copilot",
+      "pbs_debug",
+    );
+    const onRun = searchWithCopilotBrowserFocus(onDebug, "pbs_run");
+    expect(onRun).toBe("?wr=wr_1&wrs=pbs_run");
+    expect(searchWithCopilotBrowserFocus(onRun, "pbs_debug")).toBe(
+      "?wr=wr_1&wrs=pbs_debug",
+    );
+  });
+
+  it("does not move on a call that carries no browser session, whatever its text", () => {
+    for (const callSession of [null, undefined, ""]) {
+      expect(
+        searchWithCopilotBrowserFocus("?wr=wr_1&wrs=pbs_debug", callSession),
+      ).toBe("?wr=wr_1&wrs=pbs_debug");
+    }
+  });
+
+  it("never moves a run the user opened", () => {
+    expect(searchWithCopilotBrowserFocus("?wr=wr_user", "pbs_debug")).toBe(
+      "?wr=wr_user",
+    );
+  });
+
+  it("hands the pane back to the next run Copilot starts", () => {
+    const inspecting = searchWithCopilotBrowserFocus(
+      "?wr=wr_1&wrs=copilot",
+      "pbs_debug",
+    );
+    expect(
+      searchWithRunSwitched(inspecting, "wr_2", { systemFocus: true }),
+    ).toBe("?wr=wr_2&wrs=copilot");
+  });
+});
+
+describe("searchWithCopilotBrowserReleased", () => {
+  it("returns a pinned pane to the Copilot run focus", () => {
+    expect(searchWithCopilotBrowserReleased("?wr=wr_1&wrs=pbs_debug")).toBe(
+      "?wr=wr_1&wrs=copilot",
+    );
+  });
+
+  it("leaves an unpinned or user-opened run alone", () => {
+    for (const search of ["?wr=wr_1&wrs=copilot", "?wr=wr_user", ""]) {
+      expect(searchWithCopilotBrowserReleased(search)).toBe(search);
+    }
   });
 });
 

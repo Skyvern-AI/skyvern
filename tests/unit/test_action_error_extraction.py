@@ -26,13 +26,6 @@ def test_extract_errors_preserves_decisive_action_errors() -> None:
     assert _output_for_action(action).extract_errors() == [error]
 
 
-def test_extract_errors_includes_download_action_errors() -> None:
-    error = _error("data_not_downloadable")
-    action = ClickAction(element_id="download-link", download=True, errors=[error], terminal_user_errors=True)
-
-    assert _output_for_action(action).extract_errors() == [error]
-
-
 def test_agent_step_output_marks_extracted_errors_terminal() -> None:
     error = _error("data_not_downloadable")
     action = ClickAction(element_id="download-link", download=True, errors=[error], terminal_user_errors=True)

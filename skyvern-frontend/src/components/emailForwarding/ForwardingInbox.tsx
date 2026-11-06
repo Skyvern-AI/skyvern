@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import { receivedAt } from "@/api/emailForwarding";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -17,9 +17,57 @@ function safeLink(value: string): URL | null {
 
 export function ForwardingInbox({ addressId }: { addressId: string }) {
   const isCloud = useContext(CloudContext);
-  const [offset, setOffset] = useState(0);
-  const inbox = useForwardingInbox(addressId, offset);
-  const olderDisabled = inbox.isFetching || !inbox.data?.hasMore;
+  const [cursors, setCursors] = useState(["0"]);
+  const [searchCursor, setSearchCursor] = useState<string | null>(null);
+  const [nextSearchCursor, setNextSearchCursor] = useState<string | null>(null);
+  const [searchExhausted, setSearchExhausted] = useState(false);
+  const cursor = cursors[cursors.length - 1] ?? "0";
+  const inbox = useForwardingInbox(addressId, cursor);
+  const search = useForwardingInbox(
+    addressId,
+    searchCursor ?? "",
+    searchCursor !== null,
+  );
+  const nextCursor = nextSearchCursor ?? inbox.data?.nextCursor;
+  const olderDisabled =
+    inbox.isFetching || search.isFetching || searchExhausted || !nextCursor;
+
+  useEffect(() => {
+    setSearchCursor(null);
+    setNextSearchCursor(null);
+    setSearchExhausted(false);
+  }, [cursor, inbox.data]);
+
+  useEffect(() => {
+    if (
+      searchCursor === null ||
+      search.isFetching ||
+      search.isPending ||
+      search.isError ||
+      !search.data
+    )
+      return;
+    if (search.data.emails.length > 0) {
+      setCursors((previous) =>
+        inbox.data?.emails.length
+          ? [...previous, searchCursor]
+          : [...previous.slice(0, -1), searchCursor],
+      );
+      setNextSearchCursor(null);
+    } else if (search.data.hasMore && search.data.nextCursor) {
+      setNextSearchCursor(search.data.nextCursor);
+    } else {
+      setSearchExhausted(true);
+    }
+    setSearchCursor(null);
+  }, [
+    searchCursor,
+    search.isFetching,
+    search.isPending,
+    search.isError,
+    search.data,
+    inbox.data?.emails.length,
+  ]);
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -31,8 +79,14 @@ export function ForwardingInbox({ addressId }: { addressId: string }) {
           type="button"
           variant="outline"
           size="sm"
-          disabled={inbox.isFetching}
-          onClick={() => void inbox.refetch()}
+          disabled={inbox.isFetching || search.isFetching}
+          onClick={() => {
+            setSearchCursor(null);
+            setNextSearchCursor(null);
+            setSearchExhausted(false);
+            void inbox.refreshNewest();
+            if (cursor !== "0") setCursors(["0"]);
+          }}
         >
           Refresh
         </Button>
@@ -43,9 +97,9 @@ export function ForwardingInbox({ addressId }: { addressId: string }) {
         <ForwardingError error={inbox.error} />
       ) : inbox.data.emails.length === 0 ? (
         <div className="rounded-md border border-dashed p-6 text-sm text-muted-foreground">
-          No emails on this page. Send a test forward, or check whether Gmail
-          confirmation is pending. Microsoft 365 may require your administrator
-          to allow external forwarding.
+          {inbox.data.hasMore && !searchExhausted
+            ? "No visible emails found yet. Continue searching for older messages."
+            : "No received emails. Send a test forward, or check whether Gmail confirmation is pending. Microsoft 365 may require your administrator to allow external forwarding."}
         </div>
       ) : (
         <div className="space-y-3">
@@ -169,27 +223,39 @@ export function ForwardingInbox({ addressId }: { addressId: string }) {
           })}
         </div>
       )}
+      {search.isFetching && <p role="status">Searching older emails…</p>}
+      {search.isError && <ForwardingError error={search.error} />}
       <div className="flex items-center justify-between">
         <Button
           type="button"
           variant="outline"
           size="sm"
-          disabled={offset === 0 || inbox.isFetching}
-          onClick={() => setOffset(Math.max(0, offset - 20))}
+          disabled={
+            cursors.length === 1 || inbox.isFetching || search.isFetching
+          }
+          onClick={() => setCursors((previous) => previous.slice(0, -1))}
         >
           Newer
         </Button>
         <span className="text-xs text-muted-foreground">
-          Page {offset / 20 + 1}
+          Page {cursors.length}
         </span>
         <Button
           type="button"
           variant="outline"
           size="sm"
           disabled={olderDisabled}
-          onClick={() => setOffset(offset + 20)}
+          onClick={() => {
+            if (searchCursor !== null && search.isError) {
+              void search.refetch();
+            } else if (nextCursor) {
+              setSearchCursor(nextCursor);
+            }
+          }}
         >
-          Older
+          {nextSearchCursor || (inbox.data && inbox.data.emails.length < 20)
+            ? "Continue searching"
+            : "Older"}
         </Button>
       </div>
     </div>

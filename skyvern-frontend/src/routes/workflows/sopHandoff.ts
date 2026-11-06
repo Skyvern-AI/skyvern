@@ -1,6 +1,6 @@
 type PendingSop = { workflowPermanentId: string; file: File };
 
-// Home hands the chosen PDF to the editor in memory: a File fits neither the URL nor
+// Home hands the chosen SOP file to the editor in memory: a File fits neither the URL nor
 // sessionStorage, and the editor consumes it exactly once, like `?record=1`.
 let pendingSop: PendingSop | null = null;
 

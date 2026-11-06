@@ -37,7 +37,6 @@ constraints = [
 ]
 overrides = [
     { name = "aiohttp", specifier = ">=3.14.0" },
-    { name = "httpx", extras = ["socks"], specifier = ">=0.26.0" },
     { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "openai", specifier = ">=2.45.0,<3" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
@@ -306,7 +305,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "distro" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "playwright" },
     { name = "pydantic" },
     { name = "sniffio" },
@@ -344,7 +343,7 @@ dependencies = [
     { name = "anyio" },
     { name = "distro" },
     { name = "docstring-parser" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "jiter" },
     { name = "pydantic" },
     { name = "sniffio" },
@@ -787,7 +786,7 @@ name = "browser-use-sdk"
 version = "3.11.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "idna" },
     { name = "pydantic" },
 ]
@@ -1432,7 +1431,7 @@ client = [
     { name = "authlib" },
     { name = "certifi" },
     { name = "exceptiongroup" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "opentelemetry-api" },
     { name = "py-key-value-aio", extra = ["filetree", "keyring", "memory"] },
@@ -1444,7 +1443,7 @@ server = [
     { name = "cyclopts" },
     { name = "exceptiongroup" },
     { name = "griffelib" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "joserfc" },
     { name = "jsonref" },
     { name = "jsonschema-path" },
@@ -1976,7 +1975,7 @@ dependencies = [
     { name = "anyio" },
     { name = "distro" },
     { name = "google-auth", extra = ["requests"] },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "pydantic" },
     { name = "requests" },
     { name = "sniffio" },
@@ -2543,7 +2542,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "httpcore" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "wsproto" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cd/cd/ca91a07ae446451f7476bf3fcc909e98cb942ff032ebfda0e3fe449aca7b/httpx_ws-0.9.0.tar.gz", hash = "sha256:797373326f70eec1ae96f6e43ae9f12002fd7d73aee139a4985eaab964338a08", size = 107105, upload-time = "2026-03-28T14:11:10.781Z" }
@@ -2559,7 +2558,7 @@ dependencies = [
     { name = "filelock" },
     { name = "fsspec" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "packaging" },
     { name = "pyyaml" },
     { name = "tqdm" },
@@ -3110,7 +3109,7 @@ version = "4.6.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "async-lru" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "ipykernel" },
     { name = "jinja2" },
     { name = "jupyter-builder" },
@@ -3183,7 +3182,7 @@ dependencies = [
     { name = "cachetools" },
     { name = "cryptography" },
     { name = "exceptiongroup", marker = "python_full_version < '3.12'" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "httpx-ws" },
     { name = "packaging" },
     { name = "python-box" },
@@ -3384,7 +3383,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "click" },
     { name = "fastuuid" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "importlib-metadata" },
     { name = "jinja2" },
     { name = "jsonschema" },
@@ -3617,7 +3616,7 @@ version = "1.30.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "httpx-sse" },
     { name = "jsonschema" },
     { name = "pydantic" },
@@ -4254,11 +4253,11 @@ wheels = [
 
 [[package]]
 name = "oauthlib"
-version = "4.0.0"
+version = "4.0.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/7a/d8/a1bcc8ba112a627f8ffbdc212a78ce18d3ac07e91a5ca65d27918eee25a1/oauthlib-4.0.0.tar.gz", hash = "sha256:efb274799819440f95b4ab3b818869f1ce9ae26c5beacba0201d1a1b76b54f86", size = 187232, upload-time = "2026-09-28T06:01:18.77Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/33/17/2bb072de0b990303c985f26869fd47bb179024a051f47e7f9d208eb92f8e/oauthlib-4.0.1.tar.gz", hash = "sha256:3d73febdb6faa00f277c81fb04be7b7586fb96fc3b7f0b9c772dada69a25ede7", size = 191219, upload-time = "2026-10-31T09:52:58.008Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/f4/78229a1066068ca14fc60fb26cf7381cabe4382261392b90e5f9552722d4/oauthlib-4.0.0-py3-none-any.whl", hash = "sha256:624c28c13a0a59cabf9747dfa52af63be3e512a7f2714df16e91b5b3a145e6cd", size = 159715, upload-time = "2026-09-28T06:01:17.008Z" },
+    { url = "https://files.pythonhosted.org/packages/df/ef/3b8adde1b32a6f540758bff734d3442c621734c83708e5f02b0ba2f43b84/oauthlib-4.0.1-py3-none-any.whl", hash = "sha256:498a298876e996301950a5b053d12c31628bb7b895db03666430c69ce182eb61", size = 161934, upload-time = "2026-10-31T09:52:56.206Z" },
 ]
 
 [[package]]
@@ -4294,7 +4293,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "distro" },
-    { name = "httpx", extra = ["socks"] },
+    { name = "httpx" },
     { name = "jiter" },
     { name = "pydantic" },
     { name = "sniffio" },
@@ -6927,7 +6926,6 @@ local = [
     { name = "tornado" },
     { name = "urllib3" },
     { name = "websockets" },
-    { name = "yutori" },
     { name = "zstandard" },
 ]
 server = [
@@ -7001,7 +6999,6 @@ server = [
     { name = "urllib3" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
-    { name = "yutori" },
     { name = "zstandard" },
 ]
 
@@ -7209,8 +7206,6 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.44.0" },
     { name = "websockets", marker = "extra == 'local'", specifier = ">=14.0,<15.1" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=14.0,<15.1" },
-    { name = "yutori", marker = "extra == 'local'", specifier = ">=0.8.1" },
-    { name = "yutori", marker = "extra == 'server'", specifier = ">=0.8.1" },
     { name = "zstandard", marker = "extra == 'local'", specifier = ">=0.25.0" },
     { name = "zstandard", marker = "extra == 'server'", specifier = ">=0.25.0" },
 ]
@@ -7254,7 +7249,7 @@ dev = [
     { name = "freezegun", specifier = ">=1.2.2,<2" },
     { name = "grpcio-tools", specifier = "==1.80.0" },
     { name = "gspread", specifier = ">=6" },
-    { name = "import-linter", specifier = ">=2.1,<3" },
+    { name = "import-linter", specifier = ">=2.5,<3" },
     { name = "ipykernel", specifier = ">=7.3.0,<8" },
     { name = "ipython", specifier = ">=8.17.2,<9" },
     { name = "isort", specifier = ">=5.13.2" },
@@ -8386,22 +8381,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7e/af/19fbdce41412e1b96825544cc52cd7029d3724655d0988237972f078bd29/yarl-1.25.1-cp314-cp314t-win_amd64.whl", hash = "sha256:734f6e5400352ac4254456003d462866c684703570929cff7a7bde015d0cb371", size = 107386, upload-time = "2026-09-15T19:33:29.009Z" },
     { url = "https://files.pythonhosted.org/packages/2a/99/f6431c8968e89be608d74b28ae2d024521b2953f27dd44e0dece5e04f67a/yarl-1.25.1-cp314-cp314t-win_arm64.whl", hash = "sha256:287e99ff5aa4dc1c7630bfc683ded6f106d756c99dec432a2d7f197a784f51c6", size = 102094, upload-time = "2026-09-15T19:33:31.151Z" },
     { url = "https://files.pythonhosted.org/packages/54/22/318c7980066769c6bcd9221ed2248294f5698811da099013098c670565ed/yarl-1.25.1-py3-none-any.whl", hash = "sha256:681c758b0490f9e96b78e5fa8e8dc6e648e9185bb6eaebe73183c33ea0c445f3", size = 63617, upload-time = "2026-09-15T19:34:59.616Z" },
-]
-
-[[package]]
-name = "yutori"
-version = "0.8.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx", extra = ["socks"] },
-    { name = "openai" },
-    { name = "pillow" },
-    { name = "rich" },
-    { name = "typer" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c5/7d/341f4059d2323dd9eb914205126fc4ef2db967576a08e7beae161fe4eda4/yutori-0.8.1.tar.gz", hash = "sha256:fe325f2c2a99a128f33e7452c2c16064cb1f77f2c0e8d225e6aa9d92c4c19514", size = 134645, upload-time = "2026-06-25T23:55:31.074Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/45/74/0c71e50a6acd1dfdc6f1f366246ff46209e59438c7d8536f317ac4a2adee/yutori-0.8.1-py3-none-any.whl", hash = "sha256:88ec386247489e428258399fe5acda62d71cce60a7a882c5a5bf77dd35a0e788", size = 109544, upload-time = "2026-06-25T23:55:29.896Z" },
 ]
 
 [[package]]

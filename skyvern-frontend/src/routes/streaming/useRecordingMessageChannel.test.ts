@@ -74,6 +74,7 @@ describe("useRecordingMessageChannel", () => {
   it("sends commands once the socket is open", async () => {
     const { result } = renderHook(() =>
       useRecordingMessageChannel({
+        clientId: "client-test",
         browserSessionId: "pbs-1",
         enabled: true,
         clipboard: "none",
@@ -104,6 +105,7 @@ describe("useRecordingMessageChannel", () => {
     );
     const { unmount } = renderHook(() =>
       useRecordingMessageChannel({
+        clientId: "client-test",
         browserSessionId: "pbs-1",
         enabled: true,
         clipboard: "none",
@@ -127,6 +129,7 @@ describe("useRecordingMessageChannel", () => {
 
     renderHook(() =>
       useRecordingMessageChannel({
+        clientId: "client-test",
         browserSessionId: "pbs-1",
         enabled: true,
         clipboard: "none",

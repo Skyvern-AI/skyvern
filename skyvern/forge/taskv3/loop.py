@@ -31,7 +31,6 @@ from urllib.parse import urlsplit
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.errors.errors import resolve_error_code_mapping_key
 from skyvern.exceptions import (
     ActionDeadlineExceeded,
@@ -54,7 +53,7 @@ from skyvern.forge.taskv3.goal_check import (
 )
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
-from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG, run_arm_enabled
+from skyvern.forge.taskv3.llm_call_params import fallback_error_class, rejects_carried_reasoning
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
@@ -232,6 +231,8 @@ ToolOkClass = Literal[
 CoveredBranch = Literal[
     # The layer was named and its controls enumerated into the message.
     "named",
+    # A layer named only by its own text was quoted, with its controls, instead of told to be dismissed and retried.
+    "quoted",
     # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
     "challenge",
     # The walk qualified nothing, the hit was the field's OWN container, AND an ancestor was found
@@ -339,6 +340,40 @@ class ToolRefusal(Exception):
 
     def as_result(self) -> ToolResult:
         return ToolResult("error", str(self), self.data, error_class=self.error_class, refused=True)
+
+
+@dataclass(frozen=True)
+class BlockingLayer:
+    """The live layer that refused a `type`, as the browser named it: an id the typing probe minted for that layer
+    node in its own realm, which the page cannot read or forge, plus a revision number that rises whenever the layer's
+    text or any control's state changes. Neither carries page text, so the loop can hold and compare them."""
+
+    token: str
+    state: str
+
+
+class LayerCheck(Enum):
+    # The target is still refused by the very layer the lease names, in the same state.
+    SAME = "same"
+    # The probe reached the target: nothing covers it now.
+    REACHABLE = "reachable"
+    # Covered by something else, the layer changed state, or the probe could not answer: the lease proves nothing.
+    OTHER = "other"
+
+
+# The `data` key a refused `type` carries its BlockingLayer on.
+BLOCKING_LAYER_DATA_KEY = "blocking_layer"
+
+
+@dataclass
+class _LayerEpisode:
+    """Held types against one lease, counted for a one-time warning and never to end the run. Kept apart from the
+    action-loop ledger, which page change elsewhere clears: a fresh read elsewhere is no evidence this layer went."""
+
+    lease: BlockingLayer
+    first_turn: int
+    count: int = 0
+    warned: bool = False
 
 
 # The tool-result `data` keys the target-name/target-kind capture ride on (written by the browser
@@ -823,6 +858,11 @@ class ToolSpec:
     # The selector, name and kind of the field a type call is about to enter, and whether the name is its placeholder,
     # read before it acts; set on type alone.
     answer_probe: Callable[[dict[str, Any]], Awaitable[tuple[str, str, str, bool]]] | None = None
+    # Whether a type call's target is still refused by the layer an earlier type was refused by, read fresh before it
+    # acts. On SAME it also returns the refusal the full handler would give; set on type alone.
+    layer_probe: Callable[[dict[str, Any], BlockingLayer], Awaitable[tuple[LayerCheck, ToolResult | None]]] | None = (
+        None
+    )
 
     @property
     def touches_page(self) -> bool:
@@ -879,6 +919,8 @@ class LoopOutcome:
     converted_from: NonCompletedStatus | None = None
     converted_from_reason: str = ""
     unlisted_reask: dict[str, Any] | None = None
+    carried_reasoning_turns: int = 0
+    carry_reasoning_stripped: bool = False
     # The finish tool's completion gate approved this verdict, so the caller must not consult it again.
     gate_passed: bool = False
     # The model's own user-defined error code on a failed/terminated finish, re-validated against the mapping.
@@ -926,6 +968,13 @@ def _extract_reasoning_summary(response: Any) -> str | None:
     if message is None:
         return None
     return _get(message, "reasoning_content")
+
+
+def _extract_reasoning_items(response: Any) -> list[dict[str, Any]]:
+    message = _extract_message(response)
+    if message is None:
+        return []
+    return [item for item in _get(message, "reasoning_items") or [] if isinstance(item, dict)]
 
 
 def _extract_tool_calls(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
@@ -1036,6 +1085,13 @@ UNCHARGED_REFUSAL_GRACE = ACTION_LOOP_NUDGE_AFTER
 # completes such a block on one SUCCESSFUL step after retrying failed ones, and lets that step batch a
 # precursor; a v3 cap of 1 is spent by a hover, a precursor, or a click that failed without moving the page.
 ACTION_BLOCK_TARGET_ACTION_RESERVE = 2
+# Appended to a held type's refusal. The full typing path was not run for it.
+LAYER_HELD_NOTE = (
+    " Not attempted: the same layer refused an earlier type in this run and still covers this field, so every field "
+    "behind it is refused the same way until the layer is dealt with."
+)
+# How the held-retry warning names held types: per lease, whatever field or text each one named.
+LAYER_HELD_GUARD_TARGET = "fields behind the same covering layer"
 # Set on a click result once the driver's click returned, so a later verification error still reads as dispatched.
 CLICK_DISPATCHED_DATA_KEY = "click_dispatched"
 TARGET_ACTION_ROUND_EVENT = "taskv3 loop target action round"
@@ -1119,9 +1175,9 @@ def _dead_end_provenance(urls: tuple[object, ...], task_target_urls: Collection[
 PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 
 # A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
-# removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
-# verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
-# navigation. Facetable sibling of the classes above.
+# removed. Ends the run as `terminated`, matching v1's terminate verdict, for the pre-loop initial-URL
+# navigation and for an in-loop `navigate` on the granted final turn; any other in-loop dead end is returned to
+# the model. Facetable sibling of the classes above.
 NAV_DEAD_END_GUARD = "navigation_dead_end"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
@@ -2543,6 +2599,7 @@ _TOOL_CALL_RECORD_FIELDS = frozenset(
         "probe_scrolled",
         "hit_on_document_root",
         "caret_held",
+        "type_held_by_layer",
         "page_state_stall_rounds",
         "page_state_judged",
     }
@@ -2579,6 +2636,7 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "frame_unreadable_regions",
         "elements_listed",
         "pointer_roots_listed",
+        "pointer_extras_listed",
         "pointer_capped",
         "pointer_truncated",
         "pointer_dropped",
@@ -4155,6 +4213,13 @@ class LoopState:
     # may only claim the page is unchanged when no sample in the streak left that fingerprint.
     action_counts: dict[tuple[str, str], tuple[int, int, str | None, bool]] = field(default_factory=dict)
     action_warned: set[tuple[str, str]] = field(default_factory=set)
+    # The layer the last refused type named. One at a time: a later refusal by another layer replaces it.
+    layer_lease: BlockingLayer | None = None
+    # The held retries against `layer_lease`. Retired with it, so a changed layer starts its own count and warning.
+    layer_episode: _LayerEpisode | None = None
+    # The args of the latest type the leased layer refused: a target known to sit behind it, rechecked when another
+    # target reads as reachable, so an uncovered field elsewhere is not taken for the layer having gone.
+    layer_witness: dict[str, Any] | None = None
     billable_actions: list[str] = field(default_factory=list)
     # Credential re-submit guard (SKY-16594), keyed on the placeholder token rather than the field:
     # the page re-renders between attempts, so an element-keyed rule is evaded by the very re-render
@@ -4181,6 +4246,8 @@ class LoopState:
     block_reserve_verdict: GoalVerdict | None = None
     target_action_rounds_granted: int = 0
     open_turn: _OpenTurn | None = None
+    carried_reasoning_turns: int = 0
+    carry_reasoning_stripped: bool = False
 
 
 async def run_agent_tool_loop(
@@ -4199,10 +4266,15 @@ async def run_agent_tool_loop(
     should_cancel: Callable[[], Awaitable[bool]] | None = None,
     on_action_round: ActionRoundSink | None = None,
     on_turn_start: TurnStart | None = None,
+    # Reads the turn number at each turn start; a returned string is appended as a user message.
+    turn_notice: Callable[[int], str | None] | None = None,
     on_turn_end: TurnEnd | None = None,
     # Awaited after each successful model call, before the turn touches the page.
     on_model_returned: Callable[[], Awaitable[None]] | None = None,
     on_pre_action: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    # Keep each response's reasoning items on its assistant message; litellm's Responses bridge sends them back right
+    # before that message's calls. Only for a route whose main group can read the reasoning it returns.
+    carry_reasoning: bool = False,
     # Called with every look's images as the tool returns them, superseded ones included.
     on_look_screenshots: Callable[[list[bytes]], None] | None = None,
     # Called before each page-touching tool call is dispatched.
@@ -4280,6 +4352,9 @@ async def run_agent_tool_loop(
     unseen_text: UnseenPageText | None = None,
     anthropic_cache_markers: bool = False,
     initial_messages: list[dict[str, Any]] | None = None,
+    # Hold a type whose target the browser shows is still refused by the layer that refused an earlier type, instead
+    # of re-running the full typing path. Off dispatches every type as before.
+    same_layer_type_hold: bool = False,
 ) -> LoopOutcome:
     tool_by_name = {tool.name: tool for tool in tools}
     st = LoopState(
@@ -4306,6 +4381,50 @@ async def run_agent_tool_loop(
     def _clear_action_state() -> None:
         st.action_counts.clear()
         st.action_warned.clear()
+
+    async def _layer_check(
+        spec: ToolSpec, args: dict[str, Any], lease: BlockingLayer
+    ) -> tuple[LayerCheck, ToolResult | None]:
+        if spec.layer_probe is None:
+            return LayerCheck.OTHER, None
+        try:
+            return await spec.layer_probe(args, lease)
+        except Exception:
+            LOG.warning("taskv3 loop layer probe failed", tool="type", exc_info=True)
+            return LayerCheck.OTHER, None
+
+    def _retire_layer() -> None:
+        st.layer_lease = None
+        st.layer_episode = None
+        st.layer_witness = None
+
+    async def _held_by_layer(spec: ToolSpec, tool_name: str, args: dict[str, Any]) -> ToolResult | None:
+        """The refusal for a type the browser shows is still refused by the leased layer, or None to dispatch it."""
+        lease = st.layer_lease
+        if not same_layer_type_hold or tool_name != "type" or lease is None or spec.layer_probe is None:
+            return None
+        check, refusal = await _layer_check(spec, args, lease)
+        if check is LayerCheck.SAME and refusal is not None:
+            st.layer_witness = dict(args)
+            return ToolResult(
+                "error",
+                refusal.content + LAYER_HELD_NOTE,
+                refusal.data,
+                error_class=refusal.error_class or "covered",
+                refused=True,
+            )
+        if check is LayerCheck.REACHABLE:
+            # A field outside the layer, or inside it, is reachable while the layer still covers the rest; only a
+            # field the layer refused before, now not refused by it in the same state, shows the layer stopped applying.
+            witness = st.layer_witness
+            if (
+                witness is not None
+                and witness != args
+                and (await _layer_check(spec, witness, lease))[0] is LayerCheck.SAME
+            ):
+                return None
+        _retire_layer()
+        return None
 
     async def _close_turn() -> None:
         open_turn, st.open_turn = st.open_turn, None
@@ -4680,16 +4799,37 @@ async def run_agent_tool_loop(
         active_call_kwargs["caller_owns_exhaustion_receipt"] = True
 
     def _degrade_call_params(exc: BaseException) -> bool:
-        """Drop one optional call param (the reasoning-summary dict, then the Claude cache markers for the rest
-        of the run) and report whether the turn is worth re-issuing.
+        """Drop one optional call param (the carried reasoning, then the reasoning-summary dict, then the Claude cache
+        markers for the rest of this loop) and report whether the turn is worth re-issuing.
 
         Called only when the turn is otherwise about to end the run, so the cost is one extra call
-        on a run that was already failing. A context-window overflow or a refusal is excluded because
-        dropping a parameter provably cannot fix it. Dropping reasoning_effort reverts to the config's own
-        value, so a provider that rejects the dict form cannot end the run on turn 1.
+        on a run that was already failing. A refusal is excluded because dropping a parameter provably cannot fix
+        it, and so is a context-window overflow unless carried reasoning is part of the input. Dropping
+        reasoning_effort reverts to the config's own value, so a provider that rejects the dict form cannot end the
+        run on turn 1.
         """
-        nonlocal anthropic_cache_markers
-        if isinstance(exc, (SkyvernContextWindowExceededError, LLMContentFilteredError)):
+        nonlocal anthropic_cache_markers, carry_reasoning
+        if isinstance(exc, LLMContentFilteredError):
+            return False
+        # Before the overflow exclusion: the carried items count as input, so dropping them can fix an overflow.
+        if carry_reasoning and any("reasoning_items" in message for message in st.messages):
+            carry_reasoning = False
+            st.carry_reasoning_stripped = True
+            for message in st.messages:
+                message.pop("reasoning_items", None)
+            llm_caller.message_history = list(st.messages)
+            cause = exc.__cause__ or exc
+            LOG.warning(
+                "taskv3 loop retrying without optional call param",
+                dropped="reasoning_items",
+                carry_reasoning_stripped_on_error=type(cause).__name__,
+                status_code=getattr(cause, "status_code", None),
+                fallback_error=fallback_error_class(cause),
+                turn=st.turns,
+                exc_info=True,
+            )
+            return True
+        if isinstance(exc, SkyvernContextWindowExceededError):
             return False
         for param in ("reasoning_effort", "cache_control_injection_points"):
             if active_call_kwargs.pop(param, None) is not None:
@@ -4934,6 +5074,14 @@ async def run_agent_tool_loop(
                 # Read by the finish tool's hold gates: a hold's retry turn no longer exists.
                 activity.final_turn_active = True
         st.turns += 1
+        if turn_notice is not None:
+            try:
+                notice = turn_notice(st.turns)
+            except Exception:
+                LOG.warning("taskv3 turn_notice callback failed", turn=st.turns, exc_info=True)
+            else:
+                if notice:
+                    st.messages.append({"role": "user", "content": notice})
         if activity is not None:
             activity.deliver_batch_reads()
             activity.refresh_cycles_remaining = max_refresh_cycles - st.refresh_cycles
@@ -5001,6 +5149,16 @@ async def run_agent_tool_loop(
                 break
             except retryable_call_exceptions as exc:
                 call_attempt += 1
+                # A leg that cannot read the carried items rejects them every time; waiting out the transient budget
+                # only re-sends the doomed call.
+                if (
+                    carry_reasoning
+                    and any("reasoning_items" in message for message in st.messages)
+                    and rejects_carried_reasoning(exc.__cause__ or exc)
+                    and _degrade_call_params(exc)
+                ):
+                    call_attempt = max_call_retries
+                    continue
                 if call_attempt > max_call_retries:
                     # A provider rejecting the parameter surfaces here, not in the generic handler
                     # below: litellm's 400s subclass openai.APIError, which the LLM layer maps to
@@ -5072,6 +5230,16 @@ async def run_agent_tool_loop(
                 {"id": tool_call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
                 for tool_call_id, name, args in tool_calls
             ]
+        # Only reasoning the main group is known to have returned: its legs could not read what a fallback leg returned.
+        main_group = getattr(llm_caller.llm_config, "main_model_group", None)
+        served_group = getattr(llm_caller, "last_served_model_group", None)
+        if (
+            carry_reasoning
+            and (main_group is None or served_group == main_group)
+            and (reasoning_items := _extract_reasoning_items(response))
+        ):
+            assistant_message["reasoning_items"] = reasoning_items
+            st.carried_reasoning_turns += 1
         st.messages.append(assistant_message)
 
         if not tool_calls:
@@ -5125,6 +5293,7 @@ async def run_agent_tool_loop(
         # and a verdict written before the failure was seen may be wrong or mis-reasoned.
         failed_selectors: set[str] = set()
         batch_had_failure = False
+        layer_nudge_due = False
         if unseen_text is not None:
             unseen_text.batch.clear()
             unseen_text.held = False
@@ -5766,6 +5935,7 @@ async def run_agent_tool_loop(
             st.event_seq += 1
             dispatch_seq = st.event_seq
             browser_gone = False
+            layer_held_call = False
             if spec is None:
                 result = ToolResult.error(f"unknown_tool: {tool_name}")
             elif refuse_navigation and tool_name in URL_CHANGING_TOOLS:
@@ -5785,7 +5955,12 @@ async def run_agent_tool_loop(
                 LOG.info(TOOL_CALL_STARTED_EVENT, tool=tool_name, call_site="dispatch")
                 try:
                     async with under_action_deadline(budget_ms=tool_budget_ms):
-                        result = await spec.handler(args)
+                        held = await _held_by_layer(spec, tool_name, args)
+                        if held is not None:
+                            layer_held_call = True
+                            result = held
+                        else:
+                            result = await spec.handler(args)
                 except ToolRefusal as refusal:
                     result = refusal.as_result()
                 except Exception as exc:
@@ -5805,6 +5980,14 @@ async def run_agent_tool_loop(
                         result = ToolResult.error(f"tool_error: {type(exc).__name__}: {exc}", error_class=raised_class)
             tool_duration_seconds = time.monotonic() - tool_started_at
             st.tool_seconds += tool_duration_seconds
+            held_lease = st.layer_lease if layer_held_call else None
+            if same_layer_type_hold and tool_name == "type" and not layer_held_call:
+                blocker = (result.data or {}).get(BLOCKING_LAYER_DATA_KEY)
+                if isinstance(blocker, BlockingLayer) and blocker != st.layer_lease:
+                    st.layer_lease = blocker
+                    st.layer_episode = None
+                if isinstance(blocker, BlockingLayer):
+                    st.layer_witness = dict(args)
             news_at = (result.data or {}).get("delta_at")
             # A delta can show only lines an earlier read held back (flushed after this call's read failed, or filling the
             # char budget ahead of this call's own lines): that is the page from before this call, so it counts as a
@@ -5893,6 +6076,8 @@ async def run_agent_tool_loop(
                     cost_fields["covered_branch"] = covered["branch"]
                     cost_fields["covered_controls"] = covered["controls"]
                     cost_fields["covered_layer_kind"] = covered["layer_kind"]
+                    if tool_name == "type":
+                        cost_fields["type_held_by_layer"] = layer_held_call
             elif result.ok_class is not None:
                 # Prefixed for the same flat-index reason as `tool_error_class` above. NOT defaulted
                 # the way that field is: it is emitted only by tools whose `ok` spans distinct
@@ -6187,6 +6372,15 @@ async def run_agent_tool_loop(
                         st.novel_action_seq = dispatch_seq
                 if st.progress is not None:
                     st.progress.on_billable()
+                episode = st.layer_episode if held_lease is not None else None
+                if held_lease is not None and (episode is None or episode.lease != held_lease):
+                    episode = st.layer_episode = _LayerEpisode(held_lease, first_turn=st.turns)
+                if episode is not None:
+                    # Feedback only: the count drives one warning and never ends the run, since fields behind a layer
+                    # being refused says nothing about the rest of the task. The ledger below still sees the actual call.
+                    episode.count += 1
+                    if action_nudge_after is not None and episode.count >= action_nudge_after and not episode.warned:
+                        layer_nudge_due = True
                 # Errored and refused dispatches count too: a repeat-failing action is the same
                 # no-progress pathology. It does not bound refusals (a stale one resets it);
                 # UNCHARGED_REFUSAL_GRACE does.
@@ -6480,14 +6674,11 @@ async def run_agent_tool_loop(
                 st.final_turn_staged_output = staged
 
         # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
-        # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
-        # failed/terminated choice to the model's finish tool (which does not converge on this class).
+        # recovered): the navigate's result is returned to the model, except on the granted final turn, where
+        # no turn is left to act on it and the run ends terminated rather than budget_exhausted.
         if st.outcome is None and st.pending_nav_dead_end is not None:
             dead = st.pending_nav_dead_end
-            # Not on the granted final turn: with no turn left to act on it, a return would end the run budget_exhausted.
-            returned = not (activity is not None and activity.final_turn_active) and run_arm_enabled(
-                DEAD_END_RETURN_FLAG, settings.TASK_V3_DEAD_END_RETURN
-            )
+            returned = not (activity is not None and activity.final_turn_active)
             LOG.info(
                 "taskv3 loop navigation dead end",
                 http_status=dead.status,
@@ -6641,6 +6832,18 @@ async def run_agent_tool_loop(
                         page_moved=page_moved,
                     )
                 nudge_parts.append(_action_nudge_text(still_stuck, set(tool_by_name), page_moved=page_moved))
+        episode = st.layer_episode
+        if st.outcome is None and layer_nudge_due and episode is not None and not episode.warned:
+            if episode.first_turn < st.turns:
+                episode.warned = True
+                LOG.info("taskv3 loop action repeat nudged", tool="type", repeat_count=episode.count, turn=st.turns)
+                nudge_parts.append(
+                    _action_nudge_text(
+                        [("type", {"selector": LAYER_HELD_GUARD_TARGET}, episode.count)],
+                        set(tool_by_name),
+                        page_moved=None,
+                    )
+                )
         if nudge_parts:
             st.messages.append({"role": "user", "content": "\n\n".join(nudge_parts)})
 
@@ -6709,6 +6912,8 @@ async def run_agent_tool_loop(
     )
 
     st.outcome.turns = st.turns
+    st.outcome.carried_reasoning_turns = st.carried_reasoning_turns
+    st.outcome.carry_reasoning_stripped = st.carry_reasoning_stripped
     st.outcome.no_tool_call_turns = st.no_tool_call_turns
     st.outcome.tool_calls = st.total_tool_calls
     st.outcome.tool_seconds = st.tool_seconds

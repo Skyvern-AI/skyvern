@@ -1,7 +1,7 @@
 import { useCallback } from "react";
+import { nanoid } from "nanoid";
 
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { useClientIdStore } from "@/store/useClientIdStore";
 import { getWebSocketProtocols } from "@/util/env";
 
 export type WebSocketConnectParams = {
@@ -10,9 +10,22 @@ export type WebSocketConnectParams = {
   protocols: string[];
 };
 
-export function useWebSocketParams(): () => Promise<WebSocketConnectParams> {
+/**
+ * The server keys each live view's channels by client id, so every mounted stream needs its own;
+ * the sockets one stream opens share it so take/cede control finds that stream's VNC channel.
+ */
+export function generateClientId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return nanoid();
+  }
+}
+
+export function useWebSocketParams(
+  clientId: string,
+): () => Promise<WebSocketConnectParams> {
   const credentialGetter = useCredentialGetter();
-  const clientId = useClientIdStore((state) => state.clientId);
 
   return useCallback(async () => {
     const params = new URLSearchParams({ client_id: clientId });

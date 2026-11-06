@@ -80,6 +80,7 @@ UPDATE_AND_RUN_BLOCKS_TOOL_NAME = "update_and_run_blocks"
 UPDATE_WORKFLOW_TOOL_NAME = "update_workflow"
 RUN_BLOCKS_TOOL_NAME = "run_blocks_and_collect_debug"
 BLANK_BROWSER_TEST_TOOL_NAME = "test_workflow_from_blank_browser"
+CREATE_WEBHOOK_TRIGGER_TOOL_NAME = "create_webhook_trigger"
 BLOCK_RUNNING_TOOLS = frozenset(
     {RUN_BLOCKS_TOOL_NAME, UPDATE_AND_RUN_BLOCKS_TOOL_NAME, EDIT_BLOCK_AND_RUN_TOOL_NAME, BLANK_BROWSER_TEST_TOOL_NAME}
 )
@@ -333,9 +334,9 @@ class TurnNarrativePayload(TypedDict):
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
     # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
     # the tool call whose row was newest when the card was raised.
-    credentialPause: NotRequired[dict[str, str]]
+    credentialPause: NotRequired[dict[str, str | list[str]]]
     # Every pick card's credentialPause, oldest first; set only when more than one card settled this turn.
-    credentialPauses: NotRequired[list[dict[str, str]]]
+    credentialPauses: NotRequired[list[dict[str, str | list[str]]]]
     # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
     # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
     credentialAutoBound: NotRequired[dict[str, str]]
@@ -374,8 +375,10 @@ if TYPE_CHECKING:
         RecordedBuildTestOutcome,
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
+    from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
+    from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
@@ -386,6 +389,7 @@ if TYPE_CHECKING:
         DeliveredOutputFile,
         TurnOutcome,
     )
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatSender
 
 
 class UrlVisit(BaseModel):
@@ -1255,6 +1259,14 @@ class AgentResult:
 
 
 @dataclass(frozen=True)
+class ChatHistoryRow:
+    message_id: str
+    sender: WorkflowCopilotChatSender
+    created_at: str
+    text: str
+
+
+@dataclass(frozen=True)
 class InFlightStreamToolCall:
     call_id: str
     tool_name: str
@@ -1324,6 +1336,10 @@ class CopilotContext(AgentContext):
     selected_block_label: str | None = None
     doc_editor_enabled: bool = False
     turn_context_packet: TurnContextPacket | None = None
+    # Renders this chat's rows older than the chat_history window, oldest first, only when first called.
+    earlier_chat_history_rows: Callable[[], tuple[ChatHistoryRow, ...]] = tuple
+    chat_history_oldest_shown_id: str | None = None
+    earlier_chat_history_unavailable: bool = False
     prior_turn_outcome: TurnOutcome | None = None
     # Server-verified display data for recovering from a model-staged Google
     # connection that has no run authority. This never grants authority itself.
@@ -1350,7 +1366,8 @@ class CopilotContext(AgentContext):
     credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
-    credential_pause_receipts: list[dict[str, str]] = field(default_factory=list)
+    credential_pause_receipts: list[dict[str, str | list[str]]] = field(default_factory=list)
+    credential_pause_site_answer: SiteAnswer | None = None
     demonstration_requested: bool = False
     demonstration_ran: bool = False
     demonstration_id: str | None = None
@@ -1522,8 +1539,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_failure_reason: str | None = None
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
-    # The discovery tool reaches the connected FastMCP client through this.
-    discovery_mcp_server: Any | None = None
+    discovery_mcp_server: SkyvernOverlayMCPServer | None = None
 
     # default_factory is the safety net — Python dataclass inheritance
     # disallows non-default fields after default ones, and the parent

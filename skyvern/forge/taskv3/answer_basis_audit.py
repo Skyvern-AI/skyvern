@@ -86,6 +86,7 @@ def apply_answer_basis_audit(
     *,
     log_only: bool = False,
     log_fields: Mapping[str, str] | None = None,
+    armed: Callable[[], bool] | None = None,
 ) -> None:
     """``log_only`` logs each hold it would make and lets the call through, uncounted; what lands stays flagged."""
     if audit is None:
@@ -190,6 +191,9 @@ def apply_answer_basis_audit(
             _handler: Callable[[dict[str, Any]], Awaitable[ToolResult]] = spec.handler,
             _spec: ToolSpec = spec,
         ) -> ToolResult:
+            # Unseen while unarmed, so an answer entered before arming is never audited.
+            if armed is not None and not armed():
+                return await _handler(args)
             _tool = _spec.name
             entering: tuple[Field, str] | None = None
             text = str(args.get("text") or "")

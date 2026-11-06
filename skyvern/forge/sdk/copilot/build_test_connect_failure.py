@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 BuildTestConnectFailureState = Literal[
     "already_closed",
@@ -14,10 +14,16 @@ BuildTestConnectFailureState = Literal[
     "saved_profile_unresolved",
     "saved_profile_not_applied",
     "unsaved_browser_profile_pick",
+    "browser_start_capacity",
 ]
 _SAVED_PROFILE_STATES = ("saved_profile_unresolved", "saved_profile_not_applied", "unsaved_browser_profile_pick")
 
 SUPERSEDED_BY_NEWER_TEST_REASON = "Stopped because a newer test in this chat took over the browser."
+BROWSER_TOOLS_UNAVAILABLE_ERROR = "Browser tools are unavailable on this turn."
+RAW_SECRET_BROWSER_ERROR = (
+    "This turn withheld a value that may be a secret. Do not use the browser; persist only the redacted draft and call "
+    "`request_credential` with the user's sign-in URL so they can connect a saved credential before testing."
+)
 
 
 class BuildTestConnectFailure(BaseModel):
@@ -33,6 +39,10 @@ class BuildTestConnectFailure(BaseModel):
     occupier_run_id: str | None = None
     diagnostic: str | None = None
     retry_action: Literal["test_end_to_end"] | None = "test_end_to_end"
+    # Absent rather than null outside a capacity refusal, so other states' explicit-null dumps keep their shape.
+    starting_sessions: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    max_starting_sessions: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    retry_after_seconds: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="before")
     @classmethod
@@ -46,6 +56,10 @@ class BuildTestConnectFailure(BaseModel):
 
     @model_validator(mode="after")
     def validate_retry_and_identity(self) -> BuildTestConnectFailure:
+        capacity = (self.starting_sessions, self.max_starting_sessions, self.retry_after_seconds)
+        carried = sum(value is not None for value in capacity)
+        if carried != (len(capacity) if self.state == "browser_start_capacity" else 0):
+            raise ValueError("only a browser start capacity refusal carries, and must carry, its capacity facts")
         if self.state == "billing_credit_admission_refusal":
             identities = (
                 self.workflow_run_id,
@@ -68,6 +82,8 @@ class BuildTestConnectFailure(BaseModel):
 def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str:
     """A run id means the session was lost after the run started, so the operator must not be
     pointed at provisioning."""
+    if failure.diagnostic in (BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR):
+        return failure.diagnostic
     if failure.state == "billing_credit_admission_refusal":
         return (
             "Build test did not start because credits are exhausted. "
@@ -89,6 +105,12 @@ def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str
             "newly picked profile only after the proposal is accepted. No run was started. "
             "Reason codes: unsaved_browser_profile_pick."
         )
+    if failure.state == "browser_start_capacity":
+        return (
+            f"No browser session started: {failure.starting_sessions} Copilot browser sessions are already starting "
+            f"for this organization, which is its limit of {failure.max_starting_sessions}. The capacity check "
+            f"suggests retrying after {failure.retry_after_seconds} seconds."
+        )
     if failure.state == "occupied":
         holder = f" ({failure.occupier_run_id})" if failure.occupier_run_id else ""
         return (
@@ -96,5 +118,21 @@ def build_test_connect_failure_sentence(failure: BuildTestConnectFailure) -> str
             "retry in a fresh session, or wait for the running test to finish."
         )
     if failure.workflow_run_id:
-        return f"Build-test browser session was unavailable before any block ran: {failure.state}."
-    return f"Build-test browser acquisition stopped: {failure.state}."
+        return (
+            "The test run started, but its browser was lost before any block ran, so nothing was tested. "
+            "Trying again in a fresh browser may work."
+        )
+    if failure.state == "provisioning_unavailable":
+        return (
+            "Build test did not start: no test browser was ready in time. This was a problem on Skyvern's side, "
+            "not with the workflow or the account's credits. No run started. Trying again may work."
+        )
+    if failure.state == "cdp_connect_failed":
+        return (
+            "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+            "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+        )
+    return (
+        "Build test did not start: the test browser had already closed. No run started. "
+        "Trying again in a fresh browser may work."
+    )

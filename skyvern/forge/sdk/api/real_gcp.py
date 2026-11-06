@@ -19,6 +19,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import secretmanager_v1, storage
 
 from skyvern.config import settings
+from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.forge.sdk.api.gcp import (
     STORAGE_CLASS_STANDARD,
     AsyncGcpSecretManagerClient,
@@ -36,6 +37,8 @@ add_type("application/zstd", ".zst")
 _SIGNING_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
 LOG = structlog.get_logger()
+# Content-comparison requests use a third of the comparison budget as connect and read timeouts, without retries.
+_BOUNDED = {"timeout": (GET_DOWNLOADED_FILES_TIMEOUT / 3,) * 2, "retry": None}
 
 
 class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
@@ -139,6 +142,14 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
 
         return await asyncio.to_thread(_do)
 
+    async def download_range(self, uri: str, start: int, end: int, generation: int) -> bytes:
+        """Bytes ``start`` to ``end`` inclusive, failing once the object is no longer ``generation``."""
+        blob = self._get_blob(uri)
+        # Stored bytes only: decompressive transcoding of a gzip-encoded object ignores the range.
+        return await asyncio.to_thread(
+            blob.download_as_bytes, start=start, end=end, if_generation_match=generation, raw_download=True, **_BOUNDED
+        )
+
     async def delete_file(self, uri: str) -> None:
         def _do() -> None:
             try:
@@ -165,17 +176,18 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
 
         return await asyncio.to_thread(_do)
 
-    async def get_object_info(self, uri: str) -> dict | None:
+    async def get_object_info(self, uri: str, bounded: bool = False) -> dict | None:
         def _do() -> dict | None:
             parsed = GcsUri(uri)
             bucket = self._get_client().bucket(parsed.bucket)
-            blob = bucket.get_blob(parsed.object_path)
+            blob = bucket.get_blob(parsed.object_path, **(_BOUNDED if bounded else {}))
             if blob is None:
                 return None
             return {
                 "Metadata": blob.metadata or {},
                 "LastModified": blob.updated,
                 "ContentLength": blob.size,
+                "Generation": blob.generation,
             }
 
         return await asyncio.to_thread(_do)

@@ -26,6 +26,12 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
+import {
+  COPILOT_ATTENTION_LABEL,
+  useCopilotHeaderStore,
+} from "@/store/useCopilotHeaderStore";
+import { useManualSignInStore } from "@/store/useManualSignInStore";
+import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import { cn } from "@/util/utils";
 
 import { deriveDropIndicator } from "../editor/sortable/dropIndicator";
@@ -37,6 +43,8 @@ import {
   EditorPaneBlockSearch,
   EditorPaneModeToggle,
 } from "./EditorPaneHeader";
+import { useEditorShowsDoc } from "./useEditorShowsDoc";
+import { StudioPaneAttentionDot } from "./StudioPaneAttentionDot";
 import { BrowserTab } from "./BrowserTab";
 import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 import { RunTab } from "./RunTab";
@@ -59,11 +67,18 @@ import {
 } from "./paneLayout";
 import { STUDIO_PANE_META, paneAccessibleName, paneLabel } from "./paneMeta";
 import {
+  panesCollapsedForDoc,
   panesListEqual,
+  panesWithoutDeletedBlocked,
+  STUDIO_DOC_MIN_WIDTH,
+  STUDIO_PANE_IDS,
   STUDIO_PANE_MIN_WIDTH,
+  STUDIO_PANE_STRIP_WIDTH_PX,
   STUDIO_STAGE_GAP_PX,
   type StudioPaneId,
 } from "./panes";
+import { StudioNarrowPaneSwitch } from "./StudioNarrowPaneSwitch";
+import { useStudioNarrow } from "./useStudioNarrow";
 import { StudioPaneDefaultsProvider } from "./StudioPaneDefaults";
 import { useStudioPaneDefaults } from "./StudioPaneDefaultsContext";
 import {
@@ -104,6 +119,8 @@ export function StudioPane({
   open,
   order,
   flex,
+  minWidth,
+  expandable = true,
   reorder,
   onClose,
   expanded,
@@ -121,6 +138,8 @@ export function StudioPane({
   open: boolean;
   order: number | undefined;
   flex: string | undefined;
+  minWidth?: number;
+  expandable?: boolean;
   reorder: PaneReorder;
   onClose: () => void;
   expanded: boolean;
@@ -234,7 +253,7 @@ export function StudioPane({
       id={studioPanelId(id)}
       role="region"
       aria-label={accessibleLabel}
-      style={{ order, minWidth: STUDIO_PANE_MIN_WIDTH[id], flex }}
+      style={{ order, minWidth: minWidth ?? STUDIO_PANE_MIN_WIDTH[id], flex }}
       className={cn(
         "relative min-h-0 flex-col overflow-hidden bg-slate-elevation1",
         !chromeless && "rounded-lg border-2 border-border",
@@ -324,31 +343,33 @@ export function StudioPane({
             </div>
           ) : null}
         </StudioPaneCompactContext.Provider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={() => {
-                if (!expansionTransitioning) {
-                  onToggleExpanded();
-                }
-              }}
-              aria-disabled={expansionTransitioning}
-              aria-label={`${expanded ? "Restore" : "Expand"} ${accessibleLabel} pane`}
-              aria-pressed={expanded}
-              className={PANE_HEADER_ICON_BUTTON_CLASS}
-            >
-              {expanded ? (
-                <ExitFullScreenIcon className="size-3.5" />
-              ) : (
-                <EnterFullScreenIcon className="size-3.5" />
-              )}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">
-            {expanded ? "Restore pane" : "Expand to full screen"}
-          </TooltipContent>
-        </Tooltip>
+        {expandable ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!expansionTransitioning) {
+                    onToggleExpanded();
+                  }
+                }}
+                aria-disabled={expansionTransitioning}
+                aria-label={`${expanded ? "Restore" : "Expand"} ${accessibleLabel} pane`}
+                aria-pressed={expanded}
+                className={PANE_HEADER_ICON_BUTTON_CLASS}
+              >
+                {expanded ? (
+                  <ExitFullScreenIcon className="size-3.5" />
+                ) : (
+                  <EnterFullScreenIcon className="size-3.5" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {expanded ? "Restore pane" : "Expand to full screen"}
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -410,6 +431,72 @@ export function StudioPane({
 }
 
 /**
+ * A pane collapsed so the Doc keeps its width. It stays one click (or
+ * Enter/Space) away: the pane opens expanded over the stage.
+ */
+const studioStripId = (id: StudioPaneId) => `studio-strip-${id}`;
+
+function CollapsedPaneStrip({
+  id,
+  order,
+  leading,
+  onOpen,
+}: {
+  id: StudioPaneId;
+  order: number;
+  leading: boolean;
+  onOpen: () => void;
+}) {
+  const { icon: Icon } = STUDIO_PANE_META[id];
+  const label = paneAccessibleName(id);
+  const browserActivity = useStudioBrowserStore((s) => s.hasUnseenActivity);
+  const copilotAttention = useCopilotHeaderStore((s) => s.attention);
+  const activity = id === "browser" && browserActivity;
+  const awaiting = id === "copilot" ? copilotAttention : null;
+  const news = activity
+    ? ", new activity"
+    : awaiting
+      ? `, ${COPILOT_ATTENTION_LABEL[awaiting]}`
+      : "";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          id={studioStripId(id)}
+          type="button"
+          onClick={onOpen}
+          aria-label={`Show ${label} pane (collapsed to make room for the Doc)${news}`}
+          aria-controls={studioPanelId(id)}
+          style={{ order, width: STUDIO_PANE_STRIP_WIDTH_PX }}
+          className={cn(
+            "flex shrink-0 flex-col items-center gap-2 rounded-lg border-2 border-border bg-slate-elevation1 py-3 text-xs font-medium text-muted-foreground",
+            "hover:bg-accent/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+            leading ? "mr-3" : "ml-3",
+          )}
+        >
+          <span className="relative inline-flex">
+            <Icon className="size-3.5 shrink-0" aria-hidden />
+            {activity ? (
+              <StudioPaneAttentionDot
+                tone="activity"
+                title="New browser activity"
+              />
+            ) : awaiting ? (
+              <StudioPaneAttentionDot
+                tone="waiting"
+                title={`Copilot, ${COPILOT_ATTENTION_LABEL[awaiting]}`}
+              />
+            ) : null}
+          </span>
+          <span className="[writing-mode:vertical-rl]">{paneLabel(id)}</span>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="right">Show {label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/**
  * Pointer-drag divider between two open panes. It is exactly the inter-pane
  * gap (STUDIO_STAGE_GAP_PX wide), so the fit math in panes.ts still holds.
  * During the drag it writes flex pins straight to the pane elements (no React
@@ -420,6 +507,7 @@ function StudioPaneDivider({
   rightId,
   order,
   panes,
+  minWidths,
   onCommit,
   onReset,
 }: {
@@ -427,6 +515,7 @@ function StudioPaneDivider({
   rightId: StudioPaneId;
   order: number;
   panes: readonly StudioPaneId[];
+  minWidths: Record<StudioPaneId, number>;
   onCommit: (widths: PaneWidths) => void;
   onReset: () => void;
 }) {
@@ -503,8 +592,8 @@ function StudioPaneDivider({
     const delta = Math.round(
       clampResizeDelta(
         event.clientX - drag.startX,
-        { id: leftId, width: drag.leftStart },
-        { id: rightId, width: drag.rightStart },
+        { id: leftId, width: drag.leftStart, min: minWidths[leftId] },
+        { id: rightId, width: drag.rightStart, min: minWidths[rightId] },
       ),
     );
     drag.lastDelta = delta;
@@ -560,8 +649,8 @@ function StudioPaneDivider({
     const delta = Math.round(
       clampResizeDelta(
         event.key === "ArrowLeft" ? -DIVIDER_KEY_STEP_PX : DIVIDER_KEY_STEP_PX,
-        { id: leftId, width: els.left.offsetWidth },
-        { id: rightId, width: els.right.offsetWidth },
+        { id: leftId, width: els.left.offsetWidth, min: minWidths[leftId] },
+        { id: rightId, width: els.right.offsetWidth, min: minWidths[rightId] },
       ),
     );
     if (delta === 0) {
@@ -704,7 +793,10 @@ function StudioStage(props: StudioWorkspaceProps) {
   const logging = useLogging();
   const embedded = searchParams.get("embed") === "true";
   useStudioOnboardingTour(!embedded, props.workflow.workflow_permanent_id);
-  const { panes, closePane, setPanesOrder } = useStudioPanes();
+  const { panes, closePane, openPane, setPanesOrder } = useStudioPanes();
+  // Embedded run views keep their own layout at any iframe width.
+  const narrow = useStudioNarrow() && !embedded;
+  const editorShowsDoc = useEditorShowsDoc();
   const {
     registerStageElement,
     paneWidths,
@@ -778,10 +870,65 @@ function StudioStage(props: StudioWorkspaceProps) {
       : null;
   // Keep the surrounding layout mounted while the active pane grows over it.
   // Once the pane covers the stage, hiding the panes underneath is invisible.
-  const visiblePanes =
-    activeExpandedPaneId && paneTransition === null
+  const [stageEl, setStageEl] = useState<HTMLElement | null>(null);
+  const stageRef = useCallback(
+    (el: HTMLElement | null) => {
+      registerStageElement(el);
+      setStageEl(el);
+    },
+    [registerStageElement],
+  );
+  const [stageWidth, setStageWidth] = useState(0);
+  useLayoutEffect(() => {
+    if (!stageEl) return;
+    setStageWidth(stageEl.clientWidth);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() =>
+      setStageWidth(stageEl.clientWidth),
+    );
+    observer.observe(stageEl);
+    return () => observer.disconnect();
+  }, [stageEl]);
+  // Collapsed panes stay in the open list (and come back as the stage widens);
+  // only the row layout skips them.
+  const docMode = editorShowsDoc && !narrow && !embedded;
+  const collapsedPanes = docMode ? panesCollapsedForDoc(panes, stageWidth) : [];
+  const rowPanes = panes.filter((id) => !collapsedPanes.includes(id));
+  const collapsedPanesRef = useRef(collapsedPanes);
+  collapsedPanesRef.current = collapsedPanes;
+  const minWidths: Record<StudioPaneId, number> = {
+    ...STUDIO_PANE_MIN_WIDTH,
+    ...(docMode ? { editor: STUDIO_DOC_MIN_WIDTH } : {}),
+  };
+
+  // Phone width: one pane at a time. A newly opened pane (a run start, the
+  // switch below) becomes the shown one.
+  const [narrowPick, setNarrowPick] = useState<StudioPaneId | null>(null);
+  const [seenPanes, setSeenPanes] = useState(panes);
+  if (!panesListEqual(seenPanes, panes)) {
+    const added = panes.find((id) => !seenPanes.includes(id));
+    setSeenPanes(panes);
+    if (added) setNarrowPick(added);
+  }
+  const narrowShown =
+    narrowPick !== null && panes.includes(narrowPick) ? narrowPick : panes[0];
+  const narrowSwitchIds = (
+    workflowDeleted
+      ? panesWithoutDeletedBlocked(STUDIO_PANE_IDS)
+      : [...STUDIO_PANE_IDS]
+  ).filter((id) => id !== "overview" || runId || panes.includes(id));
+  const showNarrowPane = (id: StudioPaneId) => {
+    setNarrowPick(id);
+    if (!panes.includes(id)) openPane(id);
+  };
+
+  const visiblePanes = narrow
+    ? narrowShown
+      ? [narrowShown]
+      : []
+    : activeExpandedPaneId && paneTransition === null
       ? [activeExpandedPaneId]
-      : panes;
+      : rowPanes;
   const browserOpen = visiblePanes.includes("browser");
   const editorOpen = visiblePanes.includes("editor");
   const overviewOpen = visiblePanes.includes("overview");
@@ -797,13 +944,64 @@ function StudioStage(props: StudioWorkspaceProps) {
         });
       }
     }
+    // A folded pane's strip unmounts as it opens over the stage, and its
+    // restore button hides as it folds again; keep keyboard focus with it.
+    if (collapsedPanes.includes(id)) {
+      focusAfterRef.current =
+        activeExpandedPaneId === id ? studioStripId(id) : studioPanelId(id);
+    }
     setExpandedPaneId((current) => (current === id ? null : id));
   };
+  const focusAfterRef = useRef<string | null>(null);
+  useEffect(() => {
+    const target = focusAfterRef.current;
+    if (target === null) return;
+    const el = document.getElementById(target);
+    if (!el) return;
+    focusAfterRef.current = null;
+    (
+      el.querySelector<HTMLElement>('[role="group"][tabindex="0"]') ?? el
+    ).focus();
+  });
 
   const restoreExpandedPane = useCallback(() => {
     setExpandedPaneId(null);
     setPaneTransition(null);
   }, []);
+  const isPaneFolded = useCallback(
+    (id: StudioPaneId) => collapsedPanesRef.current.includes(id),
+    [],
+  );
+  // Resolved after the render that applies the open, so a pane that was
+  // closed and folds as it opens (the Doc leaves no room) is shown too.
+  const [pendingShow, setPendingShow] = useState<{ id: StudioPaneId } | null>(
+    null,
+  );
+  const showPane = useCallback((id: StudioPaneId) => {
+    setNarrowPick(id);
+    setPendingShow({ id });
+  }, []);
+  useLayoutEffect(() => {
+    if (pendingShow === null) return;
+    setPendingShow(null);
+    if (collapsedPanesRef.current.includes(pendingShow.id)) {
+      setPaneTransition(null);
+      setExpandedPaneId(pendingShow.id);
+    }
+  }, [pendingShow]);
+  // Someone asked to sign in themselves: the page they sign in on must show.
+  useLayoutEffect(
+    () =>
+      useManualSignInStore.subscribe((state, previous) => {
+        if (
+          state.browserSessionId !== null &&
+          state.browserSessionId !== previous.browserSessionId
+        ) {
+          showPane("browser");
+        }
+      }),
+    [showPane],
+  );
 
   useEffect(() => {
     restoreExpandedPane();
@@ -855,12 +1053,16 @@ function StudioStage(props: StudioWorkspaceProps) {
       setBrowserStreamSlot,
       setRunStreamSlot,
       restoreExpandedPane,
+      showPane,
+      isPaneFolded,
     }),
     [
       copilotPortalEl,
       panelPortalEl,
       props.workflow.organization_id,
       restoreExpandedPane,
+      showPane,
+      isPaneFolded,
     ],
   );
 
@@ -869,8 +1071,24 @@ function StudioStage(props: StudioWorkspaceProps) {
     setExpandedPaneId((current) => (current === id ? null : current));
     setPaneTransition((current) => (current?.id === id ? null : current));
     closePane(id);
-    document.getElementById(studioTabId(id))?.focus();
+    if (narrow) {
+      // The pane's top-bar toggle is hidden at phone width; focus moves to the
+      // pane switch once it shows the next pane.
+      focusPaneSwitchRef.current = true;
+    } else {
+      document.getElementById(studioTabId(id))?.focus();
+    }
   };
+  const focusPaneSwitchRef = useRef(false);
+  useEffect(() => {
+    if (!focusPaneSwitchRef.current) return;
+    focusPaneSwitchRef.current = false;
+    const paneSwitch = document.querySelector("[data-studio-pane-switch]");
+    (
+      paneSwitch?.querySelector<HTMLElement>("button[aria-pressed=true]") ??
+      paneSwitch?.querySelector<HTMLElement>("button")
+    )?.focus();
+  });
 
   // Reorder is otherwise invisible to assistive tech (only CSS order moves),
   // so voice the result through the polite live region below.
@@ -895,9 +1113,16 @@ function StudioStage(props: StudioWorkspaceProps) {
       open: index >= 0 && visiblePanes.includes(id),
       // Panes take even slots and the dividers between them take odd slots.
       order: index >= 0 ? index * 2 : undefined,
-      flex: index >= 0 ? paneFlex(id, panes, paneWidths) : undefined,
+      flex:
+        index < 0
+          ? undefined
+          : narrow
+            ? "1 1 0%"
+            : paneFlex(id, rowPanes, paneWidths),
+      minWidth: narrow ? 0 : minWidths[id],
+      expandable: !narrow,
       onClose: () => closeWithFocus(id),
-      expanded: activeExpandedPaneId === id,
+      expanded: !narrow && activeExpandedPaneId === id,
       expansionTransitioning: paneTransition !== null,
       onToggleExpanded: () => toggleExpandedPane(id),
       transitionFromBounds:
@@ -946,10 +1171,10 @@ function StudioStage(props: StudioWorkspaceProps) {
               Reordering (drag or keyboard) only rewrites CSS order — panes and
               the stream singleton never remount. */}
             <div
-              ref={registerStageElement}
+              ref={stageRef}
               className={cn(
                 "relative flex min-h-0 min-w-0 flex-1 overflow-hidden",
-                embedded ? "p-0" : "p-3",
+                embedded ? "p-0" : narrow ? "p-2" : "p-3",
               )}
             >
               <StudioPane
@@ -1023,20 +1248,33 @@ function StudioStage(props: StudioWorkspaceProps) {
               </StudioPane>
               {/* Dividers are the inter-pane gaps; stateless, so unlike the panes
                 they can re-render freely as the open list changes. */}
-              {activeExpandedPaneId === null || paneTransition !== null
-                ? panes
-                    .slice(1)
-                    .map((rightId, index) => (
-                      <StudioPaneDivider
-                        key={`${panes[index]}:${rightId}`}
-                        leftId={panes[index]!}
-                        rightId={rightId}
-                        order={index * 2 + 1}
-                        panes={panes}
-                        onCommit={setPaneWidths}
-                        onReset={resetPaneWidths}
-                      />
-                    ))
+              {!narrow &&
+              (activeExpandedPaneId === null || paneTransition !== null)
+                ? rowPanes.slice(1).map((rightId, index) => (
+                    <StudioPaneDivider
+                      key={`${rowPanes[index]}:${rightId}`}
+                      leftId={rowPanes[index]!}
+                      rightId={rightId}
+                      // Just before the right pane, so a strip between the
+                      // two sits left of the divider.
+                      order={panes.indexOf(rightId) * 2 - 1}
+                      panes={rowPanes}
+                      minWidths={minWidths}
+                      onCommit={setPaneWidths}
+                      onReset={resetPaneWidths}
+                    />
+                  ))
+                : null}
+              {activeExpandedPaneId === null
+                ? collapsedPanes.map((id) => (
+                    <CollapsedPaneStrip
+                      key={id}
+                      id={id}
+                      order={panes.indexOf(id) * 2}
+                      leading={panes.indexOf(id) === 0}
+                      onOpen={() => toggleExpandedPane(id)}
+                    />
+                  ))
                 : null}
               {!embedded && panes.length === 0 ? <StudioStageLauncher /> : null}
               {embedded ? null : <StudioWorkflowPanels />}
@@ -1056,6 +1294,13 @@ function StudioStage(props: StudioWorkspaceProps) {
               </span>
             </div>
           </div>
+          {narrow && !embedded ? (
+            <StudioNarrowPaneSwitch
+              ids={narrowSwitchIds}
+              shown={narrowShown}
+              onShow={showNarrowPane}
+            />
+          ) : null}
           <div
             ref={setStreamHolderEl}
             aria-hidden

@@ -65,6 +65,32 @@ export function docBlockType(node: Node): WorkflowBlockType | null {
   return blockTypeFromNode(node) as WorkflowBlockType | null;
 }
 
+const OUTPUT_BLOCK_TYPES = new Set<WorkflowBlockType>([
+  "agent_step",
+  "extraction",
+  "text_prompt",
+  "file_url_parser",
+  "pdf_parser",
+  "web_search",
+  "http_request",
+  "code",
+  "data_export",
+  "powerbi_query",
+  "human_interaction",
+  "email_inbox",
+  "google_sheets_read",
+  "file_download",
+  "download_to_s3",
+  "workflow_trigger",
+]);
+
+/** Whether the step hands data to later steps; the others don't name an output. */
+export function docStepProducesData(node: Node): boolean {
+  const blockType = docBlockType(node);
+  if (!blockType) return false;
+  return OUTPUT_BLOCK_TYPES.has(blockType);
+}
+
 export function docStepCanRun(node: Node): boolean {
   const blockType = docBlockType(node);
   return !!blockType && debuggableWorkflowBlockTypes.has(blockType);
@@ -98,9 +124,37 @@ const proseFields: Record<string, DocProseField[]> = {
   ],
   human_interaction: [field("instructions", "Instructions")],
   textPrompt: [field("prompt", "Prompt")],
+  // The Python itself stays in the visual editor; Doc edits the prompt that describes it.
+  codeBlock: [field("prompt", "Prompt")],
+  // Settings-driven steps: the main line is the field that drives the step, so what is typed is what runs.
+  url: [field("url", "URL")],
+  http_request: [field("url", "URL")],
+  sendEmail: [field("body", "Body")],
+  fileParser: [field("fileUrl", "File")],
+  pdfParser: [field("fileUrl", "File")],
+  download: [field("url", "URL")],
+  upload: [field("path", "Folder")],
+  fileUpload: [field("path", "Folder")],
+  googleSheetsRead: [field("spreadsheetUrl", "Spreadsheet")],
+  googleSheetsWrite: [field("spreadsheetUrl", "Spreadsheet")],
+  web_search: [field("query", "Query"), field("prompt", "Prompt")],
+  powerBIQuery: [field("query", "Query")],
+  emailInbox: [field("prompt", "Match prompt")],
+  terminate: [field("reason", "Reason")],
+  pdfFill: [field("prompt", "Prompt")],
+  splitPdf: [field("prompt", "Prompt")],
   agentStep: [field("prompt", "Prompt")],
   fileDownload: [field("navigationGoal", "Download goal")],
 };
+
+// The source is loopVariableReference when set (it wins at run time), else loopValue; a new loop uses the first.
+export function loopSourceKey(
+  node: Node,
+): "loopVariableReference" | "loopValue" {
+  return !text(node, "loopVariableReference") && text(node, "loopValue")
+    ? "loopValue"
+    : "loopVariableReference";
+}
 
 export function getDocProseFields(node: Node): DocProseField[] {
   // "Complete if" isn't saved for 2.0 navigation, so it isn't shown there.
@@ -111,7 +165,90 @@ export function getDocProseFields(node: Node): DocProseField[] {
           field("navigationGoal", "Goal"),
           field("completeCriterion", "Complete if"),
         ];
+  if (node.type === "loop")
+    return node.data.loopKind === "while"
+      ? [field("whileConditionExpression", "Condition")]
+      : [];
   return proseFields[node.type ?? ""] ?? [];
+}
+
+// Steps whose main line is a setting (a URL, a file), not an instruction; their title stays the summary.
+const SETTING_MAIN = new Set([
+  "url",
+  "http_request",
+  "fileParser",
+  "pdfParser",
+  "download",
+  "upload",
+  "fileUpload",
+  "googleSheetsRead",
+  "googleSheetsWrite",
+  "web_search",
+  "powerBIQuery",
+  "terminate",
+  "loop",
+]);
+
+export const docMainIsSetting = (node: Node) =>
+  SETTING_MAIN.has(node.type ?? "");
+
+/** True when the step has no field that drives it; its description is a note the agent does not read. */
+export function docStepIsNoteOnly(node: Node): boolean {
+  return (
+    getDocProseFields(node).length === 0 &&
+    node.type !== "conditional" &&
+    node.type !== "loop"
+  );
+}
+
+/** What an empty main line shows: the step's own summary when its field is a setting or short prompt. */
+export function getDocMainPlaceholder(node: Node): string {
+  const type = node.type ?? "";
+  const isPrompt = [
+    "task",
+    "taskv2",
+    "navigation",
+    "action",
+    "extraction",
+    "login",
+    "validation",
+    "human_interaction",
+    "textPrompt",
+    "agentStep",
+    "fileDownload",
+  ].includes(type);
+  return isPrompt ? "No instructions yet" : getDocStepSummary(node);
+}
+
+// Settings a step cannot run without; Doc shows each as a chip while it is empty.
+const requiredSettings: Record<string, Array<[string, string]>> = {
+  url: [["url", "URL"]],
+  http_request: [["url", "URL"]],
+  download: [["url", "URL"]],
+  fileParser: [["fileUrl", "File"]],
+  pdfParser: [["fileUrl", "File"]],
+  pdfFill: [["fileUrl", "File"]],
+  splitPdf: [["fileUrl", "File"]],
+  googleSheetsRead: [["spreadsheetUrl", "Spreadsheet"]],
+  googleSheetsWrite: [["spreadsheetUrl", "Spreadsheet"]],
+  web_search: [["query", "Query"]],
+  powerBIQuery: [["query", "Query"]],
+  workflowTrigger: [["workflowPermanentId", "Agent"]],
+  wait: [["waitInSeconds", "Seconds"]],
+  sendEmail: [["recipients", "Recipients"]],
+};
+
+export function getDocMissingSettings(node: Node): string[] {
+  return (requiredSettings[node.type ?? ""] ?? []).flatMap(([key, label]) =>
+    settingIsSet(node, key) ? [] : [label],
+  );
+}
+
+// A Wait needs a whole number of seconds of at least 1; "" or "0" would save as a wait that does nothing or is refused.
+function settingIsSet(node: Node, key: string): boolean {
+  if (node.type === "wait")
+    return /^\d+$/.test(text(node, key)) && Number(text(node, key)) >= 1;
+  return Boolean(text(node, key));
 }
 
 const text = (node: Node, key: string) =>
@@ -170,7 +307,9 @@ export function getDocStepSummary(node: Node): string {
     case "loop":
       return node.data.loopKind === "while"
         ? `Repeat while ${text(node, "whileConditionExpression") || "a condition holds"}`
-        : `For each ${text(node, "loopVariableReference") || text(node, "loopValue") || "item"}`;
+        : text(node, "loopVariableReference") || text(node, "loopValue")
+          ? `For each of ${text(node, "loopVariableReference") || text(node, "loopValue")}`
+          : "For each item";
     default:
       return "No instructions yet";
   }
@@ -181,6 +320,8 @@ const SUMMARY_IS_SETTING = new Set([
   "loop",
   "terminate",
   "wait",
+  "printPage",
+  "workflowTrigger",
   "codeBlock",
   "emailInbox",
   "pdfFill",
@@ -198,29 +339,15 @@ export function getDocSettingSummary(node: Node): string | null {
 export type DocKeyField = { key: string; label: string; value: string };
 
 const keyFields: Record<string, Array<[string, string]>> = {
-  url: [["url", "URL"]],
-  http_request: [
-    ["method", "Method"],
-    ["url", "URL"],
-  ],
+  http_request: [["method", "Method"]],
   sendEmail: [
     ["recipients", "Recipients"],
     ["subject", "Subject"],
   ],
-  fileParser: [
-    ["fileUrl", "File"],
-    ["fileType", "Type"],
-  ],
-  pdfParser: [["fileUrl", "File"]],
+  fileParser: [["fileType", "Type"]],
   workflowTrigger: [["workflowTitle", "Agent"]],
-  googleSheetsRead: [
-    ["spreadsheetUrl", "Spreadsheet"],
-    ["range", "Range"],
-  ],
-  googleSheetsWrite: [
-    ["spreadsheetUrl", "Spreadsheet"],
-    ["range", "Range"],
-  ],
+  googleSheetsRead: [["range", "Range"]],
+  googleSheetsWrite: [["range", "Range"]],
 };
 
 export function getDocKeyFields(node: Node): DocKeyField[] {
@@ -253,13 +380,15 @@ export function docStepTitle(node: Node): string {
   }
   const description =
     typeof node.data.description === "string" ? node.data.description : "";
-  const prose = getDocProseFields(node)
-    .map((f) => text(node, f.key))
-    .find(Boolean);
+  const prose = SETTING_MAIN.has(node.type ?? "")
+    ? ""
+    : getDocProseFields(node)
+        .map((f) => text(node, f.key))
+        .find(Boolean);
   const title =
     prose ||
     description.trim() ||
-    (getDocProseFields(node).length
+    (getDocProseFields(node).length && !SETTING_MAIN.has(node.type ?? "")
       ? String(node.data.label)
       : getDocStepSummary(node));
   return clip(title);
@@ -269,6 +398,17 @@ function clip(title: string): string {
   const plain = stripJinjaReferences(title);
   return plain.length > 60 ? `${plain.slice(0, 59)}…` : plain;
 }
+
+/** A loop line that already starts "For each …" is a whole sentence, so the fixed "For each of" lead-in is left off. */
+export function loopLineLeadsIn(description: string | null): boolean {
+  return /^\s*for each\b/i.test(description ?? "");
+}
+
+// Words the Doc shows for a step that its library title doesn't contain.
+const STEP_ALIASES: Record<string, string[]> = {
+  loop: ["for each", "for", "repeat"],
+  conditional: ["if", "else", "branch"],
+};
 
 /** Ranks "Add a step" choices: a title match beats a word in a description. */
 export function docStepFilter(
@@ -283,5 +423,9 @@ export function docStepFilter(
   if (t.startsWith(q)) return 0.9;
   if (t.split(/\s+/).some((word) => word.startsWith(q))) return 0.8;
   if (t.includes(q)) return 0.6;
+  if (
+    STEP_ALIASES[t]?.some((alias) => alias.startsWith(q) || q.startsWith(alias))
+  )
+    return 0.85;
   return keywords.some((k) => k.toLowerCase().includes(q)) ? 0.2 : 0;
 }

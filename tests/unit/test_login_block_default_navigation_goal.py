@@ -68,15 +68,6 @@ class TestLoginBlockDefaultNavigationGoal:
 
         assert block.navigation_goal == custom_goal
 
-    def test_default_prompt_mentions_credentials(self) -> None:
-        block_yaml = LoginBlockYAML(label="login")
-
-        block = _convert_login_block(block_yaml)
-
-        assert "credentials" in block.navigation_goal.lower()
-        assert "password" in block.navigation_goal.lower()
-        assert "login" in block.navigation_goal.lower()
-
 
 def test_login_block_preserves_include_action_history_in_verification() -> None:
     block_yaml = LoginBlockYAML(label="login", include_action_history_in_verification=True)

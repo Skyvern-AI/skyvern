@@ -234,6 +234,7 @@ async def setup_question_chat(sqlite_engine, monkeypatch):
         )
 
     api.dependency_overrides[routes.org_auth_service.get_current_org] = organization
+    api.dependency_overrides[routes.org_auth_service.get_current_org_for_credential_routes] = organization
     api.add_api_route("/reply", routes.workflow_copilot_question_response, methods=["POST"])
     api.add_api_route("/history", routes.workflow_copilot_chat_history, methods=["GET"])
     api.add_api_route("/cancel", routes.workflow_copilot_cancel, methods=["POST"], status_code=204)
@@ -611,8 +612,11 @@ async def test_long_wait_reply_cannot_be_recovered_before_delivery_and_redaction
             assert "fixture-secret-value" not in response.text
             history = await client.get("/history", params={"workflow_copilot_chat_id": ctx.workflow_copilot_chat_id})
             assert history.json()["question_interactions"][0]["status"] == "resolved"
-            assert not await repo.claim_pending_copilot_turn(
-                "org", ctx.workflow_copilot_chat_id, "turn", datetime.now(UTC) - timedelta(minutes=5)
+            assert (
+                await repo.claim_pending_copilot_turn(
+                    "org", ctx.workflow_copilot_chat_id, "turn", datetime.now(UTC) - timedelta(minutes=5)
+                )
+                == "refused"
             )
             result = await asyncio.wait_for(task, 5)
             assert result["text"].startswith("CSV;")

@@ -354,6 +354,7 @@ def agent_runs_route_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     app_mock.WORKFLOW_SERVICE = workflow_service_mock
     app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
     app_mock.AGENT_FUNCTION.accessible_workflow_folder_ids = AsyncMock(return_value=None)
+    app_mock.AGENT_FUNCTION.should_check_browser_session_artifacts = AsyncMock(return_value=False)
 
     test_app = shared_route_app(monkeypatch)
     test_app.dependency_overrides[org_auth_service.get_current_org] = lambda: _make_org()

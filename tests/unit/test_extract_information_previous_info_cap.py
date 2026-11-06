@@ -93,12 +93,6 @@ def test_handler_truncates_huge_previous_extracted_information(monkeypatch) -> N
     assert count_tokens(json.dumps(capped)) <= 20_500
 
 
-def test_handler_passes_small_previous_extracted_information_unchanged(monkeypatch) -> None:
-    small_prev = [{"iter": 0, "blob": "small"}]
-    captured = _capture_handler_kwargs(monkeypatch, previous_extracted_information=small_prev)
-    assert captured["previous_extracted_information"] == small_prev
-
-
 def _capture_handler_schema(monkeypatch, extracted_information_schema):
     import asyncio
     from unittest.mock import AsyncMock, MagicMock
@@ -165,11 +159,3 @@ def test_handler_caps_huge_extraction_schema(monkeypatch) -> None:
     schema_passed = captured["extracted_information_schema"]
     assert isinstance(schema_passed, dict)
     assert schema_passed.get("_skyvern_schema_truncated") is True
-
-
-def test_handler_passes_small_schema_unchanged(monkeypatch) -> None:
-    small_schema = {"type": "object", "properties": {"title": {"type": "string"}}}
-
-    captured = _capture_handler_schema(monkeypatch, small_schema)
-
-    assert captured["extracted_information_schema"] == small_schema

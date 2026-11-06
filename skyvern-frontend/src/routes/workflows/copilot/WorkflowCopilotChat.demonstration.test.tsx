@@ -491,6 +491,35 @@ describe("WorkflowCopilotChat demonstration", () => {
     ).toBeNull();
   });
 
+  it("sends a typed note to the recorder instead of building", async () => {
+    await renderChat({ liveBrowserSessionId: "browser-1" });
+    await startDemonstration();
+    const textbox = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(textbox.disabled).toBe(false);
+
+    fireEvent.change(textbox, { target: { value: "  Pick the cheapest  " } });
+    expect(screen.getByRole("button", { name: "Add note" })).toBeTruthy();
+    fireEvent.keyDown(textbox, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(sansApiPost).toHaveBeenCalledWith(
+        "/workflow/copilot/demonstration/control",
+        {
+          demonstration_id: "demonstration-1",
+          action: "note",
+          text: "Pick the cheapest",
+        },
+      ),
+    );
+    await waitFor(() => expect(textbox.value).toBe(""));
+    expect(
+      screen.getByRole("button", { name: "Done, build the workflow" }),
+    ).toBeTruthy();
+    expect(streamCalls.some((item) => item.path.endsWith("/chat-post"))).toBe(
+      false,
+    );
+  });
+
   it("waits for stop and preserves a failed demonstration send for retry", async () => {
     await renderChat({ liveBrowserSessionId: "browser-1" });
     const call = await startDemonstration();

@@ -20,7 +20,9 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext, CopilotBrowserSessio
 from skyvern.forge.sdk.copilot.secret_redaction import redact_raw_secrets_for_prompt, redact_secretlike_filename
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.schemas.workflow_copilot import CopilotAttachedFile
-from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, scrambled_text_layer_reason
+from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError
+from skyvern.forge.sdk.utils.pdf_parser import extract_docx_file, extract_pdf_file, scrambled_text_layer_reason
+from skyvern.services.uploaded_file_service import upload_extension
 
 from ._shared import browser_is_lost, on_working_page
 
@@ -53,6 +55,15 @@ _DELIVERED_NOTE = (
     f"(some pages clear the input after reading it). {_RETRY_NOTE}"
 )
 _NOT_A_FILE_INPUT = "The selector does not name a file input, so nothing was set."
+_UNREADABLE_DOCUMENT = "The file could not be read as a PDF or a Word .docx document."
+_READ_UNAVAILABLE = (
+    "The document could not be read right now because the server was busy or the read timed out. Try again."
+)
+_EMPTY_PDF = "The PDF has no text layer (it may be scanned images), so no text could be extracted."
+_EMPTY_DOCX = (
+    "The Word document has no text in its body that could be read. Its content may be only images, text boxes, "
+    "headers and footers, or imported HTML or RTF content, none of which is read."
+)
 
 
 def _unavailable(file_id: str) -> dict[str, Any]:
@@ -141,13 +152,16 @@ def _not_attached(file_id: str) -> dict[str, Any]:
     return {"ok": False, "error": f"{file_id!r} is not an available file attached to this chat."}
 
 
-def _redacted_pdf_text(ctx: AgentContext, data: bytes, filename: str) -> tuple[str, str | None]:
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+def _redacted_document_text(ctx: AgentContext, data: bytes, filename: str) -> tuple[str, str | None]:
+    is_docx = upload_extension(filename) == "docx"
+    extract = extract_docx_file if is_docx else extract_pdf_file
+    with tempfile.NamedTemporaryFile(suffix=".docx" if is_docx else ".pdf") as handle:
         handle.write(data)
         handle.flush()
-        text = extract_pdf_file(handle.name, file_identifier=redact_secretlike_filename(filename))
+        text = extract(handle.name, file_identifier=redact_secretlike_filename(filename))
     # Redacted before windowing: a value cut across two windows would match neither pattern nor scrub.
-    return redact_raw_secrets_for_prompt(scrub_secrets_from_structure(ctx, text)), scrambled_text_layer_reason(text)
+    redacted = redact_raw_secrets_for_prompt(scrub_secrets_from_structure(ctx, text))
+    return redacted, None if is_docx else scrambled_text_layer_reason(text)
 
 
 def _window_end(text: str, start: int) -> int:
@@ -184,14 +198,21 @@ async def read_attached_pdf(ctx: AgentContext, file_id: str, offset: int = 0) ->
         return _not_attached(file_id)
     read: dict[str, Any] = {"file_id": file_id, "filename": redact_secretlike_filename(attached.filename)}
     try:
-        text, scrambled_reason = await asyncio.to_thread(_redacted_pdf_text, ctx, data, attached.filename)
+        text, scrambled_reason = await asyncio.to_thread(_redacted_document_text, ctx, data, attached.filename)
+    except CappedSubprocessError as exc:
+        retryable = exc.kind in ("no_headroom", "timeout")
+        return {**read, "ok": False, "error": _READ_UNAVAILABLE if retryable else _UNREADABLE_DOCUMENT}
+    except OSError:
+        # Parser failures arrive as PDFParsingError or CappedSubprocessError, so an OSError is this process failing to
+        # start the child or write the temp file.
+        return {**read, "ok": False, "error": _READ_UNAVAILABLE}
     except PDFParsingError:
-        return {**read, "ok": False, "error": "The file could not be read as a PDF."}
+        return {**read, "ok": False, "error": _UNREADABLE_DOCUMENT}
     if not text.strip():
         return {
             **read,
             "ok": False,
-            "error": "The PDF has no text layer (it may be scanned images), so no text could be extracted.",
+            "error": _EMPTY_DOCX if upload_extension(attached.filename) == "docx" else _EMPTY_PDF,
         }
 
     start, end = _window_bounds(text, offset)
@@ -225,6 +246,6 @@ async def read_attached_pdf(ctx: AgentContext, file_id: str, offset: int = 0) ->
         return {
             **read,
             "ok": False,
-            "error": "This part of the PDF could not be checked for passwords and other secrets, so its text was withheld.",
+            "error": "This part of the document could not be checked for passwords and other secrets, so its text was withheld.",
         }
     return {**read, "ok": True, "text": screened.partition(_SCREEN_CONTEXT_SEPARATOR)[2]}

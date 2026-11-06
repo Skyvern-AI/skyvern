@@ -719,6 +719,33 @@ def test_a_transport_code_outside_the_driver_message_is_not_a_proxy_error() -> N
     assert "PROXY_ERROR" not in categories
 
 
+def test_the_unreachable_host_marker_counts_only_from_its_own_exception_or_the_driver_message() -> None:
+    error = _driver_nav_failure("net::ERR_TUNNEL_CONNECTION_FAILED")
+    quoted = (
+        f"The page said the site {skyvern_exceptions.UNREACHABLE_HOST_NAV_ERROR_MARKER}. "
+        f"{_workflow_failure_reason(error)}"
+    )
+
+    # A plain navigation failure whose driver message itself leads with the marker.
+    url = "https://slow.example.test/"
+    plain = skyvern_exceptions.FailedToNavigateToUrl(
+        url=url,
+        error_message=(
+            f"slow.example.test {skyvern_exceptions.UNREACHABLE_HOST_NAV_ERROR_MARKER}: "
+            f"Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at {url}"
+        ),
+        nav_error_code="net::ERR_TUNNEL_CONNECTION_FAILED",
+    )
+
+    # With the exception in hand its type decides; without it, only the driver message can carry the marker.
+    for categories in (
+        _classify(quoted, error, fallback_to_unknown=True),
+        _classify(quoted, fallback_to_unknown=True),
+        _classify(_workflow_failure_reason(plain), plain, fallback_to_unknown=True),
+    ):
+        assert derive_failure_attribution(categories)["failure_category"] == "PROXY_ERROR"
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -729,6 +756,16 @@ def test_a_transport_code_outside_the_driver_message_is_not_a_proxy_error() -> N
                 error_message="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://gone.example.test/",
             ),
             id="target_with_no_dns_record_borrows_the_tunnel_code",
+        ),
+        pytest.param(
+            skyvern_exceptions.UnreachableNavigationHost(
+                url="https://slow.example.test/",
+                host="slow.example.test",
+                upstream_status=599,
+                error_message="Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://slow.example.test/",
+                nav_error_code="net::ERR_TUNNEL_CONNECTION_FAILED",
+            ),
+            id="target_the_proxy_provider_could_not_reach_keeps_the_tunnel_code",
         ),
         pytest.param(_driver_nav_failure("net::ERR_CERT_AUTHORITY_INVALID"), id="site_certificate_chain"),
         pytest.param(_driver_nav_failure("net::ERR_NAME_NOT_RESOLVED"), id="site_dns"),

@@ -80,6 +80,9 @@ def resolve_error_code_mapping_key(code: object, error_code_mapping: dict[str, s
 
 
 BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE = "BROWSER_DOWNLOAD_PARTIAL_FAILURE"
+BROWSER_DOWNLOAD_LIMIT_EXCEEDED_CODE = "BROWSER_DOWNLOAD_LIMIT_EXCEEDED"
+BROWSER_DOWNLOAD_FAILED_CODE = "BROWSER_DOWNLOAD_FAILED"
+BROWSER_DOWNLOAD_FAILED_REASON = "The requested browser download could not be saved."
 
 
 def drop_unsolicited_download_errors(
@@ -94,6 +97,18 @@ def drop_unsolicited_download_errors(
     if downloaded_files is not None and not downloaded_files:
         return errors
     return [error for error in errors if error.get("error_code") != BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE]
+
+
+def drop_requested_download_failure_reasons(reasons: list[str], *, materialized_a_file: bool) -> list[str]:
+    """Keep the requested-download capture failure only while no file landed for that request.
+
+    A portal can serve an error page or session gate next to the real file, and the refused capture
+    outlives the download because the file often arrives by a route the interceptor never accounts for.
+    A cap breach keeps its own reason, and so does a file lost after it was saved.
+    """
+    if not materialized_a_file:
+        return reasons
+    return [reason for reason in reasons if reason != BROWSER_DOWNLOAD_FAILED_REASON]
 
 
 class SkyvernDefinedError(BaseModel):
