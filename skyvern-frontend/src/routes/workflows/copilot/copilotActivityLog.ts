@@ -745,7 +745,12 @@ function isFailedTest(row: ActivityRow): boolean {
       (entry) =>
         entry.toolName !== undefined && toolCallKind(entry.toolName) === "run",
     );
-  return lastRun?.kind === "tool_result" && lastRun.success === false;
+  // A failed call that dispatched no run was refused before it started; it is not a failed test.
+  return (
+    lastRun?.kind === "tool_result" &&
+    lastRun.success === false &&
+    lastRun.workflowRunId !== undefined
+  );
 }
 
 export interface FinishedTurnSummary {

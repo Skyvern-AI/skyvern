@@ -6122,7 +6122,9 @@ async def test_candidate_run_bind_after_a_rejected_restore_dispatches_only_the_s
         assert forge_app.WORKFLOW_SERVICE.execute_workflow.call_count == 0
     elif case == "other_settings":
         second = await _run_extract_heading(ctx)
-        assert [first, second] == [{"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR}] * 2
+        assert [first, second] == [
+            {"ok": False, "error": COPILOT_PROPOSAL_SETTINGS_CHANGED_ERROR, "data": {"run_dispatched": False}}
+        ] * 2
         workflow_service_module.prepare_workflow.assert_not_awaited()
         assert ctx.private_workflow_settings == settings_before
         assert (ctx.proposal_owner_turn_id, ctx.proposal_revision, ctx.staged_workflow) == ("turn-one", 1, None)
