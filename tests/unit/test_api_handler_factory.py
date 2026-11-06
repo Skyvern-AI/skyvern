@@ -1405,7 +1405,7 @@ def test_uses_only_anthropic_models_rejects_openai_claude_proxy() -> None:
 
 
 def test_normalize_llm_model_strips_provider_prefix() -> None:
-    """LiteLLM returns model names with provider prefixes; dbt expects the bare name."""
+    """LiteLLM returns model names with provider prefixes; downstream cost aggregation expects the bare name."""
     assert api_handler_factory._normalize_llm_model("vertex_ai/gemini-3-flash-preview") == "gemini-3-flash-preview"
     assert api_handler_factory._normalize_llm_model("openai/gpt-4.1-mini") == "gpt-4.1-mini"
     assert api_handler_factory._normalize_llm_model("gpt-4") == "gpt-4"
