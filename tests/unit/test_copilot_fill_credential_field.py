@@ -95,7 +95,9 @@ _FIXTURE_LOGIN_URL = "https://authenticationtest.com/simpleFormAuth/"
 def _resolved_credential(
     credential_id: str = "cred_123", tested_url: str | None = _FIXTURE_LOGIN_URL
 ) -> SimpleNamespace:
-    return SimpleNamespace(credential_id=credential_id, name="authtest simple", tested_url=tested_url)
+    return SimpleNamespace(
+        credential_id=credential_id, name="authtest simple", tested_url=tested_url, extra_site_urls=[]
+    )
 
 
 def _policy(**overrides: Any) -> RequestPolicy:
@@ -1550,6 +1552,7 @@ def _org_credential(
         credential_id=credential_id,
         name=name,
         tested_url=tested_url,
+        extra_site_urls=[],
         credential_type=credential_type,
         totp_type=totp_type,
     )
@@ -1788,7 +1791,9 @@ class TestCredentialFillLivePageAdmission:
     ) -> tuple[Any, str | None]:
         """Grant for a resolved credential carrying no saved login URL."""
         resolved: list[Any] = [_resolved_credential(tested_url=None)]
-        resolved.extend(SimpleNamespace(credential_id=extra, tested_url=None) for extra in also_resolved or [])
+        resolved.extend(
+            SimpleNamespace(credential_id=extra, tested_url=None, extra_site_urls=[]) for extra in also_resolved or []
+        )
         policy = RequestPolicy(resolved_credentials=resolved)
         policy.user_provided_site_urls = list(user_urls or [])
         if named:

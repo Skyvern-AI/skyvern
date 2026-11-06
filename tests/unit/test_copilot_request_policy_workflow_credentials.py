@@ -53,6 +53,7 @@ def _cred(name: str, credential_id: str, *, tested_url: str | None = None) -> Si
         name=name,
         credential_id=credential_id,
         tested_url=tested_url,
+        extra_site_urls=[],
         credential_type=CredentialType.PASSWORD,
         username="user@example.test",
         totp_type=None,

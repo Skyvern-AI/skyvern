@@ -820,6 +820,7 @@ class WorkflowRunContext:
         self.authorized_vault_item_ids: set[tuple[str, str | None, str]] = set()
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
+        self.credential_extra_site_urls: dict[str, list[str]] = {}
         # The sites each Bitwarden login's item is saved for, which a code block checks its release against.
         self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
         self.materialized_file_paths: dict[str, tuple[str, str]] = {}
@@ -1804,6 +1805,8 @@ class WorkflowRunContext:
         self.resolved_credential_parameter_ids[parameter.key] = credential_id
         if db_credential.tested_url:
             self.credential_tested_urls[parameter.key] = db_credential.tested_url
+        if db_credential.extra_site_urls:
+            self.credential_extra_site_urls[parameter.key] = db_credential.extra_site_urls
 
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
         fetch.provider = vault_type

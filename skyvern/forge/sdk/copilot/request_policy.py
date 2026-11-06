@@ -75,6 +75,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.schemas.google_sheets import extract_spreadsheet_id
 from skyvern.utils.strings import escape_code_fences
@@ -1105,6 +1106,9 @@ class RequestPolicy:
     # The site each approval or proposal carried in from an earlier turn recorded. Naming the credential
     # again drops it from live_page_admitted_urls, so the pick card reads it here.
     carried_credential_urls: dict[str, str] = field(default_factory=dict)
+    # credential_id -> origins the user saved the login for from a site question this turn, read back from the
+    # re-read row; an existing workflow's blocks may move onto them without broadening the login's scope.
+    user_confirmed_site_origins: dict[str, set[str]] = field(default_factory=dict)
     # Sites the user themselves provided anywhere in this chat, one URL per origin. A credential may
     # only be released onto one of these (or a vault/tested match); a site only a model produced is
     # never eligible.
@@ -1172,6 +1176,23 @@ class RequestPolicy:
         for urls in (self.live_page_admitted_urls, self.carried_credential_urls):
             if ref in urls:
                 urls[credential_id] = urls.pop(ref)
+
+    def refresh_credential(self, credential: Credential) -> None:
+        """Swap in a re-read row wherever this turn holds the credential, so its saved sites are current."""
+        for credentials in (self.resolved_credentials, self.auto_bound_credentials, self.discovered_credentials):
+            for index, held in enumerate(credentials):
+                if held.credential_id == credential.credential_id:
+                    credentials[index] = credential
+
+    def credential_saved_site_urls(self, credential_id: str) -> list[str]:
+        return next(
+            (
+                saved_site_urls(credential.tested_url, credential.extra_site_urls)
+                for credential in self.resolved_credentials
+                if credential.credential_id == credential_id
+            ),
+            [],
+        )
 
     def credential_intended_url(self, credential_id: str) -> str | None:
         admitted_url = self.live_page_admitted_urls.get(credential_id)
@@ -4407,6 +4428,9 @@ def credential_candidate_label(credential: Credential) -> str:
     facts: list[str] = []
     if credential.tested_url:
         facts.append(f'tested_url: "{_account_state_atom(credential.tested_url)}"')
+    if credential.extra_site_urls:
+        extra = ", ".join(f'"{_account_state_atom(url)}"' for url in credential.extra_site_urls)
+        facts.append(f"also saved for: {extra}")
     if credential.totp_type != TotpType.NONE:
         facts.append(f"totp_type: {credential.totp_type}")
     if not facts:

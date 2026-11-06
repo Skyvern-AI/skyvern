@@ -13515,6 +13515,14 @@
             "title": "Tested Url",
             "description": "Login page URL used during the credential test"
           },
+          "extra_site_urls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Extra Site Urls",
+            "description": "More sites this login may sign in on, each covering its whole site"
+          },
           "user_context": {
             "anyOf": [
               {
