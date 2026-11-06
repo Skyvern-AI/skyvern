@@ -13,6 +13,10 @@ import { EditorTab, type StudioWorkspaceProps } from "./EditorTab";
 vi.mock("@/routes/workflows/editor/Workspace", () => ({
   Workspace: () => <div data-testid="workspace" />,
 }));
+vi.mock(
+  "@/routes/workflows/editor/nodes/AgentStepNode/AgentStepCallPanel",
+  () => ({ AgentStepCallPanel: () => null }),
+);
 
 const blockingBlock: RunBlockingBlock = {
   id: "nested-block",

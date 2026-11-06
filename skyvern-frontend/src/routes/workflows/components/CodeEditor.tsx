@@ -278,7 +278,7 @@ function CodeEditorImpl({
       theme={themeMode === "dark" ? tokyoNightStorm : tokyoNightDay}
       minHeight={minHeight}
       maxHeight={maxHeight}
-      readOnly={readOnly || mutationLocked}
+      readOnly={readOnly || scopeReadOnly || mutationLocked}
       editable={!mutationLocked}
       autoFocus={autoFocus}
       className={cn("cursor-auto", className)}

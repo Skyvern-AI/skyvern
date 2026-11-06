@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import structlog
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, undefer
 
 from skyvern.forge.failure_classifier import DIAGNOSABLE_FAILURE_STATUSES, has_classifier_primary, with_diagnostic_entry
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -34,9 +34,10 @@ from skyvern.forge.sdk.db.utils import (
     downloaded_file_count_from_output,
     prefer_capped_columns,
     serialize_proxy_location,
+    truncate_oversized_jsonb_value,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
-from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.forge.sdk.schemas.workflow_runs import AgentStepToolCall, WorkflowRunBlock
 from skyvern.forge.sdk.services.audit_events import record_run_cancel_audit
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
@@ -216,6 +217,29 @@ class ObserverRepository(BaseRepository):
                     organization_id=organization_id,
                     amount=amount,
                 )
+
+    @db_operation("update_workflow_run_block_tool_calls")
+    async def update_workflow_run_block_tool_calls(
+        self,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+        tool_calls: list[AgentStepToolCall],
+    ) -> None:
+        stored = [call.model_dump(mode="json", exclude_none=True) for call in tool_calls]
+        async with self.Session() as session:
+            await session.execute(
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.workflow_run_block_id == workflow_run_block_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .values(
+                    tool_calls=truncate_oversized_jsonb_value(
+                        stored, context={"workflow_run_block_id": workflow_run_block_id}
+                    ),
+                    # A display-only column; moving modified_at would change the block's reported duration.
+                    modified_at=WorkflowRunBlockModel.modified_at,
+                )
+            )
+            await session.commit()
 
     @db_operation("create_task_v2")
     async def create_task_v2(
@@ -940,6 +964,7 @@ class ObserverRepository(BaseRepository):
         workflow_run_id: str,
         organization_id: str | None = None,
         prefer_capped: bool = False,
+        with_tool_calls: bool = False,
     ) -> list[WorkflowRunBlock]:
         async with self.Session() as session:
             if prefer_capped:
@@ -952,6 +977,8 @@ class ObserverRepository(BaseRepository):
                 )
                 capped_block = aliased(WorkflowRunBlockModel, capped, adapt_on_names=True)
                 query = select(capped_block).order_by(capped_block.created_at.desc())
+                if with_tool_calls:
+                    query = query.options(undefer(capped_block.tool_calls))
             else:
                 query = (
                     select(WorkflowRunBlockModel)
@@ -959,6 +986,8 @@ class ObserverRepository(BaseRepository):
                     .filter_by(organization_id=organization_id)
                     .order_by(WorkflowRunBlockModel.created_at.desc())
                 )
+                if with_tool_calls:
+                    query = query.options(undefer(WorkflowRunBlockModel.tool_calls))
             workflow_run_blocks = (await session.scalars(query)).all()
             if self._task_reader is None:
                 raise RuntimeError("task_reader dependency not set")
