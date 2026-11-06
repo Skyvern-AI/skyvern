@@ -1,5 +1,6 @@
 import { graphNoteReadings } from "./noteSequences";
 import { useSearchParams } from "react-router-dom";
+import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
 import {
   type HTMLAttributes,
   type Ref,
@@ -65,6 +66,7 @@ import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
 import { DocStepSearch } from "./DocStepSearch";
 import { DocAddStep, DocScope, type DocNoteProblem } from "./DocScope";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { DocSidePanel } from "./DocSidePanel";
 import { DocText } from "./DocText";
 import { DocEditBar } from "./DocEditing";
@@ -186,6 +188,8 @@ const InputChip = forwardRef<
   );
 });
 
+const REPLACE_WAIT_MS = 120_000;
+
 export function WorkflowDocEditor({
   nodes: liveNodes,
   edges: liveEdges,
@@ -215,7 +219,12 @@ export function WorkflowDocEditor({
   const [searchParams] = useSearchParams();
   // A full run from the Doc holds the doc still (no adding or inserting); a one-step run doesn't.
   const fullRunGoing = docRun.live && docRun.owned && !searchParams.has("bl");
-  const editable = !scopeReadOnly && !locked && !proposal && !fullRunGoing;
+  // A demonstration anchors its insertion by step labels, so the Doc holds still while one runs.
+  const demonstrating = useRecordingLauncherStore(
+    (s) => s.demonstration !== null,
+  );
+  const editable =
+    !scopeReadOnly && !locked && !proposal && !fullRunGoing && !demonstrating;
   const showingProposal = proposal !== null;
   const setDocMounted = useWorkflowPresentationStore((s) => s.setDocMounted);
   useEffect(() => {
@@ -399,6 +408,54 @@ export function WorkflowDocEditor({
   }, [tree, byId, blocksByLabel, branches]);
   const selectBranch = (conditionalId: string, branchId: string) =>
     setBranches((current) => ({ ...current, [conditionalId]: branchId }));
+  const startDemonstration = useRecordingLauncherStore(
+    (s) => s.startDemonstration,
+  );
+  // An empty step a recording is meant to replace goes only once the recording is open, so a refused or failed start leaves it.
+  const replaceOnRecording = useRef<{
+    id: string;
+    insertion: WorkflowCopilotDemonstrationInsertion;
+    failures: number;
+    timer: ReturnType<typeof setTimeout>;
+  } | null>(null);
+  const latestEdit = useRef<{
+    removeBlankStep: (id: string) => boolean;
+  } | null>(null);
+  useEffect(
+    () =>
+      useRecordingLauncherStore.subscribe((state) => {
+        const pending = replaceOnRecording.current;
+        if (!pending) return;
+        if (state.demonstrationStartFailures !== pending.failures) {
+          clearTimeout(pending.timer);
+          replaceOnRecording.current = null;
+          return;
+        }
+        const status = state.demonstration;
+        if (!status) return;
+        if (status.phase === "stopped") {
+          clearTimeout(pending.timer);
+          replaceOnRecording.current = null;
+        } else if (
+          status.phase === "recording" &&
+          status.insertion?.after_label === pending.insertion.after_label &&
+          status.insertion?.before_label === pending.insertion.before_label
+        ) {
+          clearTimeout(pending.timer);
+          replaceOnRecording.current = null;
+          latestEdit.current?.removeBlankStep(pending.id);
+        }
+      }),
+    [],
+  );
+  useEffect(
+    () => () => {
+      const waiting = replaceOnRecording.current;
+      if (waiting) clearTimeout(waiting.timer);
+      replaceOnRecording.current = null;
+    },
+    [],
+  );
   const openStepSettings = (id: string) => {
     panelOpener.current = document.activeElement as HTMLElement;
     panelStepId.current = id;
@@ -432,6 +489,7 @@ export function WorkflowDocEditor({
       return added;
     },
   };
+  latestEdit.current = edit;
   // References to step outputs that no step saves any more, for the inline "missing" pills.
   const missingOutputs = useMemo(() => {
     const labels = new Set(
@@ -1045,6 +1103,31 @@ export function WorkflowDocEditor({
         edit,
         destinations: () =>
           docDestinations(tree.items, byId, (node) => docStepTitle(node)),
+        demonstrateAt: (place, replacing) => {
+          const insertion = startDemonstration
+            ? (edit?.demonstrationInsertion(place, replacing) ?? null)
+            : null;
+          return insertion && startDemonstration
+            ? () => {
+                // The wait ends when the recording opens or the start is refused or fails; the timer is only a safety net.
+                const waiting = replaceOnRecording.current;
+                if (waiting) clearTimeout(waiting.timer);
+                replaceOnRecording.current = replacing
+                  ? {
+                      id: replacing,
+                      insertion,
+                      failures:
+                        useRecordingLauncherStore.getState()
+                          .demonstrationStartFailures,
+                      timer: setTimeout(() => {
+                        replaceOnRecording.current = null;
+                      }, REPLACE_WAIT_MS),
+                    }
+                  : null;
+                startDemonstration({ insertion, keepEditor: true });
+              }
+            : null;
+        },
         outputUsers: (id) =>
           findOutputUsers(nodes, id).map((node) => ({
             id: node.id,

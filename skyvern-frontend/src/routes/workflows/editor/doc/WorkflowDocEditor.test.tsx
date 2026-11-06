@@ -8,7 +8,15 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  onTestFinished,
+  test,
+  vi,
+} from "vitest";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactFlowProvider } from "@xyflow/react";
@@ -32,6 +40,10 @@ import { splitAtCaret } from "./docCaret";
 import { block, conditional, forLoop, settings } from "./docTestBlocks";
 import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import {
+  noteDemonstrationStartFailed,
+  useRecordingLauncherStore,
+} from "@/store/useRecordingLauncherStore";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("./useDocRun", () => ({
@@ -299,6 +311,10 @@ describe("WorkflowDocEditor navigation", () => {
     });
 
     test("Tab on a note under an empty loop opens the step menu and picks no type", () => {
+      useRecordingLauncherStore.setState({ startDemonstration: vi.fn() });
+      onTestFinished(() =>
+        useRecordingLauncherStore.setState({ startDemonstration: null }),
+      );
       const edits = editsWithAdd();
       renderDoc(
         [
@@ -312,6 +328,7 @@ describe("WorkflowDocEditor navigation", () => {
       fireEvent.keyDown(box, { key: "Tab" });
 
       expect(screen.getByPlaceholderText("Add a step…")).toBeTruthy();
+      expect(screen.queryByText("Demonstrate task")).toBe(null);
       expect(edits.addStep).not.toHaveBeenCalled();
     });
   });
@@ -1192,5 +1209,241 @@ describe("Doc inputs", () => {
     expect(prompt().parameterKeys).toEqual([]);
     rendered.rerender(view());
     expect(screen.getByTitle("{{ search }}: missing reference")).toBeTruthy();
+  });
+});
+
+describe("Demonstrate task in the step menu", () => {
+  const edits: DocGraphEdits = {
+    apply: vi.fn(),
+    update: vi.fn(),
+    addStep: vi.fn(() => null),
+    duplicate: vi.fn(),
+  };
+  const start = vi.fn();
+  const twoSteps = [
+    code("first_step", "second_step"),
+    code("second_step", null),
+  ];
+  const emptyLoop = {
+    ...loop,
+    loop_blocks: [],
+  } as unknown as WorkflowBlock;
+
+  beforeEach(() => {
+    docRun.current = { runId: null, blocksByLabel: new Map(), live: false };
+    useWorkflowYamlEditorStore.setState(
+      useWorkflowYamlEditorStore.getInitialState(),
+    );
+    useWorkflowParametersStore.setState({ parameters: [] });
+    useRecordingLauncherStore.setState({
+      startDemonstration: start,
+      demonstration: null,
+    });
+    start.mockClear();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
+      cb();
+      return 0;
+    });
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+  afterEach(() => {
+    cleanup();
+    useRecordingLauncherStore.setState({
+      startDemonstration: null,
+      demonstration: null,
+    });
+    vi.unstubAllGlobals();
+  });
+
+  test("Add step records after the last step, keeps the Doc open, and the item is searchable", () => {
+    renderDoc(twoSteps, edits);
+    fireEvent.click(screen.getByRole("button", { name: "+ Add step" }));
+
+    expect(screen.getByText("Copilot")).toBeTruthy();
+    expect(screen.getByText("Show Copilot how in the browser")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+      target: { value: "demo" },
+    });
+    expect(screen.queryByText("No step matches.")).toBe(null);
+
+    fireEvent.click(screen.getByText("Demonstrate task"));
+    expect(start).toHaveBeenCalledWith({
+      insertion: { after_label: "second_step", before_label: null },
+      keepEditor: true,
+    });
+  });
+
+  test("the item is left out without a live browser and inside a loop", () => {
+    useRecordingLauncherStore.setState({ startDemonstration: null });
+    renderDoc(twoSteps, edits);
+    fireEvent.click(screen.getByRole("button", { name: "+ Add step" }));
+    expect(screen.queryByText("Demonstrate task")).toBe(null);
+    cleanup();
+
+    useRecordingLauncherStore.setState({ startDemonstration: start });
+    renderDoc([emptyLoop], edits);
+    fireEvent.click(screen.getByRole("button", { name: "+ Add a step" }));
+    expect(screen.queryByText("Demonstrate task")).toBe(null);
+  });
+
+  test("the Doc holds still while a recording runs, so its anchor steps cannot move", () => {
+    useRecordingLauncherStore.setState({
+      demonstration: {
+        phase: "recording",
+        actionCount: 1,
+        interrupted: false,
+        insertion: { after_label: "first_step", before_label: "second_step" },
+      },
+    });
+    renderDoc(twoSteps, edits);
+
+    expect(screen.queryByRole("button", { name: "+ Add step" })).toBe(null);
+  });
+
+  test("a running recording shows one status line between the steps it will land between", () => {
+    useRecordingLauncherStore.setState({
+      demonstration: {
+        phase: "recording",
+        actionCount: 2,
+        interrupted: false,
+        insertion: { after_label: "first_step", before_label: "second_step" },
+      },
+    });
+    renderDoc(twoSteps, edits);
+
+    const line = screen.getByRole("status");
+    expect(line.textContent).toBe("Demonstrating · 2 actions");
+    const first = screen.getByText(/first_step|first step/i);
+    const second = screen.getByText(/second_step|second step/i);
+    expect(
+      first.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      second.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+  });
+  describe("from an empty step", () => {
+    const blankBetween = [
+      block("goto_url", "first_step", "blank_step", { url: "https://a.test" }),
+      block("goto_url", "blank_step", "second_step", { url: "" }),
+      code("second_step", null),
+    ];
+    const recording = (phase: "recording" | "stopped") => ({
+      phase,
+      actionCount: 0,
+      interrupted: false,
+      insertion: { after_label: "first_step", before_label: "second_step" },
+    });
+    beforeEach(() => {
+      vi.stubGlobal("CSS", { escape: (value: string) => value });
+    });
+    // jsdom has no innerText; the line reads its text through it.
+    const openLine = (name: string, text: string, at: number) => {
+      fireEvent.focus(screen.getByRole("textbox", { name }));
+      const box = screen.getByRole("textbox", { name });
+      Object.defineProperty(box, "innerText", {
+        value: text,
+        configurable: true,
+      });
+      box.textContent = text;
+      const range = document.createRange();
+      if (box.firstChild) range.setStart(box.firstChild, at);
+      else range.setStart(box, 0);
+      range.collapse(true);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      return box;
+    };
+    const startFromBlank = () => {
+      const applied = {
+        apply: vi.fn(),
+        update: vi.fn(),
+        addStep: vi.fn(() => null),
+        duplicate: vi.fn(),
+      } as DocGraphEdits;
+      renderDoc(blankBetween, applied);
+      fireEvent.keyDown(openLine("blank_step url", "", 0), { key: "/" });
+      fireEvent.click(screen.getByText("Demonstrate task"));
+      return applied;
+    };
+
+    test("records between its neighbours and drops the step only once the recording is open", () => {
+      const applied = startFromBlank();
+
+      expect(start).toHaveBeenCalledWith({
+        insertion: { after_label: "first_step", before_label: "second_step" },
+        keepEditor: true,
+      });
+      expect(applied.apply).not.toHaveBeenCalled();
+
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("recording"),
+        }),
+      );
+      const kept = vi.mocked(applied.apply).mock.calls[0]![0].nodes;
+      expect(kept.filter(isWorkflowBlockNode).map((n) => n.data.label)).toEqual(
+        ["first_step", "second_step"],
+      );
+    });
+
+    test("a start that fails or is refused leaves the step, even for a later recording in the same place", () => {
+      const applied = startFromBlank();
+
+      act(() => noteDemonstrationStartFailed());
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("recording"),
+        }),
+      );
+      expect(applied.apply).not.toHaveBeenCalled();
+    });
+
+    test("a slow start that opens after 25 seconds still replaces the step", () => {
+      vi.useFakeTimers();
+      try {
+        const applied = startFromBlank();
+
+        act(() => {
+          vi.advanceTimersByTime(25_000);
+        });
+        expect(applied.apply).not.toHaveBeenCalled();
+        act(() =>
+          useRecordingLauncherStore.setState({
+            demonstration: recording("recording"),
+          }),
+        );
+        const kept = vi.mocked(applied.apply).mock.calls[0]![0].nodes;
+        expect(
+          kept.filter(isWorkflowBlockNode).map((n) => n.data.label),
+        ).toEqual(["first_step", "second_step"]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    test("a recording that stops before it is open leaves the step in place", () => {
+      const applied = startFromBlank();
+
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("stopped"),
+        }),
+      );
+      act(() =>
+        useRecordingLauncherStore.setState({
+          demonstration: recording("recording"),
+        }),
+      );
+      expect(applied.apply).not.toHaveBeenCalled();
+    });
   });
 });

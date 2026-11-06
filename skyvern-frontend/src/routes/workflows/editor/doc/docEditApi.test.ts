@@ -832,4 +832,81 @@ describe("building from scratch in the doc", () => {
       (byLabel(latest(), "after").data as Record<string, unknown>).notes,
     ).toBe(big);
   });
+  test("a recording takes the place of an empty step instead of landing after it", () => {
+    const graph = getElements(
+      [
+        block("goto_url", "go_to_url_1", "go_to_url_2", {
+          url: "https://a.test",
+        }),
+        block("goto_url", "go_to_url_2", "extract", { url: "" }),
+        code("extract", null, { description: "keep me" }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    let applied = graph;
+    const api = createDocEditApi({
+      ...graph,
+      edits: {
+        apply: (next) => {
+          applied = next;
+        },
+        update: () => {},
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const blank = graph.nodes.find((n) => n.data.label === "go_to_url_2")!;
+    const place = { scope: TOP_SCOPE, index: 1 };
+
+    expect(api.canReplaceBlankStep(blank.id)).toBe(true);
+    expect(api.demonstrationInsertion({ ...place, index: 2 })).toEqual({
+      after_label: "go_to_url_2",
+      before_label: "extract",
+    });
+    expect(api.demonstrationInsertion(place, blank.id)).toEqual({
+      after_label: "go_to_url_1",
+      before_label: "extract",
+    });
+    const written = graph.nodes.find((n) => n.data.label === "extract")!;
+    expect(api.canReplaceBlankStep(written.id)).toBe(false);
+    expect(api.removeBlankStep(blank.id)).toBe(true);
+    expect(applied.nodes.some((n) => n.data.label === "go_to_url_2")).toBe(
+      false,
+    );
+  });
+  test("an empty step another step reads the output of is not replaced", () => {
+    const graph = getElements(
+      [
+        block("goto_url", "go_to_url_1", "extract", { url: "" }),
+        code("extract", null, { code: "{{ go_to_url_1_output }}" }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const api = createDocEditApi({
+      ...graph,
+      edits: {
+        apply: () => {},
+        update: () => {},
+        addStep: () => null,
+        duplicate: () => {},
+      },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const blank = graph.nodes.find((n) => n.data.label === "go_to_url_1")!;
+
+    expect(api.canReplaceBlankStep(blank.id)).toBe(false);
+  });
 });

@@ -3,7 +3,9 @@ import {
   useContext,
   useRef,
   useState,
+  type ContextType,
   type DragEvent,
+  type MutableRefObject,
   type ReactNode,
 } from "react";
 import { cn } from "@/util/utils";
@@ -25,6 +27,9 @@ import { DocEditableLine, DocInsertPopover } from "./DocEditing";
 import { NOTE_MAX_LENGTH, type DocScopeRef } from "./docGraphEdits";
 import { TOP_SCOPE, type DocPlace } from "./docEditApi";
 import { DocStepResult } from "./DocStepResult";
+import { DocDemonstrationLine } from "./DocDemonstrationLine";
+import { demonstrationLineIndex } from "./docDemonstration";
+import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import {
   requestCaretAtStart,
   runStepByKey,
@@ -229,6 +234,18 @@ function DocNode({
           open={inserting}
           onOpenChange={setInserting}
           onDismiss={() => finishSlash.current?.(true)}
+          onDemonstrate={
+            place &&
+            item.kind === "step" &&
+            !place.isFinally &&
+            actions.edit?.canReplaceBlankStep(node.id)
+              ? demonstrateFrom(actions, place, finishSlash, node.id)
+              : demonstrateFrom(
+                  actions,
+                  place && { scope: place.scope, index: place.index + 1 },
+                  finishSlash,
+                )
+          }
           onPick={(type) => {
             finishSlash.current?.(false);
             if (!place || !actions.edit) return;
@@ -341,6 +358,22 @@ function DocNode({
   );
 }
 
+// The menu's "Demonstrate task" for a place; a "/" line closes without typing the slash first.
+function demonstrateFrom(
+  actions: ContextType<typeof WorkflowDocActionsContext>,
+  place: DocPlace | undefined,
+  finishSlash?: MutableRefObject<((keepSlash: boolean) => void) | null>,
+  replacing?: string,
+) {
+  const start = place ? actions.demonstrateAt(place, replacing) : null;
+  return start
+    ? () => {
+        finishSlash?.current?.(false);
+        start();
+      }
+    : null;
+}
+
 // Drop target handlers: the target highlights while a step is over it.
 function useDropTarget(onDrop: (() => void) | undefined) {
   const [over, setOver] = useState(false);
@@ -402,6 +435,7 @@ export function DocAddStep({
     <DocInsertPopover
       open={open}
       onOpenChange={setOpen}
+      onDemonstrate={demonstrateFrom(actions, place)}
       onPick={(type) =>
         actions.setFocusId(actions.edit?.insertStep(place, type) ?? null)
       }
@@ -456,6 +490,10 @@ function DocNote({
     <DocInsertPopover
       open={inserting}
       onOpenChange={setInserting}
+      onDemonstrate={
+        // Tab on a note under an empty loop or branch picks a step for that scope, which has no demonstration insertion.
+        pickInto.current ? null : demonstrateFrom(actions, place, finishSlash)
+      }
       onDismiss={() => {
         // Closing the Tab menu leaves the note where it was; closing the "/" menu types the "/".
         finishSlash.current?.(true, !pickInto.current);
@@ -689,6 +727,20 @@ export function DocScope({
     return place ? <DocDropZone onDrop={dropAt(place.index)} /> : null;
   };
   const hasFinally = steps.some((s) => s.finally);
+  const demonstration = useRecordingLauncherStore((s) => s.demonstration);
+  const lineAt =
+    demonstration && scope && !scope.parentId && !scope.conditionalBranchId
+      ? demonstrationLineIndex(
+          items,
+          (id) => {
+            const node = byId.get(id);
+            return node && isWorkflowBlockNode(node)
+              ? node.data.label
+              : undefined;
+          },
+          demonstration.insertion,
+        )
+      : -1;
   return (
     <div className="flex min-w-0 flex-col gap-3 py-[3px]">
       {items.map((item, index) => (
@@ -702,10 +754,16 @@ export function DocScope({
                 : item.nodeId
           }
         >
+          {lineAt === index && demonstration && (
+            <DocDemonstrationLine status={demonstration} />
+          )}
           {zoneBefore(index)}
           {renderItem(item, index)}
         </Fragment>
       ))}
+      {lineAt === items.length && demonstration && (
+        <DocDemonstrationLine status={demonstration} />
+      )}
       {dropping && !hasFinally && steps.length > 0 && (
         <DocDropZone onDrop={dropAt(movable.length)} />
       )}

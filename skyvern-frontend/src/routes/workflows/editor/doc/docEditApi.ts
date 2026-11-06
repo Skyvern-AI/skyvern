@@ -15,6 +15,8 @@ import {
 } from "../nodes";
 import { availableNodeLibraryItems } from "../panels/nodeLibraryItems";
 import type { AddNodeProps } from "../Workspace";
+import { demonstrationInsertionFromNodes } from "../workspaceAuthoringActions";
+import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
 import {
   getUpdatedParametersAfterLabelUpdateForSourceParameterKey,
   inferBranchCriteriaTypeFromExpression,
@@ -40,6 +42,7 @@ import {
   contextInputsFedBy,
   findOutputUsers,
   hasSettingsBeyondText,
+  isBlankStep,
   NOTE_MAX_LENGTH,
   removeBlock,
   readChain,
@@ -289,7 +292,46 @@ export function createDocEditApi({
     return added;
   };
 
+  // A recording starts only in the top-level sequence; inside a loop or branch there is no insertion.
+  const demonstrationInsertion = (
+    place: DocPlace,
+    replacing?: string,
+  ): WorkflowCopilotDemonstrationInsertion | null => {
+    if (place.scope.parentId || place.scope.conditionalBranchId) return null;
+    // The empty step being replaced is not a neighbour: the recording goes where it stood.
+    const without =
+      replacing && canReplaceBlankStep(replacing)
+        ? removeBlock(graph, replacing, finallyId)
+        : null;
+    const base = without ?? graph;
+    const point = insertionPoint(base, place.scope, place.index, finallyId);
+    return point ? demonstrationInsertionFromNodes(base.nodes, point) : null;
+  };
+
+  // Drops an empty step so a demonstration can take its place; false when it holds anything.
+  const canReplaceBlankStep = (id: string): boolean => {
+    const node = nodes.find((n) => n.id === id);
+    if (!node || !isBlankStep(node)) return false;
+    const { parameters } = useWorkflowParametersStore.getState();
+    // Removing the step would strip the {{ step_output }} references other steps hold.
+    return (
+      !contextInputsFedBy(nodes, parameters, id).length &&
+      !findOutputUsers(nodes, id).length
+    );
+  };
+
+  const removeBlankStep = (id: string): boolean => {
+    if (!canReplaceBlankStep(id)) return false;
+    const next = removeBlock(graph, id, finallyId);
+    if (!next) return false;
+    edits.apply(next);
+    return true;
+  };
+
   return {
+    demonstrationInsertion,
+    removeBlankStep,
+    canReplaceBlankStep,
     setText: (id: string, key: string, value: string) =>
       edits.update((current) => {
         const before = current.find((n) => n.id === id)?.data as

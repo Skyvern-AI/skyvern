@@ -83,10 +83,13 @@ function useDocBoundary() {
 /** The "Add a step…" list, also used by "Turn into…". */
 export function DocStepPicker({
   onPick,
+  onDemonstrate,
   exclude = [],
   placeholder = "Add a step…",
 }: {
   onPick: (nodeType: NodeType) => void;
+  // Offers "Demonstrate task" first; left out where a demonstration can't start.
+  onDemonstrate?: () => void;
   exclude?: string[];
   placeholder?: string;
 }) {
@@ -119,6 +122,31 @@ export function DocStepPicker({
       />
       <CommandList className="max-h-[min(340px,50vh)]">
         <CommandEmpty>No step matches.</CommandEmpty>
+        {onDemonstrate && (
+          <CommandGroup heading="Copilot">
+            <CommandItem
+              value="Demonstrate task"
+              keywords={["demonstrate", "record", "teach"]}
+              onSelect={onDemonstrate}
+              className="gap-2.5"
+            >
+              <span className="grid size-7 shrink-0 place-items-center rounded-md border border-border">
+                <span
+                  aria-hidden
+                  className="h-2.5 w-2.5 rounded-full bg-red-500"
+                />
+              </span>
+              <span className="min-w-0">
+                <span className="block text-sm leading-tight">
+                  Demonstrate task
+                </span>
+                <span className="block text-xs leading-tight text-muted-foreground">
+                  Show Copilot how in the browser
+                </span>
+              </span>
+            </CommandItem>
+          </CommandGroup>
+        )}
         {groups.map((group) => (
           <CommandGroup key={group.name} heading={group.name}>
             {group.items
@@ -161,12 +189,14 @@ export function DocInsertPopover({
   open,
   onOpenChange,
   onPick,
+  onDemonstrate,
   onDismiss,
   children,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onPick: (nodeType: NodeType) => void;
+  onDemonstrate?: (() => void) | null;
   // Closed without picking a step.
   onDismiss?: () => void;
   children: ReactNode;
@@ -195,6 +225,14 @@ export function DocInsertPopover({
             onOpenChange(false);
             onPick(type);
           }}
+          onDemonstrate={
+            onDemonstrate
+              ? () => {
+                  onOpenChange(false);
+                  onDemonstrate();
+                }
+              : undefined
+          }
         />
       </PopoverContent>
     </Popover>

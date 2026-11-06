@@ -991,6 +991,18 @@ export function hasSettingsBeyondText(node: AppNode): boolean {
   );
 }
 
+/** A step with nothing written in it yet, like the empty line Enter leaves. */
+export function isBlankStep(node: AppNode): boolean {
+  if (!isWorkflowBlockNode(node) || hasSettingsBeyondText(node)) return false;
+  const data = node.data as Record<string, unknown>;
+  return [
+    ...getDocProseFields(node).map((f) => f.key),
+    "description",
+    "notes",
+    "trailingNotes",
+  ].every((key) => blank(data[key]) || String(data[key]).trim() === "");
+}
+
 // The backend's BLOCK_NOTE_MAX_LENGTH: a longer note fails the save.
 export const NOTE_MAX_LENGTH = 2000;
 

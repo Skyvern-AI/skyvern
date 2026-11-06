@@ -74,7 +74,11 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useManualSignInStore } from "@/store/useManualSignInStore";
-import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
+import {
+  noteDemonstrationStartFailed,
+  useRecordingLauncherStore,
+  type StartDemonstrationOptions,
+} from "@/store/useRecordingLauncherStore";
 import { useStudioBrowserStore } from "@/store/useStudioBrowserStore";
 import {
   type CopilotAttention,
@@ -134,7 +138,6 @@ import {
   WorkflowCopilotCredentialPauseResolvedUpdate,
   CredentialSiteAnswer,
   CredentialSiteQuestion,
-  WorkflowCopilotDemonstrationInsertion,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
@@ -6905,6 +6908,7 @@ export function WorkflowCopilotChat({
       return sent;
     },
     onStartFailed: () => {
+      noteDemonstrationStartFailed();
       const messageId = demonstrationMessageIdRef.current;
       demonstrationMessageIdRef.current = null;
       setMessages((prev) => prev.filter((message) => message.id !== messageId));
@@ -7422,15 +7426,28 @@ export function WorkflowCopilotChat({
         demonstrationRecorder.phase === "recording"
           ? navigateDemonstration
           : null,
+      demonstration:
+        demonstrationRecorder.phase === "idle"
+          ? null
+          : {
+              phase: demonstrationRecorder.phase,
+              actionCount: demonstrationRecorder.actionCount,
+              interrupted: demonstrationRecorder.browserRestarted,
+              insertion: demonstrationRecorder.insertion ?? null,
+            },
     });
     return () =>
       useRecordingLauncherStore.setState({
         demonstrationBrowserSessionId: null,
         demonstrationRecordingBrowserSessionId: null,
         navigateDemonstration: null,
+        demonstration: null,
       });
   }, [
     demonstrationRecorder.phase,
+    demonstrationRecorder.actionCount,
+    demonstrationRecorder.browserRestarted,
+    demonstrationRecorder.insertion,
     isDemonstrating,
     liveBrowserSessionId,
     navigateDemonstration,
@@ -9417,16 +9434,16 @@ export function WorkflowCopilotChat({
   const panesRef = useRef({ openPane, setOpenPanes, resolveLivePanes });
   panesRef.current = { openPane, setOpenPanes, resolveLivePanes };
   const handleStartDemonstration = useCallback(
-    ({
-      insertion,
-    }: { insertion?: WorkflowCopilotDemonstrationInsertion } = {}) => {
+    ({ insertion, keepEditor = false }: StartDemonstrationOptions = {}) => {
       if (!liveBrowserSessionId) return;
       if (historyLoadedForRef.current !== workflowPermanentId) {
         toast({ title: "Wait for Copilot to finish loading" });
+        noteDemonstrationStartFailed();
         return;
       }
       if (hasPendingQuestion) {
         toast({ title: "Answer Copilot's question first" });
+        noteDemonstrationStartFailed();
         return;
       }
       if (
@@ -9436,6 +9453,7 @@ export function WorkflowCopilotChat({
         isDemonstrating
       ) {
         toast({ title: "Wait for Copilot to finish" });
+        noteDemonstrationStartFailed();
         return;
       }
       void stopSpeech();
@@ -9444,11 +9462,12 @@ export function WorkflowCopilotChat({
       // steps aside for the browser and returns when the recording ends.
       // Copilot holds Done and Discard, so it opens too.
       const panes = panesRef.current;
-      panes.openPane("browser");
+      // showPane keeps one pending request, so the Browser opens last to be the one a folded Doc layout expands.
       if (!panes.resolveLivePanes().includes("copilot"))
         panes.openPane("copilot");
+      panes.openPane("browser");
       const live = panes.resolveLivePanes();
-      if (live.includes("editor")) {
+      if (live.includes("editor") && !keepEditor) {
         editorHiddenForDemonstrationRef.current = true;
         panes.setOpenPanes(live.filter((id) => id !== "editor"));
       }
