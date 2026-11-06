@@ -1,4 +1,4 @@
-import { availableNodeLibraryItems } from "../panels/nodeLibraryItems";
+import { nodeLibraryTitle } from "./docStepChoices";
 import type { DocNestKind, NodeType } from "./docEditApi";
 
 let message = "";
@@ -24,16 +24,16 @@ export function announceDoc(text: string) {
   listeners.forEach((listener) => listener());
 }
 
+export const announceNestReady = (kind: DocNestKind) =>
+  announceDoc(`In the ${kind}. Type / to pick its step`);
+
 export function announceNest(kind: DocNestKind, outdent: boolean) {
   announceDoc(`Moved ${outdent ? "out of" : "into"} the ${kind}`);
 }
 
 // Named as the step picker names it.
 const typeTitle = (type: NodeType) =>
-  (
-    availableNodeLibraryItems().find((item) => item.nodeType === type)?.title ??
-    type
-  ).replace(/ Block$/, "");
+  nodeLibraryTitle(type).replace(/ Block$/, "");
 
 export const announceAdded = (type: NodeType) =>
   announceDoc(`Added ${typeTitle(type)} step`);

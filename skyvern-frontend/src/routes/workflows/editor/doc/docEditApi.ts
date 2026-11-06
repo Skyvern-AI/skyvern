@@ -12,7 +12,7 @@ import {
   type AppNode,
   type WorkflowBlockNode,
 } from "../nodes";
-import { availableNodeLibraryItems } from "../panels/nodeLibraryItems";
+import { nodeLibraryTitle } from "./docStepChoices";
 import type { AddNodeProps } from "../Workspace";
 import { demonstrationInsertionFromNodes } from "../workspaceAuthoringActions";
 import type { WorkflowCopilotDemonstrationInsertion } from "../../copilot/workflowCopilotTypes";
@@ -276,8 +276,7 @@ export function createDocEditApi({
       replacing: base ? replacing : undefined,
       label: newStepLabel(
         nodes,
-        availableNodeLibraryItems().find((i) => i.nodeType === nodeType)
-          ?.title ?? nodeType,
+        nodeLibraryTitle(nodeType),
         useWorkflowParametersStore
           .getState()
           .parameters.map((parameter) => parameter.key),
@@ -567,9 +566,7 @@ export function createDocEditApi({
       const next = turnInto(graph, id, nodeType);
       if (!next) return;
       const node = nodes.find((n) => n.id === id);
-      const titleOf = (type: string) =>
-        availableNodeLibraryItems().find((i) => i.nodeType === type)?.title ??
-        type;
+      const titleOf = nodeLibraryTitle;
       const old = node && isWorkflowBlockNode(node) ? node : null;
       const autoNamed =
         old &&

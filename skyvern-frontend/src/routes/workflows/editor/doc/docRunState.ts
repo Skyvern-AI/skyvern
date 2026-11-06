@@ -152,11 +152,19 @@ function itemState(blocks: WorkflowRunBlock[]): DocLoopItem["state"] {
   return "succeeded";
 }
 
-function descendants(items: WorkflowRunTimelineItem[]): WorkflowRunBlock[] {
+function descendants(
+  items: WorkflowRunTimelineItem[],
+  withReplaced = false,
+): WorkflowRunBlock[] {
   const out: WorkflowRunBlock[] = [];
   const walk = (list: WorkflowRunTimelineItem[]) => {
     for (const item of list) {
-      if (isBlockItem(item)) out.push(item.block);
+      if (isBlockItem(item)) {
+        out.push(item.block);
+        // A Task V2 step's own row is replaced by the rows it ran; only task_v2_blocks still holds it.
+        if (withReplaced && item.task_v2_blocks)
+          out.push(...item.task_v2_blocks);
+      }
       walk(item.children);
     }
   };
@@ -343,6 +351,8 @@ function authored(step: Record<string, unknown>): string {
       if (own && (isStamped(key) || value === "")) return undefined;
       if (key === "id" && isBranch(this)) return undefined;
       if (isStep(this)) {
+        // The editor's first save fills this in along the implicit chain; it routes, it does not change the step.
+        if (key === "next_block_label") return undefined;
         if (key === "title" && value === this.label) return undefined;
         if (key === "export_data_schema" && !this.export_enabled)
           return undefined;
@@ -460,7 +470,9 @@ export function collectBlockRuns(
   into: Map<string, DocBlockRuns>,
   hasOutput: (block: WorkflowRunBlock) => boolean,
 ) {
-  for (const block of descendants(timeline)) {
+  // A script that falls back to the agent leaves two rows for one execution: one per loop item and parent.
+  const executions = new Map<string, WorkflowRunBlock>();
+  for (const block of descendants(timeline, true)) {
     if (!block.label || block.workflow_run_id !== workflowRunId) continue;
     // A row that never started (skipped branch, not reached) is not a run.
     if (
@@ -469,7 +481,18 @@ export function collectBlockRuns(
       block.status === Status.Created
     )
       continue;
-    const runs = into.get(block.label) ?? {
+    executions.set(
+      [
+        block.label,
+        block.parent_workflow_run_block_id,
+        block.current_index ?? "",
+      ].join("\0"),
+      block,
+    );
+  }
+  for (const block of executions.values()) {
+    const label = block.label as string;
+    const runs = into.get(label) ?? {
       count: 0,
       failed: 0,
       canceled: 0,
@@ -479,6 +502,6 @@ export function collectBlockRuns(
     if (FAILED.has(block.status)) runs.failed += 1;
     if (block.status === Status.Canceled) runs.canceled += 1;
     if (hasOutput(block)) runs.withOutput += 1;
-    into.set(block.label, runs);
+    into.set(label, runs);
   }
 }

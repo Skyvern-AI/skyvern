@@ -37,6 +37,7 @@ import { DocDemonstrationLine } from "./DocDemonstrationLine";
 import { demonstrationLineIndex } from "./docDemonstration";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import {
+  armNextCaretAtStart,
   requestCaretAtStart,
   requestPickerOnLine,
   runStepByKey,
@@ -46,7 +47,12 @@ import {
   type PickerOpener,
 } from "./docKeys";
 import { DocOneActionHint } from "./DocOneActionHint";
-import { announceAdded, announceMoved, announceNest } from "./docAnnounce";
+import {
+  announceAdded,
+  announceMoved,
+  announceNest,
+  announceNestReady,
+} from "./docAnnounce";
 
 type PlacedItem = Exclude<DocItem, DocNoteItem>;
 
@@ -483,6 +489,7 @@ function DocInsertLine({
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const [open, setOpen] = useState(false);
+  const plusRef = useRef<HTMLButtonElement>(null);
   // Hidden until hovered, so on touch it would be an invisible tap target; phones add with Enter, "/" and "+ Add step".
   const touch = useDocTouch();
   if (touch) return null;
@@ -490,6 +497,7 @@ function DocInsertLine({
     <DocInsertPopover
       open={open}
       onOpenChange={setOpen}
+      onEscape={() => requestAnimationFrame(() => plusRef.current?.focus())}
       onPick={(type) => {
         const added = actions.edit?.insertStep(place, type) ?? null;
         actions.setFocusId(added);
@@ -509,6 +517,7 @@ function DocInsertLine({
           )}
         />
         <button
+          ref={plusRef}
           type="button"
           aria-label={label}
           onClick={() => {
@@ -629,7 +638,10 @@ function DocNote({
       onOpenChange={setInserting}
       onDemonstrate={
         // Tab on a note under an empty loop or branch picks a step for that scope, which has no demonstration insertion.
-        into ? null : demonstrateFrom(actions, place, finishSlash)
+        // The "+" between steps offers the same rows whether or not a note sits above the step: no demonstration.
+        into || fromInsertLine.current
+          ? null
+          : demonstrateFrom(actions, place, finishSlash)
       }
       onDismiss={() => {
         // The picker can report closing more than once; only the first finishes the line.
@@ -747,7 +759,25 @@ function DocNote({
                     "pickIn" in moved
                       ? edit.nestKind(moved.pickIn.parentId)
                       : edit.nestKind(moved.ownerNodeId, !outdent);
-                  if (kind) announceNest(kind, outdent);
+                  if ("pickIn" in moved) {
+                    // Nothing is saved yet: show the empty loop or branch the line goes in, with the caret at the
+                    // line's start so "/" opens the picker, and say so instead of claiming a move.
+                    const { parentId, conditionalBranchId } = moved.pickIn;
+                    if (
+                      parentId &&
+                      kind === "loop" &&
+                      !actions.loopOpen(parentId)
+                    )
+                      actions.toggleLoop(parentId);
+                    if (parentId && kind === "branch") {
+                      if (!actions.conditionalOpen(parentId))
+                        actions.toggleConditional(parentId);
+                      if (conditionalBranchId)
+                        actions.selectBranch(parentId, conditionalBranchId);
+                    }
+                    armNextCaretAtStart();
+                    if (kind) announceNestReady(kind);
+                  } else if (kind) announceNest(kind, outdent);
                   // Tab only nests: an empty loop or branch takes the line itself, and "/" then picks its step.
                   const next =
                     "pickIn" in moved ? { ...note, into: moved.pickIn } : moved;
@@ -906,10 +936,13 @@ export function DocScope({
     if (!id || !scope || !actions.edit) return;
     // The index counts the dragged step while it is still in place.
     const from = movable.findIndex((s) => s.nodeId === id);
-    const moved = actions.edit.move(id, {
-      scope,
-      index: from !== -1 && from < index ? index - 1 : index,
-    });
+    const to = from !== -1 && from < index ? index - 1 : index;
+    if (!actions.edit.move(id, { scope, index: to })) return;
+    // Within its own list the step went up or down; only a step that came from elsewhere reads out the list's name.
+    if (from !== -1) {
+      if (to !== from) announceMoved(to < from ? "up" : "down");
+      return;
+    }
     const place = actions
       .destinations()
       .find(
@@ -917,7 +950,7 @@ export function DocScope({
           d.scope.parentId === scope.parentId &&
           d.scope.conditionalBranchId === scope.conditionalBranchId,
       )?.label;
-    if (moved && place) announceMoved({ place });
+    if (place) announceMoved({ place });
   };
   // The drop line before a step goes above its note, which belongs to it.
   const zoneBefore = (index: number) => {
