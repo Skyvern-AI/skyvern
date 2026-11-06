@@ -227,8 +227,9 @@ export function DocConditional({
     else branchEdits.removeBranch(node.id, selected.branchId);
   };
   return (
-    <div className="group/line rounded py-[3px]">
-      <div className="relative flex min-h-[26px] flex-wrap items-center gap-2">
+    <div className="rounded py-[3px]">
+      {/* The hover group is the header only: the steps inside a branch show their own controls. */}
+      <div className="group/line relative flex min-h-[26px] flex-wrap items-center gap-2">
         <DocTag node={node} place={editable ? place : undefined} />
         <button
           type="button"

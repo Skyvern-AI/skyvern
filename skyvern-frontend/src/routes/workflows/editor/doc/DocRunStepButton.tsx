@@ -1,6 +1,8 @@
 import { PlayIcon, StopIcon } from "@radix-ui/react-icons";
 
 import { cn } from "@/util/utils";
+import { DocKeyLabel, DocKeyTooltip } from "./DocKeyLabel";
+import { docShortcut } from "./docKeys";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import type { WorkflowBlockNode } from "../nodes";
 import { NodeHeader } from "../nodes/components/NodeHeader";
@@ -47,25 +49,38 @@ export function DocRunStepButton({
   return (
     <>
       {host}
-      <button
-        type="button"
-        aria-label={name}
-        title={playing ? "Stop this step" : "Run this step"}
-        disabled={disabled || (playing ? stopping : inert)}
-        onClick={() => (playing ? handle.stop() : handle.play())}
-        className={cn(
-          "inline-flex items-center rounded-[5px] px-1 py-0.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none",
-          playing
-            ? "disabled:opacity-40"
-            : "opacity-0 group-focus-within/line:opacity-100 disabled:group-focus-within/line:opacity-40 group-hover/line:opacity-100 disabled:group-hover/line:opacity-40 [@media(hover:none)]:opacity-100 disabled:[@media(hover:none)]:opacity-40",
-        )}
+      <DocKeyTooltip
+        side="top"
+        content={
+          <>
+            {playing ? (
+              "Stop this step"
+            ) : (
+              <DocKeyLabel label="Run this step" keys="Enter" />
+            )}
+          </>
+        }
       >
-        {playing ? (
-          <StopIcon className="size-[15px]" />
-        ) : (
-          <PlayIcon className="size-[15px]" />
-        )}
-      </button>
+        <button
+          type="button"
+          aria-label={name}
+          aria-keyshortcuts={playing ? undefined : docShortcut("Enter").aria}
+          disabled={disabled || (playing ? stopping : inert)}
+          onClick={() => (playing ? handle.stop() : handle.play())}
+          className={cn(
+            "inline-flex items-center rounded-[5px] px-1 py-0.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none",
+            playing
+              ? "disabled:opacity-40"
+              : "opacity-0 group-focus-within/line:opacity-100 disabled:group-focus-within/line:opacity-40 group-hover/line:opacity-100 disabled:group-hover/line:opacity-40 [@media(hover:none)]:opacity-100 disabled:[@media(hover:none)]:opacity-40",
+          )}
+        >
+          {playing ? (
+            <StopIcon className="size-[15px]" />
+          ) : (
+            <PlayIcon className="size-[15px]" />
+          )}
+        </button>
+      </DocKeyTooltip>
     </>
   );
 }

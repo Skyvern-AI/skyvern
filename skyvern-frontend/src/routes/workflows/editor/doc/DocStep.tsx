@@ -1,4 +1,11 @@
-import { useContext, useRef, useState, type ReactNode } from "react";
+import {
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { stripJinjaReferences } from "./docTextUtils";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
@@ -24,8 +31,10 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/util/utils";
+import { DocKeyLabel, DocKeyTooltip } from "./DocKeyLabel";
 import type { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
+import { announceDoc, announceMoved, announceTurnedInto } from "./docAnnounce";
 import { workflowBlockTitle } from "../nodes/types";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { getDocSettingsChips } from "./docSettingsChips";
@@ -44,6 +53,7 @@ import {
   getDocStepSummary,
 } from "./docStepRegistry";
 import { DocRunStepButton } from "./DocRunStepButton";
+import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { docTagState, type DocTagState } from "./docRunState";
 import { useDocRun } from "./useDocRun";
 import { DocText } from "./DocText";
@@ -56,7 +66,12 @@ import {
   DocStepPicker,
 } from "./DocEditing";
 import { useDocStepPending } from "./DocProposalView";
-import { takeCaretAtStart, type LineSplit, type PickerOpener } from "./docKeys";
+import {
+  docShortcut,
+  takeCaretAtStart,
+  type LineSplit,
+  type PickerOpener,
+} from "./docKeys";
 
 /** Where a step sits, for the moves its tag menu offers. Absent when the step's place can't be edited. */
 export type DocStepPlace = DocPlace & { count: number; isFinally: boolean };
@@ -130,22 +145,55 @@ function DocTagIcon({
   ) : null;
 }
 
+// The six dots of the Visual editor's node grip.
+function GripDots() {
+  return (
+    <svg
+      width="8"
+      height="14"
+      viewBox="0 0 8 14"
+      fill="currentColor"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <circle cx="1.5" cy="1.5" r="1.5" />
+      <circle cx="6.5" cy="1.5" r="1.5" />
+      <circle cx="1.5" cy="7" r="1.5" />
+      <circle cx="6.5" cy="7" r="1.5" />
+      <circle cx="1.5" cy="12.5" r="1.5" />
+      <circle cx="6.5" cy="12.5" r="1.5" />
+    </svg>
+  );
+}
+
 function DocStepMenu({
   node,
   place,
+  besideChevron = false,
 }: {
   node: WorkflowBlockNode;
   place: DocStepPlace;
+  // A loop's collapse arrow sits in the margin, so the handle goes left of it.
+  besideChevron?: boolean;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const edit = actions.edit!;
   const [moveOpen, setMoveOpen] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
+  // The menu opens under the grip or under the type label, whichever was clicked.
+  const [menuAt, setMenuAt] = useState<"grip" | "tag" | null>(null);
   const tagRef = useRef<HTMLButtonElement>(null);
+  const gripRef = useRef<HTMLButtonElement>(null);
   const [confirming, setConfirming] = useState(false);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
   const state = useDocTagState(node.data.label);
+  const playing = useBlockPlayRegistry((s) => s.handles[node.id]?.playing);
+  // A step that is running can't be moved, changed into another type or deleted.
+  const running = state === "running" || Boolean(playing);
+  // The grip unmounts while the step runs; its menu must not come back on its own afterwards.
+  useEffect(() => {
+    if (running) setMenuAt((open) => (open === "grip" ? null : open));
+  }, [running]);
   const container = node.type === "loop" || node.type === "conditional";
   const topLevel = place.scope.parentId === null;
   const destinations = moveOpen
@@ -161,41 +209,238 @@ function DocStepMenu({
             ),
         )
     : [];
+  // The menu's trigger goes with the step, so focus moves to the step that takes its place.
+  const refocus = () => {
+    // `edit` still reads the graph from before the delete.
+    const neighbour = edit.neighbourOf(node.id);
+    requestAnimationFrame(() => actions.setFocusId(neighbour));
+  };
   const remove = () => {
     if (actions.outputUsers(node.id).length) setConfirming(true);
-    else edit.remove(node.id);
+    else if (edit.remove(node.id)) refocus();
   };
+  const toggleFrom = (at: "grip" | "tag") =>
+    setMenuAt((open) => (open === at ? null : at));
+  const openOnArrow = (at: "grip" | "tag") => (event: KeyboardEvent) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setMenuAt(at);
+    }
+  };
+  const menu = (at: "grip" | "tag") =>
+    menuAt === at && (
+      <DropdownMenu
+        modal={false}
+        open
+        onOpenChange={(open) => !open && setMenuAt(null)}
+      >
+        <DropdownMenuTrigger asChild>
+          <span
+            aria-hidden
+            tabIndex={-1}
+            className="pointer-events-none absolute inset-0"
+          />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="start"
+          className="w-56"
+          onPointerDownOutside={(event) => {
+            // A click on the grip or the label toggles the menu itself.
+            const target = event.target as Element;
+            if (
+              tagRef.current?.contains(target) ||
+              gripRef.current?.contains(target)
+            )
+              event.preventDefault();
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (
+              document.activeElement === document.body ||
+              !document.activeElement
+            )
+              (at === "grip" ? gripRef : tagRef).current?.focus();
+          }}
+        >
+          {!container && !running && (
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>Turn into…</DropdownMenuSubTrigger>
+              <DropdownMenuPortal>
+                <DropdownMenuSubContent
+                  collisionPadding={8}
+                  className="w-[min(320px,calc(100vw-16px))] min-w-0 max-w-[var(--radix-dropdown-menu-content-available-width)] p-0"
+                >
+                  <DocStepPicker
+                    placeholder="Turn into…"
+                    exclude={[node.type, "loop", "conditional"]}
+                    onPick={(type) => {
+                      setMenuAt(null);
+                      setTimeout(() => {
+                        edit.turnInto(node.id, type);
+                        announceTurnedInto(type);
+                      }, 0);
+                    }}
+                  />
+                </DropdownMenuSubContent>
+              </DropdownMenuPortal>
+            </DropdownMenuSub>
+          )}
+          <DropdownMenuItem onSelect={() => actions.openSettings(node.id)}>
+            Settings
+          </DropdownMenuItem>
+          {!place.isFinally && (
+            <DropdownMenuItem
+              onSelect={() =>
+                setTimeout(() => {
+                  edit.duplicate(node.id);
+                  announceDoc(`Duplicated ${node.data.label}`);
+                }, 0)
+              }
+            >
+              Duplicate
+            </DropdownMenuItem>
+          )}
+          {topLevel && !container && !running && (
+            <DropdownMenuItem
+              onSelect={() => edit.setFinally(node.id, !place.isFinally)}
+            >
+              {place.isFinally
+                ? "Don't always run at the end"
+                : "Always run at the end"}
+            </DropdownMenuItem>
+          )}
+          {!container && !running && edit.canBePlainText(node.id) && (
+            <DropdownMenuItem
+              onSelect={() =>
+                setTimeout(
+                  () => actions.setPendingNote(edit.toPlainText(node.id)),
+                  0,
+                )
+              }
+            >
+              Back to plain text
+            </DropdownMenuItem>
+          )}
+          {!place.isFinally && !running && (
+            <>
+              <DropdownMenuSeparator />
+              {place.index > 0 && (
+                <DropdownMenuItem
+                  onSelect={() => {
+                    if (
+                      edit.move(node.id, {
+                        scope: place.scope,
+                        index: place.index - 1,
+                      })
+                    )
+                      announceMoved("up");
+                  }}
+                >
+                  Move up
+                </DropdownMenuItem>
+              )}
+              {place.index < place.count - 1 && (
+                <DropdownMenuItem
+                  onSelect={() => {
+                    if (
+                      edit.move(node.id, {
+                        scope: place.scope,
+                        index: place.index + 1,
+                      })
+                    )
+                      announceMoved("down");
+                  }}
+                >
+                  Move down
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuItem
+                onSelect={() => setTimeout(() => setMoveOpen(true), 0)}
+              >
+                Move to…
+              </DropdownMenuItem>
+            </>
+          )}
+          {!running && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                className="text-red-700 focus:text-red-700 dark:text-red-400 dark:focus:text-red-400"
+                onSelect={() => setTimeout(remove, 0)}
+              >
+                Delete
+              </DropdownMenuItem>
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    );
   return (
     <>
+      {/* The grip sits in the margin: on hover or focus with a mouse, always on touch. Never while the step runs. */}
+      {!running && (
+        <span
+          data-doc-step-handle
+          className={cn(
+            "absolute right-full top-px z-10 flex",
+            // Below sm a loop's grip joins its header row after the arrow, so the arrow keeps main's place in the 32px margin.
+            besideChevron
+              ? "mr-7 max-sm:static max-sm:ml-1 max-sm:mr-0 sm:max-[719px]:mr-1 [@media(hover:none)_and_(min-width:640px)]:mr-1"
+              : "mr-1",
+            "opacity-0 focus-within:opacity-100 group-focus-within/line:opacity-100 group-hover/line:opacity-100 max-[719px]:opacity-100 [@media(hover:none)]:opacity-100",
+            menuAt === "grip" && "opacity-100",
+          )}
+        >
+          <span className="relative inline-flex">
+            <button
+              type="button"
+              ref={gripRef}
+              // The type label is the keyboard way in; the grip is for the pointer.
+              tabIndex={-1}
+              // A menu that opens on press would cancel the drag, so it opens on click.
+              aria-haspopup="menu"
+              aria-expanded={menuAt === "grip"}
+              aria-label={`Actions for ${node.data.label}`}
+              onClick={() => toggleFrom("grip")}
+              draggable={!place.isFinally}
+              onDragStart={(event) => {
+                setMenuAt(null);
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", node.data.label);
+                // The whole step follows the pointer, not just the grip.
+                const line = event.currentTarget.closest("[data-doc-node-id]");
+                if (line) event.dataTransfer.setDragImage(line, 0, 0);
+                actions.setDragId(node.id);
+              }}
+              onDragEnd={() => actions.setDragId(null)}
+              className={cn(
+                // The background hides a parent loop's rule where the grip sits; the pseudo-element is the 36px touch target.
+                "relative grid size-6 place-items-center rounded bg-background text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:before:absolute [@media(hover:none)]:before:-inset-1.5 [@media(hover:none)]:before:content-['']",
+                !place.isFinally &&
+                  "cursor-grab active:cursor-grabbing [@media(hover:none)]:cursor-pointer",
+              )}
+            >
+              <GripDots />
+            </button>
+            {menu("grip")}
+          </span>
+        </span>
+      )}
       <DocDeleteConfirm
         id={confirming ? node.id : null}
         onClose={() => setConfirming(false)}
+        onRemoved={refocus}
       >
         <span className="relative inline-flex">
           <button
             type="button"
             ref={tagRef}
-            // The tag is also the drag handle, so the menu opens on click: a menu that opens on press cancels the drag.
+            data-doc-tag
             aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((open) => !open)}
-            onKeyDown={(event) => {
-              if (event.key === "ArrowDown") {
-                event.preventDefault();
-                setMenuOpen(true);
-              }
-            }}
-            draggable={!place.isFinally}
-            onDragStart={(event) => {
-              setMenuOpen(false);
-              event.dataTransfer.effectAllowed = "move";
-              event.dataTransfer.setData("text/plain", node.data.label);
-              actions.setDragId(node.id);
-            }}
-            onDragEnd={() => actions.setDragId(null)}
-            title={
-              place.isFinally ? undefined : "Click for actions, drag to move"
-            }
+            aria-expanded={menuAt === "tag"}
+            onClick={() => toggleFrom("tag")}
+            onKeyDown={openOnArrow("tag")}
+            title="Click for actions"
             aria-label={`${blockType ? workflowBlockTitle[blockType] : node.type} step ${node.data.label}, actions`}
             data-doc-tag-state={state}
             className={cn(
@@ -207,136 +452,16 @@ function DocStepMenu({
             {blockType ? workflowBlockTitle[blockType] : node.type}
             {state && <span className="sr-only">, {tagStateNames[state]}</span>}
           </button>
-          <DropdownMenu
-            modal={false}
-            open={menuOpen}
-            onOpenChange={setMenuOpen}
-          >
-            <DropdownMenuTrigger asChild>
-              <span
-                aria-hidden
-                tabIndex={-1}
-                className="pointer-events-none absolute inset-0"
-              />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              className="w-56"
-              onPointerDownOutside={(event) => {
-                // A click on the tag toggles the menu itself.
-                if (tagRef.current?.contains(event.target as Element))
-                  event.preventDefault();
-              }}
-              onCloseAutoFocus={(event) => {
-                event.preventDefault();
-                if (
-                  document.activeElement === document.body ||
-                  !document.activeElement
-                )
-                  tagRef.current?.focus();
-              }}
-            >
-              {!place.isFinally && (
-                <DropdownMenuItem
-                  onSelect={() => setTimeout(() => edit.duplicate(node.id), 0)}
-                >
-                  Duplicate
-                </DropdownMenuItem>
-              )}
-              <DropdownMenuItem onSelect={() => actions.openSettings(node.id)}>
-                Settings
-              </DropdownMenuItem>
-              {topLevel && !container && (
-                <DropdownMenuItem
-                  onSelect={() => edit.setFinally(node.id, !place.isFinally)}
-                >
-                  {place.isFinally
-                    ? "Don't always run at the end"
-                    : "Always run at the end"}
-                </DropdownMenuItem>
-              )}
-              {!container && (
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>Turn into…</DropdownMenuSubTrigger>
-                  <DropdownMenuPortal>
-                    <DropdownMenuSubContent
-                      collisionPadding={8}
-                      className="w-[min(320px,calc(100vw-16px))] min-w-0 max-w-[var(--radix-dropdown-menu-content-available-width)] p-0"
-                    >
-                      <DocStepPicker
-                        placeholder="Turn into…"
-                        exclude={[node.type, "loop", "conditional"]}
-                        onPick={(type) => {
-                          setMenuOpen(false);
-                          setTimeout(() => edit.turnInto(node.id, type), 0);
-                        }}
-                      />
-                    </DropdownMenuSubContent>
-                  </DropdownMenuPortal>
-                </DropdownMenuSub>
-              )}
-              {!container && edit.canBePlainText(node.id) && (
-                <DropdownMenuItem
-                  onSelect={() =>
-                    setTimeout(
-                      () => actions.setPendingNote(edit.toPlainText(node.id)),
-                      0,
-                    )
-                  }
-                >
-                  Back to plain text
-                </DropdownMenuItem>
-              )}
-              {!place.isFinally && (
-                <>
-                  <DropdownMenuSeparator />
-                  {place.index > 0 && (
-                    <DropdownMenuItem
-                      onSelect={() =>
-                        edit.move(node.id, {
-                          scope: place.scope,
-                          index: place.index - 1,
-                        })
-                      }
-                    >
-                      Move up
-                    </DropdownMenuItem>
-                  )}
-                  {place.index < place.count - 1 && (
-                    <DropdownMenuItem
-                      onSelect={() =>
-                        edit.move(node.id, {
-                          scope: place.scope,
-                          index: place.index + 1,
-                        })
-                      }
-                    >
-                      Move down
-                    </DropdownMenuItem>
-                  )}
-                  <DropdownMenuItem
-                    onSelect={() => setTimeout(() => setMoveOpen(true), 0)}
-                  >
-                    Move to…
-                  </DropdownMenuItem>
-                </>
-              )}
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                className="text-destructive focus:text-destructive"
-                onSelect={() => setTimeout(remove, 0)}
-              >
-                Delete
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {menu("tag")}
         </span>
       </DocDeleteConfirm>
       <DocMoveToDialog
         open={moveOpen}
         onOpenChange={setMoveOpen}
         destinations={destinations}
-        onPick={(d) => edit.move(node.id, d)}
+        onPick={(d) => {
+          if (edit.move(node.id, d)) announceMoved({ place: d.label });
+        }}
       />
     </>
   );
@@ -345,15 +470,20 @@ function DocStepMenu({
 export function DocTag({
   node,
   place,
+  besideChevron,
 }: {
   node: WorkflowBlockNode;
   place?: DocStepPlace;
+  besideChevron?: boolean;
 }) {
   const actions = useContext(WorkflowDocActionsContext);
   const blockType = docBlockType(node);
   const pending = useDocStepPending(node);
   const state = useDocTagState(node.data.label);
-  if (actions.edit && place) return <DocStepMenu node={node} place={place} />;
+  if (actions.edit && place)
+    return (
+      <DocStepMenu node={node} place={place} besideChevron={besideChevron} />
+    );
   return (
     <span
       className={tagClass(blockType, pending, state)}
@@ -378,25 +508,36 @@ export function DocSettingsButton({
   const changed = getDocSettingsChips(node).length;
   // Without a changed count the gear is not rendered at rest (display: none), so nothing is reserved for it.
   return (
-    <button
-      type="button"
-      aria-label={`Settings for ${node.data.label}${changed ? `, ${changed} changed` : ""}`}
-      title={
-        changed
-          ? `${changed} setting${changed > 1 ? "s" : ""} changed`
-          : "Settings"
+    <DocKeyTooltip
+      content={
+        <>
+          <DocKeyLabel
+            label={
+              changed
+                ? `${changed} setting${changed > 1 ? "s" : ""} changed`
+                : "Settings"
+            }
+            keys="."
+          />
+        </>
       }
-      onClick={() => actions.openSettings(node.id)}
-      className={cn(
-        "items-center gap-[3px] rounded-[5px] py-0.5 text-xs font-semibold leading-4 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
-        changed
-          ? "inline-flex px-1"
-          : "hidden px-1 focus-visible:inline-flex group-focus-within/line:inline-flex group-hover/line:inline-flex [@media(hover:none)]:inline-flex",
-      )}
     >
-      <GearIcon className="size-[15px]" />
-      {changed > 0 && <span>{changed}</span>}
-    </button>
+      <button
+        type="button"
+        aria-label={`Settings for ${node.data.label}${changed ? `, ${changed} changed` : ""}`}
+        aria-keyshortcuts={docShortcut(".").aria}
+        onClick={() => actions.openSettings(node.id)}
+        className={cn(
+          "items-center gap-[3px] rounded-[5px] py-0.5 text-xs font-semibold leading-4 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+          changed
+            ? "inline-flex px-1"
+            : "hidden px-1 focus-visible:inline-flex group-focus-within/line:inline-flex group-hover/line:inline-flex [@media(hover:none)]:inline-flex",
+        )}
+      >
+        <GearIcon className="size-[15px]" />
+        {changed > 0 && <span>{changed}</span>}
+      </button>
+    </DocKeyTooltip>
   );
 }
 
@@ -441,7 +582,13 @@ export function DocStepHeader({
           aria-expanded={disclosure.open}
           aria-label={`${disclosure.open ? "Collapse" : "Expand"} ${node.data.label}`}
           onClick={disclosure.onToggle}
-          className="absolute -left-[26px] top-0.5 grid h-[22px] w-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          className={cn(
+            "absolute -left-[26px] top-0.5 grid h-[22px] w-[22px] place-items-center rounded text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+            // On touch the grip shows at rest, so from sm up the arrow moves out to its left: arrow, grip, label.
+            editable &&
+              place &&
+              "sm:max-[719px]:-left-[54px] [@media(hover:none)_and_(min-width:640px)]:-left-[54px]",
+          )}
         >
           <ChevronRightIcon
             className={cn(
@@ -451,7 +598,11 @@ export function DocStepHeader({
           />
         </button>
       )}
-      <DocTag node={node} place={editable ? place : undefined} />
+      <DocTag
+        node={node}
+        place={editable ? place : undefined}
+        besideChevron={Boolean(disclosure)}
+      />
       {extra}
       {docStepProducesData(node) && (
         <span className="flex min-w-0 items-baseline gap-1 text-[12.5px] text-muted-foreground">

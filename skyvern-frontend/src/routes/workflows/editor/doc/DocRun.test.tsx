@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { Status } from "@/api/types";
+import { ArtifactType, Status } from "@/api/types";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
 import type { WorkflowBlockNode } from "../nodes";
@@ -24,6 +24,21 @@ vi.mock("./useDocRun", () => ({
     blockRun: false,
     unknownLabels: new Set<string>(),
     ...docRun.current,
+  }),
+}));
+
+const screenshotMock = vi.hoisted(() => ({
+  artifact: undefined as unknown,
+}));
+// Like the real hook, a disabled fetch still returns what the Run pane already cached.
+vi.mock("../../workflowRun/useBlockScreenshot", () => ({
+  useBlockScreenshot: () => screenshotMock.artifact,
+}));
+vi.mock("@/hooks/useArtifactImageSrc", () => ({
+  useArtifactImageSrc: () => ({
+    src: "data:image/gif;base64,R0lGODlhAQABAAAAACw=",
+    onImageError: () => {},
+    imageFailed: false,
   }),
 }));
 
@@ -60,6 +75,7 @@ function renderResult(b: WorkflowRunBlock, live = false) {
 }
 
 afterEach(() => {
+  screenshotMock.artifact = undefined;
   useBlockPlayRegistry.setState({ handles: {} });
 });
 
@@ -238,11 +254,372 @@ describe("DocStepResult", () => {
     expect(
       screen.getByRole("link", { name: /open run/i }).getAttribute("href"),
     ).toBe("/runs/wr_1");
-    expect(screen.queryByText("extracted_information")).toBeNull();
+    expect(screen.queryByTestId("doc-step-values")).toBeNull();
     fireEvent.click(
       screen.getByRole("button", { name: /show result of get_invoices/i }),
     );
-    expect(screen.getByText("extracted_information")).toBeTruthy();
+    expect(screen.getByTestId("doc-step-values")).toBeTruthy();
+    expect(screen.getByRole("columnheader", { name: "n" })).toBeTruthy();
+    expect(screen.queryByText(/Summary|Inputs|Task ID|Engine/)).toBeNull();
+  });
+
+  it("counts the rows of an extraction wrapped in one key, matching its table", () => {
+    renderResult(
+      block({
+        output: { extracted_information: { books: [{ n: 1 }, { n: 2 }] } },
+      }),
+    );
+    expect(screen.getByText("Found 2 items · 9s")).toBeTruthy();
+  });
+
+  it("caps a long table at five rows and says how many more", () => {
+    renderResult(
+      block({
+        output: {
+          extracted_information: Array.from({ length: 8 }, (_, i) => ({
+            title: `Book ${i}`,
+            price: i,
+          })),
+        },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /show result of/i }));
+    expect(screen.getAllByRole("row")).toHaveLength(1 + 5 + 1);
+    expect(screen.getByText("3 more rows")).toBeTruthy();
+  });
+
+  it("gives a step with nothing to show no chevron and says it returned nothing", () => {
+    renderResult(
+      block({ block_type: "code", label: "run_code", output: null }),
+    );
+    expect(screen.queryByRole("button", { name: /result of/i })).toBeNull();
+    expect(screen.getByText(/Completed · 9s · returned nothing/)).toBeTruthy();
+  });
+
+  it("shows only the item list under an expanded loop, never a screenshot", () => {
+    screenshotMock.artifact = { artifact_id: "art_1", archived: false };
+    const loop = block({
+      block_type: "for_loop",
+      label: "each_book",
+      output: null,
+    });
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map([["each_book", loop]]),
+      loopsByLabel: new Map([
+        [
+          "each_book",
+          {
+            total: 1,
+            items: [
+              {
+                index: 0,
+                title: "Attic",
+                detail: null,
+                state: "succeeded",
+                failureHeadline: null,
+              },
+            ],
+          },
+        ],
+      ]),
+      live: false,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="each_book" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: /show result of each_book/i }),
+    );
+    expect(screen.getByTestId("doc-loop-items")).toBeTruthy();
+    expect(screen.queryByTestId("doc-step-last-screen")).toBeNull();
+  });
+
+  it("counts a loop's failed items in red and lists the failed one with its reason", () => {
+    const loop = block({
+      block_type: "for_loop",
+      label: "each_book",
+      output: null,
+    });
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map([["each_book", loop]]),
+      loopsByLabel: new Map([
+        [
+          "each_book",
+          {
+            total: 2,
+            items: [
+              {
+                index: 0,
+                title: "Attic",
+                detail: null,
+                state: "succeeded",
+                failureHeadline: null,
+              },
+              {
+                index: 1,
+                title: "Velvet",
+                detail: null,
+                state: "failed",
+                failureHeadline: "the page did not load",
+              },
+            ],
+          },
+        ],
+      ]),
+      live: false,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="each_book" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText("· 1 failed").className).toContain("text-red-700");
+    fireEvent.click(
+      screen.getByRole("button", { name: /show result of each_book/i }),
+    );
+    expect(
+      screen
+        .getByText("Item 2 · Velvet · Failed: the page did not load")
+        .closest("li")!.className,
+    ).toContain("text-red-700");
+  });
+
+  it("says a step inside a loop ran N times, never one item's result as the whole step's", () => {
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map([["get_invoices", block({})]]),
+      runsByLabel: new Map([
+        ["get_invoices", { count: 3, failed: 1, withOutput: 2 }],
+      ]),
+      live: false,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="get_invoices" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText("· 1 failed")).toBeTruthy();
+    expect(screen.getByText(/^Ran 3 times/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /result of/i })).toBeNull();
+  });
+
+  it("never says a looped Code step returned nothing when its runs returned values", () => {
+    const ranTwice = (withOutput: number) => {
+      const b = block({
+        block_type: "code",
+        output: { result: "under budget" },
+      });
+      docRun.current = {
+        runId: "wr_1",
+        run: { downloaded_file_urls: [] },
+        blocksByLabel: new Map([[b.label as string, b]]),
+        runsByLabel: new Map([
+          [b.label as string, { count: 2, failed: 0, withOutput }],
+        ]),
+        live: false,
+      };
+      return render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter>
+            <DocStepResult label={b.label as string} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    };
+    const returned = ranTwice(2);
+    expect(returned.getByTestId("doc-step-result").textContent).toContain(
+      "Ran 2 times",
+    );
+    expect(returned.queryByText(/returned nothing/)).toBeNull();
+    returned.unmount();
+    // Only when no run returned anything does the line say so.
+    const empty = ranTwice(0);
+    expect(empty.getByText(/Ran 2 times · returned nothing/)).toBeTruthy();
+  });
+
+  it("says a Code step that returned nothing did so, ignoring the screen taken before it ran", () => {
+    screenshotMock.artifact = {
+      artifact_id: "art_code",
+      artifact_type: ArtifactType.LLMScreenshot,
+      archived: false,
+    };
+    const before = renderResult(block({ block_type: "code", output: null }));
+    expect(screen.queryByRole("button", { name: /result of/i })).toBeNull();
+    expect(screen.getByText(/Completed · 9s · returned nothing/)).toBeTruthy();
+    before.unmount();
+    // A screen from the Code step's own page actions is its result.
+    screenshotMock.artifact = {
+      artifact_id: "art_code_action",
+      artifact_type: ArtifactType.ActionScreenshot,
+      archived: false,
+    };
+    renderResult(block({ block_type: "code", output: null }));
+    fireEvent.load(screen.getByTestId("doc-step-last-screen"));
+    expect(
+      screen.getByRole("button", { name: /show result of/i }),
+    ).toBeTruthy();
+    screenshotMock.artifact = undefined;
+  });
+
+  it("reads Canceled on a loop the run was canceled in, not just its item count", () => {
+    const loop = block({
+      block_type: "for_loop",
+      label: "each_book",
+      status: Status.Canceled,
+      output: null,
+    });
+    docRun.current = {
+      runId: "wr_1",
+      run: { status: Status.Canceled, downloaded_file_urls: [] },
+      blocksByLabel: new Map([["each_book", loop]]),
+      loopsByLabel: new Map([
+        [
+          "each_book",
+          {
+            total: 3,
+            items: [
+              { index: 0, state: "completed" },
+              { index: 1, state: "completed" },
+            ],
+          },
+        ],
+      ]),
+      live: false,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="each_book" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(
+      screen.getByRole("button", { name: /show result of each_book/i })
+        .textContent,
+    ).toMatch(/^Canceled/);
+    expect(screen.getByRole("img", { name: "canceled" })).toBeTruthy();
+  });
+
+  it("keeps the reason of a step that ran several times and ended the run failed", () => {
+    const b = block({
+      status: Status.Failed,
+      failure_reason:
+        "The page never finished loading. The site kept redirecting.",
+    });
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map([[b.label as string, b]]),
+      runsByLabel: new Map([
+        [b.label as string, { count: 3, failed: 1, withOutput: 2 }],
+      ]),
+      live: false,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="get_invoices" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /show result of/i }));
+    expect(screen.getByText(/kept redirecting/)).toBeTruthy();
+  });
+
+  it("reads Canceled for a step left running when the run was canceled", () => {
+    const b = block({ status: Status.Running });
+    docRun.current = {
+      runId: "wr_1",
+      run: { status: Status.Canceled, downloaded_file_urls: [] },
+      blocksByLabel: new Map([[b.label as string, b]]),
+      live: false,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="get_invoices" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/^Canceled/)).toBeTruthy();
+    expect(screen.queryByText(/^Stopped/)).toBeNull();
+  });
+
+  it("lists a long loop's failed items first and caps the list at five", () => {
+    const loop = block({
+      block_type: "for_loop",
+      label: "each_book",
+      output: null,
+    });
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map([["each_book", loop]]),
+      loopsByLabel: new Map([
+        [
+          "each_book",
+          {
+            total: 8,
+            items: Array.from({ length: 8 }, (_, index) => ({
+              index,
+              title: `b${index}`,
+              detail: null,
+              state: index === 7 ? "failed" : "succeeded",
+              failureHeadline: index === 7 ? "it broke" : null,
+            })),
+          },
+        ],
+      ]),
+      live: false,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="each_book" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: /show result of each_book/i }),
+    );
+    const items = screen.getByTestId("doc-loop-items").querySelectorAll("li");
+    expect(items).toHaveLength(6);
+    expect(items[0]!.textContent).toContain("Item 8");
+    expect(screen.getByText("3 more items")).toBeTruthy();
+  });
+
+  it("draws a canceled step grey, never red", () => {
+    const { container } = renderResult(block({ status: Status.Canceled }));
+    expect(screen.getByText(/^Canceled/).className).not.toContain(
+      "text-destructive",
+    );
+    expect(container.querySelector(".text-destructive")).toBeNull();
+  });
+
+  it("shows a failed step's longer reason in its expansion, with no tabs", () => {
+    renderResult(
+      block({
+        status: Status.Failed,
+        failure_reason:
+          "The page never finished loading. The site kept redirecting to a sign-in page.",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /show result of/i }));
+    expect(screen.getByText(/kept redirecting/)).toBeTruthy();
+    expect(screen.queryByRole("tab")).toBeNull();
   });
 
   it("shows the failure reason on a failed step and renders nothing for a step with no run row", () => {

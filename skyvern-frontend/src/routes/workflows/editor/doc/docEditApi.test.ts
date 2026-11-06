@@ -158,7 +158,7 @@ describe("doc edit api", () => {
 
   test("deleting the finally step clears the finally label, so the save is not refused", () => {
     const graph = getElements(
-      [code("first", null), code("cleanup", null)],
+      [code("first", "second"), code("second", null), code("cleanup", null)],
       settings("cleanup"),
       true,
     ) as DocGraph;
@@ -184,7 +184,13 @@ describe("doc edit api", () => {
       inputKeys: [],
       credentialKeys: new Set(),
     });
-    api.remove(cleanup.id);
+    const idOf = (label: string) =>
+      graph.nodes.find((n) => isWorkflowBlockNode(n) && n.data.label === label)!
+        .id;
+    // Focus after deleting the finally step goes to the step above it, not to the first step.
+    expect(api.neighbourOf(cleanup.id)).toBe(idOf("second"));
+    expect(api.neighbourOf(idOf("first"))).toBe(idOf("second"));
+    expect(api.remove(cleanup.id)).toBe(true);
     const start = (applied as DocGraph | null)?.nodes.find(
       (n: AppNode) => n.type === "start" && !n.parentId,
     );

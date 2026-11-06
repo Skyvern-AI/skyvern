@@ -5,6 +5,7 @@ import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
 import type { WorkflowRunApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import {
   getActiveOrgQueryKeyScope,
   getOrgScopedQueryKey,
@@ -26,13 +27,18 @@ import type {
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
 import {
+  collectBlockRuns,
   collectLoopProgress,
-  sameSteps,
+  type DocBlockRuns,
+  docRunRowsSettled,
+  ranAnotherVersion,
+  settleRowsOfEndedRun,
   stepLabelsOf,
   stepsUnknownToRun,
   type DocLoopProgress,
 } from "./docRunState";
 import { useWorkflowQuery } from "../../hooks/useWorkflowQuery";
+import { docProduced } from "./docStepProduced";
 import {
   useDismissedDocRunId,
   isStepRun,
@@ -54,10 +60,14 @@ export function collectBlocks(
 
 const EMPTY = new Map<string, WorkflowRunBlock>();
 const NO_LOOPS = new Map<string, DocLoopProgress>();
+const NO_RUNS = new Map<string, DocBlockRuns>();
 const NO_LABELS = new Set<string>();
 type Projection = {
+  // Whether the backend has moved every row off Running, before the Doc settles rows of an ended run.
+  rowsSettled: boolean;
   blocks: Map<string, WorkflowRunBlock>;
   loops: Map<string, DocLoopProgress>;
+  runs: Map<string, DocBlockRuns>;
 };
 // Every step calls useDocRun; walk the timeline once per poll, not once per step.
 const walked = new WeakMap<object, WeakMap<object, Projection>>();
@@ -74,14 +84,31 @@ function blocksFor(
   if (!byRun) walked.set(timeline, (byRun = new WeakMap()));
   let projection = byRun.get(runKey);
   if (!projection) {
-    const attempt = filterTimelineToAttempt(
+    const rows = filterTimelineToAttempt(
       timeline,
       run?.attempts ?? [],
       getRunAttempt(run ?? {}),
     );
-    projection = { blocks: new Map(), loops: new Map() };
+    const attempt =
+      run && !runIsLogicallyActive(run)
+        ? settleRowsOfEndedRun(rows, run)
+        : rows;
+    const raw = new Map<string, WorkflowRunBlock>();
+    collectBlocks(rows, raw, workflowRunId);
+    projection = {
+      rowsSettled: docRunRowsSettled(raw),
+      blocks: new Map(),
+      loops: new Map(),
+      runs: new Map(),
+    };
     collectBlocks(attempt, projection.blocks, workflowRunId);
     collectLoopProgress(attempt, workflowRunId, projection.loops);
+    collectBlockRuns(
+      attempt,
+      workflowRunId,
+      projection.runs,
+      (block) => docProduced(block) !== null,
+    );
     byRun.set(runKey, projection);
   }
   return projection;
@@ -222,12 +249,19 @@ export function useDocRun() {
     [timeline, run, runId],
   );
   const { data: current } = useWorkflowQuery({ workflowPermanentId });
-  // Accepting a tested proposal saves a newer version with the same steps; its test run still speaks for it.
+  const proposal = useCopilotProposalStore((s) => s.proposal);
+  const proposalPending = Boolean(
+    proposal &&
+    (!workflowPermanentId ||
+      proposal.proposed.workflow_permanent_id === workflowPermanentId),
+  );
   const earlierVersion = Boolean(
     run &&
     current &&
-    run.workflow.version < current.version &&
-    !sameSteps(run.workflow.workflow_definition, current.workflow_definition),
+    ranAnotherVersion(run.workflow, current, {
+      copilotTest: Boolean(run.copilot_session_id),
+      proposalPending,
+    }),
   );
   const unknownLabels = useMemo(
     () =>
@@ -253,9 +287,11 @@ export function useDocRun() {
     run: storedGone ? undefined : run,
     blocksByLabel: projection?.blocks ?? EMPTY,
     loopsByLabel: projection?.loops ?? NO_LOOPS,
+    runsByLabel: projection?.runs ?? NO_RUNS,
     live: Boolean(run && runIsLogicallyActive(run)),
     // Until the run's step rows arrive, a missing row means "not loaded", not "not reached".
     rowsLoaded: Boolean(projection),
+    rowsSettled: projection?.rowsSettled ?? false,
     // Whether this browser started the run (or opened it by URL). Only an owned run locks the Doc,
     // offers Stop and ends with a toast; a run from elsewhere is drawn the same but read-only.
     owned: Boolean(urlRunId || (runId && runId === storedRunId)),

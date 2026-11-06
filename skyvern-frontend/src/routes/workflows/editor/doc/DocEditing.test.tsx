@@ -10,6 +10,7 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { useContext } from "react";
 
+import { toast } from "@/components/ui/use-toast";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { AxiosError } from "axios";
 
@@ -27,6 +28,7 @@ import { caretOnEdge } from "./docCaret";
 import { DocStepHeader } from "./DocStep";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 import { createDocEditApi, TOP_SCOPE } from "./docEditApi";
+import { clearDocAnnouncement, docAnnouncement } from "./docAnnounce";
 import type { DocGraph } from "./docGraphEdits";
 import { getElements } from "../workflowEditorUtils";
 import { isWorkflowBlockNode } from "../nodes";
@@ -37,6 +39,10 @@ const catalogState = vi.hoisted(() => ({
   data: undefined as
     | Array<{ id: string; status: "live" | "comingSoon" }>
     | undefined,
+}));
+vi.mock("@/components/ui/use-toast", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/components/ui/use-toast")>()),
+  toast: vi.fn(),
 }));
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
 vi.mock("./useDocRun", () => ({
@@ -299,6 +305,101 @@ describe("Add a step search", () => {
     );
     expect(tag.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByPlaceholderText("Turn into…")).toBeNull();
+    expect(docAnnouncement()).toBe("Turned into Wait");
+  });
+
+  describe("grip menu announcements", () => {
+    function setup() {
+      clearDocAnnouncement();
+      const graph = getElements(
+        [
+          block("text_prompt", "first", null, { prompt: "A", parameters: [] }),
+          block("text_prompt", "second", null, { prompt: "B", parameters: [] }),
+        ],
+        settings(),
+        true,
+      ) as DocGraph;
+      const node = graph.nodes.filter(isWorkflowBlockNode)[1]!;
+      const edit = createDocEditApi({
+        ...graph,
+        edits: {
+          apply: () => {},
+          update: () => {},
+          addStep: () => null,
+          duplicate: () => {},
+        },
+        finallyId: null,
+        workflowId: "wpid_test",
+        selectBranch: () => {},
+        selectedBranch: () => undefined,
+        inputKeys: [],
+        credentialKeys: new Set(),
+      });
+      function Header() {
+        const actions = useContext(WorkflowDocActionsContext);
+        return (
+          <WorkflowDocActionsContext.Provider
+            value={{
+              ...actions,
+              editable: true,
+              edit,
+              outputUsers: () => [],
+              destinations: () => [
+                {
+                  label: "Top of the doc",
+                  scope: TOP_SCOPE,
+                  index: 0,
+                  insideOf: null,
+                },
+              ],
+            }}
+          >
+            <DocStepHeader
+              node={node}
+              editable
+              showRunControl={false}
+              place={{ scope: TOP_SCOPE, index: 1, count: 2, isFinally: false }}
+            />
+          </WorkflowDocActionsContext.Provider>
+        );
+      }
+      render(<Header />);
+      fireEvent.click(
+        screen.getByRole("button", { name: /step second, actions/ }),
+      );
+    }
+
+    test("Move up says so", async () => {
+      setup();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move up" }));
+      expect(docAnnouncement()).toBe("Moved up");
+    });
+
+    test("Move to… names the place", async () => {
+      setup();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Move to…" }));
+      fireEvent.click(await screen.findByText("Top of the doc"));
+      await waitFor(() =>
+        expect(docAnnouncement()).toBe("Moved to Top of the doc"),
+      );
+    });
+
+    test("Duplicate and Delete name the step", async () => {
+      setup();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Duplicate" }));
+      await waitFor(() => expect(docAnnouncement()).toBe("Duplicated second"));
+      fireEvent.click(
+        screen.getByRole("button", { name: /step second, actions/ }),
+      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+      // Delete keeps its toast, which announces itself; the announcer stays silent so it is not read twice.
+      await waitFor(() =>
+        expect(toast).toHaveBeenCalledWith(
+          expect.objectContaining({ title: "Deleted second" }),
+        ),
+      );
+      expect(docAnnouncement()).not.toMatch(/Deleted/);
+    });
   });
 
   test("Power BI is offered only when the served catalog marks it live", () => {

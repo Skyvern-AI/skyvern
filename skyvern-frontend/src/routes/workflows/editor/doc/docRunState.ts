@@ -91,11 +91,50 @@ export type DocLoopItem = {
   title: string | null;
   // The item's full value, for a disclosure under the line.
   detail: string | null;
-  state: "running" | "succeeded" | "failed" | "waiting";
+  state: "running" | "succeeded" | "failed" | "waiting" | "canceled";
   failureHeadline: string | null;
 };
 
 export type DocLoopProgress = { total: number | null; items: DocLoopItem[] };
+
+/**
+ * The timeline as the ended run left it: a row the backend has not yet moved off Running ended with
+ * the run, so it reads as the run's failure or cancel, not as still running. A terminated run is left
+ * alone: its lagging rows read "Stopped", and its Stop step must keep its own status.
+ */
+export function settleRowsOfEndedRun(
+  timeline: WorkflowRunTimelineItem[],
+  run: { status: string; failure_reason?: string | null },
+): WorkflowRunTimelineItem[] {
+  const canceled = run.status === Status.Canceled;
+  const failed = run.status === Status.Failed || run.status === Status.TimedOut;
+  if (!canceled && !failed) return timeline;
+  const settle = (block: WorkflowRunBlock): WorkflowRunBlock => {
+    const lagging =
+      block.status === Status.Running || block.status === Status.Paused;
+    if (canceled)
+      return lagging ? { ...block, status: Status.Canceled } : block;
+    return lagging && block.block_type !== "terminate"
+      ? {
+          ...block,
+          status: run.status as Status,
+          failure_reason: block.failure_reason || run.failure_reason || null,
+        }
+      : block;
+  };
+  const walk = (items: WorkflowRunTimelineItem[]): WorkflowRunTimelineItem[] =>
+    items.map((item) =>
+      isBlockItem(item)
+        ? {
+            ...item,
+            block: settle(item.block),
+            task_v2_blocks: item.task_v2_blocks?.map(settle),
+            children: walk(item.children),
+          }
+        : { ...item, children: walk(item.children) },
+    );
+  return walk(timeline);
+}
 
 function itemState(blocks: WorkflowRunBlock[]): DocLoopItem["state"] {
   if (blocks.some((b) => FAILED.has(b.status))) return "failed";
@@ -109,6 +148,7 @@ function itemState(blocks: WorkflowRunBlock[]): DocLoopItem["state"] {
     )
   )
     return "running";
+  if (blocks.some((b) => b.status === Status.Canceled)) return "canceled";
   return "succeeded";
 }
 
@@ -268,21 +308,48 @@ export function docRunEndMessage(
     : "Run finished";
 }
 
-// Every saved version stamps its own ids and times on each step, so only the authored fields compare.
+// Every saved version stamps its own ids and times on each step and input, so only the authored fields compare.
 const STAMPED_KEYS = new Set([
   "output_parameter",
+  "workflow_id",
   "created_at",
   "modified_at",
   "deleted_at",
 ]);
+const isStamped = (key: string) =>
+  STAMPED_KEYS.has(key) || key.endsWith("_parameter_id");
+const isStep = (
+  value: unknown,
+): value is Record<string, unknown> & { label: string } =>
+  Boolean(value) &&
+  typeof value === "object" &&
+  typeof (value as Record<string, unknown>).label === "string" &&
+  typeof (value as Record<string, unknown>).block_type === "string";
 // A conditional branch's "id" is minted again on every save; an "id" anywhere else is authored.
 const isBranch = (holder: Record<string, unknown>) =>
   "is_default" in holder || "next_block_label" in holder;
-// A save writes defaults as null where the author left a field out, so null reads as absent.
-function stamped(this: Record<string, unknown>, key: string, value: unknown) {
-  if (STAMPED_KEYS.has(key) || value === null) return undefined;
-  if (key === "id" && isBranch(this)) return undefined;
-  return value;
+
+// The editor's first save fills defaults an agent made elsewhere left empty (null or "" fields,
+// the title as the label, the unused export schema), so those read as absent. A step inside
+// another counts by its label only: editing it changes that step, not the one around it.
+function authored(step: Record<string, unknown>): string {
+  return JSON.stringify(
+    step,
+    function (this: Record<string, unknown>, key: string, value: unknown) {
+      if (key === "") return value;
+      if (value === null) return undefined;
+      // Only a step's or an input's own keys; the same names inside an authored schema or body are edits.
+      const own = isStep(this) || typeof this.parameter_type === "string";
+      if (own && (isStamped(key) || value === "")) return undefined;
+      if (key === "id" && isBranch(this)) return undefined;
+      if (isStep(this)) {
+        if (key === "title" && value === this.label) return undefined;
+        if (key === "export_data_schema" && !this.export_enabled)
+          return undefined;
+      }
+      return isStep(value) ? `step:${value.label}` : value;
+    },
+  );
 }
 
 function stepsByLabel(node: unknown, into: Map<string, string>) {
@@ -292,8 +359,7 @@ function stepsByLabel(node: unknown, into: Map<string, string>) {
   }
   if (!node || typeof node !== "object") return;
   const record = node as Record<string, unknown>;
-  if (typeof record.label === "string" && typeof record.block_type === "string")
-    into.set(record.label, JSON.stringify(record, stamped));
+  if (isStep(record)) into.set(record.label, authored(record));
   for (const value of Object.values(record)) stepsByLabel(value, into);
 }
 
@@ -352,4 +418,67 @@ export function sameSteps(
     [...ran.keys()].join("\0") === [...current.keys()].join("\0") &&
     [...current].every(([label, definition]) => ran.get(label) === definition)
   );
+}
+
+type SavedVersion = {
+  version: number;
+  workflow_definition: unknown;
+  deleted_at?: string | null;
+};
+
+/** Whether a run's results belong to a version other than the agent's saved one. */
+export function ranAnotherVersion(
+  ran: SavedVersion,
+  current: SavedVersion,
+  newer: { copilotTest: boolean; proposalPending: boolean },
+): boolean {
+  // Accepting a tested proposal saves a newer version with the same steps; its test run still speaks for it.
+  // A newer Copilot test with no proposal left under review was rejected (its draft version is deleted once
+  // the run ends). Any other newer version is a save this tab has not loaded yet, so its run is the agent's.
+  const discarded =
+    ran.version < current.version ||
+    (ran.version > current.version &&
+      !newer.proposalPending &&
+      (newer.copilotTest || Boolean(ran.deleted_at)));
+  return (
+    discarded &&
+    !sameSteps(ran.workflow_definition, current.workflow_definition)
+  );
+}
+
+export type DocBlockRuns = {
+  count: number;
+  failed: number;
+  canceled: number;
+  withOutput: number;
+};
+
+/** How many times each step ran in the run (once per loop item), how many failed, and how many returned a value. */
+export function collectBlockRuns(
+  timeline: WorkflowRunTimelineItem[],
+  workflowRunId: string,
+  into: Map<string, DocBlockRuns>,
+  hasOutput: (block: WorkflowRunBlock) => boolean,
+) {
+  for (const block of descendants(timeline)) {
+    if (!block.label || block.workflow_run_id !== workflowRunId) continue;
+    // A row that never started (skipped branch, not reached) is not a run.
+    if (
+      block.status === Status.Skipped ||
+      block.status === Status.Queued ||
+      block.status === Status.Created
+    )
+      continue;
+    const runs = into.get(block.label) ?? {
+      count: 0,
+      failed: 0,
+      canceled: 0,
+      withOutput: 0,
+    };
+    runs.count += 1;
+    if (FAILED.has(block.status)) runs.failed += 1;
+    if (block.status === Status.Canceled) runs.canceled += 1;
+    if (hasOutput(block)) runs.withOutput += 1;
+    into.set(block.label, runs);
+  }
 }

@@ -6,7 +6,6 @@ import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { stripJinjaReferences } from "./docTextUtils";
-import { showDropBlockedToast } from "../sortable/dropBlockedToast";
 import { useNodeCollapseStore } from "../collapse/useNodeCollapseStore";
 import {
   isWorkflowBlockNode,
@@ -527,14 +526,28 @@ export function createDocEditApi({
       return index < 0 ? null : insertStep({ scope, index }, nodeType, id);
     },
     duplicate: (id: string) => edits.duplicate(id),
-    remove: (id: string) => {
-      if (refuseIfFeedsInputs([id])) return;
+    // The step that keyboard focus moves to once `id` is deleted: the one above, else below, else its loop or If.
+    neighbourOf: (id: string): string | null => {
+      const node = nodes.find((n) => n.id === id);
+      if (!node) return null;
+      // The finally step is left out of a chain that pins it, so its own chain is read without the pin.
+      const chain =
+        readChain(graph, scopeOfNode(node), id === finallyId ? null : finallyId)
+          ?.ids ?? [];
+      const at = chain.indexOf(id);
+      if (at < 0) return node.parentId ?? null;
+      const pinned = !node.parentId && id !== finallyId ? finallyId : null;
+      return chain[at - 1] ?? chain[at + 1] ?? node.parentId ?? pinned ?? null;
+    },
+    // False when the step stays.
+    remove: (id: string): boolean => {
+      if (refuseIfFeedsInputs([id])) return false;
       const removed = nodes.find((n) => n.id === id);
       const next = removeBlock(graph, id, finallyId);
-      if (!next)
-        return refuse(
-          "This step can't be deleted here. Open Visual to edit it.",
-        );
+      if (!next) {
+        refuse("This step can't be deleted here. Open Visual to edit it.");
+        return false;
+      }
       // The save refuses a finally label that names no step.
       edits.apply(
         id === finallyId
@@ -547,6 +560,7 @@ export function createDocEditApi({
             ? `Deleted ${removed.data.label}`
             : "Deleted",
       });
+      return true;
     },
     // A step still named for its old type, with nothing using its output, is renamed for the new type.
     turnInto: (id: string, nodeType: NodeType) => {
@@ -598,17 +612,18 @@ export function createDocEditApi({
     },
     move,
     // Tab nests a step in the loop or branch just above it; Shift+Tab puts it after the step that holds it.
-    // False when there is nowhere to go, so the key keeps its usual meaning.
-    nest: (id: string, outdent: boolean): boolean => {
+    // Says what it moved through, or null when there is nowhere to go, so the key keeps its usual meaning.
+    nest: (id: string, outdent: boolean): DocNestKind | null => {
       const node = nodes.find((n) => n.id === id);
-      if (!node || id === finallyId) return false;
+      if (!node || id === finallyId) return null;
       if (outdent) {
         const parent = nodes.find((n) => n.id === node.parentId);
-        if (!parent) return false;
+        const kind = nestKindOf(parent);
+        if (!parent || !kind) return null;
         const scope = scopeOfNode(parent);
         const at = readChain(graph, scope, finallyId)?.ids.indexOf(parent.id);
-        if (at === undefined || at < 0) return false;
-        return move(id, { scope, index: at + 1 });
+        if (at === undefined || at < 0) return null;
+        return move(id, { scope, index: at + 1 }) ? kind : null;
       }
       const chain = readChain(graph, scopeOfNode(node), finallyId);
       const at = chain?.ids.indexOf(id) ?? -1;
@@ -618,18 +633,29 @@ export function createDocEditApi({
         return move(id, {
           scope: { parentId: above.id, conditionalBranchId: null },
           index: Number.MAX_SAFE_INTEGER,
-        });
+        })
+          ? "loop"
+          : null;
       }
       if (above?.type === "conditional") {
         const branchId =
           selectedBranch(above.id) ?? above.data.branches[0]?.id ?? null;
-        if (!branchId) return false;
+        if (!branchId) return null;
         return move(id, {
           scope: { parentId: above.id, conditionalBranchId: branchId },
           index: Number.MAX_SAFE_INTEGER,
-        });
+        })
+          ? "branch"
+          : null;
       }
-      return false;
+      return null;
+    },
+    // What a line moving in or out of `id` is moving through; with `holder`, of the loop or If that holds `id`.
+    nestKind: (id: string | null, holder = false): DocNestKind | null => {
+      const node = nodes.find((n) => n.id === id);
+      return nestKindOf(
+        holder ? nodes.find((n) => n.id === node?.parentId) : node,
+      );
     },
     // A step with no text, no note and no setting: "/" can replace it outright.
     isEmptyStep: (id: string) => {
@@ -737,12 +763,12 @@ export function createDocEditApi({
         TOP_SCOPE,
         Number.MAX_SAFE_INTEGER,
       );
-      if (end.kind === "forward-reference")
-        return showDropBlockedToast({
-          kind: "forward-reference",
-          movedBlockLabel: end.movedLabel,
-          referrerLabels: end.referrerLabels,
-        });
+      if (end.kind === "forward-reference") {
+        const users = Array.from(new Set(end.referrerLabels));
+        return refuse(
+          `${end.movedLabel} can't run at the end: ${users.join(", ")} ${users.length === 1 ? "uses" : "use"} its output.`,
+        );
+      }
       edits.apply(end.kind === "ok" ? end.graph : { nodes: next, edges });
     },
     rename: (id: string, label: string): string | null => {
@@ -818,3 +844,11 @@ export function createDocEditApi({
 }
 
 export type DocEditApi = ReturnType<typeof createDocEditApi>;
+
+export type DocNestKind = "loop" | "branch";
+
+function nestKindOf(node: AppNode | undefined): DocNestKind | null {
+  if (node?.type === "loop") return "loop";
+  if (node?.type === "conditional") return "branch";
+  return null;
+}

@@ -1,3 +1,4 @@
+import { useSyncExternalStore } from "react";
 import { useBlockPlayRegistry } from "@/store/BlockPlayRegistryStore";
 import { isMacPlatform } from "@/util/platform";
 
@@ -12,6 +13,17 @@ export type PickerFinish = (keepLine: boolean, typeSlash?: boolean) => void;
 export type PickerOpener = (finish: PickerFinish) => void;
 
 export const modLabel = () => (isMacPlatform() ? "⌘" : "Ctrl+");
+
+/** A Cmd/Ctrl shortcut as Undo's "⌘Z" is written, and as `aria-keyshortcuts` reads it. */
+export function docShortcut(key: string, shift = false) {
+  const mac = isMacPlatform();
+  return {
+    label: mac
+      ? `⌘${shift ? "⇧" : ""}${key}`
+      : `Ctrl+${shift ? "Shift+" : ""}${key}`,
+    aria: `${mac ? "Meta" : "Control"}+${shift ? "Shift+" : ""}${key}`,
+  };
+}
 
 /** Runs one step the way its Run button does; false when it cannot run now. */
 export function runStepByKey(nodeId: string): boolean {
@@ -32,6 +44,17 @@ export const takeReferenceLine = (): ReferenceLine | null => {
   const label = referenceLine;
   referenceLine = null;
   return label;
+};
+
+// The insert line between steps opens an empty line with the step picker already open on it.
+let pickerOnLine: string | null = null;
+export const requestPickerOnLine = (lineKey: string) => {
+  pickerOnLine = lineKey;
+};
+export const takePickerOnLine = (lineKey: string): boolean => {
+  if (pickerOnLine !== lineKey) return false;
+  pickerOnLine = null;
+  return true;
 };
 
 // A step made by splitting a line puts the caret at the start of its text, not the end.
@@ -65,3 +88,25 @@ export const takeNextCaretOffset = (): number | null => {
   nextCaretOffset = null;
   return offset;
 };
+
+// Touch screens get no hover-only controls. Gated on the primary input device, not the width: a narrow window with
+// a mouse keeps them; a touch laptop drops them only when touch is its primary pointer (tablet mode).
+export const DOC_TOUCH_QUERY = "(hover: none), (pointer: coarse)";
+
+function subscribeTouch(onChange: () => void) {
+  if (typeof window.matchMedia !== "function") return () => {};
+  const query = window.matchMedia(DOC_TOUCH_QUERY);
+  query.addEventListener?.("change", onChange);
+  return () => query.removeEventListener?.("change", onChange);
+}
+
+function isDocTouch(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    Boolean(window.matchMedia(DOC_TOUCH_QUERY)?.matches)
+  );
+}
+
+export function useDocTouch(): boolean {
+  return useSyncExternalStore(subscribeTouch, isDocTouch, () => false);
+}
