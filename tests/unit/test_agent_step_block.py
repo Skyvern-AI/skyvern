@@ -63,6 +63,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block, convert_workflow_definition
+from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
 from skyvern.schemas.llm import LLMConfig
 from skyvern.schemas.workflows import (
     AgentStepBlockYAML,
@@ -77,6 +78,7 @@ from skyvern.schemas.workflows import (
     WorkflowDefinitionYAML,
 )
 from skyvern.services import script_service
+from skyvern.webeye.actions.actions import ActionStatus, UploadFileAction
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.copilot_test_helpers import scripted_call, scripted_text, tool_outputs_for
 from tests.unit.test_context_manager import _initialize_smtp_workflow, _make_workflow, _platform_email
@@ -466,6 +468,18 @@ def _credential_parameter() -> WorkflowParameter:
     )
 
 
+def _file_parameter(key: str) -> WorkflowParameter:
+    now = datetime.now(UTC)
+    return WorkflowParameter(
+        key=key,
+        workflow_parameter_id=f"wp_{key}",
+        workflow_parameter_type=WorkflowParameterType.FILE_URL,
+        workflow_id="w_1",
+        created_at=now,
+        modified_at=now,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tools", "credential", "listed", "offered", "block_types"),
@@ -799,16 +813,7 @@ async def test_browser_task_hands_over_only_this_runs_files_by_name(
 ) -> None:
     monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
     context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
-    now = datetime.now(UTC)
-    fax_file = WorkflowParameter(
-        key="fax_file",
-        workflow_parameter_id="wp_fax",
-        workflow_parameter_type=WorkflowParameterType.FILE_URL,
-        workflow_id="w_1",
-        created_at=now,
-        modified_at=now,
-    )
-    context.parameters |= {"fax_file": fax_file, "login_credential": _credential_parameter()}
+    context.parameters |= {"fax_file": _file_parameter("fax_file"), "login_credential": _credential_parameter()}
     # A value left by an earlier execution of this step, whose child labels repeat.
     context.values |= {"fax_file": "file_123", CHILD_OUTPUT: {"llm_response": "stale"}}
     declared = dict(context.parameters)
@@ -849,6 +854,167 @@ async def test_browser_task_hands_over_only_this_runs_files_by_name(
         assert str(allowed) in report["error"]
         assert handed_over == []
     assert context.parameters == declared
+
+
+FORM_URL = "https://example.com/upload"
+FAX_URL = "https://bucket.example.com/fax.pdf?X-Amz-Signature=" + "0123456789abcdef" * 4
+NOTES_URL = "https://example.com/notes.pdf"
+DECOY_URL = "https://example.com/resume.pdf?signature=" + "fedcba9876543210" * 4
+MALFORMED_URL = "http://agent:pw@[bad/receipt.pdf?X-Amz-Signature=" + "9f8e7d6c5b4a3210" * 4
+DOWNLOADED_URL = "https://bucket.example.com/statement.pdf?X-Amz-Signature=" + "a1b2c3d4e5f60789" * 4
+
+
+def _token(url: str) -> str:
+    return mask_opaque_urls({"url": url}).mask(url)
+
+
+@pytest.mark.asyncio
+async def test_a_nested_agent_result_gives_page_url_at_start_and_each_upload_attempt(
+    monkeypatch: pytest.MonkeyPatch, database: AgentDB
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts[RUN]
+    context.parameters |= {"fax_file": _file_parameter("fax_file"), "notes_file": _file_parameter("notes_file")}
+    context.values |= {"fax_file": FAX_URL, "notes_file": NOTES_URL}
+    working_page = SimpleNamespace(url="about:blank")
+    # The fourth call's page read and upload read both fail.
+    browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(side_effect=[working_page] * 3 + [RuntimeError("page closed")]),
+        take_fullpage_screenshot=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(app.BROWSER_MANAGER, "get_for_workflow_run", lambda *_, **__: browser_state)
+    read_actions = database.tasks.get_task_actions_hydrated
+    action_reads = [read_actions] * 3 + [AsyncMock(side_effect=RuntimeError("database unavailable"))]
+    monkeypatch.setattr(
+        database.tasks, "get_task_actions_hydrated", lambda *args, **kwargs: action_reads.pop(0)(*args, **kwargs)
+    )
+    # Each child: the upload rows its nested agent records, its status, its output, and the page it leaves.
+    children = [
+        (
+            [(_token(FAX_URL), ActionStatus.completed), (NOTES_URL, ActionStatus.completed)],
+            BlockStatus.completed,
+            None,
+            "https://agent:pw@example.com/upload?session_id=sK8pL2nQ5vR9xT3mW6yZ1aBc#done",
+        ),
+        (
+            [
+                (_token(DECOY_URL), ActionStatus.completed),
+                (MALFORMED_URL, ActionStatus.failed),
+                ("https://example.com/other.pdf?token=abc123", ActionStatus.failed),
+            ],
+            BlockStatus.completed,
+            {"downloaded_file_urls": [DOWNLOADED_URL]},
+            MALFORMED_URL,
+        ),
+        ([(_token(DOWNLOADED_URL), ActionStatus.completed)], BlockStatus.timed_out, None, FORM_URL),
+        ([(_token(FAX_URL), ActionStatus.completed)], BlockStatus.completed, None, FORM_URL),
+    ]
+
+    async def nested_agent(
+        block: TaskBlock, workflow_run_id: str, workflow_run_block_id: str, **_: object
+    ) -> BlockResult:
+        rows, status, output, page_after = children.pop(0)
+        task = await database.tasks.create_task(
+            url=block.url or "",
+            title=None,
+            navigation_goal=None,
+            data_extraction_goal=None,
+            navigation_payload=None,
+            organization_id=ORG,
+            workflow_run_id=RUN,
+        )
+        await database.observer.update_workflow_run_block(
+            workflow_run_block_id=workflow_run_block_id, organization_id=ORG, task_id=task.task_id
+        )
+        step = await database.tasks.create_step(
+            task_id=task.task_id, order=0, retry_index=0, organization_id=ORG, status=StepStatus.running
+        )
+        for order, (file_url, row_status) in enumerate(rows):
+            await database.workflow_params.create_action(
+                UploadFileAction(
+                    element_id="file",
+                    file_url=file_url,
+                    status=row_status,
+                    organization_id=ORG,
+                    workflow_run_id=RUN,
+                    task_id=task.task_id,
+                    step_id=step.step_id,
+                    step_order=0,
+                    action_order=order,
+                )
+            )
+        if output is not None:
+            await block.record_output_parameter_value(context, RUN, output)
+        working_page.url = page_after
+        return BlockResult(
+            success=status == BlockStatus.completed,
+            output_parameter=block.output_parameter,
+            output_parameter_value=output,
+            status=status,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+
+    monkeypatch.setattr(TaskBlock, "execute", nested_agent)
+    model = _ScriptedModel(
+        [
+            [
+                scripted_call(
+                    "browser_task", {**UPLOAD, "url": FORM_URL, "files": ["fax_file", "notes_file"]}, call_id="upload"
+                )
+            ],
+            [scripted_call("browser_task", {"url": FORM_URL, "navigation_goal": "Read the receipt"}, call_id="read")],
+            [
+                scripted_call(
+                    "browser_task", {"navigation_goal": "Upload it", "files": ["agent_task_2_output"]}, call_id="again"
+                )
+            ],
+            [scripted_call("browser_task", {**UPLOAD, "url": FORM_URL, "files": ["fax_file"]}, call_id="broken")],
+            VALID_FINISH,
+        ]
+    )
+
+    result, _ = await _run_agent_block(monkeypatch, LUNA_MEDIUM, model, tools=["browser_task"])
+
+    facts = [
+        {key: report[key] for key in ("page_url_at_start", "upload_attempts") if key in report}
+        for report in (
+            json.loads(tool_outputs_for(model.inputs[-1][1], call)[0]) for call in ("upload", "read", "again", "broken")
+        )
+    ]
+    assert facts == [
+        {
+            "page_url_at_start": "about:blank",
+            "upload_attempts": [
+                {"parameter": "fax_file", "status": "completed"},
+                {"parameter": "notes_file", "status": "completed"},
+            ],
+        },
+        {
+            "page_url_at_start": FORM_URL,
+            "upload_attempts": [
+                {"source": _token(DECOY_URL), "status": "completed"},
+                {"source": "unparseable url", "status": "failed"},
+                {"source": "https://example.com/other.pdf", "status": "failed"},
+            ],
+        },
+        {
+            "page_url_at_start": "unparseable url",
+            "upload_attempts": [{"parameter": "agent_task_2_output", "status": "completed"}],
+        },
+        {},
+    ]
+    assert children == []
+    assert result.status == BlockStatus.completed
+    assert isinstance(result.output_parameter_value, dict)
+    tool_calls = result.output_parameter_value["tool_calls"][:4]
+    assert [call["status"] for call in tool_calls] == ["completed", "completed", "timed_out", "completed"]
+    assert [{key: call[key] for key in facts[0] if key in call} for call in tool_calls] == facts
+    block_output = json.dumps(result.output_parameter_value)
+    assert not [
+        url
+        for url in (FAX_URL, DECOY_URL, DOWNLOADED_URL, "agent:pw", "9f8e7d6c5b4a3210", "sK8pL2nQ5vR9", "abc123")
+        if url in block_output
+    ]
 
 
 EMAIL = {"sender": "agent@example.com", "subject": "Report", "body": "Done."}

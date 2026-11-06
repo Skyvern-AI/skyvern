@@ -193,6 +193,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatRequest,
     WorkflowCopilotChatSender,
+    WorkflowCopilotRunOutcomeUpdate,
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.services.credential.credential_vault_service import VaultLogin, VaultLoginListing
@@ -6796,6 +6797,135 @@ class TestRunBlocksCredentialApproval:
         )
         database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
 
+    @staticmethod
+    def _ctx_after_a_real_run(resolved_credentials: list[object]) -> CopilotContext:
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=resolved_credentials), stream=FakeCopilotStream())
+        ctx.last_run_outcome = RecordedRunOutcome(
+            verdict="not_evaluated", workflow_run_id="wr_prior", run_completed=True
+        )
+        ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
+            phase="persisted_block_run",
+            attempted_tool="run_blocks_and_collect_debug",
+            verdict="progress_observed",
+            reason_code="verified_success",
+            workflow_run_id="wr_prior",
+        )
+        ctx.last_run_blocks_workflow_run_id = "wr_prior"
+        ctx.last_run_blocks_browser_session_id = "pbs_prior"
+        return ctx
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("refusal", ["credential_approval", "google_account", "credential_not_found"])
+    async def test_refused_dispatch_records_the_attempt_but_no_run_outcome(self, monkeypatch, refusal: str) -> None:
+        if refusal == "google_account":
+            workflow = self._workflow(
+                parameters=[],
+                blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "goac_staged"}],
+            )
+            stored_credentials: list[object] = []
+            resolved_credentials: list[object] = []
+        else:
+            workflow = self._workflow("cred_login")
+            login = SimpleNamespace(credential_id="cred_login")
+            stored_credentials = [login] if refusal == "credential_approval" else []
+            resolved_credentials = [] if refusal == "credential_approval" else [login]
+        monkeypatch.setattr(
+            run_execution_module.app, "DATABASE", self._db(workflow=workflow, credentials=stored_credentials)
+        )
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(
+                get_workflow_parameters=AsyncMock(return_value=[]),
+                prepare_workflow=AsyncMock(side_effect=AssertionError("prepare_workflow called")),
+                execute_workflow=AsyncMock(side_effect=AssertionError("execute_workflow called")),
+            ),
+        )
+        monkeypatch.setattr(
+            credentials_module.google_oauth_service,
+            "get_visible_credentials_for_org",
+            AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        id="goac_choice", credential_name="Google Sheets", state="active", email_address=None
+                    )
+                ]
+            ),
+        )
+        log = MagicMock()
+        monkeypatch.setattr(run_execution_module, "LOG", log)
+        ctx = self._ctx_after_a_real_run(resolved_credentials)
+        prior_outcome = ctx.last_run_outcome
+        prior_build_outcome = ctx.latest_recorded_build_test_outcome
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+
+        assert recorded is None
+        assert [frame for frame in ctx.stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)] == []
+        assert "copilot_run_outcome_recorded" not in [call.args[0] for call in log.info.call_args_list if call.args]
+        assert ctx.latest_recorded_build_test_outcome is prior_build_outcome
+        assert ctx.run_outcome_trace == [prior_outcome]
+        assert (ctx.last_test_ok, ctx.last_test_run_started) == (False, False)
+        ctx.last_update_block_count = 1
+        reply = _rewrite_failed_test_response("The workflow is ready.", ctx)
+        assert reply.startswith("I couldn't start a test run:")
+        if refusal != "credential_not_found":
+            assert "Reason codes" not in reply and "Ask the user" not in reply
+        assert result["ok"] is False
+        if refusal == "credential_approval":
+            assert "unapproved_credential_reference" in result["error"]
+        elif refusal == "credential_not_found":
+            assert "cred_login" in result["error"]
+        else:
+            assert ctx.blocker_signal is not None
+            assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
+            assert [choice.connection_id for choice in ctx.connected_account_recovery_choices] == ["goac_choice"]
+
+    @pytest.mark.asyncio
+    async def test_refused_dispatch_still_reaches_the_model_as_a_credential_ask(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "DATABASE",
+            self._db(workflow=self._workflow("cred_login"), credentials=[SimpleNamespace(credential_id="cred_login")]),
+        )
+        ctx = self._ctx_after_a_real_run([])
+        ctx.last_test_non_retriable_nav_error = "Failed to navigate to url https://typo.invalid"
+
+        result = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, result, time.monotonic())
+        run_execution_module.finalize_build_test_result(
+            ctx, source_tool="run_blocks_and_collect_debug", result=result, recorded_outcome=recorded
+        )
+
+        contract = ctx.latest_diagnosis_repair_contract
+        assert contract.repair_decision.next_action == RepairNextAction.ASK
+        assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+        packet = result["data"][run_execution_module.BUILD_TEST_PACKET_KEY]
+        assert packet["run"] == {}
+        assert "unapproved_credential_reference" in packet["failure"]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_refused_dispatch_controls(self) -> None:
+        ctx = self._ctx_after_a_real_run([])
+        sandbox = run_execution_module._copilot_sandbox_unavailable_result(
+            organization_id="org-1", workflow_permanent_id="wfp-1"
+        )
+
+        recorded = await run_execution_module._verify_and_record_run_blocks_result(ctx, sandbox, time.monotonic())
+        run_execution_module.finalize_build_test_result(
+            ctx, source_tool="run_blocks_and_collect_debug", result=sandbox, recorded_outcome=recorded
+        )
+        assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == RepairNextAction.STOP
+
+        saved_profile_failure = run_execution_module._saved_profile_start_failure(
+            "saved_profile_unresolved", requested_block_labels=["login"]
+        )
+        await run_execution_module._verify_and_record_run_blocks_result(ctx, saved_profile_failure, time.monotonic())
+        frames = [frame for frame in ctx.stream.sent if isinstance(frame, WorkflowCopilotRunOutcomeUpdate)]
+        assert len(frames) == 2
+        assert ctx.last_run_outcome is not None and ctx.last_run_outcome.workflow_run_id != "wr_prior"
+
     @pytest.mark.asyncio
     async def test_unapproved_google_connection_halts_with_verified_account_rows(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot.tools import credentials as credentials_module
@@ -6918,7 +7048,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_sheet"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is None
         assert ctx.latest_tool_blocker_signal is None
         assert ctx.tool_blocker_signals == []
@@ -6950,7 +7080,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_replacement"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["login"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is None
         assert ctx.connected_account_recovery_choices == []
 
@@ -6985,7 +7115,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.connected_account_recovery_choices
@@ -7046,7 +7176,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.tool_blocker_signals
@@ -7082,7 +7212,7 @@ class TestRunBlocksCredentialApproval:
         ctx.tool_activity.append(self._listing_activity("goac_first"))
         admitted = await _run_blocks_and_collect_debug({"block_labels": ["first_write"], "parameters": {}}, ctx)
 
-        assert admitted == {"ok": False, "error": "Organization not found"}
+        assert admitted == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         assert ctx.blocker_signal is not None
         assert ctx.blocker_signal.internal_reason_code == "unapproved_google_connection_reference"
         assert ctx.connected_account_recovery_choices
@@ -7132,7 +7262,7 @@ class TestRunBlocksCredentialApproval:
             _ctx(request_policy=policy),
         )
 
-        assert result == {"ok": False, "error": "Organization not found"}
+        assert result == {"ok": False, "error": "Organization not found", "data": {"run_dispatched": False}}
         approval.assert_awaited_once()
         assert approval.await_args.args[0] == [
             ("nested_write", "goac_nested"),
