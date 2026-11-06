@@ -120,7 +120,7 @@ function DocStepProblem({
           {fix.message.split("\n").map((message) => (
             <li
               key={message}
-              className="text-[13px] leading-[1.55] text-muted-foreground"
+              className="text-[13px] leading-[1.55] text-muted-foreground [overflow-wrap:anywhere]"
             >
               {message}
             </li>
