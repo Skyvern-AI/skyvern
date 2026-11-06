@@ -175,7 +175,11 @@ export function DocConditional({
   const conditions = item.branches.filter((b) => b.kind !== "otherwise");
   const otherwise = item.branches.find((b) => b.kind === "otherwise");
   const { blocksByLabel, unknownLabels } = useDocRun();
-  const { selected, ranBranch: ranOnRun } = docBranchSelection(
+  const {
+    selected,
+    ranBranch: ranOnRun,
+    selectedRan,
+  } = docBranchSelection(
     item,
     node.data.label,
     actions.selectedBranch(node.id),
@@ -453,6 +457,7 @@ export function DocConditional({
             <div className="mb-1 ml-[11px] mt-0.5 border-l border-border pl-4">
               {ranBranch &&
                 selected !== ranBranch &&
+                !selectedRan &&
                 selected.stepCount > 0 && (
                   <p
                     className="my-1 text-[13px] text-muted-foreground"

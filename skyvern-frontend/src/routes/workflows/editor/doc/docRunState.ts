@@ -35,6 +35,18 @@ export function blockFailureHeadline(block: WorkflowRunBlock): string | null {
   );
 }
 
+/** The plain-words headline for a run that failed before any step row exists. */
+export function runFailureHeadline(run: {
+  status: string;
+  failure_reason?: string | null;
+}): string | null {
+  if (!FAILED.has(run.status) || !run.failure_reason?.trim()) return null;
+  return failureHeadlineInPlainWords(
+    run.failure_reason,
+    (raw) => formatFailureReason(raw).headline,
+  );
+}
+
 // A Stop step that did its job ends "terminated"; one whose reason failed to render ends "failed".
 export const stoppedOnPurpose = (block: WorkflowRunBlock) =>
   block.block_type === "terminate" &&
@@ -75,7 +87,10 @@ export function docRunStoppedByStep(
 
 export type DocLoopItem = {
   index: number;
-  value: string | null;
+  // A few plain words naming the item; null when it has no readable name.
+  title: string | null;
+  // The item's full value, for a disclosure under the line.
+  detail: string | null;
   state: "running" | "succeeded" | "failed" | "waiting";
   failureHeadline: string | null;
 };
@@ -107,6 +122,42 @@ function descendants(items: WorkflowRunTimelineItem[]): WorkflowRunBlock[] {
   };
   walk(items);
   return out;
+}
+
+const TITLE_KEYS = ["title", "name", "label", "heading", "subject"];
+const SHORT = 60;
+
+function shortText(value: unknown): string | null {
+  if (typeof value === "number" || typeof value === "boolean")
+    return String(value);
+  if (typeof value !== "string") return null;
+  const text = value.trim().replace(/\s+/g, " ");
+  if (!text) return null;
+  return text.length > SHORT ? `${text.slice(0, SHORT - 1)}…` : text;
+}
+
+/** A loop item's name in a few words and its full value; raw objects never go on the line. */
+export function loopItemText(
+  value: unknown,
+  currentValue: string | null,
+): Pick<DocLoopItem, "title" | "detail"> {
+  if (value !== undefined && value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const key = Array.isArray(value)
+      ? undefined
+      : TITLE_KEYS.find((k) => shortText(record[k]));
+    return {
+      title: key ? shortText(record[key]) : null,
+      detail: JSON.stringify(value, null, 2),
+    };
+  }
+  const text = value ?? currentValue;
+  if (text === undefined || text === null) return { title: null, detail: null };
+  const raw = String(text);
+  // The run row stores objects as their Python text; it is not a name.
+  if (/^\s*[[{(]/.test(raw)) return { title: null, detail: raw };
+  const title = shortText(raw);
+  return { title, detail: title === raw.trim() ? null : raw };
 }
 
 /** Per-item progress of each loop in the run, keyed by the loop's label. */
@@ -142,7 +193,12 @@ export function collectLoopProgress(
             const failed = blocks.find((b) => FAILED.has(b.status));
             return {
               index,
-              value: blocks.find((b) => b.current_value)?.current_value ?? null,
+              ...loopItemText(
+                Array.isArray(block.loop_values)
+                  ? block.loop_values[index]
+                  : undefined,
+                blocks.find((b) => b.current_value)?.current_value ?? null,
+              ),
               state: itemState(blocks),
               failureHeadline: failed ? blockFailureHeadline(failed) : null,
             };
@@ -219,9 +275,15 @@ const STAMPED_KEYS = new Set([
   "modified_at",
   "deleted_at",
 ]);
+// A conditional branch's "id" is minted again on every save; an "id" anywhere else is authored.
+const isBranch = (holder: Record<string, unknown>) =>
+  "is_default" in holder || "next_block_label" in holder;
 // A save writes defaults as null where the author left a field out, so null reads as absent.
-const stamped = (key: string, value: unknown) =>
-  STAMPED_KEYS.has(key) || value === null ? undefined : value;
+function stamped(this: Record<string, unknown>, key: string, value: unknown) {
+  if (STAMPED_KEYS.has(key) || value === null) return undefined;
+  if (key === "id" && isBranch(this)) return undefined;
+  return value;
+}
 
 function stepsByLabel(node: unknown, into: Map<string, string>) {
   if (Array.isArray(node)) {
@@ -251,6 +313,13 @@ export function stepsUnknownToRun(
   for (const [label, definition] of current)
     if (ran.get(label) !== definition) unknown.add(label);
   return unknown;
+}
+
+/** The labels of the steps a run's saved version had. */
+export function stepLabelsOf(definition: unknown): Set<string> {
+  const labels = new Map<string, string>();
+  stepsByLabel(definition, labels);
+  return new Set(labels.keys());
 }
 
 function inputsOf(definition: unknown): string {

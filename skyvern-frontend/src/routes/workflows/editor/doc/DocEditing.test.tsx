@@ -41,6 +41,7 @@ const catalogState = vi.hoisted(() => ({
 vi.mock("../hooks/useSaveWorkflow", () => ({ useSaveWorkflow: () => save }));
 vi.mock("./useDocRun", () => ({
   useDocRun: () => ({
+    rowsLoaded: true,
     runId: undefined,
     run: undefined,
     blocksByLabel: new Map(),

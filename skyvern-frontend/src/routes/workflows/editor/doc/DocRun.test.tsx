@@ -19,6 +19,7 @@ import { DocScope } from "./DocScope";
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("./useDocRun", () => ({
   useDocRun: () => ({
+    rowsLoaded: true,
     loopsByLabel: new Map(),
     blockRun: false,
     unknownLabels: new Set<string>(),
@@ -91,6 +92,105 @@ describe("DocStepResult", () => {
       "[data-testid=doc-step-live-thumbnail]",
     );
     expect(box === null || box.hidden).toBe(true);
+  });
+
+  it("says nothing about a finished run's steps until its rows have loaded, then says what happened", () => {
+    const ui = (
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="get_invoices" />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map(),
+      live: false,
+      rowsLoaded: false,
+    };
+    const loading = render(ui);
+    expect(screen.queryByText(/Not reached/)).toBeNull();
+    loading.unmount();
+    docRun.current = { ...docRun.current, rowsLoaded: true };
+    render(ui);
+    expect(screen.getByText("Not reached")).toBeTruthy();
+    cleanup();
+    docRun.current = {
+      ...docRun.current,
+      ranLabels: new Set(["other_step"]),
+    };
+    render(ui);
+    expect(screen.queryByText(/Not reached/)).toBeNull();
+  });
+
+  it("keeps a loop item's raw value off its line and behind a disclosure", () => {
+    const loop = block({ block_type: "for_loop", label: "each_book" });
+    docRun.current = {
+      runId: "wr_1",
+      run: { downloaded_file_urls: [] },
+      blocksByLabel: new Map([["each_book", loop]]),
+      loopsByLabel: new Map([
+        [
+          "each_book",
+          {
+            total: 1,
+            items: [
+              {
+                index: 0,
+                title: null,
+                detail: "{'task_id': 'tsk_1', 'downloaded_file_urls': None}",
+                state: "succeeded",
+                failureReason: null,
+              },
+            ],
+          },
+        ],
+      ]),
+      live: true,
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DocStepResult label="each_book" />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const line = screen.getByRole("button", { name: "Show item 1" });
+    expect(line.textContent).toBe("Item 1");
+    expect(screen.queryByText(/tsk_1/)).toBeNull();
+    fireEvent.click(line);
+    expect(screen.getByTestId("doc-loop-item-value").textContent).toContain(
+      "tsk_1",
+    );
+  });
+
+  it("states a one-step run's failure on its step when the run failed before the step had a row", () => {
+    docRun.current = {
+      runId: "wr_1",
+      run: {
+        status: Status.Failed,
+        failure_reason: "block 'get_invoices' has no starting URL set.",
+        downloaded_file_urls: [],
+      },
+      blocksByLabel: new Map(),
+      live: false,
+      blockRun: true,
+    };
+    const ui = (label: string) => (
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/studio?wr=wr_1&bl=get_invoices"]}>
+          <DocStepResult label={label} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    render(ui("get_invoices"));
+    expect(screen.getByTestId("doc-step-result").textContent).toMatch(
+      /^Failed: /,
+    );
+    cleanup();
+    render(ui("another_step"));
+    expect(screen.queryByTestId("doc-step-result")).toBeNull();
   });
 
   it("shows nothing for a step an earlier run cannot speak for, even if that run failed it", () => {
@@ -405,6 +505,115 @@ describe("DocConditional on a run", () => {
       </QueryClientProvider>,
     );
     expect(tab(/otherwise/i).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("does not call a branch skipped when its steps ran on an earlier item of a loop", () => {
+    const tick = {
+      id: "t1",
+      type: "navigation",
+      data: { label: "tick_on" },
+    } as unknown as WorkflowBlockNode;
+    docRun.current = {
+      runId: "wr_1",
+      blocksByLabel: new Map([
+        [
+          "check_box",
+          block({
+            label: "check_box",
+            block_type: "conditional",
+            executed_branch_id: "b_else",
+          }),
+        ],
+        ["tick_on", block({ label: "tick_on" })],
+      ]),
+      live: false,
+      unknownLabels: new Set<string>(),
+    };
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <WorkflowDocActionsContext.Consumer>
+            {(actions) => (
+              <WorkflowDocActionsContext.Provider
+                value={{ ...actions, selectedBranch: () => "b_if" }}
+              >
+                <DocConditional
+                  node={conditional}
+                  item={
+                    {
+                      ...item,
+                      branches: [
+                        {
+                          ...item.branches[0]!,
+                          stepCount: 1,
+                          children: [{ kind: "step", nodeId: "t1" }],
+                        },
+                        item.branches[1]!,
+                      ],
+                    } as typeof item
+                  }
+                  byId={new Map([["t1", tick]])}
+                  editable={false}
+                  renderChildren={() => null}
+                />
+              </WorkflowDocActionsContext.Provider>
+            )}
+          </WorkflowDocActionsContext.Consumer>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId("doc-branch-skipped")).toBeNull();
+  });
+
+  it("names the branch from the condition the run recorded when a save renamed the branch IDs", () => {
+    const run = (expression: string | null, result?: boolean | null) => {
+      docRun.current = {
+        runId: "wr_1",
+        blocksByLabel: new Map([
+          [
+            "check_box",
+            block({
+              label: "check_box",
+              block_type: "conditional",
+              executed_branch_id: "id_minted_by_the_save",
+              executed_branch_expression: expression,
+              executed_branch_result: result,
+            }),
+          ],
+        ]),
+        live: false,
+        unknownLabels: new Set<string>(),
+      };
+      return render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter>
+            <DocConditional
+              node={conditional}
+              item={item}
+              byId={new Map()}
+              editable={false}
+              renderChildren={() => null}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    };
+    run(null, false);
+    expect(screen.getByTestId("doc-step-result").textContent).toMatch(
+      /Took Otherwise/,
+    );
+    cleanup();
+    run(null, null);
+    expect(screen.getByTestId("doc-step-result").textContent).toMatch(
+      /Took Otherwise/,
+    );
+    cleanup();
+    run(null);
+    expect(tab(/otherwise/i).textContent).not.toMatch(/ran/);
+    cleanup();
+    run("{{ checked }}");
+    expect(tab(/^if/i).textContent).toMatch(/ran/);
+    expect(tab(/otherwise/i).textContent).not.toMatch(/ran/);
   });
 
   it("does not guess a branch for a run that recorded none", () => {

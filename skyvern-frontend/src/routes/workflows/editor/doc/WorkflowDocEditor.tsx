@@ -841,8 +841,9 @@ export function WorkflowDocEditor({
         (p as { dataType?: string }).dataType ===
           WorkflowParameterValueType.CredentialId
       ) {
+        // The server runs without a credential an input names but no step uses.
+        if (!used.has(p.key)) return [];
         const required = !p.credentialId;
-        if (!used.has(p.key) && !required) return [];
         return [
           {
             key: p.key,

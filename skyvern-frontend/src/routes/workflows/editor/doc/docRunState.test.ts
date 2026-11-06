@@ -6,6 +6,7 @@ import type {
   WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
 import {
+  loopItemText,
   collectLoopProgress,
   docLoopProgressText,
   docRunEndMessage,
@@ -94,7 +95,7 @@ describe("Doc run state", () => {
     const { blocks, loops } = project(timeline);
     const progress = loops.get("each_invoice")!;
 
-    expect(progress.items.map((i) => [i.value, i.state])).toEqual([
+    expect(progress.items.map((i) => [i.title, i.state])).toEqual([
       ["a", "succeeded"],
       ["b", "failed"],
       ["c", "succeeded"],
@@ -104,6 +105,29 @@ describe("Doc run state", () => {
     expect(docRunEndMessage({ status: Status.Completed }, blocks, loops)).toBe(
       "Run finished · 1 item failed and was skipped",
     );
+  });
+
+  it("names a loop item in a few plain words and keeps its full value for the disclosure", () => {
+    const book = { title: "A Light in the Attic", price: 51.77, id: "b_1" };
+    expect(loopItemText(book, "{'title': 'A Light in the Attic'}")).toEqual({
+      title: "A Light in the Attic",
+      detail: JSON.stringify(book, null, 2),
+    });
+    const result = { task_id: "tsk_1", downloaded_file_urls: null };
+    expect(loopItemText(result, null).title).toBeNull();
+    expect(
+      loopItemText(
+        undefined,
+        "{'task_id': 'tsk_1', 'downloaded_file_urls': None}",
+      ),
+    ).toEqual({
+      title: null,
+      detail: "{'task_id': 'tsk_1', 'downloaded_file_urls': None}",
+    });
+    expect(loopItemText("Travel", "Travel")).toEqual({
+      title: "Travel",
+      detail: null,
+    });
   });
 
   it("states a failed loop item with the same headline as the Run panel", () => {
@@ -214,8 +238,34 @@ describe("stepsUnknownToRun authored identifiers", () => {
       ],
     });
     expect(stepsUnknownToRun(step("c1", "a"), step("c1", "b")).size).toBe(0);
+    const ifStep = (branchId: string) => ({
+      blocks: [
+        {
+          label: "check_price",
+          block_type: "conditional",
+          branch_conditions: [{ id: branchId, is_default: true }],
+        },
+      ],
+    });
+    // A save re-mints branch ids; the If itself did not change.
+    expect(stepsUnknownToRun(ifStep("old"), ifStep("new")).size).toBe(0);
     expect([...stepsUnknownToRun(step("c1", "a"), step("c2", "b"))]).toEqual([
       "login",
     ]);
+  });
+
+  it("still sees an authored field named id as an edit", () => {
+    const exportStep = (idType: string) => ({
+      blocks: [
+        {
+          label: "export",
+          block_type: "data_export",
+          schema: { properties: { id: { type: idType } } },
+        },
+      ],
+    });
+    expect([
+      ...stepsUnknownToRun(exportStep("integer"), exportStep("string")),
+    ]).toEqual(["export"]);
   });
 });
