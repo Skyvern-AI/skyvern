@@ -1137,6 +1137,7 @@ _EXEMPT_BLOCK_FIELDS = {
     "loop_values",  # capped separately, count-preserving
     "actions",  # capped per-action as they are hydrated
     "script_run",  # fixed-shape record
+    "tool_calls",  # trimmed to 512 KiB when written, oldest calls first
 }
 
 
