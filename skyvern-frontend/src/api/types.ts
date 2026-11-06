@@ -1242,6 +1242,7 @@ export type CredentialApiResponse = {
     | "bitwarden"
     | "azure_vault"
     | "gcp"
+    | "aws_secrets_manager"
     | "custom"
     | "onepassword"
     | "bitwarden_connected"
