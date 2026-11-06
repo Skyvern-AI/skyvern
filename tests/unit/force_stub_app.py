@@ -76,6 +76,9 @@ def create_forge_stub_app() -> ForgeApp:
     # making every wr_ alias read as a live sharer. Default to "no run is live" so tests must opt a run
     # into liveness explicitly (non-PBS ownership signal).
     fake_app_module.WORKFLOW_CONTEXT_MANAGER.has_workflow_run_context = MagicMock(return_value=False)
+    # Sync card-provenance predicate — an auto-mocked AsyncMock is truthy and would read every typed
+    # secret as card data.
+    fake_app_module.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text = MagicMock(return_value=False)
     fake_app_module.WORKFLOW_SERVICE = _LazyNamespace()
     fake_app_module.BROWSER_MANAGER = _LazyNamespace()
     # get_for_task is a sync lookup returning None when no browser state is registered; _LazyNamespace
@@ -100,6 +103,22 @@ def create_forge_stub_app() -> ForgeApp:
     fake_app_module.AGENT_FUNCTION.copilot_browser_code_mode = AsyncMock(return_value=CopilotBrowserCodeMode.OFF)
     fake_app_module.AGENT_FUNCTION.execute_code_block_override = AsyncMock(return_value=None)
     base_agent_function = AgentFunction()
+    fake_app_module.AGENT_FUNCTION.note_page_action = base_agent_function.note_page_action
+    fake_app_module.AGENT_FUNCTION.enforce_platform_aws_secret_ownership = (
+        base_agent_function.enforce_platform_aws_secret_ownership
+    )
+    fake_app_module.AGENT_FUNCTION.should_check_browser_session_artifacts = (
+        base_agent_function.should_check_browser_session_artifacts
+    )
+    fake_app_module.AGENT_FUNCTION.can_access_browser_session_artifacts = (
+        base_agent_function.can_access_browser_session_artifacts
+    )
+    fake_app_module.AGENT_FUNCTION.browser_session_ids_authorized_for_connect = (
+        base_agent_function.browser_session_ids_authorized_for_connect
+    )
+    fake_app_module.AGENT_FUNCTION.should_redact_unresolved_browser_session_address = (
+        base_agent_function.should_redact_unresolved_browser_session_address
+    )
     fake_app_module.AGENT_FUNCTION.accessible_workflow_folder_ids = base_agent_function.accessible_workflow_folder_ids
     fake_app_module.AGENT_FUNCTION.hidden_workflow_permanent_ids = base_agent_function.hidden_workflow_permanent_ids
     fake_app_module.AGENT_FUNCTION.enforce_folder_access = base_agent_function.enforce_folder_access

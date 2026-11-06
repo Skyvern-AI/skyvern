@@ -6,7 +6,7 @@ import textwrap
 import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Annotated, Any, Literal, Protocol, TypeVar
+from typing import Annotated, Any, Literal, Protocol, TypeVar, get_args
 
 import structlog
 from jsonschema import Draft202012Validator
@@ -24,10 +24,10 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from pydantic_core import to_jsonable_python
 
 from skyvern.config import settings
 from skyvern.constants import ERROR_CODE_REASONING_MAX_LENGTH, MAX_PDF_OCR_PAGES
-from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.browser_profile_key import validate_browser_profile_key
@@ -38,7 +38,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
-from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES
+from skyvern.schemas.agent_step_tool_names import AGENT_STEP_TOOL_NAMES, current_tool_names
 from skyvern.schemas.browser_settings import BrowserSettings, require_known_timezone
 from skyvern.schemas.emails import EmailBodyFormat, EmailTransport
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine, normalize_browser_type
@@ -154,6 +154,9 @@ def _normalize_llm_selection(
         )
         block.llm_key = None
         return block
+
+    # Local on purpose: config_registry imports litellm, and the stdio MCP server must not load it at boot.
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # noqa: PLC0415
 
     if raw_llm_key in LLMConfigRegistry.get_model_names():
         block.llm_key = raw_llm_key
@@ -1522,6 +1525,18 @@ class TerminateBlockYAML(BlockYAML):
         return value
 
 
+AGENT_STEP_LLM_FLAG = "AGENT_BLOCK_LLM_NAME"
+AGENT_STEP_NOT_ENABLED_MESSAGE = (
+    f"The agent_step block requires {AGENT_STEP_LLM_FLAG} to be enabled for this organization, and it could not be "
+    "confirmed. Remove the block or ask for the flag to be enabled."
+)
+AGENT_STEP_BLOCK_SUMMARY = (
+    "one model-driven step that decides and acts with this run's blocks, with or without the browser, "
+    "so it can look things up across sites, branch on what it finds and write the answer. It returns fields "
+    "matching its data_schema. The editor labels it the Agent block (block type `agent_step`)"
+)
+
+
 class AgentStepBlockYAML(BlockYAML):
     block_type: Literal[BlockType.AGENT_STEP] = BlockType.AGENT_STEP  # type: ignore
 
@@ -1560,6 +1575,7 @@ class AgentStepBlockYAML(BlockYAML):
     def validate_tools(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
+        value = current_tool_names(value)
         if unknown := sorted(set(value) - AGENT_STEP_TOOL_NAMES):
             raise ValueError(f"Unknown tools {unknown}. Valid tools: {', '.join(sorted(AGENT_STEP_TOOL_NAMES))}.")
         return value
@@ -1810,6 +1826,8 @@ class GoogleSheetsReadBlockYAML(BlockYAML):
 class EmailInboxBlockYAML(BlockYAML):
     block_type: Literal[BlockType.EMAIL_INBOX] = BlockType.EMAIL_INBOX  # type: ignore
     email_client: Literal["gmail", "outlook"]
+    credential_source: Literal["native", "nango"] = "native"
+    connection_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     credential_id: str | None = Field(default=None, json_schema_extra={"x-skyvern-connected-account": True})
     folder: str | None = None
     prompt: str | None = None
@@ -1843,9 +1861,10 @@ class PowerBIQueryBlockYAML(BlockYAML):
     block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
     connection_id: str = Field(
         min_length=1,
-        description="Microsoft OAuth credential ID for this user.",
+        description="Power BI connection ID for this user.",
         json_schema_extra={"x-skyvern-connected-account": True},
     )
+    credential_source: Literal["nango"] = "nango"
     dataset_id: str = Field(min_length=1)
     query: str = Field(min_length=1, description="A single read-only DAX query.")
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
@@ -1911,6 +1930,9 @@ BLOCK_YAML_SUBCLASSES = (
     | PowerBIQueryBlockYAML
 )
 BLOCK_YAML_TYPES = Annotated[BLOCK_YAML_SUBCLASSES, Field(discriminator="block_type")]
+BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
+    to_jsonable_python(model.model_fields["block_type"].default): model for model in get_args(BLOCK_YAML_SUBCLASSES)
+}
 
 
 def workflow_definition_has_v2_graph_constructs(blocks: list[BLOCK_YAML_SUBCLASSES]) -> bool:

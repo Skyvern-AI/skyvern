@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import { HomeTelemetry } from "@/util/homeTelemetry";
 import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import {
   PromptBox,
   type ExamplePromptKey,
@@ -39,8 +38,6 @@ type Props = {
 };
 
 function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
-  const copilotHandoffFlag = useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF");
-  const enableCopilotHandoff = copilotHandoffFlag === true;
   const createWorkflowMutation = useCreateWorkflowMutation({
     onCreated: revamp ? onRevampComplete : undefined,
   });
@@ -136,7 +133,7 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
         <h1 className="sr-only">Create an agent</h1>
         <PromptBox
           ref={promptBoxRef}
-          enableCopilotHandoff={enableCopilotHandoff}
+          enableCopilotHandoff
           minimal
           onAgentCreated={onRevampComplete}
         />
@@ -171,8 +168,7 @@ function DiscoverPage({ revamp = false, onRevampComplete }: Props = {}) {
       <h1 className="sr-only">Create an agent</h1>
       <PromptBox
         ref={promptBoxRef}
-        enableCopilotHandoff={enableCopilotHandoff}
-        handoffFlagLoading={copilotHandoffFlag === undefined}
+        enableCopilotHandoff
         siblingBusy={createWorkflowMutation.isPending}
         secondaryAction={({ busy }) => (
           <button

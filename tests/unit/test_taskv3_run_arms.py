@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -105,14 +106,23 @@ async def test_each_flag_keeps_its_own_arm_within_one_run(
     assert (run_arm_enabled(_FLAG, forced=False), run_arm_enabled(_OTHER_FLAG, forced=False)) == (True, False)
 
 
+@functools.cache
+def _skyvern_sources() -> dict[Path, str]:
+    return {path: path.read_text() for path in Path(skyvern.__file__).parent.rglob("*.py")}
+
+
+@functools.cache
+def _skyvern_tree(path: Path) -> ast.Module:
+    return ast.parse(_skyvern_sources()[path])
+
+
 def _run_arm_call_flags(func_name: str, flag_position: int, *, result_used: bool = False) -> set[str]:
     """Names passed as the flag to every ``func_name`` call in the skyvern package; a literal fails the test."""
     names: set[str] = set()
-    for path in Path(skyvern.__file__).parent.rglob("*.py"):
-        source = path.read_text()
+    for path, source in _skyvern_sources().items():
         if func_name not in source:
             continue
-        tree = ast.parse(source)
+        tree = _skyvern_tree(path)
         # An assigned, awaited result is how a caller reads the arm it resolved.
         calls = (
             [a.value.value for a in ast.walk(tree) if isinstance(a, ast.Assign) and isinstance(a.value, ast.Await)]

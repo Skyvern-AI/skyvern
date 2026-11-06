@@ -90,6 +90,7 @@ def _execute_workflow(*, retry_policy: object | None = None) -> SimpleNamespace:
         workflow_id="wf_1",
         persist_browser_session=True,
         reuse_browser_session=False,
+        run_sequentially=False,
         workflow_permanent_id="wpid_test",
         title="Workflow",
         organization_id="o_test",
@@ -116,6 +117,7 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         browser_session_id=None,
         browser_profile_id="bp_managed",
         browser_seed_source=BrowserSeedSource.own_memory,
+        browser_sink_profile_id="bp_managed",
         browser_address=None,
         extra_http_headers=None,
         cdp_connect_headers=None,
@@ -129,6 +131,8 @@ def _execute_workflow_run(status: WorkflowRunStatus) -> SimpleNamespace:
         parent_workflow_run_id=None,
         depends_on_workflow_run_id=None,
         task_queue=None,
+        sequential_key=None,
+        sequential_credential_id=None,
         proxy_location=None,
         max_scrape_screenshots=None,
         max_elapsed_time_minutes=1,
@@ -2127,6 +2131,40 @@ async def test_human_interaction_run_boots_session_from_its_profile_before_first
     ) == ("bp_user", expected_read_only, True, expected_browser_type)
     assert bound_at_first_block == [("pbs_auto", True, "pbs_auto", "bp_user")]
     close_session.assert_awaited_once_with("o_test", "pbs_auto", reason=BrowserSessionCloseReason.run_ended)
+
+
+@pytest.mark.asyncio
+async def test_run_start_reseed_boots_the_browser_from_the_newly_saved_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SKY-19415: a run queued before any profile held content stamps a credential seed. Once it
+    # clears the sequential gate, its browser must boot from the profile an earlier run in the lane
+    # saved meanwhile — the stamped seed is re-read all the way through to session creation.
+    svc = WorkflowService()
+    create_session, _close_session, _bound = _patch_real_session_factory(
+        monkeypatch,
+        svc,
+        _human_interaction_workflow(),
+        is_managed=True,
+        browser_sink_profile_id="bp_own",
+        engine_enabled=True,
+    )
+    for run in (svc.get_workflow_run.return_value, svc.mark_workflow_run_as_running.return_value):
+        run.browser_profile_id = "bp_cred"
+        run.browser_seed_source = BrowserSeedSource.credential
+        run.sequential_key = "seq_c_1"
+    reseeded_run = _execute_workflow_run(WorkflowRunStatus.running)
+    reseeded_run.browser_profile_id = "bp_own"
+    reseeded_run.browser_sink_profile_id = "bp_own"
+    reseeded_run.sequential_key = "seq_c_1"
+    app.DATABASE.workflow_runs.update_workflow_run.return_value = reseeded_run
+    monkeypatch.setattr(service_module.app.STORAGE, "browser_profile_exists", AsyncMock(return_value=True))
+    _patch_browser_cleanup(monkeypatch, svc, [])
+    _patch_finalize(monkeypatch, svc, [], _execute_workflow_run(WorkflowRunStatus.completed))
+
+    await _run_execute_workflow(svc)
+
+    assert create_session.await_args.kwargs["browser_profile_id"] == "bp_own"
 
 
 @pytest.mark.asyncio

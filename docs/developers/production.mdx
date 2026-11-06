@@ -298,6 +298,8 @@ Each mapped error looks like `{"error_code": "login_failed", "reasoning": "...",
 
 Skyvern also adds its own codes to `errors`: `REACH_MAX_STEPS`, `REACH_MAX_RETRIES`, `OTP_ERROR`, `OTP_TIMEOUT`, `OTP_EXPIRED`, and `MISSING_TOTP_SOURCE`.
 
+An error from a failed block also names it: `workflow_run_block_id`, `block_label`, `block_type`, `loop_index` (null outside a loop), and `final_url`. A failed code block adds `exception_class`, `exception_message`, `failing_line`, and `source_line`, any of which can be null.
+
 ### Failure categories
 
 Agent runs that end in `failed`, `terminated`, or `timed_out` get a `failure_category` list. Each entry has a `category`, a `confidence_float`, and `reasoning`. The first entry is the most likely cause. The app shows it as a badge on the run.

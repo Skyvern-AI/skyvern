@@ -5,9 +5,6 @@ Verifies the priority chain:
 
 run_with is always "agent" or "code" (never null). When run_with="agent" and
 code_version >= 1, the code_version fallback still applies (workflow intended code mode).
-
-Also covers the app-level code-mode gate: when intended mode is "code",
-WorkflowService asks app.AGENT_FUNCTION whether the run should keep code mode.
 """
 
 from datetime import datetime, timezone
@@ -61,27 +58,6 @@ def _make_run(
         created_at=datetime.now(timezone.utc),
         modified_at=datetime.now(timezone.utc),
     )
-
-
-class _RecordingAgentFunction(AgentFunction):
-    def __init__(self, enabled: bool) -> None:
-        self.enabled = enabled
-        self.calls: list[tuple[str, str, str]] = []
-
-    async def should_keep_code_mode_for_workflow_run(
-        self,
-        *,
-        workflow: Workflow,
-        workflow_run: WorkflowRun,
-    ) -> bool:
-        self.calls.append(
-            (
-                workflow_run.workflow_run_id,
-                workflow_run.organization_id,
-                workflow.workflow_permanent_id,
-            )
-        )
-        return self.enabled
 
 
 @pytest.fixture
@@ -173,6 +149,12 @@ class TestShouldRunScript:
         assert await service.should_run_script(wf, wr) is True
 
     @pytest.mark.asyncio
+    async def test_run_with_none_inherits_workflow_code(self, service):
+        wf = _make_workflow(run_with="code", code_version=2)
+        wr = _make_run(run_with=None)
+        assert await service.should_run_script(wf, wr) is True
+
+    @pytest.mark.asyncio
     async def test_legacy_adaptive_caching_does_not_override_agent(self, service):
         """Legacy adaptive_caching=True does NOT override explicit run_with=agent."""
         wf = _make_workflow(run_with="agent", adaptive_caching=True)
@@ -182,63 +164,9 @@ class TestShouldRunScript:
         assert await service.should_run_script(wf, wr) is False
 
 
-class TestCodeModeGate:
-    """WorkflowService asks the app-level gate only for intended-code runs."""
-
-    @pytest.mark.asyncio
-    async def test_gate_enabled_keeps_code(self, monkeypatch):
-        agent_function = _RecordingAgentFunction(enabled=True)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        service = WorkflowService()
-        wf = _make_workflow(run_with="code", code_version=2)
-        wr = _make_run(run_with="code")
-        assert await service.should_run_script(wf, wr) is True
-        assert agent_function.calls == [("wr_test", "org_test", "wpid_test")]
-
-    @pytest.mark.asyncio
-    async def test_gate_disabled_diverts(self, monkeypatch):
-        agent_function = _RecordingAgentFunction(enabled=False)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        service = WorkflowService()
-        wf = _make_workflow(run_with="code", code_version=2)
-        wr = _make_run(run_with="code")
-        assert await service.should_run_script(wf, wr) is False
-
-    @pytest.mark.asyncio
-    async def test_gate_not_consulted_when_intended_agent(self, monkeypatch):
-        agent_function = _RecordingAgentFunction(enabled=False)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        service = WorkflowService()
-        wf = _make_workflow(run_with="agent")
-        wr = _make_run(run_with="agent")
-        assert await service.should_run_script(wf, wr) is False
-        assert agent_function.calls == []
-
-    @pytest.mark.asyncio
-    async def test_inherits_workflow_run_with_when_run_run_with_is_none(self, monkeypatch):
-        """workflow_run.run_with=None means inherit-from-workflow. The app gate
-        must still apply when the workflow itself says 'code'."""
-        agent_function = _RecordingAgentFunction(enabled=False)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        service = WorkflowService()
-        wf = _make_workflow(run_with="code", code_version=2)
-        wr = _make_run(run_with=None)
-        assert await service.should_run_script(wf, wr) is False
-        assert len(agent_function.calls) == 1
-
-
 class _UpgradingAgentFunction(AgentFunction):
-    def __init__(self, upgrade: bool, keep_code: bool = True) -> None:
+    def __init__(self, upgrade: bool) -> None:
         self.upgrade = upgrade
-        self.keep_code = keep_code
         self.upgrade_calls: list[tuple[str, str, str]] = []
 
     async def should_upgrade_to_code_mode(self, *, workflow: Workflow, workflow_run: WorkflowRun) -> bool:
@@ -247,16 +175,13 @@ class _UpgradingAgentFunction(AgentFunction):
         )
         return self.upgrade
 
-    async def should_keep_code_mode_for_workflow_run(self, *, workflow: Workflow, workflow_run: WorkflowRun) -> bool:
-        return self.keep_code
-
 
 class TestCodeModeUpgrade:
     """A flag-gated rollout can upgrade an agent-intended run to code."""
 
     @pytest.mark.asyncio
     async def test_upgrade_flips_agent_to_code(self, monkeypatch):
-        agent_function = _UpgradingAgentFunction(upgrade=True, keep_code=True)
+        agent_function = _UpgradingAgentFunction(upgrade=True)
         monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
         from skyvern.forge.sdk.workflow.service import WorkflowService
 
@@ -268,17 +193,6 @@ class TestCodeModeUpgrade:
     @pytest.mark.asyncio
     async def test_upgrade_disabled_stays_agent(self, monkeypatch):
         agent_function = _UpgradingAgentFunction(upgrade=False)
-        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        wf = _make_workflow(run_with="agent")
-        wr = _make_run(run_with="agent")
-        assert await WorkflowService().should_run_script(wf, wr) is False
-
-    @pytest.mark.asyncio
-    async def test_upgraded_run_still_passes_keep_code_gate(self, monkeypatch):
-        """Upgrade True but keep-code gate False → still agent (gate can veto)."""
-        agent_function = _UpgradingAgentFunction(upgrade=True, keep_code=False)
         monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
         from skyvern.forge.sdk.workflow.service import WorkflowService
 
@@ -302,7 +216,7 @@ class TestCodeModeUpgrade:
         # A code->agent fallback retry (run_with=agent, retried_from set) must never be re-upgraded
         # to code, or the rollout would re-run the very script that just failed and the fallback
         # would be a no-op for exactly the rollout population.
-        agent_function = _UpgradingAgentFunction(upgrade=True, keep_code=True)
+        agent_function = _UpgradingAgentFunction(upgrade=True)
         monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
         from skyvern.forge.sdk.workflow.service import WorkflowService
 

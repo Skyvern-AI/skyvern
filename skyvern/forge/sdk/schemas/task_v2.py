@@ -39,6 +39,8 @@ class TaskV2(BaseModel):
     workflow_run_id: str | None = None
     workflow_id: str | None = None
     workflow_permanent_id: str | None = None
+    # Retain the association for authorization without exposing a new response field.
+    browser_session_id: str | None = Field(default=None, exclude=True)
     prompt: str | None = None
     url: str | None = None
     summary: str | None = None

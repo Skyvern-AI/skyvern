@@ -1,26 +1,28 @@
 from __future__ import annotations
 
+import re
 from typing import Any, ClassVar, Literal
+from uuid import UUID
 
 from pydantic import Field, field_validator
 
 from skyvern.forge import app
 from skyvern.forge.sdk.services.powerbi_query_service import PowerBIQueryError
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
-from skyvern.forge.sdk.workflow.exceptions import RENDER_FAILURE_OUTPUT_KEY
-from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason, render_failure_record
-from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
+from skyvern.forge.sdk.workflow.models.block import Block, get_all_blocks
+from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, WorkflowParameter, WorkflowParameterType
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
-from skyvern.utils.templating import (
-    get_caller_supplied_workflow_parameter_keys,
-    get_jinja_template_variable_roots,
-)
+
+
+def normalize_powerbi_query(query: str) -> str:
+    return query.replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n")
 
 
 class PowerBIQueryBlock(Block):
     block_type: Literal[BlockType.POWERBI_QUERY] = BlockType.POWERBI_QUERY  # type: ignore
 
     connection_id: str
+    credential_source: Literal["nango"] = "nango"
     dataset_id: str
     query: str
     max_rows: int = Field(default=1_000, ge=1, le=100_000, strict=True)
@@ -38,10 +40,83 @@ class PowerBIQueryBlock(Block):
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
 
-    def _render_templates(self, workflow_run_context: WorkflowRunContext) -> None:
-        for field in sorted(self.TEMPLATABLE_FIELDS):
-            value = getattr(self, field)
-            setattr(self, field, self.render_templatable_field(field, value, workflow_run_context))
+    def has_valid_input_shape(self) -> bool:
+        if not self.query or len(self.query) > 100_000 or any(m in self.query for m in ("{{", "{%", "{#")):
+            return False
+        if not normalize_powerbi_query(self.query):
+            return False
+        if len(self.dataset_id) > 255:
+            return False
+        if re.fullmatch(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", self.dataset_id):
+            return True
+        try:
+            return len(self.dataset_id) == 36 and str(UUID(self.dataset_id)) == self.dataset_id.lower()
+        except ValueError:
+            return False
+
+    async def _resolve_dataset_id(self, workflow_run_id: str, organization_id: str) -> str | None:
+        try:
+            source = self.dataset_id
+            if len(source) > 255:
+                return None
+            match = re.fullmatch(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", source)
+            if match is not None:
+                key = match.group(1)
+                workflow = await app.DATABASE.workflows.get_workflow_for_workflow_run(
+                    workflow_run_id, organization_id=organization_id
+                )
+                if workflow is None or workflow.organization_id != organization_id:
+                    return None
+                labels = {block.label for block in get_all_blocks(workflow.workflow_definition.blocks)}
+                reserved = (
+                    labels
+                    | {f"{label}_output" for label in labels}
+                    | {
+                        "current_index",
+                        "current_item",
+                        "current_value",
+                        "workflow_run_outputs",
+                        "workflow_run_summary",
+                    }
+                )
+                if key in reserved:
+                    return None
+                definitions = [
+                    parameter
+                    for parameter in workflow.workflow_definition.parameters
+                    if isinstance(parameter, WorkflowParameter) and parameter.key == key
+                ]
+                if len(definitions) != 1:
+                    return None
+                definition = definitions[0]
+                default = definition.default_value
+                if (
+                    definition.workflow_id != workflow.workflow_id
+                    or definition.workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID
+                    or (default is not None and not isinstance(default, str))
+                    or (isinstance(default, str) and any(marker in default for marker in ("{{", "{%", "{#")))
+                ):
+                    return None
+                values = [
+                    run_parameter.value
+                    for parameter, run_parameter in await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+                        workflow_run_id
+                    )
+                    if parameter.workflow_parameter_id == definition.workflow_parameter_id
+                    and parameter.workflow_id == definition.workflow_id
+                    and parameter.key == definition.key
+                    and parameter.workflow_parameter_type == definition.workflow_parameter_type
+                    and run_parameter.workflow_run_id == workflow_run_id
+                    and run_parameter.workflow_parameter_id == definition.workflow_parameter_id
+                ]
+                if len(values) != 1 or not isinstance(values[0], str):
+                    return None
+                source = values[0]
+            if len(source) != 36 or str(UUID(source)) != source.lower():
+                return None
+            return source
+        except Exception:  # noqa: BLE001 - unverified run inputs must fail closed.
+            return None
 
     async def _failure(
         self,
@@ -52,11 +127,8 @@ class PowerBIQueryBlock(Block):
         organization_id: str | None,
         error_code: str,
         failure_reason: str,
-        render_failure: dict[str, Any] | None = None,
     ) -> BlockResult:
         output: dict[str, Any] = {"error": error_code}
-        if render_failure is not None:
-            output[RENDER_FAILURE_OUTPUT_KEY] = render_failure
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
         return await self.build_block_result(
             success=False,
@@ -75,37 +147,26 @@ class PowerBIQueryBlock(Block):
         browser_session_id: str | None = None,
         **kwargs: Any,
     ) -> BlockResult:
+        return await self._execute_powerbi_query(
+            workflow_run_id,
+            workflow_run_block_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            **kwargs,
+        )
+
+    async def _execute_powerbi_query(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: Any,
+    ) -> BlockResult:
         workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         effective_org_id = organization_id or workflow_run_context.organization_id
 
-        if "{{" in self.connection_id or "{%" in self.connection_id:
-            return await self._failure(
-                workflow_run_context=workflow_run_context,
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=effective_org_id,
-                error_code="connection_id_must_be_literal",
-                failure_reason="Power BI connection_id must be a literal credential ID.",
-            )
-
-        caller_parameter_keys = get_caller_supplied_workflow_parameter_keys(workflow_run_context.parameters.values())
-        try:
-            template_roots = set().union(
-                *(get_jinja_template_variable_roots(getattr(self, field)) for field in ("dataset_id", "query"))
-            )
-            block_metadata = workflow_run_context.get_block_metadata(self.label)
-            shadowed_parameter_keys = (
-                set(workflow_run_context.workflow_run_outputs)
-                | workflow_run_context.carried_block_labels
-                | {self.label, "workflow_run_outputs", "workflow_run_summary"}
-                | ({"current_index", "current_item", "current_value"} & block_metadata.keys())
-            )
-            unsafe_template_source = bool(
-                template_roots - caller_parameter_keys or template_roots & shadowed_parameter_keys
-            )
-        except Exception:
-            unsafe_template_source = True
-        if unsafe_template_source:
+        if not self.has_valid_input_shape():
             return await self._failure(
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
@@ -115,18 +176,25 @@ class PowerBIQueryBlock(Block):
                 failure_reason="Power BI dataset_id and query may use only workflow input parameters or literals.",
             )
 
-        try:
-            self._render_templates(workflow_run_context)
-        except Exception as exc:
-            redact = self.secret_redactor(workflow_run_context)
+        hop_token = workflow_run_context.get_powerbi_hop_token(self.label)
+        if not hop_token:
             return await self._failure(
                 workflow_run_context=workflow_run_context,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=effective_org_id,
-                error_code="template_format_failed",
-                failure_reason=render_failure_reason("Could not render Power BI query fields.", exc, redact),
-                render_failure=render_failure_record(exc, redact),
+                error_code="integration_unavailable",
+                failure_reason="Power BI queries are not currently available.",
+            )
+
+        if "{{" in self.connection_id or "{%" in self.connection_id:
+            return await self._failure(
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=effective_org_id,
+                error_code="connection_id_must_be_literal",
+                failure_reason="Power BI connection_id must be a literal credential ID.",
             )
 
         if not effective_org_id:
@@ -139,12 +207,28 @@ class PowerBIQueryBlock(Block):
                 failure_reason="Power BI query execution context is unavailable.",
             )
 
+        dataset_id = await self._resolve_dataset_id(workflow_run_id, effective_org_id)
+        if dataset_id is None:
+            return await self._failure(
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=effective_org_id,
+                error_code="unsafe_query_input_source",
+                failure_reason="Power BI dataset_id must resolve to a UUID from a workflow input or literal.",
+            )
+        query = normalize_powerbi_query(self.query)
+        self.dataset_id = dataset_id
+        self.query = query
+
         try:
             rows = await app.AGENT_FUNCTION.execute_powerbi_query_for_run(
                 organization_id=effective_org_id,
                 workflow_run_id=workflow_run_id,
                 workflow_run_block_id=workflow_run_block_id,
                 connection_id=self.connection_id,
+                hop_token=hop_token,
+                credential_source=self.credential_source,
                 dataset_id=self.dataset_id,
                 query=self.query,
                 max_rows=self.max_rows,
@@ -177,7 +261,16 @@ class PowerBIQueryBlock(Block):
                     error_code="copilot_test_run_unsupported",
                     failure_reason="Power BI blocks can't run in Copilot test runs yet; run the saved workflow instead.",
                 )
-            if exc.code == "integration_unavailable":
+            if exc.code == "row_limit_exceeded":
+                return await self._failure(
+                    workflow_run_context=workflow_run_context,
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=effective_org_id,
+                    error_code="row_limit_exceeded",
+                    failure_reason="Power BI query exceeded the row limit.",
+                )
+            if exc.code in {"integration_unavailable", "invalid_credential_source"}:
                 return await self._failure(
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,

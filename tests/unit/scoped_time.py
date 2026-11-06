@@ -22,3 +22,17 @@ class ScopedTime:
 
     def __getattr__(self, name: str) -> object:
         return getattr(time, name)
+
+
+class SkewedTime:
+    """``monotonic`` reads the real clock plus ``skew``, so a test moves time forward by raising ``skew`` instead of
+    sleeping and the real clock still advances; every other attribute is served by the real ``time``."""
+
+    def __init__(self) -> None:
+        self.skew = 0.0
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.skew
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)

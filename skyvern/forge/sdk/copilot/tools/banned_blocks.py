@@ -112,7 +112,7 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     "task": _P(
         _AI_LEAF,
         _WITHOUT_AGENT_BLOCKS,
-        "agent-block authoring",
+        "Browser Task block authoring",
         (
             "The task agent is unavailable while only code may be authored; decompose the goal into focused "
             "code blocks instead."
@@ -173,7 +173,7 @@ _COPILOT_BLOCK_TYPE_POLICIES: dict[str, CopilotBlockPolicy] = {
     "agent_step": _P(
         _BANNED,
         _WITHOUT_AGENT_STEP,
-        "an organization with the agent_step block enabled, in a turn that may author agent blocks",
+        "an organization with the agent_step block enabled, in a turn that may author Browser Task blocks",
         (
             "It is not enabled for this organization or this turn; build the step from `web_search`, `navigation` "
             "or `extraction` blocks followed by a `conditional` on their output."
@@ -221,20 +221,16 @@ CODE_BLOCK_SUMMARY = (
     "Python that drives the browser directly with Playwright when the steps are the same every run, "
     "and transforms data it already holds"
 )
-AGENT_STEP_BLOCK_SUMMARY = (
-    "one model-driven step that decides and acts with this run's blocks, with or without the browser, "
-    "then returns fields matching its data_schema"
-)
 _AGENT_FAMILY_BLOCK_TYPES: frozenset[str] = frozenset(AGENT_FAMILY_BLOCK_SUMMARIES)
 _AGENT_FAMILY_BLOCK_LIST = join_phrases([f"`{block_type}`" for block_type in AGENT_FAMILY_BLOCK_SUMMARIES], "and")
 
 # Reaches the model on the three authoring tool descriptions, the block-type list and the
 # choosing_a_block knowledge topic, and only when both families may be authored.
 AUTHORING_FAMILY_GUIDANCE = (
-    f"Write a `code` block for browser work: that is the default. Write an agent block (engine `{_TASK_V3_ENGINE}`) "
-    "only when the user asks for one, when the site or page is only known at run time, or when the page has "
-    "been shown to change so much between visits that fixed code is not practical. An unclear item in the "
-    "request is settled by scouting the site or by asking, not by an agent block. "
+    "Write a `code` block for browser work: that is the default. Write a Browser Task block "
+    f"(engine `{_TASK_V3_ENGINE}`) only when the user asks for one, when the site or page is only known at run time, "
+    "or when the page has been shown to change so much between visits that fixed code is not practical. An unclear "
+    "item in the request is settled by scouting the site or by asking, not by a Browser Task block. "
     "Both families belong in one workflow."
 )
 
@@ -406,7 +402,7 @@ def _code_only_browser_schema_guidance(*, agent_blocks: bool = False, image_ocr:
     """The `code` schema response. Two entries answer "what else may this turn author", so they read
     as a closed list and have to change when the agent family is authorable too."""
     availability = (
-        "Agent blocks and non-browser helper blocks are available alongside `code` in the same workflow."
+        "Browser Task blocks and non-browser helper blocks are available alongside `code` in the same workflow."
         if agent_blocks
         else "Non-browser helper blocks stay available: `conditional`, `for_loop`, `while_loop`, `send_email`, `human_interaction`, S3/Google Sheets helpers, file parsers, and triggers."
     )

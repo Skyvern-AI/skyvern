@@ -172,6 +172,20 @@ class ObserverRepository(BaseRepository):
             total = (await session.execute(query)).scalar_one()
             return float(total)
 
+    @db_operation("get_block_llm_costs_by_workflow_run_id")
+    async def get_block_llm_costs_by_workflow_run_id(
+        self, workflow_run_id: str, organization_id: str
+    ) -> dict[str, float]:
+        """`llm_cost` of each workflow_run_block in this run that has one."""
+        async with self.Session() as session:
+            query = (
+                select(WorkflowRunBlockModel.workflow_run_block_id, WorkflowRunBlockModel.llm_cost)
+                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunBlockModel.organization_id == organization_id)
+                .where(WorkflowRunBlockModel.llm_cost > 0)
+            )
+            return {block_id: float(cost) for block_id, cost in (await session.execute(query)).all()}
+
     @db_operation("increment_workflow_run_block_llm_cost")
     async def increment_workflow_run_block_llm_cost(
         self,
@@ -909,6 +923,18 @@ class ObserverRepository(BaseRepository):
                 )
             ).first()
             return found is not None
+
+    @db_operation("get_child_workflow_run_ids")
+    async def get_child_workflow_run_ids(self, workflow_run_id: str, organization_id: str) -> set[str]:
+        async with self.Session() as session:
+            rows = await session.scalars(
+                select(WorkflowRunBlockModel.block_workflow_run_id).where(
+                    WorkflowRunBlockModel.workflow_run_id == workflow_run_id,
+                    WorkflowRunBlockModel.organization_id == organization_id,
+                    WorkflowRunBlockModel.block_workflow_run_id.is_not(None),
+                )
+            )
+            return {run_id for run_id in rows if run_id is not None}
 
     @db_operation("get_workflow_run_blocks")
     async def get_workflow_run_blocks(

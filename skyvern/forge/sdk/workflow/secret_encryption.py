@@ -365,9 +365,13 @@ async def encrypt_secret_field_value(
     return _SENTINEL_PREFIX + base64.b64encode(nonce + ciphertext).decode()
 
 
+# One message for every failure, including non-encrypted input, so callers and logs cannot tell causes apart.
+_DECRYPT_FAILED = "Failed to decrypt or authenticate the encrypted secret"
+
+
 async def decrypt_secret_field_value(value: str, *, organization_id: str | None, field_name: str) -> str:
     if not is_encrypted_secret(value):
-        raise ValueError("Value is not an encrypted secret")
+        raise ValueError(_DECRYPT_FAILED)
     try:
         raw = base64.b64decode(value[len(_SENTINEL_PREFIX) :], validate=True)
         nonce, ciphertext = raw[:_NONCE_LEN], raw[_NONCE_LEN:]
@@ -376,7 +380,7 @@ async def decrypt_secret_field_value(value: str, *, organization_id: str | None,
         plaintext = AESGCM(_derive_key()).decrypt(nonce, ciphertext, _binding_aad(organization_id, field_name))
     except Exception:
         # Generic on purpose: never reveal the ciphertext/plaintext or which check failed.
-        raise ValueError("Failed to decrypt or authenticate the encrypted secret") from None
+        raise ValueError(_DECRYPT_FAILED) from None
     return plaintext.decode()
 
 

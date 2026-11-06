@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import structlog
 
+from skyvern.forge.sdk import forge_log
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.organization_age_cache import remember_organization_created_at
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -225,7 +227,9 @@ async def test_browser_runtime_task_pbs_boundary_preserves_owner_log(
     runtime_logs: list[dict], workflow_owned: bool
 ) -> None:
     owner = SkyvernContext(workflow_run_id="workflow-owner" if workflow_owned else None, task_id="task-owner")
-    task = MagicMock(task_id=owner.task_id, workflow_run_id=owner.workflow_run_id, organization_id="org-owner")
+    task = MagicMock(
+        task_id=owner.task_id, workflow_run_id=owner.workflow_run_id, requested_by=None, organization_id="org-owner"
+    )
 
     async def acquire(session_id: str, **kwargs: object) -> None:
         with log_browser_acquisition_failure(
@@ -369,3 +373,44 @@ def test_json_log_callsite_names_the_caller_without_reading_its_source(tmp_path:
     )
     assert (record["func_name"], record["lineno"]) == ("emit", probe["line"])
     assert probe["source_read"] is False
+
+
+def test_outbound_url_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forge_log, "_sensitive_url_path_prefixes", set())
+    log_filter = forge_log._OutboundURLLogFilter()
+
+    def render(message: str, *args: object) -> str:
+        record = logging.LogRecord("httpx", logging.INFO, "", 0, message, args, None)
+        assert log_filter.filter(record)
+        return record.getMessage()
+
+    group = "22222222-2222-4222-8222-222222222222"
+    dataset = "11111111-1111-4111-8111-111111111111"
+    assert render(f"GET https://example.invalid/groups/{group}/datasets/{dataset}?q=private 403") == (
+        "GET https://example.invalid/groups/[REDACTED]/datasets/[REDACTED]?[REDACTED] 403"
+    )
+    assert render("GET https://example.invalid/messages/abcdef0123456789?q=private 200") == (
+        "GET https://example.invalid/messages/[REDACTED]?[REDACTED] 200"
+    )
+    assert render("GET https://example.invalid/messages 200") == "GET https://example.invalid/messages 200"
+    assert render("GET https://example.invalid/items/abc123456789012345678901 200") == (
+        "GET https://example.invalid/items/[REDACTED] 200"
+    )
+    forge_log.register_sensitive_url_path_prefix("/proxy/")
+    assert render("GET https://example.invalid/proxy/mail/messages/short-id?q=private 403") == (
+        "GET https://example.invalid/proxy/[REDACTED] 403"
+    )
+    assert render("GET https://example.invalid/proxy/data/groups/short-id/datasets 200") == (
+        "GET https://example.invalid/proxy/[REDACTED] 200"
+    )
+    assert render("%d", "not-an-integer") == "outbound log suppressed (unrenderable)"
+
+
+@pytest.mark.parametrize("logger_name", ["httpx", "httpcore.http11"])
+def test_outbound_url_redaction_at_info(caplog: pytest.LogCaptureFixture, logger_name: str) -> None:
+    logger = logging.getLogger(logger_name)
+    caplog.set_level(logging.INFO, logger=logger_name)
+    logger.info("HTTP Request: GET https://example.invalid/items/abcdef0123456789?q=private 403")
+    assert caplog.records[-1].getMessage() == (
+        "HTTP Request: GET https://example.invalid/items/[REDACTED]?[REDACTED] 403"
+    )

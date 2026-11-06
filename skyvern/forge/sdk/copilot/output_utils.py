@@ -25,6 +25,8 @@ from skyvern.forge.sdk.copilot.build_test_outcome import (
     BLOCK_FACT_MAX_LABELS,
     BLOCK_FACT_SCREEN_NOTICE_MAX_CHARS,
     BLOCK_FACT_URL_MAX_CHARS,
+    DOWNLOAD_TEXT_OMISSION_NOTICES,
+    DOWNLOAD_TEXT_OVER_PACKET_LIMIT,
     OBSERVED_BLOCK_END_URLS_EMPTY,
     OBSERVED_BLOCK_END_URLS_UNREPORTABLE,
     OBSERVED_BLOCK_END_URLS_WITHHELD,
@@ -84,11 +86,13 @@ _BUILD_TEST_FAILURE_REASON_MAX_CHARS = 1_200
 _BUILD_TEST_LABEL_MAX_ITEMS = 24
 _BUILD_TEST_OUTPUT_MAX_ITEMS = 12
 _BUILD_TEST_OUTPUT_VALUE_MAX_CHARS = 800
+OUTPUT_VALUE_MAX_CHARS = 200
 # The share of that cap a failure reason may hold before it starts crowding out available_keys, and
 # the shortest it is worth trimming one to.
 _AVAILABLE_KEYS_REASON_SHARE = 400
 _AVAILABLE_KEYS_REASON_FLOOR = 80
 _BUILD_TEST_DOWNLOAD_MAX_ITEMS = 12
+_BUILD_TEST_DOWNLOAD_TEXT_MAX_CHARS = 20_000
 _BUILD_TEST_UNFINISHED_MAX_ITEMS = 24
 _BUILD_TEST_ACTION_TRACE_MAX_ITEMS = 6
 _BUILD_TEST_PAGE_SUMMARY_MAX_ITEMS = 8
@@ -918,6 +922,21 @@ def _clipped_120(text: str | None) -> str | None:
     return text[:117] + "..." if text is not None and len(text) > 120 else text
 
 
+REGISTERED_OUTPUTS_NOTICE_PREFIX = "registered_outputs "
+DOWNLOADS_NOTICE_PREFIX = "downloads "
+
+
+def bound_output_value(value: JsonValue, value_complete: bool) -> tuple[JsonValue, bool]:
+    # An incomplete string is already-rendered text; quoting it again would escape it and grow it on every pass.
+    if isinstance(value, str) and not value_complete:
+        rendered = value
+    else:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) > OUTPUT_VALUE_MAX_CHARS:
+        return rendered[: OUTPUT_VALUE_MAX_CHARS - 3] + "...", False
+    return value, value_complete
+
+
 def _compact_packet_for_aggregate_limit(
     packet: BuildTestEvidencePacket,
     notices: list[str],
@@ -930,15 +949,8 @@ def _compact_packet_for_aggregate_limit(
     for output in _compacted(
         packet.registered_outputs, 6, field_name="registered_outputs", notices=notices, keep="first"
     ):
-        rendered = json.dumps(output.output, ensure_ascii=False, separators=(",", ":"))
-        outputs.append(
-            output.model_copy(
-                update={
-                    "output": rendered[:197] + "..." if len(rendered) > 200 else output.output,
-                    "value_complete": output.value_complete and len(rendered) <= 200,
-                }
-            )
-        )
+        value, value_complete = bound_output_value(output.output, output.value_complete)
+        outputs.append(output.model_copy(update={"output": value, "value_complete": value_complete}))
 
     def compact_page_state(
         page_state: BuildTestPacketPageState | None, *, field_prefix: str
@@ -1135,6 +1147,23 @@ def _fit_available_keys(block_output: JsonValue, label: str | None, notices: lis
     return fitted, keys_shortened or reason_shortened
 
 
+def _shorten_download_text(packet: BuildTestEvidencePacket, notices: list[str], excess: int) -> BuildTestEvidencePacket:
+    # Clipped from the last download backwards; each file keeps its page and character facts.
+    over = excess + 200
+    downloads = list(packet.downloads)
+    for index in reversed(range(len(downloads))):
+        if over <= 0:
+            break
+        text = downloads[index].text
+        if not text:
+            continue
+        kept = max(0, len(text) - over)
+        over -= len(text) - kept
+        downloads[index] = downloads[index].model_copy(update={"text": text[:kept] or None, "truncated": True})
+    append_omission_notice(notices, DOWNLOAD_TEXT_OVER_PACKET_LIMIT)
+    return packet.model_copy(update={"downloads": downloads, "omission_notices": notices})
+
+
 def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildTestEvidencePacket:
     """Return the one bounded model projection of a factual build-test packet."""
     notices = list(packet.omission_notices)
@@ -1279,7 +1308,7 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(packet.registered_outputs) > _BUILD_TEST_OUTPUT_MAX_ITEMS:
         append_omission_notice(
             notices,
-            "registered_outputs shortened: "
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}shortened: "
             f"{len(packet.registered_outputs) - _BUILD_TEST_OUTPUT_MAX_ITEMS} item(s) omitted.",
         )
 
@@ -1372,6 +1401,12 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
                     max_chars=_BUILD_TEST_IDENTIFIER_MAX_CHARS,
                     notices=notices,
                 ),
+                "text": _bounded_packet_string(
+                    download.text,
+                    field_name="downloads[].text",
+                    max_chars=_BUILD_TEST_DOWNLOAD_TEXT_MAX_CHARS,
+                    notices=notices,
+                ),
             }
         )
         for download in packet.downloads[:_BUILD_TEST_DOWNLOAD_MAX_ITEMS]
@@ -1379,7 +1414,8 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(packet.downloads) > _BUILD_TEST_DOWNLOAD_MAX_ITEMS:
         append_omission_notice(
             notices,
-            f"downloads shortened: {len(packet.downloads) - _BUILD_TEST_DOWNLOAD_MAX_ITEMS} item(s) omitted.",
+            f"{DOWNLOADS_NOTICE_PREFIX}shortened: "
+            f"{len(packet.downloads) - _BUILD_TEST_DOWNLOAD_MAX_ITEMS} item(s) omitted.",
         )
     unfinished = [
         item.model_copy(
@@ -1487,6 +1523,9 @@ def project_build_test_packet_for_llm(packet: BuildTestEvidencePacket) -> BuildT
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS:
         projected = _compact_loop_inputs(projected, notices)
         serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
+    if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS and any(download.text for download in projected.downloads):
+        projected = _shorten_download_text(projected, notices, len(serialized) - _BUILD_TEST_PACKET_MAX_CHARS)
+        serialized = json.dumps(projected.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
     if len(serialized) > _BUILD_TEST_PACKET_MAX_CHARS and projected.canonical_workflow_yaml is not None:
         excess = len(serialized) - _BUILD_TEST_PACKET_MAX_CHARS
         retained_chars = max(0, len(projected.canonical_workflow_yaml) - excess - 200)
@@ -1521,7 +1560,11 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
     notices: list[str] = []
     if OBSERVED_BLOCK_END_URLS_WITHHELD in packet.omission_notices:
         notices.append(OBSERVED_BLOCK_END_URLS_WITHHELD)
-    notices.extend(notice for notice in packet.omission_notices if notice in LOOP_INPUT_OMISSION_NOTICES)
+    notices.extend(
+        notice
+        for notice in packet.omission_notices
+        if notice in LOOP_INPUT_OMISSION_NOTICES or notice in DOWNLOAD_TEXT_OMISSION_NOTICES
+    )
     if packet.canonical_workflow_yaml is None:
         notices.append("canonical_workflow_yaml omitted: no persisted workflow readback was recorded.")
     if packet.run.workflow_run_id is None:
@@ -1534,7 +1577,8 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
         notices.append("executed_block_labels omitted: no block execution was recorded.")
     if not packet.registered_outputs:
         notices.append(
-            "registered_outputs empty: no workflow run block output or registered output-parameter value was recorded."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}empty: no workflow run block output or registered output-parameter "
+            "value was recorded."
         )
     redacted_output_count = sum(
         REDACTED_SECRET_PLACEHOLDER in json.dumps(output.output, ensure_ascii=False)
@@ -1542,10 +1586,11 @@ def project_direct_test_handoff_packet_for_llm(packet: BuildTestEvidencePacket) 
     )
     if redacted_output_count:
         notices.append(
-            f"registered_outputs redacted {redacted_output_count} item(s) containing registered secret values."
+            f"{REGISTERED_OUTPUTS_NOTICE_PREFIX}redacted {redacted_output_count} item(s) containing registered secret "
+            "values."
         )
     if not packet.downloads:
-        notices.append("downloads empty: no registered download artifact was recorded.")
+        notices.append(f"{DOWNLOADS_NOTICE_PREFIX}empty: no registered download artifact was recorded.")
     if not packet.screenshot.present:
         notices.append("screenshot omitted: no final or failed-block screenshot was recorded.")
     if not packet.unfinished_items:
@@ -2186,6 +2231,7 @@ _TRIGGER_MAPPING_REASON_LABELS: dict[TriggerMappingReasonCode, str] = {
     "invalid_mapping": "Mapping is invalid",
     "invalid_parameters": "Inputs failed validation",
     "owner_lookup_failed": "Couldn't look up your role; try again",
+    "owner_not_authorized": "Trigger owner cannot access a required credential",
 }
 
 
@@ -2347,6 +2393,9 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any], *, for_display
         return (
             f"Read characters {result.get('offset')}-{end} of {result.get('total_chars')} from {result.get('filename')}"
         )
+    if tool_name == "read_chat_history":
+        messages = result.get("messages")
+        return f"Read {len(messages) if isinstance(messages, list) else 0} earlier message(s) in this chat"
     if tool_name == "run_browser_code":
         operations = result.get("operations")
         count = len(operations) if isinstance(operations, list) else 0
@@ -2404,6 +2453,8 @@ def summarize_tool_result_detail(
     """
     if result.get("ok", False) if success is None else success:
         return None
+    if tool_name == "read_chat_history":
+        return _USER_FACING_CHAT_HISTORY_FAILURE
     structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
     if structured is not None:
         return structured
@@ -2441,6 +2492,7 @@ _INTERNAL_VALIDATION_MARKERS: tuple[str, ...] = (INTERNAL_VALIDATION_FAILURE_PRE
 
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
 _USER_FACING_GENERIC_FAILURE = _STRUCTURED_UNSAFE_FALLBACK
+_USER_FACING_CHAT_HISTORY_FAILURE = "Could not read earlier messages in this chat"
 
 _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset(
     {
@@ -2489,6 +2541,8 @@ def format_tool_result_for_user(
     if _is_unconfirmed_extension(result):
         return summarize_tool_result(tool_name, result, for_display=True)
     if not result.get("ok", False):
+        if tool_name == "read_chat_history":
+            return _USER_FACING_CHAT_HISTORY_FAILURE
         structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
         if structured is not None:
             return structured

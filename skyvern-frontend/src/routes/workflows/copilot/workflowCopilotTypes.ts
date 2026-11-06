@@ -13,6 +13,7 @@ export type CopilotProductAction = {
 export interface WorkflowCopilotDemonstrationInsertion {
   after_label: string | null;
   before_label: string | null;
+  replace_label?: string | null;
 }
 export type ProposalDisposition =
   | "no_proposal"
@@ -311,12 +312,20 @@ export interface WorkflowCopilotChatHistoryMessage {
   narrative_payload?: Record<string, unknown> | null;
 }
 
+export interface CopilotInFlightTurn {
+  turn_id: string;
+  cancel_token?: string | null;
+  latest_draft?: WorkflowApiResponse | null;
+  latest_draft_at?: string | null;
+}
+
 export interface WorkflowCopilotChatHistoryResponse {
   pending_credential_requests?: WorkflowCopilotCredentialRequiredUpdate[];
   question_interactions?: QuestionInteraction[];
   pending_question_cancel_token?: string | null;
   workflow_copilot_chat_id: string | null;
   request_turn_id?: string | null;
+  in_flight_turn?: CopilotInFlightTurn | null;
   chat_history: WorkflowCopilotChatHistoryMessage[];
   accepted_turn_ids?: string[];
   proposed_workflow?: WorkflowApiResponse | null;
@@ -536,7 +545,22 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
     attempted?: boolean;
     outcome?: "rejected" | "unknown" | "created_not_connected" | null;
   } | null;
+  // The site question asked about a picked login, so a reloaded card asks it again.
+  site_question?: CredentialSiteQuestion | null;
   timestamp: string;
+}
+
+export type CredentialSiteAnswer = "add" | "move" | "no";
+
+export interface CredentialSiteQuestion {
+  credential_id: string;
+  name: string;
+  // The origin this card signs in on.
+  site: string;
+  // Origins the login is saved for.
+  saved_sites: string[];
+  // The sites come from a connected vault, so only that vault can add one.
+  vault_sourced: boolean;
 }
 
 export interface WorkflowCopilotDemonstrationStartedUpdate {
@@ -560,7 +584,9 @@ export interface WorkflowCopilotDemonstrationActionUpdate {
     | "drag"
     | "navigate_browser"
     | "upload_attached_file"
-    | "fill_credential_field";
+    | "fill_credential_field"
+    | "note"
+    | "skyvern_tab_switch";
   // Present only on an upload the recorder attached; a skipped file request has none.
   file_id?: string;
   filename?: string;
@@ -600,8 +626,15 @@ export interface WorkflowCopilotDemonstrationStoppedUpdate {
 
 export interface WorkflowCopilotDemonstrationControlRequest {
   demonstration_id: string;
-  action: "navigate" | "fill_credential" | "upload_file" | "stop" | "cancel";
+  action:
+    | "navigate"
+    | "fill_credential"
+    | "upload_file"
+    | "note"
+    | "stop"
+    | "cancel";
   url?: string | null;
+  text?: string | null;
   selector?: string | null;
   credential_id?: string | null;
   field?: "password" | "totp" | null;
@@ -633,7 +666,15 @@ export interface WorkflowCopilotActiveDemonstration {
 }
 
 export interface WorkflowCopilotCredentialResponseResult {
-  result: "accepted" | "signed_in" | "no_sign_in_found" | "save_failed";
+  result:
+    | "accepted"
+    | "signed_in"
+    | "no_sign_in_found"
+    | "save_failed"
+    | "site_question"
+    | "site_changed_not_connected"
+    | "site_change_unknown";
+  site_question?: CredentialSiteQuestion | null;
   expires_at?: string | null;
   host?: string | null;
   browser_profile_id?: string | null;
@@ -657,6 +698,10 @@ export interface WorkflowCopilotCredentialPauseResolvedUpdate {
   credential_id: string | null;
   name: string | null;
   browser_profile_id?: string | null;
+  site_answer?: CredentialSiteAnswer | null;
+  site_a?: string | null;
+  saved_sites?: string[] | null;
+  site_b?: string | null;
   timestamp: string;
 }
 

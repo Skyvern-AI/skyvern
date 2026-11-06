@@ -11,6 +11,7 @@ import {
 } from "react";
 import { ResetIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
+import { caretOnEdge, splitAtCaret } from "./docCaret";
 import {
   Command,
   CommandDialog,
@@ -29,6 +30,8 @@ import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { useIntegrationCatalogQuery } from "@/hooks/useIntegrationCatalogQuery";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
+import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 import { AGENT_BLOCK_FLAG } from "@/util/featureFlags";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 import { cn } from "@/util/utils";
@@ -40,7 +43,16 @@ import type { DocDestination, NodeType } from "./docEditApi";
 import type { DocReferenceGroup } from "./docGraphEdits";
 import { docStepChoices } from "./docStepChoices";
 import { docStepFilter } from "./docStepRegistry";
+import {
+  DOC_RUN_AGENT_EVENT,
+  armNextCaretAtStart,
+  rememberReferenceLine,
+  takeNextCaretAtStart,
+  type LineSplit,
+  type PickerOpener,
+} from "./docKeys";
 import { DocText } from "./DocText";
+import { saveAndReport, useDocSaveFailureStore } from "./docSaveState";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
 // Menus anchored to a Doc line stay between the Doc pane's top and bottom and inside the window, cap their
@@ -79,13 +91,31 @@ export function DocStepPicker({
 }) {
   const agentBlockEnabled = useFeatureFlag(AGENT_BLOCK_FLAG) === true;
   const { data: integrationCatalog } = useIntegrationCatalogQuery();
-  const groups = useMemo(
+  const [search, setSearch] = useState("");
+  const choices = useMemo(
     () => docStepChoices({ agentBlockEnabled, integrationCatalog }),
     [agentBlockEnabled, integrationCatalog],
   );
+  // cmdk ranks items inside a group but never moves a group, so the group holding the best match is put first here.
+  const groups = useMemo(() => {
+    if (!search.trim()) return choices;
+    const best = (group: (typeof choices)[number]) =>
+      Math.max(
+        0,
+        ...group.items.map((item) =>
+          docStepFilter(item.title, search, [item.description, item.nodeType]),
+        ),
+      );
+    return [...choices].sort((a, b) => best(b) - best(a));
+  }, [choices, search]);
   return (
     <Command loop filter={docStepFilter} className="min-h-0">
-      <CommandInput autoFocus placeholder={placeholder} />
+      <CommandInput
+        autoFocus
+        placeholder={placeholder}
+        value={search}
+        onValueChange={setSearch}
+      />
       <CommandList className="max-h-[min(340px,50vh)]">
         <CommandEmpty>No step matches.</CommandEmpty>
         {groups.map((group) => (
@@ -170,29 +200,35 @@ export function DocInsertPopover({
   );
 }
 
-// The line's text on each side of the caret, with line breaks; null when the caret is elsewhere.
-function splitAtCaret(el: HTMLElement): [string, string] | null {
-  const selection = window.getSelection();
-  if (!selection?.rangeCount) return null;
-  const caret = selection.getRangeAt(0);
-  if (!el.contains(caret.startContainer)) return null;
-  const read = (range: Range) => {
-    let out = "";
-    const walk = (node: Node) => {
-      if (node.nodeType === Node.TEXT_NODE) out += node.nodeValue ?? "";
-      else if (node.nodeName === "BR") out += "\n";
-      else node.childNodes.forEach(walk);
-    };
-    walk(range.cloneContents());
-    return out;
-  };
-  const before = document.createRange();
-  before.selectNodeContents(el);
-  before.setEnd(caret.startContainer, caret.startOffset);
-  const after = document.createRange();
-  after.selectNodeContents(el);
-  after.setStart(caret.endContainer, caret.endOffset);
-  return [read(before), read(after)];
+// A collapsed caret `offset` characters into a line's text, counting each <br> as one.
+function caretRangeAt(el: HTMLElement, offset: number): Range {
+  const range = document.createRange();
+  let left = offset;
+  const walker = document.createTreeWalker(
+    el,
+    NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+  );
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const length = node.nodeValue?.length ?? 0;
+      if (left <= length) {
+        range.setStart(node, left);
+        range.collapse(true);
+        return range;
+      }
+      left -= length;
+    } else if (node.nodeName === "BR") {
+      if (left === 0) {
+        range.setStartBefore(node);
+        range.collapse(true);
+        return range;
+      }
+      left -= 1;
+    }
+  }
+  range.selectNodeContents(el);
+  range.collapse(false);
+  return range;
 }
 
 const runHistory = (redo: boolean) => {
@@ -221,6 +257,10 @@ export function DocEditableLine({
   references,
   onTab,
   onBackspaceAtStart,
+  onMove,
+  onSettings,
+  onRunStep,
+  caretAtStart,
   maxLength,
 }: {
   value: string;
@@ -231,15 +271,22 @@ export function DocEditableLine({
   multiline?: boolean;
   label: string;
   onChange: (value: string) => void;
-  onEnter?: () => void;
+  // Enter, with the text on each side of the caret.
+  onEnter?: (split: LineSplit | null) => void;
   // Opens the step picker. The line stays open until finish: true types the "/" after all, false closes the line.
-  onSlash?: (finish: (keepSlash: boolean) => void) => void;
+  onSlash?: PickerOpener;
   onDone?: (value: string) => void;
   // What "@" offers here; no "@" menu without it.
   references?: () => DocReferenceGroup[];
-  // Both return false when they did nothing, so the key keeps its usual meaning.
-  onTab?: (outdent: boolean) => boolean;
+  // Both return false when they did nothing, so the key keeps its usual meaning. Tab can instead ask for the step picker.
+  onTab?: (outdent: boolean) => boolean | PickerOpener;
   onBackspaceAtStart?: () => boolean;
+  // Moves the step this line belongs to up (-1) or down (1).
+  onMove?: (delta: -1 | 1) => boolean;
+  onSettings?: () => void;
+  onRunStep?: () => void;
+  // True when entering the line should put the caret at its start.
+  caretAtStart?: () => boolean;
   maxLength?: number;
 }) {
   const [editing, setEditing] = useState(autoFocus);
@@ -250,6 +297,17 @@ export function DocEditableLine({
   const [referenceGroups, setReferenceGroups] = useState<
     DocReferenceGroup[] | null
   >(null);
+  const [referenceQuery, setReferenceQuery] = useState("");
+  const { createInput } = useContext(WorkflowDocActionsContext);
+  const typedKey = referenceQuery.trim();
+  const newInputKey =
+    createInput &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test(typedKey) &&
+    !(referenceGroups ?? []).some((group) =>
+      group.items.some((item) => item.key === typedKey),
+    )
+      ? typedKey
+      : null;
   // The caret when "@" was typed; the menu takes focus, so the line keeps editing until it closes.
   const caret = useRef<Range | null>(null);
   // The caret when "/" opened the step picker, which also takes focus.
@@ -270,28 +328,63 @@ export function DocEditableLine({
     }
     // insertText fires the input event, so the change reaches onChange and the browser's caret moves past it.
     document.execCommand("insertText", false, insert);
+    const label = el.getAttribute("aria-label");
+    const same = Array.from(
+      el.closest(IN_DOC)?.querySelectorAll<HTMLElement>("[data-doc-line]") ??
+        [],
+    ).filter((line) => line.getAttribute("aria-label") === label);
+    rememberReferenceLine(label ? { label, index: same.indexOf(el) } : null);
   };
   useLayoutEffect(() => {
     const el = ref.current;
     if (!editing || !el) return;
-    // Outside changes (undo, rename) replace the text; the person's own typing doesn't.
-    if (el.innerText !== value && emitted.current !== value)
+    // Outside changes (undo, rename) replace the text; the person's own typing doesn't. A stored value
+    // that only lost a trailing space is still the typing: resetting would drop the space and the caret.
+    const typed: string | undefined = el.innerText;
+    if (
+      (typed === undefined || typed.trimEnd() !== value.trimEnd()) &&
+      emitted.current !== value
+    )
       el.innerText = value;
     emitted.current = value;
   }, [value, editing]);
+  // A save locks the Doc read-only while the line stays in edit mode; the edit span then remounts empty.
+  const resumed = useRef(false);
+  // Where the caret or selection was at the last key, so a Cmd+S puts it back there.
+  const keyCaret = useRef<[number, number] | null>(null);
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!editing || !el) return;
+    if (!editing) return;
+    if (!editable || !el) {
+      resumed.current = true;
+      return;
+    }
+    const resuming = resumed.current;
+    resumed.current = false;
     el.innerText = value;
+    // Back from read-only, the caret returns only if nothing else took focus meanwhile.
+    const elsewhere =
+      document.activeElement && document.activeElement !== document.body;
+    if (resuming && elsewhere) return;
     el.focus();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    range.collapse(false);
+    let range: Range;
+    if (resuming) {
+      const [start, end] = keyCaret.current ?? [value.length, value.length];
+      range = caretRangeAt(el, start);
+      const endAt = caretRangeAt(el, end);
+      range.setEnd(endAt.endContainer, endAt.endOffset);
+    } else {
+      keyCaret.current = null;
+      range = document.createRange();
+      range.selectNodeContents(el);
+      const atStart = caretAtStart?.() ?? false;
+      range.collapse(takeNextCaretAtStart() || atStart);
+    }
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
-    // Only on entering edit mode.
+    // Only on entering edit mode, or coming back to it after a read-only spell.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editing]);
+  }, [editing, editable]);
   useEffect(() => {
     if (autoFocus) setEditing(true);
   }, [autoFocus]);
@@ -314,6 +407,7 @@ export function DocEditableLine({
     return (
       <span
         key="view"
+        data-doc-line
         role="textbox"
         tabIndex={0}
         aria-label={label}
@@ -332,11 +426,54 @@ export function DocEditableLine({
       </span>
     );
 
+  // Opens the step picker for this line. The line stays open until the picker finishes: it can type the "/" after all,
+  // return to the line typing nothing, or close the line.
+  const openPicker = (
+    opener: PickerOpener,
+    [before, after]: [string, string],
+  ) => {
+    const selection = window.getSelection();
+    const at = selection?.rangeCount
+      ? selection.getRangeAt(0).cloneRange()
+      : null;
+    slashAt.current = at;
+    opener((keepLine, typeSlash = keepLine) => {
+      if (slashAt.current !== at) return;
+      slashAt.current = null;
+      const el = ref.current;
+      if (!keepLine) {
+        setEditing(false);
+        setOverLimit(false);
+        onDone?.(el?.innerText ?? value);
+        return;
+      }
+      if (el?.isConnected && at) {
+        // Type the "/" into the line, so the DOM, the caret and onChange agree.
+        el.focus();
+        window.getSelection()?.removeAllRanges();
+        window.getSelection()?.addRange(at);
+        if (typeSlash) document.execCommand("insertText", false, "/");
+        return;
+      }
+      if (typeSlash) onChange(`${before}/${after}`);
+    });
+  };
+
   const onKeyDown = (event: KeyboardEvent<HTMLSpanElement>) => {
     // Keys that confirm an IME candidate belong to the IME.
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     const mod = event.metaKey || event.ctrlKey;
     const split = ref.current ? splitAtCaret(ref.current) : null;
+    keyCaret.current =
+      split && ref.current
+        ? [
+            split[0].length,
+            Math.max(
+              split[0].length,
+              ref.current.innerText.length - split[1].length,
+            ),
+          ]
+        : null;
     // A menu opens only where a word or line starts, so "bob@example.com" and "Open /settings" stay text.
     const atWordStart = !split || /(^|\s)$/.test(split[0]);
     if (mod && event.key.toLowerCase() === "z") {
@@ -350,9 +487,60 @@ export function DocEditableLine({
       ref.current?.blur();
       return;
     }
+    if (event.key === "Enter" && mod) {
+      event.preventDefault();
+      if (event.shiftKey) window.dispatchEvent(new Event(DOC_RUN_AGENT_EVENT));
+      else onRunStep?.();
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey && (onEnter || !multiline)) {
       event.preventDefault();
-      onEnter?.();
+      onEnter?.(split ? { before: split[0], after: split[1] } : null);
+      return;
+    }
+    if (mod && event.key === "." && onSettings) {
+      event.preventDefault();
+      onSettings();
+      return;
+    }
+    if (
+      (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+      ((mod && !event.shiftKey && !event.altKey) ||
+        (event.altKey && event.shiftKey && !mod)) &&
+      onMove
+    ) {
+      if (onMove(event.key === "ArrowUp" ? -1 : 1)) event.preventDefault();
+      return;
+    }
+    if (
+      (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+      !mod &&
+      !event.shiftKey &&
+      !event.altKey &&
+      ref.current &&
+      caretOnEdge(ref.current, event.key === "ArrowUp" ? "first" : "last")
+    ) {
+      const lines = Array.from(
+        ref.current
+          .closest(IN_DOC)
+          ?.querySelectorAll<HTMLElement>("[data-doc-line]") ?? [],
+      );
+      const next =
+        lines[lines.indexOf(ref.current) + (event.key === "ArrowUp" ? -1 : 1)];
+      if (next) {
+        event.preventDefault();
+        if (event.key === "ArrowDown" && !next.isContentEditable)
+          armNextCaretAtStart();
+        next.focus();
+        // A line already open keeps its caret where it was; put it at the edge the arrow came from.
+        if (next.isContentEditable) {
+          const range = document.createRange();
+          range.selectNodeContents(next);
+          range.collapse(event.key === "ArrowDown");
+          window.getSelection()?.removeAllRanges();
+          window.getSelection()?.addRange(range);
+        }
+      }
       return;
     }
     if (event.key === "@" && references && ref.current && atWordStart) {
@@ -365,11 +553,15 @@ export function DocEditableLine({
         caret.current.selectNodeContents(ref.current);
         caret.current.collapse(false);
       }
+      setReferenceQuery("");
       setReferenceGroups(references());
       return;
     }
     if (event.key === "Tab" && onTab && !mod && !event.altKey) {
-      if (onTab(event.shiftKey)) event.preventDefault();
+      const handled = onTab(event.shiftKey);
+      if (handled) event.preventDefault();
+      if (typeof handled === "function")
+        openPicker(handled, split ?? [ref.current?.innerText ?? "", ""]);
       return;
     }
     if (event.key === "Backspace" && onBackspaceAtStart && !mod) {
@@ -382,35 +574,14 @@ export function DocEditableLine({
       return;
     }
     if (event.key === "/" && onSlash && !mod) {
-      const [before, after] = split ?? [ref.current?.innerText ?? "", ""];
-      const lineSoFar = before.slice(before.lastIndexOf("\n") + 1);
+      const sides: [string, string] = split ?? [
+        ref.current?.innerText ?? "",
+        "",
+      ];
+      const lineSoFar = sides[0].slice(sides[0].lastIndexOf("\n") + 1);
       if (!lineSoFar.trim()) {
         event.preventDefault();
-        const selection = window.getSelection();
-        const at = selection?.rangeCount
-          ? selection.getRangeAt(0).cloneRange()
-          : null;
-        slashAt.current = at;
-        onSlash((keepSlash) => {
-          if (slashAt.current !== at) return;
-          slashAt.current = null;
-          const el = ref.current;
-          if (!keepSlash) {
-            setEditing(false);
-            setOverLimit(false);
-            onDone?.(el?.innerText ?? value);
-            return;
-          }
-          if (el?.isConnected && at) {
-            // Type the "/" into the line, so the DOM, the caret and onChange agree.
-            el.focus();
-            window.getSelection()?.removeAllRanges();
-            window.getSelection()?.addRange(at);
-            document.execCommand("insertText", false, "/");
-            return;
-          }
-          onChange(`${before}/${after}`);
-        });
+        openPicker(onSlash, sides);
       }
     }
   };
@@ -418,13 +589,15 @@ export function DocEditableLine({
     <Popover
       key="edit"
       open={referenceGroups !== null}
-      onOpenChange={(open) => !open && closeReferences("@")}
+      // Leaving the menu types nothing: the "@" only opened it.
+      onOpenChange={(open) => !open && closeReferences("")}
     >
       <PopoverAnchor asChild ref={anchorRef}>
         <span
           ref={ref}
           role="textbox"
           aria-label={label}
+          data-doc-line
           aria-multiline={multiline}
           contentEditable="plaintext-only"
           suppressContentEditableWarning
@@ -455,7 +628,7 @@ export function DocEditableLine({
             onDone?.(ref.current?.innerText ?? value);
           }}
           className={cn(
-            "block min-h-[1.55em] whitespace-pre-wrap rounded outline-none [overflow-wrap:anywhere] empty:before:font-normal empty:before:text-muted-foreground empty:before:content-[attr(data-placeholder)] focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-4 focus-visible:ring-offset-background",
+            "block min-h-[1.55em] whitespace-pre-wrap rounded outline-none [overflow-wrap:anywhere] empty:before:font-normal empty:before:text-muted-foreground empty:before:content-[attr(data-placeholder)]",
             className,
           )}
         />
@@ -475,9 +648,18 @@ export function DocEditableLine({
         onCloseAutoFocus={(e) => e.preventDefault()}
       >
         <Command loop className="min-h-0">
-          <CommandInput autoFocus placeholder="Insert a reference…" />
+          <CommandInput
+            autoFocus
+            placeholder="Insert a reference…"
+            value={referenceQuery}
+            onValueChange={setReferenceQuery}
+          />
           <CommandList className="max-h-[min(300px,45vh)]">
-            <CommandEmpty>Nothing to reference here.</CommandEmpty>
+            <CommandEmpty>
+              {createInput
+                ? "Nothing to reference yet. Type a name to create an input."
+                : "Nothing to reference here."}
+            </CommandEmpty>
             {(referenceGroups ?? []).map((group) => (
               <CommandGroup key={group.name} heading={group.name}>
                 {group.items.map((item) => (
@@ -497,6 +679,25 @@ export function DocEditableLine({
                 ))}
               </CommandGroup>
             ))}
+            {newInputKey && (
+              <CommandGroup heading="New">
+                <CommandItem
+                  value={`create input ${newInputKey}`}
+                  onSelect={() => {
+                    if (createInput?.(newInputKey))
+                      closeReferences(`{{ ${newInputKey} }}`);
+                  }}
+                  className="flex flex-col items-start gap-0"
+                >
+                  <span className="text-[13px]">
+                    Create input "{newInputKey}"
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    Adds it to the inputs at the top
+                  </span>
+                </CommandItem>
+              </CommandGroup>
+            )}
           </CommandList>
         </Command>
       </PopoverContent>
@@ -510,7 +711,7 @@ export function DocOutputName({ id, label }: { id: string; label: string }) {
   const [draft, setDraft] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const pill =
-    "inline-block max-w-full rounded bg-muted px-[5px] text-left font-medium leading-[1.25] [overflow-wrap:anywhere]";
+    "inline-block max-w-full rounded bg-muted px-[5px] text-left align-baseline font-medium leading-[1.25] [overflow-wrap:anywhere]";
   if (!edit)
     return (
       <span className={pill} title={`${label}_output`}>
@@ -698,16 +899,15 @@ export function DocMoveToDialog({
   );
 }
 
-/** Unsaved marker, problem count, undo/redo and Save. Each shows only when it applies. */
-// `reserve` keeps the bar's row when it has nothing to show, so the doc doesn't jump on the first edit or on Save.
+/** Unsaved marker, undo/redo and Save. Each shows only when it applies. */
+// `floating` (sm and up) lays the bar over the page's top padding (the parent positions it), so it adds no height
+// and the Inputs row sits where v26 puts it, while the doc still doesn't jump on the first edit or on Save.
 // While a Copilot proposal is pending its Accept / Reject bar is the one decision, so this bar steps aside.
 export function DocEditBar({
-  problems,
-  reserve = false,
+  floating = false,
   proposalPending = false,
 }: {
-  problems: number;
-  reserve?: boolean;
+  floating?: boolean;
   proposalPending?: boolean;
 }) {
   const hasChanges = useWorkflowHasChangesStore((s) => s.hasChanges);
@@ -716,40 +916,101 @@ export function DocEditBar({
   const { undoShortcutLabel, redoShortcutLabel } = useUndoRedoShortcutLabels();
   const save = useSaveWorkflow();
   const [saving, setSaving] = useState(false);
+  const workflowPermanentId = useWorkflowYamlEditorStore(
+    (s) => s.editorOwner?.workflowPermanentId,
+  );
+  const saveFailure = useDocSaveFailureStore((s) =>
+    workflowPermanentId ? s.failures[workflowPermanentId] : undefined,
+  );
+  // The studio's own dirty check: the draft is back to the saved baseline after a user edit.
+  const matchesSaved = useWorkflowSnapshotStore(
+    (s) => s.snapshot !== null && s.userHasEdited && !s.contentDirty,
+  );
   const pendingGoalChangeCount = useCopilotActionStore(
     (state) => state.pendingGoalChanges.length,
   );
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const saveNow = () => {
+    // Same check as the studio Save: a new Goal whose code isn't regenerated is applied or undone first.
+    if (pendingGoalChangeCount > 0) {
+      setGoalDialogOpen(true);
+      return;
+    }
+    runSave();
+  };
+  const saveShortcut = useRef<() => void>(() => {});
+  saveShortcut.current = () => {
+    if (!proposalPending && hasChanges && !saving) saveNow();
+  };
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.isComposing ||
+        event.altKey ||
+        !(event.metaKey || event.ctrlKey) ||
+        event.key.toLowerCase() !== "s"
+      )
+        return;
+      // The browser's own "save page" has no meaning in the Doc.
+      event.preventDefault();
+      saveShortcut.current();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
   const runSave = () => {
     setSaving(true);
-    // A failed save is already toasted and keeps the unsaved marker.
-    void save()
-      .catch(() => {})
-      .finally(() => setSaving(false));
+    void saveAndReport(save).finally(() => setSaving(false));
   };
-  if (
-    proposalPending ||
-    (!hasChanges && !canUndo && !canRedo && problems === 0)
-  )
-    return reserve ? <div aria-hidden className="mb-3 h-[28px]" /> : null;
+  useEffect(() => {
+    if (hasChanges && matchesSaved && !saving) {
+      useWorkflowHasChangesStore.getState().setHasChanges(false);
+    }
+  }, [hasChanges, matchesSaved, saving]);
+  useEffect(() => {
+    if (!hasChanges && workflowPermanentId)
+      useDocSaveFailureStore.getState().setFailure(workflowPermanentId, null);
+  }, [hasChanges, workflowPermanentId]);
+  // A save made while the Doc is hidden (Visual, Code) never clears the entry, so the bar drops it when it unmounts.
+  useEffect(
+    () => () => {
+      if (workflowPermanentId)
+        useDocSaveFailureStore.getState().setFailure(workflowPermanentId, null);
+    },
+    [workflowPermanentId],
+  );
+  if (proposalPending || (!hasChanges && !canUndo && !canRedo))
+    return floating ? (
+      <div aria-hidden className="mb-3 h-[28px] sm:hidden" />
+    ) : null;
   return (
-    <div className="mb-3 flex min-h-[28px] flex-wrap items-center gap-x-2.5 gap-y-1.5 text-[12.5px] text-muted-foreground">
-      {hasChanges && (
-        <span className="font-medium text-[#B45B0A] dark:text-[#E79A55]">
+    <div
+      className={cn(
+        "mb-3 flex min-h-[28px] flex-wrap items-center gap-x-2.5 gap-y-1.5 text-[12.5px] text-muted-foreground",
+        floating && "sm:mb-0 sm:flex-nowrap",
+      )}
+    >
+      {hasChanges && saveFailure && !saving ? (
+        <span
+          role="alert"
+          className="min-w-0 truncate text-xs font-normal text-destructive"
+          title={saveFailure}
+        >
+          Couldn't save: {saveFailure}
+        </span>
+      ) : hasChanges ? (
+        <span className="min-w-0 truncate text-xs font-normal text-[#B45B0A] dark:text-[#E79A55]">
           Unsaved changes
         </span>
-      )}
-      {problems > 0 && (
-        <span>
-          {problems} problem{problems === 1 ? "" : "s"}
-        </span>
+      ) : (
+        <span>Saved</span>
       )}
       <span className="flex-1" />
       {canUndo && (
         <Button
           size="sm"
           variant="ghost"
-          className="h-7 gap-1 px-2"
+          className="h-7 shrink-0 gap-1 px-2"
           title={`Undo (${undoShortcutLabel})`}
           onClick={() => runHistory(false)}
         >
@@ -761,7 +1022,7 @@ export function DocEditBar({
         <Button
           size="sm"
           variant="ghost"
-          className="h-7 gap-1 px-2"
+          className="h-7 shrink-0 gap-1 px-2"
           title={`Redo (${redoShortcutLabel})`}
           onClick={() => runHistory(true)}
         >
@@ -772,18 +1033,11 @@ export function DocEditBar({
       {hasChanges && (
         <Button
           size="sm"
-          className="h-7 px-3"
+          className="h-7 shrink-0 px-3"
           disabled={saving}
-          onClick={() => {
-            // Same check as the studio Save: a new Goal whose code isn't regenerated is applied or undone first.
-            if (pendingGoalChangeCount > 0) {
-              setGoalDialogOpen(true);
-              return;
-            }
-            runSave();
-          }}
+          onClick={saveNow}
         >
-          {saving ? "Saving…" : "Save"}
+          {saving ? "Saving…" : saveFailure ? "Try again" : "Save"}
         </Button>
       )}
       <PendingGoalChangesDialog

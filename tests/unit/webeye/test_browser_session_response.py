@@ -31,6 +31,7 @@ PINNED_CLIENT_FIELDS = frozenset(
         "runnable_id",
         "timeout",
         "browser_address",
+        "browser_address_redacted",
         "app_url",
         "extensions",
         "browser_type",

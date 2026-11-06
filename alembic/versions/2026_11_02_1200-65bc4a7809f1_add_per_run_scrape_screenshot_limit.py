@@ -1,7 +1,7 @@
 """Add per-run scrape screenshot limits.
 
 Revision ID: 65bc4a7809f1
-Revises: 711920698281
+Revises: 2868bd257141
 Create Date: 2026-11-02 12:00:00
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "65bc4a7809f1"
-down_revision = "711920698281"
+down_revision = "2868bd257141"
 branch_labels = None
 depends_on = None
 

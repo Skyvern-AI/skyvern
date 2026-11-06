@@ -63,8 +63,10 @@ _FAKE_JWT = ".".join(
 )
 
 
-def _credential(credential_id: str = "cred_safe", tested_url: str = "https://login.example.test/login") -> object:
-    return SimpleNamespace(credential_id=credential_id, name="Saved Login", tested_url=tested_url)
+def _credential(
+    credential_id: str = "cred_safe", tested_url: str | None = "https://login.example.test/login"
+) -> SimpleNamespace:
+    return SimpleNamespace(credential_id=credential_id, name="Saved Login", tested_url=tested_url, extra_site_urls=[])
 
 
 def _policy(**overrides: object) -> RequestPolicy:
@@ -837,6 +839,67 @@ def test_rejects_existing_workflow_credential_id_without_prior_origin_scope() ->
     assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
 
 
+def test_existing_workflow_credential_with_known_prior_origin_ignores_current_resolution() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[_credential(tested_url="https://login.example.test/signin")],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={"cred_safe": ["https://portal.example.test"]},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
+    )
+
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+def test_existing_workflow_block_on_a_site_added_to_its_login_does_not_broaden_scope() -> None:
+    policy = _policy(
+        existing_workflow_credential_ids=["cred_safe"],
+        existing_workflow_credential_origins={},
+        credential_input_kind="none",
+    )
+    workflow_yaml = _workflow_yaml(url="https://account.example.org/login")
+
+    before = evaluate_output_policy(request_policy=policy, workflow_yaml=workflow_yaml)
+    policy.refresh_credential(
+        SimpleNamespace(
+            credential_id="cred_safe",
+            name="Saved Login",
+            tested_url="https://login.example.test/login",
+            extra_site_urls=["https://account.example.org/login"],
+        )
+    )
+    after = evaluate_output_policy(request_policy=policy, workflow_yaml=workflow_yaml)
+
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in before.reason_codes
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED not in after.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("resolved_credentials", "admitted_urls"),
+    [
+        pytest.param([_credential("cred_other", "https://login.example.test/signin")], {}, id="other-id-resolved"),
+        pytest.param([], {"cred_safe": "https://login.example.test/a"}, id="admitted-but-unresolved"),
+    ],
+)
+def test_existing_workflow_credential_scope_without_prior_origin_refuses_other_authority(
+    resolved_credentials: list[SimpleNamespace], admitted_urls: dict[str, str]
+) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=resolved_credentials,
+            live_page_admitted_urls=admitted_urls,
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
+    )
+
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
 def test_rejects_approved_credential_on_different_login_origin() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
@@ -1493,31 +1556,6 @@ workflow_definition:
     assert diagnostics["final_output_kind"] == "workflow_draft_proposal"
 
 
-def test_final_output_policy_checks_the_unbound_credential_lead_without_a_done_placeholder(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctx = _ctx(request_policy=_policy(clarification_reason="workflow_credential_inputs_unbound"))
-    ctx.last_run_skipped_unbound_credentials = True
-    ctx.last_workflow = object()
-    ctx.last_update_block_count = 2
-    ctx.last_workflow_yaml = _COVERED_DRAFT_YAML
-    checked_replies: list[str] = []
-    real_evaluate = agent_module.evaluate_output_policy
-
-    def recording_evaluate(**kwargs: Any) -> OutputPolicyVerdict:
-        checked_replies.append(kwargs["user_response"])
-        return real_evaluate(**kwargs)
-
-    monkeypatch.setattr(agent_module, "evaluate_output_policy", recording_evaluate)
-
-    agent_module._evaluate_copilot_final_output_policy(ctx, "ASK_QUESTION:")
-
-    assert checked_replies == [
-        "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-        "the required credentials. Add them in Credentials, then I can try again."
-    ]
-
-
 def test_translation_surfaces_untested_draft_when_agent_asks_after_drafting() -> None:
     ctx = _ctx(
         request_policy=_policy(
@@ -1876,7 +1914,7 @@ workflow_definition:
 
 
 def _discovered(credential_id: str, tested_url: str | None) -> object:
-    return SimpleNamespace(credential_id=credential_id, name=credential_id, tested_url=tested_url)
+    return SimpleNamespace(credential_id=credential_id, name=credential_id, tested_url=tested_url, extra_site_urls=[])
 
 
 def test_rejects_discovered_credential_bound_to_new_origin() -> None:

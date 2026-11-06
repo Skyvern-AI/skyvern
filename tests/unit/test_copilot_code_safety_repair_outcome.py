@@ -324,4 +324,8 @@ async def test_safe_helper_arm_persists_and_reaches_test_run(
     assert ctx.has_staged_proposal is True
     assert len(run_calls) == 1
     assert run_calls[0]["workflow_yaml"] == ctx.workflow_yaml
-    assert run_calls[0]["params"] == {"block_labels": ["download_result"], "parameters": {}}
+    assert run_calls[0]["params"] == {
+        "block_labels": ["download_result"],
+        "parameters": {},
+        "run_every_loop_iteration": False,
+    }

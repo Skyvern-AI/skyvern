@@ -987,6 +987,138 @@ async def test_resolve_and_stamp_skips_profileless_live_session(monkeypatch: pyt
     update_run.assert_not_awaited()
 
 
+# --- run-start reseed: pick up a profile saved after the run was queued (SKY-19415) ----
+
+
+def _lane_workflow(*, run_sequentially: bool = True, reuse_browser_session: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_permanent_id="wpid_test",
+        run_sequentially=run_sequentially,
+        reuse_browser_session=reuse_browser_session,
+    )
+
+
+def _lane_run(
+    *,
+    seed: str | None = None,
+    source: BrowserSeedSource | None = BrowserSeedSource.credential,
+    sink: str | None = "bp_own",
+    sequential_key: str | None = "seq_c_1",
+    browser_session_id: str | None = None,
+    browser_address: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_run_id="wr_test",
+        organization_id="o_test",
+        browser_profile_id=seed,
+        browser_seed_source=source,
+        browser_sink_profile_id=sink,
+        browser_session_id=browser_session_id,
+        debug_session_id=None,
+        browser_address=browser_address,
+        sequential_credential_id=None,
+        sequential_key=sequential_key,
+        depends_on_workflow_run_id=None,
+        reuse_bound_key=None,
+        start_fresh_browser=None,
+        reuse_browser_session=None,
+        mark_row_write_unconfirmed=lambda: None,
+    )
+
+
+def _stub_reseed_deps(
+    monkeypatch: pytest.MonkeyPatch, *, has_content: bool | Exception = True, engine_enabled: bool = True
+) -> AsyncMock:
+    monkeypatch.setattr(app.AGENT_FUNCTION, "is_browser_memory_engine_enabled", AsyncMock(return_value=engine_enabled))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.workflow.service.app.STORAGE.browser_profile_exists",
+        AsyncMock(side_effect=has_content)
+        if isinstance(has_content, Exception)
+        else AsyncMock(return_value=has_content),
+    )
+    update_run = AsyncMock(return_value=SimpleNamespace(workflow_run_id="wr_test", browser_profile_id="bp_own"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.service.app.DATABASE.workflow_runs.update_workflow_run", update_run)
+    return update_run
+
+
+@pytest.mark.asyncio
+async def test_run_start_reseeds_from_profile_saved_after_queueing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SKY-19415: a batch enqueued before any profile holds content stamps seed=credential at queue
+    # time. Once an earlier run in the lane saves the workflow's own profile, the next run must start
+    # from that profile instead of replaying its stale queue-time choice.
+    svc = WorkflowService()
+    update_run = _stub_reseed_deps(monkeypatch)
+
+    result = await svc._reseed_from_saved_profile_at_run_start(
+        workflow=_lane_workflow(),  # type: ignore[arg-type]
+        workflow_run=_lane_run(seed="bp_cred"),  # type: ignore[arg-type]
+    )
+
+    assert result.browser_profile_id == "bp_own"
+    update_run.assert_awaited_once_with(
+        workflow_run_id="wr_test",
+        browser_profile_id="bp_own",
+        browser_seed_source=BrowserSeedSource.own_memory,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "workflow", "run", "has_content", "engine_enabled"),
+    [
+        # Already seeded from its own saved profile — nothing to move.
+        ("own_memory_in_steady_state", _lane_workflow(), _lane_run(seed="bp_own"), True, True),
+        # An explicit per-run override and a start-fresh run seed where the caller said.
+        ("override", _lane_workflow(), _lane_run(seed="bp_ovr", source=BrowserSeedSource.override), True, True),
+        ("start_fresh", _lane_workflow(), _lane_run(source=BrowserSeedSource.fresh, sink=None), True, True),
+        # A live session or fixed browser address never loads the stamp, and a reuse run may adopt its lane's live
+        # session; re-stamping any of them would only make the end-of-run write-back skip.
+        ("live_session", _lane_workflow(), _lane_run(browser_session_id="pbs_1"), True, True),
+        ("browser_address", _lane_workflow(), _lane_run(browser_address="ws://10.0.0.5:9222"), True, True),
+        ("reuse_session", _lane_workflow(reuse_browser_session=True), _lane_run(), True, True),
+        # An unserialized run can start while the profile's writer is still mid-flight.
+        ("unserialized", _lane_workflow(run_sequentially=False), _lane_run(sequential_key=None), True, True),
+        # Nothing saved yet: this run is the one that creates the content.
+        ("profile_still_empty", _lane_workflow(), _lane_run(), False, True),
+        ("engine_off", _lane_workflow(), _lane_run(), True, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_start_reseed_leaves_the_queue_time_seed_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    workflow: SimpleNamespace,
+    run: SimpleNamespace,
+    has_content: bool,
+    engine_enabled: bool,
+) -> None:
+    svc = WorkflowService()
+    update_run = _stub_reseed_deps(monkeypatch, has_content=has_content, engine_enabled=engine_enabled)
+
+    result = await svc._reseed_from_saved_profile_at_run_start(
+        workflow=workflow,  # type: ignore[arg-type]
+        workflow_run=run,  # type: ignore[arg-type]
+    )
+
+    assert result is run, case
+    update_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_start_reseed_keeps_credential_seed_on_storage_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Setup's has-content probe fails safe to HAS-content; here the safe direction is the opposite —
+    # an unreadable probe must not trade a signed-in credential profile for an unproven own profile.
+    svc = WorkflowService()
+    update_run = _stub_reseed_deps(monkeypatch, has_content=RuntimeError("s3 blip"))
+
+    result = await svc._reseed_from_saved_profile_at_run_start(
+        workflow=_lane_workflow(),  # type: ignore[arg-type]
+        workflow_run=_lane_run(seed="bp_cred"),  # type: ignore[arg-type]
+    )
+
+    assert result.browser_profile_id == "bp_cred"
+    update_run.assert_not_awaited()
+
+
 # --- credential IP pin: keep the same IP for sign-ins with a pinning credential ----
 
 

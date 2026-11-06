@@ -1092,15 +1092,29 @@ def _anchored_plan(
                 labels_to_execute, frontier_start_label, new_definition
             )
         if needs_own_browser:
-            # No browser can be named for this start, and the chat's holds the page scouting left
-            # open. Run what was asked where nothing is signed in — all of what was asked, because
-            # a slice narrowed to where a previous attempt failed relies on state the earlier
-            # blocks of that same request established, and a blank browser holds none of it. The
-            # plan is restored to the request, so it still never gains a label the caller left out.
+            # No browser can be named for this start, so run the whole request in a blank one: a narrowed
+            # slice depends on browser state its earlier blocks set up. Outputs of blocks the restored
+            # request does not run are data, not browser state, so their seeds stay.
             if requested_labels:
                 labels_to_execute = list(requested_labels)
-                block_outputs_to_seed = {}
                 frontier_start_label = requested_labels[0]
+                executed = (
+                    executed_suffix_labels(labels_to_execute, new_definition)
+                    if isinstance(new_definition, WorkflowDefinition)
+                    else labels_to_execute
+                )
+                needed = _referenced_output_labels(executed, new_definition) - set(executed)
+                block_outputs_to_seed = {
+                    label: value for label, value in block_outputs_to_seed.items() if label in needed
+                }
+                ctx.frontier_selected_output_sources = {
+                    label: source
+                    for label, source in ctx.frontier_selected_output_sources.items()
+                    if label in block_outputs_to_seed
+                }
+                ctx.frontier_origin_reused_labels = [
+                    label for label in ctx.frontier_origin_reused_labels if label in block_outputs_to_seed
+                ]
             ctx.frontier_requires_own_browser = True
             LOG.info(
                 "copilot_frontier_start_requires_own_browser",
@@ -1277,7 +1291,7 @@ def _anchor_selected_suffix(
         ctx.frontier_origin_reused_labels = []
         ctx.frontier_origin_output_refusal = None
         ctx.frontier_named_output_refusal = None
-        return _fill_seed_from_origin(ctx, plan, definition, requested_labels)
+        return _fill_seed_from_origin(ctx, (plan[0], {}, plan[2], plan[3]), definition, requested_labels)
     return plan
 
 

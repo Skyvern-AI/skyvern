@@ -3,6 +3,14 @@ import { useNodes, useReactFlow } from "@xyflow/react";
 import { useMemo, useState } from "react";
 import type { Extension } from "@uiw/react-codemirror";
 
+import {
+  describeSchema,
+  type SchemaView,
+} from "@/components/DataSchemaInputGroup/describeSchema";
+import {
+  SchemaFieldList,
+  SchemaViewButton,
+} from "@/components/DataSchemaInputGroup/SchemaFieldList";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
@@ -29,6 +37,7 @@ import {
   freshGoalSuggestion,
   goalChangeIsPending,
   goalChangeUndoPatch,
+  goalTextEditPatch,
   keepCodeWithGoalPatch,
 } from "@/routes/workflows/editor/workflowEditorUtils";
 import { getCodeStepPlainText } from "@/routes/workflows/workflowBlockUtils";
@@ -241,36 +250,10 @@ function CodeBlockEditorBody({
         name="prompt"
         nodeId={blockId}
         onChange={(value) => {
-          if (value === (data.prompt ?? "")) {
-            return;
+          const patch = goalTextEditPatch(data, value);
+          if (patch) {
+            update(patch);
           }
-          if (undoPatch && value === (data.goalBeforeEdit?.prompt ?? "")) {
-            update(undoPatch);
-            return;
-          }
-          if (value.trim().length > 0) {
-            update({
-              prompt: value,
-              userOwnedGoal: true,
-              goalNeedsRegeneration: true,
-              ...(!goalChangePending && {
-                goalBeforeEdit: {
-                  prompt: data.prompt,
-                  userOwnedGoal: data.userOwnedGoal,
-                  goalNeedsRegeneration: data.goalNeedsRegeneration,
-                },
-              }),
-            });
-            return;
-          }
-          update({
-            prompt: value,
-            ...(data.userOwnedGoal === true && { userOwnedGoal: false }),
-            ...(goalChangePending && {
-              goalNeedsRegeneration: false,
-              goalBeforeEdit: null,
-            }),
-          });
         }}
         value={data.prompt ?? ""}
         // The build in flight carries the Goal it was started with; a later edit would be lost to it.
@@ -306,19 +289,52 @@ function CodeBlockEditorBody({
   );
 
   const dataSchemaText = data.dataSchema?.trim() ?? "";
+  const schemaOutline = useMemo(
+    () => describeSchema(dataSchemaText),
+    [dataSchemaText],
+  );
+  // Scoped to blockId because the studio sidebar reuses this component across blocks without remounting it.
+  const [schemaChoice, setSchemaChoice] = useState<{
+    owner: string;
+    view: SchemaView;
+  } | null>(null);
+  const schemaView: SchemaView =
+    schemaOutline === null
+      ? "json"
+      : schemaChoice?.owner === blockId
+        ? schemaChoice.view
+        : "fields";
+  const showSchemaFields = schemaView === "fields" && schemaOutline !== null;
   const dataSchemaField =
     dataSchemaText === "" || dataSchemaText === "null" ? null : (
       <div className="space-y-2">
-        <Label className="text-xs text-tertiary-foreground">
-          Returned data schema
-        </Label>
-        <pre
-          data-testid="code-block-data-schema"
-          tabIndex={0}
-          className="nopan nowheel max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation1 p-2 text-xs text-tertiary-foreground"
-        >
-          {dataSchemaText}
-        </pre>
+        <div className="flex items-center justify-between gap-2">
+          <Label className="text-xs text-tertiary-foreground">
+            Returned data schema
+          </Label>
+          {schemaOutline !== null && (
+            <SchemaViewButton
+              view={schemaView}
+              onClick={() =>
+                setSchemaChoice({
+                  owner: blockId,
+                  view: schemaView === "fields" ? "json" : "fields",
+                })
+              }
+            />
+          )}
+        </div>
+        {showSchemaFields ? (
+          <SchemaFieldList outline={schemaOutline} />
+        ) : (
+          <pre
+            data-testid="code-block-data-schema"
+            tabIndex={0}
+            className="nopan nowheel max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-slate-elevation1 p-2 text-xs text-tertiary-foreground"
+          >
+            {dataSchemaText}
+          </pre>
+        )}
       </div>
     );
 

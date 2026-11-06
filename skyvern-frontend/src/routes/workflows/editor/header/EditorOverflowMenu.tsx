@@ -6,7 +6,7 @@ import {
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
-import { useId } from "react";
+import { type ReactNode, useId } from "react";
 import { useWorkflowPermanentId } from "@/routes/workflows/WorkflowPermanentIdContext";
 
 import { getClient } from "@/api/AxiosClient";
@@ -50,6 +50,7 @@ export function EditorOverflowMenu({
   triggerClassName = "size-10 min-w-[2.5rem]",
   onVersionHistory,
   embedded = false,
+  leadingItems,
 }: {
   triggerClassName?: string;
   // Studio override: the shell collapses to an editor-only layout before
@@ -58,6 +59,8 @@ export function EditorOverflowMenu({
   // Embedded (studio) hosts provide their own TooltipProvider with the shell's
   // fast timing; standalone (legacy header) brings a local one.
   embedded?: boolean;
+  // Host controls folded into this menu (the studio top bar at phone width).
+  leadingItems?: ReactNode;
 } = {}) {
   const workflowPermanentId = useWorkflowPermanentId();
   const { data: workflow } = useWorkflowQuery({ workflowPermanentId });
@@ -157,6 +160,7 @@ export function EditorOverflowMenu({
     <DropdownMenu modal={false}>
       {embedded ? trigger : <TooltipProvider>{trigger}</TooltipProvider>}
       <DropdownMenuContent align="end" className="min-w-[12rem]">
+        {leadingItems}
         {!embedded && enterYamlMode && (
           <DropdownMenuItem onSelect={() => enterYamlMode()}>
             <FileTextIcon className="mr-2 size-4" />

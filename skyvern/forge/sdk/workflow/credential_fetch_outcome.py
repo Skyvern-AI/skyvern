@@ -27,6 +27,7 @@ from skyvern.exceptions import (
     OnePasswordServiceUnavailableError,
     OnePasswordSessionExpiredError,
     RuntimeSequentialCredentialUnsupported,
+    SkyvernHTTPException,
 )
 from skyvern.forge.sdk.schemas.credentials import CredentialVaultType
 from skyvern.forge.sdk.services.bitwarden import BitwardenSessionUsage, track_bitwarden_session_usage
@@ -106,6 +107,8 @@ def _link_outcome(error: BaseException, *, customer_owned: bool) -> CredentialFe
         return "provider_error"
     if isinstance(error, (HttpException, HTTPException)):
         return _status_outcome(error.status_code, customer_owned=customer_owned)
+    if isinstance(error, SkyvernHTTPException) and error.status_code >= 500:
+        return "provider_error"
     if isinstance(error, aiohttp.ClientResponseError):
         return _status_outcome(error.status, customer_owned=customer_owned)
     if isinstance(error, ClientAuthenticationError):

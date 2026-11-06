@@ -3,17 +3,17 @@ from __future__ import annotations
 from typing import Any, ClassVar, Literal
 
 import structlog
+from pydantic import field_validator
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.custom_llm_registry import is_custom_llm_key
 from skyvern.forge.sdk.workflow.models.block import Block, render_failure_reason
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE
-from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
+from skyvern.schemas.agent_step_tool_names import current_tool_names
+from skyvern.schemas.workflows import AGENT_STEP_LLM_FLAG, BlockResult, BlockStatus, BlockType
 
 LOG = structlog.get_logger()
-
-LLM_FLAG = "AGENT_BLOCK_LLM_NAME"
 
 
 def usable_agent_llm_key(variant: str | None) -> bool:
@@ -31,19 +31,20 @@ async def read_flag_llm_key(workflow_run_id: str, organization_id: str | None, w
     """Raises ValueError naming the flag unless it gives a registered platform key with a pinned effort."""
     try:
         variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
-            LLM_FLAG,
+            AGENT_STEP_LLM_FLAG,
             workflow_run_id,
             properties={"organization_id": organization_id, "workflow_permanent_id": workflow_permanent_id},
         )
     except Exception as e:
-        LOG.warning("Failed to read the agent block flag", flag=LLM_FLAG, exc_info=True)
-        raise ValueError(f"The agent block could not read {LLM_FLAG}.") from e
+        LOG.warning("Failed to read the agent block flag", flag=AGENT_STEP_LLM_FLAG, exc_info=True)
+        raise ValueError(f"The agent block could not read {AGENT_STEP_LLM_FLAG}.") from e
     if not isinstance(variant, str) or not variant:
-        raise ValueError(f"The agent block is not enabled for this run: {LLM_FLAG} has no variant for it.")
+        raise ValueError(f"The agent block is not enabled for this run: {AGENT_STEP_LLM_FLAG} has no variant for it.")
     if not usable_agent_llm_key(variant):
-        LOG.warning("Agent block flag variant is not usable", flag=LLM_FLAG, variant=variant)
+        LOG.warning("Agent block flag variant is not usable", flag=AGENT_STEP_LLM_FLAG, variant=variant)
         raise ValueError(
-            f"{LLM_FLAG} variant {variant!r} is not a registered platform llm_key that pins a reasoning effort."
+            f"{AGENT_STEP_LLM_FLAG} variant {variant!r} is not a registered platform llm_key "
+            "that pins a reasoning effort."
         )
     return variant
 
@@ -58,6 +59,11 @@ class AgentStepBlock(Block):
     parameters: list[PARAMETER_TYPE] = []
 
     TEMPLATABLE_FIELDS: ClassVar[frozenset[str]] = frozenset({"prompt"})
+
+    @field_validator("tools")
+    @classmethod
+    def map_retired_tool_names(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else current_tool_names(value)
 
     def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
         return self.parameters
@@ -91,8 +97,13 @@ class AgentStepBlock(Block):
             workflow_run_block_id=workflow_run_block_id, organization_id=organization_id, prompt=self.prompt
         )
         try:
+            run_context.reject_platform_smtp_references(self.model_dump())
             prompt = self.render_templatable_field("prompt", self.prompt, run_context)
             self._apply_workflow_system_prompt(run_context)
+            prompt = run_context.mask_platform_smtp_for_agent(prompt)
+            if self.workflow_system_prompt is not None:
+                self.workflow_system_prompt = run_context.mask_platform_smtp_for_agent(self.workflow_system_prompt)
+                run_context.record_block_workflow_system_prompt(self.label, self.workflow_system_prompt)
         except Exception as e:
             return await self._template_format_failure_result(
                 e,

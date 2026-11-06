@@ -13,10 +13,12 @@ IDs on every workflow-run-status response.
 
 from __future__ import annotations
 
+import copy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.schemas.files import FileInfo
 
@@ -176,8 +178,153 @@ def test_collect_artifact_ids_multi_block():
 
     screenshot_ids, download_ids = WorkflowService._collect_artifact_ids(tree)
 
-    assert set(screenshot_ids) == {"s_1", "s_2", "ws_1", "s_3"}
-    assert set(download_ids) == {"d_1", "d_2", "d_3"}
+    assert screenshot_ids == ["s_1", "s_2", "ws_1", "s_3"]
+    assert download_ids == ["d_1", "d_2", "d_3"]
+
+
+class _Mapping(dict):
+    pass
+
+
+class _Sequence(list):
+    pass
+
+
+def test_collect_artifact_ids_keeps_order_duplicates_and_container_semantics():
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    shared = {"task_screenshot_artifact_ids": ["s_shared"], "downloaded_file_artifact_ids": ["d_shared"]}
+    tree = _Mapping(
+        first=_Sequence([shared, 7, None, "text", 1.5, True, {"nested": _Sequence([shared])}]),
+        # A marker dict stops the descent even when its id lists are empty or None.
+        marker_without_ids={
+            "task_screenshot_artifact_ids": None,
+            "workflow_screenshot_artifact_ids": [],
+            "child": {"task_screenshot_artifact_ids": ["s_hidden"]},
+        },
+        # Download ids alone do not make a marker; the walk keeps descending.
+        downloads_only={
+            "downloaded_file_artifact_ids": ["d_ignored"],
+            "child": {"workflow_screenshot_artifact_ids": ["ws_1"]},
+        },
+        # Only dict and list containers are walked.
+        tuple_leaf=({"task_screenshot_artifact_ids": ["s_in_tuple"]},),
+        set_leaf=frozenset({"s_in_set"}),
+        # Values are extended as stored, not normalized.
+        string_ids={"task_screenshot_artifact_ids": "ab"},
+    )
+    before = copy.deepcopy(tree)
+
+    screenshot_ids, download_ids = WorkflowService._collect_artifact_ids(tree)
+
+    assert screenshot_ids == ["s_shared", "s_shared", "ws_1", "a", "b"]
+    assert download_ids == ["d_shared", "d_shared"]
+    assert tree == before
+    assert WorkflowService._collect_artifact_ids("scalar root") == ([], [])
+
+
+def test_collect_artifact_ids_never_recurses_into_scalar_children():
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    real = WorkflowService._collect_artifact_ids
+    entered: list[object] = []
+
+    def observe(value):
+        entered.append(value)
+        return real(value)
+
+    tree = {
+        "rows": [{"id": 1, "name": "a", "tags": ["x", "y"]}, 3, "z", None],
+        "block": {"task_screenshot_artifact_ids": ["s_1"], "downloaded_file_artifact_ids": ["d_1"]},
+        "note": "n",
+    }
+    with patch.object(WorkflowService, "_collect_artifact_ids", staticmethod(observe)):
+        screenshot_ids, download_ids = WorkflowService._collect_artifact_ids(tree)
+
+    assert (screenshot_ids, download_ids) == (["s_1"], ["d_1"])
+    assert entered[0] is tree
+    assert all(isinstance(child, (dict, list)) for child in entered)
+
+
+@pytest.mark.asyncio
+async def test_refresh_with_only_the_database_stubbed_rebuilds_urls_in_place_and_keeps_legacy_fallback():
+    """Real refresh, scoping, URL and FileInfo construction; only database reads are stubbed. A legacy
+    block without artifact ids still refreshes by filename, and scalar data is left as-is."""
+    from skyvern.config import settings
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    def bundled(artifact_id: str, artifact_type: ArtifactType, name: str) -> Artifact:
+        return Artifact(
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            uri=f"s3://bucket/o_real/wr_1/{name}",
+            bundle_key=name,
+            organization_id="o_real",
+            run_id="wr_1",
+            checksum=f"sha-{artifact_id}",
+            created_at="2026-04-25T00:00:00Z",
+            modified_at="2026-04-25T00:00:00Z",
+        )
+
+    shot_current = bundled("s_current", ArtifactType.SCREENSHOT_FINAL, "current.png")
+    shot_other_attempt = bundled("s_other", ArtifactType.SCREENSHOT_FINAL, "other.png")
+    download = bundled("d_1", ArtifactType.DOWNLOAD, "invoice.pdf")
+    legacy_download = bundled("d_legacy", ArtifactType.DOWNLOAD, "legacy.zip")
+    rows = {a.artifact_id: a for a in (shot_current, shot_other_attempt, download)}
+
+    block = {
+        "task_screenshot_artifact_ids": ["s_other", "s_current"],
+        "workflow_screenshot_artifact_ids": [],
+        "downloaded_file_artifact_ids": ["d_1"],
+    }
+    legacy_block = {
+        "task_screenshot_artifact_ids": [],
+        "workflow_screenshot_artifact_ids": [],
+        "downloaded_file_artifact_ids": None,
+        "downloaded_files": [{"url": "https://stale.example/legacy.zip", "filename": "legacy.zip"}],
+    }
+    extracted = [{"row": i, "values": [i, str(i), None, True]} for i in range(3)]
+    tree = {"out": [block, legacy_block], "extracted_information": extracted, "count": 3}
+
+    get_by_ids = AsyncMock(side_effect=lambda ids, _org: [rows[i] for i in ids if i in rows])
+    manager = ArtifactManager()
+    with (
+        patch("skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.get_artifacts_by_ids", new=get_by_ids),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.list_artifacts_for_run_by_type",
+            new=AsyncMock(return_value=[legacy_download]),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.organizations.get_organization",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds",
+            new=manager.resolve_artifact_url_expiry_seconds,
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_share_url", new=manager.resolve_share_url
+        ),
+    ):
+        result = await WorkflowService()._refresh_output_urls(
+            tree,
+            organization_id="o_real",
+            workflow_run_id="wr_1",
+            current_attempt_artifacts=[shot_current, download],
+        )
+
+    base = settings.SKYVERN_BASE_URL.rstrip("/")
+    assert result is tree and result["out"][0] is block and result["out"][1] is legacy_block
+    assert get_by_ids.await_args.args[0] == ["s_current", "d_1"]
+    assert [url.split("?")[0] for url in block["task_screenshots"]] == [f"{base}/v1/artifacts/s_current/content"]
+    assert block["downloaded_file_urls"][0].startswith(f"{base}/v1/artifacts/d_1/content")
+    assert [(f["filename"], f["checksum"], f["artifact_id"]) for f in block["downloaded_files"]] == [
+        ("invoice.pdf", "sha-d_1", "d_1")
+    ]
+    assert legacy_block["downloaded_file_urls"][0].startswith(f"{base}/v1/artifacts/d_legacy/content")
+    assert [f["filename"] for f in legacy_block["downloaded_files"]] == ["legacy.zip"]
+    assert result["extracted_information"] is extracted
+    assert extracted == [{"row": i, "values": [i, str(i), None, True]} for i in range(3)]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,4 @@
 import {
-  Fragment,
   createContext,
   useContext,
   useEffect,
@@ -19,10 +18,7 @@ import { humanizeBlockLabel } from "../../copilot/blockLabel";
 import { useCopilotProposalStore } from "@/store/CopilotProposalStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { cn } from "@/util/utils";
-import {
-  ACCEPT_BUTTON_CLASS,
-  REJECT_BUTTON_CLASS,
-} from "../../copilot/cards/cardLayout";
+import { ACCEPT_BUTTON_CLASS } from "../../copilot/cards/cardLayout";
 import {
   DuplicateWriteRows,
   ReviewCoverageBadge,
@@ -56,6 +52,18 @@ import { DocText } from "./DocText";
 const DocProposalContext = createContext<DocProposal | null>(null);
 
 export const DocProposalProvider = DocProposalContext.Provider;
+
+// A step Copilot added and the user has not accepted yet: its tag is drawn dashed.
+// eslint-disable-next-line react-refresh/only-export-components
+export function useDocStepPending(node: AppNode | undefined): boolean {
+  const proposal = useContext(DocProposalContext);
+  return Boolean(
+    proposal &&
+    node &&
+    isWorkflowBlockNode(node) &&
+    proposal.marks.get(node.data.label) === "added",
+  );
+}
 
 // The pending Copilot proposal for this workflow, rendered from what Accept would save.
 // eslint-disable-next-line react-refresh/only-export-components
@@ -245,45 +253,38 @@ export function DocProposalCard({
   return (
     <section
       aria-label="Copilot proposal"
-      className="mb-5 rounded-lg border border-sky-500/30 bg-sky-500/[0.06]"
+      className="mb-[18px] rounded-lg bg-[#F3EEF8] shadow-[0_1px_3px_rgba(0,0,0,0.12)] dark:bg-[rgba(183,147,218,.15)]"
     >
       {/* One line unless the title cannot sit beside the buttons; then they wrap below it. */}
-      <div className="flex min-h-10 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-2 py-1">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 px-3 py-[9px] text-[13.5px]">
         <button
           type="button"
           aria-expanded={open}
           onClick={() => setOpen((v) => !v)}
-          className="flex min-w-min flex-1 basis-0 items-start gap-2 rounded-md py-1 pl-1 text-left text-xs leading-4 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex min-w-[200px] flex-1 basis-0 items-center gap-2.5 rounded-md text-left leading-[1.45] text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <ChevronRightIcon
             aria-hidden="true"
             className={cn(
-              "size-4 shrink-0 text-sky-700 transition-transform dark:text-sky-300",
+              "size-3.5 shrink-0 text-[#8456A8] transition-transform dark:text-[#B793DA]",
               open && "rotate-90",
             )}
           />
-          {/* The summary wraps under the title, between its counts, rather than being cut off. */}
-          <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-0.5">
-            <span className="flex shrink-0 items-center gap-2">
-              <MagicWandIcon
-                aria-hidden="true"
-                className="size-3.5 shrink-0 text-sky-700 dark:text-sky-300"
-              />
-              <span className="font-semibold text-sky-700 dark:text-sky-300">
-                Copilot proposal
+          <MagicWandIcon
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-[#8456A8] dark:text-[#B793DA]"
+          />
+          <span className="flex min-w-0 flex-col">
+            <span className="flex items-center gap-1.5">
+              <span className="font-[550] text-foreground">
+                Proposed changes
+              </span>
+              <span className="rounded-full border border-border bg-[hsl(0_0%_98.3%)] px-2 py-px text-[11.5px] font-semibold text-muted-foreground dark:bg-[hsl(222_50%_7.5%)]">
+                {proposal.tested ? "Tested" : "Untested"}
               </span>
             </span>
             {!comparisonUnavailable && summaryParts.length > 0 && (
-              <span className="flex min-w-0 flex-wrap gap-x-1 text-muted-foreground">
-                {summaryParts.map((part, index) => (
-                  <Fragment key={part}>
-                    {index > 0 && " "}
-                    <span className="whitespace-nowrap">
-                      {index < summaryParts.length - 1 ? `${part} ·` : part}
-                    </span>
-                  </Fragment>
-                ))}
-              </span>
+              <span>{summaryParts.join(" · ")} by Copilot.</span>
             )}
           </span>
         </button>
@@ -294,7 +295,7 @@ export function DocProposalCard({
             variant="outline"
             disabled={locked}
             onClick={() => void decide("reject")}
-            className={cn("h-7 shrink-0 px-2.5", REJECT_BUTTON_CLASS)}
+            className="h-[29px] shrink-0 px-3 text-[13px]"
           >
             Reject
           </Button>
@@ -303,7 +304,10 @@ export function DocProposalCard({
             size="sm"
             disabled={locked || !pending?.acceptable || comparisonUnavailable}
             onClick={() => void decide("approve")}
-            className={cn("h-7 shrink-0 px-2.5", ACCEPT_BUTTON_CLASS)}
+            className={cn(
+              "h-[29px] shrink-0 px-3 text-[13px]",
+              ACCEPT_BUTTON_CLASS,
+            )}
           >
             Accept
           </Button>
@@ -321,7 +325,7 @@ export function DocProposalCard({
         </p>
       )}
       {open && !comparisonUnavailable && (
-        <div className="flex flex-col gap-1 border-t border-sky-500/20 px-3 pb-2.5 pt-2 text-[13px]">
+        <div className="flex flex-col gap-1 border-t border-[#8456A8]/20 px-3 pb-2.5 pt-2 text-[13px] dark:border-[#B793DA]/20">
           {marked.map(([label, mark]) => (
             <button
               key={label}
@@ -439,7 +443,7 @@ export function DocProposalCard({
 
 const MARK_CLASSES = {
   added:
-    "border-emerald-500/30 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+    "border-[#8456A8]/30 bg-[#F3EEF8] text-[#8456A8] dark:border-[#B793DA]/30 dark:bg-[rgba(183,147,218,.15)] dark:text-[#B793DA]",
   changed:
     "border-amber-500/30 bg-amber-500/15 text-amber-700 dark:text-amber-300",
   removed: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400",
@@ -593,12 +597,10 @@ export function DocProposalStepMark({
       )}
       <div
         className={cn(
-          mark && "border-l-2 pl-3",
-          mark === "added" && "border-emerald-500/60",
-          mark === "changed" && "border-amber-500/60",
+          mark === "changed" && "border-l-2 border-amber-500/60 pl-3",
         )}
       >
-        {mark && <MarkChip mark={mark} />}
+        {mark === "changed" && <MarkChip mark={mark} />}
         {children}
       </div>
       {notes?.trailing && notes.trailing.after === null && (
@@ -638,13 +640,15 @@ export function DocProposalNoteMark({
         "border-l-2 pl-3",
         change
           ? change.before === null
-            ? "border-emerald-500/60"
+            ? "border-[#8456A8]/60 dark:border-[#B793DA]/60"
             : "border-amber-500/60"
           : "border-border",
       )}
     >
       {change ? (
-        <MarkChip mark={change.before === null ? "added" : "changed"} />
+        change.before === null ? null : (
+          <MarkChip mark="changed" />
+        )
       ) : (
         <span className="text-[11px] font-semibold text-muted-foreground">
           Kept your note

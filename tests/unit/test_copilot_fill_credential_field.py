@@ -95,7 +95,9 @@ _FIXTURE_LOGIN_URL = "https://authenticationtest.com/simpleFormAuth/"
 def _resolved_credential(
     credential_id: str = "cred_123", tested_url: str | None = _FIXTURE_LOGIN_URL
 ) -> SimpleNamespace:
-    return SimpleNamespace(credential_id=credential_id, name="authtest simple", tested_url=tested_url)
+    return SimpleNamespace(
+        credential_id=credential_id, name="authtest simple", tested_url=tested_url, extra_site_urls=[]
+    )
 
 
 def _policy(**overrides: Any) -> RequestPolicy:
@@ -1550,6 +1552,7 @@ def _org_credential(
         credential_id=credential_id,
         name=name,
         tested_url=tested_url,
+        extra_site_urls=[],
         credential_type=credential_type,
         totp_type=totp_type,
     )
@@ -1788,7 +1791,9 @@ class TestCredentialFillLivePageAdmission:
     ) -> tuple[Any, str | None]:
         """Grant for a resolved credential carrying no saved login URL."""
         resolved: list[Any] = [_resolved_credential(tested_url=None)]
-        resolved.extend(SimpleNamespace(credential_id=extra, tested_url=None) for extra in also_resolved or [])
+        resolved.extend(
+            SimpleNamespace(credential_id=extra, tested_url=None, extra_site_urls=[]) for extra in also_resolved or []
+        )
         policy = RequestPolicy(resolved_credentials=resolved)
         policy.user_provided_site_urls = list(user_urls or [])
         if named:
@@ -3329,6 +3334,7 @@ def _acquisitions_before_fill(events: list[str]) -> int:
     return events[: events.index("fill")].count("acquire")
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "auto_submit_totp",
@@ -3396,6 +3402,7 @@ async def test_acquisition_arm_pays_one_acquisition_per_target_read(
         assert secret not in retained
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 async def test_acquisition_arm_counts_a_padded_role_name_as_the_name_it_records(
     monkeypatch: pytest.MonkeyPatch,
@@ -3408,6 +3415,7 @@ async def test_acquisition_arm_counts_a_padded_role_name_as_the_name_it_records(
     assert (probe.role, probe.accessible_name, probe.role_name_match_count) == ("button", "Sign in", 1)
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 async def test_acquisition_arm_origin_departure_before_the_fill_releases_nothing_to_the_new_origin(
     monkeypatch: pytest.MonkeyPatch,
@@ -3437,6 +3445,7 @@ async def test_acquisition_arm_origin_departure_before_the_fill_releases_nothing
     assert later["data"]["result"] == "sso.example.com"
 
 
+@pytest.mark.requires_chromium
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retired_at", ["probe", "after_mint"])
 async def test_acquisition_arm_retired_generation_types_nothing_and_leaves_later_reads_working(

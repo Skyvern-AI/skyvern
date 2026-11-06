@@ -3077,7 +3077,7 @@ def test_crash_listener_registers_once_for_pre_existing_and_later_pages() -> Non
     # Other page listeners (the main-frame navigation observer) register after the crash listener.
     assert existing.on.call_args_list[0] == call("crash", state._on_page_crashed)
     assert existing.on.call_args_list.count(call("crash", state._on_page_crashed)) == 1
-    assert call("page", state._watch_page_for_crash) in context.on.call_args_list
+    assert call("page", state._watch_new_page) in context.on.call_args_list
     registered_on_existing = existing.on.call_count
 
     later = _crashable_page()

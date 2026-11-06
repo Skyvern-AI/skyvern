@@ -1298,10 +1298,16 @@ class FakeWorkflowRunContext:
     workflow = None
     mask_secrets = True
 
+    reject_platform_smtp_template_references = WorkflowRunContext.reject_platform_smtp_template_references
+    agent_unmasked_platform_secret_ids = staticmethod(set)
+
     def __init__(self, secrets: dict[str, str] | None = None) -> None:
         self.secrets = secrets or {}
+        self.parameters: dict[str, object] = {}
         self.credential_tested_urls: dict[str, str] = {}
+        self.credential_extra_site_urls: dict[str, list[str]] = {}
         self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
+        self.succeeded_code_block_labels: set[str] = set()
         self._failure_evidence_capture = None
 
     start_failure_evidence_capture = WorkflowRunContext.start_failure_evidence_capture
@@ -2639,7 +2645,14 @@ async def test_keyboard_release_allows_when_all_frames_are_on_site() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_arms_the_guard_from_a_credential_parameter(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("extra_sites", "fills"),
+    [([], False), (["https://example.org/login"], True), (["https://other.example.net/login"], False)],
+    ids=["tested-site-only", "added-site", "other-added-site"],
+)
+async def test_execute_arms_the_guard_from_a_credential_parameter(
+    monkeypatch: pytest.MonkeyPatch, extra_sites: list[str], fills: bool
+) -> None:
     """The wiring, not the guard: a real credential parameter with a tested login site must arm the
     release check for the block's own run. Hand-armed guards in the other tests cannot see this
     path, so disabling it here is invisible to them."""
@@ -2647,6 +2660,7 @@ async def test_execute_arms_the_guard_from_a_credential_parameter(monkeypatch: p
     page.inner.frame_url = "https://accounts.example.org/challenge"
     context = FakeWorkflowRunContext()
     context.credential_tested_urls = {"login_credentials": "https://login.example.com/account"}
+    context.credential_extra_site_urls = {"login_credentials": extra_sites} if extra_sites else {}
     _patch_execute_environment(monkeypatch, page, context)
 
     credential_parameter = CredentialParameter(
@@ -2667,9 +2681,10 @@ async def test_execute_arms_the_guard_from_a_credential_parameter(monkeypatch: p
     block.parameters = [credential_parameter]
     result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
 
-    assert result.success is False
-    assert "belongs to https://example.com" in (result.failure_reason or "")
-    assert not any(call.startswith("fill:") for call in page.inner.calls)
+    assert any(call.startswith("fill:") for call in page.inner.calls) is fills
+    if not fills:
+        assert result.success is False
+        assert "belongs to https://example.com" in (result.failure_reason or "")
 
 
 async def _execute_vault_login_block(

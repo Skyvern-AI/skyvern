@@ -167,7 +167,8 @@ async def prepared_dispatch_db(interim_retry_db: AgentDB, monkeypatch: pytest.Mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resume_fresh", [True, False], ids=["startup", "periodic"])
-@pytest.mark.parametrize("configured_grace", [0, 600, 2 * service_module.LEASE_TAKEOVER_SECONDS])
+# The grace is floored at LEASE_TAKEOVER_SECONDS, so a configured 600 computes the same grace as 0.
+@pytest.mark.parametrize("configured_grace", [0, 2 * service_module.LEASE_TAKEOVER_SECONDS])
 @pytest.mark.parametrize("scenario", ["stale", "young", "boundary", "running"])
 async def test_claimed_undispatched_retry_recovers_after_process_loss(
     prepared_dispatch_db: AgentDB,
@@ -1309,9 +1310,22 @@ async def test_interim_snapshot_is_bounded_and_survives_completed_delivery(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("artifact_link", ["task", "step", "block"])
-@pytest.mark.parametrize("ancestry", ["block", "chain", "fallback"])
-@pytest.mark.parametrize("child_attempt", [None, 1])
+# Attribution reads the ancestry, the attempt rule and the artifact link independently, so these cases cover every pair
+# of child attempt, ancestry and artifact link rather than every combination.
+@pytest.mark.parametrize(
+    ("child_attempt", "ancestry", "artifact_link"),
+    [
+        (None, "block", "task"),
+        (1, "chain", "task"),
+        (None, "fallback", "task"),
+        (1, "block", "step"),
+        (None, "chain", "step"),
+        (1, "fallback", "step"),
+        (None, "block", "block"),
+        (1, "chain", "block"),
+        (None, "fallback", "block"),
+    ],
+)
 async def test_historical_child_artifacts_use_parent_attempt(
     interim_retry_db: AgentDB,
     monkeypatch: pytest.MonkeyPatch,
@@ -1574,7 +1588,9 @@ async def test_interim_snapshot_metadata_overflow_keeps_retry_and_reports_omissi
     interim_retry_db: AgentDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = interim_retry_db
-    count = 10000
+    snapshot_budget = 16 * 1024
+    monkeypatch.setattr(workflow_runs_repository_module, "INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES", snapshot_budget)
+    count = 400
     created_at = datetime.now(UTC).replace(tzinfo=None)
     ids = [f"op_metadata_overflow_{index:08d}" for index in range(count)]
     async with database.Session() as session:
@@ -1606,7 +1622,7 @@ async def test_interim_snapshot_metadata_overflow_keeps_retry_and_reports_omissi
     assert snapshot["omitted_output_count"] == count - len(entries)
     assert (
         len(json.dumps({key: snapshot[key] for key in ("output_parameters", "omitted_output_count")}).encode())
-        <= INTERIM_OUTPUT_SNAPSHOT_MAX_BYTES
+        <= snapshot_budget
     )
     assert [entry["output_parameter_id"] for entry in entries] == ids[: len(entries)]
     monkeypatch.setattr(app.STORAGE, "get_downloaded_files", AsyncMock(return_value=[]))

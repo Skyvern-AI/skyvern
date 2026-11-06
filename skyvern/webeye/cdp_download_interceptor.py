@@ -54,7 +54,12 @@ from skyvern.constants import (
     BROWSER_INTERCEPTOR_DISABLE_TIMEOUT,
     BROWSER_PAGE_CLOSE_TIMEOUT,
 )
-from skyvern.errors.errors import BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE
+from skyvern.errors.errors import (
+    BROWSER_DOWNLOAD_FAILED_CODE,
+    BROWSER_DOWNLOAD_FAILED_REASON,
+    BROWSER_DOWNLOAD_LIMIT_EXCEEDED_CODE,
+    BROWSER_DOWNLOAD_PARTIAL_FAILURE_CODE,
+)
 from skyvern.exceptions import DownloadFileMaxSizeExceeded, redact_cdp_endpoint_urls
 from skyvern.forge.sdk.api import files as file_api
 from skyvern.forge.sdk.core import skyvern_context
@@ -1461,14 +1466,14 @@ class CDPDownloadInterceptor:
             return None
         if any(reason.endswith("_limit") for reason in failures):
             error: dict[str, Any] = {
-                "error_code": "BROWSER_DOWNLOAD_LIMIT_EXCEEDED",
+                "error_code": BROWSER_DOWNLOAD_LIMIT_EXCEEDED_CODE,
                 "reasoning": "The requested browser download exceeded the configured limit.",
                 "error_type": "SYSTEM_DEFINED_ERROR",
             }
         else:
             error = {
-                "error_code": "BROWSER_DOWNLOAD_FAILED",
-                "reasoning": "The requested browser download could not be saved.",
+                "error_code": BROWSER_DOWNLOAD_FAILED_CODE,
+                "reasoning": BROWSER_DOWNLOAD_FAILED_REASON,
                 "error_type": "SYSTEM_DEFINED_ERROR",
             }
         if include_failure_keys:

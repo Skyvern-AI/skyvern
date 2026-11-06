@@ -404,6 +404,7 @@ class TestRunCreatedHookWiring:
             patch.object(agent_protocol.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
             patch.object(agent_protocol, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),
             patch.object(agent_protocol.analytics, "capture"),
+            patch.object(agent_protocol, "_redact_browser_session_addresses", AsyncMock()),
             patch.object(agent_protocol, "app", mock_app),
         ):
             await agent_protocol.run_workflow(
@@ -479,6 +480,7 @@ class TestRunCreatedHookWiring:
             patch.object(agent_protocol.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
             patch.object(agent_protocol, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),
             patch.object(agent_protocol.analytics, "capture"),
+            patch.object(agent_protocol, "_redact_browser_session_addresses", AsyncMock()),
             patch.object(agent_protocol, "app", mock_app),
         ):
             await agent_protocol.retry_workflow_run(
@@ -522,6 +524,7 @@ class TestRunCreatedHookWiring:
             patch.object(run_blocks.skyvern_context, "ensure_context", return_value=MagicMock(request_id="req_1")),
             patch.object(run_blocks, "WorkflowRunRequest", side_effect=lambda **kwargs: kwargs),
             patch.object(run_blocks, "WorkflowRunResponse", side_effect=lambda **kwargs: kwargs),
+            patch.object(run_blocks, "_redact_browser_session_addresses", AsyncMock()),
             patch.object(run_blocks, "app", mock_app),
         ):
             await run_blocks._run_workflow_and_build_response(

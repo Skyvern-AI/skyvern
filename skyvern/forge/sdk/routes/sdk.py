@@ -215,21 +215,30 @@ async def _run_sdk_action(
                 )
                 raise
 
-        await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
-            organization,
-            workflow_run.workflow_run_id,
-            workflow.title,
-            workflow.workflow_id,
-            workflow.workflow_permanent_id,
-            [],
-            [],
-            [],
-            [],
-            None,
-            workflow,
-            mask_secrets=getattr(workflow, "mask_secrets", False),
-            attempt_number=attempt_number,
-        )
+        try:
+            await app.WORKFLOW_CONTEXT_MANAGER.initialize_workflow_run_context(
+                organization,
+                workflow_run.workflow_run_id,
+                workflow.title,
+                workflow.workflow_id,
+                workflow.workflow_permanent_id,
+                [],
+                [],
+                [],
+                [],
+                None,
+                workflow,
+                mask_secrets=getattr(workflow, "mask_secrets", False),
+                attempt_number=attempt_number,
+            )
+        except (PermissionError, SkyvernHTTPException, HTTPException) as exc:
+            await app.DATABASE.tasks.update_task(
+                task_id=task.task_id,
+                organization_id=organization_id,
+                status=TaskStatus.failed,
+                failure_reason=str(exc),
+            )
+            raise
 
         context = skyvern_context.ensure_context()
         skyvern_context.replace(

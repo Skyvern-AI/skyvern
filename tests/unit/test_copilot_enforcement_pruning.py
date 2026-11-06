@@ -39,7 +39,13 @@ from skyvern.forge.sdk.copilot.enforcement import (
     enforcement_decision,
     is_screenshot_message,
 )
-from skyvern.forge.sdk.copilot.output_utils import MCP_RESULT_PROVENANCE_KEY, MCP_RESULT_PROVENANCE_VALUE
+from skyvern.forge.sdk.copilot.output_utils import (
+    DOWNLOADS_NOTICE_PREFIX,
+    MCP_RESULT_PROVENANCE_KEY,
+    MCP_RESULT_PROVENANCE_VALUE,
+    OUTPUT_VALUE_MAX_CHARS,
+    REGISTERED_OUTPUTS_NOTICE_PREFIX,
+)
 from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tools import (
@@ -422,6 +428,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         copilot_total_timeout_exceeded=False,
         workflow_verification_evidence=WorkflowVerificationEvidence(),
         last_run_blocks_workflow_run_id=None,
+        superseded_minted_browser_sessions=set(),
         last_run_blocks_block_ids=[],
         last_run_outcome_block_ids=[],
         last_run_blocks_block_labels=[],
@@ -993,6 +1000,124 @@ def test_an_evicted_build_test_packet_keeps_its_challenge_facts_and_levers() -> 
     assert packet["challenge"]["solver_result"] == "failed"
     assert [lever["mechanism"] for lever in packet["levers"]] == ["human_interaction"]
     assert packet["challenge_notices"]
+
+
+def test_an_evicted_run_packet_keeps_block_outputs_and_downloads_through_both_passes() -> None:
+    outputs = {"release_date": "2026-10-28", "age_days": 7, "is_recent": True}
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "contract_version": "build_test_evidence_packet_v1",
+                    "run": {"workflow_run_id": "wr_release", "status": "completed"},
+                    "registered_outputs": [
+                        {"label": "check_release", "status": "completed", "output": outputs, "value_complete": True}
+                    ],
+                    "downloads": [
+                        {"artifact_id": "a_site", "file_name": "app_1.4.2_amd64.deb"},
+                        {"artifact_id": "a_gen", "file_name": "release_summary.json", "generated": True},
+                    ],
+                    "omission_notices": [
+                        "registered_outputs redacted 1 item(s) containing registered secret values.",
+                        "downloads omitted file names from artifact evidence belonging to another run.",
+                        "stdout shortened at 400 characters.",
+                    ],
+                },
+                "stdout": "y" * 400,
+            },
+        }
+    )
+
+    first, second = _prune_twice(old_output)
+
+    packet = first["build_test_packet"]
+    assert packet["registered_outputs"] == [
+        {"label": "check_release", "status": "completed", "output": outputs, "value_complete": True}
+    ]
+    assert packet["downloads"] == [
+        {"file_name": "app_1.4.2_amd64.deb"},
+        {"file_name": "release_summary.json", "generated": True},
+    ]
+    assert packet["omission_notices"] == [
+        "registered_outputs redacted 1 item(s) containing registered secret values.",
+        "downloads omitted file names from artifact evidence belonging to another run.",
+    ]
+    assert len(json.dumps(first, separators=(",", ":"))) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD
+    assert second == first
+
+
+def test_an_evicted_run_packet_bounds_its_outputs_downloads_and_notices_stably() -> None:
+    long_value = {"text": "x" * 400}
+    long_label = "l" * 200
+    source_notices = [f"registered_outputs shortened: {i} item(s) omitted." for i in range(5)] + [
+        "downloads shortened: 9 item(s) omitted.",
+        "registered_outputs[].output shortened at 800 characters.",
+    ]
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "run": {"workflow_run_id": "wr_many", "status": "completed"},
+                    "registered_outputs": [
+                        {"label": long_label, "status": "completed", "output": long_value, "value_complete": True}
+                    ]
+                    + [{"label": f"o{i}", "output": i, "value_complete": True} for i in range(1, 8)],
+                    "downloads": [{"artifact_id": f"a{i}", "file_name": f"f{i}.pdf"} for i in range(8)],
+                    "omission_notices": source_notices,
+                }
+            },
+        }
+    )
+
+    first, second = _prune_twice(old_output)
+
+    packet = first["build_test_packet"]
+    kept_outputs = packet["registered_outputs"]
+    assert [entry["label"] for entry in kept_outputs[1:]] == ["o1", "o2", "o3", "o4", "o5"]
+    rendered = json.dumps(long_value, ensure_ascii=False, separators=(",", ":"))
+    cut = kept_outputs[0]["output"]
+    assert len(cut) <= OUTPUT_VALUE_MAX_CHARS
+    assert cut.endswith("...")
+    assert rendered.startswith(cut.removesuffix("..."))
+    assert kept_outputs[0]["value_complete"] is False
+    assert [entry["file_name"] for entry in packet["downloads"]] == [f"f{i}.pdf" for i in range(6)]
+    output_notice, download_notice = packet["omission_notices"][:2]
+    assert output_notice.startswith(REGISTERED_OUTPUTS_NOTICE_PREFIX) and "2 item(s)" in output_notice
+    assert download_notice.startswith(DOWNLOADS_NOTICE_PREFIX) and "2 item(s)" in download_notice
+    assert len(packet["omission_notices"]) == 6
+    assert not any(notice.startswith("registered_outputs[]") for notice in packet["omission_notices"])
+    assert len(json.dumps(first, separators=(",", ":"))) > _TOOL_OUTPUT_SUMMARIZE_THRESHOLD
+    assert json.dumps(second, separators=(",", ":")) == json.dumps(first, separators=(",", ":"))
+
+
+def test_an_evicted_output_already_cut_by_the_packet_is_cut_raw_without_requoting() -> None:
+    rendered = json.dumps({"rows": [{"name": f"item {i}", "url": f"https://example.com/{i}"} for i in range(40)]})
+    assert len(rendered) > 800
+    packet_cut = rendered[:797] + "..."
+    old_output = json.dumps(
+        {
+            "ok": True,
+            "data": {
+                "build_test_packet": {
+                    "run": {"workflow_run_id": "wr_cut", "status": "completed"},
+                    "registered_outputs": [
+                        {"label": "rows", "status": "completed", "output": packet_cut, "value_complete": False}
+                    ],
+                },
+                "stdout": "y" * 400,
+            },
+        }
+    )
+
+    first, second = _prune_twice(old_output)
+
+    kept = first["build_test_packet"]["registered_outputs"][0]
+    assert kept["output"] == rendered[: OUTPUT_VALUE_MAX_CHARS - 3] + "..."
+    assert '\\"' not in kept["output"]
+    assert kept["value_complete"] is False
+    assert second == first
 
 
 def test_an_evicted_frame_only_packet_gains_no_solver_facts_on_the_way_through() -> None:

@@ -40,6 +40,8 @@ from skyvern.utils.phone_validation import normalize_identifier
 
 LOG = structlog.get_logger()
 INBOUND_BODY_READ_TIMEOUT_SECONDS = 30
+INBOX_SCAN_LIMIT = 200
+INBOX_SCAN_BATCH_SIZE = 100
 _MUTABLE_ADDRESS_STATUSES = (
     ForwardingAddressStatus.PENDING,
     ForwardingAddressStatus.ACTIVE,
@@ -389,40 +391,64 @@ async def list_forwarded_emails(
     emails = await app.DATABASE.email_forwarding.list_inbound_emails(
         forwarding_address_id, current_org.organization_id, limit + 1, offset
     )
+    if (
+        address.credential_id is None
+        and emails
+        and await app.AGENT_FUNCTION.credential_folders_restricted(current_org.organization_id)
+    ):
+        principal = get_request_principal()
+        if not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
+
+            def email_identifier(email: InboundEmail) -> str:
+                return normalize_identifier(
+                    email.original_recipient
+                    if address.match_mode == ForwardingMatchMode.ORIGINAL_RECIPIENT and email.original_recipient
+                    else address.email_address
+                )
+
+            visible: list[InboundEmail] = []
+            scanned = 0
+            batch_size = limit + 1
+            while emails:
+                identifiers = {email_identifier(email) for email in emails}
+                credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
+                    identifiers, current_org.organization_id
+                )
+                credential_ids = set().union(*credential_ids_by_identifier.values())
+                allowed_credential_ids = (
+                    await app.AGENT_FUNCTION.accessible_credential_ids(principal, "credential.use", credential_ids)
+                    if credential_ids
+                    else set()
+                )
+                for index, email in enumerate(emails):
+                    linked_ids = credential_ids_by_identifier.get(email_identifier(email))
+                    if linked_ids is not None and linked_ids <= allowed_credential_ids:
+                        if len(visible) == limit:
+                            response.headers["X-Has-More"] = "true"
+                            response.headers["X-Next-Cursor"] = str(offset + index)
+                            return visible
+                        visible.append(email)
+                scanned += len(emails)
+                if len(emails) < batch_size:
+                    break
+                offset += len(emails)
+                if scanned >= INBOX_SCAN_LIMIT:
+                    # Unscanned rows may still contain visible mail.
+                    response.headers["X-Has-More"] = "true"
+                    response.headers["X-Next-Cursor"] = str(offset)
+                    return visible
+                batch_size = min(max(limit + 1, INBOX_SCAN_BATCH_SIZE), INBOX_SCAN_LIMIT - scanned)
+                emails = await app.DATABASE.email_forwarding.list_inbound_emails(
+                    forwarding_address_id, current_org.organization_id, batch_size, offset
+                )
+            response.headers["X-Has-More"] = "false"
+            return visible
+
     has_more = len(emails) > limit
-    emails = emails[:limit]
     response.headers["X-Has-More"] = str(has_more).lower()
-    if address.credential_id is not None or not emails:
-        return emails
-    if not await app.AGENT_FUNCTION.credential_folders_restricted(current_org.organization_id):
-        return emails
-    principal = get_request_principal()
-    if await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
-        return emails
-
-    def email_identifier(email: InboundEmail) -> str:
-        return normalize_identifier(
-            email.original_recipient
-            if address.match_mode == ForwardingMatchMode.ORIGINAL_RECIPIENT and email.original_recipient
-            else address.email_address
-        )
-
-    identifiers = {email_identifier(email) for email in emails}
-    credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
-        identifiers, current_org.organization_id
-    )
-    credential_ids = set().union(*credential_ids_by_identifier.values())
-    if not credential_ids:
-        return []
-    allowed_credential_ids = await app.AGENT_FUNCTION.accessible_credential_ids(
-        principal, "credential.use", credential_ids
-    )
-    return [
-        email
-        for email in emails
-        if (linked_ids := credential_ids_by_identifier.get(email_identifier(email))) is not None
-        and linked_ids <= allowed_credential_ids
-    ]
+    if has_more:
+        response.headers["X-Next-Cursor"] = str(offset + limit)
+    return emails[:limit]
 
 
 @email_forwarding_router.post(

@@ -1177,6 +1177,8 @@ def _serialize_credential(credential: Credential) -> dict[str, Any]:
         "credential_type": str(credential.credential_type),
         "tested_url": credential.tested_url,
     }
+    if credential.extra_site_urls:
+        entry["also_saved_for"] = list(credential.extra_site_urls)
     accessors = credential_code_accessors(credential.credential_type, credential.totp_type)
     if accessors:
         entry["code"] = {"workflow_parameter_type": "credential_id", "accessors": list(accessors)}

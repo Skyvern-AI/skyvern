@@ -63,6 +63,8 @@ class IntegrationEntry(BaseModel):
     oauth_scope_profile: str | None = None
     required_scopes: list[str] | None = None
     capability_scopes: list[str] | None = None
+    credential_backend: Literal["nango"] | None = None
+    additional_credential_backends: list[Literal["nango"]] | None = None
     credential_form_id: str | None = None
     learn_more_url: str | None = None
     to: str | None = None
@@ -440,10 +442,35 @@ def with_accounts(
     return entry.model_copy(update={"accounts": accounts, "accounts_unavailable": None})
 
 
-def integration_entries(email_forwarding_available: bool = True) -> list[IntegrationEntry]:
+def integration_entries(
+    email_forwarding_available: bool = True, powerbi_available: bool = False, gmail_available: bool = False
+) -> list[IntegrationEntry]:
     entries = [*SKYVERN_INTEGRATIONS, *app.AGENT_FUNCTION.get_cloud_integration_entries()]
     if not email_forwarding_available:
         entries = [entry for entry in entries if entry.id != "email_forwarding"]
+    if gmail_available:
+        entries = [
+            entry.model_copy(update={"additional_credential_backends": ["nango"]})
+            if entry.id == _GOOGLE_GMAIL_ENTRY_ID
+            else entry
+            for entry in entries
+        ]
+    if powerbi_available:
+        entries = [
+            entry.model_copy(
+                update={
+                    "status": "live",
+                    "oauth_provider": None,
+                    "oauth_scope_profile": None,
+                    "required_scopes": None,
+                    "capability_scopes": None,
+                    "credential_backend": "nango",
+                }
+            )
+            if entry.id == "powerbi"
+            else entry
+            for entry in entries
+        ]
     return sorted(entries, key=lambda entry: entry.position)
 
 
@@ -467,7 +494,24 @@ async def integration_entries_for_org(organization_id: str) -> list[IntegrationE
             exc_info=True,
         )
         email_forwarding_available = False
-    return integration_entries(email_forwarding_available=email_forwarding_available)
+    try:
+        powerbi_available = await app.AGENT_FUNCTION.nango_powerbi_catalog_available(organization_id)
+    except Exception:
+        LOG.warning(
+            "Power BI availability check failed; leaving it unavailable in the integration catalog",
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        powerbi_available = False
+    try:
+        gmail_available = await app.AGENT_FUNCTION.nango_gmail_catalog_available(organization_id)
+    except Exception:  # noqa: BLE001 - availability failures leave Gmail dark.
+        gmail_available = False
+    return integration_entries(
+        email_forwarding_available=email_forwarding_available,
+        powerbi_available=powerbi_available,
+        gmail_available=gmail_available,
+    )
 
 
 def integration_is_live(integration_id: str) -> bool:

@@ -10,6 +10,12 @@ type RunValidationStore = {
   /** Container node id -> number of blocking blocks nested inside it. */
   blockingDescendantCountById: ReadonlyMap<string, number>;
   setBlockingBlocks: (blocks: Array<RunBlockingBlock>) => void;
+  /** Problems the open Doc editor found in the draft; 0 when no Doc is open. */
+  docProblemCount: number;
+  setDocProblemCount: (count: number) => void;
+  /** Scrolls the open Doc to its first problem step; null when no Doc is open. */
+  docShowFirstProblem: (() => void) | null;
+  setDocShowFirstProblem: (show: (() => void) | null) => void;
 };
 
 function pathKey(path: Array<RunBlockingPathSegment>): string {
@@ -61,6 +67,12 @@ export const useRunValidationStore = create<RunValidationStore>((set, get) => ({
   blockingBlocks: [],
   blockingBlockIds: new Set(),
   blockingDescendantCountById: new Map(),
+  docProblemCount: 0,
+  setDocProblemCount: (count) => {
+    if (get().docProblemCount !== count) set({ docProblemCount: count });
+  },
+  docShowFirstProblem: null,
+  setDocShowFirstProblem: (show) => set({ docShowFirstProblem: show }),
   setBlockingBlocks: (blocks) => {
     if (sameBlocks(get().blockingBlocks, blocks)) {
       return;

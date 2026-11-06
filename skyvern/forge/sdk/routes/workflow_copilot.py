@@ -27,7 +27,7 @@ from skyvern.constants import DEFAULT_WORKFLOW_TITLES
 from skyvern.exceptions import HttpException as VaultHttpException
 from skyvern.exceptions import SkyvernHTTPException, WorkflowNotFound, WorkflowPinnedByRunGroup
 from skyvern.forge import app
-from skyvern.forge.agent_functions import AuditEvent
+from skyvern.forge.agent_functions import AuditEvent, record_request_audit_event
 from skyvern.forge.sdk.api.files import is_uploaded_file_id
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -68,18 +68,23 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     MANUAL_SIGN_IN_SAVE_TIMEOUT_SECONDS,
     CredentialPauseRejection,
     SignedInProfile,
+    SiteChangeClaim,
+    ask_credential_site,
     check_credential_pause_resumable,
     claim_credential_generation,
+    claim_credential_site_change,
     claim_manual_sign_in,
     credential_pause_is_active,
+    credential_pause_site_url,
     finish_credential_generation,
+    finish_credential_site_change,
     finish_manual_sign_in,
     pending_credential_requests,
     resolve_credential_pause,
     sign_in_site,
     start_manual_sign_in,
 )
-from skyvern.forge.sdk.copilot.credential_resolution import load_credentials
+from skyvern.forge.sdk.copilot.credential_resolution import load_credentials, loggable_origin
 from skyvern.forge.sdk.copilot.demonstration_recorder import (
     DemonstrationRecorder,
     DemonstrationRejection,
@@ -160,6 +165,7 @@ from skyvern.forge.sdk.core.event_source_stream import EventSourceStream, FastAP
 from skyvern.forge.sdk.db.enums import WorkflowBuildSource
 from skyvern.forge.sdk.db.exceptions import (
     CopilotProposalConflictError,
+    CredentialSitesChangedError,
     DatabaseConnectionUnavailableError,
     DuplicateCopilotTurnError,
     NotFoundError,
@@ -169,7 +175,7 @@ from skyvern.forge.sdk.routes.browser_profiles import (
     _hard_delete_created_profile_after_store_failure,
     create_profile_from_running_session,
 )
-from skyvern.forge.sdk.routes.credentials import delete_organization_credential
+from skyvern.forge.sdk.routes.credentials import delete_organization_credential, vault_login_sites
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import (
     CopilotRequestBrowserAllocations,
@@ -193,6 +199,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     CopilotAttachedFile,
     CopilotCancelSource,
     CopilotFailureKind,
+    CopilotInFlightTurn,
     CopilotPendingTurn,
     CopilotProposalMetadata,
     CopilotProposalRunFacts,
@@ -242,9 +249,10 @@ from skyvern.forge.sdk.services.credential.credential_creation_service import (
     store_new_credential,
 )
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
-from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.services.request_principal import enforce_principal_role, get_request_principal
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, WorkflowVersionConflict
+from skyvern.forge.sdk.workflow.models.credential_release import login_site_url, normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.forge.sdk.workflow.secret_encryption import (
     mask_workflow_for_api,
@@ -2279,6 +2287,7 @@ async def _restore_workflow_definition(original_workflow: Workflow | None, organ
         preserve_completion_contract=False,
         validate_code_block_templates=False,
         preserve_redacted_credential_references_from=original_workflow,
+        prior_definition=original_workflow.workflow_definition,
     )
     # A shielded finalizer runs in a child task with a copied context, so the marker has to be a
     # mutable object shared by reference rather than a value set through the ContextVar.
@@ -4028,13 +4037,16 @@ async def _reconcile_interrupted_copilot_turns(chat: WorkflowCopilotChat, organi
             # credential wait, while an unrelated stale turn must eventually
             # reconcile even if the auxiliary cache remains unavailable.
             continue
-        claimed = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
+        claim = await app.DATABASE.workflow_params.claim_pending_copilot_turn(
             organization_id=organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             turn_id=entry.turn_id,
             claim_before=abandoned_before,
         )
-        if not claimed:
+        if claim == "refused":
+            continue
+        entry.recovering_at = datetime.now(UTC)
+        if claim == "recovering":
             continue
         try:
             await _recover_interrupted_copilot_turn(chat, organization_id, entry)
@@ -4321,11 +4333,33 @@ async def workflow_copilot_chat_history(
             organization.organization_id, chat.workflow_copilot_chat_id, question_interactions
         )
     pending_ids = {item.interaction_id for item in question_interactions if item.status == "pending"}
+    answered_turn_ids = {
+        message.turn_outcome.copilot_turn_id for message in chat_messages if message.turn_outcome is not None
+    }
+    live_entry = max(
+        (
+            entry
+            for entry in (chat.pending_turns.values() if chat else [])
+            if entry.turn_id not in answered_turn_ids and entry.recovering_at is None
+        ),
+        key=lambda entry: _as_utc(entry.started_at),
+        default=None,
+    )
     return WorkflowCopilotChatHistoryResponse(
         pending_credential_requests=pending_credentials,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id if chat else None,
         request_turn_id=request_turn_id,
         request_browser_allocations=request_browser_allocations,
+        in_flight_turn=(
+            CopilotInFlightTurn(
+                turn_id=live_entry.turn_id,
+                cancel_token=live_entry.cancel_token,
+                latest_draft=live_entry.latest_draft,
+                latest_draft_at=live_entry.latest_draft_at,
+            )
+            if live_entry is not None
+            else None
+        ),
         question_interactions=question_interactions,
         pending_question_cancel_token=next(
             (
@@ -4779,7 +4813,8 @@ async def _resolve_manual_sign_in(
 )
 async def workflow_copilot_credential_response(
     response_request: WorkflowCopilotCredentialResponseRequest,
-    organization: Organization = Depends(org_auth_service.get_current_org),
+    # A site answer writes the login, so this route accepts only the tokens the credential routes do.
+    organization: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),
 ) -> WorkflowCopilotCredentialResponseResult:
     """Resume a turn paused on ``credential_required`` with the user's card response.
 
@@ -4843,6 +4878,14 @@ async def workflow_copilot_credential_response(
         )
         if not existing:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Credential {credential_id} not found")
+        if response_request.asks_site and response_request.site_answer in ("add", "move"):
+            return await _change_credential_site(cache, organization.organization_id, response_request, existing[0])
+        if response_request.asks_site and response_request.site_answer is None:
+            question = await _credential_site_question(
+                cache, organization.organization_id, response_request, existing[0]
+            )
+            if question is not None:
+                return question
 
     try:
         await resolve_credential_pause(
@@ -4853,10 +4896,174 @@ async def workflow_copilot_credential_response(
             resume_token=response_request.resume_token,
             action=response_request.action,
             credential_id=credential_id,
+            declined_site=response_request.asks_site and response_request.site_answer == "no",
         )
     except CredentialPauseRejection as rejection:
         raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
     return WorkflowCopilotCredentialResponseResult(result="accepted")
+
+
+async def _credential_site_question(
+    cache: BaseCache,
+    organization_id: str,
+    response_request: WorkflowCopilotCredentialResponseRequest,
+    credential: Credential,
+) -> WorkflowCopilotCredentialResponseResult | None:
+    pause_ids = {
+        "organization_id": organization_id,
+        "workflow_copilot_chat_id": response_request.workflow_copilot_chat_id,
+        "turn_id": response_request.turn_id,
+        "resume_token": response_request.resume_token,
+    }
+    try:
+        if await credential_pause_site_url(cache, **pause_ids) is None:
+            return None
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    try:
+        await app.AGENT_FUNCTION.enforce_credential_use(
+            organization_id, credential.credential_id, principal=get_request_principal()
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can't use this login") from exc
+    try:
+        vault_sites = await vault_login_sites(credential)
+    except Exception:
+        # An unreadable vault entry asks nothing; the pause then admits or refuses the pick by its own checks.
+        LOG.info("copilot_credential_site_question_unavailable", credential_id=credential.credential_id, exc_info=True)
+        return None
+    try:
+        question = await ask_credential_site(cache, credential=credential, vault_sites=vault_sites, **pause_ids)
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    if question is None:
+        return None
+    LOG.info(
+        "copilot_credential_site_question",
+        credential_id=credential.credential_id,
+        site=question.site,
+        saved_sites=question.saved_sites,
+        vault_sourced=question.vault_sourced,
+    )
+    return WorkflowCopilotCredentialResponseResult(result="site_question", site_question=question)
+
+
+async def _write_credential_site(
+    organization_id: str, credential: Credential, claim: SiteChangeClaim
+) -> Literal["written", "refused", "unknown"]:
+    """Save the claimed site to the login; any failure before the write is attempted reports 'refused'.
+    Raises ValueError, before writing anything, when the site cannot be saved on this login."""
+    outcome: Literal["written", "refused", "unknown"] = "refused"
+    tested_url: str | None = None
+    extra_site_urls: list[str] = []
+    if claim.answer.action == "move":
+        tested_url = login_site_url(claim.site_url)
+    else:
+        extra_site_urls = normalize_extra_site_urls(
+            credential.tested_url, [*credential.extra_site_urls, claim.site_url]
+        )
+    try:
+        requires_write_lock = await app.AGENT_FUNCTION.should_lock_credential_write(
+            credential=None, existing_credential=credential
+        )
+        write_guard: contextlib.AbstractAsyncContextManager[None] = (
+            app.AGENT_FUNCTION.credential_write_lock(
+                organization_id=organization_id, credential_id=credential.credential_id
+            )
+            if requires_write_lock
+            else contextlib.nullcontext()
+        )
+        async with write_guard:
+            outcome = "unknown"
+            try:
+                await app.DATABASE.credentials.update_credential(
+                    credential.credential_id,
+                    organization_id,
+                    expected_site_urls=list(claim.question.saved_site_urls),
+                    tested_url=tested_url,
+                    extra_site_urls=extra_site_urls,
+                )
+            except (CredentialSitesChangedError, NotFoundError):
+                outcome = "refused"
+            else:
+                outcome = "written"
+    except Exception:
+        LOG.warning("copilot_credential_site_change_write_failed", outcome=outcome, exc_info=True)
+    if outcome != "refused":
+        await record_request_audit_event(
+            organization_id,
+            "credential.update",
+            "credential",
+            credential.credential_id,
+            changed_fields=("extra_site_urls", "tested_url") if tested_url else ("extra_site_urls",),
+            metadata={
+                "confirmed": "true" if outcome == "written" else "false",
+                "action": claim.answer.action,
+                "site": loggable_origin(claim.site_url),
+            },
+        )
+    return outcome
+
+
+async def _change_credential_site(
+    cache: BaseCache,
+    organization_id: str,
+    response_request: WorkflowCopilotCredentialResponseRequest,
+    credential: Credential,
+) -> WorkflowCopilotCredentialResponseResult:
+    """Save the site this card signs in on to the login, as the user's Add or Move answer, then connect it."""
+    action: Literal["add", "move"] = "move" if response_request.site_answer == "move" else "add"
+    principal = await enforce_principal_role(get_request_principal(), "credential.update")
+    await app.AGENT_FUNCTION.enforce_credential_folder_access_for_ids(
+        principal, "credential.update", {("credential_id", credential.credential_id)}
+    )
+    pause_ids = {
+        "organization_id": organization_id,
+        "workflow_copilot_chat_id": response_request.workflow_copilot_chat_id,
+        "turn_id": response_request.turn_id,
+    }
+    try:
+        claim = await claim_credential_site_change(
+            cache,
+            resume_token=response_request.resume_token,
+            credential_id=credential.credential_id,
+            action=action,
+            **pause_ids,
+        )
+    except CredentialPauseRejection as rejection:
+        raise HTTPException(status_code=rejection.status_code, detail=rejection.detail)
+    try:
+        outcome = await _write_credential_site(organization_id, credential, claim)
+    except ValueError as exc:
+        await finish_credential_site_change(cache, claim=claim, written=False, **pause_ids)
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    try:
+        connected = await finish_credential_site_change(cache, claim=claim, written=outcome != "refused", **pause_ids)
+    except Exception:
+        if outcome == "refused":
+            raise
+        LOG.warning(
+            "copilot_credential_site_change_finish_failed", credential_id=credential.credential_id, exc_info=True
+        )
+        connected = False
+    if outcome == "refused":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This login's sites changed since the card asked. Pick it again.",
+        )
+    LOG.info(
+        "copilot_credential_site_changed",
+        credential_id=credential.credential_id,
+        action=action,
+        site_a=claim.answer.site_a or None,
+        saved_sites=list(claim.answer.saved_sites),
+        site_b=loggable_origin(claim.site_url),
+        confirmed=outcome == "written",
+        connected=connected,
+    )
+    if outcome == "unknown":
+        return WorkflowCopilotCredentialResponseResult(result="site_change_unknown")
+    return WorkflowCopilotCredentialResponseResult(result="accepted" if connected else "site_changed_not_connected")
 
 
 async def _demonstration_cache() -> BaseCache:
@@ -4936,6 +5143,10 @@ async def workflow_copilot_demonstration_control(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)") from exc
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="url must be http(s)")
+    if control_request.action == "note" and not (control_request.text or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="text is required when action is 'note'"
+        )
     if control_request.action == "fill_credential" and not (
         control_request.credential_id and control_request.selector and control_request.field
     ):

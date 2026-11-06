@@ -4,7 +4,9 @@ import json
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -15,12 +17,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.enums import WorkflowRunStatus
 from skyvern.forge.sdk.db.models import TaskModel
 from skyvern.forge.sdk.db.repositories import tasks as tasks_repository
 from skyvern.forge.sdk.routes import agent_protocol
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunResponseBase
 from tests.unit.shared_route_app import shared_route_app
 
 ORG_ID = "o_task_listing"
@@ -90,6 +94,85 @@ async def test_task_listing_builds_and_serializes_the_page_off_the_event_loop(
     assert response.json() == json.loads(expected_body)
     assert len(response.json()) == 3
     assert agent_protocol.TASK_NEXT_CURSOR_HEADER not in response.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connect_authorized", [False, True])
+async def test_workflow_run_listing_respects_connect_authorization(
+    monkeypatch: pytest.MonkeyPatch, connect_authorized: bool
+) -> None:
+    session_id = "pbs_test_workflow_run_listing"
+    address = f"wss://router.test/{session_id}?token=secret"
+    run = WorkflowRun.model_construct(
+        workflow_run_id="wr_test_workflow_run_listing",
+        workflow_id="wpid_test_workflow_run_listing",
+        workflow_permanent_id="wpid_test_workflow_run_listing",
+        organization_id=ORG_ID,
+        status=WorkflowRunStatus.running,
+        browser_session_id=session_id,
+        browser_address=address,
+    )
+    authorization = AsyncMock(return_value={session_id} if connect_authorized else set())
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    monkeypatch.setattr(
+        app_instance,
+        "WORKFLOW_SERVICE",
+        SimpleNamespace(get_workflow_runs=AsyncMock(return_value=[run])),
+    )
+    monkeypatch.setattr(
+        app_instance,
+        "AGENT_FUNCTION",
+        SimpleNamespace(
+            browser_session_ids_authorized_for_connect=authorization,
+            should_check_browser_session_artifacts=AsyncMock(return_value=False),
+        ),
+    )
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    principal = SimpleNamespace(organization_id=ORG_ID, api_key_access_mode="member")
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: principal)
+
+    async with _client(shared_route_app(monkeypatch)) as client:
+        response = await client.get("/api/v1/workflows/runs")
+
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["browser_session_id"] == session_id
+    assert response.json()[0]["browser_address"] == (address if connect_authorized else None)
+    authorization.assert_awaited_once_with(principal, ORG_ID, {session_id})
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_detail_respects_connect_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    session_id = "pbs_test_workflow_run_detail"
+    address = f"wss://router.test/{session_id}?token=secret"
+    response = WorkflowRunResponseBase.model_construct(
+        workflow_run_id="wr_test_workflow_run_detail",
+        workflow_id="wpid_test_workflow_run_detail",
+        status=WorkflowRunStatus.running,
+        browser_session_id=session_id,
+        browser_address=address,
+    )
+    authorization = AsyncMock(return_value=set())
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    monkeypatch.setattr(
+        agent_protocol.run_service,
+        "coalesce_in_flight",
+        AsyncMock(return_value=response),
+    )
+    monkeypatch.setattr(
+        app_instance,
+        "AGENT_FUNCTION",
+        SimpleNamespace(browser_session_ids_authorized_for_connect=authorization),
+    )
+    monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
+    principal = SimpleNamespace(organization_id=ORG_ID, api_key_access_mode="member")
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: principal)
+
+    result = await agent_protocol.get_workflow_run(
+        response.workflow_run_id, current_org=SimpleNamespace(organization_id=ORG_ID)
+    )
+
+    assert result.browser_address is None
+    authorization.assert_awaited_once_with(principal, ORG_ID, {session_id})
 
 
 def _client(fastapi_app: FastAPI, organization_id: str = ORG_ID) -> httpx.AsyncClient:
@@ -281,3 +364,95 @@ async def test_task_export_applies_filters_and_builds_batches_off_the_event_loop
     *exported, trailer = (json.loads(line) for line in response.text.splitlines())
     assert sorted(task["task_id"] for task in exported) == sorted(task_ids[1:])
     assert trailer == {"export_complete": True, "task_count": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["list", "export"])
+async def test_task_listing_checks_descendants_once_per_run_per_request(
+    monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine, endpoint: str
+) -> None:
+    from fastapi import HTTPException
+
+    import skyvern.forge.agent as agent_module
+    from skyvern.forge.sdk.services import browser_session_artifacts as artifacts
+    from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
+
+    task_ids = await _seed_tasks_with_timestamp_ties(monkeypatch, sqlite_engine, count=12)
+    app_instance = object.__getattribute__(agent_protocol.app, "_inst")
+    db = app_instance.DATABASE
+    async with db.Session() as session:
+        for index, task_id in enumerate(task_ids):
+            await session.execute(
+                update(TaskModel)
+                .where(TaskModel.task_id == task_id)
+                .values(
+                    workflow_run_id="wr_a" if index < 6 else "wr_b",
+                    browser_session_id="pbs_denied" if index == 0 else "pbs_both_denied" if index == 6 else None,
+                    extracted_information={"downloaded_file_urls": ["file:///tmp/private.pdf"]},
+                )
+            )
+        await session.commit()
+
+    async def children(parent_id: str, *, organization_id: str) -> list[SimpleNamespace]:
+        await asyncio.sleep(0.01)
+        return [SimpleNamespace(workflow_run_id="wr_hidden")] if parent_id == "wr_b" else []
+
+    async def folder_access(principal: RequestPrincipal, action: str, resource: dict[str, object]) -> None:
+        if principal.user_id == "viewer":
+            raise HTTPException(status_code=403)
+
+    async def task_access(
+        _org: str, *, session_ids: list[str | None], **_kwargs: object
+    ) -> artifacts.BrowserSessionArtifactAccess:
+        return artifacts.BrowserSessionArtifactAccess(
+            "pbs_denied" not in session_ids
+            and not ("pbs_both_denied" in session_ids and principal["value"].user_id == "viewer")
+        )
+
+    lookup = AsyncMock(side_effect=children)
+    root_access = AsyncMock(side_effect=task_access)
+    monkeypatch.setattr(db.workflow_runs, "get_workflow_runs_by_parent_workflow_run_id", lookup)
+    monkeypatch.setattr(db.observer, "get_child_workflow_run_ids", AsyncMock(return_value=set()))
+    monkeypatch.setattr(
+        app_instance.AGENT_FUNCTION, "should_check_browser_session_artifacts", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(app_instance.AGENT_FUNCTION, "enforce_folder_access", folder_access)
+    monkeypatch.setattr(agent_module, "browser_session_artifact_access", root_access)
+    monkeypatch.setattr(
+        artifacts,
+        "browser_session_artifact_access",
+        AsyncMock(return_value=artifacts.BrowserSessionArtifactAccess(True)),
+    )
+    monkeypatch.setattr(app_instance, "agent", ForgeAgent())
+    monkeypatch.setattr(agent_protocol, "TASK_EXPORT_BATCH_SIZE", 3)
+    principal = {"value": RequestPrincipal(ORG_ID, AuthKind.bearer, user_id="viewer")}
+    monkeypatch.setattr(agent_protocol, "get_request_principal", lambda: principal["value"])
+
+    def rows(response: httpx.Response) -> list[dict[str, Any]]:
+        if endpoint == "list":
+            return response.json()
+        return [row for line in response.text.splitlines() if "task_id" in (row := json.loads(line))]
+
+    path = "/api/v1/tasks" if endpoint == "list" else "/api/v1/tasks/export"
+    async with _client(shared_route_app(monkeypatch)) as client:
+        denied = await client.get(path, params={"page_size": 100} if endpoint == "list" else None)
+        assert denied.status_code == 200, denied.text
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_a") == 1
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_b") == 1
+        assert root_access.await_count == len(task_ids)
+        denied_by_id = {row["task_id"]: row for row in rows(denied)}
+        assert denied_by_id[task_ids[0]]["extracted_information"]["downloaded_file_urls"] is None
+        assert denied_by_id[task_ids[1]]["extracted_information"]["downloaded_file_urls"]
+        assert denied_by_id[task_ids[6]]["extracted_information"] == "[redacted]"
+
+        lookup.reset_mock()
+        root_access.reset_mock()
+        principal["value"] = RequestPrincipal(ORG_ID, AuthKind.bearer, user_id="editor")
+        allowed = await client.get(path, params={"page_size": 100} if endpoint == "list" else None)
+        assert allowed.status_code == 200, allowed.text
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_a") == 1
+        assert [call.args[0] for call in lookup.await_args_list].count("wr_b") == 1
+        assert root_access.await_count == len(task_ids)
+        allowed_by_id = {row["task_id"]: row for row in rows(allowed)}
+        assert allowed_by_id[task_ids[0]]["extracted_information"]["downloaded_file_urls"] is None
+        assert allowed_by_id[task_ids[6]]["extracted_information"]["downloaded_file_urls"]

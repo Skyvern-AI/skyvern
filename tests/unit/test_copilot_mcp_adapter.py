@@ -41,7 +41,9 @@ from skyvern.forge.sdk.copilot import agent as copilot_agent
 from skyvern.forge.sdk.copilot import mcp_adapter
 from skyvern.forge.sdk.copilot import runtime as copilot_runtime
 from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
+from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, resolve_copilot_tool_surface
+from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
 from skyvern.forge.sdk.copilot.config import (
     AGENT_BLOCKS_ONLY,
     ALL_BLOCK_FAMILIES,
@@ -2444,6 +2446,63 @@ class TestBrowserSessionContinuity:
             "The browser session was lost, and I couldn't re-establish it. Please retry this turn."
         )
         assert ctx.blocker_signal.internal_reason_code == "tool_error_browser_session_lost"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("failure", "facts"),
+        [
+            (
+                BuildTestConnectFailure(
+                    state="browser_start_capacity",
+                    starting_sessions=10,
+                    max_starting_sessions=10,
+                    retry_after_seconds=7,
+                ),
+                {
+                    "state": "browser_start_capacity",
+                    "starting_sessions": 10,
+                    "max_starting_sessions": 10,
+                    "retry_after_seconds": 7,
+                },
+            ),
+            (
+                BuildTestConnectFailure(state="billing_credit_admission_refusal", retry_action=None),
+                {"state": "billing_credit_admission_refusal"},
+            ),
+        ],
+    )
+    async def test_a_refused_replacement_start_reports_its_facts(
+        self, monkeypatch: pytest.MonkeyPatch, failure: BuildTestConnectFailure, facts: dict[str, Any]
+    ) -> None:
+        refusal = copilot_runtime._browser_session_acquisition_failure_result(failure)
+
+        async def _ensure(_ctx: AgentContext, **_kwargs: Any) -> dict[str, Any]:
+            return refusal
+
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", _ensure)
+        ctx = make_copilot_ctx(browser_session_id="pbs_lost")
+        sibling = make_copilot_ctx(browser_session_id="pbs_lost")
+
+        for loss_ctx in (ctx, sibling):
+            disposition = await _handle_browser_session_loss(
+                loss_ctx, tool_name="evaluate", call_path="model", lost_session_id="pbs_lost"
+            )
+
+            assert disposition == "failed"
+            assert loss_ctx.browser_session_id is None
+            signal = loss_ctx.blocker_signal
+            assert signal is not None
+            assert signal.internal_reason_code == "tool_error_browser_session_lost"
+            assert facts.items() <= signal.extra["browser_session_acquisition_failure"].items()
+            assert "Build test" not in signal.user_facing_reason
+            assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool=signal.blocked_tool)
+
+            _, loss_result, _ = await mcp_adapter._prepare_browser_session_for_dispatch(
+                loss_ctx, tool_name="evaluate", call_path="model", observed_generation=0
+            )
+            assert loss_result is not None
+            assert facts.items() <= loss_result["data"]["browser_session_acquisition_failure"].items()
+            assert "Please retry this turn" not in loss_result["error"]
 
     @pytest.mark.asyncio
     async def test_session_lost_during_attach_reestablishes(self, monkeypatch: pytest.MonkeyPatch) -> None:

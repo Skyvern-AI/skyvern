@@ -11,6 +11,7 @@ identifies it.
 
 import time
 from collections.abc import Callable, Collection
+from dataclasses import dataclass
 from types import FrameType
 from typing import Any, NamedTuple, TypeVar, TypeVarTuple, Unpack
 
@@ -21,7 +22,7 @@ from pypdf.errors import LimitReachedError
 from skyvern.config import settings
 from skyvern.constants import FILE_PARSE_STEP_TIMEOUT_SECONDS, MAX_FILE_PARSE_INPUT_TOKENS, MAX_PDF_OCR_PAGES
 from skyvern.exceptions import PDFParsingError
-from skyvern.forge.sdk.utils import pdfplumber_child
+from skyvern.forge.sdk.utils import docx_child, pdfplumber_child
 from skyvern.forge.sdk.utils.capped_subprocess import CappedSubprocessError, run_in_capped_subprocess
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.utils.token_counter import count_tokens
@@ -36,6 +37,12 @@ _Ts = TypeVarTuple("_Ts")
 _CHARS_PER_TOKEN_STOP = 8
 
 
+@dataclass
+class PdfExtractStats:
+    page_count: int = 0
+    truncated: bool = False
+
+
 class _ResultLimit(NamedTuple):
     max_bytes: int
     memory_factor: int
@@ -45,12 +52,12 @@ class _ResultLimit(NamedTuple):
 # 6.4x for crafted ones on Python 3.11, text with astral characters up to 6x, and page PNGs 1x because they are read
 # straight into their final buffer.
 _PAGE_COUNT_RESULT = _ResultLimit(64 * 1024, 6)
-_PAGE_TEXTS_RESULT = _ResultLimit(32 * 1024 * 1024, 6)
+_TEXT_RESULT = _ResultLimit(32 * 1024 * 1024, 6)
 _UPRIGHT_WORDS_RESULT = _ResultLimit(32 * 1024 * 1024, 7)
 _PAGE_IMAGES_MEMORY_FACTOR = 1
 # Fallback text is read up to this many characters; the child also stops before a page that would push the pickled
-# text past _PAGE_TEXTS_RESULT, so the page that crosses a limit is cut instead of failing the whole parse.
-_PAGE_TEXTS_CHAR_LIMIT = _PAGE_TEXTS_RESULT.max_bytes // 4
+# text past _TEXT_RESULT, so the page that crosses a limit is cut instead of failing the whole parse.
+_TEXT_CHAR_LIMIT = _TEXT_RESULT.max_bytes // 4
 
 # A font whose ToUnicode map is wrong substitutes its glyphs out of an unrelated Unicode
 # block. Latin Extended-A/B and the private-use area are where those substitutions land;
@@ -225,11 +232,11 @@ def _size_limit_failure(identifier: str, pypdf_error: Exception) -> PDFParsingEr
     )
 
 
-def _run_pdfplumber(
+def _run_parser_child(
     func: Callable[[Unpack[_Ts]], _T], *args: Unpack[_Ts], result: _ResultLimit, log_identifier: str, started_at: float
 ) -> _T:
-    # pdfminer, which pdfplumber parses with, decodes streams with no size limit, so a crafted PDF can grow memory
-    # until the pod is OOM-killed. The child is capped and gets what is left of the caller's parse budget.
+    # A crafted document can grow a parser's memory until the pod is OOM-killed (pdfminer decodes PDF streams with no
+    # size limit, and a .docx is a zip). The child is capped and gets what is left of the caller's parse budget.
     return run_in_capped_subprocess(
         func,
         *args,
@@ -260,6 +267,7 @@ def extract_pdf_file(
     file_path: str,
     file_identifier: str | None = None,
     max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
+    stats: PdfExtractStats | None = None,
 ) -> str:
     """
     Extract text from a PDF file with fallback support.
@@ -273,6 +281,7 @@ def extract_pdf_file(
         file_path: Path to the PDF file to parse
         file_identifier: Optional identifier for logging (e.g., URL or filename).
                         If not provided, uses file_path.
+        stats: Optional out-param that receives the page count and whether a limit cut the text.
 
     Returns:
         Extracted text from all pages of the PDF
@@ -288,6 +297,7 @@ def extract_pdf_file(
     identifier = file_identifier or file_path
     log_identifier = identifier.partition("?")[0]
     started_at = time.monotonic()
+    stats = stats if stats is not None else PdfExtractStats()
 
     # Try pypdf first
     try:
@@ -295,6 +305,7 @@ def extract_pdf_file(
         extracted_text = ""
         current_tokens = 0
         page_count = len(reader.pages)
+        stats.page_count = page_count
 
         for i in range(page_count):
             page_text = reader.pages[i].extract_text() or ""
@@ -308,6 +319,7 @@ def extract_pdf_file(
                         total_pages=page_count,
                         max_tokens=max_tokens,
                     )
+                    stats.truncated = True
                     break
                 current_tokens += page_tokens
             extracted_text += page_text + "\n"
@@ -338,29 +350,27 @@ def extract_pdf_file(
             # Only text averaging over 8 characters a token, such as long runs of one symbol, stops at this limit
             # before the token cap; the second pass then reads on to the most text a result may hold.
             first_char_limit = (
-                min(max_tokens * _CHARS_PER_TOKEN_STOP, _PAGE_TEXTS_CHAR_LIMIT)
-                if max_tokens
-                else _PAGE_TEXTS_CHAR_LIMIT
+                min(max_tokens * _CHARS_PER_TOKEN_STOP, _TEXT_CHAR_LIMIT) if max_tokens else _TEXT_CHAR_LIMIT
             )
-            page_texts, page_count, read_every_page = _run_pdfplumber(
+            page_texts, page_count, read_every_page = _run_parser_child(
                 pdfplumber_child.page_texts,
                 file_path,
                 first_char_limit,
-                _PAGE_TEXTS_RESULT.max_bytes,
-                result=_PAGE_TEXTS_RESULT,
+                _TEXT_RESULT.max_bytes,
+                result=_TEXT_RESULT,
                 log_identifier=log_identifier,
                 started_at=started_at,
             )
             extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
             read_on_failed = False
-            if truncated_at_page is None and not read_every_page and first_char_limit < _PAGE_TEXTS_CHAR_LIMIT:
+            if truncated_at_page is None and not read_every_page and first_char_limit < _TEXT_CHAR_LIMIT:
                 try:
-                    more_texts, more_page_count, more_read_every_page = _run_pdfplumber(
+                    more_texts, more_page_count, more_read_every_page = _run_parser_child(
                         pdfplumber_child.page_texts,
                         file_path,
-                        _PAGE_TEXTS_CHAR_LIMIT,
-                        _PAGE_TEXTS_RESULT.max_bytes,
-                        result=_PAGE_TEXTS_RESULT,
+                        _TEXT_CHAR_LIMIT,
+                        _TEXT_RESULT.max_bytes,
+                        result=_TEXT_RESULT,
                         log_identifier=log_identifier,
                         started_at=started_at,
                     )
@@ -378,6 +388,8 @@ def extract_pdf_file(
                 else:
                     page_texts, page_count, read_every_page = more_texts, more_page_count, more_read_every_page
                     extracted_text, truncated_at_page = _join_within_token_limit(page_texts, max_tokens)
+            stats.page_count = page_count
+            stats.truncated = truncated_at_page is not None or not read_every_page
             if truncated_at_page is not None:
                 LOG.warning(
                     "PDF text exceeds token limit, truncating at page boundary",
@@ -392,7 +404,7 @@ def extract_pdf_file(
                     file_identifier=log_identifier,
                     pages_included=len(page_texts),
                     total_pages=page_count,
-                    char_limit=_PAGE_TEXTS_CHAR_LIMIT,
+                    char_limit=_TEXT_CHAR_LIMIT,
                 )
 
             # Sanitize text to remove characters that cannot be stored in PostgreSQL
@@ -418,6 +430,42 @@ def extract_pdf_file(
                 pypdf_error=str(pypdf_error),
                 pdfplumber_error=str(pdfplumber_error),
             )
+
+
+def extract_docx_file(
+    file_path: str,
+    file_identifier: str | None = None,
+    max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS,
+) -> str:
+    """Return a Word .docx file's paragraph and table-row text in document order, cut at max_tokens. Raises
+    CappedSubprocessError when the file cannot be parsed or the capped child fails."""
+    log_identifier = (file_identifier or file_path).partition("?")[0]
+    block_texts, read_every_block = _run_parser_child(
+        docx_child.block_texts,
+        file_path,
+        _TEXT_CHAR_LIMIT,
+        _TEXT_RESULT.max_bytes,
+        result=_TEXT_RESULT,
+        log_identifier=log_identifier,
+        started_at=time.monotonic(),
+    )
+    extracted_text, truncated_at_block = _join_within_token_limit(block_texts, max_tokens)
+    if truncated_at_block is not None:
+        LOG.warning(
+            "DOCX text exceeds token limit, truncating at block boundary",
+            file_identifier=log_identifier,
+            blocks_included=truncated_at_block,
+            blocks_read=len(block_texts),
+            max_tokens=max_tokens,
+        )
+    elif not read_every_block:
+        LOG.warning(
+            "DOCX text exceeds the size limit for a parse, truncating at block boundary",
+            file_identifier=log_identifier,
+            blocks_included=len(block_texts),
+            char_limit=_TEXT_CHAR_LIMIT,
+        )
+    return sanitize_postgres_text(extracted_text)
 
 
 def validate_pdf_file(
@@ -472,7 +520,7 @@ def validate_pdf_file(
 
         # Fallback to pdfplumber
         try:
-            _run_pdfplumber(
+            _run_parser_child(
                 pdfplumber_child.page_count,
                 file_path,
                 result=_PAGE_COUNT_RESULT,
@@ -516,7 +564,7 @@ def render_pdf_pages_as_images(
     """
     identifier = file_identifier or file_path
     log_identifier = identifier.partition("?")[0]
-    page_images, total_pages = _run_pdfplumber(
+    page_images, total_pages = _run_parser_child(
         pdfplumber_child.page_images,
         file_path,
         max_pages,
@@ -544,7 +592,7 @@ def render_pdf_pages_as_images(
 
 def extract_upright_pdf_words(file_path: str, page_indexes: Collection[int]) -> dict[int, list[dict[str, Any]]]:
     """Map each requested 0-based page index to pdfplumber's upright words on that page."""
-    return _run_pdfplumber(
+    return _run_parser_child(
         pdfplumber_child.upright_words,
         file_path,
         sorted(page_indexes),

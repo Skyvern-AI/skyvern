@@ -346,6 +346,8 @@ async def test_finally_block_re_finalization_records_only_the_minutes_it_added(
             task_queue=None,
             browser_session_id=None,
             browser_profile_id=None,
+            browser_seed_source=None,
+            browser_sink_profile_id=None,
             debug_session_id=None,
             copilot_session_id=None,
             browser_address=None,

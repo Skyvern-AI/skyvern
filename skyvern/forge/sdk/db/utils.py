@@ -493,6 +493,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         max_screenshot_scrolls=task_obj.max_screenshot_scrolling_times,
         max_scrape_screenshots=task_obj.max_scrape_screenshots,
         browser_session_id=task_obj.browser_session_id,
+        requested_by=task_obj.requested_by,
         browser_address=task_obj.browser_address,
         download_timeout=task_obj.download_timeout,
         # The final recording match's claim is row bookkeeping, read only by the task repository's guarded writers.

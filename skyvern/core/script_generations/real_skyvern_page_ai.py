@@ -161,6 +161,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
     jinja_template = jinja_sandbox_env.from_string(template)
     context = skyvern_context.current()
     run_secrets: dict[str, Any] | None = None
+    excluded_secret_ids: set[str] | None = None
     if context and context.workflow_run_id:
         workflow_run_id = context.workflow_run_id
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
@@ -168,6 +169,7 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
         if template in template_data:
             return template_data[template]
         run_secrets = workflow_run_context.secrets
+        excluded_secret_ids = workflow_run_context.agent_unmasked_platform_secret_ids()
 
     # Inject loop metadata from script `skyvern.loop()` / `skyvern.while_loop()`
     # (current_value, current_index, current_item) so cached function bodies inside
@@ -179,7 +181,9 @@ def render_template(template: str, data: dict[str, Any] | None = None) -> str:
 
     rendered = jinja_template.render(template_data)
     if run_secrets is not None:
-        register_secret_derived_output(run_secrets, jinja_template, template, template_data, rendered)
+        register_secret_derived_output(
+            run_secrets, jinja_template, template, template_data, rendered, excluded_secret_ids=excluded_secret_ids
+        )
     return rendered
 
 
@@ -427,6 +431,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
         """Input text into an element using AI to determine the value."""
         self._raise_if_browser_connection_lost()
         sensitive_value = value if value_is_sensitive else None
+        run_context = skyvern_context.current()
+        run_id = run_context.workflow_run_id if run_context else None
+        if sensitive_value and run_id and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(run_id, sensitive_value):
+            # A card placeholder stands for the number or CVV, which the reviewer's model and stored records must not keep.
+            sensitive_value = str(get_actual_value_of_parameter_if_secret(run_id, sensitive_value))
 
         # v3 mid-run hook — see ai_click for the contract.
         # Never expose an unresolved TOTP value to a reviewer that can write its prompt value directly to the page.
@@ -435,7 +444,8 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 action_type="fill",
                 failed_selector=failed_selector,
                 intention=intention,
-                value=value,
+                # The reviewer redacts with this value and never types a sensitive one, so it gets the resolved card.
+                value=sensitive_value or value,
                 totp_identifier=totp_identifier,
                 totp_url=totp_url,
                 block_label=block_label,

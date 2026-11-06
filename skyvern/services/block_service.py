@@ -137,12 +137,13 @@ async def execute_blocks(
 
         block_output_parameters[block_label] = output_parameter
 
-    for block_label, output_parameter in block_output_parameters.items():
+    # block_runs is keyed on workflow_run_id, so a run of several blocks records its last one.
+    if block_labels:
         await app.DATABASE.debug.create_block_run(
             organization_id=organization.organization_id,
             user_id=user_id,
-            block_label=block_label,
-            output_parameter_id=output_parameter.output_parameter_id,
+            block_label=block_labels[-1],
+            output_parameter_id=block_output_parameters[block_labels[-1]].output_parameter_id,
             workflow_run_id=workflow_run_id,
         )
 
@@ -155,6 +156,31 @@ async def execute_blocks(
         block_labels=block_labels,
         block_output_count=len(block_outputs or {}),
     )
+
+    try:
+        workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization.organization_id,
+        )
+        saved_workflow = await app.DATABASE.workflows.get_workflow_for_workflow_run(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization.organization_id,
+        )
+        if (
+            workflow_run is not None
+            and saved_workflow is not None
+            and workflow_run.workflow_run_id == workflow_run_id
+            and workflow_run.organization_id == organization.organization_id
+            and saved_workflow.organization_id == organization.organization_id
+            and saved_workflow.workflow_id == workflow_run.workflow_id
+            and not workflow_run.row_write_unconfirmed
+        ):
+            await app.AGENT_FUNCTION.prepare_powerbi_query_hop_tokens(
+                workflow_run=workflow_run, workflow=saved_workflow
+            )
+            await app.AGENT_FUNCTION.prepare_gmail_hop_tokens(workflow_run=workflow_run, workflow=saved_workflow)
+    except Exception as exc:  # noqa: BLE001 - a missing capability must not prevent editor dispatch.
+        LOG.warning("Could not prepare Power BI hop for block run", error_type=type(exc).__name__)
 
     await AsyncExecutorFactory.get_executor().execute_workflow(
         request=request,

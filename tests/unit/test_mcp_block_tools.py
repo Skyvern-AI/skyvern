@@ -7,12 +7,14 @@ import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import get_args
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastmcp import Client
 from playwright.async_api import Page
 
-from skyvern.cli.mcp_tools import blocks
+from skyvern.cli.mcp_tools import blocks, mcp
 from skyvern.cli.mcp_tools.blocks import (
     CODE_BLOCK_RUNTIME_TOPIC,
     NOTES_KNOWLEDGE_TOPIC,
@@ -22,6 +24,9 @@ from skyvern.cli.mcp_tools.blocks import (
     skyvern_block_validate,
     skyvern_workflow_knowledge,
 )
+from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import FailedToFormatJinjaStyleParameter, MissingJinjaVariables
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, TaskBlock
@@ -31,6 +36,13 @@ from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     _PAGE_ACTION_MAP,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.schemas.workflows import (
+    AGENT_STEP_BLOCK_SUMMARY,
+    AGENT_STEP_LLM_FLAG,
+    BLOCK_TYPE_MAP,
+    BLOCK_YAML_SUBCLASSES,
+    BlockType,
+)
 
 
 @pytest.mark.asyncio
@@ -322,12 +334,100 @@ async def test_unavailable_powerbi_is_hidden_from_schema_and_nested_validation(
     assert "Power BI queries are not currently available." in nested["error"]["message"]
 
 
+_AGENT_STEP_BLOCK = {"block_type": "agent_step", "label": "decide", "prompt": "Pick the cheapest plan"}
+_LOOPED_AGENT_STEP_BLOCK = {
+    "block_type": "for_loop",
+    "label": "each_plan",
+    "loop_over_parameter_key": "plans",
+    "loop_blocks": [_AGENT_STEP_BLOCK],
+}
+
+
+def test_block_summaries_cover_every_block_yaml_class() -> None:
+    union_types = {model.model_fields["block_type"].default.value for model in get_args(BLOCK_YAML_SUBCLASSES)}
+
+    assert set(blocks.BLOCK_SUMMARIES) == union_types - {BlockType.TASK.value, BlockType.TaskV2.value}
+    assert BlockType.TASK.value in BLOCK_TYPE_MAP
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.asyncio
+async def test_agent_step_is_described_and_validated_only_for_a_flagged_request_org(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    hook = AsyncMock(return_value=enabled)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "agent_step_enabled", hook)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "get_mcp_request_organization_id", lambda: "o_request")
+
+    with skyvern_context.scoped(SkyvernContext()):
+        listing = await skyvern_block_schema()
+        lookup = await skyvern_block_schema(block_type="agent_step")
+        unknown = await skyvern_block_schema(block_type="no_such_block")
+        validations = [
+            await skyvern_block_validate(block_json=json.dumps(block))
+            for block in (_AGENT_STEP_BLOCK, _LOOPED_AGENT_STEP_BLOCK)
+        ]
+
+    hook.assert_awaited_with("o_request")
+    assert ("agent_step" in listing["data"]["block_types"]) is enabled
+    assert ("agent_step" in unknown["error"]["hint"]) is enabled
+    assert lookup["ok"] is enabled
+    for result in validations:
+        assert result["ok"] is enabled
+    if enabled:
+        assert listing["data"]["block_types"]["agent_step"] == AGENT_STEP_BLOCK_SUMMARY
+        assert lookup["data"]["summary"] == AGENT_STEP_BLOCK_SUMMARY
+        assert {"prompt", "data_schema", "tools", "max_turns", "parameter_keys"} <= set(
+            lookup["data"]["schema"]["properties"]
+        )
+    else:
+        assert "agent_step" not in lookup["error"]["hint"]
+        for refusal in (lookup, *validations):
+            assert AGENT_STEP_LLM_FLAG in refusal["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_in_process_client_validates_agent_step_for_the_skyvern_context_org(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hook = AsyncMock(return_value=True)
+    monkeypatch.setattr(app.AGENT_FUNCTION, "agent_step_enabled", hook)
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_copilot")):
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "skyvern_block_validate", {"block_json": json.dumps(_LOOPED_AGENT_STEP_BLOCK)}
+            )
+
+    assert result.data["ok"] is True, result.data
+    hook.assert_awaited_with("o_copilot")
+
+
+@pytest.mark.parametrize("unresolvable", ["no_org", "no_forge_app"])
+@pytest.mark.asyncio
+async def test_agent_step_is_left_to_the_server_when_the_org_cannot_be_checked(
+    monkeypatch: pytest.MonkeyPatch, unresolvable: str
+) -> None:
+    if unresolvable == "no_org":
+        monkeypatch.setattr(app.AGENT_FUNCTION, "get_mcp_request_organization_id", lambda: None)
+    else:
+        monkeypatch.setitem(app.__dict__, "_inst", None)
+
+    with skyvern_context.scoped(SkyvernContext()):
+        listing = await skyvern_block_schema()
+        validation = await skyvern_block_validate(block_json=json.dumps(_LOOPED_AGENT_STEP_BLOCK))
+
+    assert listing["data"]["block_types"]["agent_step"] == AGENT_STEP_BLOCK_SUMMARY
+    assert validation["ok"] is True
+
+
 CONNECTED_ACCOUNT_MARKER = "x-skyvern-connected-account"
 CONNECTED_ACCOUNT_FIELDS = {
     ("file_upload", "google_credential_id"),
     ("file_download", "google_credential_id"),
     ("send_email", "credential_id"),
     ("google_sheets_read", "credential_id"),
+    ("email_inbox", "connection_id"),
     ("email_inbox", "credential_id"),
     ("google_sheets_write", "credential_id"),
     ("powerbi_query", "connection_id"),

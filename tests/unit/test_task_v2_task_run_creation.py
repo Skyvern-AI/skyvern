@@ -13,6 +13,27 @@ from skyvern.services.task_v2_service import DEFAULT_WORKFLOW_TITLE, initialize_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identifier", "expected"),
+    [(None, None), ("", None), (" \t ", None), ("  destination@example.test  ", "  destination@example.test  ")],
+)
+async def test_initialize_task_v2_normalizes_blank_totp_before_persistence(
+    monkeypatch: pytest.MonkeyPatch, identifier: str | None, expected: str | None
+) -> None:
+    create_task = AsyncMock(side_effect=RuntimeError("task write reached"))
+    monkeypatch.setattr(app.DATABASE.observer, "create_task_v2", create_task)
+
+    with pytest.raises(RuntimeError, match="task write reached"):
+        await initialize_task_v2(
+            organization=SimpleNamespace(organization_id="org_123"),
+            user_prompt="Open the page",
+            totp_identifier=identifier,
+        )
+
+    assert create_task.await_args.kwargs["totp_identifier"] == expected
+
+
+@pytest.mark.asyncio
 async def test_initialize_task_v2_populates_task_run_url_when_user_url_is_known(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

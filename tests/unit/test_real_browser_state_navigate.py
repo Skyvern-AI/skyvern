@@ -205,6 +205,7 @@ async def test_agent_navigation_rejects_hostname_resolving_to_internal_address(
         workflow_run_id=None,
         browser_session_id=None,
         browser_address=None,
+        download_timeout=None,
         navigation_goal=None,
         navigation_payload=None,
         data_extraction_goal=None,

@@ -1,8 +1,15 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { RunBlockingBlock } from "./getRunBlockingBlocks";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { RunBlockingSurface } from "./RunBlockingSurface";
 import { useLocateBlockStore } from "./useLocateBlockStore";
 import { useRunBlockingPanelStore } from "./useRunBlockingPanelStore";
@@ -37,6 +44,27 @@ describe("RunBlockingSurface", () => {
   test("renders nothing when no blocks are run-blocking", () => {
     const { container } = render(<RunBlockingSurface />);
     expect(container.firstChild).toBeNull();
+  });
+
+  test("hides only while the Doc is mounted, even with a stored Doc preference", () => {
+    useWorkflowPresentationStore.setState({
+      enabled: true,
+      presentation: "doc",
+      docMounted: false,
+    });
+    useRunValidationStore
+      .getState()
+      .setBlockingBlocks([block("n2", "block_2")]);
+    render(<RunBlockingSurface />);
+    expect(screen.getByText("block_2")).toBeTruthy();
+    act(() => useWorkflowPresentationStore.getState().setDocMounted(true));
+    expect(screen.queryByText("block_2")).toBeNull();
+    act(() => useWorkflowPresentationStore.getState().setDocMounted(false));
+    expect(screen.getByText("block_2")).toBeTruthy();
+    useWorkflowPresentationStore.setState({
+      enabled: false,
+      presentation: "visual",
+    });
   });
 
   test("lists every blocking block", () => {

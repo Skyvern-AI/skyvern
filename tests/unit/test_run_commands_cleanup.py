@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import os
+import re
+import select
 import shutil
+import subprocess
+import sys
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
@@ -533,3 +540,106 @@ async def test_run_task_tool_registration_points_to_browser_module() -> None:
     tool = await mcp.get_tool("skyvern_run_task")
     assert tool is not None
     assert tool.fn.__module__ == "skyvern.cli.mcp_tools.browser"
+
+
+# A stdio MCP process is spawned per client session, so whatever it imports at boot is paid once per session.
+# These pull in the LLM, workflow and database stack (~330 MB) that no stdio tool needs until it runs.
+SERVER_ONLY_MODULES = frozenset(
+    {
+        "litellm",
+        "openai",
+        "anthropic",
+        "pandas",
+        "azure",
+        "docx",
+        "asyncssh",
+        "libcst",
+        "psycopg",
+        "skyvern.forge.agent_functions",
+        "skyvern.forge.sdk.api.llm.config_registry",
+        "skyvern.core.script_generations.skyvern_page",
+        "skyvern.cli.core.mcp_http_auth",
+    }
+)
+# Boot imports about 2,300 modules; main imported about 7,100. The cap catches a leak through a module the set above omits.
+MAX_BOOT_MODULES = 4_000
+_IMPORT_TIME_LINE = re.compile(r"^import time:\s+\d+ \|\s+\d+ \|\s*(\S+)$")
+
+
+def _next_json_line(proc: subprocess.Popen[bytes], buffer: bytearray, deadline: float) -> dict[str, Any]:
+    assert proc.stdout is not None
+    while True:
+        newline = buffer.find(b"\n")
+        if newline >= 0:
+            line = bytes(buffer[:newline])
+            del buffer[: newline + 1]
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "timed out waiting for the MCP server"
+        if select.select([proc.stdout], [], [], remaining)[0]:
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            assert chunk, "the MCP server closed stdout"
+            buffer.extend(chunk)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="the probe reads the server stdout with select, which Windows pipes lack"
+)
+def test_stdio_server_boot_and_shutdown_never_import_the_server_graph(tmp_path: Any) -> None:
+    import_log = tmp_path / "importtime.txt"
+    env = {
+        **os.environ,
+        "SKYVERN_API_KEY": "test-key",
+        "SKYVERN_BASE_URL": "http://127.0.0.1:9",
+        "SKYVERN_TELEMETRY": "false",
+    }
+    with import_log.open("wb") as stderr:
+        proc = subprocess.Popen(
+            [sys.executable, "-X", "importtime", "-m", "skyvern", "run", "mcp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            env=env,
+        )
+        try:
+            assert proc.stdin is not None
+            buffer = bytearray()
+            deadline = time.monotonic() + 120
+            requests: list[dict[str, Any]] = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "boot-probe", "version": "0"},
+                    },
+                },
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            ]
+            for request in requests:
+                proc.stdin.write(json.dumps(request).encode() + b"\n")
+                proc.stdin.flush()
+                if "id" in request:
+                    response = _next_json_line(proc, buffer, deadline)
+                    while response.get("id") != request["id"]:
+                        response = _next_json_line(proc, buffer, deadline)
+            tool_names = {tool["name"] for tool in response["result"]["tools"]}
+            proc.stdin.close()
+            proc.wait(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    assert "skyvern_browser_session_create" in tool_names
+    imported = {
+        match.group(1) for line in import_log.read_text().splitlines() if (match := _IMPORT_TIME_LINE.match(line))
+    }
+    assert sorted(SERVER_ONLY_MODULES & imported) == []
+    assert len(imported) < MAX_BOOT_MODULES, f"{len(imported)} modules imported at boot"

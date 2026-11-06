@@ -9,6 +9,7 @@ import {
   WORKFLOW_AUTHORING_PANES,
   fitPanesToWidth,
   isAuthoringLayout,
+  panesCollapsedForDoc,
   panesFitWidth,
   panesFromDeepLink,
   panesListEqual,
@@ -212,6 +213,27 @@ describe("panesFitWidth", () => {
     const panes = ["copilot", "browser"] as const;
     expect(panesFitWidth(panes, width(panes))).toBe(true);
     expect(panesFitWidth(panes, width(panes) - 1)).toBe(false);
+  });
+});
+
+describe("panesCollapsedForDoc", () => {
+  const four = ["copilot", "editor", "overview", "browser"] as const;
+
+  test("collapses nothing when the Doc keeps 360px", () => {
+    expect(panesCollapsedForDoc(four, 1440)).toEqual([]);
+    expect(panesCollapsedForDoc(["copilot", "browser"], 300)).toEqual([]);
+  });
+
+  test("the Browser gives way first, then Run, then Copilot; never the Editor", () => {
+    // copilot 260 + doc 360 + run 260 + 2 gaps + padding = 928; a strip adds 48.
+    expect(panesCollapsedForDoc(four, 1100)).toEqual(["browser"]);
+    expect(panesCollapsedForDoc(four, 976)).toEqual(["browser"]);
+    expect(panesCollapsedForDoc(four, 975)).toEqual(["browser", "overview"]);
+    expect(panesCollapsedForDoc(four, 200)).toEqual([
+      "browser",
+      "overview",
+      "copilot",
+    ]);
   });
 });
 
