@@ -72,10 +72,13 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     is_sensitive_workflow_parameter,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import block_yaml_to_block
+from skyvern.forge.taskv3.handoff_redaction import sanitize_handoff_url, string_leaves
+from skyvern.forge.taskv3.opaque_refs import _TOKEN_PREFIX, mask_opaque_urls
 from skyvern.schemas.agent_step_tool_names import ALWAYS_OFFERED_TOOLS
 from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType
 from skyvern.utils.secret_redaction import redact_secrets_from_text
+from skyvern.webeye.actions.actions import UploadFileAction
 
 if TYPE_CHECKING:
     from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
@@ -83,6 +86,7 @@ if TYPE_CHECKING:
 LOG = structlog.get_logger()
 _MAX_TOOL_RESULT_CHARS = 20_000
 _MASK = "*****"
+_Fact = str | list[dict[str, str]]
 
 _INSTRUCTIONS = (
     "You are one step of an unattended workflow run; nobody can answer questions. "
@@ -221,15 +225,24 @@ class _LoopHooks(RunHooks[Any]):
             )
 
 
-def _record_call(state: _RunState, written: object, **call: str) -> None:
+def _record_call(state: _RunState, written: object, facts: dict[str, _Fact] | None = None, **call: str) -> None:
+    secrets = state.run_context.agent_redactable_secret_values()
     arguments = redact_secrets_from_text(
         json.dumps(
             state.run_context.mask_platform_smtp_for_agent(written),
             default=lambda value: state.run_context.mask_platform_smtp_for_agent(str(value)),
         ),
-        state.run_context.agent_redactable_secret_values(),
+        secrets,
     )
-    state.calls.append({**call, "arguments": arguments})
+
+    def scrub(text: str) -> str:
+        return redact_secrets_from_text(state.run_context.mask_platform_smtp_for_agent(text), secrets)
+
+    redacted = {
+        key: scrub(fact) if isinstance(fact, str) else [{k: scrub(v) for k, v in row.items()} for row in fact]
+        for key, fact in (facts or {}).items()
+    }
+    state.calls.append({**call, "arguments": arguments, **redacted})
 
 
 def resolve_agent_model(llm_key: str) -> tuple[str | Model, RunConfig]:
@@ -609,6 +622,7 @@ async def _run_child_block(
         modified_at=now,
     )
     report: dict[str, Any]
+    facts: dict[str, _Fact] = {}
     try:
         if not isinstance(written, dict):
             raise ValueError("arguments must be a JSON object.")
@@ -658,7 +672,16 @@ async def _run_child_block(
                         )
                 elif not state.run_context.has_parameter(parameter.key):
                     await state.run_context.register_aws_secret_parameter_value(parameter, platform_smtp_block=child)
-            report = await _execute_child(child, written, state)
+            page_url = await _page_url_at_start(state) if tool.nested_agent else None
+            report, child_block_id = await _execute_child(child, written, state)
+            if page_url is not None:
+                facts["page_url_at_start"] = page_url
+            if "files" in tool.fields:
+                attempts = await _upload_attempts(state, child_block_id, written.get("files") or [])
+                if attempts is not None:
+                    facts["upload_attempts"] = attempts
+            # Ahead of output, so the window that cuts a long output keeps them.
+            report = {"status": report["status"], **facts, **report}
             if (
                 report["status"] == BlockStatus.completed
                 and state.run_context.has_value(output_parameter.key)
@@ -670,12 +693,14 @@ async def _run_child_block(
             for key in temporary_smtp_keys:
                 state.run_context.parameters.pop(key, None)
                 state.run_context.values.pop(key, None)
-    _record_call(state, written, tool=tool_name, block_type=block_type.value, label=label, status=report["status"])
+    _record_call(
+        state, written, facts, tool=tool_name, block_type=block_type.value, label=label, status=report["status"]
+    )
     state.results[label] = report
     return _window(_masked_text(report, state.run_context), 0, label)
 
 
-async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> dict[str, Any]:
+async def _execute_child(child: Block, written: dict[str, Any], state: _RunState) -> tuple[dict[str, Any], str | None]:
     child._agent_smtp_isolation = True
     child.mark_fields_prerendered(written)
     # Children write their own LLM cost to their own rows.
@@ -686,7 +711,60 @@ async def _execute_child(child: Block, written: dict[str, Any], state: _RunState
             organization_id=state.organization_id,
             browser_session_id=state.browser_session_id,
         )
-    return {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    report = {"status": result.status, "output": result.output_parameter_value, "error": result.failure_reason}
+    return report, result.workflow_run_block_id
+
+
+def _url_fact(url: str) -> str:
+    if url == "about:blank" or url.startswith(_TOKEN_PREFIX):
+        return url
+    return sanitize_handoff_url(url) or "unparseable url"
+
+
+async def _page_url_at_start(state: _RunState) -> str | None:
+    try:
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(state.workflow_run_id)
+        page = await browser_state.get_working_page(prune_excess_pages=False) if browser_state else None
+        return _url_fact(page.url) if page else None
+    except Exception:
+        LOG.warning("Could not read the page url before a nested agent", label=state.label, exc_info=True)
+        return None
+
+
+async def _upload_attempts(
+    state: _RunState, workflow_run_block_id: str | None, files: list[str]
+) -> list[dict[str, str]] | None:
+    try:
+        if workflow_run_block_id is None:
+            return None
+        run_block = await app.DATABASE.observer.get_workflow_run_block(
+            workflow_run_block_id, organization_id=state.organization_id
+        )
+        if run_block.task_id is None:
+            return None
+        actions = await app.DATABASE.tasks.get_task_actions_hydrated(
+            run_block.task_id, organization_id=state.organization_id
+        )
+        handed = {key: state.run_context.values.get(key) for key in files}
+        attempts = []
+        for action in actions:
+            if not isinstance(action, UploadFileAction):
+                continue
+            # Task V3 stores the file argument as its model wrote it, so a handed signed URL is its opaque_url_ token.
+            parameter = next(
+                (
+                    key
+                    for key, value in handed.items()
+                    if mask_opaque_urls({key: value}).resolve(action.file_url) in string_leaves(value)
+                ),
+                None,
+            )
+            named = {"parameter": parameter} if parameter else {"source": _url_fact(action.file_url)}
+            attempts.append({**named, "status": action.status.value})
+        return attempts
+    except Exception:
+        LOG.warning("Could not read a nested agent's uploads", label=state.label, exc_info=True)
+        return None
 
 
 def _credential_keys(parameters: list[PARAMETER_TYPE]) -> list[str]:
