@@ -7249,7 +7249,7 @@ dev = [
     { name = "freezegun", specifier = ">=1.2.2,<2" },
     { name = "grpcio-tools", specifier = "==1.80.0" },
     { name = "gspread", specifier = ">=6" },
-    { name = "import-linter", specifier = ">=2.1,<3" },
+    { name = "import-linter", specifier = ">=2.5,<3" },
     { name = "ipykernel", specifier = ">=7.3.0,<8" },
     { name = "ipython", specifier = ">=8.17.2,<9" },
     { name = "isort", specifier = ">=5.13.2" },
