@@ -219,7 +219,7 @@ def decode_demonstration_record(raw: Any) -> DemonstrationRecord | None:
             {
                 key: value
                 for key, value in data["insertion"].items()
-                if key in {"after_label", "before_label"} and (isinstance(value, str) or value is None)
+                if key in {"after_label", "before_label", "replace_label"} and (isinstance(value, str) or value is None)
             }
             if isinstance(data.get("insertion"), dict)
             else None

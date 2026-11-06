@@ -32,7 +32,6 @@ from websockets import ConnectionClosedError, ConnectionClosedOK, Data
 from skyvern.config import settings
 from skyvern.exceptions import MissingRoutedVncAddressError
 from skyvern.forge.sdk.routes.streaming.auth import get_x_api_key
-from skyvern.forge.sdk.routes.streaming.channels.execution import execution_channel
 from skyvern.forge.sdk.routes.streaming.run_stream_outcome import RunStreamConnection
 from skyvern.forge.sdk.routes.streaming.verify import (
     loop_verify_browser_session,
@@ -93,7 +92,6 @@ class Keys:
         Cmd = b"\x04\x01\x00\x00\x00\x00\xff\xe9"
         Super = b"\x04\x01\x00\x00\x00\x00\xff\xeb"  # Cmd, from current frontends
         Alt = b"\x04\x01\x00\x00\x00\x00\xff~"  # option
-        CKey = b"\x04\x01\x00\x00\x00\x00\x00c"
         OKey = b"\x04\x01\x00\x00\x00\x00\x00o"
         VKey = b"\x04\x01\x00\x00\x00\x00\x00v"
 
@@ -130,12 +128,6 @@ class KeyState:
         Do not allow the opening of files.
         """
         return self.ctrl_is_down and data == Keys.Down.OKey
-
-    def is_copy(self, data: bytes) -> bool:
-        """
-        Detect Ctrl+C or Cmd+C for copy.
-        """
-        return (self.ctrl_is_down or self.cmd_is_down) and data == Keys.Down.CKey
 
     def is_paste(self, data: bytes) -> bool:
         """
@@ -444,28 +436,6 @@ class VncChannel:
         return time.monotonic() - self.remote_clipboard_synced_at <= REMOTE_CLIPBOARD_SYNC_PASTE_GRACE_SECONDS
 
 
-async def copy_text(vnc_channel: VncChannel) -> None:
-    class_name = vnc_channel.class_name
-    LOG.info(f"{class_name} Retrieving selected text via CDP", **vnc_channel.identity)
-
-    try:
-        async with execution_channel(vnc_channel) as execute:
-            copied_text = await execute.get_selected_text()
-
-            message_channel = get_message_channel(vnc_channel.client_id)
-
-            if message_channel:
-                await message_channel.send_copied_text(copied_text)
-            else:
-                LOG.info(
-                    f"{class_name} No message channel found for client, or it is not open",
-                    message_channel=message_channel,
-                    **vnc_channel.identity,
-                )
-    except Exception:
-        LOG.exception(f"{class_name} Failed to retrieve selected text via CDP", **vnc_channel.identity)
-
-
 async def ask_for_clipboard(vnc_channel: VncChannel) -> None:
     class_name = vnc_channel.class_name
     LOG.info(f"{class_name} Asking for clipboard data via CDP", **vnc_channel.identity)
@@ -584,9 +554,6 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
 
                         if message_type == MessageType.Keyboard.value:
                             vnc_channel.update_key_state(data)
-
-                            if vnc_channel.key_state.is_copy(data):
-                                await copy_text(vnc_channel)
 
                             if (
                                 vnc_channel.key_state.is_paste(data)
