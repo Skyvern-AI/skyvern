@@ -38,7 +38,11 @@ import {
   useCallback,
   memo,
 } from "react";
-import type { AxiosInstance, AxiosRequestConfig } from "axios";
+import {
+  isAxiosError,
+  type AxiosInstance,
+  type AxiosRequestConfig,
+} from "axios";
 import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
 import {
@@ -128,6 +132,8 @@ import {
   WorkflowCopilotCredentialGenerateResult,
   WorkflowCopilotCredentialResponseResult,
   WorkflowCopilotCredentialPauseResolvedUpdate,
+  CredentialSiteAnswer,
+  CredentialSiteQuestion,
   WorkflowCopilotDemonstrationInsertion,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
@@ -1070,20 +1076,28 @@ function autoBoundReceiptFor(
   return credentialCardFrameFor(turn) ? null : turn.credentialAutoBound;
 }
 
-// The persisted credentialPause carries no name, so a tab that received the live
-// credential_pause_resolved frame names the receipt from it.
 function historicalCredentialOutcome(
   pause: TurnNarrativeState["credentialPause"],
   pauseCardResolutions: Record<string, CredentialPauseHistorical>,
 ): CredentialPauseHistorical | undefined {
   if (!pause || pause.outcome === "declined") return undefined;
   const credentialId = pause.credentialId ?? undefined;
-  const name = credentialId
-    ? Object.values(pauseCardResolutions).find(
-        (resolution) => resolution.credentialId === credentialId,
-      )?.name
-    : undefined;
-  return { outcome: pause.outcome, credentialId, name };
+  const name =
+    pause.name ??
+    (credentialId
+      ? Object.values(pauseCardResolutions).find(
+          (resolution) => resolution.credentialId === credentialId,
+        )?.name
+      : undefined);
+  return {
+    outcome: pause.outcome,
+    credentialId,
+    name,
+    siteAnswer: pause.siteAnswer,
+    siteA: pause.siteA,
+    siteB: pause.siteB,
+    savedSites: pause.savedSites,
+  };
 }
 
 type CredentialResolution = CredentialPauseHistorical & {
@@ -1901,6 +1915,14 @@ export function WorkflowCopilotChat({
   // Live pause answers keyed by resume_token: one turn can raise a pick card and then an update card.
   const [pauseCardResolutions, setPauseCardResolutions] = useState<
     Record<string, CredentialResolution>
+  >({});
+  // Per resume token: the site question a pick raised, and whether its answer is still being saved.
+  const [siteQuestions, setSiteQuestions] = useState<
+    Record<string, { question: CredentialSiteQuestion; pending: boolean }>
+  >({});
+  // Per resume token: the user set aside the question the card opened with, to pick another login.
+  const [dismissedFrameQuestions, setDismissedFrameQuestions] = useState<
+    Record<string, true>
   >({});
   // Per resume token: a Done in flight, the site a Done found no sign-in for, or a Done that failed to save.
   const [manualSignIns, setManualSignIns] = useState<
@@ -2755,6 +2777,8 @@ export function WorkflowCopilotChat({
       action: "connected" | "skip" | "signing_in" | "signed_in" | "generate",
       credentialId?: string,
       name?: string,
+      siteAnswer?: CredentialSiteAnswer,
+      question?: CredentialSiteQuestion,
     ): Promise<WorkflowCopilotCredentialResponseResult | undefined> => {
       if (credentialResponseInFlight.current) return;
       if (
@@ -2795,6 +2819,12 @@ export function WorkflowCopilotChat({
           // Any answer, even an unconfirmed one, can mean a new saved login the picker should list.
           setCredentialsReloadKey((key) => key + 1);
         } else {
+          if (siteAnswer && question) {
+            setSiteQuestions((prev) => ({
+              ...prev,
+              [frame.resume_token]: { question, pending: true },
+            }));
+          }
           const response =
             await client.post<WorkflowCopilotCredentialResponseResult>(
               "/workflow/copilot/credential-response",
@@ -2803,6 +2833,8 @@ export function WorkflowCopilotChat({
                 action,
                 credential_id:
                   action === "connected" ? credentialId : undefined,
+                ...(action === "connected" ? { asks_site: true } : {}),
+                ...(siteAnswer ? { site_answer: siteAnswer } : {}),
               },
             );
           // A backend that predates sign-in answers 204 with no body.
@@ -2849,17 +2881,46 @@ export function WorkflowCopilotChat({
         ) {
           return result;
         }
+        const askedSite = result.site_question;
+        if (result.result === "site_question" && askedSite) {
+          setSiteQuestions((prev) => ({
+            ...prev,
+            [frame.resume_token]: { question: askedSite, pending: false },
+          }));
+          return result;
+        }
+        // The paused turn reads the login back and its credential_pause_resolved frame settles the card.
+        if (result.result === "site_change_unknown") return result;
+        const siteFacts =
+          siteAnswer && question
+            ? {
+                siteAnswer,
+                siteA: question.saved_sites[0],
+                savedSites: question.saved_sites,
+                siteB: question.site,
+                name: question.name,
+              }
+            : {};
         const resolution: CredentialResolution = generated
           ? {
               outcome: "connected",
               credentialId: generated.credential_id ?? undefined,
               name: generated.name ?? undefined,
             }
-          : action === "connected"
-            ? { outcome: "connected", credentialId, name }
-            : action === "signed_in"
-              ? { outcome: "signed_in" }
-              : { outcome: "skipped" };
+          : result.result === "site_changed_not_connected"
+            ? {
+                outcome: "timeout",
+                credentialId,
+                ...siteFacts,
+                siteSavedNotConnected: true,
+              }
+            : action === "connected" && siteAnswer === "no"
+              ? { outcome: "not_admitted", credentialId, ...siteFacts }
+              : action === "connected"
+                ? { outcome: "connected", credentialId, name, ...siteFacts }
+                : action === "signed_in"
+                  ? { outcome: "signed_in" }
+                  : { outcome: "skipped" };
         // The waiter's credential_pause_resolved frame can land first and carries the admitted verdict.
         setPauseCardResolutions((prev) =>
           prev[frame.resume_token]
@@ -2894,6 +2955,52 @@ export function WorkflowCopilotChat({
         if (action === "generate") {
           void refreshRegistrationCard(frame);
           return;
+        }
+        if (siteAnswer) {
+          // A 409 or 422 saved nothing and reopened the card, so the question is asked again on the next pick.
+          const status = isAxiosError(error)
+            ? error.response?.status
+            : undefined;
+          const conflict = status === 409 || status === 422;
+          setSiteQuestions((prev) => {
+            const next = { ...prev };
+            if (conflict) {
+              delete next[frame.resume_token];
+            } else if (next[frame.resume_token]) {
+              next[frame.resume_token] = {
+                ...next[frame.resume_token]!,
+                pending: false,
+              };
+            }
+            return next;
+          });
+          if (conflict) {
+            setDismissedFrameQuestions((prev) => ({
+              ...prev,
+              [frame.resume_token]: true,
+            }));
+          }
+          if (status === 422) {
+            const detail = isAxiosError(error)
+              ? error.response?.data?.detail
+              : undefined;
+            toast({
+              title: "Couldn't save this site on the login",
+              description:
+                typeof detail === "string" ? detail : "Pick another login.",
+              variant: "destructive",
+            });
+            return;
+          }
+          if (conflict) {
+            toast({
+              title: "This login changed",
+              description:
+                "Its sites changed since the card asked. Pick it again.",
+              variant: "destructive",
+            });
+            return;
+          }
         }
         toast({
           title: "Couldn't send your credential response",
@@ -8963,9 +9070,21 @@ export function WorkflowCopilotChat({
                   outcome: pause.outcome,
                   credentialId: pause.credentialId ?? undefined,
                   name: payload.name ?? undefined,
+                  ...(payload.site_answer
+                    ? {
+                        siteAnswer: payload.site_answer,
+                        siteA: payload.site_a ?? undefined,
+                        savedSites: payload.saved_sites ?? undefined,
+                        siteB: payload.site_b ?? undefined,
+                      }
+                    : {}),
                 };
                 setPauseCardResolutions((prev) =>
-                  withCappedResolution(prev, payload.resume_token, resolution),
+                  withCappedResolution(prev, payload.resume_token, {
+                    ...prev[payload.resume_token],
+                    ...resolution,
+                    name: resolution.name ?? prev[payload.resume_token]?.name,
+                  }),
                 );
                 return false;
               }
@@ -9985,7 +10104,11 @@ export function WorkflowCopilotChat({
   ) => (
     <CredentialCard
       key={frame.resume_token}
-      frame={liveFrameToCardFrame(frame)}
+      frame={liveFrameToCardFrame(
+        dismissedFrameQuestions[frame.resume_token]
+          ? { ...frame, site_question: null }
+          : frame,
+      )}
       mode="inline-pause"
       reloadKey={credentialsReloadKey}
       resolvedOutcome={pauseCardResolutions[frame.resume_token]}
@@ -10006,6 +10129,35 @@ export function WorkflowCopilotChat({
       }
       onSkip={() => void respondToCredentialPause(frame, "skip")}
       onGenerate={() => void respondToCredentialPause(frame, "generate")}
+      siteQuestion={siteQuestions[frame.resume_token]?.question}
+      siteAnswerPending={Boolean(siteQuestions[frame.resume_token]?.pending)}
+      onSiteAnswer={(answer) => {
+        const question =
+          siteQuestions[frame.resume_token]?.question ??
+          (dismissedFrameQuestions[frame.resume_token]
+            ? null
+            : frame.site_question);
+        if (!question) return;
+        void respondToCredentialPause(
+          frame,
+          "connected",
+          question.credential_id,
+          question.name,
+          answer,
+          question,
+        );
+      }}
+      onDismissSiteQuestion={() => {
+        setSiteQuestions((prev) => {
+          const next = { ...prev };
+          delete next[frame.resume_token];
+          return next;
+        });
+        setDismissedFrameQuestions((prev) => ({
+          ...prev,
+          [frame.resume_token]: true,
+        }));
+      }}
       signIn={
         frame.sign_in_browser_session_id &&
         frame.sign_in_browser_session_id === liveBrowserSessionId
