@@ -46,6 +46,7 @@ import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import { useStudioRunId } from "../../studio/useStudioRunId";
 import { docRunEndMessage, docRunRowsSettled } from "./docRunState";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
+import { saveAndReport } from "./docSaveState";
 import { docLatestRunKey, useDocRun } from "./useDocRun";
 
 class DocSaveFailedError extends Error {}
@@ -203,11 +204,18 @@ export function DocRunButton() {
     mutationFn: async (data: Record<string, unknown>) => {
       // Never run an older saved version than the doc on screen.
       if (useWorkflowHasChangesStore.getState().hasChanges) {
-        try {
-          await saveWorkflow.mutateAsync(undefined);
-        } catch {
-          throw new DocSaveFailedError();
-        }
+        // A refusal is not stored: the save's own toast already says it.
+        const outcome = await saveAndReport(
+          () => saveWorkflow.mutateAsync(undefined),
+          { recordRefusals: false },
+        );
+        // An unanswered save has no toast of its own, and the edit bar's reason can be scrolled out of view.
+        if (outcome === "released")
+          toast({
+            variant: "destructive",
+            title: "Couldn't save: can't reach the server",
+          });
+        if (outcome !== "saved") throw new DocSaveFailedError();
         if (useWorkflowHasChangesStore.getState().hasChanges)
           throw new Error("Save the agent before running");
       }
@@ -250,7 +258,7 @@ export function DocRunButton() {
     onError: (
       error: Error & { response?: { data?: { detail?: unknown } } },
     ) => {
-      // A failed save already showed its own reason.
+      // A failed save already told the person.
       if (error instanceof DocSaveFailedError) return;
       const detail = error.response?.data?.detail;
       toast({

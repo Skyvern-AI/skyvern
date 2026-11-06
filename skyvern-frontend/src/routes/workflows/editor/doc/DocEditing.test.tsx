@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -21,6 +22,7 @@ import {
 import { useWorkflowSnapshotStore } from "@/store/WorkflowSnapshotStore";
 
 import { DocEditBar, DocStepPicker } from "./DocEditing";
+import { useDocSaveFailureStore } from "./docSaveState";
 import { caretOnEdge } from "./docCaret";
 import { DocStepHeader } from "./DocStep";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
@@ -60,6 +62,8 @@ afterEach(() => {
   useWorkflowHistoryAccessStore.getState().reset();
   useWorkflowSnapshotStore.getState().clearSnapshot();
   useWorkflowHasChangesStore.setState({ hasChanges: false });
+  useWorkflowYamlEditorStore.setState({ editorOwner: null, pendingSaves: {} });
+  useDocSaveFailureStore.setState({ failures: {} });
 });
 
 describe("Doc edit bar row", () => {
@@ -110,6 +114,9 @@ describe("Doc Save", () => {
   });
 
   test("a failed save says why, keeps the edit and offers Try again", async () => {
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: { workflowPermanentId: "wpid_1", active: true },
+    });
     useWorkflowHasChangesStore.setState({ hasChanges: true });
     save.mockRejectedValueOnce(new AxiosError("Network Error", "ERR_NETWORK"));
     render(<DocEditBar />);
@@ -146,13 +153,59 @@ describe("Doc Save", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await screen.findByText(/Couldn't save/);
-    const pendingSaves = useWorkflowYamlEditorStore.getState().pendingSaves;
-    expect(pendingSaves.wpid_a).toBeUndefined();
-    expect(pendingSaves.wpid_b?.persisting).toBe(true);
+    await waitFor(() =>
+      expect(
+        useWorkflowYamlEditorStore.getState().pendingSaves.wpid_a,
+      ).toBeUndefined(),
+    );
+    expect(
+      useWorkflowYamlEditorStore.getState().pendingSaves.wpid_b?.persisting,
+    ).toBe(true);
+    // The reason belongs to the workflow that failed, not to the one now open.
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_a: "can't reach the server",
+    });
+    expect(screen.queryByText(/Couldn't save/)).toBe(null);
+  });
+
+  test("a failure recorded for another workflow does not show on this bar", () => {
     useWorkflowYamlEditorStore.setState({
-      editorOwner: null,
-      pendingSaves: {},
+      editorOwner: { workflowPermanentId: "wpid_b", active: true },
+    });
+    useDocSaveFailureStore.setState({
+      failures: { wpid_a: "can't reach the server" },
+    });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    render(<DocEditBar />);
+
+    expect(screen.queryByText(/Couldn't save/)).toBe(null);
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy();
+  });
+
+  test("the bar drops only its own workflow's failure when the Doc unmounts or has no unsaved changes", () => {
+    useWorkflowYamlEditorStore.setState({
+      editorOwner: { workflowPermanentId: "wpid_1", active: true },
+    });
+    const failures = {
+      wpid_1: "can't reach the server",
+      wpid_2: "the server had a problem",
+    };
+    useDocSaveFailureStore.setState({ failures });
+    useWorkflowHasChangesStore.setState({ hasChanges: true });
+    const { unmount } = render(<DocEditBar />);
+    expect(
+      screen.getByText(/Couldn't save: can't reach the server/),
+    ).toBeTruthy();
+    unmount();
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_2: "the server had a problem",
+    });
+
+    useDocSaveFailureStore.setState({ failures });
+    render(<DocEditBar />);
+    act(() => useWorkflowHasChangesStore.getState().setHasChanges(false));
+    expect(useDocSaveFailureStore.getState().failures).toEqual({
+      wpid_2: "the server had a problem",
     });
   });
 
