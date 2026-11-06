@@ -982,6 +982,10 @@ class ScriptSkyvernPage(SkyvernPage):
         workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(context.workflow_run_id)
         return bool(workflow_run_context and workflow_run_context.get_original_secret_value_or_none(value) is not None)
 
+    def _is_card_secret_reference(self, value: str) -> bool:
+        context = skyvern_context.current()
+        return context is not None and app.WORKFLOW_CONTEXT_MANAGER.is_card_secret_text(context.workflow_run_id, value)
+
     # Class-level cache for TOTP codes to ensure all digits in a sequence use the same code
     # Key: (workflow_run_id, credential_key), Value: totp_code
     # Uses TTLCache with 30-second expiry (aligned with TOTP rotation period)

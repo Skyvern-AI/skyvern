@@ -16,6 +16,25 @@ DEMONSTRATED_OPERATIONS = frozenset(
     | {"select_option"}
 )
 BROWSER_SESSION_UNAVAILABLE_ERROR_CODE = "browser_session_unavailable"
+# Page operations refused on a page a secret-carrying test ran in, because each can return a transformation of a
+# secret that value-matching scrubbing cannot catch; text reads stay allowed since scrubbing covers them.
+DENIED_WHILE_TAINTED = frozenset(
+    {
+        "screenshot",
+        "pdf",
+        "evaluate",
+        "evaluate_all",
+        "evaluate_handle",
+        "eval_on_selector",
+        "eval_on_selector_all",
+        "wait_for_function",
+        "add_script_tag",
+        # Takes HTML, not a script, but a <script> element in it runs in the tainted origin.
+        "set_content",
+        "click_and_download",
+        "cookies",
+    }
+)
 
 
 class BrowserCodeSessionUnavailableError(Exception):

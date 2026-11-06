@@ -3,7 +3,6 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
 import { copyText } from "@/util/copyText";
 import { getWebSocketProtocols } from "@/util/env";
-import { useClientIdStore } from "@/store/useClientIdStore";
 import {
   mouseButtonName,
   getModifiers,
@@ -18,6 +17,7 @@ const RECONNECTABLE_CODES = new Set([1006, 1011, 4408, 4410, 4411]);
 const MOUSE_MOVE_BUFFER_THRESHOLD = 64 * 1024;
 
 interface UseCdpInputOptions {
+  clientId: string;
   inputWsUrl: string | null;
   interactive: boolean;
   viewportWidth: number;
@@ -122,6 +122,7 @@ function isEditableTarget(target: EventTarget | null) {
 }
 
 export function useCdpInput({
+  clientId,
   inputWsUrl,
   interactive,
   viewportWidth,
@@ -137,7 +138,6 @@ export function useCdpInput({
   const [navigateError, setNavigateError] = useState<string | null>(null);
   const credentialGetter = useCredentialGetter();
   const logging = useLogging();
-  const clientId = useClientIdStore((s) => s.clientId);
 
   const inputSocketRef = useRef<WebSocket | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);

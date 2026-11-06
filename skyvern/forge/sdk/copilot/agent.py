@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import os
 import re
 import subprocess
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -102,6 +103,7 @@ from skyvern.forge.sdk.copilot.context import (
     SIGNED_OUT_PAGE_SUMMARY_CHAR_CAP,
     UPDATE_AND_RUN_BLOCKS_TOOL_NAME,
     AgentResult,
+    ChatHistoryRow,
     CodeAuthoringRepairContext,
     CopilotContext,
     HistoricalNarrativeTurnFacts,
@@ -235,6 +237,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     BrowserProbeOutcome,
     _browser_context_attachability,
+    cancel_ledgered_build_test_prestarts,
     close_browser_session_quietly,
     end_minted_browser_renewals,
     record_attached_browser_driver,
@@ -591,7 +594,7 @@ async def _resolve_live_browser_session_id(
 
 
 def _historical_turn_facts_projection(
-    narrative_payload: TurnNarrativePayload | None,
+    narrative_payload: Mapping[str, Any] | None,
 ) -> HistoricalTurnFactsProjection | None:
     if not isinstance(narrative_payload, dict):
         return None
@@ -760,7 +763,11 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
         role = chat_history_role(msg.sender)
         questions = msg.narrative_payload.get("questionInteractions", []) if msg.narrative_payload is not None else []
         for raw in questions:
-            interaction = QuestionInteraction.model_validate(raw)
+            try:
+                interaction = QuestionInteraction.model_validate(raw)
+            except ValidationError:
+                lines.append("user question interaction: unreadable")
+                continue
             if interaction.account_group_review is not None or interaction.account_group_cancel is not None:
                 summary = (
                     interaction.tool_result()
@@ -796,6 +803,57 @@ def _format_chat_history(chat_history: list[WorkflowCopilotChatHistoryMessage]) 
         if expiry is not None:
             lines.append(f"turn_outcome: {expiry}")
     return "\n".join(lines)
+
+
+def _chat_history_message_for_prompt(msg: WorkflowCopilotChatHistoryMessage) -> str:
+    return redact_raw_secrets_for_prompt(_format_chat_history([msg]))
+
+
+def _chat_history_text_for_prompt(
+    window: Sequence[WorkflowCopilotChatHistoryMessage],
+    earlier: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> str:
+    text = "\n".join(_chat_history_message_for_prompt(msg) for msg in window)
+    if not earlier:
+        return text
+    oldest_shown_id = window[0].workflow_copilot_chat_message_id
+    return f"earlier_messages_not_shown: {len(earlier)}; oldest_shown_message_id: {oldest_shown_id}\n{text}"
+
+
+def _earlier_chat_history(
+    window: Sequence[WorkflowCopilotChatHistoryMessage],
+    full_chat: Sequence[WorkflowCopilotChatHistoryMessage],
+) -> list[WorkflowCopilotChatHistoryMessage] | None:
+    """Rows of ``full_chat`` before ``window``, or None when ``window`` is not exactly its id-bearing tail."""
+    window_start = len(full_chat) - len(window)
+    window_ids = [msg.workflow_copilot_chat_message_id for msg in window]
+    earlier = list(full_chat[: max(window_start, 0)])
+    tail_ids = [msg.workflow_copilot_chat_message_id for msg in full_chat[max(window_start, 0) :]]
+    ids_present = not earlier or (
+        bool(window_ids) and all([window_ids[0], *(msg.workflow_copilot_chat_message_id for msg in earlier)])
+    )
+    if window_start >= 0 and tail_ids == window_ids and ids_present:
+        return earlier
+    if window_start > 0:
+        LOG.warning(
+            "Chat history window is not the tail of the chat; earlier messages withheld",
+            window_count=len(window),
+            chat_count=len(full_chat),
+        )
+    return None
+
+
+def _chat_history_rows(messages: Sequence[WorkflowCopilotChatHistoryMessage]) -> tuple[ChatHistoryRow, ...]:
+    return tuple(
+        ChatHistoryRow(
+            message_id=msg.workflow_copilot_chat_message_id,
+            sender=msg.sender,
+            created_at=msg.created_at.isoformat(),
+            text=_chat_history_message_for_prompt(msg),
+        )
+        for msg in messages
+        if msg.workflow_copilot_chat_message_id
+    )
 
 
 def _build_block_goal_main_goal(
@@ -1473,7 +1531,10 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         # The occupying run id is cleared first -- prompt atoms carry no raw run ids, and leaving it
         # in makes the leak guard drop the whole line rather than redact the id.
         sentence = build_test_connect_failure_sentence(connect_failure.model_copy(update={"occupier_run_id": None}))
-        lines.append(f"browser_acquisition_failed: {_clean_authoring_repair_prompt_atom(sentence)}")
+        lines.append(
+            "browser_acquisition_failed: "
+            f"{_clean_authoring_repair_prompt_atom(sentence, max_chars=RUNTIME_FAILURE_REASON_MAX_CHARS)}"
+        )
     # Facts render for every outcome; the two post-run page-path directives bind the model's next
     # action, so they keep the authority check and stay on turns that may author code, the only ones
     # they were built and measured for.
@@ -1762,6 +1823,7 @@ _RAW_SECRET_CARD_NOT_CONNECTED = {
     "declined": "The credential card could not be shown. ",
     "not_admitted": "The credential you connected is saved for a different site, so it was not used. ",
 }
+_RAW_SECRET_CARD_DECLINED_SITE = "You chose not to use the saved credential on this site. "
 
 
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
@@ -1779,22 +1841,13 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         return f"{lead} {reply}{keep_draft_affordance}" if reply else lead
 
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
-    if (
-        policy is not None
-        and policy.clarification_reason == "workflow_credential_inputs_unbound"
-        and ctx.last_workflow is not None
-        and block_count is not None
-    ):
-        return lead_then_reply(
-            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-            "the required credentials. Add them in Credentials, then I can try again."
-        )
-
     if ctx.last_test_ok is False and block_count is not None:
         connect_failure = _terminal_connect_failure(ctx)
         if connect_failure is not None and connect_failure.state == "billing_credit_admission_refusal":
             sentence = build_test_connect_failure_sentence(connect_failure)
             return lead_then_reply(f"I couldn't start a test. {sentence} The draft is untested.")
+        if connect_failure is not None and connect_failure.workflow_run_id:
+            return lead_then_reply(f"I couldn't test the draft. {build_test_connect_failure_sentence(connect_failure)}")
 
         # No run row means nothing executed, so claiming the draft was tested is false.
         if (
@@ -1821,6 +1874,13 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
                 return (
                     f"I drafted the workflow, withheld a value that may be a secret, and {binding}. "
                     "This draft is untested; ask me to test it in a later message."
+                )
+            site_answer = ctx.credential_pause_site_answer
+            if site_answer is not None and site_answer.action == "no":
+                return (
+                    "I drafted the workflow and withheld a value that may be a secret. "
+                    f"{_RAW_SECRET_CARD_DECLINED_SITE}Store the value as a saved credential before testing. "
+                    "This draft has not been verified end-to-end."
                 )
             not_connected = _RAW_SECRET_CARD_NOT_CONNECTED.get(ctx.credential_pause_outcome or "", "")
             return (
@@ -5352,8 +5412,10 @@ async def run_copilot_agent(
             finally:
                 turn_end_ctx = ctx_sink[0] if ctx_sink else None
                 if turn_end_ctx is not None:
-                    # Synchronous and first, so no later cleanup step that raises or is cancelled can leave a
-                    # minted browser stamped for the life of this process.
+                    # These three run synchronously before any awaited cleanup, so a later step that raises or is
+                    # cancelled cannot leave a pre-start running or a minted browser stamped for this process's life.
+                    turn_end_ctx.prestart_teardown_started = True
+                    cancel_ledgered_build_test_prestarts(turn_end_ctx)
                     end_minted_browser_renewals(turn_end_ctx)
                 _log_authoring_turn_summary(turn_end_ctx)
                 finalize_outcome_verification_trace(turn_end_ctx, turn_span)
@@ -5465,8 +5527,8 @@ async def _run_copilot_turn_impl(
     # server-owned evidence that the corresponding user turn must never re-enter a model prompt.
     safe_chat_history_messages = redact_refused_secret_turns(chat_history)
     safe_prior_user_messages = redact_refused_secret_turns(list(prior_user_messages))
-    chat_history_text = _format_chat_history(safe_chat_history_messages)
-    safe_chat_history_text = redact_raw_secrets_for_prompt(chat_history_text)
+    earlier_chat_history = _earlier_chat_history(safe_chat_history_messages, safe_prior_user_messages)
+    safe_chat_history_text = _chat_history_text_for_prompt(safe_chat_history_messages, earlier_chat_history or [])
     safe_global_llm_context = build_model_safe_global_llm_context(global_llm_context)
     previous_user_messages = [msg.content for msg in safe_chat_history_messages if msg.sender in TURN_OPENER_SENDERS]
     previous_user_message = previous_user_messages[-1] if previous_user_messages else None
@@ -5512,6 +5574,11 @@ async def _run_copilot_turn_impl(
 
     ctx = CopilotContext(
         organization_id=organization_id,
+        earlier_chat_history_rows=functools.cache(functools.partial(_chat_history_rows, earlier_chat_history or [])),
+        earlier_chat_history_unavailable=earlier_chat_history is None,
+        chat_history_oldest_shown_id=(
+            safe_chat_history_messages[0].workflow_copilot_chat_message_id if earlier_chat_history else None
+        ),
         workflow_id=chat_request.workflow_id,
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_yaml=chat_request.workflow_yaml or "",

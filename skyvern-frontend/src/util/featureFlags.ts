@@ -1,5 +1,3 @@
-export const ANALYTICS_DASHBOARD_FLAG = "ANALYTICS_DASHBOARD";
-
 // Gates the anomaly alert feed on /analytics; the backend /analytics/anomalies
 // route enforces the same flag server-side.
 export const ANALYTICS_ANOMALY_DETECTION_FLAG = "ANALYTICS_ANOMALY_DETECTION";

@@ -22,6 +22,7 @@ from skyvern.exceptions import BlockedNavigationDestination, InvalidUrl, Unresol
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
+from skyvern.forge.sdk.routes.streaming.channels.vnc import STREAM_AUTHORIZATION_RECHECK_SECONDS
 from skyvern.forge.sdk.routes.streaming.payload_limits import MAX_CLIPBOARD_PASTE_BYTES
 from skyvern.forge.sdk.routes.streaming.screencast import (
     _resolve_working_page,
@@ -29,6 +30,7 @@ from skyvern.forge.sdk.routes.streaming.screencast import (
     wait_for_browser_state,
 )
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
+from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal
 from skyvern.forge.sdk.streaming.registries import (
     add_cdp_input_channel,
     del_cdp_input_channel,
@@ -377,6 +379,51 @@ async def _close_ws_safely(websocket: WebSocket, code: int, reason: str = "") ->
         await websocket.close(code=code, reason=reason)
     except Exception:
         pass
+
+
+async def _reauthorize_stream_periodically(
+    websocket: WebSocket,
+    reauthorize: t.Callable[[], t.Awaitable[bool]],
+    log_context: dict[str, str],
+    should_reauthorize: t.Callable[[], t.Awaitable[bool]] | None = None,
+) -> None:
+    grace = 3 * STREAM_AUTHORIZATION_RECHECK_SECONDS
+    failure_started_at: float | None = None
+    while True:
+        await asyncio.sleep(STREAM_AUTHORIZATION_RECHECK_SECONDS)
+        if should_reauthorize is not None:
+            try:
+                required = await should_reauthorize()
+            except PermissionError:
+                await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+                return
+            except Exception:
+                LOG.warning("CDP input: enforcement-state check failed; retrying", **log_context, exc_info=True)
+                continue
+            if not required:
+                continue
+            should_reauthorize = None
+        attempt_started_at = time.monotonic()
+        timeout = grace if failure_started_at is None else max(0.001, grace - (attempt_started_at - failure_started_at))
+        try:
+            authorized = await asyncio.wait_for(reauthorize(), timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except PermissionError:
+            await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+            return
+        except Exception:
+            LOG.warning("CDP input: browser-session reauthorization failed", **log_context, exc_info=True)
+            if failure_started_at is None:
+                failure_started_at = attempt_started_at
+            if time.monotonic() - failure_started_at >= grace:
+                await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+                return
+            continue
+        if not authorized:
+            await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+            return
+        failure_started_at = None
 
 
 _EVENT_DISPATCH_MAP: dict[str, tuple[t.Callable[[dict], dict | None], str]] = {
@@ -823,6 +870,7 @@ async def cdp_input_stream(
     cdp_session: CDPSession | None = None
     input_session: ActivePageCdpInputSession | None = None
     browser_state: BrowserState | None = None
+    reauthorization_task: asyncio.Task[None] | None = None
     stream_registered = False
     try:
         deadline = time.monotonic() + 120
@@ -861,6 +909,81 @@ async def cdp_input_stream(
             await websocket.close(code=4408, reason="browser_state_timeout")
             return
 
+        principal = get_request_principal()
+        last_browser_session_id: str | None = None
+
+        async def resolve_browser_session_id() -> str | None:
+            persistent_session = await app.PERSISTENT_SESSIONS_MANAGER.get_session_by_runnable_id(
+                runnable_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            return persistent_session.persistent_browser_session_id if persistent_session is not None else None
+
+        try:
+            last_browser_session_id = await resolve_browser_session_id()
+            if last_browser_session_id is not None and not await app.AGENT_FUNCTION.authorize_browser_session_stream(
+                principal, organization_id, last_browser_session_id
+            ):
+                await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+                return
+            reauthorization_required = await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(
+                principal, organization_id
+            )
+            monitor_required = False
+            monitor_hook = getattr(app.AGENT_FUNCTION, "browser_session_stream_enforcement_monitor_required", None)
+            if not reauthorization_required and monitor_hook is not None:
+                monitor_required = await monitor_hook(principal, organization_id)
+            if reauthorization_required or monitor_required:
+
+                async def reauthorize_current_session() -> bool:
+                    nonlocal last_browser_session_id
+                    browser_session_id = await resolve_browser_session_id()
+                    if browser_session_id is None:
+                        if last_browser_session_id is not None:
+                            return False
+                        if isinstance(principal, RequestPrincipal) and principal.api_key_access_mode == "scoped":
+                            return await app.AGENT_FUNCTION.reauthorize_workflow_run_stream(
+                                principal,
+                                organization_id,
+                                workflow_run_id,
+                                "browser_session.connect",
+                                folder_action="workflow_run.execute",
+                            )
+                        return await app.AGENT_FUNCTION.reauthorize_workflow_run_stream(
+                            principal, organization_id, workflow_run_id, "workflow_run.execute"
+                        )
+                    authorized = await app.AGENT_FUNCTION.reauthorize_browser_session_stream(
+                        principal, organization_id, browser_session_id
+                    )
+                    if authorized:
+                        last_browser_session_id = browser_session_id
+                    return authorized
+
+                async def should_reauthorize() -> bool:
+                    return await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(
+                        principal, organization_id
+                    )
+
+                reauthorization_task = asyncio.create_task(
+                    _reauthorize_stream_periodically(
+                        websocket,
+                        reauthorize_current_session,
+                        {"workflow_run_id": workflow_run_id, "browser_session_id": last_browser_session_id or "none"},
+                        should_reauthorize=should_reauthorize if monitor_required else None,
+                    )
+                )
+        except PermissionError:
+            await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+            return
+        except Exception:
+            LOG.warning(
+                "CDP input: browser-session authorization failed",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            await _close_ws_safely(websocket, 1011, "authorization-temporarily-unavailable")
+            return
+
         input_session = ActivePageCdpInputSession(browser_state, workflow_run_id, "workflow_run")
         cdp_session = await input_session.get_session(force_refresh=True)
         if cdp_session is None:
@@ -882,13 +1005,18 @@ async def cdp_input_stream(
         LOG.warning("CDP input: unexpected error", workflow_run_id=workflow_run_id, exc_info=True)
     finally:
         try:
-            await _close_input_session_and_release_browser_state(
-                input_session, browser_state, "workflow_run", workflow_run_id
-            )
+            if reauthorization_task is not None:
+                reauthorization_task.cancel()
+                await asyncio.gather(reauthorization_task, return_exceptions=True)
         finally:
-            if stream_registered:
-                await stream_ref_dec(workflow_run_id)
-        await channel.close()
+            try:
+                await _close_input_session_and_release_browser_state(
+                    input_session, browser_state, "workflow_run", workflow_run_id
+                )
+            finally:
+                if stream_registered:
+                    await stream_ref_dec(workflow_run_id)
+            await channel.close()
         LOG.info("CDP input channel closed", workflow_run_id=workflow_run_id, client_id=client_id)
 
 
@@ -916,6 +1044,30 @@ async def cdp_input_browser_session_stream(
         return
     assert client_id is not None
 
+    principal = get_request_principal()
+    try:
+        if not await app.AGENT_FUNCTION.authorize_browser_session_stream(
+            principal, organization_id, browser_session_id
+        ):
+            await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+            return
+        reauthorization_required = await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(
+            principal, organization_id
+        )
+        monitor_hook = getattr(app.AGENT_FUNCTION, "browser_session_stream_enforcement_monitor_required", None)
+        monitor_required = (
+            not reauthorization_required and monitor_hook is not None and await monitor_hook(principal, organization_id)
+        )
+    except PermissionError:
+        await _close_ws_safely(websocket, 4403, "browser-session-access-denied")
+        return
+    except Exception:
+        LOG.warning(
+            "CDP input: browser-session authorization failed", browser_session_id=browser_session_id, exc_info=True
+        )
+        await _close_ws_safely(websocket, 1011, "authorization-temporarily-unavailable")
+        return
+
     channel = CdpInputChannel(
         client_id=client_id,
         organization_id=organization_id,
@@ -924,7 +1076,29 @@ async def cdp_input_browser_session_stream(
 
     input_session: ActivePageCdpInputSession | None = None
     browser_state: BrowserState | None = None
+    reauthorization_task: asyncio.Task[None] | None = None
     try:
+        if reauthorization_required or monitor_required:
+
+            async def reauthorize_current_session() -> bool:
+                return await app.AGENT_FUNCTION.reauthorize_browser_session_stream(
+                    principal, organization_id, browser_session_id
+                )
+
+            async def should_reauthorize() -> bool:
+                return await app.AGENT_FUNCTION.browser_session_stream_reauthorization_required(
+                    principal, organization_id
+                )
+
+            reauthorization_task = asyncio.create_task(
+                _reauthorize_stream_periodically(
+                    websocket,
+                    reauthorize_current_session,
+                    {"browser_session_id": browser_session_id},
+                    should_reauthorize=should_reauthorize if monitor_required else None,
+                )
+            )
+
         session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
             session_id=browser_session_id,
             organization_id=organization_id,
@@ -970,8 +1144,13 @@ async def cdp_input_browser_session_stream(
     except Exception:
         LOG.warning("CDP input: unexpected error", browser_session_id=browser_session_id, exc_info=True)
     finally:
-        await _close_input_session_and_release_browser_state(
-            input_session, browser_state, "browser_session", browser_session_id
-        )
-        await channel.close()
+        try:
+            if reauthorization_task is not None:
+                reauthorization_task.cancel()
+                await asyncio.gather(reauthorization_task, return_exceptions=True)
+        finally:
+            await _close_input_session_and_release_browser_state(
+                input_session, browser_state, "browser_session", browser_session_id
+            )
+            await channel.close()
         LOG.info("CDP input channel closed", browser_session_id=browser_session_id, client_id=client_id)

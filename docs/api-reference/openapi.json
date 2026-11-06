@@ -259,7 +259,6 @@
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
-                      "yutori_navigator": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
                   },
@@ -542,6 +541,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -553,6 +553,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "default": 10,
               "title": "Page Size"
@@ -954,6 +955,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number",
               "default": 1,
@@ -2977,6 +2979,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -2988,6 +2991,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "default": 10,
               "title": "Page Size"
@@ -4026,6 +4030,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination",
               "examples": [
@@ -4045,6 +4050,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of items per page",
               "examples": [
@@ -4832,6 +4838,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination",
               "examples": [
@@ -4848,6 +4855,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of items per page",
               "examples": [
@@ -5130,6 +5138,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "default": 1,
               "title": "Page"
@@ -6031,6 +6040,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination.",
               "default": 1,
@@ -6044,6 +6054,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of runs to return per page.",
               "default": 10,
@@ -6224,6 +6235,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number for pagination.",
               "default": 1,
@@ -6237,6 +6249,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000,
               "minimum": 1,
               "description": "Number of runs to return per page.",
               "default": 10,
@@ -6452,7 +6465,9 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "integer"
+                  "type": "integer",
+                  "maximum": 2147483647,
+                  "minimum": 1
                 },
                 {
                   "type": "null"
@@ -7526,6 +7541,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 1000000,
               "minimum": 1,
               "description": "Page number.",
               "default": 1,
@@ -9613,7 +9629,7 @@
               }
             ],
             "title": "Tools",
-            "description": "The tools the step may call. A block it runs through run_block is named by its block type, such as http_request. finish and read_run_data are always offered, and login only when the run has a credential parameter. Without a list the step has no other tools."
+            "description": "The tools the step may call. A block it runs through run_block is named by its block type, such as http_request. finish and read_run_data are always offered, and login only when parameter_keys lists a credential parameter. Without a list the step has no other tools."
           }
         },
         "type": "object",
@@ -11319,7 +11335,7 @@
           "degraded_fresh"
         ],
         "title": "BrowserSeedSource",
-        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved once at run setup, before any browser creation, for all run types (C-semantics).\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
+        "description": "Which layer of the seed-precedence chain seeded a run's browser (provenance).\n\nResolved at run setup, before any browser creation, for all run types (C-semantics). A\nserialized Save & Reuse run re-resolves once more after the sequential wait, so a profile an\nearlier run in its lane saved while it was queued becomes own_memory rather than a stale pick.\n- override: explicit request browser_profile_id (one-run-only pick via API)\n- picked: the workflow's explicit profile pick (workflows.browser_profile_id) — \"always start here\"\n- own_memory: the workflow's own auto-profile (no pick + persist_browser_session)\n- credential: the run's selected credential's profile (rotation-aware; also the empty-own boot)\n- fresh: no seed profile\n- degraded_fresh: a resolved profile failed to load; ran fresh"
       },
       "BrowserSessionResponse": {
         "properties": {
@@ -11418,6 +11434,12 @@
               "http://localhost:9222",
               "https://3.12.10.11/browser/123456"
             ]
+          },
+          "browser_address_redacted": {
+            "type": "boolean",
+            "title": "Browser Address Redacted",
+            "description": "Whether the browser address was withheld because this caller cannot connect",
+            "default": false
           },
           "app_url": {
             "anyOf": [
@@ -13493,6 +13515,14 @@
             "title": "Tested Url",
             "description": "Login page URL used during the credential test"
           },
+          "extra_site_urls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Extra Site Urls",
+            "description": "More sites this login may sign in on, each covering its whole site"
+          },
           "user_context": {
             "anyOf": [
               {
@@ -14690,6 +14720,26 @@
             ],
             "title": "Email Client"
           },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id"
+          },
           "credential_id": {
             "anyOf": [
               {
@@ -14897,6 +14947,27 @@
               "outlook"
             ],
             "title": "Email Client"
+          },
+          "credential_source": {
+            "type": "string",
+            "enum": [
+              "native",
+              "nango"
+            ],
+            "title": "Credential Source",
+            "default": "native"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connection Id",
+            "x-skyvern-connected-account": true
           },
           "credential_id": {
             "anyOf": [
@@ -23062,6 +23133,12 @@
             "type": "string",
             "title": "Connection Id"
           },
+          "credential_source": {
+            "type": "string",
+            "const": "nango",
+            "title": "Credential Source",
+            "default": "nango"
+          },
           "dataset_id": {
             "type": "string",
             "title": "Dataset Id"
@@ -23202,8 +23279,14 @@
             "type": "string",
             "minLength": 1,
             "title": "Connection Id",
-            "description": "Microsoft OAuth credential ID for this user.",
+            "description": "Power BI connection ID for this user.",
             "x-skyvern-connected-account": true
+          },
+          "credential_source": {
+            "type": "string",
+            "const": "nango",
+            "title": "Credential Source",
+            "default": "nango"
           },
           "dataset_id": {
             "type": "string",
@@ -23772,8 +23855,7 @@
           "skyvern-3.0",
           "openai-cua",
           "anthropic-cua",
-          "ui-tars",
-          "yutori-navigator"
+          "ui-tars"
         ],
         "title": "RunEngine"
       },
@@ -24037,8 +24119,7 @@
           "workflow_run",
           "openai_cua",
           "anthropic_cua",
-          "ui_tars",
-          "yutori_navigator"
+          "ui_tars"
         ],
         "title": "RunType"
       },
@@ -27587,8 +27668,7 @@
               "task_v3",
               "openai_cua",
               "anthropic_cua",
-              "ui_tars",
-              "yutori_navigator"
+              "ui_tars"
             ],
             "title": "Run Type",
             "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"

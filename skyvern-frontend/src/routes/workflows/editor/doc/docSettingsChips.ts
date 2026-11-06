@@ -131,7 +131,6 @@ export function getDocSettingsChips(
         "skyvern-3.0": "Skyvern 3.0",
         "openai-cua": "OpenAI CUA",
         "anthropic-cua": "Anthropic CUA",
-        "yutori-navigator": "Yutori Navigator",
       };
       if (typeof value !== "string" || !engines[value]) return [];
       formatted = engines[value]!;

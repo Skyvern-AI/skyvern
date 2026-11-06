@@ -91,25 +91,6 @@ def _client_classes(path: Path) -> dict[str, ast.ClassDef]:
     return {statement.name: statement for statement in tree.body if isinstance(statement, ast.ClassDef)}
 
 
-def test_top_level_type_names_include_module_scope_control_flow(tmp_path: Path) -> None:
-    """Generated types inside a module-level conditional must remain part of the export surface."""
-    module = tmp_path / "conditional_type.py"
-    module.write_text(
-        """
-if enabled:
-    class ConditionalType:
-        pass
-
-try:
-    TryType = str
-except ImportError:
-    FallbackType = str
-"""
-    )
-
-    assert _top_level_type_names(module) == {"ConditionalType", "FallbackType", "TryType"}
-
-
 def test_type_exports_match_generated_type_modules() -> None:
     """Every generated type is registered once in both type-package export declarations."""
     derived_imports = _derived_type_imports()

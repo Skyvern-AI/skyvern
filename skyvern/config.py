@@ -320,8 +320,6 @@ class Settings(BaseSettings):
     # dispatch is unavailable, instead of failing closed. Grants nothing on its own -- see
     # AgentFunction.allow_copilot_inline_code_execution for the conditions it is ANDed with.
     COPILOT_ALLOW_INLINE_CODE_EXECUTION: bool = False
-    # Default code_only for MCP block/workflow tools. Off = permissive.
-    MCP_CODE_ONLY_MODE: bool = False
     RUN_HEARTBEAT_TIMEOUT_MINUTES: int = 30
     PORT: int = 8000
     # uvicorn answers 503 without dispatching to ASGI once *either* open connections or in-flight
@@ -590,6 +588,9 @@ class Settings(BaseSettings):
     # Kill switch for committing a list row that names the value without being it exactly (its main label, a
     # singular/plural, a unique word prefix on a click-opened list) (SKY-18017). Off: typeaheads commit exact rows only.
     TASK_V3_CHOICE_NONEXACT_COMMIT: bool = True
+    # Kill switch: hold a Task V3 typing call whose field is still refused by the same live layer that refused an earlier
+    # one, instead of re-running the full typing path for it (SKY-19408). Off: every call runs its full path as before.
+    TASK_V3_SAME_LAYER_TYPE_HOLD: bool = True
     # Press a sub-pixel date segment through the layer painted over it, and route month/year and
     # year-only segment groups to the segment path (SKY-17013). Force-on term only: runs are randomized per
     # run by the flag of the same name, read through run_arm_enabled(DATE_SEGMENT_AIM_FLAG, ...).
@@ -597,9 +598,9 @@ class Settings(BaseSettings):
     # Hold the first click or Enter after a password fill until 45 s after Task V3 started the block. Force-on term
     # only: runs are randomized per run by the flag of the same name, read through run_arm_enabled(LOGIN_PACE_FLAG, ...).
     TASK_V3_LOGIN_PACE: bool = False
-    # Return an in-loop navigate's 404/410 to the model as the navigate result instead of ending the run (SKY-16206).
-    # Force-on term only: runs are randomized per run by the flag of the same name (DEAD_END_RETURN_FLAG).
-    TASK_V3_DEAD_END_RETURN: bool = False
+    # The acting model declares whether a run is a job application, and only a yes delivers the application defaults.
+    # Force-on term only: runs are randomized per run by the flag of the same name (APPLICATION_CONTEXT_FLAG).
+    TASK_V3_APPLICATION_CONTEXT: bool = False
     # Store the error code v3's model chose on finish instead of the post-run page guess. Off: the guess is stored
     # as before. Force-on term only: where it is off, organizations are gated by the flag of the same name.
     # Retry policies match on stored codes, so turning this on can change which runs retry.
@@ -639,18 +640,11 @@ class Settings(BaseSettings):
     VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
     VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
 
-    # Yutori Navigator
-    ENABLE_YUTORI: bool = False
-    YUTORI_API_KEY: str | None = None
     SERPAPI_API_KEY: str | None = Field(default=None, repr=False)
     EXA_API_KEY: str | None = Field(default=None, repr=False)
     # Lets the search_web helper and Copilot tool spend the Search block's keys above. Off by default so
     # keys set only for the Search block are not spent by code blocks and the Copilot.
     ENABLE_SEARCH_WEB: bool = False
-    YUTORI_API_BASE: str = "https://api.yutori.com/v1"
-    YUTORI_MODEL: str = "n1.5-latest"
-    YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
-    YUTORI_TOOL_SET: str = ""
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
@@ -1364,6 +1358,14 @@ class Settings(BaseSettings):
                 else "ANTHROPIC_CLAUDE5.5_OPUS"
             ),
             "label": "Anthropic Claude Opus 5.5",
+        }
+        mapping["claude-haiku-5-5"] = {
+            "llm_key": (
+                "BEDROCK_ANTHROPIC_CLAUDE5_5_HAIKU_INFERENCE_PROFILE"
+                if self.ENABLE_BEDROCK_ANTHROPIC
+                else "ANTHROPIC_CLAUDE5_5_HAIKU"
+            ),
+            "label": "Anthropic Claude Haiku 5.5",
         }
 
         try:

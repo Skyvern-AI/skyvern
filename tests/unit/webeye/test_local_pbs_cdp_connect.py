@@ -3,14 +3,7 @@ from unittest.mock import patch
 
 from skyvern.webeye.cdp_connection import (
     prepare_persistent_browser_cdp_connect,
-    resolve_local_pbs_cdp_url,
-    strip_browser_address_discriminator,
 )
-
-
-def test_strip_browser_address_discriminator() -> None:
-    url = "ws://127.0.0.1:9224/devtools/browser/abc#pbs_pbs_123"
-    assert strip_browser_address_discriminator(url) == "ws://127.0.0.1:9224/devtools/browser/abc"
 
 
 @patch.dict(os.environ, {"LOCAL_CDP_HOST_PORT": "9224"}, clear=False)
@@ -92,9 +85,3 @@ def test_prepare_remote_cdp_connect_does_not_add_managed_headers() -> None:
 
     assert connect_url == browser_address
     assert headers == {"X-Provider-Auth": "provider-value"}
-
-
-@patch("skyvern.webeye.cdp_connection.settings.ENV", "prod")
-def test_resolve_local_pbs_cdp_url_noop_outside_local() -> None:
-    url = "wss://sessions.example.com/pbs_1/token/devtools/browser/abc"
-    assert resolve_local_pbs_cdp_url(url) == url

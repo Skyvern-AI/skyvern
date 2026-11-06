@@ -8,6 +8,7 @@ export const POWERBI_QUERY_MAX_ROWS = 100_000;
 export const POWERBI_QUERY_DEFAULT_MAX_ROWS = 1_000;
 
 export type PowerBIQueryNodeData = NodeBaseData & {
+  credentialSource?: "native" | "nango";
   connectionId: string;
   datasetId: string;
   query: string;
@@ -23,6 +24,7 @@ export const powerBIQueryNodeDefaultData: PowerBIQueryNodeData = {
   continueOnFailure: false,
   editable: true,
   model: null,
+  credentialSource: "nango",
   connectionId: "",
   datasetId: "",
   query: "",

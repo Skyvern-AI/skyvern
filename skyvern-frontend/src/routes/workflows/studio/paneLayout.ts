@@ -114,12 +114,12 @@ export function paneWidthsKey(widths: PaneWidths): string {
 
 export function clampResizeDelta(
   delta: number,
-  left: { id: StudioPaneId; width: number },
-  right: { id: StudioPaneId; width: number },
+  left: { id: StudioPaneId; width: number; min?: number },
+  right: { id: StudioPaneId; width: number; min?: number },
 ): number {
   return Math.min(
-    Math.max(delta, STUDIO_PANE_MIN_WIDTH[left.id] - left.width),
-    right.width - STUDIO_PANE_MIN_WIDTH[right.id],
+    Math.max(delta, (left.min ?? STUDIO_PANE_MIN_WIDTH[left.id]) - left.width),
+    right.width - (right.min ?? STUDIO_PANE_MIN_WIDTH[right.id]),
   );
 }
 

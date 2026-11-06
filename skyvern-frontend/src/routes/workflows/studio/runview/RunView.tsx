@@ -108,12 +108,13 @@ import {
   type RunOutputError,
   type RunOutputFile,
 } from "./RunOutputsSection";
-import { failingBlock } from "./failingBlock";
+import { failedBlockRuns, failingBlock } from "./failingBlock";
 import { RunPlaceholder } from "./RunPlaceholder";
 import { RunFeedback } from "@/components/feedback/RunFeedback";
 import { RunSummaryStrip } from "./RunSummaryStrip";
 import { type WorkflowRunBlock } from "../../types/workflowRunTypes";
 import {
+  ContinuedFailuresLine,
   FailureRecoveryActions,
   RunFailureLine,
 } from "./RunFailurePresentation";
@@ -140,6 +141,8 @@ type RunViewProps = {
   onFix?: (failingLabel?: string | null) => void;
   onRetry?: () => void;
   milestoneRerun?: WorkflowRunMilestoneCardProps["rerun"];
+  // False keeps the pinned step out of ?active= (a ?active= URL reloads into the run layout).
+  mirrorSelectionToUrl?: boolean;
 };
 
 function isRunOutputError(value: unknown): value is RunOutputError {
@@ -264,6 +267,7 @@ export function RunView({
   onFix,
   onRetry,
   milestoneRerun,
+  mirrorSelectionToUrl = true,
 }: RunViewProps) {
   const { workflowRunMilestoneCard: WorkflowRunMilestoneCard } = usePageSlots();
   const { runId: pathRunId } = useParams();
@@ -505,8 +509,11 @@ export function RunView({
     const next = new URLSearchParams(
       window.location.search || searchParamsRef.current.toString(),
     );
+    // Not mirroring also clears a selection left in the URL from before.
     const desired =
-      pinnedFrameId && !/:\d+$/.test(pinnedFrameId) ? pinnedFrameId : null;
+      mirrorSelectionToUrl && pinnedFrameId && !/:\d+$/.test(pinnedFrameId)
+        ? pinnedFrameId
+        : null;
     const desiredIteration =
       desired && activeIteration !== null ? String(activeIteration) : null;
     if (
@@ -534,6 +541,7 @@ export function RunView({
     workflowRunId,
     navigate,
     preserveNextEntry,
+    mirrorSelectionToUrl,
   ]);
 
   // Stabilize an ?active=-only deep link by ADDING ?wr= when it's absent. Gated on
@@ -613,6 +621,13 @@ export function RunView({
   const failedBlock = useMemo(
     () => failingBlock(currentTimeline, finallyBlockLabel),
     [currentTimeline, finallyBlockLabel],
+  );
+  const continuedFailures = useMemo(
+    () =>
+      outcome === "success" && !runIsPlaceholder
+        ? failedBlockRuns(currentTimeline)
+        : [],
+    [outcome, runIsPlaceholder, currentTimeline],
   );
   const failureBlockId =
     codeFailure?.workflowRunBlockId ??
@@ -1040,6 +1055,13 @@ export function RunView({
               {recovery}
             </RunFailureLine>
           ) : null}
+          {continuedFailures.length > 0 ? (
+            <ContinuedFailuresLine
+              count={continuedFailures.length}
+              firstLabel={continuedFailures[0]!.label}
+              onJump={() => selectTimelineBlock(continuedFailures[0]!)}
+            />
+          ) : null}
           <ResizableTimelineSplit
             className="flex-1"
             top={
@@ -1094,6 +1116,7 @@ export function RunView({
                     // pin; otherwise the pin's URL writer can drop `browser`.
                     requestAnimationFrame(() => pinFrame(workflowRunBlockId));
                   }}
+                  onFix={embedded ? undefined : onFix}
                   statedFailureBlockId={failed ? failureBlockId : null}
                   statedFailureHeadline={failed ? failureHeadline : null}
                 />

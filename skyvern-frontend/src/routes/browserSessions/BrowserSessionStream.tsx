@@ -3,6 +3,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useLogging } from "@/hooks/useLogging";
 import { newWssBaseUrl, getWebSocketProtocols } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
+import { generateClientId } from "@/routes/streaming/webSocketParams";
 import {
   useRecordingMessageChannel,
   type Command,
@@ -129,6 +130,7 @@ function BrowserSessionStream({
   enableUrlInput = false,
   onFrameWidthChange,
 }: Props) {
+  const [clientId] = useState(generateClientId);
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamImgToken, setStreamImgToken] = useState<number>(0);
   const [streamFormat, setStreamFormat] = useState<string>("png");
@@ -289,6 +291,7 @@ function BrowserSessionStream({
     navigateError,
     pasteClipboard,
   } = useCdpInput({
+    clientId,
     inputWsUrl,
     interactive: controllable,
     viewportWidth,
@@ -316,6 +319,7 @@ function BrowserSessionStream({
   const messageChannelEnabled = userIsControlling;
   const { isMessageConnected, sendCommand: sendMessageCommand } =
     useRecordingMessageChannel({
+      clientId,
       browserSessionId,
       enabled: messageChannelEnabled,
       clipboard: "message",

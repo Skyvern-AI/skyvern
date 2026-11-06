@@ -13,11 +13,6 @@ vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => mocks.credentialGetter,
 }));
 
-vi.mock("@/store/useClientIdStore", () => ({
-  useClientIdStore: (selector: (state: { clientId: string }) => unknown) =>
-    selector({ clientId: "client-test" }),
-}));
-
 vi.mock("@/util/env", () => ({
   getWebSocketProtocols: mocks.getWebSocketProtocols,
 }));
@@ -65,6 +60,7 @@ class MockWebSocket {
 async function renderInputHook() {
   renderHook(() =>
     useCdpInput({
+      clientId: "client-test",
       inputWsUrl: "wss://input.test",
       interactive: true,
       viewportWidth: 1280,
@@ -86,6 +82,7 @@ async function renderControllingInputHook(
 ) {
   const { result } = renderHook(() =>
     useCdpInput({
+      clientId: "client-test",
       inputWsUrl: "wss://input.test",
       interactive: true,
       viewportWidth: 1280,
@@ -107,6 +104,7 @@ async function renderControllingInputHook(
 async function renderWheelInputHook() {
   const hook = renderHook(() =>
     useCdpInput({
+      clientId: "client-test",
       inputWsUrl: "wss://input.test",
       interactive: true,
       viewportWidth: 1280,
@@ -1047,6 +1045,7 @@ describe("useCdpInput key handling", () => {
     const { result, rerender } = renderHook(
       ({ paste }: { paste?: (text: string) => void }) =>
         useCdpInput({
+          clientId: "client-test",
           inputWsUrl: "wss://input.test",
           interactive: true,
           viewportWidth: 1280,
@@ -1147,6 +1146,7 @@ describe("useCdpInput navigate", () => {
   it("does not send a navigateEvent when the user has not taken control", async () => {
     const { result } = renderHook(() =>
       useCdpInput({
+        clientId: "client-test",
         inputWsUrl: "wss://input.test",
         interactive: true,
         viewportWidth: 1280,
@@ -1169,6 +1169,7 @@ describe("useCdpInput navigate", () => {
   it("sends a navigateEvent over the existing input socket once controlling", async () => {
     const { result } = renderHook(() =>
       useCdpInput({
+        clientId: "client-test",
         inputWsUrl: "wss://input.test",
         interactive: true,
         viewportWidth: 1280,
@@ -1197,6 +1198,7 @@ describe("useCdpInput navigate", () => {
   it("surfaces a navigate-error message the server sends back", async () => {
     const { result } = renderHook(() =>
       useCdpInput({
+        clientId: "client-test",
         inputWsUrl: "wss://input.test",
         interactive: true,
         viewportWidth: 1280,
@@ -1221,6 +1223,7 @@ describe("useCdpInput navigate", () => {
   it("clears a stale navigateError when control is ceded", async () => {
     const { result } = renderHook(() =>
       useCdpInput({
+        clientId: "client-test",
         inputWsUrl: "wss://input.test",
         interactive: true,
         viewportWidth: 1280,
@@ -1251,6 +1254,7 @@ describe("useCdpInput navigate", () => {
   it("clears a stale navigateError on reconnect (fresh ready message)", async () => {
     const { result } = renderHook(() =>
       useCdpInput({
+        clientId: "client-test",
         inputWsUrl: "wss://input.test",
         interactive: true,
         viewportWidth: 1280,

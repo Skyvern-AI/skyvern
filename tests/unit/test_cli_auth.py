@@ -109,7 +109,7 @@ class TestCallbackHandlerStateValidation:
 
     def test_valid_state_accepted(self) -> None:
         server = self._make_server("test-nonce-123")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         port = server.server_address[1]
         try:
@@ -136,7 +136,7 @@ class TestCallbackHandlerStateValidation:
 
     def test_invalid_state_rejected(self) -> None:
         server = self._make_server("correct-nonce")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         port = server.server_address[1]
         try:
@@ -160,7 +160,7 @@ class TestCallbackHandlerStateValidation:
 
     def test_missing_api_key_rejected(self) -> None:
         server = self._make_server("test-nonce")
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         port = server.server_address[1]
         try:

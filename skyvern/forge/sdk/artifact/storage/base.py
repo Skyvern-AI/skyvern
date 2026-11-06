@@ -382,6 +382,10 @@ class StreamingArtifactStorage(ABC):
     def can_stream_artifact(self, artifact: Artifact) -> bool:
         """Whether the artifact's content is its stored bytes unchanged, with no decoding after the read."""
 
+    def can_verify_artifact(self, artifact: Artifact) -> bool:
+        """Whether a content comparison may read the stored bytes through ``open_artifact_stream``."""
+        return self.can_stream_artifact(artifact)
+
     @abstractmethod
     async def stat_artifact(self, artifact: Artifact) -> StoredObjectVersion | None:
         """The stored object's size and version, or None when it cannot be read."""

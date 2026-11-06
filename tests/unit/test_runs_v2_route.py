@@ -840,6 +840,8 @@ async def test_retry_workflow_run_preserves_recipe_trigger_and_derives_ordinary_
     mock_agent_function = SimpleNamespace(
         get_workflow_run_retry_refusal=AsyncMock(return_value=None),
         is_block_scoped_workflow_run=AsyncMock(return_value=False),
+        browser_session_ids_authorized_for_connect=AsyncMock(return_value={"pbs_123"}),
+        should_redact_unresolved_browser_session_address=AsyncMock(return_value=False),
         on_run_created=AsyncMock(),
     )
     monkeypatch.setattr(app_instance, "AGENT_FUNCTION", mock_agent_function, raising=False)
@@ -1187,7 +1189,10 @@ def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     monkeypatch.setattr(
         app_instance,
         "AGENT_FUNCTION",
-        SimpleNamespace(on_run_created=on_run_created),
+        SimpleNamespace(
+            on_run_created=on_run_created,
+            browser_session_ids_authorized_for_connect=AsyncMock(return_value=set()),
+        ),
         raising=False,
     )
     monkeypatch.setattr(
@@ -1203,7 +1208,13 @@ def _install_task_route_doubles(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     )
     monkeypatch.setattr(agent_protocol.analytics, "capture", lambda *args, **kwargs: None)
     monkeypatch.setattr(agent_protocol, "TaskRunRequest", lambda **kwargs: SimpleNamespace(**kwargs))
-    monkeypatch.setattr(agent_protocol, "TaskRunResponse", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    def task_run_response(**kwargs: Any) -> SimpleNamespace:
+        kwargs.setdefault("browser_session_id", None)
+        kwargs.setdefault("browser_address", None)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(agent_protocol, "TaskRunResponse", task_run_response)
     return on_run_created
 
 

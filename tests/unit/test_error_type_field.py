@@ -116,15 +116,3 @@ def test_an_all_whitespace_slice_is_not_rstripped_into_an_empty_reasoning() -> N
     error = UserDefinedError(error_code="A", reasoning=whitespace_prefix, confidence_float=1.0)
     assert error.reasoning != ""
     assert len(error.reasoning) == ERROR_CODE_REASONING_MAX_LENGTH
-
-
-def test_the_bound_admits_exactly_what_the_declared_gate_admits() -> None:
-    # The reasoning length contract is declared once, in skyvern.schemas.workflows, and the ingress
-    # validators gate on it. A second, stricter number on the model would silently drop characters a
-    # workflow author had just been told were acceptable, so the model must accept the full gate
-    # width untouched. (The cloud-side runtime parity for the same constant is asserted in
-    # tests/cloud/test_code_block_escalation_secure.py, which can import the cloud package.)
-    at_the_gate = "y" * ERROR_CODE_REASONING_MAX_LENGTH
-    error = UserDefinedError(error_code="A", reasoning=at_the_gate, confidence_float=1.0)
-    assert error.reasoning == at_the_gate
-    assert len(error.reasoning) == ERROR_CODE_REASONING_MAX_LENGTH

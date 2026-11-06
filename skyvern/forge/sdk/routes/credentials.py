@@ -64,8 +64,10 @@ from skyvern.forge import app
 from skyvern.forge.agent_functions import OnePasswordTelemetryErrorClass, record_request_audit_event
 from skyvern.forge.sdk.api.files import discard_temp_working_dir
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowBuildSource
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError
 from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
@@ -84,6 +86,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_PYTHON,
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
+from skyvern.forge.sdk.routes.pagination import MAX_PAGE, MAX_PAGE_SIZE
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
@@ -179,6 +182,7 @@ from skyvern.forge.sdk.services.onepassword_token_service import resolve_onepass
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, get_request_principal, synthetic_user_id
 from skyvern.forge.sdk.services.route_authorization import require_request_actions
 from skyvern.forge.sdk.workflow.browser_session_persistence import retrieve_persisted_workflow_browser_state_dir
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
 from skyvern.schemas.credential_folders import (
@@ -710,7 +714,12 @@ async def get_totp_codes(
     ),
 ) -> list[TOTPCode]:
     principal = get_request_principal()
-    workflow_restricted = await app.AGENT_FUNCTION.workflow_folders_restricted(curr_org.organization_id)
+    scoped_folder_ceiling = (
+        principal is not None and principal.api_key_access_mode == "scoped" and principal.api_key_reach == "folders"
+    )
+    workflow_restricted = scoped_folder_ceiling or await app.AGENT_FUNCTION.workflow_folders_restricted(
+        curr_org.organization_id
+    )
     credential_restricted = await app.AGENT_FUNCTION.credential_folders_restricted(curr_org.organization_id)
     if (workflow_restricted or credential_restricted) and principal is None:
         return []
@@ -753,7 +762,12 @@ async def get_totp_codes(
             accessible_references = await app.AGENT_FUNCTION.accessible_workflow_reference_ids(
                 principal, "workflow_run.read", set().union(*references_by_code.values())
             )
-            page = [code for code in page if references_by_code[code.totp_code_id] <= accessible_references]
+            page = [
+                code
+                for code in page
+                if references_by_code[code.totp_code_id] <= accessible_references
+                and (not scoped_folder_ceiling or references_by_code[code.totp_code_id])
+            ]
 
         if credential_restricted and page and not await app.AGENT_FUNCTION.credential_folder_admin_bypass(principal):
             credential_ids_by_identifier = await app.DATABASE.credentials.get_credential_ids_by_totp_identifiers(
@@ -938,6 +952,16 @@ def _build_login_test_blocks(
     return blocks
 
 
+async def vault_login_sites(credential: Credential) -> list[LoginSite] | None:
+    """The sites a connected vault names for this login, or None when Skyvern holds them."""
+    service = app.CREDENTIAL_VAULT_SERVICES.get(credential.vault_type or CredentialVaultType.BITWARDEN)
+    if service is None:
+        return None
+    item = await service.get_credential_item(credential)
+    sites = item.named_login_sites()
+    return sites if sites or item.login_sites is not None else None
+
+
 @base_router.patch(
     "/credentials/{credential_id}",
     response_model=CredentialResponse,
@@ -990,6 +1014,25 @@ async def rename_credential(
         update_kwargs["pin_saved_session_ip"] = data.pin_saved_session_ip
     if data.tested_url is not None:
         update_kwargs["tested_url"] = data.tested_url
+    if data.extra_site_urls:
+        try:
+            vault_sites = await vault_login_sites(credential)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Could not read this login's vault entry") from exc
+        if vault_sites is not None:
+            raise HTTPException(
+                status_code=422, detail="This login's sites come from its connected vault; add the site there"
+            )
+    if data.extra_site_urls is not None:
+        try:
+            update_kwargs["extra_site_urls"] = normalize_extra_site_urls(
+                data.tested_url or credential.tested_url, data.extra_site_urls
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    sites_change = data.tested_url is not None or data.extra_site_urls is not None
+    if sites_change and data.expected_site_urls is not None:
+        update_kwargs["expected_site_urls"] = data.expected_site_urls
     if data.user_context is not None:
         update_kwargs["user_context"] = data.user_context
     if data.save_browser_session_intent is not None:
@@ -1022,11 +1065,16 @@ async def rename_credential(
             credential_id=credential_id,
         )
     async with write_guard:
-        updated = await _update_credential_or_profile_conflict(**update_kwargs)
+        try:
+            updated = await _update_credential_or_profile_conflict(**update_kwargs)
+        except CredentialSitesChangedError as exc:
+            raise HTTPException(
+                status_code=409, detail="This login's sites changed since it was opened. Reload it and try again."
+            ) from exc
     if not updated:
         raise HTTPException(status_code=500, detail="Failed to update credential")
 
-    changed_fields = tuple(sorted(update_kwargs.keys() - {"credential_id", "organization_id"}))
+    changed_fields = tuple(sorted(update_kwargs.keys() - {"credential_id", "organization_id", "expected_site_urls"}))
     if changed_fields:
         await record_request_audit_event(
             current_org.organization_id,
@@ -2632,6 +2680,7 @@ async def get_credentials(
     page: int = Query(
         1,
         ge=1,
+        le=MAX_PAGE,
         description="Page number for pagination",
         examples=[1],
         openapi_extra={"x-fern-sdk-parameter-name": "page"},
@@ -2639,6 +2688,7 @@ async def get_credentials(
     page_size: int = Query(
         10,
         ge=1,
+        le=MAX_PAGE_SIZE,
         description="Number of items per page",
         examples=[10],
         openapi_extra={"x-fern-sdk-parameter-name": "page_size"},
@@ -2775,7 +2825,7 @@ async def get_credential_folder(
 )
 @base_router.get("/credential_folders/", response_model=list[CredentialFolder], include_in_schema=False)
 async def get_credential_folders(
-    page: int = Query(1, ge=1, description="Page number"),
+    page: int = Query(1, ge=1, le=MAX_PAGE, description="Page number"),
     page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
     search: str | None = Query(None, description="Search folders by title or description"),
     current_org: Organization = Depends(org_auth_service.get_current_org_for_credential_routes),

@@ -10,6 +10,7 @@ import {
   ConnectedAccountChoice,
   CopilotResponseType,
   CopilotSteerMessage,
+  type CredentialSiteAnswer,
   type CopilotTestInput,
   type CopilotTestInputSource,
   DeliveredOutputFile,
@@ -239,7 +240,8 @@ type BuildTestConnectFailureState =
   | "provisioning_unavailable"
   | "cdp_connect_failed"
   | "occupied"
-  | "billing_credit_admission_refusal";
+  | "billing_credit_admission_refusal"
+  | "browser_start_capacity";
 
 export function isBuildTestConnectFailureState(
   value: unknown,
@@ -249,7 +251,8 @@ export function isBuildTestConnectFailureState(
     value === "provisioning_unavailable" ||
     value === "cdp_connect_failed" ||
     value === "occupied" ||
-    value === "billing_credit_admission_refusal"
+    value === "billing_credit_admission_refusal" ||
+    value === "browser_start_capacity"
   );
 }
 
@@ -472,8 +475,19 @@ export interface TurnNarrativeState {
   // Resolved pause outcome, from the credentialPause narrative signal.
   // "declined" means the pause engaged but never sent a frame, so no card.
   credentialPause: {
-    outcome: "connected" | "skipped" | "timeout" | "declined" | "signed_in";
+    outcome:
+      | "connected"
+      | "skipped"
+      | "timeout"
+      | "declined"
+      | "signed_in"
+      | "not_admitted";
     credentialId: string | null;
+    name?: string;
+    siteAnswer?: CredentialSiteAnswer;
+    siteA?: string;
+    savedSites?: string[];
+    siteB?: string;
     // The tool call whose row was newest when the card was raised. Absent on
     // turns recorded before it was stamped.
     anchorToolCallId?: string;
@@ -628,23 +642,39 @@ export function parseCredentialPause(
     typeof o.anchorToolCallId === "string" && o.anchorToolCallId
       ? o.anchorToolCallId
       : undefined;
-  // The user answered but nothing was bound, which the card already renders as a skip.
-  if (outcome === "not_admitted") {
-    return { outcome: "skipped", credentialId: null, anchorToolCallId };
-  }
   if (
     outcome !== "connected" &&
     outcome !== "skipped" &&
     outcome !== "timeout" &&
     outcome !== "declined" &&
-    outcome !== "signed_in"
+    outcome !== "signed_in" &&
+    outcome !== "not_admitted"
   ) {
     return null;
   }
+  const siteAnswer =
+    o.siteAnswer === "add" || o.siteAnswer === "move" || o.siteAnswer === "no"
+      ? o.siteAnswer
+      : undefined;
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
     anchorToolCallId,
+    ...(typeof o.name === "string" && o.name ? { name: o.name } : {}),
+    ...(siteAnswer
+      ? {
+          siteAnswer,
+          siteA: typeof o.siteA === "string" ? o.siteA : undefined,
+          savedSites:
+            Array.isArray(o.savedSites) &&
+            o.savedSites.every(
+              (site): site is string => typeof site === "string",
+            )
+              ? o.savedSites
+              : undefined,
+          siteB: typeof o.siteB === "string" ? o.siteB : undefined,
+        }
+      : {}),
   };
 }
 
@@ -907,7 +937,11 @@ const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
   inspect_page_for_composition: "Inspecting the page",
   list_credentials: "Checking saved credentials",
   get_organization_usage_quota: "Checking account usage",
+  create_webhook_trigger: "Creating a webhook trigger",
+  test_trigger_mapping: "Testing the trigger mapping",
+  list_workflow_triggers: "Checking this workflow's triggers",
   extend_browser_session: "Extending the browser session",
+  read_chat_history: "Reading earlier messages in this chat",
   run_browser_code: "Working in the browser",
   fill_credential_field: "Entering saved credentials",
   edit_block: "Editing block",
@@ -958,7 +992,11 @@ const TOOL_CALL_KINDS: Record<string, ToolCallKind> = {
   offer_demonstration: "other",
   read_google_sheet: "other",
   read_attached_pdf: "other",
+  read_chat_history: "other",
   get_organization_usage_quota: "other",
+  create_webhook_trigger: "other",
+  test_trigger_mapping: "other",
+  list_workflow_triggers: "other",
   extend_browser_session: "other",
   search_web: "other",
   list_org_workflows: "other",
@@ -1595,15 +1633,33 @@ export function applyNarrativeEvent(
       };
     }
 
-    case "run_started":
-      if (!event.skipped_prefix?.length) return prev;
+    case "run_started": {
+      // A pending placeholder rather than null: null lets notConfirmedOutcome fall back to an
+      // earlier run's not_demonstrated block row.
+      const lastRunOutcome =
+        prev.lastRunOutcome !== null &&
+        prev.lastRunOutcome.workflowRunId !== event.workflow_run_id
+          ? {
+              verdict: "not_evaluated" as const,
+              role: "interim_build_test" as const,
+              displayReason: null,
+              workflowRunId: event.workflow_run_id,
+            }
+          : prev.lastRunOutcome;
+      if (!event.skipped_prefix?.length) {
+        return lastRunOutcome === prev.lastRunOutcome
+          ? prev
+          : { ...prev, lastRunOutcome };
+      }
       return {
         ...prev,
+        lastRunOutcome,
         pendingSkippedPrefix: {
           ...prev.pendingSkippedPrefix,
           [event.workflow_run_id]: event.skipped_prefix,
         },
       };
+    }
 
     case "run_outcome": {
       // Apply the recorded verdict by run-block id only — no label fallback, so
@@ -2400,7 +2456,14 @@ export function notConfirmedOutcome(
       workflowRunId: turn.turnFacts?.runId ?? undefined,
     };
   }
-  const block = notDemonstratedBlock(turn.blocks);
+  const anchoredRunId = turn.turnFacts?.runId;
+  const block = notDemonstratedBlock(
+    anchoredRunId
+      ? turn.blocks.filter(
+          (b) => !b.workflowRunId || b.workflowRunId === anchoredRunId,
+        )
+      : turn.blocks,
+  );
   return block === null
     ? null
     : {

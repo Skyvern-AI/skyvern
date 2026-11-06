@@ -78,13 +78,17 @@ function buildSessionTranscript(
   results: SpeechRecognitionResultList,
   resultIndex: number,
   finalizedChunks: Map<number, string>,
+  startIndex = 0,
+  // Leading text of a still-growing result that clearTranscript already took. When the engine revises that text
+  // instead of appending to it, the same number of words is skipped, which can drop or repeat a word.
+  consumedText: Map<number, string> = new Map(),
 ): {
   finalText: string;
   interimText: string;
 } {
   const finalParts: string[] = [];
 
-  for (let i = 0; i < resultIndex; i += 1) {
+  for (let i = startIndex; i < resultIndex; i += 1) {
     const cached = finalizedChunks.get(i);
     if (cached) {
       finalParts.push(cached);
@@ -92,12 +96,15 @@ function buildSessionTranscript(
   }
 
   const interimParts: string[] = [];
-  for (let i = resultIndex; i < results.length; i += 1) {
+  for (let i = Math.max(resultIndex, startIndex); i < results.length; i += 1) {
     const result = results[i];
     if (!result) {
       continue;
     }
-    const chunk = (result[0]?.transcript ?? "").trim();
+    const chunk = withoutConsumed(
+      (result[0]?.transcript ?? "").trim(),
+      consumedText.get(i),
+    );
     if (!chunk) {
       continue;
     }
@@ -112,6 +119,13 @@ function buildSessionTranscript(
     finalText: finalParts.join(" "),
     interimText: interimParts.join(" "),
   };
+}
+
+function withoutConsumed(heard: string, consumed: string | undefined): string {
+  if (!consumed) return heard;
+  // A prefix match also works for languages written without spaces between words.
+  if (heard.startsWith(consumed)) return heard.slice(consumed.length).trim();
+  return heard.split(/\s+/).slice(consumed.split(/\s+/).length).join(" ");
 }
 
 function combineDictated(finalText: string, interimText: string): string {
@@ -146,8 +160,10 @@ export interface UseSpeechToTextResult {
   start: () => void;
   /** Resolves with captured audio when available; callers may ignore it. */
   stop: () => Promise<Blob | null>;
-  /** Stops immediately and drops any transcript still in flight. */
+  /** Stops immediately and drops any transcript and audio still in flight. */
   cancel: () => void;
+  /** Keeps listening but forgets everything heard so far, so later results start from empty text. */
+  clearTranscript: () => void;
   toggle: () => void;
   takeAudioBlob: () => Blob | null;
 }
@@ -211,6 +227,10 @@ export function useSpeechToText(
   const shouldKeepListeningRef = useRef(false);
   const enabledRef = useRef(enabled);
   const finalizedChunksRef = useRef<Map<number, string>>(new Map());
+  const startIndexRef = useRef(0);
+  const consumedTextRef = useRef<Map<number, string>>(new Map());
+  const latestResultsRef = useRef<SpeechRecognitionResultList | null>(null);
+  const lastTranscriptRef = useRef("");
   const hearingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastStartAttemptAtRef = useRef(0);
@@ -219,6 +239,7 @@ export function useSpeechToText(
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const latestAudioBlobRef = useRef<Blob | null>(null);
+  const discardAudioRef = useRef(false);
   const isAudioStartingRef = useRef(false);
   const audioStopResolverRef = useRef<((blob: Blob | null) => void) | null>(
     null,
@@ -285,7 +306,10 @@ export function useSpeechToText(
     (blob: Blob | null) => {
       mediaRecorderRef.current = null;
       cleanupAudioStream();
-      if (blob && blob.size > 0) {
+      // A cancelled capture finishes after cancel returns; its audio must not reach a later message.
+      const discarded = discardAudioRef.current;
+      discardAudioRef.current = false;
+      if (blob && blob.size > 0 && !discarded) {
         latestAudioBlobRef.current = blob;
         onAudioCapturedRef.current?.(blob);
         resolveAudioStop(blob);
@@ -412,6 +436,8 @@ export function useSpeechToText(
 
   const cancel = useCallback(() => {
     startTokenRef.current += 1;
+    latestAudioBlobRef.current = null;
+    if (mediaRecorderRef.current) discardAudioRef.current = true;
     shouldKeepListeningRef.current = false;
     isListeningRef.current = false;
     setIsListening(false);
@@ -433,10 +459,14 @@ export function useSpeechToText(
     teardownRecognition();
     clearHearingSpeech();
     finalizedChunksRef.current.clear();
+    startIndexRef.current = 0;
+    consumedTextRef.current.clear();
+    latestResultsRef.current = null;
     rapidRestartCountRef.current = 0;
     startAudioCapture();
 
     baseTextRef.current = getBaseTextRef.current?.() ?? "";
+    lastTranscriptRef.current = baseTextRef.current;
 
     const recognition = new SpeechRecognitionCtor();
     recognition.continuous = true;
@@ -445,13 +475,20 @@ export function useSpeechToText(
       lang ?? (typeof navigator !== "undefined" ? navigator.language : "en-US");
 
     recognition.onresult = (event: SpeechRecognitionEventLike) => {
+      latestResultsRef.current = event.results;
       const { finalText, interimText } = buildSessionTranscript(
         event.results,
         event.resultIndex,
         finalizedChunksRef.current,
+        startIndexRef.current,
+        consumedTextRef.current,
       );
       const dictated = combineDictated(finalText, interimText);
-      onTranscriptRef.current(mergeTranscript(baseTextRef.current, dictated));
+      lastTranscriptRef.current = mergeTranscript(
+        baseTextRef.current,
+        dictated,
+      );
+      onTranscriptRef.current(lastTranscriptRef.current);
       rapidRestartCountRef.current = 0;
       if (interimText) {
         markHearingSpeech();
@@ -496,6 +533,13 @@ export function useSpeechToText(
 
       try {
         lastStartAttemptAtRef.current = Date.now();
+        // A restarted session numbers its results from zero again, so what was heard
+        // before becomes the base text instead of colliding with the new indices.
+        baseTextRef.current = lastTranscriptRef.current;
+        finalizedChunksRef.current.clear();
+        startIndexRef.current = 0;
+        consumedTextRef.current.clear();
+        latestResultsRef.current = null;
         recognition.start();
         return true;
       } catch {
@@ -615,6 +659,24 @@ export function useSpeechToText(
     };
   }, [clearHearingSpeech, stopAudioCapture, teardownRecognition]);
 
+  const clearTranscript = useCallback(() => {
+    baseTextRef.current = "";
+    lastTranscriptRef.current = "";
+    finalizedChunksRef.current.clear();
+    const results = latestResultsRef.current;
+    if (!results) return;
+    let firstInterim = results.length;
+    for (let i = startIndexRef.current; i < results.length; i += 1) {
+      const result = results[i];
+      if (result && !result.isFinal) {
+        firstInterim = Math.min(firstInterim, i);
+        const heard = (result[0]?.transcript ?? "").trim();
+        consumedTextRef.current.set(i, heard);
+      }
+    }
+    startIndexRef.current = firstInterim;
+  }, []);
+
   const takeAudioBlob = useCallback(() => {
     const blob = latestAudioBlobRef.current;
     latestAudioBlobRef.current = null;
@@ -629,6 +691,7 @@ export function useSpeechToText(
     stop,
     cancel,
     toggle,
+    clearTranscript,
     takeAudioBlob,
   };
 }

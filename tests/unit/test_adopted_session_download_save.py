@@ -1128,7 +1128,7 @@ async def test_adopted_session_refetch_saves_query_backslash_via_real_authorizer
     _SKY15916_RECV.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Sky15916Handler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     monkeypatch.setattr(settings, "ALLOWED_HOSTS", [*settings.ALLOWED_HOSTS, "127.0.0.1"])
     try:
         url = f"http://127.0.0.1:{port}/ELABSTelFileDownload.aspx?TelFile={_SKY15916_WINQ}"

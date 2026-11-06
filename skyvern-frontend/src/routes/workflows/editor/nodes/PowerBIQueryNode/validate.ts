@@ -6,7 +6,14 @@ export function validatePowerBIQueryNode(
   node: PowerBIQueryNode,
 ): Array<string> {
   const errors: Array<string> = [];
-  const { label, connectionId, datasetId, query, maxRows } = node.data;
+  const { label, credentialSource, connectionId, datasetId, query, maxRows } =
+    node.data;
+
+  if (credentialSource !== "nango") {
+    errors.push(
+      `${label}: Select a verified Power BI connection; native connections are no longer supported.`,
+    );
+  }
 
   if (missing(connectionId)) {
     errors.push(`${label}: Microsoft Power BI connection is required.`);

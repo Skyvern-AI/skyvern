@@ -45,7 +45,11 @@ import {
   type AttentionTrayPresentation,
 } from "./AttentionTray";
 import { TURN_ROW_INSET } from "./cardLayout";
-import type { CredentialBinding } from "../workflowCopilotTypes";
+import type {
+  CredentialBinding,
+  CredentialSiteAnswer,
+  CredentialSiteQuestion,
+} from "../workflowCopilotTypes";
 import { useDemoLoginGuide } from "@/hooks/useDemoLoginGuide";
 
 // Union of the request-policy reason tokens and the run-derived pause reasons. `type`/`reason` are the
@@ -86,6 +90,7 @@ export interface CredentialRequiredFrame {
   signing_in?: boolean;
   credential_binding?: CredentialBinding | null;
   registration?: CredentialRegistrationDetails | null;
+  site_question?: CredentialSiteQuestion | null;
   timestamp?: string;
 }
 
@@ -95,13 +100,22 @@ export type CredentialPauseOutcome =
   | "connected"
   | "skipped"
   | "timeout"
-  | "signed_in";
+  | "signed_in"
+  | "not_admitted";
 
 export interface CredentialPauseHistorical {
   outcome: CredentialPauseOutcome;
   credentialId?: string;
   // Captured at connect time so the receipt names the credential without a lookup.
   name?: string;
+  // The answer to the site question, with the origins it was asked about, so a reload shows both.
+  siteAnswer?: CredentialSiteAnswer;
+  siteA?: string;
+  // Every site the login was saved for when asked; siteA is the first.
+  savedSites?: string[];
+  siteB?: string;
+  // The site was saved on the login after the request ended, so it was not connected.
+  siteSavedNotConnected?: boolean;
 }
 
 // A picker row: id/name plus a secondary discriminator (the login username) so two credentials
@@ -149,6 +163,12 @@ export interface CredentialCardProps {
   // Registration cards only: saves a server-generated password under the frame's username and name.
   onGenerate?: () => void;
   offerCredentials?: boolean;
+  // Asked after the user picked a login saved for another site; overrides the frame's own copy.
+  siteQuestion?: CredentialSiteQuestion | null;
+  // Set while a site answer is in flight or its save is being confirmed.
+  siteAnswerPending?: boolean;
+  onSiteAnswer?: (answer: CredentialSiteAnswer) => void;
+  onDismissSiteQuestion?: () => void;
 }
 
 export interface ManualSignInOffer {
@@ -758,6 +778,207 @@ function AskMessage({ message }: { message?: string }) {
   );
 }
 
+// An https site reads as its host; any other scheme keeps the full origin so it is not mistaken for https.
+function siteHost(origin: string): string {
+  try {
+    const url = new URL(origin);
+    return url.protocol === "https:" ? url.host : url.origin;
+  } catch {
+    return origin;
+  }
+}
+
+function resolvedSiteCopy(outcome: CredentialPauseHistorical): {
+  tone: "done" | "warn";
+  title: string;
+  meta?: string;
+  detail?: string;
+} {
+  const name = outcome.name ? `'${outcome.name}'` : "This login";
+  const savedSites = outcome.savedSites?.length
+    ? outcome.savedSites
+    : outcome.siteA
+      ? [outcome.siteA]
+      : [];
+  const siteA = savedSites.length
+    ? savedSites.map(siteHost).join(", ")
+    : "its saved site";
+  const siteB = outcome.siteB ? siteHost(outcome.siteB) : "this site";
+  if (outcome.outcome === "connected" && outcome.siteAnswer === "move") {
+    return {
+      tone: "done",
+      title: `Moved ${name} to ${siteB}`,
+      meta: `no longer used on ${siteA}`,
+      detail: `${name} now signs in on ${siteB} only. Workflows that sign in on ${siteA} with it stop working there.`,
+    };
+  }
+  if (outcome.outcome === "connected") {
+    return {
+      tone: "done",
+      title: `Added ${siteB} to ${name}`,
+      meta: `works on ${siteA} and ${siteB}`,
+    };
+  }
+  if (outcome.siteSavedNotConnected) {
+    return {
+      tone: "warn",
+      title: `Saved ${siteB} on ${name}, not connected`,
+      detail:
+        "The request ended before this login was connected. Ask Copilot again to use it.",
+    };
+  }
+  if (outcome.siteAnswer === "no") {
+    return {
+      tone: "warn",
+      title: `Not used on ${siteB}`,
+      meta: `${name} stays saved for ${siteA}`,
+    };
+  }
+  if (outcome.siteAnswer) {
+    return {
+      tone: "warn",
+      title: `Couldn't confirm ${siteB} was saved on ${name}`,
+      detail:
+        "Check the login on the Credentials page, then ask Copilot again.",
+    };
+  }
+  return {
+    tone: "warn",
+    title: `${name} not used here`,
+    meta: "it is saved for another site",
+  };
+}
+
+function SiteQuestionAsk({
+  question,
+  tray,
+  rootRef,
+  countdown,
+  disabled,
+  pending,
+  insideLiveRegion,
+  onAnswer,
+  onDismiss,
+}: {
+  question: CredentialSiteQuestion;
+  tray?: AttentionTrayPresentation;
+  rootRef: RefObject<HTMLDivElement>;
+  countdown: ReactNode;
+  disabled: boolean;
+  pending: boolean;
+  insideLiveRegion: boolean;
+  onAnswer: (answer: CredentialSiteAnswer) => void;
+  onDismiss?: () => void;
+}) {
+  const savedFor = question.saved_sites.map(siteHost).join(", ") || "no site";
+  const site = siteHost(question.site);
+  const off = disabled || pending;
+  const unencrypted =
+    question.site.startsWith("http:") &&
+    question.saved_sites.some((saved) => saved.startsWith("https:"));
+  const lines = question.vault_sourced
+    ? [
+        <span key="vault" className="text-[11px] leading-relaxed">
+          Its sites come from your connected vault, where it is saved for{" "}
+          {savedFor}. To use it on {site}, add {site} to it in that vault.
+        </span>,
+      ]
+    : [
+        <span key="consent" className="text-[11px] font-medium leading-relaxed">
+          Add or Move lets Skyvern type this login&apos;s password on {site}, in
+          this chat and in every saved run that uses it.
+        </span>,
+        ...(unencrypted
+          ? [
+              <span
+                key="unencrypted"
+                className="text-[11px] font-medium leading-relaxed text-destructive"
+              >
+                {site} is not https, so the password would be sent without
+                encryption.
+              </span>,
+            ]
+          : []),
+        <span
+          key="move"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          Add keeps it working on {savedFor}. Move means workflows that sign in
+          on {savedFor} with it stop working there.
+        </span>,
+      ];
+  if (pending) {
+    lines.push(
+      <span key="pending" className="text-[11px] font-medium">
+        Saving the site…
+      </span>,
+    );
+  }
+  return (
+    <AskChrome
+      tray={tray}
+      rootRef={rootRef}
+      title={`'${question.name}' is saved for ${savedFor}. Use it on ${site}?`}
+      countdown={countdown}
+      lines={lines}
+      footer={
+        <>
+          {question.vault_sourced ? null : (
+            <>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={off}
+                onClick={() => onAnswer("add")}
+              >
+                Add {site}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={off}
+                onClick={() => onAnswer("move")}
+              >
+                Move to {site}
+              </Button>
+            </>
+          )}
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={off}
+            onClick={() => onAnswer("no")}
+          >
+            No
+          </Button>
+          {onDismiss ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              disabled={off}
+              onClick={onDismiss}
+            >
+              Pick another login
+            </Button>
+          ) : null}
+        </>
+      }
+      announcer={
+        <span
+          className="sr-only"
+          role={insideLiveRegion ? undefined : "status"}
+        >
+          {pending && !insideLiveRegion ? "Saving the site…" : ""}
+        </span>
+      }
+    />
+  );
+}
+
 function ResolvedCredentialCard({
   tone,
   title,
@@ -840,6 +1061,10 @@ function CredentialAskCard({
   signIn,
   onGenerate,
   offerCredentials = true,
+  siteQuestion,
+  siteAnswerPending = false,
+  onSiteAnswer,
+  onDismissSiteQuestion,
 }: Readonly<CredentialCardProps>) {
   // Terminal mode never expires by design: its signal carries no timeout/expiry
   // semantics at all, so there is nothing to compare "now" against. Only a
@@ -1038,6 +1263,11 @@ function CredentialAskCard({
           />
         );
       case "timeout":
+        if (resolvedOutcome.siteSavedNotConnected) {
+          return (
+            <ResolvedCredentialCard {...resolvedSiteCopy(resolvedOutcome)} />
+          );
+        }
         return frame.registration?.outcome === "created_not_connected" ? (
           <ResolvedCredentialCard
             tone="warn"
@@ -1046,6 +1276,10 @@ function CredentialAskCard({
           />
         ) : (
           <ResolvedCredentialCard tone="warn" {...TIMEOUT_OUTCOME} />
+        );
+      case "not_admitted":
+        return (
+          <ResolvedCredentialCard {...resolvedSiteCopy(resolvedOutcome)} />
         );
       case "signed_in":
         return (
@@ -1061,6 +1295,11 @@ function CredentialAskCard({
           />
         );
       case "connected": {
+        if (resolvedOutcome.siteAnswer) {
+          return (
+            <ResolvedCredentialCard {...resolvedSiteCopy(resolvedOutcome)} />
+          );
+        }
         const name = resolvedOutcome.name;
         // A save from the editor does not prove 2FA was added; the retried step says whether it was.
         const heading = continued
@@ -1097,6 +1336,27 @@ function CredentialAskCard({
         );
       }
     }
+  }
+
+  const askedSite = siteQuestion ?? frame.site_question ?? null;
+  if (askedSite && mode === "inline-pause" && onSiteAnswer) {
+    return (
+      <SiteQuestionAsk
+        question={askedSite}
+        tray={tray}
+        rootRef={rootRef}
+        countdown={
+          countdownActive ? (
+            <PauseCountdown remainingMs={remainingMs} expired={expired} />
+          ) : null
+        }
+        disabled={disabled}
+        pending={siteAnswerPending}
+        insideLiveRegion={insideLiveRegion}
+        onAnswer={onSiteAnswer}
+        onDismiss={onDismissSiteQuestion}
+      />
+    );
   }
 
   if (mode === "auto-bound" && autoBound) {

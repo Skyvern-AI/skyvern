@@ -1651,18 +1651,6 @@ class TestNoAvailableOptionFoundForCustomSelection:
         assert "Foxtrot" not in msg  # excerpt is capped at 5
         assert "not present in the list" in msg
 
-    def test_attributes_are_accessible_for_downstream_consumers(self) -> None:
-        exc = NoAvailableOptionFoundForCustomSelection(
-            reason="not in dropdown",
-            target_value="Target",
-            observed_options=["Alpha", "Bravo"],
-        )
-        assert exc.code == "OPTION_NOT_AVAILABLE"
-        assert exc.target_value == "Target"
-        assert exc.observed_options_count == 2
-        assert exc.observed_options_excerpt == ["Alpha", "Bravo"]
-        assert exc.reason == "not in dropdown"
-
     def test_omits_optional_fields_when_not_supplied(self) -> None:
         exc = NoAvailableOptionFoundForCustomSelection(reason=None)
         msg = str(exc)
@@ -1673,21 +1661,6 @@ class TestNoAvailableOptionFoundForCustomSelection:
         assert exc.target_value is None
         assert exc.observed_options_count == 0
         assert exc.observed_options_excerpt == []
-
-    def test_no_value_error_when_constructed_from_empty_no_match_payload(self) -> None:
-        # Regression: previously ActionType("") fired on this payload before the
-        # OPTION_NOT_AVAILABLE branch could run.
-        json_response = {"action_type": "", "id": "", "reasoning": "not present", "relevant": False}
-        try:
-            raise NoAvailableOptionFoundForCustomSelection(
-                reason=json_response["reasoning"],
-                target_value="Anything",
-                observed_options=["Alpha"],
-            )
-        except ValueError:
-            pytest.fail("ValueError leaked from no-match exception construction")
-        except NoAvailableOptionFoundForCustomSelection as exc:
-            assert exc.code == "OPTION_NOT_AVAILABLE"
 
 
 class TestNoMatchExceptionForDropdown:

@@ -11,6 +11,7 @@ import {
   type DocBranch,
   type DocItem,
 } from "./buildDocTree";
+import { docOutlineEntries } from "./docOutlineEntries";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 
 function project(blocks: WorkflowBlock[], finallyLabel: string | null = null) {
@@ -189,6 +190,28 @@ describe("buildDocTree", () => {
       { outer: ["in_a", { inner: ["deep_a", "deep_b"] }] },
       "last",
     ]);
+  });
+
+  test("includes nested loop and conditional steps in the outline", () => {
+    const blocks = [
+      forLoop("outer", "after", [
+        conditional("check", null, [
+          { id: "yes", next: "inside", when: "found" },
+          { id: "otherwise", next: "fallback" },
+        ]),
+        code("inside", null),
+        code("fallback", null),
+      ]),
+      code("after", null),
+    ];
+    const { tree, nodes } = project(blocks);
+    const byId = new Map(
+      nodes.filter(isWorkflowBlockNode).map((node) => [node.id, node]),
+    );
+
+    expect(
+      docOutlineEntries(tree.items, byId).map(({ depth }) => depth),
+    ).toEqual([0, 1, 2, 2, 0]);
   });
 
   test("lists six branches in check order with Otherwise last, each with its check mode", () => {

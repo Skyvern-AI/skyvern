@@ -628,7 +628,7 @@ def test_run_mcp_serves_without_waiting_for_sweep_and_stops_blocking_child(tmp_p
         "skyvern.cli.schedule_command",
         "skyvern.cli.config_command",
         "skyvern.cli.block",
-        "skyvern.cli.setup_commands",
+        # mcp_commands imports setup_commands at module scope, so its case covers setup_commands' import chain too.
         "skyvern.cli.mcp_commands",
         "skyvern.cli.init_command",
         "skyvern.cli.quickstart",

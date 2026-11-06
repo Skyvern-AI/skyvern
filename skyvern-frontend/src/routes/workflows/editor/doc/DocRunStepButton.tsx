@@ -54,9 +54,10 @@ export function DocRunStepButton({
         disabled={disabled || (playing ? stopping : inert)}
         onClick={() => (playing ? handle.stop() : handle.play())}
         className={cn(
-          "inline-flex items-center rounded-[5px] px-1 py-0.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40",
-          !playing &&
-            "opacity-0 group-focus-within/line:opacity-100 group-hover/line:opacity-100 disabled:group-hover/line:opacity-40 [@media(hover:none)]:opacity-100",
+          "inline-flex items-center rounded-[5px] px-1 py-0.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none",
+          playing
+            ? "disabled:opacity-40"
+            : "opacity-0 group-focus-within/line:opacity-100 disabled:group-focus-within/line:opacity-40 group-hover/line:opacity-100 disabled:group-hover/line:opacity-40 [@media(hover:none)]:opacity-100 disabled:[@media(hover:none)]:opacity-40",
         )}
       >
         {playing ? (

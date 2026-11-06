@@ -134,6 +134,7 @@ class TaskModel(Base):
     task_id = Column(String, primary_key=True, default=generate_task_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id"))
     browser_session_id = Column(String, nullable=True, index=True)
+    requested_by = Column(String, nullable=True)
     status = Column(String, index=True)
     webhook_callback_url = Column(String)
     webhook_failure_reason = Column(String, nullable=True)
@@ -893,6 +894,7 @@ class WorkflowRunGroupModel(Base):
     input_fingerprint = Column(String, nullable=False)
     status = Column(String, nullable=False, default="active")
     created_by = Column(String, nullable=True)
+    requested_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
         DateTime,
@@ -1058,7 +1060,8 @@ class WorkflowRunModel(Base):
     # classifier ran and abstained. none_as_null=True so clearing it (ORM `= None` or Core
     # `.values(...=None)`) stores SQL NULL, not the JSON token `null`: reopen/reset/timeout
     # clears must be SQL NULL for the COALESCE repair and the completed-run NULL invariant to
-    # hold at SQL/CDC/Redshift grain, not just when deserialized back to Python None.
+    # hold at the SQL level and for downstream replication, not just when deserialized back to
+    # Python None.
     failure_attribution = Column(JSON(none_as_null=True), nullable=True)
     # When True, this run was spawned by a WorkflowTriggerBlock whose
     # ignore_workflow_system_prompt flag was set, and the child must not
@@ -1705,7 +1708,7 @@ class WorkflowRunBlockModel(Base):
     script_run = Column(JSON, nullable=True)
 
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
-    # not CDC-mirrored, so download success would not otherwise be queryable.
+    # not replicated downstream, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
     attempt_number = Column(Integer, nullable=True)
 
@@ -1895,6 +1898,8 @@ class PersistentBrowserSessionModel(Base):
     # workflow's cancellation to ride a throttled heartbeat. Write-once: it marks the first request.
     close_requested_at = Column(DateTime, nullable=True)
     cdp_unreachable_at = Column(DateTime, nullable=True)
+    # When a Copilot pre-started browser was claimed by a test; uptime is billed from this, not started_at.
+    claimed_at = Column(DateTime, nullable=True)
     # A BrowserSessionCloseReason, write-once; NULL when the session timed out, failed, or predates the column.
     close_reason = Column(String, nullable=True)
     # Retained, unwritten column: the asynchronous-create contract that populated it was reverted,
@@ -2097,6 +2102,7 @@ class CredentialModel(Base):
     browser_profile_id = Column(String, nullable=True)
     auto_profile_disabled = Column(Boolean, nullable=True, default=False)
     tested_url = Column(String, nullable=True)
+    extra_site_urls = Column(JSON, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
     pin_saved_session_ip = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())
@@ -2140,8 +2146,8 @@ class DebugSessionModel(Base):
 
 class BlockRunModel(Base):
     """
-    When a block is run in the debugger, it runs "as a 'workflow run'", but that
-    workflow run has just a single block in it. This table ties a block run to
+    When a block is run in the debugger, it runs "as a 'workflow run'". A run of
+    several blocks records only its last block here. This table ties a block run to
     the workflow run, and a particular output parameter id (which gets
     overwritten on each run.)
 

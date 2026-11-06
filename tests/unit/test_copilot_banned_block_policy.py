@@ -54,7 +54,6 @@ from skyvern.forge.sdk.copilot.tools.banned_blocks import (
     _AGENT_FAMILY_BLOCK_TYPES,
     _CODE_BLOCKS_ONLY_BANNED_BLOCK_TYPES,
     _IMAGE_CAPTCHA_GUIDANCE,
-    AGENT_STEP_BLOCK_SUMMARY,
     AUTHORING_FAMILY_GUIDANCE,
     CODE_BLOCK_SUMMARY,
     CREDENTIAL_CODE_ACCESSORS,
@@ -74,6 +73,7 @@ from skyvern.forge.sdk.copilot.tools.mcp_hooks import (
 from skyvern.forge.sdk.copilot.workflow_yaml import _normalize_copilot_yaml
 from skyvern.forge.sdk.workflow.models.block import _TASK_V3_SUPPORTED_BLOCK_TYPES
 from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.workflows import AGENT_STEP_BLOCK_SUMMARY
 from tests.unit.copilot_test_helpers import make_copilot_ctx
 
 _CODE_ONLY_UNAVAILABLE = tuple(
@@ -83,7 +83,7 @@ _CODE_ONLY_REQUIRED_TEXT = {
     "file_download": "download registration",
     "file_upload": "attach_authorized_file",
     "login": "credential-typed code",
-    "task": "agent-block authoring",
+    "task": "Browser Task block authoring",
     "task_v2": "declared AI leaf",
 }
 _CODE_ONLY_HELPERS = tuple(
@@ -310,7 +310,7 @@ async def test_task_v3_pure_schema_exposes_real_task_and_catalog() -> None:
     assert "const" not in engine and "default" not in engine
     assert "engine" not in task_result["data"]["schema"].get("required", [])
     assert "skyvern-3.0" in engine["description"] and "keeps" in engine["description"]
-    assert any("keeps" in line for line in task_result["data"]["agent_block_guidance"])
+    assert any("keeps" in line for line in task_result["data"]["browser_task_guidance"])
 
     listed = await _get_block_schema_post_hook(
         {"ok": True, "data": {"block_types": {"navigation": "Navigate", "code": "Code"}, "count": 2}},
@@ -1817,7 +1817,7 @@ async def test_the_agent_step_grant_survives_from_the_request_config_to_the_turn
     monkeypatch.setattr(settings, "WORKFLOW_COPILOT_CODE_BLOCK_MODE", True)
     agent_function = AgentFunction()
     monkeypatch.setattr(agent_function, "has_code_block_access", AsyncMock(return_value=True))
-    monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_function, "agent_step_enabled", AsyncMock(return_value=True))
 
     config = await agent_function.get_copilot_config_for_request("o_test")
     assert config is not None
@@ -1840,7 +1840,7 @@ async def test_agent_step_stays_unavailable_without_a_grant_or_when_the_lookup_f
 ) -> None:
     agent_function = AgentFunction()
     if hook is not None:
-        monkeypatch.setattr(agent_function, "copilot_agent_step_enabled", hook)
+        monkeypatch.setattr(agent_function, "agent_step_enabled", hook)
 
     config = await agent_function.get_copilot_config_for_request("o_test", code_block_mode=False)
 

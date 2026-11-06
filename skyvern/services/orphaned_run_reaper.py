@@ -20,6 +20,7 @@ from skyvern.forge.sdk.executor.run_liveness import (
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
+from skyvern.forge.sdk.services.browser_session_artifacts import browser_session_artifact_system_read
 from skyvern.forge.sdk.services.org_auth_token_service import get_valid_org_api_token
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.retry_policy import get_recorded_decision, on_terminal_transition
@@ -118,7 +119,8 @@ async def _task_v2_side_effects(run: WorkflowRun, task: TaskV2) -> None:
     log_diagnostic_unavailable(run.workflow_run_id, "orphan_reaper")
     task = await _reload_task_v2(run.workflow_run_id, task)
     await uploaded_file_service.delete_files_attached_to_run(run_id=run.workflow_run_id)
-    await task_v2_service.send_task_v2_webhook(task)
+    with browser_session_artifact_system_read():
+        await task_v2_service.send_task_v2_webhook(task)
 
 
 async def _task_side_effects(task: Task) -> None:
@@ -127,7 +129,8 @@ async def _task_side_effects(task: Task) -> None:
     await uploaded_file_service.delete_files_attached_to_run(run_id=task.task_id)
     api_key = await _api_key(task.organization_id)
     if api_key:
-        await app.agent.execute_task_webhook(task, api_key)
+        with browser_session_artifact_system_read():
+            await app.agent.execute_task_webhook(task, api_key)
 
 
 async def _finish_committed_failure(run: WorkflowRun, attempt_number: int | None) -> None:

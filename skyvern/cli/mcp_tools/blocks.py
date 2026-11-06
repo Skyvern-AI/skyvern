@@ -17,47 +17,17 @@ import structlog
 from playwright.async_api import Page
 from pydantic import Field, TypeAdapter, ValidationError
 
+from skyvern.forge import app
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.workflows import (
+    AGENT_STEP_BLOCK_SUMMARY,
+    AGENT_STEP_NOT_ENABLED_MESSAGE,
+    BLOCK_TYPE_MAP,
     BLOCK_YAML_TYPES,
-    ActionBlockYAML,
     BlockType,
-    BlockYAML,
-    CodeBlockYAML,
-    ConditionalBlockYAML,
-    DataExportBlockYAML,
-    DownloadToS3BlockYAML,
-    EmailInboxBlockYAML,
-    ExtractionBlockYAML,
-    FileDownloadBlockYAML,
-    FileParserBlockYAML,
-    FileUploadBlockYAML,
-    ForLoopBlockYAML,
-    GoogleSheetsReadBlockYAML,
-    GoogleSheetsWriteBlockYAML,
-    HttpRequestBlockYAML,
-    HumanInteractionBlockYAML,
-    LoginBlockYAML,
-    NavigationBlockYAML,
-    PdfFillBlockYAML,
-    PDFParserBlockYAML,
-    PowerBIQueryBlockYAML,
-    PrintPageBlockYAML,
-    SendEmailBlockYAML,
-    SplitPdfBlockYAML,
-    TaskBlockYAML,
-    TaskV2BlockYAML,
-    TerminateBlockYAML,
-    TextPromptBlockYAML,
-    UploadToS3BlockYAML,
-    UrlBlockYAML,
-    ValidationBlockYAML,
-    WaitBlockYAML,
-    WebSearchBlockYAML,
-    WhileLoopBlockYAML,
-    WorkflowTriggerBlockYAML,
 )
 
-from ._common import CODE_ONLY_FIELD_DESCRIPTION, CODE_ONLY_POLICY_HINT, ErrorCode, make_error, make_result
+from ._common import ErrorCode, make_error, make_result
 
 LOG = structlog.get_logger(__name__)
 
@@ -68,58 +38,39 @@ def _powerbi_queries_available() -> bool:
     return integration_is_live("powerbi")
 
 
-def _contains_powerbi_query(value: Any) -> bool:
+async def _agent_step_enabled() -> bool:
+    """True when this process cannot check the org (stdio, or no forge app): the server's save check decides then."""
+    context = skyvern_context.current()
+    organization_id = context.organization_id if context else None
+    try:
+        organization_id = organization_id or app.AGENT_FUNCTION.get_mcp_request_organization_id()
+        if not organization_id:
+            return True
+        return await app.AGENT_FUNCTION.agent_step_enabled(organization_id)
+    except (RuntimeError, ValueError):
+        return True
+
+
+async def _available_block_summaries() -> dict[str, str]:
+    available = dict(BLOCK_SUMMARIES)
+    if not _powerbi_queries_available():
+        available.pop(BlockType.POWERBI_QUERY.value)
+    if not await _agent_step_enabled():
+        available.pop(BlockType.AGENT_STEP.value)
+    return available
+
+
+def _contains_block_type(value: Any, block_type: str) -> bool:
     if isinstance(value, list):
-        return any(_contains_powerbi_query(block) for block in value if isinstance(block, dict))
+        return any(_contains_block_type(block, block_type) for block in value if isinstance(block, dict))
     if not isinstance(value, dict):
         return False
-    if value.get("block_type") == BlockType.POWERBI_QUERY.value:
+    if value.get("block_type") == block_type:
         return True
     if value.get("block_type") not in {BlockType.FOR_LOOP.value, BlockType.WHILE_LOOP.value}:
         return False
-    return _contains_powerbi_query(value.get("loop_blocks", []))
+    return _contains_block_type(value.get("loop_blocks", []), block_type)
 
-
-# ---------------------------------------------------------------------------
-# Block type → YAML class mapping
-# ---------------------------------------------------------------------------
-
-BLOCK_TYPE_MAP: dict[str, type[BlockYAML]] = {
-    BlockType.TASK.value: TaskBlockYAML,
-    BlockType.TaskV2.value: TaskV2BlockYAML,
-    BlockType.FOR_LOOP.value: ForLoopBlockYAML,
-    BlockType.WHILE_LOOP.value: WhileLoopBlockYAML,
-    BlockType.CONDITIONAL.value: ConditionalBlockYAML,
-    BlockType.CODE.value: CodeBlockYAML,
-    BlockType.TEXT_PROMPT.value: TextPromptBlockYAML,
-    BlockType.EXTRACTION.value: ExtractionBlockYAML,
-    BlockType.ACTION.value: ActionBlockYAML,
-    BlockType.NAVIGATION.value: NavigationBlockYAML,
-    BlockType.LOGIN.value: LoginBlockYAML,
-    BlockType.WAIT.value: WaitBlockYAML,
-    BlockType.VALIDATION.value: ValidationBlockYAML,
-    BlockType.HTTP_REQUEST.value: HttpRequestBlockYAML,
-    BlockType.WEB_SEARCH.value: WebSearchBlockYAML,
-    BlockType.SEND_EMAIL.value: SendEmailBlockYAML,
-    BlockType.FILE_DOWNLOAD.value: FileDownloadBlockYAML,
-    BlockType.FILE_UPLOAD.value: FileUploadBlockYAML,
-    BlockType.GOTO_URL.value: UrlBlockYAML,
-    BlockType.DOWNLOAD_TO_S3.value: DownloadToS3BlockYAML,
-    BlockType.DATA_EXPORT.value: DataExportBlockYAML,
-    BlockType.TERMINATE.value: TerminateBlockYAML,
-    BlockType.UPLOAD_TO_S3.value: UploadToS3BlockYAML,
-    BlockType.FILE_URL_PARSER.value: FileParserBlockYAML,
-    BlockType.PDF_PARSER.value: PDFParserBlockYAML,
-    BlockType.HUMAN_INTERACTION.value: HumanInteractionBlockYAML,
-    BlockType.PRINT_PAGE.value: PrintPageBlockYAML,
-    BlockType.PDF_FILL.value: PdfFillBlockYAML,
-    BlockType.SPLIT_PDF.value: SplitPdfBlockYAML,
-    BlockType.WORKFLOW_TRIGGER.value: WorkflowTriggerBlockYAML,
-    BlockType.GOOGLE_SHEETS_READ.value: GoogleSheetsReadBlockYAML,
-    BlockType.EMAIL_INBOX.value: EmailInboxBlockYAML,
-    BlockType.GOOGLE_SHEETS_WRITE.value: GoogleSheetsWriteBlockYAML,
-    BlockType.POWERBI_QUERY.value: PowerBIQueryBlockYAML,
-}
 
 # ---------------------------------------------------------------------------
 # One-line summaries
@@ -158,6 +109,7 @@ BLOCK_SUMMARIES: dict[str, str] = {
     "email_inbox": "Read matching messages from a Gmail or Outlook inbox",
     "google_sheets_write": "Write rows to a Google Sheet (append new rows or update existing cells)",
     "powerbi_query": "Run one read-only DAX query against a user's authorized Power BI dataset",
+    "agent_step": AGENT_STEP_BLOCK_SUMMARY,
 }
 
 # ---------------------------------------------------------------------------
@@ -701,9 +653,7 @@ async def skyvern_block_schema(
     action = "skyvern_block_schema"
 
     if block_type is None:
-        block_types = dict(BLOCK_SUMMARIES)
-        if not _powerbi_queries_available():
-            block_types.pop(BlockType.POWERBI_QUERY.value, None)
+        block_types = await _available_block_summaries()
         return make_result(
             action,
             data={
@@ -720,15 +670,24 @@ async def skyvern_block_schema(
         normalized = "navigation"
 
     if normalized == BlockType.POWERBI_QUERY.value and not _powerbi_queries_available():
-        available_types = dict(BLOCK_SUMMARIES)
-        available_types.pop(BlockType.POWERBI_QUERY.value, None)
         return make_result(
             action,
             ok=False,
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 "Power BI queries are not currently available.",
-                f"Available types: {', '.join(sorted(available_types))}.",
+                f"Available types: {', '.join(sorted(await _available_block_summaries()))}.",
+            ),
+        )
+
+    if normalized == BlockType.AGENT_STEP.value and not await _agent_step_enabled():
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                AGENT_STEP_NOT_ENABLED_MESSAGE,
+                f"Available types: {', '.join(sorted(await _available_block_summaries()))}.",
             ),
         )
 
@@ -740,7 +699,8 @@ async def skyvern_block_schema(
             error=make_error(
                 ErrorCode.INVALID_INPUT,
                 f"Unknown block type: {block_type!r}",
-                f"Available types: {', '.join(sorted(BLOCK_SUMMARIES.keys()))}. Note: 'task' is also accepted (deprecated alias for 'navigation')",
+                f"Available types: {', '.join(sorted(await _available_block_summaries()))}."
+                " Note: 'task' is also accepted (deprecated alias for 'navigation')",
             ),
         )
 
@@ -816,10 +776,6 @@ async def skyvern_block_validate(
         str,
         Field(description="JSON string of a single block definition to validate"),
     ],
-    code_only: Annotated[
-        bool | None,
-        Field(description=CODE_ONLY_FIELD_DESCRIPTION),
-    ] = None,
 ) -> dict[str, Any]:
     """Validate a single workflow block definition (pass it as a JSON string in block_json) before using
     it in skyvern_workflow_create. Returns field-level errors. To look up the schema or fields for a
@@ -850,7 +806,7 @@ async def skyvern_block_validate(
             ),
         )
 
-    if not _powerbi_queries_available() and _contains_powerbi_query(raw):
+    if not _powerbi_queries_available() and _contains_block_type(raw, BlockType.POWERBI_QUERY.value):
         return make_result(
             action,
             ok=False,
@@ -861,26 +817,16 @@ async def skyvern_block_validate(
             ),
         )
 
-    if code_only:
-        # Preserve the lightweight-install constraint; copilot helpers require server-only deps.
-        from skyvern.forge.sdk.copilot.tools.banned_blocks import (  # noqa: PLC0415
-            collect_code_only_banned_items,
+    if _contains_block_type(raw, BlockType.AGENT_STEP.value) and not await _agent_step_enabled():
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                AGENT_STEP_NOT_ENABLED_MESSAGE,
+                "Use a currently available block type from skyvern_block_schema.",
+            ),
         )
-
-        banned_items = collect_code_only_banned_items([raw])
-        if banned_items:
-            labels = ", ".join(sorted({label for label, _ in banned_items}))
-            types = ", ".join(sorted({block_type for _, block_type in banned_items}))
-            return make_result(
-                action,
-                ok=False,
-                error=make_error(
-                    ErrorCode.INVALID_INPUT,
-                    f"Block type(s) {types} are not allowed in code-only mode (offending labels: {labels})",
-                    "In code-only mode, use a `code` block for durable browser/page work instead of "
-                    "task/navigation/extraction/etc. " + CODE_ONLY_POLICY_HINT,
-                ),
-            )
 
     adapter = _get_block_adapter()
     try:

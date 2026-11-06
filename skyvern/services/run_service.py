@@ -11,6 +11,11 @@ from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNo
 from skyvern.forge import app
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    REDACTED_ARTIFACT,
+    REDACTED_URL,
+    browser_session_artifact_read_scope,
+)
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.forge.sdk.workflow.response_value_caps import (
@@ -49,8 +54,8 @@ _IN_FLIGHT: dict[tuple[Hashable, ...], asyncio.Task[Any]] = {}
 async def coalesce_in_flight(build: Callable[[*Ts], Coroutine[Any, Any, T]], *args: *Ts) -> T:
     """Overlapping calls of one build with equal arguments await a single run of it, and a finished result is never
     reused. A caller that joins an in-flight build can get a result older than its own request."""
-    # The key is the whole call, so the build must take everything that changes its result as an argument.
-    key = (build, *args)
+    # A signed response must never be shared across callers with different artifact permissions.
+    key = (build, browser_session_artifact_read_scope(), *args)
     task = _IN_FLIGHT.get(key)
     if task is None or task.done():
         task = asyncio.create_task(build(*args))
@@ -99,7 +104,6 @@ async def get_run_response(
         or run.task_run_type == RunType.openai_cua
         or run.task_run_type == RunType.anthropic_cua
         or run.task_run_type == RunType.ui_tars
-        or run.task_run_type == RunType.yutori_navigator
         or run.task_run_type == RunType.task_v3
     ):
         # fetch task v1 from db and transform to task run response
@@ -116,8 +120,6 @@ async def get_run_response(
             run_engine = RunEngine.anthropic_cua
         elif run.task_run_type == RunType.ui_tars:
             run_engine = RunEngine.ui_tars
-        elif run.task_run_type == RunType.yutori_navigator:
-            run_engine = RunEngine.yutori_navigator
         elif run.task_run_type == RunType.task_v3:
             run_engine = RunEngine.skyvern_v3
 
@@ -150,7 +152,9 @@ async def get_run_response(
                 # An extraction-only task has no navigation goal, so resolve the prompt the same
                 # way the agent resolves its first-turn goal instead of failing validation.
                 prompt=task_v1_response.request.navigation_goal or task_v1_response.request.data_extraction_goal or "",
-                url=task_v1_response.request.url,
+                url=None
+                if task_v1_response.request.url in {REDACTED_ARTIFACT, REDACTED_URL}
+                else task_v1_response.request.url,
                 webhook_url=task_v1_response.request.webhook_callback_url,
                 totp_identifier=task_v1_response.request.totp_identifier,
                 totp_url=task_v1_response.request.totp_verification_url,
@@ -360,7 +364,6 @@ async def cancel_run(
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
-        RunType.yutori_navigator,
         RunType.task_v3,
     ]:
         await cancel_task_v1(
@@ -444,6 +447,7 @@ async def retry_run_webhook(
     organization_id: str | None = None,
     api_key: str | None = None,
     webhook_url: str | None = None,
+    principal: RequestPrincipal | None = None,
 ) -> RunWebhookReplayResponse:
     """Retry sending the webhook for a run, optionally to a custom URL."""
     if not organization_id:
@@ -453,4 +457,5 @@ async def retry_run_webhook(
         run_id=run_id,
         target_url=webhook_url,
         api_key=api_key,
+        principal=principal,
     )

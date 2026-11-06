@@ -658,7 +658,7 @@ def slow_self_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, An
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), SlowAck)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     monkeypatch.setattr(client_mod.settings, "PORT", server.server_address[1])
     try:
         yield received

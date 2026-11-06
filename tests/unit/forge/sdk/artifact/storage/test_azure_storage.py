@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
+import azure.core.exceptions as azure_exceptions
 import pytest
 
 import skyvern.forge.sdk.artifact.storage.azure as azure_module
@@ -23,6 +24,7 @@ from skyvern.forge.sdk.artifact.storage.recording_test_helpers import fake_prepa
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from tests.unit.conftest import FakeWorkflowRunAttemptsRepository
+from tests.unit.helpers import PINNED_READ_CASES, make_pdf, unique_stored_pdf_ids
 
 # Test constants
 TEST_CONTAINER = "test-azure-container"
@@ -558,3 +560,57 @@ async def test_save_downloaded_files_retry_skips_stale_files_and_versions_fresh_
     assert registered == [fresh_file.name]
     attempt_two_listing = [row.uri.rsplit("/", 1)[-1] for row in rows if row.modified_at >= attempt_started_at]
     assert attempt_two_listing == [fresh_file.name]
+
+
+class _AzureBlobs:
+    """azure-storage-blob fake: blob properties, and chunked downloads that fail once the ETag no longer matches."""
+
+    def __init__(self, contents: list[bytes]) -> None:
+        self.blobs = {f"o_1/a_{i}.pdf": (data, f"etag-{i}") for i, data in enumerate(contents)}
+        self.replaced_after_stat: set[str] = set()
+
+    def get_container_client(self, _container: str) -> SimpleNamespace:
+        return SimpleNamespace(get_blob_client=self._blob)
+
+    def _blob(self, path: str) -> SimpleNamespace:
+        async def get_blob_properties() -> SimpleNamespace:
+            data, etag = self.blobs[path]
+            if path in self.replaced_after_stat:
+                self.blobs[path] = (data, etag + "-new")
+            return SimpleNamespace(size=len(data), etag=etag, content_settings=None, last_modified=None, metadata={})
+
+        async def download_blob(*, etag: str, match_condition: Any) -> SimpleNamespace:
+            data, current = self.blobs[path]
+            if etag != current:
+                raise azure_exceptions.ResourceModifiedError("The condition specified was not met.")
+
+            async def chunks() -> Any:
+                for start in range(0, len(data), 100):
+                    yield data[start : start + 100]
+
+            return SimpleNamespace(size=len(data), chunks=chunks)
+
+        return SimpleNamespace(get_blob_properties=get_blob_properties, download_blob=download_blob)
+
+
+@pytest.mark.parametrize("case, expected", PINNED_READ_CASES)
+@pytest.mark.asyncio
+async def test_azure_downloads_list_each_pdf_content_once_only_from_etag_pinned_reads(
+    monkeypatch: pytest.MonkeyPatch, case: str, expected: list[str]
+) -> None:
+    pdf = make_pdf("Invoice 1001")
+    blobs = _AzureBlobs([pdf, make_pdf("Invoice 1002") if case == "differs" else pdf, make_pdf("Statement 2002")])
+    if case == "replaced":
+        blobs.replaced_after_stat.add("o_1/a_1.pdf")
+    elif case == "missing":
+        del blobs.blobs["o_1/a_1.pdf"]
+    elif case == "oversize":
+        monkeypatch.setattr(settings, "BROWSER_DOWNLOAD_MAX_FILE_SIZE_BYTES", len(pdf) - 1)
+    storage = AzureStorageForTests(container=TEST_CONTAINER)
+    storage.async_client = RealAsyncAzureStorageClient(
+        account_name="acct", account_key=base64.b64encode(b"k" * 32).decode()
+    )
+    monkeypatch.setattr(storage.async_client, "_get_blob_service_client", lambda: blobs)
+    claimed = [pdf, pdf, make_pdf("Statement 2002")]
+
+    assert await unique_stored_pdf_ids(monkeypatch, storage, "azure://c/o_1", claimed) == expected

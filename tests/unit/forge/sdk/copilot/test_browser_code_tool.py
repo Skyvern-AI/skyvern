@@ -29,6 +29,7 @@ from skyvern.forge.sdk.copilot.browser_ablation import (
     resolve_copilot_tool_surface,
 )
 from skyvern.forge.sdk.copilot.browser_code_contract import (
+    DENIED_WHILE_TAINTED,
     BrowserCodeCellResult,
     BrowserCodeOperation,
     BrowserCodeSession,
@@ -143,6 +144,24 @@ def test_oss_browser_code_description_keeps_the_url_wait_line_without_a_pattern_
     description = next(tool for tool in tools if tool.name == browser_code_module.TOOL_NAME).description
     assert "wait_for_url" in description and re.search(r"\bglob\b", description)
     assert "Compiled" not in description
+
+
+@pytest.mark.parametrize("pattern_calls", [(), ("page.wait_for_url",)])
+def test_every_operation_refused_after_a_secret_run_is_named_in_the_browser_code_description(
+    pattern_calls: tuple[str, ...],
+) -> None:
+    tools = {
+        tool.name: tool.description
+        for tool in copilot_native_tools(
+            supports_question_tool=True,
+            browser_code_available=True,
+            run_tools_available=True,
+            browser_pattern_accepting_calls=pattern_calls,
+        )
+    }
+
+    for description in (tools[browser_code_module.TOOL_NAME], browser_code_module.TOOL_DESCRIPTION):
+        assert all(f"`{name}`" in description for name in DENIED_WHILE_TAINTED)
 
 
 class _LeaseProbeSession:
@@ -289,7 +308,9 @@ async def test_a_cell_whose_browser_cannot_be_entered_returns_the_acquisition_fa
 
     manager = MagicMock()
     manager.get_browser_state = AsyncMock(side_effect=BrowserCdpConnectionError("CDP connection failed"))
-    monkeypatch.setattr(runtime_module, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime_module, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
     ctx = make_copilot_context()
     ctx.api_key = "sk-test"
@@ -318,7 +339,9 @@ async def test_an_unclassified_acquisition_failure_is_named_by_type_not_by_its_o
 
     manager = MagicMock()
     manager.get_browser_state = AsyncMock(side_effect=RuntimeError("connect ws://10.1.2.3:9222/devtools refused"))
-    monkeypatch.setattr(runtime_module, "app", SimpleNamespace(PERSISTENT_SESSIONS_MANAGER=manager))
+    monkeypatch.setattr(
+        runtime_module, "app", SimpleNamespace(AGENT_FUNCTION=AgentFunction(), PERSISTENT_SESSIONS_MANAGER=manager)
+    )
     monkeypatch.setattr(browser_code_module, "_prepare_browser_session_for_dispatch", prepared)
     ctx = make_copilot_context()
     ctx.api_key = "sk-test"

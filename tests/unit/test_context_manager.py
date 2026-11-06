@@ -13,7 +13,9 @@ from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from google.api_core.exceptions import PermissionDenied, ServiceUnavailable
 from structlog.testing import capture_logs
 
+import skyvern.forge.agent_functions as agent_functions_module
 from skyvern.constants import SCRUBBED_VALUE
+from skyvern.core.script_generations import real_skyvern_page_ai
 from skyvern.exceptions import (
     BitwardenAccessDeniedError,
     BitwardenListItemsError,
@@ -26,6 +28,8 @@ from skyvern.exceptions import (
     OnePasswordSessionExpiredError,
 )
 from skyvern.forge.sdk.api.azure import AsyncAzureVaultClient
+from skyvern.forge.sdk.core import skyvern_context
+from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.credential_site_policy import LoginSite
 from skyvern.forge.sdk.schemas.credentials import (
     CredentialItem,
@@ -41,23 +45,58 @@ from skyvern.forge.sdk.services.credential.custom_credential_vault_service impor
     CustomCredentialNotConfiguredError,
 )
 from skyvern.forge.sdk.workflow import context_manager as cm
-from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowRunContext
+from skyvern.forge.sdk.workflow.context_manager import BlockOutcome, WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.credential_fetch_outcome import (
     RUN_CREDENTIAL_FETCH_FINISHED_MESSAGE,
     classify_credential_fetch_failure,
 )
-from skyvern.forge.sdk.workflow.models.block import BranchEvaluationContext, WaitBlock
+from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
+from skyvern.forge.sdk.workflow.models.block import (
+    BranchEvaluationContext,
+    ConditionalBlock,
+    DownloadToS3Block,
+    ExtractionBlock,
+    HttpRequestBlock,
+    SendEmailBlock,
+    WaitBlock,
+)
 from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard
 from skyvern.forge.sdk.workflow.models.parameter import (
+    PLATFORM_SMTP_AWS_KEYS,
+    AWSSecretParameter,
     AzureVaultCredentialParameter,
+    BitwardenCreditCardDataParameter,
     BitwardenLoginCredentialParameter,
+    BitwardenSensitiveInformationParameter,
     ContextParameter,
     CredentialParameter,
     WorkflowParameter,
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition, WorkflowRunParameter
-from skyvern.schemas.workflows import BlockStatus
+from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.workflows import (
+    BLOCK_YAML_TYPES,
+    PARAMETER_YAML_TYPES,
+    AgentStepBlockYAML,
+    AWSSecretParameterYAML,
+    BlockResult,
+    BlockStatus,
+    BranchConditionYAML,
+    BranchCriteriaYAML,
+    CodeBlockYAML,
+    ConditionalBlockYAML,
+    ContextParameterYAML,
+    DownloadToS3BlockYAML,
+    ForLoopBlockYAML,
+    HttpRequestBlockYAML,
+    NavigationBlockYAML,
+    SendEmailBlockYAML,
+    WaitBlockYAML,
+    WorkflowDefinitionYAML,
+    WorkflowParameterYAML,
+)
+from skyvern.services import script_service
 from tests.unit.conftest import make_block_output_parameter
 from tests.unit.fake_workflow_run_context import FakeWorkflowRunContext
 from tests.unit.helpers import unsolved_captcha_relabel_categories
@@ -121,6 +160,817 @@ def _make_organization(
         created_at=now,
         modified_at=now,
     )
+
+
+def _platform_email() -> SendEmailBlockYAML:
+    return SendEmailBlockYAML(
+        label="email", sender="sender@example.com", recipients=["recipient@example.com"], subject="Subject", body="Body"
+    )
+
+
+async def _initialize_smtp_workflow(
+    workflow: Workflow | None,
+    secrets: list[AWSSecretParameter],
+    aws_client: MagicMock,
+    workflow_parameter_tuples: list[tuple[WorkflowParameter, WorkflowRunParameter]] | None = None,
+) -> WorkflowRunContext:
+    manager = WorkflowContextManager()
+    manager.aws_client = aws_client
+    return await manager.initialize_workflow_run_context(
+        organization=_make_organization(),
+        workflow_run_id="wr_test",
+        workflow_title="Test",
+        workflow_id="wf_test",
+        workflow_permanent_id="wpid_test",
+        workflow_parameter_tuples=workflow_parameter_tuples or [],
+        workflow_output_parameters=[],
+        context_parameters=[],
+        secret_parameters=secrets,
+        workflow=workflow,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_input_template_cannot_render_platform_smtp_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[
+                WorkflowParameterYAML(key="download_url", workflow_parameter_type=WorkflowParameterType.STRING),
+                AWSSecretParameterYAML(key="smtp_password", aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"]),
+            ],
+            blocks=[_platform_email(), DownloadToS3BlockYAML(label="download", url="download_url")],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    parameters = workflow.workflow_definition.parameters
+    run_input = next(p for p in parameters if isinstance(p, WorkflowParameter) and p.key == "download_url")
+    secrets = [p for p in parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="platform-value"))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        cm.app,
+        "DATABASE",
+        MagicMock(
+            observer=MagicMock(update_workflow_run_block=AsyncMock()),
+            workflow_runs=MagicMock(create_or_update_workflow_run_output_parameter=AsyncMock()),
+        ),
+    )
+    download = AsyncMock(side_effect=AssertionError("download must not run"))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.resolve_local_or_download_file", download)
+    context = await _initialize_smtp_workflow(
+        workflow,
+        secrets,
+        aws_client,
+        [(run_input, _make_run_parameter(run_input, "https://example.com/{{ smtp_password }}"))],
+    )
+    monkeypatch.setattr(DownloadToS3Block, "get_workflow_run_context", staticmethod(lambda _: context))
+    block = workflow.workflow_definition.blocks[1]
+    assert isinstance(block, DownloadToS3Block)
+
+    result = await block.execute("wr_test", "wrb_test", organization_id="org_test")
+
+    assert result.status == BlockStatus.failed
+    download.assert_not_awaited()
+    assert context.values["smtp_password"] not in json.dumps(result.output_parameter_value, default=str)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["conditional", "cached_script"])
+@pytest.mark.parametrize("with_agent", [False, True])
+async def test_platform_placeholder_from_workflow_output_cannot_reach_http(
+    monkeypatch: pytest.MonkeyPatch, source: str, with_agent: bool
+) -> None:
+    request = HttpRequestBlockYAML(
+        label="request",
+        url="https://example.com/collect",
+        method="POST",
+        body={"value": "{{ decision_output.llm_prompt }}" if source == "conditional" else "{{ echoed_output.url }}"},
+    )
+    intermediary: BLOCK_YAML_TYPES = (
+        ConditionalBlockYAML(
+            label="decision",
+            branch_conditions=[
+                BranchConditionYAML(criteria=BranchCriteriaYAML(criteria_type="prompt", expression="Continue?")),
+                BranchConditionYAML(is_default=True),
+            ],
+        )
+        if source == "conditional"
+        else NavigationBlockYAML(label="navigate", url="{{ target_url }}", navigation_goal="Open the page")
+    )
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[WorkflowParameterYAML(key="target_url", workflow_parameter_type=WorkflowParameterType.STRING)],
+            blocks=[
+                _platform_email(),
+                intermediary,
+                *([AgentStepBlockYAML(label="agent", prompt="Continue")] if with_agent else []),
+                request,
+            ],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    parameters = workflow.workflow_definition.parameters
+    run_input = next(p for p in parameters if isinstance(p, WorkflowParameter) and p.key == "target_url")
+    secrets = [p for p in parameters if isinstance(p, AWSSecretParameter)]
+    platform_values = {
+        PLATFORM_SMTP_AWS_KEYS["smtp_host"]: "smtp.example.com",
+        PLATFORM_SMTP_AWS_KEYS["smtp_port"]: "587",
+        PLATFORM_SMTP_AWS_KEYS["smtp_username"]: "sender-user",
+        PLATFORM_SMTP_AWS_KEYS["smtp_password"]: "platform-password-secret",
+    }
+    aws_client = MagicMock(get_secret=AsyncMock(side_effect=platform_values.get))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        cm.app,
+        "DATABASE",
+        MagicMock(
+            observer=MagicMock(update_workflow_run_block=AsyncMock()),
+            workflow_runs=MagicMock(create_or_update_workflow_run_output_parameter=AsyncMock()),
+        ),
+    )
+    context = await _initialize_smtp_workflow(
+        workflow,
+        secrets,
+        aws_client,
+        [(run_input, _make_run_parameter(run_input, "https://example.com/{{ smtp_password }}"))],
+    )
+    placeholder = context.values["smtp_password"]
+    ordinary = context.register_secret_value("ordinary-secret")
+    assert context.get_original_secret_value_or_none(ordinary) == "ordinary-secret"
+    for value in (placeholder, f"prefix {placeholder}", f"{ordinary}/{placeholder}"):
+        with pytest.raises(InvalidWorkflowDefinition):
+            context.get_original_secret_value_or_none(value)
+    context.values["credential_like"] = {"context": "test", "username": placeholder, "password": ""}
+    with pytest.raises(InvalidWorkflowDefinition):
+        context.credential_template_entries(["credential_like"], resolve_credential_dicts=True)
+    del context.values["credential_like"]
+    email = workflow.workflow_definition.blocks[0]
+    assert isinstance(email, SendEmailBlock)
+    assert (
+        context.resolve_smtp_secret(email, email.smtp_password)
+        == platform_values[PLATFORM_SMTP_AWS_KEYS["smtp_password"]]
+    )
+    with pytest.raises(InvalidWorkflowDefinition):
+        context.resolve_smtp_secret(
+            email.model_copy(update={"custom_smtp_host": "smtp.example.com"}), email.smtp_password
+        )
+    monkeypatch.setattr(cm.app, "WORKFLOW_CONTEXT_MANAGER", MagicMock(get_workflow_run_context=lambda _: context))
+    send = AsyncMock(return_value=(200, {}, {}))
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.aiohttp_request", send)
+    block = workflow.workflow_definition.blocks[-1]
+    assert isinstance(block, HttpRequestBlock)
+
+    with skyvern_context.scoped(SkyvernContext(workflow_run_id="wr_test", organization_id="org_test")):
+        if source == "conditional":
+            conditional = workflow.workflow_definition.blocks[1]
+            assert isinstance(conditional, ConditionalBlock)
+
+            async def evaluate(extraction: ExtractionBlock, **_: object) -> BlockResult:
+                return BlockResult(
+                    success=True,
+                    output_parameter=extraction.output_parameter,
+                    output_parameter_value={"evaluations": [{"condition_index": 1, "reasoning": "ok", "result": True}]},
+                )
+
+            monkeypatch.setattr(ExtractionBlock, "execute", evaluate)
+            await conditional.execute("wr_test", "wrb_conditional", organization_id="org_test")
+            assert context.values["smtp_password"] in context.values["decision_output"]["llm_prompt"]
+        else:
+            first_render = script_service.render_template("{{ target_url }}")
+            rendered_url = real_skyvern_page_ai.render_template(first_render)
+            assert context.values["smtp_password"] in rendered_url
+            context.values["echoed_output"] = {"url": rendered_url}
+
+        result = await block.execute("wr_test", "wrb_request", organization_id="org_test")
+
+    assert result.success is False
+    send.assert_not_awaited()
+    assert platform_values[PLATFORM_SMTP_AWS_KEYS["smtp_password"]] not in str(result.output_parameter_value)
+
+
+@pytest.mark.parametrize("identifier_type", ["name", "arn", "alias"])
+def test_platform_smtp_values_cannot_be_read_by_parameter_name(identifier_type: str) -> None:
+    identifier = PLATFORM_SMTP_AWS_KEYS["smtp_password"]
+    if identifier_type == "arn":
+        identifier = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{identifier}-Ab12Cd"
+    elif identifier_type == "alias":
+        identifier = f"{identifier}:AWSCURRENT"
+    now = datetime.now(UTC)
+    parameter = AWSSecretParameter(
+        key="mail_password",
+        aws_secret_parameter_id="asp_test",
+        workflow_id="wf_test",
+        aws_key=identifier,
+        created_at=now,
+        modified_at=now,
+    )
+    context = WorkflowRunContext("Test", "wf_test", "wpid_test", "wr_test", MagicMock())
+    context.parameters[parameter.key] = parameter
+    context.values[parameter.key] = "placeholder_test"
+
+    with pytest.raises(InvalidWorkflowDefinition):
+        context.get_value(parameter.key)
+    with pytest.raises(InvalidWorkflowDefinition):
+        context._resolve_parameter_value(parameter.key)
+    assert context.get_value_or_none(parameter.key) == "placeholder_test"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_platform_smtp", [False, True])
+async def test_static_agent_and_platform_email_can_share_a_workflow(
+    monkeypatch: pytest.MonkeyPatch, scope_platform_smtp: bool
+) -> None:
+    monkeypatch.setattr(
+        cm.app.AGENT_FUNCTION, "platform_smtp_scoping_required", AsyncMock(return_value=scope_platform_smtp)
+    )
+    enforce = AsyncMock(side_effect=PermissionError("credential not accessible") if scope_platform_smtp else None)
+    monkeypatch.setattr(cm.app.AGENT_FUNCTION, "enforce_workflow_context_credential_use", enforce)
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[],
+            blocks=[_platform_email(), AgentStepBlockYAML(label="agent", prompt="Continue", tools=["http_request"])],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="platform-value"))
+
+    context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    assert set(PLATFORM_SMTP_AWS_KEYS).issubset(context.parameters)
+    assert aws_client.get_secret.await_count == len(PLATFORM_SMTP_AWS_KEYS)
+    enforce.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "parameter_keys", "alias"),
+    [
+        ("smtp_password", None, False),
+        ("Read {{ smtp_password }}", None, False),
+        ("Read {{ mail_password }}", None, True),
+        ("Continue", ["mail_password"], True),
+    ],
+)
+async def test_static_agent_cannot_reference_platform_email_secrets(
+    prompt: str, parameter_keys: list[str] | None, alias: bool
+) -> None:
+    workflow = _make_workflow([])
+    parameters = (
+        [AWSSecretParameterYAML(key="mail_password", aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"])] if alias else []
+    )
+    email = _platform_email()
+    if alias:
+        email = email.model_copy(update={"smtp_password_secret_parameter_key": "mail_password"})
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=parameters,
+            blocks=[email, AgentStepBlockYAML(label="agent", prompt=prompt, parameter_keys=parameter_keys)],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="platform-value"))
+
+    with pytest.raises(InvalidWorkflowDefinition):
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parameter_type", ["login", "identity", "card"])
+@pytest.mark.parametrize("field", ["client_id", "client_secret", "master_password"])
+@pytest.mark.parametrize("identifier_type", ["name", "arn", "alias", "non_platform"])
+async def test_bitwarden_fallback_rejects_platform_smtp_identifiers(
+    monkeypatch: pytest.MonkeyPatch, parameter_type: str, field: str, identifier_type: str
+) -> None:
+    for setting in ("BITWARDEN_CLIENT_ID", "BITWARDEN_CLIENT_SECRET", "BITWARDEN_MASTER_PASSWORD"):
+        monkeypatch.setattr(cm.settings, setting, None)
+    now = datetime.now(UTC)
+    identifier = PLATFORM_SMTP_AWS_KEYS["smtp_password"]
+    if identifier_type == "arn":
+        identifier = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{identifier}-Ab12Cd"
+    elif identifier_type == "alias":
+        identifier = f"{identifier}:AWSCURRENT"
+    elif identifier_type == "non_platform":
+        identifier = "other-secret"
+    fields = {
+        "key": "vault",
+        "workflow_id": "wf_test",
+        "created_at": now,
+        "modified_at": now,
+        "bitwarden_client_id_aws_secret_key": "customer-client-id",
+        "bitwarden_client_secret_aws_secret_key": "customer-client-secret",
+        "bitwarden_master_password_aws_secret_key": "customer-master-password",
+        f"bitwarden_{field}_aws_secret_key": identifier,
+    }
+    if parameter_type == "login":
+        parameter = BitwardenLoginCredentialParameter(bitwarden_login_credential_parameter_id="bw_1", **fields)
+    elif parameter_type == "identity":
+        parameter = BitwardenSensitiveInformationParameter(
+            bitwarden_sensitive_information_parameter_id="bw_1",
+            bitwarden_collection_id="collection",
+            bitwarden_identity_key="identity",
+            bitwarden_identity_fields=["email"],
+            **fields,
+        )
+    else:
+        parameter = BitwardenCreditCardDataParameter(
+            bitwarden_credit_card_data_parameter_id="bw_1",
+            bitwarden_collection_id="collection",
+            bitwarden_item_id="item",
+            **fields,
+        )
+    aws_client = MagicMock(get_secret=AsyncMock(side_effect=lambda key: key))
+    context = WorkflowRunContext("Test", "wf_test", "wpid_test", "wr_test", aws_client)
+
+    if identifier_type == "non_platform":
+        assert await context._get_global_bitwarden_credentials(parameter) == (
+            fields["bitwarden_client_id_aws_secret_key"],
+            fields["bitwarden_client_secret_aws_secret_key"],
+            fields["bitwarden_master_password_aws_secret_key"],
+            None,
+        )
+    else:
+        with pytest.raises(InvalidWorkflowDefinition):
+            await context._get_global_bitwarden_credentials(parameter)
+        aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custom_smtp", [False, True])
+async def test_unreferenced_platform_parameters_are_inert_and_workflow_runs(
+    monkeypatch: pytest.MonkeyPatch, custom_smtp: bool
+) -> None:
+    parameters = [AWSSecretParameterYAML(key=key, aws_key=value) for key, value in PLATFORM_SMTP_AWS_KEYS.items()]
+    parameters.append(
+        AWSSecretParameterYAML(
+            key="old_mail_password",
+            aws_key=f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{PLATFORM_SMTP_AWS_KEYS['smtp_password']}-Ab12Cd",
+        )
+    )
+    blocks: list[BLOCK_YAML_TYPES] = [WaitBlockYAML(label="wait", wait_sec=1)]
+    if custom_smtp:
+        blocks.append(_platform_email().model_copy(update={"custom_smtp_host": "smtp.example.com"}))
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=parameters, blocks=blocks), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="SMTP_SECRET_VALUE_MUST_NOT_BE_EXPOSED"))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        cm.app,
+        "DATABASE",
+        MagicMock(
+            observer=MagicMock(update_workflow_run_block=AsyncMock()),
+            workflow_runs=MagicMock(create_or_update_workflow_run_output_parameter=AsyncMock()),
+        ),
+    )
+
+    context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+    monkeypatch.setattr(WaitBlock, "get_workflow_run_context", staticmethod(lambda _: context))
+    wait = workflow.workflow_definition.blocks[0]
+    assert isinstance(wait, WaitBlock)
+    result = await wait.execute("wr_test", "wrb_test", organization_id="org_test")
+
+    assert result.success is True
+    assert result.status == BlockStatus.completed
+    aws_client.get_secret.assert_not_awaited()
+    assert {parameter.key for parameter in parameters}.isdisjoint(context.parameters)
+    assert {parameter.key for parameter in parameters}.isdisjoint(context.values)
+    assert not context.secrets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["http", "code"])
+async def test_platform_secret_denied_for_non_rbac_workflow_and_logged_without_value(consumer: str) -> None:
+    parameter = AWSSecretParameterYAML(key="declared_secret", aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"])
+    block = (
+        HttpRequestBlockYAML(label="request", url="https://example.com", parameter_keys=[parameter.key])
+        if consumer == "http"
+        else CodeBlockYAML(label="code", code="return {}", parameter_keys=[parameter.key])
+    )
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[parameter], blocks=[block]), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    secret_value = "SMTP_SECRET_VALUE_MUST_NOT_BE_LOGGED"
+    aws_client = MagicMock(get_secret=AsyncMock(return_value=secret_value))
+
+    with capture_logs() as logs, pytest.raises(InvalidWorkflowDefinition) as error:
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    assert parameter.key in str(error.value)
+    assert secret_value not in str(error.value)
+    aws_client.get_secret.assert_not_awaited()
+    denial = next(log for log in logs if log["event"] == "Platform-managed secret parameter denied")
+    assert (denial["organization_id"], denial["workflow_id"], denial["parameter_key"]) == (
+        "org_test",
+        "wf_test",
+        "declared_secret",
+    )
+    assert secret_value not in json.dumps(logs, default=str)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "declared",
+        "template",
+        "template_key",
+        "invalid_template",
+        "nested",
+        "context",
+        "email_body",
+        "custom_smtp",
+        "missing_workflow",
+    ],
+)
+async def test_platform_email_cannot_share_platform_secret_with_other_uses(reference: str) -> None:
+    parameter = AWSSecretParameterYAML(key="smtp_password", aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"])
+    email = _platform_email()
+    blocks: list[BLOCK_YAML_TYPES] = [email]
+    parameters: list[PARAMETER_YAML_TYPES] = [parameter]
+    if reference == "declared":
+        blocks.append(CodeBlockYAML(label="code", code="return {}", parameter_keys=[parameter.key]))
+    elif reference == "template":
+        blocks.append(HttpRequestBlockYAML(label="request", url="https://example.com/{{ smtp_password }}"))
+    elif reference == "template_key":
+        blocks.append(HttpRequestBlockYAML(label="request", files={"{{ smtp_password }}": "file"}))
+    elif reference == "invalid_template":
+        blocks.append(HttpRequestBlockYAML(label="request", url="https://example.com/{{ smtp_password"))
+    elif reference == "nested":
+        blocks.append(
+            ForLoopBlockYAML(
+                label="loop",
+                loop_variable_reference="{{ items }}",
+                loop_blocks=[CodeBlockYAML(label="code", code="return {}", parameter_keys=[parameter.key])],
+            )
+        )
+    elif reference == "context":
+        parameters.append(ContextParameterYAML(key="alias", source_parameter_key=parameter.key))
+    elif reference == "email_body":
+        email.body = "{{ smtp_password }}"
+    elif reference == "custom_smtp":
+        blocks.append(
+            _platform_email().model_copy(
+                update={
+                    "label": "custom",
+                    "custom_smtp_host": "smtp.example.com",
+                    "custom_smtp_username": "{{ smtp_password }}",
+                }
+            )
+        )
+
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=parameters, blocks=blocks), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="SMTP_SECRET_VALUE_MUST_NOT_BE_LOGGED"))
+
+    with capture_logs() as logs, pytest.raises(InvalidWorkflowDefinition):
+        await _initialize_smtp_workflow(None if reference == "missing_workflow" else workflow, secrets, aws_client)
+
+    aws_client.get_secret.assert_not_awaited()
+    assert any(log.get("parameter_key") == parameter.key for log in logs)
+    if reference == "missing_workflow":
+        assert {log.get("parameter_key") for log in logs} == set(PLATFORM_SMTP_AWS_KEYS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custom_first", [False, True])
+async def test_platform_and_custom_smtp_blocks_can_share_a_workflow(
+    monkeypatch: pytest.MonkeyPatch, custom_first: bool
+) -> None:
+    email = _platform_email()
+    custom = email.model_copy(update={"label": "custom", "custom_smtp_host": "smtp.example.com"})
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[], blocks=[custom, email] if custom_first else [email, custom]),
+        workflow_id=workflow.workflow_id,
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="platform-value"))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+
+    context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    assert set(PLATFORM_SMTP_AWS_KEYS).issubset(context.parameters)
+    assert aws_client.get_secret.await_count == len(PLATFORM_SMTP_AWS_KEYS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_reference", [False, True])
+async def test_platform_emails_with_different_parameter_aliases_work_in_enforcing_org(
+    monkeypatch: pytest.MonkeyPatch, invalid_reference: bool
+) -> None:
+    alias = AWSSecretParameterYAML(key="mail_password", aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"])
+    first = _platform_email().model_copy(
+        update={
+            "smtp_password_secret_parameter_key": alias.key,
+            "body": "{{ smtp_password }}" if invalid_reference else "Body",
+        }
+    )
+    second = _platform_email().model_copy(update={"label": "second"})
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[alias], blocks=[first, second]), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    platform_values = dict(
+        zip(PLATFORM_SMTP_AWS_KEYS.values(), ("smtp.example.com", "587", "user", "password"), strict=True)
+    )
+    aws_client = MagicMock(get_secret=AsyncMock(side_effect=platform_values.get))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+    enforce = AsyncMock(side_effect=PermissionError("credential not accessible"))
+    monkeypatch.setattr(cm.app.AGENT_FUNCTION, "enforce_workflow_context_credential_use", enforce)
+
+    if invalid_reference:
+        with pytest.raises(InvalidWorkflowDefinition):
+            await _initialize_smtp_workflow(workflow, secrets, aws_client)
+        aws_client.get_secret.assert_not_awaited()
+    else:
+        context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+        assert {"mail_password", "smtp_password"}.issubset(context.parameters)
+        for block in workflow.workflow_definition.blocks:
+            assert isinstance(block, SendEmailBlock)
+            assert block._decrypt_smtp_parameters(context) == ("smtp.example.com", "587", "user", "password")
+    enforce.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identifier_type", ["arn", "case", "version"])
+async def test_platform_sender_rejects_noncanonical_secret_identifiers(identifier_type: str) -> None:
+    identifier = PLATFORM_SMTP_AWS_KEYS["smtp_host"]
+    if identifier_type == "arn":
+        identifier = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{identifier}-Ab12Cd"
+    elif identifier_type == "case":
+        identifier = identifier.lower()
+    else:
+        identifier = f"{identifier}:AWSCURRENT"
+    host = AWSSecretParameterYAML(key="smtp_host", aws_key=identifier)
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[host], blocks=[_platform_email()]), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="platform-value"))
+
+    with pytest.raises(InvalidWorkflowDefinition):
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    context = WorkflowRunContext("Test", "wf_test", "wpid_test", "wr_test", aws_client, workflow=workflow)
+    context.organization_id = "org_test"
+    for secret in secrets:
+        with pytest.raises(InvalidWorkflowDefinition):
+            await context.register_aws_secret_parameter_value(
+                secret, platform_smtp_block=workflow.workflow_definition.blocks[0]
+            )
+    aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["smtp_host", "smtp_port", "smtp_username", "smtp_password"])
+async def test_email_with_mixed_smtp_bindings_denies_platform_parameters(field: str) -> None:
+    parameter = AWSSecretParameterYAML(key="user_connection", aws_key="USER_CONNECTION")
+    email = _platform_email().model_copy(update={f"{field}_secret_parameter_key": parameter.key})
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[parameter], blocks=[email]), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    platform_secrets = [p for p in secrets if p.key in PLATFORM_SMTP_AWS_KEYS]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="secret-value"))
+
+    with pytest.raises(InvalidWorkflowDefinition) as error:
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+    assert all(secret.key in str(error.value) for secret in platform_secrets)
+    aws_client.get_secret.assert_not_awaited()
+
+    context = WorkflowRunContext("Test", "wf_test", "wpid_test", "wr_test", aws_client, workflow=workflow)
+    context.organization_id = "org_test"
+    for secret in platform_secrets:
+        with pytest.raises(InvalidWorkflowDefinition, match=secret.key):
+            await context.register_aws_secret_parameter_value(
+                secret, platform_smtp_block=workflow.workflow_definition.blocks[0]
+            )
+    aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["custom_smtp_host", "custom_smtp_username", "custom_smtp_password"])
+@pytest.mark.parametrize("value", ["smtp_password", "{{ smtp_password }}"])
+async def test_custom_smtp_fields_cannot_reference_platform_parameters(field: str, value: str) -> None:
+    parameter = AWSSecretParameterYAML(key="smtp_password", aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"])
+    fields = {"custom_smtp_host": "smtp.example.com", field: value}
+    email = _platform_email().model_copy(update=fields)
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[parameter], blocks=[email]), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="secret-value"))
+
+    with pytest.raises(InvalidWorkflowDefinition, match=parameter.key):
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+    aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_email_allows_templated_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    contact = WorkflowParameterYAML(
+        key="contact", workflow_parameter_type=WorkflowParameterType.STRING, default_value="sender@example.com"
+    )
+    email = _platform_email().model_copy(update={"sender": "{{ contact }}", "recipients": ["{{ contact }}"]})
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[contact], blocks=[email]), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="platform-value"))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+
+    context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    assert set(PLATFORM_SMTP_AWS_KEYS).issubset(context.parameters)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["sender", "recipients", "cc", "bcc"])
+async def test_platform_email_addresses_cannot_reference_platform_parameters(field: str) -> None:
+    value = "{{ smtp_password }}"
+    if field in {"cc", "bcc"}:
+        email = SendEmailBlockYAML(label="gmail", transport="gmail", recipients=[], subject="", body="")
+        blocks: list[BLOCK_YAML_TYPES] = [_platform_email(), email.model_copy(update={field: [value]})]
+    else:
+        blocks = [_platform_email().model_copy(update={field: value if field == "sender" else [value]})]
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[], blocks=blocks), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="secret-value"))
+
+    with pytest.raises(InvalidWorkflowDefinition, match="smtp_password"):
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+    aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_platform_email_rejects_mismatched_saved_parameter_binding() -> None:
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[], blocks=[_platform_email()]), workflow_id=workflow.workflow_id
+    )
+    workflow.workflow_definition.parameters = [
+        p.model_copy(update={"aws_key": "USER_CONNECTION"})
+        if isinstance(p, AWSSecretParameter) and p.key == "smtp_host"
+        else p
+        for p in workflow.workflow_definition.parameters
+    ]
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="secret-value"))
+
+    with pytest.raises(InvalidWorkflowDefinition, match="smtp_password"):
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+    aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("correct_slot", [False, True])
+async def test_platform_email_alias_must_bind_the_matching_smtp_field(
+    monkeypatch: pytest.MonkeyPatch, correct_slot: bool
+) -> None:
+    parameter = AWSSecretParameterYAML(
+        key="mail_secret",
+        aws_key=PLATFORM_SMTP_AWS_KEYS["smtp_password"],
+    )
+    email = _platform_email().model_copy(
+        update={
+            "smtp_password_secret_parameter_key" if correct_slot else "smtp_host_secret_parameter_key": parameter.key
+        }
+    )
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(parameters=[parameter], blocks=[email]), workflow_id=workflow.workflow_id
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="platform-value"))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+
+    if correct_slot:
+        context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+        assert parameter.key in context.parameters
+        assert any(call.args == (parameter.aws_key,) for call in aws_client.get_secret.await_args_list)
+    else:
+        with pytest.raises(InvalidWorkflowDefinition, match=parameter.key):
+            await _initialize_smtp_workflow(workflow, secrets, aws_client)
+        aws_client.get_secret.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference", ["smtp_password | string", "{{ smtp_password | string }}"])
+async def test_platform_secret_cannot_reach_http_through_loop_expression(reference: str) -> None:
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[],
+            blocks=[
+                _platform_email(),
+                ForLoopBlockYAML(
+                    label="loop",
+                    loop_variable_reference=reference,
+                    loop_blocks=[HttpRequestBlockYAML(label="request", headers={"X-Value": "{{ current_value }}"})],
+                ),
+            ],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="SMTP_SECRET_VALUE_MUST_NOT_BE_LOGGED"))
+
+    with capture_logs() as logs, pytest.raises(InvalidWorkflowDefinition):
+        await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    aws_client.get_secret.assert_not_awaited()
+    assert any(log.get("parameter_key") == "smtp_password" for log in logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", list(PLATFORM_SMTP_AWS_KEYS.values()))
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:{key}-Ab12Cd",
+        "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:{key}",
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:{key}-Ab12Cd::AWSCURRENT:version",
+        "{key}:AWSPREVIOUS",
+        "  {key}  ",
+    ],
+)
+async def test_platform_secret_alternate_identifiers_are_denied_at_init_and_read(key: str, identifier: str) -> None:
+    parameter = AWSSecretParameterYAML(key="declared_secret", aws_key=identifier.format(key=key.lower()))
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[parameter],
+            blocks=[HttpRequestBlockYAML(label="request", parameter_keys=[parameter.key])],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    (secret,) = (p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter))
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="SMTP_SECRET_VALUE_MUST_NOT_BE_LOGGED"))
+
+    with capture_logs() as logs, pytest.raises(InvalidWorkflowDefinition):
+        await _initialize_smtp_workflow(workflow, [secret], aws_client)
+    context = WorkflowRunContext("Test", "wf_test", "wpid_test", "wr_test", aws_client, workflow=workflow)
+    context.organization_id = "org_test"
+    with capture_logs() as read_logs, pytest.raises(InvalidWorkflowDefinition) as error:
+        await context.register_aws_secret_parameter_value(secret)
+
+    assert parameter.key in str(error.value)
+    assert "SMTP_SECRET_VALUE_MUST_NOT_BE_LOGGED" not in str(error.value)
+    aws_client.get_secret.assert_not_awaited()
+    assert all(log.get("parameter_key") == parameter.key for log in [*logs, *read_logs])
+    assert "SMTP_SECRET_VALUE_MUST_NOT_BE_LOGGED" not in json.dumps([*logs, *read_logs], default=str)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "aws_key",
+    [
+        "USER_SECRET",
+        f"{PLATFORM_SMTP_AWS_KEYS['smtp_password']}-backup",
+        f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{PLATFORM_SMTP_AWS_KEYS['smtp_password']}-backup-Ab12Cd",
+    ],
+)
+async def test_unrelated_aws_secret_still_resolves(monkeypatch: pytest.MonkeyPatch, aws_key: str) -> None:
+    parameter = AWSSecretParameterYAML(key="user_secret", aws_key=aws_key)
+    workflow = _make_workflow([])
+    workflow.workflow_definition = convert_workflow_definition(
+        WorkflowDefinitionYAML(
+            parameters=[parameter],
+            blocks=[CodeBlockYAML(label="code", code="return {}", parameter_keys=[parameter.key])],
+        ),
+        workflow_id=workflow.workflow_id,
+    )
+    secrets = [p for p in workflow.workflow_definition.parameters if isinstance(p, AWSSecretParameter)]
+    aws_client = MagicMock(get_secret=AsyncMock(return_value="user-value"))
+    monkeypatch.setattr(WorkflowRunContext, "_should_include_secrets_in_templates", AsyncMock(return_value=False))
+
+    context = await _initialize_smtp_workflow(workflow, secrets, aws_client)
+
+    assert context.get_original_secret_value_or_none(context.get_value(parameter.key)) == "user-value"
+    aws_client.get_secret.assert_awaited_once_with(aws_key)
 
 
 @pytest.mark.asyncio
@@ -398,7 +1248,10 @@ def _install_credential_app(
             ),
             CREDENTIAL_VAULT_SERVICES={CredentialVaultType.AZURE_VAULT: vault_service},
             AGENT_FUNCTION=SimpleNamespace(
+                enforce_workflow_context_credential_use=AsyncMock(),
                 enforce_credential_use=AsyncMock(),
+                enforce_platform_azure_vault_item_ownership=AsyncMock(),
+                enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False),
                 process_registered_credential_item=AsyncMock(side_effect=lambda **kwargs: kwargs["credential_item"]),
                 parse_enterprise_totp_secret=AsyncMock(return_value=None),
             ),
@@ -564,6 +1417,7 @@ class TestBitwardenLoginScope:
             totp_identifier=None,
             run_sequentially=False,
             tested_url="https://other.example.com/login",
+            extra_site_urls=[],
         )
         item = CredentialItem(
             item_id=_VAULT_ITEM_ID,
@@ -590,6 +1444,48 @@ class TestBitwardenLoginScope:
         assert armed.enforced
         assert armed.admits(allowed)
         assert not armed.admits(refused)
+
+    @pytest.mark.asyncio
+    async def test_a_login_saved_for_an_added_site_is_released_on_both_sites_and_nowhere_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_credential = SimpleNamespace(
+            credential_id="cred_1",
+            organization_id="org_test",
+            item_id="item_1",
+            vault_type=CredentialVaultType.AZURE_VAULT,
+            totp_identifier=None,
+            run_sequentially=False,
+            tested_url="https://portal.example.com/login",
+            extra_site_urls=["https://login.example.org/signin"],
+        )
+        item = CredentialItem(
+            item_id="item_1",
+            name="Portal",
+            credential_type=CredentialType.PASSWORD,
+            credential=PasswordCredential(username="user@example.com", password="synthetic-password"),
+        )
+        _install_credential_app(
+            monkeypatch,
+            db_credential=db_credential,
+            vault_service=SimpleNamespace(get_credential_item=AsyncMock(return_value=item)),
+        )
+        portal = _make_workflow_parameter("portal_login", workflow_parameter_type=WorkflowParameterType.CREDENTIAL_ID)
+
+        context = await _init_context(workflow_parameter_tuples=[(portal, _make_run_parameter(portal, "cred_1"))])
+        armed = CredentialReleaseGuard().arm_login(
+            ["synthetic-password"],
+            "portal_login",
+            tested_url=context.credential_tested_urls.get("portal_login"),
+            vault_sites=context.bitwarden_login_sites.get("portal_login"),
+            enforce_vault_sites=True,
+            extra_site_urls=context.credential_extra_site_urls.get("portal_login", ()),
+        )
+
+        assert all(entry.enforced for entry in armed)
+        assert any(entry.admits("https://www.example.com/account") for entry in armed)
+        assert any(entry.admits("https://app.example.org/home") for entry in armed)
+        assert not any(entry.admits("https://example.net/login") for entry in armed)
 
     @pytest.mark.asyncio
     async def test_a_login_read_that_lost_its_sites_is_recorded_as_having_none(
@@ -739,6 +1635,7 @@ class TestRunCredentialFetchOutcome:
             totp_identifier=None,
             run_sequentially=False,
             tested_url=None,
+            extra_site_urls=[],
         )
         item = CredentialItem(
             item_id="item_1",
@@ -785,6 +1682,7 @@ class TestRunCredentialFetchOutcome:
             totp_identifier=None,
             run_sequentially=False,
             tested_url=None,
+            extra_site_urls=[],
         )
         item = CredentialItem(
             item_id="item_1",
@@ -981,3 +1879,12 @@ async def test_templates_see_the_failure_categories_from_before_an_output_only_r
     rendered_after = await observe(after)
     assert rendered_after == await observe(before)
     assert after[0]["reason_code"] in rendered_after[0]
+
+
+@pytest.mark.asyncio
+async def test_oss_context_credential_hook_preserves_explicit_ids() -> None:
+    item = (CredentialVaultType.AZURE_VAULT.value, None, "item")
+    worker = agent_functions_module.AgentFunction()
+    assert await worker.enforce_workflow_context_credential_use(
+        "org", "run", credential_ids={"cred"}, vault_item_ids={item}, refresh=True
+    ) == {"cred"}

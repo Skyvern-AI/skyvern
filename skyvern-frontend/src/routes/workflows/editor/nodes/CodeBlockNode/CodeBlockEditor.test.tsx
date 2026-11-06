@@ -297,7 +297,7 @@ describe("save-time error code mapping validation", () => {
 });
 
 describe("CodeBlockEditor returned data schema", () => {
-  test("shows a copilot-authored schema read-only under the Goal", () => {
+  test("shows an object schema as fields with the raw JSON one click away", () => {
     const schema = JSON.stringify(
       { type: "object", properties: { total: { type: "string" } } },
       null,
@@ -306,9 +306,99 @@ describe("CodeBlockEditor returned data schema", () => {
     node.data = { ...baseData, ...codeFirstData, dataSchema: schema };
     renderEditor();
 
+    const list = screen.getByTestId("schema-field-list");
+    expect(list.textContent).toContain("total");
+    expect(list.textContent).not.toContain(
+      "Some parts of this schema show only in JSON view",
+    );
+    expect(screen.queryByTestId("code-block-data-schema")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
     const pre = screen.getByTestId("code-block-data-schema");
     expect(pre.textContent).toBe(schema);
     expect(pre.tagName).toBe("PRE");
+    expect(screen.queryByTestId("schema-field-list")).toBeNull();
+  });
+
+  test.each(["{{ output_schema }}", '"return the total"'])(
+    "shows a non-object schema %s only as raw text",
+    (schema) => {
+      node.data = { ...baseData, ...codeFirstData, dataSchema: schema };
+      renderEditor();
+
+      expect(screen.getByTestId("code-block-data-schema").textContent).toBe(
+        schema,
+      );
+      expect(screen.queryByTestId("schema-field-list")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Show fields" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Show JSON" })).toBeNull();
+    },
+  );
+
+  test("shows the fields when a string schema is replaced by an object schema", () => {
+    node.data = {
+      ...baseData,
+      ...codeFirstData,
+      dataSchema: '"return the total"',
+    };
+    const { rerender } = renderEditor();
+    const schema = JSON.stringify({
+      type: "object",
+      properties: { total: { type: "string" } },
+    });
+    node.data = { ...baseData, ...codeFirstData, dataSchema: schema };
+    rerender(
+      <WorkflowScopeContext.Provider
+        value={{ workflowId: "w", readOnly: false }}
+      >
+        <CodeBlockEditor blockId="cb1" />
+      </WorkflowScopeContext.Provider>,
+    );
+
+    expect(screen.getByTestId("schema-field-list").textContent).toContain(
+      "total",
+    );
+    expect(screen.queryByTestId("code-block-data-schema")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show JSON" })).not.toBeNull();
+  });
+
+  test("notes that part of the schema shows only in JSON view", () => {
+    node.data = {
+      ...baseData,
+      ...codeFirstData,
+      dataSchema: JSON.stringify({
+        type: "object",
+        properties: { ref: { $ref: "#/x" } },
+      }),
+    };
+    renderEditor();
+
+    expect(screen.getByTestId("schema-field-list").textContent).toContain(
+      "Some parts of this schema show only in JSON view",
+    );
+  });
+
+  test("does not carry a JSON choice to another block in the same panel", () => {
+    node.data = {
+      ...baseData,
+      ...codeFirstData,
+      dataSchema: JSON.stringify({
+        type: "object",
+        properties: { total: { type: "string" } },
+      }),
+    };
+    const { rerender } = renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Show JSON" }));
+    expect(screen.queryByTestId("schema-field-list")).toBeNull();
+
+    rerender(
+      <WorkflowScopeContext.Provider
+        value={{ workflowId: "w", readOnly: false }}
+      >
+        <CodeBlockEditor blockId="cb2" />
+      </WorkflowScopeContext.Provider>,
+    );
+    expect(screen.getByTestId("schema-field-list")).not.toBeNull();
   });
 
   test("renders nothing for a block without a schema", () => {

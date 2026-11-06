@@ -165,7 +165,17 @@ const repairLoopTurn = (): TurnNarrativeState => ({
 
 describe("NarrativeView — activity log", () => {
   it("folds a finished turn under one header that counts its failed tests", () => {
-    render(<NarrativeView turn={repairLoopTurn()} />);
+    const turn = repairLoopTurn();
+    render(
+      <NarrativeView
+        turn={{
+          ...turn,
+          designActivity: turn.designActivity.map((entry) =>
+            entry.id === "tr-2" ? { ...entry, workflowRunId: "wr_1" } : entry,
+          ),
+        }}
+      />,
+    );
     expect(screen.queryByText("Explore site")).toBeNull();
     const fold = screen.getByRole("button", { name: /^Worked through/ });
     expect(fold.textContent).toBe("Worked through 3 steps · 1 failed test");

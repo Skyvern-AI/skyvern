@@ -41,7 +41,7 @@ from skyvern.webeye.browser_engine import BrowserEngineSelection
 from skyvern.webeye.dom_inspection import read_locator_selected_state
 from skyvern.webeye.navigation import redact_url_secrets
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
-from skyvern.webeye.utils.page import mask_otp_values_in_html
+from skyvern.webeye.utils.page import apply_secret_visual_mask_to_locator, mask_otp_values_in_html
 
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
@@ -229,6 +229,18 @@ class SkyvernPage(Page):
 
     def _is_secret_reference(self, value: str) -> bool:
         return False
+
+    def _is_card_secret_reference(self, value: str) -> bool:
+        return False
+
+    async def _mask_card_secret_field(self, locator: Locator, original_value: str, value: str, timeout: float) -> None:
+        # A vault card number or CVV is masked whatever the run's Mask Secrets setting: the mask is CSS-only.
+        if (
+            settings.ENABLE_SECRET_VISUAL_MASKING
+            and value != original_value
+            and self._is_card_secret_reference(original_value)
+        ):
+            await apply_secret_visual_mask_to_locator(locator, timeout=timeout)
 
     async def _resolve_totp_placeholder_or_raise(
         self,
@@ -1001,6 +1013,9 @@ class SkyvernPage(Page):
             raise NoTOTPSecretFound()
 
         try:
+            await self._mask_card_secret_field(
+                self._locator_scope.locator(selector).first, original_value, actual_value, timeout
+            )
             result = await self._do_autocomplete(
                 selector=selector,
                 value=actual_value,
@@ -1019,9 +1034,11 @@ class SkyvernPage(Page):
                 error=redact_sensitive_value(str(e), redaction_value),
             )
             if prompt:
+                # A card placeholder stays unresolved, as in _input_text's fallback.
+                keep_placeholder = resolved_totp_value is not None or self._is_card_secret_reference(original_value)
                 return await self._frame_scoped_ai.ai_input_text(
                     selector=None,
-                    value=value if resolved_totp_value is not None else actual_value,
+                    value=value if keep_placeholder else actual_value,
                     intention=prompt,
                     data=data,
                     timeout=timeout,
@@ -1246,6 +1263,7 @@ class SkyvernPage(Page):
                             totp_identifier=totp_identifier,
                             totp_url=totp_url,
                         )
+                    await self._mask_card_secret_field(locator, original_value, value, timeout)
                     # Use locator.fill() (programmatic, single-shot) instead of typing
                     # character-by-character.  Sequential typing triggers autocomplete
                     # dropdowns on search bars and typeaheads which destabilise the DOM
@@ -1268,9 +1286,12 @@ class SkyvernPage(Page):
                     selector = None
 
             if intention:
+                # The fallback types the model's answer through the handler, which can tell a vault card number from
+                # page text only by its placeholder. Other values keep the resolved form (e.g. a polled OTP code).
+                keep_placeholder = resolved_totp_value is not None or self._is_card_secret_reference(original_value)
                 return await self._frame_scoped_ai.ai_input_text(
                     selector=selector,
-                    value=original_value if resolved_totp_value is not None else value,
+                    value=original_value if keep_placeholder else value,
                     intention=intention,
                     data=data,
                     totp_identifier=totp_identifier,

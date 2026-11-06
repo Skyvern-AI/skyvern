@@ -35,6 +35,7 @@ import {
   type PanesCutFrom,
 } from "./StudioPaneDefaultsContext";
 import { useStudioWorkflowDeletedAt } from "./StudioShellContext";
+import { isStudioNarrow } from "./useStudioNarrow";
 
 // Which panes a reopened Editor keeps on a narrow stage once no run holds the
 // Browser, first to last; Editor leads so a one-pane stage still shows it.
@@ -229,7 +230,8 @@ export function StudioPaneDefaultsProvider({
         width > 0 &&
         panes.length > previous.panes.length &&
         !panesFitWidth(panes, width) &&
-        !firstRun.narrowNudgeSeen
+        !firstRun.narrowNudgeSeen &&
+        !isStudioNarrow()
       ) {
         firstRun.markNarrowNudgeSeen();
         toast({

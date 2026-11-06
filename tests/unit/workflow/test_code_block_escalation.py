@@ -56,6 +56,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
     CodeBlockStep,
     ErrorCode,
+    code_failure_source_line,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     BitwardenCreditCardDataParameter,
@@ -67,7 +68,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.forge.sdk.workflow.service import WorkflowService, _merge_workflow_run_errors
+from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.forge.taskv3.goal_composition import (
     CodeProgressRecord,
     GoalDirectives,
@@ -84,6 +85,7 @@ from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_runtime_events import BrowserRuntimeLogContext
 from skyvern.webeye.navigation import clear_task_nav_error_code, record_task_nav_error_code
 from skyvern.webeye.real_browser_state import RealBrowserState
+from tests.unit.helpers import merge_block_error_reasons
 
 SECRET_VALUE = "hunter2-super-secret"
 SHORT_SECRET_VALUE = "abc"
@@ -512,7 +514,7 @@ def test_workflow_error_merge_does_not_replace_cross_provenance_task_error() -> 
         "error_type": "USER_DEFINED_ERROR",
     }
     malformed = {**typed, "error_code": "extra", "unexpected": True}
-    result = _merge_workflow_run_errors(
+    result = merge_block_error_reasons(
         [{"error_code": "same", "reasoning": "legacy", "confidence_float": 1.0}],
         [("wrb_code", ["same", "diagnostic"], "failure", {"errors": [typed, malformed]}, "code")],
     )
@@ -532,7 +534,7 @@ def test_workflow_error_merge_upgrades_only_same_block_legacy_entry() -> None:
     }
     second = {**first, "reasoning": "second typed"}
 
-    assert _merge_workflow_run_errors(
+    assert merge_block_error_reasons(
         [],
         [
             ("wrb_1", ["same"], "first legacy", {"errors": [first]}, "code"),
@@ -550,7 +552,7 @@ def test_workflow_error_merge_dedupes_only_within_provenance_and_kind() -> None:
     }
     task = dict(typed)
 
-    assert _merge_workflow_run_errors(
+    assert merge_block_error_reasons(
         [
             {"error_code": "task_same", "reasoning": "first", "confidence_float": 1.0},
             {"error_code": "task_same", "reasoning": "second", "confidence_float": 1.0},
@@ -580,7 +582,7 @@ def test_workflow_error_merge_at_cap_skips_appends_but_allows_later_same_block_u
     }
     task_errors = [{"error_code": f"task_{index}", "reasoning": "task", "confidence_float": 1.0} for index in range(99)]
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         task_errors,
         [
             ("wrb_upgrade", ["upgrade"], "legacy", None, "code"),
@@ -595,7 +597,7 @@ def test_workflow_error_merge_at_cap_skips_appends_but_allows_later_same_block_u
 
 
 def test_workflow_error_merge_caps_duplicate_legacy_entries_per_row_and_processes_later_blocks() -> None:
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [
             ("wrb_duplicates", ["duplicate"] * 1000, "first", None, "code"),
@@ -613,7 +615,7 @@ def test_workflow_error_merge_ignores_typed_payload_beyond_per_row_candidate_cap
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
     }
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["declared"], "legacy", {"errors": [None] * 150 + [typed]}, "code")],
     )
@@ -628,7 +630,7 @@ def test_workflow_error_merge_upgrades_from_early_typed_payload_after_invalid_ca
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
     }
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["declared"], "legacy", {"errors": [None, {"bad": "shape"}, typed]}, "code")],
     )
@@ -637,7 +639,7 @@ def test_workflow_error_merge_upgrades_from_early_typed_payload_after_invalid_ca
 
 
 def test_workflow_error_merge_preserves_ordinary_and_file_parser_failures() -> None:
-    result = _merge_workflow_run_errors(
+    result = merge_block_error_reasons(
         [],
         [
             ("wrb_code", ["code_failed"], "code reason", None, "code"),
@@ -658,7 +660,7 @@ def test_workflow_error_merge_matches_status_and_webhook_top_level_shape() -> No
         "error_type": "USER_DEFINED_ERROR",
     }
     context = _make_context(with_secret=True)
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["diagnostic", "declared"], "failure", {"errors": [typed]}, "code")],
         mask_reasoning=context.mask_secrets_in_data,
@@ -679,7 +681,7 @@ def test_workflow_error_merge_skips_typed_secret_code_when_masker_is_available()
     }
     context = _make_context(with_secret=True)
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", [], "generic failure", {"errors": [typed]}, "code")],
         mask_reasoning=context.mask_secrets_in_data,
@@ -691,7 +693,7 @@ def test_workflow_error_merge_skips_typed_secret_code_when_masker_is_available()
 def test_workflow_error_merge_skips_legacy_secret_code_when_masker_is_available() -> None:
     context = _make_context(with_secret=True)
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_code", ["first", SECRET_VALUE, "last"], "generic failure", None, "code")],
         mask_reasoning=context.mask_secrets_in_data,
@@ -708,7 +710,7 @@ def test_workflow_error_merge_without_masker_preserves_legacy_and_typed_codes() 
         "error_type": "USER_DEFINED_ERROR",
     }
 
-    errors = _merge_workflow_run_errors(
+    errors = merge_block_error_reasons(
         [],
         [("wrb_legacy", [SECRET_VALUE], "legacy", None, "code"), ("wrb_typed", [], None, {"errors": [typed]}, "code")],
         mask_reasoning=None,
@@ -727,7 +729,7 @@ def test_workflow_error_merge_only_promotes_typed_payloads_from_code_blocks() ->
         "confidence_float": 1.0,
         "error_type": "USER_DEFINED_ERROR",
     }
-    assert _merge_workflow_run_errors(
+    assert merge_block_error_reasons(
         [],
         [("wrb_parser", ["diagnostic"], "failure", {"errors": [typed]}, "file_url_parser")],
     ) == [{"error_code": "diagnostic", "reasoning": "failure", "confidence_float": 1.0}]
@@ -745,7 +747,7 @@ def test_workflow_error_merge_without_context_preserves_masked_content_with_boun
         ]
     )
 
-    errors = _merge_workflow_run_errors(task_errors, [], mask_reasoning=None)
+    errors = merge_block_error_reasons(task_errors, [], mask_reasoning=None)
 
     assert len(errors) == 100
     assert errors[0]["error_code"] == "task_0"
@@ -763,6 +765,9 @@ async def test_workflow_run_block_errors_query_has_stable_multi_block_order() ->
             failure_reason="first reason",
             output=None,
             block_type="code",
+            label="first_block",
+            current_index=0,
+            final_url="https://x.test/first",
         ),
         SimpleNamespace(
             workflow_run_block_id="wrb_2",
@@ -770,6 +775,9 @@ async def test_workflow_run_block_errors_query_has_stable_multi_block_order() ->
             failure_reason="second reason",
             output=None,
             block_type="code",
+            label="second_block",
+            current_index=None,
+            final_url=None,
         ),
     ]
     result = MagicMock()
@@ -780,8 +788,8 @@ async def test_workflow_run_block_errors_query_has_stable_multi_block_order() ->
     repository = WorkflowRunsRepository(session_factory)
 
     assert await repository.get_workflow_run_block_errors("wr_test") == [
-        ("wrb_1", ["first"], "first reason", None, "code"),
-        ("wrb_2", ["second"], "second reason", None, "code"),
+        ("wrb_1", ["first"], "first reason", None, "code", "first_block", 0, "https://x.test/first"),
+        ("wrb_2", ["second"], "second reason", None, "code", "second_block", None, None),
     ]
     query = session.execute.await_args.args[0]
     assert [clause.name for clause in query._order_by_clauses] == ["created_at", "workflow_run_block_id"]
@@ -1068,9 +1076,10 @@ async def _execute_inline_failure_with_download_output(
     context: WorkflowRunContext | None = None,
     format_templates: bool = False,
     capture_failure_output: bool = False,
+    code: str | None = None,
 ) -> tuple[BlockResult, AsyncMock | None, AsyncMock]:
     _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
-    code = (
+    code = code or (
         f"raise ErrorCode({exception.error_code!r}, {exception.reasoning!r})"
         if type(exception) is ErrorCode
         else "raise RuntimeError('processing failed')"
@@ -1160,7 +1169,7 @@ async def test_rendered_error_code_misuse_returns_and_records_failed_result(monk
     assert result.success is False
     recorded_output = record_output.await_args.args[2]
     assert recorded_output["status"] == "failed"
-    record_output.assert_awaited_once_with(context, "wr_test", recorded_output)
+    assert all(call.args[:2] == (context, "wr_test") for call in record_output.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -1362,8 +1371,12 @@ async def test_inline_ordinary_exception_failure_still_preserves_download_metada
         download_output=download_output,
     )
 
-    assert result.output_parameter_value == download_output
-    assert failure_output_with_downloads.await_args.kwargs.get("result") is None
+    assert result.output_parameter_value == {
+        **download_output,
+        "code_failure": {"exception_class": "RuntimeError", "message": "processing failed", "line": None},
+    }
+    # What later blocks read is recorded from this result, and it is unchanged by code_failure.
+    assert failure_output_with_downloads.await_args.kwargs["result"] is None
 
 
 @pytest.mark.asyncio
@@ -1975,6 +1988,8 @@ async def test_declared_inputs_keep_their_payload_and_win_over_a_referenced_name
 async def test_fallback_never_receives_a_referenced_value_carrying_a_secret(
     monkeypatch: pytest.MonkeyPatch, ai_fallback_flag: Callable[[str | None], None], secret: str
 ) -> None:
+    # Keep the unrelated screenshot duration deterministic without weakening the log scan.
+    monkeypatch.setattr("skyvern.webeye.utils.page._monotonic", lambda: 0.0)
     ai_fallback_flag("o_test")
     context = _make_context()
     if secret.startswith(RANDOM_SECRET_ID_PREFIX):
@@ -1991,6 +2006,7 @@ async def test_fallback_never_receives_a_referenced_value_carrying_a_secret(
     )
 
     assert create_kwargs["navigation_payload"] == {"Other": {"id": "row-18"}}
+    assert any(log.get("event") == "Screenshot request failed" and log.get("elapsed_ms") == 0.0 for log in logs)
     assert secret not in json.dumps(create_kwargs, default=str, ensure_ascii=False)
     assert secret not in json.dumps(logs, default=str, ensure_ascii=False)
 
@@ -5423,7 +5439,7 @@ async def test_secure_failed_fallback_keeps_the_block_error_code_on_the_row_and_
     assert "browser_operation_failed" not in (state["recovery_block_updates"][-1].get("error_codes") or [])
     if "browser_operation_failed" in expected_codes:
         assert row["failure_reason"].startswith(runner_reason)
-        errors = _merge_workflow_run_errors(
+        errors = merge_block_error_reasons(
             [], [("wrb_test", row["error_codes"], row["failure_reason"], row.get("output"), "code")]
         )
         assert [error for error in errors if error["error_code"] == "browser_operation_failed"] == [
@@ -5932,3 +5948,133 @@ async def test_heal_episode_persistence_failure_does_not_change_heal_outcome(
 
     assert result.success is True
     assert any(entry.get("event") == "self-heal episode persistence failed; continuing" for entry in logs)
+
+
+@pytest.mark.asyncio
+async def test_inline_user_exception_records_code_failure_from_the_authored_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _make_context(with_secret=True)
+    context.values["step"] = "Policy Info"
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.user_code_line_from_exception", lambda _: 2)
+
+    result, _, _ = await _execute_inline_failure_with_download_output(
+        monkeypatch,
+        exception=ValueError(f"Could not find the Policy Info input for {SECRET_VALUE}."),
+        download_output=None,
+        context=context,
+        format_templates=True,
+        code=f'step = "{{{{ step }}}}"\nraise ValueError(f"Could not find the {{step}} input for {SECRET_VALUE}.")',
+    )
+
+    assert result.failure_reason is not None
+    code_failure = result.output_parameter_value["code_failure"]
+    assert code_failure == {
+        "exception_class": "ValueError",
+        "message": "Could not find the Policy Info input for *****.",
+        "line": 2,
+        "source_line": 'raise ValueError(f"Could not find the {step} input for *****.")',
+    }
+    assert code_failure["message"] in result.failure_reason
+    assert SECRET_VALUE not in str(result.output_parameter_value)
+
+
+@pytest.mark.asyncio
+async def test_inline_error_code_raise_records_no_code_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    result, _, _ = await _execute_inline_failure_with_download_output(
+        monkeypatch, exception=ErrorCode("UNDECLARED", "the author's withheld text"), download_output=None
+    )
+
+    assert result.success is False
+    assert "code_failure" not in (result.output_parameter_value or {})
+    assert "withheld text" not in str(result.output_parameter_value)
+
+
+@pytest.mark.asyncio
+async def test_secure_deferred_failure_writes_code_failure_and_receives_authored_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_db_fakes(monkeypatch, final_status=TaskStatus.completed)
+    block = _make_code_block(prompt=None, code='step = "{{ step }}"\nraise ValueError("missing")')
+    context = _make_context()
+    context.values["step"] = "Policy Info"
+    fake_browser_state = SimpleNamespace(
+        get_working_page=AsyncMock(return_value=MagicMock()),
+        engine_selection=None,
+        browser_artifacts=BrowserArtifacts(),
+    )
+    _patch_execute_chokepoint_environment(
+        monkeypatch, context=context, fake_browser_state=fake_browser_state, use_codeblock_runner=True
+    )
+    code_failure = {"exception_class": "ValueError", "message": "missing", "line": 2, "source_line": "raise"}
+    override = AsyncMock(
+        return_value=CodeBlockEngineResult(
+            block_result=None,
+            failure=CodeBlockEngineFailure(
+                error_code="user_code_error",
+                safe_message=None,
+                failure_reason="CodeBlock failed with ValueError at line 2: missing.",
+                exception_class="builtins.ValueError",
+                failing_line=2,
+                healability_hint=False,
+                code_failure=code_failure,
+            ),
+        )
+    )
+    monkeypatch.setattr(app.AGENT_FUNCTION, "execute_code_block_override", override)
+    FakeRecorder.reset(last_recorded_exception=None)
+    monkeypatch.setattr("skyvern.forge.sdk.workflow.models.block.CodeBlockActionRecording", FakeRecorder)
+    monkeypatch.setattr(CodeBlock, "record_output_parameter_value", AsyncMock(return_value=None))
+
+    result = await block.execute(
+        workflow_run_id="wr_test",
+        workflow_run_block_id="wrb_test",
+        organization_id="o_test",
+        browser_session_id="pbs_test",
+    )
+
+    assert result.success is False
+    assert result.output_parameter_value["code_failure"] == code_failure
+    assert override.await_args.kwargs["authored_code"] == 'step = "__skyvern_slot__0"\nraise ValueError("missing")'
+
+
+def test_code_failure_source_line_masks_a_secret_crossing_the_cap() -> None:
+    context = _make_context(with_secret=True)
+    line = "note = '" + "a" * 290 + SECRET_VALUE + "'"
+
+    source_line = code_failure_source_line(
+        authored_code=f"x = 1\n    {line}  ",
+        executed_code="x = 1\nrendered",
+        line=2,
+        workflow_run_context=context,
+        redaction_parameters={},
+    )
+
+    assert source_line is not None and len(source_line) <= 300
+    assert source_line.startswith("note = 'aaa")
+    assert SECRET_VALUE[:4] not in source_line
+
+
+@pytest.mark.parametrize(
+    ("authored_code", "executed_code", "line"),
+    [
+        pytest.param(None, "x = 1", 1, id="no_authored_code"),
+        pytest.param("x = 1", "x = 1\ny = 2", 1, id="line_counts_differ"),
+        pytest.param("x = 1", "x = 1", 2, id="line_out_of_range"),
+        pytest.param("x = 1", "x = 1", None, id="no_line"),
+        pytest.param('step = "__skyvern_slot__0"', 'step = "Policy Info"', 1, id="line_holds_a_slot"),
+    ],
+)
+def test_code_failure_source_line_is_omitted_without_a_matching_authored_line(
+    authored_code: str | None, executed_code: str, line: int | None
+) -> None:
+    assert (
+        code_failure_source_line(
+            authored_code=authored_code,
+            executed_code=executed_code,
+            line=line,
+            workflow_run_context=_make_context(),
+            redaction_parameters={},
+        )
+        is None
+    )

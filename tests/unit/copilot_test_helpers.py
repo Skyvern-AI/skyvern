@@ -58,7 +58,15 @@ from skyvern.forge.sdk.copilot.enforcement import (
     run_with_enforcement,
 )
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
-from skyvern.forge.sdk.copilot.repair_origin_run import RepairOriginBinding
+from skyvern.forge.sdk.copilot.repair_origin_run import (
+    OriginBlockOutput,
+    OriginExecutionSettings,
+    OriginOutputRefusal,
+    OriginOutputRefusalDetail,
+    OriginOutputSnapshot,
+    RepairOriginBinding,
+    SelectedOutputSource,
+)
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.review_gate import build_review_projection, workflow_block_fingerprints
 from skyvern.forge.sdk.copilot.runtime import AgentContext
@@ -104,7 +112,7 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.runs import ProxyLocation
 from skyvern.schemas.self_heal import HealEpisode
-from skyvern.schemas.workflows import BlockType
+from skyvern.schemas.workflows import BlockStatus, BlockType
 from skyvern.services import workflow_service as workflow_service_module
 from skyvern.webeye import real_browser_manager
 from skyvern.webeye.actions.action_types import ActionType
@@ -280,6 +288,8 @@ def harness_run(
     workflow_permanent_id: str = "wpid-1",
     organization_id: str = "org-1",
     workflow_definition_sha256: str | None = None,
+    credits_used: int = 0,
+    cached_credits_used: int = 0,
 ) -> SimpleNamespace:
     """Naive-UTC created_at, as the database returns it."""
     return SimpleNamespace(
@@ -294,6 +304,8 @@ def harness_run(
         failure_reason=None,
         browser_session_id="pbs-1",
         workflow_definition_sha256=workflow_definition_sha256,
+        credits_used=credits_used,
+        cached_credits_used=cached_credits_used,
     )
 
 
@@ -312,11 +324,18 @@ def install_get_run_results_harness(
     carried_run_id: str | None = None,
     heal_episodes: list[HealEpisode] | None = None,
     run_definition_sha256: str | None = None,
+    run_credits: tuple[int, int] = (0, 0),
 ) -> SimpleNamespace:
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
     ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
     pool = [
-        harness_run("wr-1", status=run_status, workflow_definition_sha256=run_definition_sha256),
+        harness_run(
+            "wr-1",
+            status=run_status,
+            workflow_definition_sha256=run_definition_sha256,
+            credits_used=run_credits[0],
+            cached_credits_used=run_credits[1],
+        ),
         *(other_runs or []),
     ]
     workflow = SimpleNamespace(
@@ -735,6 +754,50 @@ def make_build_test_ctx(
     if on_chat_browser:
         monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", AsyncMock(return_value=None))
     return ctx
+
+
+def install_fresh_run_browser(monkeypatch: pytest.MonkeyPatch, session_id: str) -> None:
+    async def _acquire(acquisition_ctx: CopilotContext, **_kwargs: object) -> None:
+        acquisition_ctx.browser_session_id = session_id
+
+    monkeypatch.setattr(run_execution_module, "acquire_build_test_browser_session", _acquire)
+    monkeypatch.setattr(forge_app.WORKFLOW_SERVICE, "preview_run_seed", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        forge_app.AGENT_FUNCTION, "is_browser_memory_engine_enabled_for_org", AsyncMock(return_value=False)
+    )
+
+
+def refuse_seeded_origin_output_once(
+    monkeypatch: pytest.MonkeyPatch, ctx: CopilotContext, *, on_settings_check: bool = True
+) -> list[OriginOutputRefusalDetail]:
+    workflow = ctx.staged_workflow
+    assert workflow is not None
+    refusals = [
+        OriginOutputRefusalDetail(
+            reason=OriginOutputRefusal.CHANGED_PRODUCER, block_label="run_search", origin_workflow_run_id="wr_origin"
+        )
+    ]
+
+    def _refuse_once(
+        *_args: object, check_settings: bool = True, **_kwargs: object
+    ) -> OriginOutputRefusalDetail | None:
+        return refusals.pop() if check_settings == on_settings_check and refusals else None
+
+    monkeypatch.setattr(run_execution_module, "selected_output_run_refusal", _refuse_once)
+    origin = OriginOutputSnapshot(
+        definition=workflow.workflow_definition,
+        outputs={
+            "run_search": OriginBlockOutput(
+                status=BlockStatus.completed, has_value=True, created_at=datetime.now(UTC), value={"results": []}
+            )
+        },
+        settings=OriginExecutionSettings.of(workflow),
+    )
+    ctx.repair_origin_outputs = origin
+    ctx.frontier_selected_output_sources = {
+        "run_search": SelectedOutputSource("run_search", "wr_origin", "origin", origin)
+    }
+    return refusals
 
 
 def install_secret_carrying_run_registry(monkeypatch: pytest.MonkeyPatch, *, all_registered: bool = False) -> None:
@@ -1965,7 +2028,11 @@ workflow_definition:
 
 
 def receipt_message(narrative_payload: dict[str, Any]) -> MagicMock:
-    return MagicMock(sender=WorkflowCopilotChatSender.AI, narrative_payload=narrative_payload)
+    return MagicMock(
+        sender=WorkflowCopilotChatSender.AI,
+        narrative_payload=narrative_payload,
+        _narrative_payload_unreadable=False,
+    )
 
 
 def all_blocks_tested_message() -> MagicMock:

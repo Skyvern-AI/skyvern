@@ -1037,10 +1037,11 @@ describe("WorkflowRunBlockDetail code block", () => {
       }),
     ]);
 
+    expect(screen.getByText("Keep the rows due this week")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Code" }));
     expect(screen.getByTestId("code-editor").textContent).toContain(
       "{{ Fetch_Rows_output }}",
     );
-    expect(screen.getByText("Keep the rows due this week")).toBeDefined();
     const uses = screen.getByRole("list", { name: "Names this code reads" });
     expect(
       Array.from(uses.children).map((item) => [

@@ -29,6 +29,7 @@ import {
   blockLabelFor,
   demonstrationInsertionFromNodes,
   sopAttachmentDraft,
+  SOP_ACCEPT,
   stageSopFile,
 } from "../workspaceAuthoringActions";
 
@@ -204,7 +205,7 @@ function EdgeWithAddButton({
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf"
+            accept={SOP_ACCEPT}
             className="hidden"
             onChange={handleSOPFileChange}
           />

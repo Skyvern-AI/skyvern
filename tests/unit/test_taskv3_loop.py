@@ -25,12 +25,15 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Collection
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
+from litellm.completion_extras.litellm_responses_transformation.transformation import (
+    LiteLLMResponsesTransformationHandler,
+)
 from structlog.testing import capture_logs
 
 import skyvern.webeye.action_deadline as action_deadline_module
 import skyvern.webeye.cdp_download_interceptor as cdp_module
-from skyvern.config import settings
 from skyvern.exceptions import (
     ActionDeadlineExceeded,
     CompletionGateTerminationError,
@@ -38,6 +41,8 @@ from skyvern.exceptions import (
     SkyvernContextWindowExceededError,
     StepTerminationError,
 )
+from skyvern.forge.sdk.api.llm import api_handler_factory
+from skyvern.forge.sdk.api.llm.api_handler_factory import LLMCaller
 from skyvern.forge.sdk.api.llm.exceptions import LLMContentFilteredError, LLMProviderErrorRetryableTask
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
@@ -93,7 +98,6 @@ from skyvern.forge.taskv3.loop import (
     PROGRESS_LEDGER_WINDOW,
     STALE_READ_MAX_HOLDS,
     SUBMISSION_HELD_WAIT_MAX_SECONDS,
-    SUBMISSION_RENDER_MARGIN_SECONDS,
     TARGET_ACTION_ROUND_EVENT,
     TARGET_KIND_DATA_KEY,
     TARGET_LABEL_DATA_KEY,
@@ -138,11 +142,12 @@ from skyvern.forge.taskv3.loop import (
     submissions_since,
 )
 from skyvern.forge.taskv3.opaque_refs import mask_opaque_urls
-from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG
 from skyvern.forge.taskv3.tools import build_browser_tools
+from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from skyvern.utils.url_validators import validate_fetch_url
 from tests.unit.helpers import held_finish_restated
 from tests.unit.scoped_asyncio import ScopedAsyncio
+from tests.unit.scoped_time import ScopedTime, SkewedTime
 
 
 class _ScriptedCaller:
@@ -777,21 +782,6 @@ def _navigate_tool(dead_end_status: int | None = None, *, landed_url: str | None
 
 
 @pytest.mark.asyncio
-async def test_navigate_dead_end_terminates_run() -> None:
-    # A navigate that landed on a dead/removed posting (HTTP 404/410) must end the run as `terminated`,
-    # matching v1 — NOT left to the model's finish choice (which defaults to failed at agent.py).
-    tools = [_navigate_tool(dead_end_status=404), make_finish_tool()]
-    script = [
-        [("navigate", {"url": "https://jobs.example.test/acme/closed"})],
-        [("finish", {"status": "completed", "reason": "should never run"})],
-    ]
-    outcome, _ = await _run(script, tools)
-
-    assert outcome.status == "terminated"
-    assert outcome.guard == NAV_DEAD_END_GUARD
-
-
-@pytest.mark.asyncio
 async def test_navigate_without_dead_end_does_not_terminate() -> None:
     # Anti-over-route: an ordinary navigation (no dead-end signal) must NOT be reclassified — the run
     # proceeds and finishes on the model's own verdict.
@@ -818,9 +808,10 @@ def _url_navigate_tool(dead: frozenset[str] = frozenset({_DEAD, _DEAD_TOO, _DEAD
         url = args["url"]
         data: dict[str, Any] = {"page_state_changed": True, ACTION_OUTCOME_DATA_KEY: {"page_transitioned": True}}
         if url in dead:
+            status = 410 if url == _DEAD_TOO else 404
             return ToolResult.ok(
-                f"navigated to {url} (HTTP 404)",
-                data={**data, "navigation_dead_end": 404, "navigation_dead_end_url": url},
+                f"navigated to {url} (HTTP {status})",
+                data={**data, "navigation_dead_end": status, "navigation_dead_end_url": url},
             )
         return ToolResult.ok(f"navigated to {url}", data=data)
 
@@ -856,12 +847,7 @@ async def _run_dead_end(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arm", ["forced", "treatment"])
-async def test_every_in_loop_dead_end_goes_back_to_the_model_under_the_arm(
-    monkeypatch: pytest.MonkeyPatch, arm: str
-) -> None:
-    if arm == "forced":
-        monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
+async def test_every_in_loop_dead_end_goes_back_to_the_model() -> None:
     script = [
         [("navigate", {"url": _DEAD})],
         [("navigate", {"url": _DEAD_TOO}), ("observe", {})],
@@ -869,22 +855,24 @@ async def test_every_in_loop_dead_end_goes_back_to_the_model_under_the_arm(
         [("navigate", {"url": _LIVE})],
         [("finish", {"status": "completed", "reason": "posting is open"})],
     ]
-    context = SkyvernContext(run_arms={DEAD_END_RETURN_FLAG: ("wr_1", "treatment")} if arm == "treatment" else {})
     activity = ActivityRecency()
-    with skyvern_context.scoped(context), capture_logs() as logs:
+    with capture_logs() as logs:
         outcome, _ = await _run_dead_end(script, activity=activity)
 
     assert (outcome.status, outcome.reason) == ("completed", "posting is open")
     lines = [entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end"]
-    assert [(line["returned_to_model"], line["provenance"]) for line in lines] == [(True, "undecided")] * 3
+    assert [(line["http_status"], line["returned_to_model"], line["provenance"]) for line in lines] == [
+        (404, True, "undecided"),
+        (410, True, "undecided"),
+        (404, True, "undecided"),
+    ]
     assert activity.dead_ends_returned == 3
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["completed", "failed", "terminated"])
-async def test_any_verdict_is_accepted_on_a_returned_dead_end(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+async def test_any_verdict_is_accepted_on_a_returned_dead_end(status: str) -> None:
     # A goal can be met by confirming a link is dead; the model, which sees the goal and the page, decides.
-    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
     script = [[("navigate", {"url": _DEAD})], [("finish", {"status": status, "reason": "the posting is gone"})]]
     outcome, finishes = await _run_dead_end(script)
 
@@ -893,10 +881,7 @@ async def test_any_verdict_is_accepted_on_a_returned_dead_end(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arm_on", [False, True])
-async def test_batched_dead_end_then_live_navigate_recovers(monkeypatch: pytest.MonkeyPatch, arm_on: bool) -> None:
-    # The model is told to batch aggressively: a fallback navigate in the same batch recovers, under either arm.
-    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+async def test_batched_dead_end_then_live_navigate_recovers() -> None:
     script = [
         [("navigate", {"url": _DEAD}), ("navigate", {"url": _LIVE})],
         [("navigate", {"url": _DEAD_TOO}), ("observe", {})],
@@ -906,18 +891,13 @@ async def test_batched_dead_end_then_live_navigate_recovers(monkeypatch: pytest.
     with capture_logs() as logs:
         outcome, _ = await _run_dead_end(script)
 
-    if arm_on:
-        assert (outcome.status, outcome.reason) == ("completed", "applied to the live one")
-    else:
-        assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    assert (outcome.status, outcome.reason) == ("completed", "applied to the live one")
     # Only the second batch's dead end reaches the settle site.
     assert len([entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_a_failed_call_after_a_task_url_dead_end_behaves_the_same_under_either_arm(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_a_failed_call_after_a_task_url_dead_end_keeps_the_models_verdict() -> None:
     async def stale_click(args: dict[str, Any]) -> ToolResult:
         return ToolResult.error("stale ref", data={"page_state_changed": True})
 
@@ -926,37 +906,31 @@ async def test_a_failed_call_after_a_task_url_dead_end_behaves_the_same_under_ei
         [("navigate", {"url": _DEAD}), ("click", {"ref": 3})],
         [("finish", {"status": "failed", "reason": "gone"})],
     ]
-    outcomes = []
-    for arm_on in (False, True):
-        monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
-        activity = ActivityRecency()
-        tools = [_url_navigate_tool(), click, make_finish_tool(activity=activity)]
-        outcome, _ = await _run(
-            script, tools, activity=activity, task_target_urls=caller_known_published_urls(_DEAD, keep_query=True)
-        )
-        outcomes.append((outcome.status, outcome.guard))
+    activity = ActivityRecency()
+    tools = [_url_navigate_tool(), click, make_finish_tool(activity=activity)]
+    outcome, _ = await _run(
+        script, tools, activity=activity, task_target_urls=caller_known_published_urls(_DEAD, keep_query=True)
+    )
 
-    # The failed click reports a page change, which clears the pending dead end as on main, so the model's verdict stands.
-    assert outcomes == [("failed", None), ("failed", None)]
+    assert (outcome.status, outcome.guard) == ("failed", None)
 
 
 @pytest.mark.asyncio
-async def test_a_dead_end_on_the_granted_final_turn_still_ends_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", True)
+async def test_a_dead_end_on_the_granted_final_turn_still_ends_the_run() -> None:
     activity = ActivityRecency(final_turn_active=True)
     script = [[("navigate", {"url": _DEAD})], [("finish", {"status": "completed", "reason": "never"})]]
-    outcome, _ = await _run(script, [_url_navigate_tool(), make_finish_tool(activity=activity)], activity=activity)
+    with capture_logs() as logs:
+        outcome, _ = await _run(script, [_url_navigate_tool(), make_finish_tool(activity=activity)], activity=activity)
 
     assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert line["returned_to_model"] is False
+    assert activity.dead_ends_returned == 0
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arm_on", [False, True])
-async def test_a_dead_end_on_the_tasks_own_url_is_the_models_evidence_under_the_arm(
-    monkeypatch: pytest.MonkeyPatch, arm_on: bool
-) -> None:
-    # The goal can be to confirm the link it supplies is dead; under the arm the model judges that from the status.
-    monkeypatch.setattr(settings, "TASK_V3_DEAD_END_RETURN", arm_on)
+async def test_a_dead_end_on_the_tasks_own_url_is_the_models_evidence() -> None:
+    # The goal can be to confirm the link it supplies is dead; the model judges that from the status.
     script = [
         [("navigate", {"url": _DEAD})],
         [("finish", {"status": "completed", "reason": "the supplied link is dead"})],
@@ -966,15 +940,12 @@ async def test_a_dead_end_on_the_tasks_own_url_is_the_models_evidence_under_the_
             script, task_target_urls=caller_known_published_urls(_DEAD, keep_query=True)
         )
 
-    if arm_on:
-        assert (outcome.status, outcome.reason) == ("completed", "the supplied link is dead")
-        assert [result.status for result in finishes] == ["ok"]
-    else:
-        assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    assert (outcome.status, outcome.reason) == ("completed", "the supplied link is dead")
+    assert [result.status for result in finishes] == ["ok"]
     (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
-    assert (line["provenance"], line["returned_to_model"]) == ("task_supplied", arm_on)
+    assert (line["provenance"], line["returned_to_model"]) == ("task_supplied", True)
 
-    # The pre-loop initial navigation is not in-loop: it ends the run under either arm.
+    # The pre-loop initial navigation is not in-loop: it still ends the run.
     initial, _ = await _run_dead_end(script[1:], initial_navigation_status=404, initial_navigation_url=_DEAD)
     assert (initial.status, initial.guard) == ("terminated", NAV_DEAD_END_GUARD)
 
@@ -1062,12 +1033,13 @@ async def test_navigate_dead_end_logs_its_provenance_without_a_url(
         return ToolResult.ok("navigated", data={**data, "nav_revisit": True} if revisit else data)
 
     tools = [ToolSpec(name="navigate", description="n", parameters={}, handler=handler), make_finish_tool()]
-    script = [[("navigate", {"url": requested})], [("finish", {"status": "completed", "reason": "never"})]]
+    script = [[("navigate", {"url": requested})], [("finish", {"status": "completed", "reason": "read the status"})]]
     with capture_logs() as logs:
         outcome, _ = await _run(script, tools, task_target_urls=caller_known_published_urls(*targets, keep_query=True))
 
-    assert (outcome.status, outcome.guard) == ("terminated", NAV_DEAD_END_GUARD)
+    assert (outcome.status, outcome.reason) == ("completed", "read the status")
     (line,) = (entry for entry in logs if entry["event"] == "taskv3 loop navigation dead end")
+    assert line["returned_to_model"] is True
     assert (line["task_supplied"], line["previously_visited"]) == expected
     assert line["provenance"] == (
         "task_supplied" if expected[0] else "previously_visited" if expected[1] else "undecided"
@@ -1220,6 +1192,83 @@ async def test_non_retryable_call_error_is_not_retried() -> None:
     assert caller.attempts == 1  # raised once, no retry
 
 
+class _OpenDeadline:
+    def __init__(self, scope: Any, at: float, delay: float) -> None:
+        self.scope = scope
+        self.at = at
+        self.delay = delay
+        self.fired = False
+
+
+class _ClockedTimeout:
+    """An ``asyncio.timeout`` scope that the deadline clock, not the wall clock, expires."""
+
+    def __init__(self, clock: _DeadlineClock, entry: _OpenDeadline) -> None:
+        self._clock = clock
+        self._entry = entry
+
+    async def __aenter__(self) -> Any:
+        return await self._entry.scope.__aenter__()
+
+    async def __aexit__(self, *exc_info: Any) -> bool | None:
+        try:
+            return await self._entry.scope.__aexit__(*exc_info)
+        finally:
+            if self._entry in self._clock.open_deadlines:
+                self._clock.open_deadlines.remove(self._entry)
+
+
+class _DeadlineClock(ScopedTime):
+    """The loop's deadline clock, frozen until a test moves it, so a stalled runner cannot spend a run's deadline.
+
+    ``action_deadline.under_action_deadline`` bounds a dispatch, a reload or a pre-action capture with an
+    ``asyncio.timeout``. Here those scopes expire when this clock passes them: ``advance`` moves time as a
+    handler would by running long, and ``expire_innermost`` is the hung handler's wait running out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.now = 1000.0
+        self.open_deadlines: list[_OpenDeadline] = []
+
+    def timeout(self, delay: float | None) -> Any:
+        scope = asyncio.timeout(None)
+        if delay is None:
+            return scope
+        entry = _OpenDeadline(scope, self.now + delay, delay)
+        self.open_deadlines.append(entry)
+        return _ClockedTimeout(self, entry)
+
+    def _fire(self, entry: _OpenDeadline) -> None:
+        entry.fired = True
+        entry.scope.reschedule(asyncio.get_running_loop().time())
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        for entry in list(self.open_deadlines):
+            if not entry.fired and entry.at <= self.now:
+                self._fire(entry)
+
+    def expire_innermost(self, budget_seconds: float) -> None:
+        """The hung call's bound runs out. ``budget_seconds`` is how long that bound should be (the run's remaining
+        deadline plus the dispatch margin), so a bound that grew or shrank fails here instead of passing."""
+        pending = [entry for entry in self.open_deadlines if not entry.fired]
+        assert pending, "no deadline scope is open to expire: the hung call is not bounded"
+        entry = pending[-1]
+        assert entry.delay == pytest.approx(budget_seconds), (entry.delay, budget_seconds)
+        self.now = max(self.now, entry.at) + 0.001
+        self._fire(entry)
+
+
+@pytest.fixture
+def deadline_clock(monkeypatch: pytest.MonkeyPatch) -> _DeadlineClock:
+    clock = _DeadlineClock()
+    monkeypatch.setattr(loop_module, "time", clock)
+    monkeypatch.setattr(action_deadline_module, "asyncio", ScopedAsyncio(timeout=clock.timeout))
+    # The scope also arms a real re-arm timer; keep it far past any test so a stalled runner cannot fire it.
+    monkeypatch.setattr(action_deadline_module, "DEADLINE_REARM_INTERVAL_SECONDS", 3600.0)
+    return clock
+
+
 class _Clock:
     """Deterministic monotonic clock: returns each queued value once, then repeats the last."""
 
@@ -1280,7 +1329,7 @@ async def test_deadline_seconds_exhausts_budget(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.asyncio
 async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_deadline(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     # The wait_for makes a regression fail instead of hanging; the margin puts the timeout past the run deadline.
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.2)
@@ -1296,6 +1345,7 @@ async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_dead
     monkeypatch.setattr(loop_module, "_tool_call_timed_out", _capture_timeout)
 
     async def _never_returns(args: dict[str, Any]) -> ToolResult:
+        deadline_clock.expire_innermost(1.0 + 0.2)
         await asyncio.Event().wait()
         raise AssertionError("the handler was awaited to completion")
 
@@ -1335,7 +1385,7 @@ async def test_a_tool_that_never_returns_is_stopped_and_the_run_ends_on_its_dead
 
 @pytest.mark.asyncio
 async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_turn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -1345,6 +1395,7 @@ async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_tu
 
     async def never_returns(_args: dict[str, Any]) -> ToolResult:
         link_calls.append(None)
+        deadline_clock.expire_innermost(0.2 + 0.05)
         await asyncio.Event().wait()
         raise AssertionError("the handler was awaited to completion")
 
@@ -1383,7 +1434,9 @@ async def test_timed_out_engaging_page_tool_invalidates_finish_on_cap_granted_tu
 
 
 @pytest.mark.asyncio
-async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_expired_deadline_skips_the_rest_of_a_tool_batch(
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
+) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
     monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
@@ -1392,6 +1445,7 @@ async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pyte
     async def _observe(args: dict[str, Any]) -> ToolResult:
         calls.append(args["id"])
         if args["id"] == 1:
+            deadline_clock.expire_innermost(0.25 + 0.05)
             await asyncio.Event().wait()
         return ToolResult.ok("observed")
 
@@ -1427,7 +1481,11 @@ async def test_expired_deadline_skips_the_rest_of_a_tool_batch(monkeypatch: pyte
     [("page_refresh", "budget_exhausted", False), ("on_pre_action", "failed", True)],
 )
 async def test_hung_pre_dispatch_work_is_bounded_and_logged(
-    call_site: str, expected_status: str, finish_is_dispatched: bool, monkeypatch: pytest.MonkeyPatch
+    call_site: str,
+    expected_status: str,
+    finish_is_dispatched: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_clock: _DeadlineClock,
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -1444,6 +1502,7 @@ async def test_hung_pre_dispatch_work_is_bounded_and_logged(
     monkeypatch.setattr(loop_module, "_tool_call_timed_out", capture_timeout_result)
 
     async def _hang(*_args: Any, **_kwargs: Any) -> None:
+        deadline_clock.expire_innermost(0.25 + 0.05)
         await asyncio.Event().wait()
 
     kwargs: dict[str, Any] = {}
@@ -3368,10 +3427,7 @@ async def test_toggle_probe_not_consulted_without_a_batch_failure() -> None:
     [
         ("page_transitioned", True, "completed"),
         ("page_state_changed", True, "completed"),
-        # navigation_dead_end additionally classifies the run as terminated once the batch settles --
-        # that's a separate mechanism from the batch-stop this test targets, so it gets its own expected
-        # final status rather than "completed".
-        ("navigation_dead_end", 404, "terminated"),
+        ("navigation_dead_end", 404, "completed"),
     ],
 )
 async def test_page_changing_tool_error_still_stops_batch(
@@ -7248,15 +7304,14 @@ async def test_a_navigation_that_answered_an_http_error_is_recorded_as_a_failed_
 
     navs: list[tuple[str, dict[str, Any]]] = []
     nav_outcome = {"requested_url": _NAV_URL, "url": _NAV_URL, "http_status": 404, "navigation_dead_end": 404}
-    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "completed", "reason": "should not win"})]]
+    script = [[("navigate", {"url": _NAV_URL})], [("finish", {"status": "failed", "reason": "the page is gone"})]]
     outcome, _ = await _run(
         script, [_recordable_navigate(navs, outcome=nav_outcome), make_finish_tool()], on_action_round=_on_round
     )
     assert [action.succeeded for round_actions in rounds for action in round_actions] == [False]
     assert [action.outcome for round_actions in rounds for action in round_actions] == [nav_outcome]
-    # The dead-end verdict still ends the run (the row explains it; it does not replace it), and the
-    # model still read the tool's own ok result.
-    assert outcome.status == "terminated" and outcome.guard == NAV_DEAD_END_GUARD
+    # The model read the tool's own ok result and gave the verdict.
+    assert (outcome.status, outcome.reason) == ("failed", "the page is gone")
     assert [m["content"] for m in outcome.messages if m.get("name") == "navigate"] == ["navigated"]
 
 
@@ -7708,6 +7763,23 @@ async def test_finish_terminated_after_submit_click_stands_without_a_relook() ->
     assert fp_calls["n"] == 0
 
 
+_RENDER_CLOCK = SkewedTime()
+
+
+@pytest.fixture(autouse=True)
+def _render_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Reads and submission records are stamped on this clock; at zero skew it is the real monotonic clock.
+    _RENDER_CLOCK.skew = 0.0
+    monkeypatch.setattr(loop_module, "time", _RENDER_CLOCK)
+
+
+async def _let_the_render_margin_pass() -> None:
+    """A read that starts after this counts a response already delivered as rendered. The loop's clock jumps past the
+    production margin rather than the test sleeping through it."""
+    _RENDER_CLOCK.skew += loop_module.SUBMISSION_RENDER_MARGIN_SECONDS + 0.1
+    await asyncio.sleep(0)
+
+
 class _FakeSubmissions:
     """What a page-level interceptor's ledger reports, driven by the test's own tools."""
 
@@ -7718,7 +7790,7 @@ class _FakeSubmissions:
         return tuple(self.records)
 
     def deliver(self, *, ago: float = 0.0, outcome: SubmissionOutcome = SubmissionOutcome.DELIVERED) -> None:
-        at = time.monotonic() - ago
+        at = _RENDER_CLOCK.monotonic() - ago
         self.records.append(
             InterceptedSubmission(
                 record_id=len(self.records) + 1,
@@ -7736,12 +7808,14 @@ class _FakeSubmissions:
     def hold(self) -> int:
         record_id = len(self.records) + 1
         self.records.append(
-            InterceptedSubmission(record_id=record_id, outcome=SubmissionOutcome.HELD, started_at=time.monotonic())
+            InterceptedSubmission(
+                record_id=record_id, outcome=SubmissionOutcome.HELD, started_at=_RENDER_CLOCK.monotonic()
+            )
         )
         return record_id
 
     def release(self, record_id: int) -> None:
-        now = time.monotonic()
+        now = _RENDER_CLOCK.monotonic()
         self.records[record_id - 1] = dataclasses.replace(
             self.records[record_id - 1], outcome=SubmissionOutcome.DELIVERED, released_at=now, delivered_at=now
         )
@@ -7760,14 +7834,14 @@ def _submission_tools(
         if click_delivers:
             submissions.deliver()
         if click_settles:
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("click done")
 
     async def observe(args: dict[str, Any]) -> ToolResult:
         if observe_delivers_mid_read:
             # The reference run: the read started before the response reached the page and returned after it.
             submissions.deliver()
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("url=x text: 'Submit application'")
 
     return [
@@ -8082,7 +8156,7 @@ async def test_a_submission_released_after_the_wait_cap_is_still_shown_before_th
         reads[0] += 1
         if reads[0] == 2:
             submissions.release(record_id)
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("url=x text: 'Submit application'")
 
     tools = [
@@ -8161,8 +8235,8 @@ def test_submissions_since_keeps_a_response_landing_within_the_render_margin_bef
     # not the block boundary, decides whether this block saw it.
     submissions = _FakeSubmissions()
     started_at = time.monotonic()
-    inside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS / 2
-    outside = started_at - SUBMISSION_RENDER_MARGIN_SECONDS * 2
+    inside = started_at - loop_module.SUBMISSION_RENDER_MARGIN_SECONDS / 2
+    outside = started_at - loop_module.SUBMISSION_RENDER_MARGIN_SECONDS * 2
     for at in (outside, inside):
         submissions.records.append(
             InterceptedSubmission(
@@ -8197,9 +8271,11 @@ async def _typed_rejection_run(
     *,
     click_outcomes: list[SubmissionOutcome] | None = None,
     finish_kwargs: dict[str, Any] | None = None,
+    release_held: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """Each click is a submit the interceptor records with the next outcome; once they run out it records nothing."""
+    """Each click is a submit the interceptor records with the next outcome; once they run out it records nothing.
+    With ``release_held`` an in-flight record is answered while its click is still settling."""
     activity = ActivityRecency()
     tools = _submission_tools(submissions, activity, **(finish_kwargs or {}))
     pending = list(click_outcomes or [])
@@ -8208,10 +8284,12 @@ async def _typed_rejection_run(
         if pending:
             next_outcome = pending.pop(0)
             if next_outcome is SubmissionOutcome.HELD:
-                submissions.hold()
+                record_id = submissions.hold()
+                if release_held:
+                    submissions.release(record_id)
             else:
                 submissions.deliver(outcome=next_outcome)
-            await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+            await _let_the_render_margin_pass()
         return ToolResult.ok("click done")
 
     tools[0] = ToolSpec(name="click", description="c", parameters={}, handler=click, billable=True)
@@ -8324,15 +8402,9 @@ async def test_a_submit_queued_behind_the_retry_hold_spends_the_offer_for_the_re
         [("finish", {"status": "terminated", "reason": "r3"})],
     ]
 
-    async def settle_held() -> None:
-        while not any(r.outcome is SubmissionOutcome.HELD for r in submissions.records):
-            await asyncio.sleep(0.01)
-        submissions.release(next(r.record_id for r in submissions.records if r.outcome is SubmissionOutcome.HELD))
-
-    releaser = asyncio.create_task(settle_held()) if second is SubmissionOutcome.HELD else None
-    outcome, logs = await _typed_rejection_run(submissions, script, click_outcomes=outcomes)
-    if releaser is not None:
-        await releaser
+    outcome, logs = await _typed_rejection_run(
+        submissions, script, click_outcomes=outcomes, release_held=second is SubmissionOutcome.HELD
+    )
     finishes = [
         str(m.get("content")) for m in outcome.messages if m.get("role") == "tool" and m.get("name") == "finish"
     ]
@@ -8352,7 +8424,7 @@ async def test_a_submission_the_loop_did_not_send_also_spends_the_retry_offer_fo
 
     async def click(args: dict[str, Any]) -> ToolResult:
         submissions.deliver(outcome=_REJECTED)
-        await asyncio.sleep(SUBMISSION_RENDER_MARGIN_SECONDS + 0.2)
+        await _let_the_render_margin_pass()
         return ToolResult.ok("click done")
 
     async def observe(args: dict[str, Any]) -> ToolResult:
@@ -9185,7 +9257,9 @@ async def test_hung_pending_marker_probe_is_bounded_and_reads_as_nothing_pending
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", ["click_poisoning_probe", "finish_settled_probe"])
-async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scenario: str) -> None:
+async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(
+    scenario: str, deadline_clock: _DeadlineClock
+) -> None:
     # SKY-15056 exhaustive audit: two probes in the per-turn batch flow were bounded only by the flat
     # default cap (_PAGE_PROBE_TIMEOUT_SECONDS), never by what's left of the run's OWN deadline -- the
     # click-poisoning probe_before/probe_after pair (a failed batched call's page-moved check), and
@@ -9202,7 +9276,7 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
     class _SlowFirstCallCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 0:
-                await asyncio.sleep(0.1)  # eats the whole deadline before this turn's batch dispatches
+                deadline_clock.advance(0.1)  # eats the whole deadline before this turn's batch dispatches
             return await super().call(**kwargs)
 
     if scenario == "click_poisoning_probe":
@@ -9216,7 +9290,7 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
                 page_fingerprint=hanging_probe,
                 settle_wait_seconds=0.0,
                 max_settle_deferrals=1,
-                deadline_at=time.monotonic() - 1.0,  # already elapsed before the run even starts
+                deadline_at=deadline_clock.monotonic() - 1.0,  # already elapsed before the run even starts
             )
         ]
         caller = _ScriptedCaller(
@@ -9227,7 +9301,6 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
         )
         run_kwargs = {}
 
-    started = time.monotonic()
     outcome = await asyncio.wait_for(
         run_agent_tool_loop(
             llm_caller=caller,
@@ -9238,11 +9311,9 @@ async def test_deadline_already_elapsed_bounds_every_reachable_batch_probe(scena
             max_tool_calls=20,
             **run_kwargs,
         ),
-        timeout=2,
+        timeout=10,
     )
-    elapsed = time.monotonic() - started
 
-    assert elapsed <= 1.0, elapsed
     assert hang_calls["n"] == 0  # the hanging sampler was never awaited, at either call site
     assert outcome.status in ("budget_exhausted", "completed")
 
@@ -9264,6 +9335,7 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     skipped_tool_before_finish: str | None,
     expected_status: str,
     expected_skips: list[bool],
+    deadline_clock: _DeadlineClock,
 ) -> None:
     # The stall detector's pre-batch fingerprint baseline passes deadline_at, so a slow LLM turn that
     # burns the whole deadline must skip the sample entirely -- a hanging sampler there would otherwise
@@ -9310,7 +9382,7 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     class _SlowFirstCallCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 0:
-                await asyncio.sleep(0.2)  # eats the whole deadline before this turn's batch dispatches
+                deadline_clock.advance(0.2)  # eats the whole deadline before this turn's batch dispatches
             return await super().call(**kwargs)
 
     final_batch: list[tuple[str, dict[str, Any]]] = []
@@ -9319,18 +9391,19 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
         final_batch.append((skipped_tool_before_finish, skipped_args))
     final_batch.append(("finish", {"status": "completed", "reason": "ok"}))
     caller = _SlowFirstCallCaller([[("click", {"selector": "#next"})], final_batch])
-    started = time.monotonic()
-    outcome = await run_agent_tool_loop(
-        llm_caller=caller,
-        system_prompt="sys",
-        user_prompt="goal",
-        tools=tools,
-        max_turns=20,
-        max_tool_calls=100,
-        page_fingerprint=hanging_fingerprint,
-        deadline_seconds=0.05,
+    outcome = await asyncio.wait_for(
+        run_agent_tool_loop(
+            llm_caller=caller,
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=tools,
+            max_turns=20,
+            max_tool_calls=100,
+            page_fingerprint=hanging_fingerprint,
+            deadline_seconds=0.05,
+        ),
+        timeout=10,
     )
-    elapsed = time.monotonic() - started
 
     # Skipped page-changing calls invalidate a queued finish; skipped reads do not.
     assert outcome.status == expected_status
@@ -9339,12 +9412,11 @@ async def test_pre_batch_fingerprint_sample_is_bounded_by_an_already_elapsed_dea
     assert fp_calls["n"] == 0  # deadline already gone -- the hanging sampler was never awaited
     tool_results = [message for message in outcome.messages if message.get("role") == "tool"]
     assert [message["content"].startswith("skipped:") for message in tool_results] == expected_skips
-    assert elapsed < 2.0, elapsed  # loose wall-clock bound: an awaited sampler would add its full 5s sleep
 
 
 @pytest.mark.asyncio
 async def test_post_dispatch_refresh_expiry_does_not_duplicate_skipped_tail_result(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.01)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -9373,7 +9445,7 @@ async def test_post_dispatch_refresh_expiry_does_not_duplicate_skipped_tail_resu
     class _SlowFirstCallCaller(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 0:
-                await asyncio.sleep(0.1)
+                deadline_clock.advance(0.1)
             return await super().call(**kwargs)
 
     caller = _SlowFirstCallCaller(
@@ -11683,13 +11755,17 @@ async def test_refused_finish_preserves_pending_refresh_before_next_observe() ->
 @pytest.mark.parametrize("batch_tail", [[], [("observe", {})]], ids=["no-pending-call", "pending-call"])
 @pytest.mark.parametrize("wrap_up_tool", ["finish", "observe"], ids=["final-finish", "final-nonfinish"])
 async def test_post_dispatch_refresh_timeout_skips_only_pending_calls(
-    batch_tail: list[tuple[str, dict[str, Any]]], wrap_up_tool: str, monkeypatch: pytest.MonkeyPatch
+    batch_tail: list[tuple[str, dict[str, Any]]],
+    wrap_up_tool: str,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_clock: _DeadlineClock,
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
     monkeypatch.setattr(loop_module, "asyncio", ScopedAsyncio())
 
     async def reload_page() -> None:
+        deadline_clock.expire_innermost(0.5 + 0.05)
         await asyncio.Event().wait()
 
     click_calls: list[tuple[str, dict[str, Any]]] = []
@@ -11738,7 +11814,7 @@ async def test_post_dispatch_refresh_timeout_skips_only_pending_calls(
 
 @pytest.mark.asyncio
 async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_turn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -11749,6 +11825,7 @@ async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_t
 
     async def reload_page() -> None:
         reload_calls.append(None)
+        deadline_clock.expire_innermost(0.2 + 0.05)
         await asyncio.Event().wait()
 
     ctx = SkyvernContext(task_id="tsk_refresh_timeout_on_cap_final_turn")
@@ -11791,7 +11868,7 @@ async def test_post_dispatch_refresh_timeout_invalidates_finish_on_cap_granted_t
 
 @pytest.mark.asyncio
 async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates_finish(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.5)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -11804,14 +11881,14 @@ async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates
 
     async def observe_handler(args: dict[str, Any]) -> ToolResult:
         observe_calls.append(("observe", args))
-        await asyncio.sleep(0.35)
+        deadline_clock.advance(0.35)
         return ToolResult.ok("observed")
 
     async def click_handler(args: dict[str, Any]) -> ToolResult:
         click_calls.append(("click", args))
-        click_times.append(time.monotonic())
-        await asyncio.sleep(0.25)
-        click_times.append(time.monotonic())
+        click_times.append(deadline_clock.monotonic())
+        deadline_clock.advance(0.25)
+        click_times.append(deadline_clock.monotonic())
         ctx.refresh_working_page = True
         return ToolResult.ok("click done")
 
@@ -11829,7 +11906,7 @@ async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates
             [("click", {"selector": "#submit"}), ("finish", {"status": "completed", "reason": "done"})],
         ]
     )
-    run_started_at = time.monotonic()
+    run_started_at = deadline_clock.monotonic()
     skyvern_context.set(ctx)
     try:
         outcome = await asyncio.wait_for(
@@ -11862,7 +11939,7 @@ async def test_post_dispatch_required_refresh_dropped_after_deadline_invalidates
 
 @pytest.mark.asyncio
 async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, deadline_clock: _DeadlineClock
 ) -> None:
     monkeypatch.setattr(loop_module, "TOOL_CALL_DEADLINE_MARGIN_SECONDS", 0.05)
     monkeypatch.setattr(action_deadline_module, "ACTION_DEADLINE_HEADROOM_MS", 0)
@@ -11873,6 +11950,7 @@ async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending
 
     async def reload_page() -> None:
         reload_calls.append(None)
+        deadline_clock.expire_innermost(0.5 + 0.05)
         await asyncio.Event().wait()
 
     class _RefreshBeforeFinalCall(_ScriptedCaller):
@@ -11918,7 +11996,7 @@ async def test_pre_dispatch_refresh_timeout_invalidates_finish_with_read_pending
 @pytest.mark.parametrize("finish_status", ["completed", "failed", "terminated"])
 @pytest.mark.parametrize("read_before_finish", [False, True], ids=["finish-only", "skipped-read-first"])
 async def test_expired_deadline_preserves_refresh_before_granted_finish(
-    finish_status: str, read_before_finish: bool
+    finish_status: str, read_before_finish: bool, deadline_clock: _DeadlineClock
 ) -> None:
     reload_calls: list[None] = []
     observe_calls: list[tuple[str, dict[str, Any]]] = []
@@ -11931,16 +12009,16 @@ async def test_expired_deadline_preserves_refresh_before_granted_finish(
     class _RefreshDuringFinalCall(_ScriptedCaller):
         async def call(self, **kwargs: Any) -> dict[str, Any]:
             if self.calls == 1:
-                await asyncio.sleep(0.55)
+                deadline_clock.advance(0.55)
                 ctx.refresh_working_page = True
-                final_call_times.append(time.monotonic())
+                final_call_times.append(deadline_clock.monotonic())
             return await super().call(**kwargs)
 
     final_batch = ([("observe", {})] if read_before_finish else []) + [
         ("finish", {"status": finish_status, "reason": "done"})
     ]
     caller = _RefreshDuringFinalCall([[("observe", {})], final_batch])
-    run_started_at = time.monotonic()
+    run_started_at = deadline_clock.monotonic()
     skyvern_context.set(ctx)
     try:
         outcome = await asyncio.wait_for(
@@ -12701,6 +12779,307 @@ async def test_loop_drops_a_rejected_optional_param_for_the_rest_of_the_run(
     assert outcome.status == "completed"
     first_without = caller.sent_param.index(False)
     assert first_without > 0 and not any(caller.sent_param[first_without:])
+
+
+class _ReasoningCaller(_ScriptedCaller):
+    """Returns a reasoning item with every response, as litellm's Responses bridge does, and records the history each
+    call sent; ``reject`` refuses calls whose history carries one (``always`` refuses every call once one was refused),
+    as a leg that cannot read the reasoning would, raising ``rejection()`` when given."""
+
+    def __init__(
+        self,
+        script: list[list[tuple[str, dict[str, Any]]]],
+        *,
+        items: bool = True,
+        reject: bool = False,
+        always: bool = False,
+        rejection: Callable[[], Exception] | None = None,
+        fail_first: int = 0,
+    ) -> None:
+        super().__init__(script)
+        self.items, self.reject, self.always, self.rejection = items, reject, always, rejection
+        self.fail_first = fail_first
+        self.sent: list[list[dict[str, Any]]] = []
+        self.sent_effort: list[bool] = []
+        self.refused = False
+
+    async def call(self, **kwargs: Any) -> dict[str, Any]:
+        self.sent.append(copy.deepcopy(self.message_history))
+        self.sent_effort.append(kwargs.pop("reasoning_effort", None) is not None)
+        if (
+            (self.reject and any(m.get("reasoning_items") for m in self.message_history))
+            or (self.always and self.refused)
+            or len(self.sent) <= self.fail_first
+        ):
+            self.refused = True
+            raise self.rejection() if self.rejection else LLMProviderErrorRetryableTask("TEST_KEY")
+        response = await super().call(**kwargs)
+        if self.items:
+            response["choices"][0]["message"]["reasoning_items"] = [
+                {
+                    "type": "reasoning",
+                    "id": f"rs_{self.calls}",
+                    "encrypted_content": f"opaque{self.calls}",
+                    "summary": [],
+                }
+            ]
+        return response
+
+
+def _distinct_observe_tool() -> ToolSpec:
+    reads = itertools.count(1)
+
+    async def handler(args: dict[str, Any]) -> ToolResult:
+        return ToolResult.ok(f"OBSERVE_{next(reads)} " + "x" * 400)
+
+    return ToolSpec(
+        name="observe", description="observe", parameters={}, handler=handler, compactable=True, issues_handles=True
+    )
+
+
+async def _run_reasoning(caller: _ReasoningCaller, *, carry: bool, **loop_kwargs: Any) -> LoopOutcome:
+    return await run_agent_tool_loop(
+        llm_caller=caller,
+        system_prompt="sys",
+        user_prompt="goal",
+        tools=[_distinct_observe_tool(), make_finish_tool()],
+        max_turns=6,
+        max_tool_calls=10,
+        retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+        call_retry_base_delay=0.0,
+        carry_reasoning=carry,
+        **{"max_call_retries": 1, **loop_kwargs},
+    )
+
+
+_REASONING_SCRIPT: list[list[tuple[str, dict[str, Any]]]] = [
+    [("observe", {})],
+    [("observe", {})],
+    [("observe", {})],
+    [("finish", {"status": "completed", "reason": "ok"})],
+]
+
+
+@pytest.mark.asyncio
+async def test_carried_reasoning_goes_back_right_before_the_calls_it_produced() -> None:
+    caller = _ReasoningCaller(_REASONING_SCRIPT)
+    outcome = await _run_reasoning(caller, carry=True)
+
+    assert outcome.status == "completed"
+    wire, _ = LiteLLMResponsesTransformationHandler().convert_chat_completion_messages_to_responses_api(caller.sent[-1])
+    shape = [(item["type"], item.get("id") or item.get("call_id")) for item in wire if item["type"] != "message"]
+    # Each turn's reasoning precedes that turn's call, and its result follows the call.
+    assert shape == [
+        ("reasoning", "rs_1"),
+        ("function_call", "call_0"),
+        ("function_call_output", "call_0"),
+        ("reasoning", "rs_2"),
+        ("function_call", "call_0"),
+        ("function_call_output", "call_0"),
+        ("reasoning", "rs_3"),
+        ("function_call", "call_0"),
+        ("function_call_output", "call_0"),
+    ]
+    assert [item.get("encrypted_content") for item in wire if item["type"] == "reasoning"] == [
+        "opaque1",
+        "opaque2",
+        "opaque3",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("carry", "items"), [(False, True), (True, False)])
+async def test_no_carried_reasoning_leaves_every_request_as_before(carry: bool, items: bool) -> None:
+    baseline = _ReasoningCaller(_REASONING_SCRIPT, items=False)
+    await _run_reasoning(baseline, carry=False)
+    caller = _ReasoningCaller(_REASONING_SCRIPT, items=items)
+    await _run_reasoning(caller, carry=carry)
+
+    assert json.dumps(caller.sent) == json.dumps(baseline.sent)
+
+
+@pytest.mark.asyncio
+async def test_compaction_keeps_each_reasoning_item_with_its_own_calls() -> None:
+    caller = _ReasoningCaller(_REASONING_SCRIPT)
+    await _run_reasoning(caller, carry=True)
+
+    final = caller.sent[-1]
+    assert any("elided" in str(m.get("content")) for m in final if m.get("role") == "tool")
+    carried = [m for m in final if m.get("reasoning_items")]
+    assert all(m["role"] == "assistant" and m.get("tool_calls") for m in carried)
+    assert [m["reasoning_items"][0]["id"] for m in carried] == ["rs_1", "rs_2", "rs_3"]
+    assert len(carried) == sum(1 for m in final if m.get("role") == "assistant")
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_carry_stops_for_the_run_and_retries_the_turn_once() -> None:
+    caller = _ReasoningCaller(_REASONING_SCRIPT, reject=True)
+    with capture_logs() as logs:
+        outcome = await _run_reasoning(caller, carry=True)
+
+    assert outcome.status == "completed"
+    carried = [sum(1 for m in history if m.get("reasoning_items")) for history in caller.sent]
+    # Turn 2 carries, is refused twice (one transient retry), then goes once without; nothing carries after.
+    assert carried[:4] == [0, 1, 1, 0] and not any(carried[3:])
+    assert [e["dropped"] for e in logs if e["event"] == "taskv3 loop retrying without optional call param"] == [
+        "reasoning_items"
+    ]
+
+    still_failing = _ReasoningCaller(_REASONING_SCRIPT, reject=True, always=True)
+    outcome = await _run_reasoning(still_failing, carry=True)
+    assert outcome.status == "loop_error" and len(still_failing.sent) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_leg_that_cannot_read_carried_reasoning_fails_loudly_once_then_the_turn_runs_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = LLMRouterConfig(
+        model_name="scope-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(model_name="primary", litellm_params={"model": "openai/gpt-test", "api_key": "a"}),
+            LLMRouterModelConfig(
+                model_name="other-endpoint",
+                litellm_params={"model": "azure/gpt-test", "api_base": "https://other.example.test", "api_key": "b"},
+            ),
+        ],
+        main_model_group="primary",
+        fallback_model_group="other-endpoint",
+        num_retries=0,
+        disable_cooldowns=True,
+    )
+    monkeypatch.setattr(api_handler_factory.LLMConfigRegistry, "get_config", lambda _: config)
+    monkeypatch.setattr(api_handler_factory, "_LLMCALLER_ROUTER_CACHE", {})
+    monkeypatch.setattr(api_handler_factory, "_validate_custom_llm_api_base", AsyncMock())
+    artifact_manager = MagicMock()
+    artifact_manager.bulk_create_artifacts = AsyncMock()
+    monkeypatch.setattr(api_handler_factory.app, "ARTIFACT_MANAGER", artifact_manager)
+    sent: list[tuple[str, bool]] = []
+
+    async def provider(**kwargs: Any) -> Any:
+        provider_name = "azure" if kwargs["model"].startswith("azure") else "openai"
+        carried = any(m.get("reasoning_items") for m in kwargs["messages"])
+        sent.append((provider_name, carried))
+        if provider_name == "openai" and len(sent) > 1:
+            raise litellm.InternalServerError("primary down", model="gpt-test", llm_provider="openai")
+        if carried:
+            raise litellm.BadRequestError("Item with id 'rs_1' not found.", model="gpt-test", llm_provider="azure")
+        turn = (
+            [{"name": "observe", "arguments": "{}"}]
+            if len(sent) == 1
+            else [{"name": "finish", "arguments": json.dumps({"status": "completed", "reason": "ok"})}]
+        )
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": f"call_{len(sent)}", "type": "function", "function": f} for f in turn],
+        }
+        if provider_name == "openai":
+            message["reasoning_items"] = [{"type": "reasoning", "id": "rs_1", "summary": []}]
+        return litellm.ModelResponse(
+            model="gpt-test" if provider_name == "openai" else "gpt-test-azure",
+            choices=[{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+            usage={"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    # The mocked provider returns no deployment id, so name the serving group from the provider that answered.
+    monkeypatch.setattr(
+        api_handler_factory.LLMAPIHandlerFactory,
+        "_served_model_group",
+        staticmethod(lambda _router, response: "primary" if response.model == "gpt-test" else "other-endpoint"),
+    )
+    with capture_logs() as logs:
+        outcome = await run_agent_tool_loop(
+            llm_caller=LLMCaller("TEST_REASONING_SCOPE_ROUTER"),
+            system_prompt="sys",
+            user_prompt="goal",
+            tools=[_distinct_observe_tool(), make_finish_tool()],
+            max_turns=4,
+            max_tool_calls=10,
+            retryable_call_exceptions=(LLMProviderErrorRetryableTask,),
+            max_call_retries=0,
+            call_retry_base_delay=0.0,
+            carry_reasoning=True,
+        )
+
+    assert outcome.status == "completed"
+    # The other endpoint gets the items once and refuses them; the turn then reaches it without them. The router
+    # re-raises the primary's error, so the refusal is read from the fallback error it records.
+    assert sent == [("openai", False), ("openai", True), ("azure", True), ("openai", False), ("azure", False)]
+    stripped = [e for e in logs if e.get("carry_reasoning_stripped_on_error")]
+    assert [(e["carry_reasoning_stripped_on_error"], e["status_code"], e["fallback_error"]) for e in stripped] == [
+        ("InternalServerError", 500, "BadRequestError")
+    ]
+
+
+def _rejected_carry() -> Exception:
+    cause = litellm.BadRequestError("Item with id 'rs_1' not found.", model="gpt-test", llm_provider="azure")
+    error = LLMProviderErrorRetryableTask("TEST_KEY", cause=cause)
+    error.__cause__ = cause
+    return error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rejection", "call_kwargs"),
+    [
+        (_rejected_carry, None),
+        (lambda: SkyvernContextWindowExceededError(model="gpt-test"), None),
+        (lambda: RuntimeError("provider rejected the request"), {"reasoning_effort": {"effort": "high"}}),
+    ],
+    ids=["deterministic_4xx", "context_window", "non_retryable_with_reasoning_effort"],
+)
+async def test_a_carry_rejection_strips_on_the_first_failure(
+    rejection: Callable[[], Exception], call_kwargs: dict[str, Any] | None
+) -> None:
+    caller = _ReasoningCaller(_REASONING_SCRIPT, reject=True, rejection=rejection)
+    with capture_logs() as logs:
+        outcome = await _run_reasoning(caller, carry=True, max_call_retries=2, call_kwargs=call_kwargs)
+
+    assert outcome.status == "completed"
+    assert outcome.carry_reasoning_stripped is True and outcome.carried_reasoning_turns == 1
+    carried = [sum(1 for m in history if m.get("reasoning_items")) for history in caller.sent]
+    # The carrying call is sent once, not once per transient retry, and nothing carries after it.
+    assert carried[:3] == [0, 1, 0] and not any(carried[2:])
+    dropped = [e["dropped"] for e in logs if e["event"] == "taskv3 loop retrying without optional call param"]
+    assert dropped == ["reasoning_items"]
+    assert all(caller.sent_effort) is (call_kwargs is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_before_anything_is_carried_retries_as_control_does() -> None:
+    sends: dict[bool, tuple[int, list[bool]]] = {}
+    for carry in (True, False):
+        caller = _ReasoningCaller(_REASONING_SCRIPT, rejection=_rejected_carry, fail_first=2)
+        outcome = await _run_reasoning(
+            caller, carry=carry, max_call_retries=2, call_kwargs={"reasoning_effort": {"effort": "high"}}
+        )
+        assert outcome.status == "completed" and outcome.carry_reasoning_stripped is False
+        sends[carry] = (len(caller.sent), caller.sent_effort)
+
+    assert sends[True] == sends[False] and all(sends[True][1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("main_group", "served", "carries"),
+    [("primary", "primary", True), ("primary", "other-endpoint", False), ("primary", None, False), (None, None, True)],
+    ids=["router_main_served", "router_fallback_served", "router_unknown", "direct"],
+)
+async def test_only_reasoning_the_main_group_is_known_to_have_returned_is_carried(
+    main_group: str | None, served: str | None, carries: bool
+) -> None:
+    caller = _ReasoningCaller(_REASONING_SCRIPT)
+    caller.llm_config = SimpleNamespace(supports_vision=True, main_model_group=main_group)
+    caller.last_served_model_group = served
+    outcome = await _run_reasoning(caller, carry=True)
+
+    assert outcome.carried_reasoning_turns == (4 if carries else 0)
+    assert any(m.get("reasoning_items") for history in caller.sent for m in history) is carries
 
 
 def test_canonical_progress_tracker_counts_targets_and_clears_on_progress() -> None:
@@ -15774,13 +16153,14 @@ async def test_action_loop_verdict_names_no_control_when_the_call_reported_none(
 
 
 def _dead_end_run(landed: str, *, status: int = 404, **kwargs: Any) -> Any:
-    """One `navigate` that lands dead on ``landed``, driven through the real loop to its verdict."""
-    tools = [_navigate_tool(dead_end_status=status, landed_url=landed), make_finish_tool()]
+    """One `navigate` on the granted final turn that lands dead on ``landed``, run through the loop to its verdict."""
+    activity = ActivityRecency(final_turn_active=True)
+    tools = [_navigate_tool(dead_end_status=status, landed_url=landed), make_finish_tool(activity=activity)]
     script = [
         [("navigate", {"url": "https://mail.example.test/r"})],
         [("finish", {"status": "completed", "reason": "should never run"})],
     ]
-    return _run(script, tools, **kwargs)
+    return _run(script, tools, activity=activity, **kwargs)
 
 
 def _verdict_place(reason: str) -> str | None:

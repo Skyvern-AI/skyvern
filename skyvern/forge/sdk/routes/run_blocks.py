@@ -24,6 +24,10 @@ from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.browser_session_redaction import (
+    redact_browser_session_addresses as _redact_browser_session_addresses,
+)
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.tags import CallerType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody
@@ -113,7 +117,7 @@ async def _run_workflow_and_build_response(
         caller_type=caller_type,
     )
 
-    return WorkflowRunResponse(
+    response = WorkflowRunResponse(
         run_id=workflow_run.workflow_run_id,
         run_type=RunType.workflow_run,
         status=str(workflow_run.status),
@@ -138,6 +142,10 @@ async def _run_workflow_and_build_response(
         browser_seed_source=workflow_run.browser_seed_source,
         browser_settings_receipt=workflow_run.browser_settings_receipt,
     )
+    await _redact_browser_session_addresses(
+        [response], organization.organization_id, app.AGENT_FUNCTION, get_request_principal()
+    )
+    return response
 
 
 @base_router.post(
@@ -182,6 +190,14 @@ async def login(
     url = _validate_url(login_request.url)
     totp_verification_url = _validate_url(login_request.totp_url, field_name="totp_url")
     webhook_url = _validate_url(login_request.webhook_url, field_name="webhook_url")
+
+    if login_request.credential_type == CredentialType.bitwarden:
+        await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+            organization.organization_id,
+            {login_request.bitwarden_item_id} if login_request.bitwarden_item_id else set(),
+            {login_request.bitwarden_collection_id} if login_request.bitwarden_collection_id else set(),
+            allow_own_token=True,
+        )
 
     # 1. create empty workflow with a credential parameter
     new_workflow = await app.WORKFLOW_SERVICE.create_empty_workflow(
