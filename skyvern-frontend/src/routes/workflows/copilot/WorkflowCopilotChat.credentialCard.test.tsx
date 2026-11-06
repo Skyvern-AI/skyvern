@@ -1841,7 +1841,8 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
       await act(async () => {
         if (order === "after") rejected();
       });
-      expect(await screen.findByText(/Sign-in skipped/)).toBeTruthy();
+      expect(await screen.findByText(/not used here/)).toBeTruthy();
+      expect(screen.queryByText(/Sign-in skipped/)).toBeNull();
       expect(screen.queryByText(/added/)).toBeNull();
 
       await act(async () => {
@@ -1867,7 +1868,8 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
         });
         streamCalls[0]!.resolve();
       });
-      expect(await screen.findByText(/Sign-in skipped/)).toBeTruthy();
+      expect(await screen.findByText(/not used here/)).toBeTruthy();
+      expect(screen.queryByText(/Sign-in skipped/)).toBeNull();
       expect(screen.queryByText(/added/)).toBeNull();
     },
   );
@@ -2182,6 +2184,7 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     });
     expect(Object.keys(pickBody).sort()).toEqual([
       "action",
+      "asks_site",
       "credential_id",
       "resume_token",
       "turn_id",
@@ -2214,6 +2217,291 @@ describe("WorkflowCopilotChat — credential card wiring", () => {
     });
     expect(await screen.findByText(/Credential 'HN Login' added/)).toBeTruthy();
   });
+
+  it.each([
+    [
+      "move",
+      /^Move to b\.example\.com$/,
+      /Moved 'HN Login' to b\.example\.com/,
+    ],
+    ["add", /^Add b\.example\.com$/, /Added b\.example\.com to 'HN Login'/],
+    ["no", /^No$/, /Not used on b\.example\.com/],
+  ])(
+    "a pick saved for another site asks first, and %s is sent and shown with both sites after a reload",
+    async (answer, button, resolvedText) => {
+      credentialsData.current = [
+        { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+      ];
+      sansApiPost.mockImplementationOnce(() =>
+        Promise.resolve({
+          data: {
+            result: "site_question",
+            site_question: {
+              credential_id: "cred-hn",
+              name: "HN Login",
+              site: "https://b.example.com",
+              saved_sites: ["https://a.example.com"],
+              vault_sourced: false,
+            },
+          },
+        }),
+      );
+      await renderChat();
+      await submit("build me a workflow");
+      await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        streamCalls[0]!.onMessage(turnStart());
+        streamCalls[0]!.onMessage(credentialFrame());
+      });
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("combobox"));
+      });
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: /^HN Login/ }),
+        );
+      });
+
+      expect(
+        await screen.findByText(
+          "'HN Login' is saved for a.example.com. Use it on b.example.com?",
+        ),
+      ).toBeTruthy();
+      for (const name of [/^Add /, /^Move to /, /^No$/]) {
+        const { className } = screen.getByRole("button", { name });
+        expect(className).toMatch(/\bborder-input\b/);
+        expect(className).not.toMatch(/\bbg-cta\b/);
+      }
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: button }));
+      });
+      await waitFor(() => expect(credentialResponsePosts()).toHaveLength(2));
+      expect(credentialResponsePosts()[1]![1]).toMatchObject({
+        action: "connected",
+        credential_id: "cred-hn",
+        asks_site: true,
+        site_answer: answer,
+      });
+      expect(await screen.findByText(resolvedText)).toBeTruthy();
+
+      await act(async () => {
+        streamCalls[0]!.onMessage({
+          type: "response",
+          workflow_copilot_chat_id: "chat-1",
+          message: "Done.",
+          updated_workflow: null,
+          response_time: "2026-07-13T00:00:06Z",
+          proposal_disposition: "no_proposal",
+          turn_id: "turn-1",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            terminal: "response",
+            terminalMessage: "Done.",
+            startedAt: "2026-07-13T00:00:00Z",
+            endedAt: "2026-07-13T00:00:06Z",
+            credentialPause: {
+              outcome: answer === "no" ? "not_admitted" : "connected",
+              credentialId: answer === "no" ? undefined : "cred-hn",
+              siteAnswer: answer,
+              siteA: "https://a.example.com",
+              siteB: "https://b.example.com",
+            },
+          },
+        });
+        streamCalls[0]!.resolve();
+      });
+      expect(await screen.findByText(resolvedText)).toBeTruthy();
+      expect(screen.queryByText(/Sign-in skipped/)).toBeNull();
+    },
+  );
+
+  it("a card that opens with the refused login's site question can go back to the picker", async () => {
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          site_question: {
+            credential_id: "cred-hn",
+            name: "HN Login",
+            site: "https://b.example.com",
+            saved_sites: ["https://a.example.com"],
+            vault_sourced: false,
+          },
+        }),
+      );
+    });
+
+    const question =
+      "'HN Login' is saved for a.example.com. Use it on b.example.com?";
+    expect(await screen.findByText(question)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Pick another login" }),
+      );
+    });
+    expect(screen.queryByText(question)).toBeNull();
+    expect(await screen.findByRole("combobox")).toBeTruthy();
+    expect(credentialResponsePosts()).toHaveLength(0);
+  });
+
+  it("a card that opened with the site question goes back to the picker when the server refuses the save", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    sansApiPost.mockRejectedValueOnce(
+      Object.assign(new Error("Request failed with status code 409"), {
+        isAxiosError: true,
+        response: { status: 409, data: { detail: "sites changed" } },
+      }),
+    );
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(
+        credentialFrame({
+          site_question: {
+            credential_id: "cred-hn",
+            name: "HN Login",
+            site: "https://b.example.com",
+            saved_sites: ["https://a.example.com"],
+            vault_sourced: false,
+          },
+        }),
+      );
+    });
+    const question =
+      "'HN Login' is saved for a.example.com. Use it on b.example.com?";
+    expect(await screen.findByText(question)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Move to / }));
+    });
+
+    await waitFor(() => expect(screen.queryByText(question)).toBeNull());
+    expect(await screen.findByRole("combobox")).toBeTruthy();
+  });
+
+  it("a site answer the server cannot save clears the question and shows the server's reason", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    credentialsData.current = [
+      { credential_id: "cred-hn", name: "HN Login", tested_url: null },
+    ];
+    sansApiPost
+      .mockImplementationOnce(() =>
+        Promise.resolve({
+          data: {
+            result: "site_question",
+            site_question: {
+              credential_id: "cred-hn",
+              name: "HN Login",
+              site: "https://b.example.com",
+              saved_sites: ["https://a.example.com"],
+              vault_sourced: false,
+            },
+          },
+        }),
+      )
+      .mockRejectedValueOnce(
+        Object.assign(new Error("Request failed with status code 422"), {
+          isAxiosError: true,
+          response: {
+            status: 422,
+            data: { detail: "Not a website URL a login can be saved for" },
+          },
+        }),
+      );
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      streamCalls[0]!.onMessage(turnStart());
+      streamCalls[0]!.onMessage(credentialFrame());
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("combobox"));
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: /^HN Login/ }));
+    });
+    const question =
+      "'HN Login' is saved for a.example.com. Use it on b.example.com?";
+    expect(await screen.findByText(question)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Add / }));
+    });
+
+    await waitFor(() =>
+      expect(toastFn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          description: "Not a website URL a login can be saved for",
+        }),
+      ),
+    );
+    expect(screen.queryByText(question)).toBeNull();
+  });
+
+  it.each([
+    ["move", /Moved 'HN Login' to b\.example\.com/],
+    ["add", /Added b\.example\.com to 'HN Login'/],
+    ["no", /'HN Login' stays saved for a\.example\.com/],
+  ])(
+    "a reloaded chat names the login on a resolved %s answer",
+    async (answer, resolvedText) => {
+      credentialsData.current = [];
+      historyResponse.data.chat_history = [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          turn_id: "turn-1",
+          created_at: "2026-07-13T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content: "Done.",
+          turn_id: "turn-1",
+          created_at: "2026-07-13T00:00:06Z",
+          turn_outcome: {
+            copilot_turn_id: "turn-1",
+            terminal_reason: "completed",
+          },
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            terminal: "response",
+            terminalMessage: "Done.",
+            startedAt: "2026-07-13T00:00:00Z",
+            endedAt: "2026-07-13T00:00:06Z",
+            credentialPause: {
+              outcome: answer === "no" ? "not_admitted" : "connected",
+              credentialId: answer === "no" ? undefined : "cred-hn",
+              name: "HN Login",
+              siteAnswer: answer,
+              siteA: "https://a.example.com",
+              siteB: "https://b.example.com",
+            },
+          },
+        },
+      ];
+      await renderChat();
+      expect(await screen.findByText(resolvedText)).toBeTruthy();
+      expect(screen.queryByText(/This login/)).toBeNull();
+    },
+  );
 
   it("resolves a picked existing credential mid-turn on a brand-new chat", async () => {
     historyResponse.data.workflow_copilot_chat_id = null;

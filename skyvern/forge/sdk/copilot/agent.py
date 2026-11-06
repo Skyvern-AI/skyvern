@@ -1823,6 +1823,7 @@ _RAW_SECRET_CARD_NOT_CONNECTED = {
     "declined": "The credential card could not be shown. ",
     "not_admitted": "The credential you connected is saved for a different site, so it was not used. ",
 }
+_RAW_SECRET_CARD_DECLINED_SITE = "You chose not to use the saved credential on this site. "
 
 
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
@@ -1873,6 +1874,13 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
                 return (
                     f"I drafted the workflow, withheld a value that may be a secret, and {binding}. "
                     "This draft is untested; ask me to test it in a later message."
+                )
+            site_answer = ctx.credential_pause_site_answer
+            if site_answer is not None and site_answer.action == "no":
+                return (
+                    "I drafted the workflow and withheld a value that may be a secret. "
+                    f"{_RAW_SECRET_CARD_DECLINED_SITE}Store the value as a saved credential before testing. "
+                    "This draft has not been verified end-to-end."
                 )
             not_connected = _RAW_SECRET_CARD_NOT_CONNECTED.get(ctx.credential_pause_outcome or "", "")
             return (

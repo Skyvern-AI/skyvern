@@ -644,8 +644,12 @@ workflow_definition:
 """
     request_policy = RequestPolicy(
         resolved_credentials=[
-            SimpleNamespace(credential_id="cred_first", tested_url="https://portal.example.com/login"),
-            SimpleNamespace(credential_id="cred_second", tested_url="https://other.example.com/login"),
+            SimpleNamespace(
+                credential_id="cred_first", tested_url="https://portal.example.com/login", extra_site_urls=[]
+            ),
+            SimpleNamespace(
+                credential_id="cred_second", tested_url="https://other.example.com/login", extra_site_urls=[]
+            ),
         ]
     )
 
@@ -1047,6 +1051,7 @@ async def test_runtime_credential_registration_proceeds_when_lane_is_safe(
         credential_id="cred_runtime",
         run_sequentially=run_sequentially,
         tested_url=None,
+        extra_site_urls=[],
         vault_type=None,
         totp_identifier=None,
     )

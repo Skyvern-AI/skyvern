@@ -7,6 +7,7 @@ from skyvern.forge.sdk.copilot.credential_resolution import (
     url_parts,
 )
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE, url_origin
+from skyvern.forge.sdk.credential_site_policy import same_release_scope
 
 # `urlparse` raises on a bracket it cannot read as an IPv6 literal. Every shape here is one a user
 # can type into a chat turn, and the first is what pasting a markdown auto-link produces.
@@ -24,6 +25,19 @@ def test_url_helpers_decline_a_malformed_authority_instead_of_raising(url: str) 
     assert loggable_origin(url) == ""
     assert url_origin(url) is None
     assert is_resolved_page_url(url) is False
+
+
+@pytest.mark.parametrize(
+    ("url", "origin"),
+    [
+        ("http://[::1]:8900/login", "http://[::1]:8900"),
+        ("https://[2001:db8::1]/sign-in", "https://[2001:db8::1]"),
+        ("https://login.example.com:8443/x", "https://login.example.com:8443"),
+    ],
+)
+def test_loggable_origin_is_an_origin_the_site_check_still_reads(url: str, origin: str) -> None:
+    assert loggable_origin(url) == origin
+    assert same_release_scope(url, loggable_origin(url))
 
 
 @pytest.mark.parametrize("url", [url for url in MALFORMED if "://" in url])

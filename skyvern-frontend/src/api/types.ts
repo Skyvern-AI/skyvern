@@ -1253,6 +1253,8 @@ export type CredentialApiResponse = {
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
+  // More sites this login signs in on, each covering its whole site.
+  extra_site_urls?: string[] | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
   run_sequentially?: boolean | null;

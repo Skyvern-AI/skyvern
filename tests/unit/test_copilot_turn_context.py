@@ -157,6 +157,7 @@ def test_credential_context_contains_safe_metadata_only() -> None:
                         credential_type="password",
                         vault_type="bitwarden",
                         tested_url="https://example.test/login",
+                        extra_site_urls=[],
                         browser_profile_id="bp-1",
                         username="private@example.test",
                         totp_identifier="private-phone",

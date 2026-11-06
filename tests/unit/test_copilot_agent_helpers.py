@@ -108,6 +108,7 @@ from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
 )
+from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -1135,16 +1136,22 @@ workflow_definition:
         assert verdict.reason_codes == []
 
     @pytest.mark.parametrize(
-        ("card", "expected"),
+        ("card", "site_answer", "expected"),
         [
-            ("skipped", "You chose not to connect a saved credential"),
-            ("timeout", "The credential card went unanswered"),
-            ("declined", "The credential card could not be shown"),
-            ("not_admitted", "saved for a different site"),
+            ("skipped", None, "You chose not to connect a saved credential"),
+            ("timeout", None, "The credential card went unanswered"),
+            ("declined", None, "The credential card could not be shown"),
+            ("not_admitted", None, "saved for a different site"),
+            (
+                "not_admitted",
+                SiteAnswer("no", "https://a.example.com", "https://b.example.com"),
+                "You chose not to use",
+            ),
+            ("not_admitted", SiteAnswer("add", "https://a.example.com", "https://b.example.com"), "a different site"),
         ],
     )
     def test_rewrite_states_why_no_credential_connected_on_a_redacted_secret_draft(
-        self, card: str, expected: str
+        self, card: str, site_answer: SiteAnswer | None, expected: str
     ) -> None:
         ctx = _ctx(
             last_workflow=object(),
@@ -1152,6 +1159,7 @@ workflow_definition:
             last_update_block_count=2,
             last_test_ok=None,
             credential_pause_outcome=card,
+            credential_pause_site_answer=site_answer,
             request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
         )
 
