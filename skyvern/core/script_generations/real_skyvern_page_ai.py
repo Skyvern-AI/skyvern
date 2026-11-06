@@ -25,6 +25,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
     nace_decision_active,
     with_explicit_llm_override,
 )
+from skyvern.forge.sdk.api.llm.nace_decision_llm_caller import parse_page_classify_options
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.api.llm.utils import llm_response_log_metadata
 from skyvern.forge.sdk.cache import extraction_cache
@@ -92,7 +93,7 @@ async def _resolve_assist_llm_handler(prompt_type: str, default: LLMAPIHandler) 
     return await resolve_prompt_type_handler(prompt_type, distinct_id, context.organization_id, org_aware_default)
 
 
-async def _page_classify_llm_handler() -> LLMAPIHandler:
+async def _page_classify_llm_handler(prompt: str | None = None) -> LLMAPIHandler:
     """The handler for page-classify.
 
     Precedence: run override, organization default, Nace opt-in, platform default.
@@ -103,6 +104,8 @@ async def _page_classify_llm_handler() -> LLMAPIHandler:
     if nace_decision_active() and context and context.task_id and organization_id:
         run_task = await app.DATABASE.tasks.get_task(context.task_id, organization_id)
     decision_default = get_decision_llm_api_handler(app.SECONDARY_LLM_API_HANDLER)
+    if nace_decision_active() and prompt is not None and not parse_page_classify_options(prompt):
+        decision_default = app.SECONDARY_LLM_API_HANDLER
     return with_explicit_llm_override(
         run_task.llm_key if run_task else None,
         get_org_aware_secondary_llm_api_handler(default=decision_default),
@@ -927,7 +930,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
 
         try:
-            classify_handler = await _page_classify_llm_handler()
+            classify_handler = await _page_classify_llm_handler(classify_prompt)
             json_response = await classify_handler(
                 prompt=classify_prompt,
                 prompt_name="page-classify",
@@ -1855,11 +1858,13 @@ class RealSkyvernPageAi(SkyvernPageAi):
             navigation_goal=prompt,
         )
 
-        infer_default = with_explicit_llm_override(
-            task.llm_key,
+        infer_llm_handler = await _resolve_assist_llm_handler(
+            "infer-action-type",
             get_decision_llm_api_handler(app.SINGLE_INPUT_AGENT_LLM_API_HANDLER),
         )
-        infer_llm_handler = await _resolve_assist_llm_handler("infer-action-type", infer_default)
+        # Explicit run models take precedence only on the Nace opt-in path.
+        if nace_decision_active():
+            infer_llm_handler = with_explicit_llm_override(task.llm_key, infer_llm_handler)
         json_response = await infer_llm_handler(
             prompt=infer_action_type_prompt,
             prompt_name="infer-action-type",

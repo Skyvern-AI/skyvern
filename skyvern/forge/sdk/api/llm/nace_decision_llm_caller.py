@@ -365,14 +365,37 @@ _PAGE_CLASSIFY_OPTION = re.compile(r'^- "(?P<key>[^"]+)": (?P<description>.*)$',
 
 
 def parse_page_classify_options(prompt: str) -> dict[str, str]:
-    """The option keys and descriptions rendered by page-classify.j2 (including UNKNOWN)."""
-    start = prompt.find(_PAGE_CLASSIFY_OPTIONS_START)
-    if start < 0:
+    """Read the template's options only when its delimiters are unambiguous.
+
+    Page text and step notes can contain arbitrary headings. Since the template always adds
+    its own delimiters, any additional occurrence makes the rendered prompt unsafe to parse.
+    """
+    options = _parse_page_classify_options(prompt)
+    if not options:
+        LOG.info(
+            "Drex Max classification options missing or ambiguous; declining decision prompt",
+            prompt_name=PAGE_CLASSIFY_PROMPT_NAME,
+        )
+    return options
+
+
+def _parse_page_classify_options(prompt: str) -> dict[str, str]:
+    if prompt.count(_PAGE_CLASSIFY_OPTIONS_START) != 1 or prompt.count(_PAGE_CLASSIFY_OPTIONS_END) != 1:
         return {}
-    end = prompt.find(_PAGE_CLASSIFY_OPTIONS_END, start)
-    section = prompt[start : end if end > start else len(prompt)]
-    matches = _PAGE_CLASSIFY_OPTION.finditer(section)
-    return {match["key"]: match["description"].strip() for match in matches}
+    start = prompt.find(_PAGE_CLASSIFY_OPTIONS_START)
+    end = prompt.find(_PAGE_CLASSIFY_OPTIONS_END)
+    if end <= start:
+        return {}
+    section = prompt[start + len(_PAGE_CLASSIFY_OPTIONS_START) : end]
+    options: dict[str, str] = {}
+    for line in section.splitlines():
+        if not line.strip():
+            continue
+        match = _PAGE_CLASSIFY_OPTION.fullmatch(line)
+        if match is None or match["key"] in options:
+            return {}
+        options[match["key"]] = match["description"].strip()
+    return options
 
 
 def _page_classify_request(prompt: str) -> DecisionRequest:
@@ -380,7 +403,7 @@ def _page_classify_request(prompt: str) -> DecisionRequest:
     if not options:
         raise NaceDecisionPromptError(
             PAGE_CLASSIFY_PROMPT_NAME,
-            "no classification options found in the prompt",
+            "classification options are missing or ambiguous in the prompt",
         )
     questions = {
         "classification": _choice(
@@ -467,6 +490,8 @@ _AUTO_COMPLETION_ELEMENTS_HEADING = "HTML elements:"
 _AUTO_COMPLETION_EMERGING_HEADING = "IDs for emerging HTML elements"
 _NO_OPTION = "NONE"
 _MAX_CANDIDATE_DESCRIPTION_CHARS = 240
+_VALUE_ATTRIBUTE_TAGS = frozenset({"button", "option", "select", "textarea"})
+_VALUE_INPUT_TYPES = frozenset({"", "text", "search", "email", "tel", "url", "button", "submit"})
 _VOID_TAGS = frozenset(
     {
         "area",
@@ -499,6 +524,19 @@ class CandidateElement:
     def text(self) -> str:
         """The text of the element's subtree with whitespace collapsed."""
         return " ".join(" ".join(self.text_parts).split())
+
+    @property
+    def value(self) -> str:
+        """The text or a supported form control's value, with whitespace collapsed."""
+        text = self.text
+        if text:
+            return text
+        if self.tag == "input":
+            if self.attributes.get("type", "").lower() not in _VALUE_INPUT_TYPES:
+                return ""
+        elif self.tag not in _VALUE_ATTRIBUTE_TAGS:
+            return ""
+        return " ".join(self.attributes.get("value", "").split())
 
     def describe(self) -> str:
         """A one-line tag, attributes and text description used as the choice option's criterion."""
@@ -570,7 +608,7 @@ def _auto_completion_request(prompt: str) -> DecisionRequest:
             kept=NACE_MAX_CHOICE_OPTIONS - 1,
         )
         candidates = candidates[: NACE_MAX_CHOICE_OPTIONS - 1]
-    values = {candidate.element_id: candidate.text for candidate in candidates}
+    values = {candidate.element_id: candidate.value for candidate in candidates}
 
     questions: dict[str, dict[str, Any]] = {
         "auto_completion_attempt": _noul(
