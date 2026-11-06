@@ -75,6 +75,7 @@ from skyvern.services.workflow_schedule_service import (
     start_workflow_schedule_scheduler,
     stop_workflow_schedule_scheduler,
 )
+from skyvern.utils.frozen_module_inspect import prime_inspect_for_frozen_modules
 
 LOG = structlog.get_logger()
 
@@ -766,4 +767,5 @@ def create_api_app() -> FastAPI:
     # preflights short-circuited by the cloud middleware registered above.
     fastapi_app.add_middleware(SecurityHeadersMiddleware)
 
+    prime_inspect_for_frozen_modules()
     return fastapi_app
