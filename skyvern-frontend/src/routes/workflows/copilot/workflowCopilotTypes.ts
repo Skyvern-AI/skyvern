@@ -550,7 +550,7 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
   timestamp: string;
 }
 
-export type CredentialSiteAnswer = "add" | "move" | "no";
+export type CredentialSiteAnswer = "add" | "no";
 
 export interface CredentialSiteQuestion {
   credential_id: string;

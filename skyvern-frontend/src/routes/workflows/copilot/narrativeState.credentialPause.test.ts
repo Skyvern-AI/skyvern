@@ -92,11 +92,11 @@ describe("parseCredentialPause", () => {
         outcome: "connected",
         credentialId: "c1",
         name: "HN Login",
-        siteAnswer: "move",
+        siteAnswer: "add",
         siteA: "https://site-a.example",
         siteB: "https://site-b.example",
       }),
-    ).toMatchObject({ name: "HN Login", siteAnswer: "move" });
+    ).toMatchObject({ name: "HN Login", siteAnswer: "add" });
     expect(
       parseCredentialPause({
         outcome: "connected",
