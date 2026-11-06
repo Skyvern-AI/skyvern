@@ -19084,6 +19084,7 @@ class WorkflowService:
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             prefer_capped=cap_output_values,
+            with_tool_calls=True,
         )
         access = BrowserSessionArtifactAccess(True)
         child_access = BrowserSessionArtifactAccess(True)

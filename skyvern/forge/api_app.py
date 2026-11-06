@@ -263,9 +263,23 @@ class ExecutionDatePlugin(Plugin):
         return datetime.now()
 
 
+def _schema_refs(node: object) -> set[str]:
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        own = {ref.rsplit("/", 1)[-1]} if isinstance(ref, str) and ref.startswith("#/components/schemas/") else set()
+        return own.union(*(_schema_refs(value) for value in node.values()))
+    if isinstance(node, list):
+        return set().union(*(_schema_refs(value) for value in node))
+    return set()
+
+
 def strip_internal_schema_properties(openapi_schema: dict) -> None:
-    """Drop component properties marked ``x-internal`` so they stay out of the public docs and the SDK."""
-    for schema in openapi_schema.get("components", {}).get("schemas", {}).values():
+    """Drop components and properties marked ``x-internal`` so they stay out of the public docs and the SDK."""
+    schemas = openapi_schema.get("components", {}).get("schemas", {})
+    referenced = _schema_refs(openapi_schema)
+    for name in [name for name, schema in schemas.items() if schema.get("x-internal")]:
+        del schemas[name]
+    for schema in schemas.values():
         properties = schema.get("properties")
         if not properties:
             continue
@@ -274,6 +288,14 @@ def strip_internal_schema_properties(openapi_schema: dict) -> None:
             del properties[name]
         if internal and "required" in schema:
             schema["required"] = [name for name in schema["required"] if name not in internal]
+    # A component only the dropped ones used would be a dangling public schema; one never referenced stays.
+    while True:
+        used = _schema_refs(openapi_schema)
+        orphans = [name for name in schemas if name in referenced and name not in used]
+        if not orphans:
+            return
+        for name in orphans:
+            del schemas[name]
 
 
 def custom_openapi(app: FastAPI) -> dict:
@@ -366,6 +388,8 @@ _SQLITE_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("organizations", "slug", "VARCHAR"),
     ("tasks", "attempt_number", "INTEGER"),
     ("workflow_run_blocks", "attempt_number", "INTEGER"),
+    ("workflow_run_blocks", "capped_output", "JSON"),
+    ("workflow_run_blocks", "tool_calls", "JSON"),
     ("google_oauth_credentials", "google_subject", "VARCHAR"),
     ("tasks", "task_queue", "VARCHAR"),
 )

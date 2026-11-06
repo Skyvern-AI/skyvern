@@ -1710,6 +1710,8 @@ class WorkflowRunBlockModel(Base):
     # Scalar mirror of output["downloaded_files"] length: the JSON output column is
     # not replicated downstream, so download success would not otherwise be queryable.
     downloaded_file_count = Column(Integer, nullable=True)
+    # A large display-only list, so block reads load it only when asked for.
+    tool_calls = deferred(Column(JSON, nullable=True))
     attempt_number = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
