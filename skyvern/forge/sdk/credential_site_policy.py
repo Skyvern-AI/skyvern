@@ -16,6 +16,9 @@ from skyvern.forge.sdk.browser_action_policy import _DEFAULT_PORTS, BrowserOrigi
 # vercel.app, s3.amazonaws.com -- stay separate sites rather than collapsing into one.
 _SITE_EXTRACT = tldextract.TLDExtract(include_psl_private_domains=True)
 
+MAX_EXTRA_SITE_URLS = 20
+MAX_SITE_URL_LENGTH = 2048
+
 
 def origin_of(url: str | None) -> BrowserOrigin | None:
     raw = (url or "").strip()

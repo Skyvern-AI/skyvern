@@ -21,6 +21,7 @@ _ERROR_DETAIL_LIMIT = 500
 
 PUBLIC_WORKFLOW_ROUTE = "v1/workflows"
 INTERNAL_WORKFLOW_ROUTE = "api/v1/workflows"
+INTERNAL_WORKFLOW_RUN_BLOCK_ROUTE = "api/v1/workflow_run_block"
 
 
 def coerce_timestamp(value: Any) -> str | None:
@@ -281,3 +282,18 @@ async def get_workflow_run_status(
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unexpected get_workflow_run_status payload: {type(payload).__name__}")
     return payload
+
+
+async def get_workflow_run_block_artifacts(workflow_run_block_id: str) -> list[dict[str, Any]]:
+    """GET /api/v1/workflow_run_block/{id}/artifacts — the block's artifacts, newest first, with signed URLs."""
+    skyvern = get_skyvern()
+    response = await skyvern._client_wrapper.httpx_client.request(
+        f"{INTERNAL_WORKFLOW_RUN_BLOCK_ROUTE}/{workflow_run_block_id}/artifacts",
+        method="GET",
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {extract_error_detail(response)}")
+    payload = _decode_success_payload(response, operation="get_workflow_run_block_artifacts")
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Unexpected get_workflow_run_block_artifacts payload: {type(payload).__name__}")
+    return [artifact for artifact in payload if isinstance(artifact, dict)]

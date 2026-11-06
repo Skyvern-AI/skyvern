@@ -29,6 +29,11 @@ from skyvern.forge.sdk.schemas.debug_sessions import (
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    browser_session_artifact_read,
+    redact_workflow_run_artifact_rows,
+)
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.forge.sdk.workflow.models.block import LoginBlock
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import (
@@ -710,12 +715,13 @@ async def get_block_outputs_for_debug_session(
     current_org: Organization = Depends(org_auth_service.get_current_org),
     current_user_id: str = Depends(org_auth_service.get_current_user_id),
 ) -> dict[str, dict[str, t.Any]]:
-    return await app.WORKFLOW_SERVICE.get_block_outputs_for_debug_session(
-        workflow_permanent_id=workflow_permanent_id,
-        organization_id=current_org.organization_id,
-        user_id=current_user_id,
-        version=version,
-    )
+    with browser_session_artifact_read(get_request_principal()):
+        return await app.WORKFLOW_SERVICE.get_block_outputs_for_debug_session(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,
+            version=version,
+        )
 
 
 @base_router.get(
@@ -813,5 +819,7 @@ async def get_debug_session_runs(
         debug_session_id=debug_session.debug_session_id,
         organization_id=current_org.organization_id,
     )
+    with browser_session_artifact_read(get_request_principal()):
+        runs = await redact_workflow_run_artifact_rows(runs, current_org.organization_id)
 
     return DebugSessionRuns(debug_session=debug_session, runs=runs)

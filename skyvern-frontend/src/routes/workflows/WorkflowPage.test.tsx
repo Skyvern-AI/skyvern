@@ -181,7 +181,6 @@ afterEach(() => {
 
 type RenderOptions = {
   isCloud?: boolean;
-  analyticsFlagEnabled?: boolean;
   pageSlots?: PageSlots;
   initialEntries?: Array<string>;
   workflowRuns?: Array<WorkflowRunApiResponse>;
@@ -194,12 +193,11 @@ function LocationProbe() {
 
 function renderWorkflowPage({
   isCloud = true,
-  analyticsFlagEnabled = true,
   pageSlots = {},
   initialEntries = ["/workflows/wpid_abc123"],
   workflowRuns = [],
 }: RenderOptions = {}) {
-  mockFeatureFlagEnabled.mockReturnValue(analyticsFlagEnabled);
+  mockFeatureFlagEnabled.mockReturnValue(true);
   mockWorkflowRunsQuery.mockReturnValue({
     data: workflowRuns,
     isLoading: false,
@@ -249,20 +247,13 @@ function makeWorkflowRun(
 }
 
 describe("WorkflowPage analytics button", () => {
-  it("shows the Analytics link for cloud users when the dashboard flag is enabled", () => {
+  it("shows the Analytics link for cloud users", () => {
     renderWorkflowPage();
 
     const analyticsLink = screen.getByRole("link", { name: /analytics/i });
     expect(analyticsLink.getAttribute("href")).toBe(
       "/analytics?workflow=wpid_abc123",
     );
-    expect(mockFeatureFlagEnabled).toHaveBeenCalledWith("ANALYTICS_DASHBOARD");
-  });
-
-  it("hides the Analytics link when the dashboard flag is disabled", () => {
-    renderWorkflowPage({ analyticsFlagEnabled: false });
-
-    expect(screen.queryByRole("link", { name: /analytics/i })).toBeNull();
   });
 
   it("hides the Analytics link outside the cloud app", () => {

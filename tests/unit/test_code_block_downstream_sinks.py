@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -12,6 +12,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.copilot.completion_verification import evaluate_completion_criteria
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tools.completion import _build_run_evidence_snapshot
+from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunBlockErrorRow
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     CodeBlock,
@@ -31,7 +32,7 @@ SHORT_CREDENTIAL = "12"
 CODE_CREDENTIAL = "587"
 GENERIC_REASONING = "CodeBlock failed while running user code."
 SAFE_CODE = "DECLARED_FAILURE"
-FIXED_NOW = datetime(2026, 8, 9, 15, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 8, 9, 15, 0, tzinfo=UTC)
 
 
 def _context(*secrets: str) -> WorkflowRunContext:
@@ -117,7 +118,9 @@ async def _status_response_from_captured_output(
             workflow_runs=SimpleNamespace(
                 get_workflow_run_parameters=AsyncMock(return_value=[]),
                 get_workflow_run_block_errors=AsyncMock(
-                    return_value=[("wrb_test", ["user_code_error"], GENERIC_REASONING, captured, "code")]
+                    return_value=[
+                        WorkflowRunBlockErrorRow("wrb_test", ["user_code_error"], GENERIC_REASONING, captured, "code")
+                    ]
                 ),
                 get_workflow_run_retried_by=AsyncMock(return_value=None),
             ),

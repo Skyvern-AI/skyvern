@@ -1531,7 +1531,10 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         # The occupying run id is cleared first -- prompt atoms carry no raw run ids, and leaving it
         # in makes the leak guard drop the whole line rather than redact the id.
         sentence = build_test_connect_failure_sentence(connect_failure.model_copy(update={"occupier_run_id": None}))
-        lines.append(f"browser_acquisition_failed: {_clean_authoring_repair_prompt_atom(sentence)}")
+        lines.append(
+            "browser_acquisition_failed: "
+            f"{_clean_authoring_repair_prompt_atom(sentence, max_chars=RUNTIME_FAILURE_REASON_MAX_CHARS)}"
+        )
     # Facts render for every outcome; the two post-run page-path directives bind the model's next
     # action, so they keep the authority check and stay on turns that may author code, the only ones
     # they were built and measured for.
@@ -1820,6 +1823,7 @@ _RAW_SECRET_CARD_NOT_CONNECTED = {
     "declined": "The credential card could not be shown. ",
     "not_admitted": "The credential you connected is saved for a different site, so it was not used. ",
 }
+_RAW_SECRET_CARD_DECLINED_SITE = "You chose not to use the saved credential on this site. "
 
 
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
@@ -1837,22 +1841,13 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         return f"{lead} {reply}{keep_draft_affordance}" if reply else lead
 
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
-    if (
-        policy is not None
-        and policy.clarification_reason == "workflow_credential_inputs_unbound"
-        and ctx.last_workflow is not None
-        and block_count is not None
-    ):
-        return lead_then_reply(
-            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-            "the required credentials. Add them in Credentials, then I can try again."
-        )
-
     if ctx.last_test_ok is False and block_count is not None:
         connect_failure = _terminal_connect_failure(ctx)
         if connect_failure is not None and connect_failure.state == "billing_credit_admission_refusal":
             sentence = build_test_connect_failure_sentence(connect_failure)
             return lead_then_reply(f"I couldn't start a test. {sentence} The draft is untested.")
+        if connect_failure is not None and connect_failure.workflow_run_id:
+            return lead_then_reply(f"I couldn't test the draft. {build_test_connect_failure_sentence(connect_failure)}")
 
         # No run row means nothing executed, so claiming the draft was tested is false.
         if (
@@ -1879,6 +1874,13 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
                 return (
                     f"I drafted the workflow, withheld a value that may be a secret, and {binding}. "
                     "This draft is untested; ask me to test it in a later message."
+                )
+            site_answer = ctx.credential_pause_site_answer
+            if site_answer is not None and site_answer.action == "no":
+                return (
+                    "I drafted the workflow and withheld a value that may be a secret. "
+                    f"{_RAW_SECRET_CARD_DECLINED_SITE}Store the value as a saved credential before testing. "
+                    "This draft has not been verified end-to-end."
                 )
             not_connected = _RAW_SECRET_CARD_NOT_CONNECTED.get(ctx.credential_pause_outcome or "", "")
             return (

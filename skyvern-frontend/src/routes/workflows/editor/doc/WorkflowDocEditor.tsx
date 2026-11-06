@@ -1,4 +1,5 @@
 import { graphNoteReadings } from "./noteSequences";
+import { useSearchParams } from "react-router-dom";
 import {
   type HTMLAttributes,
   type Ref,
@@ -13,6 +14,7 @@ import type { Edge } from "@xyflow/react";
 import { GearIcon, QuestionMarkCircledIcon } from "@radix-ui/react-icons";
 import { usePostHog } from "posthog-js/react";
 import { cn } from "@/util/utils";
+import { Status } from "@/api/types";
 import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
 import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
@@ -49,14 +51,16 @@ import {
   saveDocInput,
 } from "./docInputs";
 import { DocInputEditor } from "./DocInputEditor";
+import { takeReferenceLine } from "./docKeys";
 import type { ParametersState } from "../types";
-import { toast } from "@/components/ui/use-toast";
+import { toast, useToast } from "@/components/ui/use-toast";
 import {
   WorkflowDocActionsContext,
   type DocPendingNote,
 } from "./WorkflowDocActionsContext";
 import { docBranchSelection } from "./docBranchSelection";
 import { useDocRun } from "./useDocRun";
+import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
 import { DocStepSearch } from "./DocStepSearch";
@@ -69,17 +73,20 @@ import {
   docDestinations,
   TOP_SCOPE,
   type DocGraphEdits,
+  type DocPlace,
+  type NodeType,
 } from "./docEditApi";
 import { countReferences, findOutputUsers } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
 import { docStepProblems } from "./docProblems";
+import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
 import {
   DocGettingStarted,
   DocKeyHints,
   DocStarterNote,
   DocTip,
-  type DocStarterProgress,
 } from "./DocStarter";
+import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import {
   DocProposalCard,
@@ -203,8 +210,18 @@ export function WorkflowDocEditor({
   const parameters = proposal?.parameters ?? liveParameters;
   const nodes = proposal?.nodes ?? liveNodes;
   const edges = proposal?.edges ?? liveEdges;
-  const editable = !scopeReadOnly && !locked && !proposal;
+  const docRun = useDocRun();
+  const { blocksByLabel } = docRun;
+  const [searchParams] = useSearchParams();
+  // A full run from the Doc holds the doc still (no adding or inserting); a one-step run doesn't.
+  const fullRunGoing = docRun.live && docRun.owned && !searchParams.has("bl");
+  const editable = !scopeReadOnly && !locked && !proposal && !fullRunGoing;
   const showingProposal = proposal !== null;
+  const setDocMounted = useWorkflowPresentationStore((s) => s.setDocMounted);
+  useEffect(() => {
+    setDocMounted(true);
+    return () => setDocMounted(false);
+  }, [setDocMounted]);
   // Workspace's undo shortcut listens on the document, so this holds wherever focus is: undo
   // would change the live graph hidden behind the read-only proposal.
   useEffect(() => {
@@ -230,6 +247,8 @@ export function WorkflowDocEditor({
   const rootRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const panelOpener = useRef<HTMLElement | null>(null);
+  // The step whose settings opened the panel, so Esc can put the caret back in its text.
+  const panelStepId = useRef<string | null>(null);
   const learnButtonRef = useRef<HTMLButtonElement>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelTab, setPanelTab] = useState("learn");
@@ -244,6 +263,7 @@ export function WorkflowDocEditor({
   const locateRequest = useLocateBlockStore((s) => s.request);
   const clearLocate = useLocateBlockStore((s) => s.clearLocate);
   const [wide, setWide] = useState(false);
+  const toastShowing = useToast().toasts.some((t) => t.open !== false);
   const [focusId, setFocusId] = useState<string | null>(null);
   const focusIdRef = useRef(focusId);
   focusIdRef.current = focusId;
@@ -254,6 +274,25 @@ export function WorkflowDocEditor({
     type: "workflow" | "context";
     isNew?: boolean;
   } | null>(null);
+  // Closing the input editor that "@ > Create input" opened puts the caret back in the line the "@" came from.
+  const inputEditorWasOpen = useRef(false);
+  useEffect(() => {
+    const open = editingInput !== null;
+    const closed = inputEditorWasOpen.current && !open;
+    inputEditorWasOpen.current = open;
+    if (!closed) return;
+    const frame = requestAnimationFrame(() => {
+      const line = takeReferenceLine();
+      const active = document.activeElement;
+      if (!line || (active && active !== document.body)) return;
+      Array.from(
+        rootRef.current?.querySelectorAll<HTMLElement>("[data-doc-line]") ?? [],
+      )
+        .filter((el) => el.getAttribute("aria-label") === line.label)
+        [line.index]?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [editingInput]);
   // Inputs deleted here: their mentions stay in the text and show as missing.
   const [removedInputs, setRemovedInputs] = useState<Set<string>>(
     () => new Set(),
@@ -331,7 +370,6 @@ export function WorkflowDocEditor({
       )?.id ?? null,
     [nodes, finallyBlockLabel],
   );
-  const { blocksByLabel } = useDocRun();
   const branchSelections = useMemo(() => {
     const selected = new Map<string, string>();
     const visit = (items: DocItem[]) => {
@@ -358,7 +396,14 @@ export function WorkflowDocEditor({
   }, [tree, byId, blocksByLabel, branches]);
   const selectBranch = (conditionalId: string, branchId: string) =>
     setBranches((current) => ({ ...current, [conditionalId]: branchId }));
-  const edit =
+  const openStepSettings = (id: string) => {
+    panelOpener.current = document.activeElement as HTMLElement;
+    panelStepId.current = id;
+    setSelectedStepId(id);
+    setPanelTab("settings");
+    setPanelOpen(true);
+  };
+  const baseEdit =
     editable && edits
       ? createDocEditApi({
           nodes,
@@ -373,6 +418,18 @@ export function WorkflowDocEditor({
           credentialKeys,
         })
       : null;
+  const edit = baseEdit && {
+    ...baseEdit,
+    insertStep: (place: DocPlace, nodeType: NodeType) => {
+      const added = baseEdit.insertStep(place, nodeType);
+      if (added) {
+        useDocUnfinishedStore.getState().add(added);
+        // A login has nothing to run without its credential, so its settings open on it.
+        if (nodeType === "login") openStepSettings(added);
+      }
+      return added;
+    },
+  };
   // References to step outputs that no step saves any more, for the inline "missing" pills.
   const missingOutputs = useMemo(() => {
     const labels = new Set(
@@ -409,15 +466,34 @@ export function WorkflowDocEditor({
     return missing;
   }, [nodes, parameters]);
   // What steps still need before they can run, found as the draft is typed; the server's check follows.
-  const stepFixes = useMemo(
-    () => (proposal ? new Map<string, string[]>() : docStepProblems(nodes)),
-    [nodes, proposal],
+  // A step added a moment ago is unfinished, not wrong: its problems wait until the user leaves it, runs or saves.
+  const unfinishedIds = useDocUnfinishedStore((s) => s.ids);
+  const stepFixes = useMemo(() => {
+    if (proposal) return new Map<string, string[]>();
+    const found = docStepProblems(nodes);
+    for (const id of unfinishedIds) found.delete(id);
+    return found;
+  }, [nodes, proposal, unfinishedIds]);
+  const unfinishedLabels = useMemo(
+    () =>
+      new Set(
+        nodes.filter((n) => unfinishedIds.has(n.id)).map((n) => n.data.label),
+      ),
+    [nodes, unfinishedIds],
   );
   const fixCount = [...stepFixes.values()].reduce(
     (count, messages) => count + messages.length,
     0,
   );
-  const problems = validationProblems.length + fixCount;
+  const shownProblems = useMemo(
+    () =>
+      validationProblems.filter(
+        (problem) =>
+          !problem.block_label || !unfinishedLabels.has(problem.block_label),
+      ),
+    [validationProblems, unfinishedLabels],
+  );
+  const problems = shownProblems.length + fixCount;
   // A check that couldn't reach the server says so, but doesn't hold the run. The problems it left
   // from an earlier check describe an older draft, so they stay on screen but no longer block it.
   const checkFailed = validationProblems.some(
@@ -430,7 +506,7 @@ export function WorkflowDocEditor({
   const noteProblems = useMemo(() => {
     const idsByLabel = new Map(nodes.map((node) => [node.data.label, node.id]));
     const result = new Map<string, DocNoteProblem>();
-    for (const problem of validationProblems) {
+    for (const problem of shownProblems) {
       if (
         problem.code === "credential_in_note" &&
         problem.block_label &&
@@ -462,7 +538,7 @@ export function WorkflowDocEditor({
         message: messages.join("\n"),
       });
     return result;
-  }, [nodes, validationProblems, stepFixes]);
+  }, [nodes, shownProblems, stepFixes]);
 
   // Step warnings sit in the same map but are not notes and do not need fixing.
   const noteProblemCount = [...noteProblems.keys()].filter(
@@ -474,7 +550,7 @@ export function WorkflowDocEditor({
     (checkFailed ? 0 : noteProblemCount) +
     (checkFailed
       ? 0
-      : validationProblems.filter(
+      : shownProblems.filter(
           (problem) =>
             problem.code !== "validation_failed" &&
             problem.severity !== "warning" &&
@@ -487,6 +563,37 @@ export function WorkflowDocEditor({
     () => () => useRunValidationStore.getState().setDocProblemCount(0),
     [],
   );
+  // The panel is exempt from leave detection while it shows the step's settings; closing it or switching away is leaving.
+  useEffect(() => {
+    const { ids, settle } = useDocUnfinishedStore.getState();
+    settle(
+      [...ids].filter(
+        (id) =>
+          !(panelOpen && panelTab === "settings" && id === selectedStepId),
+      ),
+    );
+  }, [panelOpen, panelTab, selectedStepId]);
+  // A new step turns into a normal one when the user moves on: clicks or tabs elsewhere, or presses a Run/Save shortcut.
+  useEffect(() => {
+    const store = useDocUnfinishedStore.getState;
+    const leave = (event: Event) => {
+      const { ids, settle } = store();
+      if (ids.size) settle(stepsLeftBy(ids, event.target));
+    };
+    const shortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && /^(s|Enter)$/i.test(event.key))
+        store().clear();
+    };
+    document.addEventListener("pointerdown", leave, true);
+    document.addEventListener("focusin", leave, true);
+    document.addEventListener("keydown", shortcut, true);
+    return () => {
+      document.removeEventListener("pointerdown", leave, true);
+      document.removeEventListener("focusin", leave, true);
+      document.removeEventListener("keydown", shortcut, true);
+      store().clear();
+    };
+  }, []);
   const firstProblemId = useMemo(() => {
     const ids = new Set(
       [...noteProblems.keys()]
@@ -537,8 +644,14 @@ export function WorkflowDocEditor({
       (node) => node.type === "loop" || node.type === "conditional",
     ),
     problems,
-    ran: blocksByLabel.size > 0,
+    ran:
+      docRun.run?.status === Status.Completed &&
+      !docRun.blockRun &&
+      !docRun.earlierVersion,
   };
+  // One onboarding aid at a time: the checklist waits while a tip is showing.
+  const showTip =
+    starter.active && docTipIndex(starterProgress, starter.seenTips) >= 0;
   const reached = docStarterDone(starterProgress);
   const { markDone } = starter;
   useEffect(() => {
@@ -621,9 +734,10 @@ export function WorkflowDocEditor({
   useEffect(() => {
     rootRef.current?.focus();
     const root = rootRef.current;
-    const observer = new ResizeObserver(() =>
-      setWide((root?.clientWidth ?? 0) >= OUTLINE_MIN_WIDTH),
-    );
+    const observer = new ResizeObserver(() => {
+      const width = root?.clientWidth ?? 0;
+      setWide(width >= OUTLINE_MIN_WIDTH);
+    });
     if (root) observer.observe(root);
     return () => {
       observer.disconnect();
@@ -638,9 +752,19 @@ export function WorkflowDocEditor({
 
   const closePanel = () => {
     setPanelOpen(false);
+    // The step's line was replaced when it lost focus, so look it up again.
+    const stepLine =
+      panelStepId.current && rootRef.current
+        ? Array.from(
+            rootRef.current.querySelectorAll<HTMLElement>("[data-doc-node-id]"),
+          )
+            .find((el) => el.dataset.docNodeId === panelStepId.current)
+            ?.querySelector<HTMLElement>("[data-doc-line]")
+        : null;
+    panelStepId.current = null;
     (panelOpener.current?.isConnected
       ? panelOpener.current
-      : learnButtonRef.current
+      : (stepLine ?? learnButtonRef.current)
     )?.focus();
   };
   const goTo = (id: string) => {
@@ -670,6 +794,14 @@ export function WorkflowDocEditor({
         `[data-doc-node-id="${CSS.escape(id)}"]`,
       );
       target?.scrollIntoView({ block: "center", behavior: "smooth" });
+      if (!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches)
+        target?.animate?.(
+          [
+            { backgroundColor: "hsl(var(--muted))" },
+            { backgroundColor: "transparent" },
+          ],
+          { duration: 1200, easing: "ease-out" },
+        );
       // A step whose line is being typed in (Tab just moved it) gets the caret back on that line.
       const line =
         focusIdRef.current === id
@@ -693,6 +825,64 @@ export function WorkflowDocEditor({
         useRunValidationStore.getState().setDocShowFirstProblem(null);
     };
   }, []);
+  const runInputs = useMemo<DocRunInput[]>(() => {
+    const used = new Set(
+      inputs.filter((input) => !input.unused).map((input) => input.key),
+    );
+    return parameters.flatMap((p) => {
+      // The editor keeps a credential_id run input as a Skyvern "credential" parameter; the server
+      // still takes it as a run input, with its saved credential as the default.
+      // A fixed credential (no dataType) is not a run input.
+      if (
+        p.parameterType === "credential" &&
+        "credentialId" in p &&
+        (p as { dataType?: string }).dataType ===
+          WorkflowParameterValueType.CredentialId
+      ) {
+        const required = !p.credentialId;
+        if (!used.has(p.key) && !required) return [];
+        return [
+          {
+            key: p.key,
+            type: WorkflowParameterValueType.CredentialId,
+            defaultValue: p.credentialId || null,
+            required,
+          },
+        ];
+      }
+      if (p.parameterType !== "workflow") return [];
+      const required =
+        p.defaultValue === null ||
+        p.defaultValue === undefined ||
+        p.defaultValue === "";
+      // The server refuses a run missing any input without a default, used or not.
+      if (!used.has(p.key) && !required) return [];
+      return [
+        {
+          key: p.key,
+          type: p.dataType,
+          defaultValue: p.defaultValue,
+          required,
+        },
+      ];
+    });
+  }, [inputs, parameters]);
+  useEffect(() => {
+    useDocRunStore.getState().publish({
+      inputs: proposal ? [] : runInputs,
+      stepCount,
+      mounted: true,
+    });
+  }, [runInputs, stepCount, proposal]);
+  useEffect(
+    () => () =>
+      useDocRunStore.getState().publish({
+        inputs: [],
+        stepCount: 0,
+        mounted: false,
+      }),
+    [],
+  );
   useEffect(() => {
     if (!locateRequest) return;
     if (
@@ -826,13 +1016,8 @@ export function WorkflowDocEditor({
     <WorkflowDocActionsContext.Provider
       value={{
         editable,
-        runControlsVisible: !scopeReadOnly && !proposal,
-        openSettings: (id) => {
-          panelOpener.current = document.activeElement as HTMLElement;
-          setSelectedStepId(id);
-          setPanelTab("settings");
-          setPanelOpen(true);
-        },
+        runControlsVisible: !scopeReadOnly && !proposal && !fullRunGoing,
+        openSettings: openStepSettings,
         openVisual: () =>
           useWorkflowPresentationStore.getState().setPresentation("visual"),
         goTo,
@@ -946,14 +1131,29 @@ export function WorkflowDocEditor({
         <div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto">
           <div
             className={cn(
-              "mx-auto w-full max-w-[820px] px-8 pb-40 pt-7 sm:pt-11",
+              "relative mx-auto w-full max-w-[820px] px-8 pb-40 pt-7 sm:pt-11",
               wide && "sm:px-10",
             )}
           >
-            <DocEditBar
-              reserve={Boolean(edit)}
-              proposalPending={Boolean(proposal)}
-            />
+            <div
+              className={cn(
+                "sm:absolute sm:inset-x-0 sm:top-2 sm:px-8",
+                wide && "sm:px-10",
+              )}
+            >
+              <DocEditBar
+                floating={Boolean(edit)}
+                proposalPending={Boolean(proposal)}
+              />
+            </div>
+            {docRun.earlierVersion && docRun.runId && (
+              <div
+                className="mb-3 text-[13px] text-muted-foreground"
+                data-testid="doc-earlier-version-note"
+              >
+                Results from the last run (an earlier version)
+              </div>
+            )}
             <div className="mb-[26px] flex flex-wrap items-center gap-1.5 border-b border-border pb-[18px]">
               <span className="mr-1 text-[12.5px] text-[hsl(0_0%_60%)] dark:text-[hsl(215_14%_52%)]">
                 Inputs
@@ -1021,6 +1221,9 @@ export function WorkflowDocEditor({
                         : WorkflowEditorParameterTypes.Workflow
                     }
                     initialValues={parameter}
+                    isNew={Boolean(
+                      editingInput?.isNew && editingInput.key === input.key,
+                    )}
                     onSave={(value) => saveInput(input.key, value)}
                     onDelete={() => deleteInput(input.key)}
                     onClose={closeInputEditor}
@@ -1077,6 +1280,7 @@ export function WorkflowDocEditor({
                   }
                   onClick={() => {
                     panelOpener.current = document.activeElement as HTMLElement;
+                    panelStepId.current = null;
                     setSelectedStepId(startId);
                     setPanelTab("settings");
                     setPanelOpen(true);
@@ -1103,7 +1307,7 @@ export function WorkflowDocEditor({
                   data-doc-problems
                   disabled={!firstProblemId}
                   onClick={() => firstProblemId && goTo(firstProblemId)}
-                  className="rounded-md border border-[#C0392B] px-2 py-[2px] text-[#C0392B] outline-none hover:bg-[#C0392B]/10 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default dark:border-[#F08A7E] dark:text-[#F08A7E]"
+                  className="rounded-md border border-border px-2 py-[2px] text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
                 >
                   {problems} problem{problems === 1 ? "" : "s"}
                 </button>
@@ -1148,6 +1352,7 @@ export function WorkflowDocEditor({
                 aria-expanded={panelOpen && panelTab === "learn"}
                 onClick={() => {
                   panelOpener.current = learnButtonRef.current;
+                  panelStepId.current = null;
                   setPanelTab("learn");
                   setPanelOpen(true);
                 }}
@@ -1200,18 +1405,11 @@ export function WorkflowDocEditor({
                     label="Add step"
                   />
                   <DocKeyHints />
-                  {starter.active && (
+                  {showTip && (
                     <DocTip
                       progress={starterProgress}
                       seen={starter.seenTips}
                       onSeen={starter.seeTip}
-                    />
-                  )}
-                  {starter.active && (
-                    <DocGettingStarted
-                      progress={starterProgress}
-                      kept={starter.done}
-                      onHide={starter.hide}
                     />
                   )}
                 </div>
@@ -1219,6 +1417,16 @@ export function WorkflowDocEditor({
             </DocProposalProvider>
           </div>
         </div>
+        {edit && starter.active && !showTip && !(panelOpen && !wide) && (
+          <DocGettingStarted
+            progress={starterProgress}
+            kept={starter.done}
+            onHide={starter.hide}
+            folded={toastShowing}
+            compact={!wide || Boolean(docRun.runId)}
+            clearOfPanel={panelOpen}
+          />
+        )}
         {wide && !panelOpen && (
           <DocOutline items={tree.items} byId={byId} scrollRef={scrollRef} />
         )}

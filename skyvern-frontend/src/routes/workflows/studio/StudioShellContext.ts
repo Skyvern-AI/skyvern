@@ -1,5 +1,7 @@
 import { createContext, useContext } from "react";
 
+import { type StudioPaneId } from "./panes";
+
 type StudioShellContextValue = {
   organizationId?: string | null;
   // Left-column target Workspace portals the docked Copilot into; null when
@@ -18,6 +20,11 @@ type StudioShellContextValue = {
   // Pane actions from nested controls leave fullscreen before applying their
   // own layout change, including when the requested pane is already open.
   restoreExpandedPane?: () => void;
+  // Brings an open pane on screen: the shown pane at phone width, or opened
+  // over the stage when it is folded into a strip to make room for the Doc.
+  showPane?: (id: StudioPaneId) => void;
+  // Whether an open pane is folded into a strip to make room for the Doc.
+  isPaneFolded?: (id: StudioPaneId) => boolean;
 };
 
 export const StudioShellContext = createContext<StudioShellContextValue>({

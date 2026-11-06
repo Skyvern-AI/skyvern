@@ -58,6 +58,9 @@ vi.mock("../editor/hooks/useSaveWorkflow", () => ({
   useSaveWorkflow: () => saveWorkflowSpy,
 }));
 vi.mock("@/api/AxiosClient", () => ({ getClient: getClientMock }));
+vi.mock("../editor/doc/DocRunButton", () => ({
+  DocRunButton: () => <div data-testid="doc-run" />,
+}));
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => vi.fn(),
 }));
@@ -80,7 +83,14 @@ import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTi
 import { taskNodeDefaultData } from "../editor/nodes/TaskNode/types";
 
 import { useRunValidationStore } from "../editor/runValidation/useRunValidationStore";
-import { RunStopButton, SaveButton, TitleSection } from "./StudioTopBar";
+import { useDocRunStore } from "../editor/doc/docRunStore";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
+import {
+  RunStopButton,
+  SaveButton,
+  TitleSection,
+  TopBarRunControl,
+} from "./StudioTopBar";
 
 // jsdom lacks ResizeObserver, which Radix's tooltip popper constructs once a
 // tooltip opens. Install it for this suite only and restore afterward.
@@ -1065,5 +1075,48 @@ describe("RunStopButton while the Doc lists problems", () => {
 
     expect(showFirstProblem).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId("location")).toBeNull();
+  });
+});
+
+describe("TopBarRunControl with the Doc as the editor", () => {
+  beforeEach(() => {
+    useWorkflowPresentationStore.setState({
+      enabled: true,
+      presentation: "doc",
+    });
+    useDocRunStore.setState({ mounted: true });
+  });
+  afterEach(() => {
+    useWorkflowPresentationStore.setState({
+      enabled: false,
+      presentation: "visual",
+    });
+    useDocRunStore.setState({ mounted: false });
+  });
+
+  test("the Doc owns Run only while its pane is open and no block run is going", () => {
+    mockRun(Status.Completed);
+    renderAt("/workflows/wpid_1/studio?panes=editor", <TopBarRunControl />);
+    expect(screen.queryByTestId("doc-run")).not.toBeNull();
+    cleanup();
+
+    // Watching a run with the editor pane closed: the hidden Doc must not take the shared control.
+    renderAt(
+      "/workflows/wpid_1/studio?wr=wr_1&panes=overview",
+      <TopBarRunControl />,
+    );
+    expect(screen.queryByTestId("doc-run")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Re-run|Run/ })).not.toBeNull();
+    cleanup();
+
+    // A live block run keeps Stop with a full run beside it.
+    mockRun(Status.Running);
+    renderAt(
+      "/workflows/wpid_1/studio?panes=editor&wr=wr_1&bl=Block%201",
+      <TopBarRunControl />,
+    );
+    expect(screen.queryByTestId("doc-run")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Stop/ })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /Run/ })).not.toBeNull();
   });
 });

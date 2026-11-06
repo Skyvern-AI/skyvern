@@ -1961,7 +1961,7 @@ class TestPdfplumberFallbackTokenLimit:
         symbols_pdf = tmp_path / "symbols.pdf"
         symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
         monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
-        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_CHAR_LIMIT", 500)
+        monkeypatch.setattr(pdf_parser_module, "_TEXT_CHAR_LIMIT", 500)
 
         with structlog.testing.capture_logs() as logs:
             text = extract_pdf_file(str(symbols_pdf), max_tokens=40)
@@ -2000,7 +2000,7 @@ class TestPdfplumberFallbackTokenLimit:
         symbols_pdf = tmp_path / "symbols.pdf"
         symbols_pdf.write_bytes(_build_letter_pdf(6, ("=" * 60,) * 3))
         monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
-        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(2048, 6))
+        monkeypatch.setattr(pdf_parser_module, "_TEXT_RESULT", pdf_parser_module._ResultLimit(2048, 6))
 
         text = extract_pdf_file(str(symbols_pdf), max_tokens=0)
 
@@ -2013,7 +2013,7 @@ class TestPdfplumberFallbackTokenLimit:
         symbols_pdf = tmp_path / "symbols.pdf"
         symbols_pdf.write_bytes(_build_letter_pdf(2, ("=" * 60,) * 3))
         monkeypatch.setattr(pdf_parser_module, "PdfReader", _RejectingPdfReader)
-        monkeypatch.setattr(pdf_parser_module, "_PAGE_TEXTS_RESULT", pdf_parser_module._ResultLimit(300, 6))
+        monkeypatch.setattr(pdf_parser_module, "_TEXT_RESULT", pdf_parser_module._ResultLimit(300, 6))
 
         with pytest.raises(PDFParsingError, match="a result may hold"):
             extract_pdf_file(str(symbols_pdf), max_tokens=0)

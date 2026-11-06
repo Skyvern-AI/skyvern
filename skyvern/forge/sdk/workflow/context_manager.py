@@ -10,7 +10,8 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal, Self, overload
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Self, overload
 
 import structlog
 from jinja2 import Template, TemplateError
@@ -23,6 +24,7 @@ from skyvern.constants import BROWSER_CLOSE_TIMEOUT, SCRUBBED_VALUE
 from skyvern.exceptions import (
     AzureConfigurationError,
     BitwardenBaseError,
+    BitwardenListItemsError,
     CredentialItemNotFoundError,
     CredentialParameterNotFoundError,
     CredentialSourceNotConfiguredError,
@@ -31,6 +33,7 @@ from skyvern.exceptions import (
     InvalidCredentialId,
     RuntimeSequentialCredentialUnsupported,
     SkyvernException,
+    SkyvernHTTPException,
     WorkflowRunContextNotInitialized,
     sanitize_credential_for_error,
 )
@@ -52,6 +55,9 @@ from skyvern.forge.sdk.services.bitwarden import (
 )
 from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_service import (
     CONNECTED_BITWARDEN_VAULT_ID,
+)
+from skyvern.forge.sdk.services.credential.onepassword_credential_vault_service import (
+    is_onepassword_card_secret_field,
 )
 from skyvern.forge.sdk.services.credentials import (
     AzureVaultConstants,
@@ -140,7 +146,7 @@ def _platform_smtp_bindings(
         "smtp_username": block.smtp_username,
         "smtp_password": block.smtp_password,
     }
-    if any(not _is_platform_smtp_aws_key(p.aws_key, PLATFORM_SMTP_AWS_KEYS[field]) for field, p in bindings.items()):
+    if any(p.aws_key != PLATFORM_SMTP_AWS_KEYS[field] for field, p in bindings.items()):
         return {}
     for binding in bindings.values():
         matches = [parameter for parameter in parameters if parameter.key == binding.key]
@@ -195,7 +201,8 @@ def _platform_email_parameter_usage(
         return "denied"
 
     referenced_by_email = False
-    for block in get_all_blocks(definition.blocks):
+    blocks = get_all_blocks(definition.blocks)
+    for block in blocks:
         if isinstance(block, ForLoopBlock) and block.loop_variable_reference:
             expression = f"{{{{ {block.loop_variable_reference.strip(' {}')} | tojson }}}}"
             if _references_parameter(expression, parameter.key):
@@ -274,6 +281,11 @@ NON_SECRET_CREDENTIAL_FIELDS = frozenset({"card_brand"})
 # Secrets shorter than this mask only on exact whole-string match: substring-replacing a short
 # value (a CVV, a 2-digit expiry) corrupts unrelated scalars such as timestamp milliseconds.
 SECRET_SUBSTRING_MIN_LENGTH = 5
+
+# Credential fields whose plaintext must never be legible in a stored screenshot or recording, so
+# they are visually masked regardless of the workflow's Mask Secrets opt-in. Expiry, cardholder
+# name, and brand are deliberately absent: they do not authorize a charge on their own.
+CARD_SECRET_FIELD_KEYS = frozenset({"card_number", "card_cvv"})
 
 
 @dataclass
@@ -366,10 +378,17 @@ def register_secret_derived_output(
     source: str,
     template_data: Mapping[str, Any],
     rendered: str,
+    *,
+    excluded_secret_ids: set[str] | None = None,
 ) -> None:
     """Register the span of `rendered` that changes when each secret is swapped for a canary, so redactors
     fed from the `secrets` registry also match a secret a Jinja filter transformed (`{{ token|reverse }}`)."""
-    present = collect_redactable_secret_values(secrets)
+    source_secrets = (
+        {key: value for key, value in secrets.items() if key not in excluded_secret_ids}
+        if excluded_secret_ids
+        else secrets
+    )
+    present = collect_redactable_secret_values(source_secrets)
     if not present or not rendered:
         return
     parsed = template.environment.parse(source)
@@ -772,8 +791,13 @@ class WorkflowRunContext:
         self.parameters: dict[str, PARAMETER_TYPE] = {}
         self.values: dict[str, Any] = {}
         self.secrets: dict[str, Any] = {}
+        self._platform_smtp_secret_ids: dict[str, str] = {}
+        self._bitwarden_email: str | None = None
+        self._bitwarden_resolved_collection_id: str | None = None
         self.workflow_run_outputs: dict[str, Any] = {}
         self.carried_block_labels: set[str] = set()
+        # In memory only, so a retried or resumed attempt starts empty.
+        self.succeeded_code_block_labels: set[str] = set()
         # Blocks whose loop iterates page-derived values: their current_value/current_item came from a page.
         self.page_derived_loop_labels: set[str] = set()
         # ContextParameter keys a page-derived loop wrote. Never cleared: the value outlives the loop.
@@ -787,12 +811,16 @@ class WorkflowRunContext:
         self.credential_totp_identifiers: dict[str, str] = {}
         # Secret ids minted for the username slot of a login credential; never derived from a field name.
         self.login_identifier_secret_ids: set[str] = set()
+        # Secret ids minted for a card number or CVV, recorded where the vault field is known rather
+        # than re-derived from the id, so the visual mask does not depend on parsing the id back.
+        self.card_secret_ids: set[str] = set()
         self.resolved_credential_parameter_ids: dict[str, str] = {}
         self._credential_authorization_started = False
         self.authorized_credential_ids: set[str] = set()
         self.authorized_vault_item_ids: set[tuple[str, str | None, str]] = set()
         # tested_url per credential parameter key: where each credential's secrets may be released.
         self.credential_tested_urls: dict[str, str] = {}
+        self.credential_extra_site_urls: dict[str, list[str]] = {}
         # The sites each Bitwarden login's item is saved for, which a code block checks its release against.
         self.bitwarden_login_sites: dict[str, list[LoginSite]] = {}
         self.materialized_file_paths: dict[str, tuple[str, str]] = {}
@@ -917,6 +945,79 @@ class WorkflowRunContext:
     def get_parameter(self, key: str) -> Parameter:
         return self.parameters[key]
 
+    def platform_smtp_parameter_keys(self) -> set[str]:
+        return {
+            key
+            for key, parameter in self.parameters.items()
+            if isinstance(parameter, AWSSecretParameter) and _is_platform_smtp_aws_key(parameter.aws_key)
+        }
+
+    def reject_platform_smtp_references(self, value: object, *, exact: bool = True) -> None:
+        if any(_references_parameter(value, key, exact=exact) for key in self.platform_smtp_parameter_keys()):
+            raise InvalidWorkflowDefinition("Platform-managed secrets are restricted to platform email delivery.")
+
+    def reject_platform_smtp_template_references(self, template: str) -> None:
+        for parameter in self.parameters.values():
+            if (
+                isinstance(parameter, AWSSecretParameter)
+                and _is_platform_smtp_aws_key(parameter.aws_key)
+                and _references_parameter(template, parameter.key, exact=False)
+            ):
+                raise InvalidWorkflowDefinition("Platform-managed secrets are restricted to platform email delivery.")
+
+    def platform_smtp_placeholders(self) -> dict[str, str]:
+        placeholders = self._platform_smtp_secret_ids.copy()
+        for key in self.platform_smtp_parameter_keys():
+            parameter = self.parameters[key]
+            value = self.values.get(key)
+            if isinstance(parameter, AWSSecretParameter) and isinstance(value, str) and value in self.secrets:
+                placeholders.setdefault(value, parameter.aws_key)
+        return placeholders
+
+    def agent_unmasked_platform_secret_ids(self) -> set[str]:
+        return {
+            token
+            for token, aws_key in self.platform_smtp_placeholders().items()
+            if aws_key == PLATFORM_SMTP_AWS_KEYS["smtp_port"]
+            or not isinstance(self.secrets.get(token), str)
+            or len(self.secrets[token]) < MIN_UNANCHORED_SECRET_LENGTH
+        }
+
+    def agent_redactable_secret_values(self) -> set[str]:
+        excluded = self.agent_unmasked_platform_secret_ids()
+        return {
+            value for key, value in self.secrets.items() if key not in excluded and isinstance(value, str) and value
+        }
+
+    def mask_platform_smtp_for_agent(self, data: Any) -> Any:
+        keys = self.platform_smtp_parameter_keys()
+        placeholders = self.platform_smtp_placeholders()
+        excluded = self.agent_unmasked_platform_secret_ids()
+        secret_values = {
+            value
+            for token in placeholders
+            if token not in excluded and isinstance((value := self.secrets.get(token)), str) and value
+        }
+        if not keys and not placeholders:
+            return data
+        tokens = sorted(placeholders, key=len, reverse=True)
+        secrets = sorted(secret_values, key=len, reverse=True)
+
+        def mask(value: Any) -> Any:
+            if isinstance(value, str):
+                for secret in (*tokens, *secrets):
+                    value = value.replace(secret, "*****")
+                return value
+            if isinstance(value, dict):
+                return {mask(key): mask(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [mask(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(mask(item) for item in value)
+            return value
+
+        return mask(data)
+
     def get_powerbi_hop_token(self, block_label: str) -> str | None:
         """Return the run capability kept outside workflow values and template data."""
         token = self._powerbi_hop_tokens.get(block_label)
@@ -931,6 +1032,9 @@ class WorkflowRunContext:
         the actual secret value. This will be used when building the navigation payload since we don't want to expose
         the actual secret value in the payload.
         """
+        parameter = self.parameters.get(key)
+        if isinstance(parameter, AWSSecretParameter) and _is_platform_smtp_aws_key(parameter.aws_key):
+            raise InvalidWorkflowDefinition("Platform-managed secrets are restricted to platform email delivery.")
         return self.values[key]
 
     def has_parameter(self, key: str) -> bool:
@@ -1054,7 +1158,14 @@ class WorkflowRunContext:
             if names - template_data.keys():
                 return raw
             rendered = template.render(template_data)
-            register_secret_derived_output(self.secrets, template, raw, template_data, rendered)
+            register_secret_derived_output(
+                self.secrets,
+                template,
+                raw,
+                template_data,
+                rendered,
+                excluded_secret_ids=self.agent_unmasked_platform_secret_ids(),
+            )
             return rendered.strip() or raw
         except Exception:
             LOG.warning(
@@ -1168,7 +1279,14 @@ class WorkflowRunContext:
 
         template = jinja_sandbox_env.from_string(raw_template)
         rendered = template.render(template_data)
-        register_secret_derived_output(self.secrets, template, raw_template, template_data, rendered)
+        register_secret_derived_output(
+            self.secrets,
+            template,
+            raw_template,
+            template_data,
+            rendered,
+            excluded_secret_ids=self.agent_unmasked_platform_secret_ids(),
+        )
         return rendered
 
     async def _should_include_secrets_in_templates(self) -> bool:
@@ -1202,8 +1320,11 @@ class WorkflowRunContext:
             has_password_shape = "username" in value
             if not has_password_shape and "secret_value" not in value:
                 continue
-            entries[f"{key}_real_username"] = self.secrets.get(value.get("username", ""), "")
-            entries[f"{key}_real_password"] = self.secrets.get(value.get("password", ""), "")
+            for field in ("username", "password"):
+                secret_id = value.get(field, "")
+                entries[f"{key}_real_{field}"] = (
+                    self.get_original_secret_value_or_none(secret_id) if secret_id in self.secrets else ""
+                )
             if resolve_credential_dicts:
                 resolved_credential = value.copy()
                 for credential_field, credential_placeholder in value.items():
@@ -1230,6 +1351,13 @@ class WorkflowRunContext:
         assume it's an actual parameter value and return it.
 
         """
+        if isinstance(secret_id_or_value, str) and any(
+            token in secret_id_or_value for token in self._platform_smtp_secret_ids
+        ):
+            if any(
+                token in self._platform_smtp_secret_ids for token in self._scan_placeholder_tokens(secret_id_or_value)
+            ):
+                raise InvalidWorkflowDefinition("Platform-managed secrets are restricted to platform email delivery.")
         if len(self.secrets) == 0:
             return None
         if isinstance(secret_id_or_value, str):
@@ -1255,6 +1383,28 @@ class WorkflowRunContext:
                         raise ImaginarySecretValue(secret_id_or_value)
                 return None
         return None
+
+    def resolve_smtp_secret(self, block: "SendEmailBlock", parameter: AWSSecretParameter) -> Any:
+        value = self.get_value_or_none(parameter.key)
+        if value is None:
+            return None
+        if _is_platform_smtp_aws_key(parameter.aws_key):
+            from skyvern.forge.sdk.workflow.models.block import SendEmailBlock
+
+            if (
+                not isinstance(block, SendEmailBlock)
+                or block.transport == EmailTransport.GMAIL
+                or block.has_custom_smtp()
+                or not isinstance(value, str)
+                or self._platform_smtp_secret_ids.get(value) != parameter.aws_key
+                or not any(
+                    binding.key == parameter.key and binding.aws_key == parameter.aws_key
+                    for binding in _platform_smtp_bindings(block, list(self.parameters.values())).values()
+                )
+            ):
+                raise InvalidWorkflowDefinition("Platform-managed secrets are restricted to platform email delivery.")
+            return self.secrets.get(value)
+        return self.get_original_secret_value_or_none(value)
 
     def _scan_placeholder_tokens(self, text: str) -> list[str]:
         """Scan *text* for registered placeholder keys, longest-first.
@@ -1295,7 +1445,7 @@ class WorkflowRunContext:
 
         result = text
         for token in tokens_found:
-            result = result.replace(token, self.secrets[token], 1)
+            result = result.replace(token, self.get_original_secret_value_or_none(token), 1)
         if RANDOM_SECRET_ID_PREFIX in result:
             raise ImaginarySecretValue(text)
         return result
@@ -1360,7 +1510,9 @@ class WorkflowRunContext:
             masked = masked.replace(secret, "[redacted]")
         return masked or "[redacted]"
 
-    def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
+    def mask_secrets_in_data(
+        self, data: Any, mask: str = "*****", *, excluded_secret_ids: set[str] | None = None
+    ) -> Any:
         """
         Recursively replace registered secret values in data with a mask.
         Used to sanitize HttpRequestBlock output before storing.
@@ -1378,7 +1530,11 @@ class WorkflowRunContext:
             return data
 
         # Collect all non-empty string secret values
-        secret_values = {v for v in self.secrets.values() if isinstance(v, str) and v}
+        secret_values = {
+            value
+            for key, value in self.secrets.items()
+            if (excluded_secret_ids is None or key not in excluded_secret_ids) and isinstance(value, str) and value
+        }
 
         if not secret_values:
             return data
@@ -1392,13 +1548,19 @@ class WorkflowRunContext:
                 if len(secret) >= SECRET_SUBSTRING_MIN_LENGTH:
                     result = result.replace(secret, mask)
             return result
-        elif isinstance(data, dict):
+        elif isinstance(data, (dict, list)):
+
+            def mask_item(value: Any) -> Any:
+                if excluded_secret_ids is None:
+                    return self.mask_secrets_in_data(value, mask)
+                return self.mask_secrets_in_data(value, mask, excluded_secret_ids=excluded_secret_ids)
+
             # Keys are masked as well as values: authored code is free to build {code: True}, and a
             # key carrying a secret is as readable in stored output as a value carrying one. Two keys
             # that both mask to the same string collapse into one entry, which is preferred to leaking.
-            return {self.mask_secrets_in_data(k, mask): self.mask_secrets_in_data(v, mask) for k, v in data.items()}
-        elif isinstance(data, list):
-            return [self.mask_secrets_in_data(item, mask) for item in data]
+            if isinstance(data, dict):
+                return {mask_item(key): mask_item(value) for key, value in data.items()}
+            return [mask_item(item) for item in data]
         elif isinstance(data, (int, float)) and not isinstance(data, bool):
             # A numeric secret decoded from `| json` arrives as a number; the redactor's floor keeps counts and years.
             text = str(data)
@@ -1470,6 +1632,7 @@ class WorkflowRunContext:
         if self.organization_id is None:
             raise PermissionError("credential not accessible")
         item_id = self.secrets[BitwardenConstants.BW_ITEM_ID]
+        collection_id = self.secrets[BitwardenConstants.BW_COLLECTION_ID]
         await self._enforce_context_credential_use(
             self.organization_id,
             vault_item_ids=(
@@ -1482,16 +1645,34 @@ class WorkflowRunContext:
             ),
             unresolved_vault_item=not item_id,
         )
-        secret_credentials = await BitwardenService.get_secret_value_from_url(
-            url=self.secrets[BitwardenConstants.URL],
-            client_secret=self.secrets[BitwardenConstants.CLIENT_SECRET],
-            client_id=self.secrets[BitwardenConstants.CLIENT_ID],
-            master_password=self.secrets[BitwardenConstants.MASTER_PASSWORD],
-            bw_organization_id=self.secrets[BitwardenConstants.BW_ORGANIZATION_ID],
-            bw_collection_ids=self.secrets[BitwardenConstants.BW_COLLECTION_IDS],
-            collection_id=self.secrets[BitwardenConstants.BW_COLLECTION_ID],
-            item_id=self.secrets[BitwardenConstants.BW_ITEM_ID],
-        )
+        scoped = False
+        email = app.AGENT_FUNCTION.bitwarden_refetch_email(self._bitwarden_email)
+        if email is None and (self._bitwarden_email is None or settings.BITWARDEN_EMAIL):
+            scoped = await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+                self.organization_id,
+                {item_id} if item_id else set(),
+                {self._bitwarden_resolved_collection_id} if self._bitwarden_resolved_collection_id else set(),
+            )
+            if scoped:
+                collection_id = self._bitwarden_resolved_collection_id
+        try:
+            secret_credentials = await BitwardenService.get_secret_value_from_url(
+                url=self.secrets[BitwardenConstants.URL],
+                client_secret=self.secrets[BitwardenConstants.CLIENT_SECRET],
+                client_id=self.secrets[BitwardenConstants.CLIENT_ID],
+                master_password=self.secrets[BitwardenConstants.MASTER_PASSWORD],
+                bw_organization_id=None
+                if scoped and collection_id and not item_id
+                else self.secrets[BitwardenConstants.BW_ORGANIZATION_ID],
+                bw_collection_ids=self.secrets[BitwardenConstants.BW_COLLECTION_IDS],
+                collection_id=collection_id,
+                item_id=item_id,
+                email=email,
+            )
+        except BitwardenBaseError as error:
+            if scoped:
+                self._raise_platform_bitwarden_error(error)
+            raise
         return secret_credentials
 
     @staticmethod
@@ -1624,6 +1805,8 @@ class WorkflowRunContext:
         self.resolved_credential_parameter_ids[parameter.key] = credential_id
         if db_credential.tested_url:
             self.credential_tested_urls[parameter.key] = db_credential.tested_url
+        if db_credential.extra_site_urls:
+            self.credential_extra_site_urls[parameter.key] = db_credential.extra_site_urls
 
         vault_type = db_credential.vault_type or CredentialVaultType.BITWARDEN
         fetch.provider = vault_type
@@ -1668,6 +1851,7 @@ class WorkflowRunContext:
                     used_secret_field_keys.add(key)
                 continue
             for field_key, field_value in self._flatten_credential_secret_field(key, value):
+                is_card_secret = field_key in CARD_SECRET_FIELD_KEYS
                 field_key = self._dedupe_secret_field_key(field_key, used_secret_field_keys)
                 if field_key in NON_SECRET_CREDENTIAL_FIELDS:
                     self.values[parameter.key][field_key] = field_value
@@ -1676,6 +1860,8 @@ class WorkflowRunContext:
                 secret_id = f"{random_secret_id}_{field_key}"
                 self.secrets[secret_id] = field_value
                 self.values[parameter.key][field_key] = secret_id
+                if is_card_secret:
+                    self.card_secret_ids.add(secret_id)
                 if isinstance(credential, PasswordCredential) and key == "username" and credential.password:
                     self.login_identifier_secret_ids.add(secret_id)
 
@@ -1807,9 +1993,6 @@ class WorkflowRunContext:
                 if candidate.key != parameter.key and references(candidate.model_dump(mode="json")):
                     return False
             blocks = get_all_blocks(definition.blocks)
-            # A static agent may create later blocks that cannot be inspected here.
-            if dynamic_block is None and any(block.block_type == BlockType.AGENT_STEP for block in blocks):
-                return False
         elif dynamic_block is None:
             return False
         if dynamic_block is not None:
@@ -1832,8 +2015,8 @@ class WorkflowRunContext:
                     for field, smtp_parameter in _platform_smtp_bindings(
                         block, available_parameters, allow_missing=block is dynamic_block
                     ).items():
+                        data.pop(field, None)
                         if smtp_parameter.key == parameter.key and smtp_parameter.aws_key == parameter.aws_key:
-                            data.pop(field, None)
                             found = True
             if references(data):
                 return False
@@ -1848,7 +2031,8 @@ class WorkflowRunContext:
         aws_key = await app.AGENT_FUNCTION.enforce_platform_aws_secret_ownership(
             self.organization_id, parameter.aws_key
         )
-        if _is_platform_smtp_aws_key(parameter.aws_key):
+        is_platform_smtp = _is_platform_smtp_aws_key(aws_key)
+        if is_platform_smtp:
             if platform_smtp_block is None:
                 usage = _platform_email_parameter_usage(
                     parameter,
@@ -1882,8 +2066,9 @@ class WorkflowRunContext:
         # We'll replace the random secret id with the actual secret value when we need to use it.
         secret_value = await self._aws_client.get_secret(aws_key)
         if secret_value is not None:
-            random_secret_id = self.generate_random_secret_id()
-            self.secrets[random_secret_id] = secret_value
+            random_secret_id = self.register_secret_value(secret_value)
+            if is_platform_smtp:
+                self._platform_smtp_secret_ids[random_secret_id] = aws_key
             self.values[parameter.key] = random_secret_id
             self.parameters[parameter.key] = parameter
 
@@ -2037,7 +2222,12 @@ class WorkflowRunContext:
                     self._add_secret_parameter_value(parameter, "card_cvv", field.value)
                 else:
                     # this will be the username, password or other fields
-                    self._add_secret_parameter_value(parameter, field.id.replace(" ", "_"), field.value)
+                    self._add_secret_parameter_value(
+                        parameter,
+                        field.id.replace(" ", "_"),
+                        field.value,
+                        card_secret=is_onepassword_card_secret_field(item, field),
+                    )
 
         # Secure Note support
         if item.notes:
@@ -2065,6 +2255,8 @@ class WorkflowRunContext:
                     aws_keys[index] = await app.AGENT_FUNCTION.enforce_platform_aws_secret_ownership(
                         self.organization_id, aws_keys[index], bitwarden=True
                     )
+            if any(not value and _is_platform_smtp_aws_key(aws_keys[index]) for index, value in enumerate(configured)):
+                raise InvalidWorkflowDefinition("Platform-managed secrets are restricted to platform email delivery.")
             client_id = configured[0] or await self._aws_client.get_secret(aws_keys[0])
             client_secret = configured[1] or await self._aws_client.get_secret(aws_keys[1])
             master_password = configured[2] or await self._aws_client.get_secret(aws_keys[2])
@@ -2127,13 +2319,22 @@ class WorkflowRunContext:
             raise ValueError("Bitwarden master password not found")
 
     @staticmethod
-    def _should_retry_bitwarden_with_global_credentials(error: BitwardenBaseError) -> bool:
+    def _bitwarden_global_retry_reason(error: BitwardenBaseError) -> Literal["timeout", "device_verification"] | None:
         error_message = str(error).lower()
-        return (
-            "timeouterror" in error_message
-            or "timed out" in error_message
-            or "new device verification" in error_message
-        )
+        if "timeouterror" in error_message or "timed out" in error_message:
+            return "timeout"
+        if "new device verification" in error_message:
+            return "device_verification"
+        return None
+
+    @staticmethod
+    def _raise_platform_bitwarden_error(
+        error: BitwardenBaseError,
+    ) -> NoReturn:
+        if isinstance(error, BitwardenListItemsError) and error.missing_item:
+            raise CredentialItemNotFoundError("Credential not found") from None
+        LOG.warning("Platform Bitwarden operation failed", error_type=type(error).__name__)
+        raise SkyvernHTTPException("Credential not accessible", status_code=HTTPStatus.SERVICE_UNAVAILABLE) from None
 
     async def _run_bitwarden_operation_with_fallback(
         self,
@@ -2141,7 +2342,10 @@ class WorkflowRunContext:
         parameter: BitwardenLoginCredentialParameter
         | BitwardenSensitiveInformationParameter
         | BitwardenCreditCardDataParameter,
-        operation: Callable[[str | None, str | None, str, str | None], Awaitable[Any]],
+        operation: Callable[[str | None, str | None, str, str | None, bool], Awaitable[Any]],
+        *,
+        item_id: str | None = None,
+        collection_id: str | None = None,
     ) -> tuple[Any, BitwardenCredentials]:
         candidates = await self._get_bitwarden_credential_candidates(organization, parameter)
         last_error: BitwardenBaseError | None = None
@@ -2152,18 +2356,25 @@ class WorkflowRunContext:
             assert master_password
 
             try:
-                result = await operation(client_id, client_secret, master_password, email)
+                scoped = False
+                if email is None:
+                    scoped = await app.AGENT_FUNCTION.enforce_platform_bitwarden_item_ownership(
+                        organization.organization_id,
+                        {item_id} if item_id else set(),
+                        {collection_id} if collection_id else set(),
+                    )
+                result = await operation(client_id, client_secret, master_password, email, scoped)
                 return result, credentials
             except BitwardenBaseError as error:
+                if scoped:
+                    self._raise_platform_bitwarden_error(error)
                 last_error = error
                 has_fallback = index + 1 < len(candidates)
-                if email and has_fallback and self._should_retry_bitwarden_with_global_credentials(error):
+                reason = self._bitwarden_global_retry_reason(error) if email and has_fallback else None
+                if reason:
                     LOG.warning(
                         "Org-level Bitwarden email auth failed, retrying with global Bitwarden credentials",
-                        organization_id=organization.organization_id,
-                        workflow_id=parameter.workflow_id,
-                        parameter_key=parameter.key,
-                        error=str(error),
+                        reason=reason,
                     )
                     continue
                 raise
@@ -2207,12 +2418,13 @@ class WorkflowRunContext:
             client_secret: str | None,
             master_password: str,
             email: str | None,
+            scoped: bool,
         ) -> dict[str, str]:
             return await BitwardenService.get_secret_value_from_url(
                 client_id,
                 client_secret,
                 master_password,
-                organization.bw_organization_id,
+                None if scoped and collection_id and not item_id else organization.bw_organization_id,
                 organization.bw_collection_ids,
                 url,
                 collection_id=collection_id,
@@ -2225,6 +2437,8 @@ class WorkflowRunContext:
                 organization,
                 parameter,
                 fetch_secret_credentials,
+                item_id=item_id,
+                collection_id=collection_id,
             )
             client_id, client_secret, master_password, email = credentials
             if secret_credentials and not item_id:
@@ -2243,6 +2457,8 @@ class WorkflowRunContext:
                     organization.organization_id, vault_item_ids=vault_item_ids, unresolved_vault_item=not item_id
                 )
             if secret_credentials:
+                self._bitwarden_email = email
+                self._bitwarden_resolved_collection_id = collection_id
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
                 self.secrets[BitwardenConstants.URL] = url
@@ -2388,12 +2604,13 @@ class WorkflowRunContext:
             client_secret: str | None,
             master_password: str,
             email: str | None,
+            scoped: bool,
         ) -> dict[str, str]:
             return await BitwardenService.get_sensitive_information_from_identity(
                 client_id,
                 client_secret,
                 master_password,
-                organization.bw_organization_id,
+                None if scoped else organization.bw_organization_id,
                 organization.bw_collection_ids,
                 collection_id,
                 bitwarden_identity_key,
@@ -2406,6 +2623,7 @@ class WorkflowRunContext:
                 organization,
                 parameter,
                 fetch_sensitive_values,
+                collection_id=collection_id,
             )
             client_id, client_secret, master_password, email = credentials
             if sensitive_values:
@@ -2424,6 +2642,8 @@ class WorkflowRunContext:
                     ),
                     unresolved_vault_item=not item_id,
                 )
+                self._bitwarden_email = email
+                self._bitwarden_resolved_collection_id = collection_id
                 self.secrets[BitwardenConstants.BW_ORGANIZATION_ID] = organization.bw_organization_id
                 self.secrets[BitwardenConstants.BW_COLLECTION_IDS] = organization.bw_collection_ids
                 self.secrets[BitwardenConstants.IDENTITY_KEY] = bitwarden_identity_key
@@ -2478,6 +2698,7 @@ class WorkflowRunContext:
             client_secret: str | None,
             master_password: str,
             email: str | None,
+            _scoped: bool,
         ) -> dict[str, str]:
             return await BitwardenService.get_credit_card_data(
                 client_id,
@@ -2495,11 +2716,14 @@ class WorkflowRunContext:
                 organization,
                 parameter,
                 fetch_credit_card_data,
+                item_id=item_id,
+                collection_id=collection_id,
             )
             client_id, client_secret, master_password, email = credentials
             if not credit_card_data:
                 raise CredentialItemNotFoundError(f"Credit card data not found in Bitwarden. {lookup_context}")
 
+            self._bitwarden_email = email
             self.secrets[BitwardenConstants.CLIENT_ID] = client_id
             self.secrets[BitwardenConstants.CLIENT_SECRET] = client_secret
             self.secrets[BitwardenConstants.MASTER_PASSWORD] = master_password
@@ -2529,6 +2753,7 @@ class WorkflowRunContext:
                 secret_id = f"{random_secret_id}_{secret_suffix}"
                 self.secrets[secret_id] = credit_card_data[data_key]
                 parameter_value[secret_suffix] = secret_id
+                self.card_secret_ids.add(secret_id)
 
             extra_field_keys = [
                 key
@@ -2840,7 +3065,7 @@ class WorkflowRunContext:
 
         # Fallback on direct value in case configured as 'my_parameter' instead of '{{ my_parameter }}'
         if self.has_parameter(parameter_value) and self.has_value(parameter_value):
-            return self.values[parameter_value]
+            return self.get_value(parameter_value)
         else:
             return jinja_sandbox_env.from_string(parameter_value).render(self.values)
 
@@ -2862,7 +3087,9 @@ class WorkflowRunContext:
             azure_vault_client = azure_client_factory.create_default()
         return azure_vault_client
 
-    def _add_secret_parameter_value(self, parameter: Parameter, key: str, value: str) -> None:
+    def _add_secret_parameter_value(
+        self, parameter: Parameter, key: str, value: str, *, card_secret: bool = False
+    ) -> None:
         if parameter.key not in self.values:
             raise ValueError(f"{parameter.key} is missing")
 
@@ -2870,6 +3097,8 @@ class WorkflowRunContext:
         secret_id = f"{random_secret_id}_{key}"
         self.secrets[secret_id] = value
         self.values[parameter.key][key] = secret_id
+        if card_secret or key in CARD_SECRET_FIELD_KEYS:
+            self.card_secret_ids.add(secret_id)
 
     @staticmethod
     def _normalize_secret_field_key(key: str) -> str:
@@ -3116,6 +3345,15 @@ class WorkflowContextManager:
         if workflow_run_id is None or workflow_run_id not in self.workflow_run_contexts:
             return frozenset()
         return frozenset(self.workflow_run_contexts[workflow_run_id].login_identifier_secret_ids)
+
+    def is_card_secret_text(self, workflow_run_id: str | None, text: str | None) -> bool:
+        """Whether text names a card number or CVV held by this run, alone or among other placeholders."""
+        if workflow_run_id is None or not isinstance(text, str) or not text:
+            return False
+        context = self.workflow_run_contexts.get(workflow_run_id)
+        return context is not None and any(
+            token in context.card_secret_ids for token in context.find_embedded_placeholder_tokens(text)
+        )
 
     def secret_values_for_drop_check(self, workflow_run_id: str | None) -> set[str]:
         """Every configured secret value, with no numeric floor and no masking opt-in, for a check that only

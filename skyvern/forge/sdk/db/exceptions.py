@@ -32,6 +32,10 @@ class NotFoundError(Exception):
     pass
 
 
+class CredentialSitesChangedError(Exception):
+    """The login's saved sites no longer match the ones the edit was made from."""
+
+
 class RunsListSearchCanceled(Exception):
     """A statement timeout cancelled the statement carrying a runs-list search filter.
 

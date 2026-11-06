@@ -334,9 +334,9 @@ class TurnNarrativePayload(TypedDict):
     # {"outcome": "connected"|"skipped"|"timeout", "credentialId": ..., "anchorToolCallId": ...}, set
     # when a mid-build credential pause (credential_pause.py) resolved during this turn. The anchor is
     # the tool call whose row was newest when the card was raised.
-    credentialPause: NotRequired[dict[str, str]]
+    credentialPause: NotRequired[dict[str, str | list[str]]]
     # Every pick card's credentialPause, oldest first; set only when more than one card settled this turn.
-    credentialPauses: NotRequired[list[dict[str, str]]]
+    credentialPauses: NotRequired[list[dict[str, str | list[str]]]]
     # {"credentialId": ..., "name": ...}, set when a credential was bound this turn without an ask
     # (deterministic auto-bind); the FE renders it as a receipt with a Change affordance.
     credentialAutoBound: NotRequired[dict[str, str]]
@@ -375,6 +375,7 @@ if TYPE_CHECKING:
         RecordedBuildTestOutcome,
     )
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
+    from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.interruption import StoppedTurnFacts
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
@@ -1365,7 +1366,8 @@ class CopilotContext(AgentContext):
     credential_generation_spent: bool = False
     credential_pause_connected_credential_id: str | None = None
     credential_pause_anchor_tool_call_id: str | None = None
-    credential_pause_receipts: list[dict[str, str]] = field(default_factory=list)
+    credential_pause_receipts: list[dict[str, str | list[str]]] = field(default_factory=list)
+    credential_pause_site_answer: SiteAnswer | None = None
     demonstration_requested: bool = False
     demonstration_ran: bool = False
     demonstration_id: str | None = None

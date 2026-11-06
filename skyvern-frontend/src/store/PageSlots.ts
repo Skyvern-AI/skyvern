@@ -61,6 +61,14 @@ export type PermissionsState =
   | Readonly<{ status: "ready"; data: PermissionsResponse }>;
 
 export type PageSlots = {
+  powerBIDatasetPicker?: React.ComponentType<
+    Readonly<{
+      connectionId: string;
+      value: string;
+      disabled: boolean;
+      onChange: (value: string) => void;
+    }>
+  >;
   brokerCredentialSelector?: React.ComponentType<BrokerCredentialSelectorProps>;
   workflowFindingsScope?: React.ComponentType<
     Readonly<{

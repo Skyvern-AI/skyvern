@@ -306,6 +306,7 @@ async def test_signing_in_survives_a_reload_and_done_resumes_the_same_call_with_
                 "expires_at": None,
                 "host": "portal.example.com",
                 "browser_profile_id": None,
+                "site_question": None,
             }
             failed = await client.post("/credential-response", json={**body, "action": "signed_in"})
             assert failed.json()["result"] == "save_failed"

@@ -15,7 +15,7 @@ import uuid
 from asyncio.exceptions import CancelledError
 from collections.abc import Collection, Iterator
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Concatenate, Literal, NamedTuple, ParamSpec, Sequence, Tuple, cast
@@ -145,6 +145,7 @@ from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.base import get_download_retry_started_at
+from skyvern.forge.sdk.artifact.storage.unique_pdfs import ResponseComparison
 from skyvern.forge.sdk.browser_action_preflight import (
     observed_page,
     preflight_action,
@@ -201,8 +202,12 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.services.browser_session_artifacts import (
+    REDACTED_ARTIFACT,
+    TASK_V1_METADATA,
     browser_session_artifact_access,
     browser_session_artifact_system_read,
+    child_run_artifact_access,
+    redact_descendant_entity,
 )
 from skyvern.forge.sdk.services.credentials import parse_totp_config
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal, task_requester_id
@@ -250,7 +255,6 @@ from skyvern.forge.taskv3.run_arms import (
     APPLICATION_CONTEXT_FLAG,
     CARRY_REASONING_FLAG,
     DATE_SEGMENT_AIM_FLAG,
-    DEAD_END_RETURN_FLAG,
     LLM_ROUTE_FLAG,
     LOGIN_PACE_FLAG,
     TURN_DOM_FLAG,
@@ -682,6 +686,23 @@ _TASKV3_RESPONSE_MAX_CHARS = 500
 # A turn step write sits on the turn's critical path (the create precedes its model call), so a slow database
 # costs the run at most this per write instead of stalling it.
 _TASKV3_TURN_STEP_WRITE_TIMEOUT_SECONDS = 3
+_V3_SCREENSHOT_PAINT_TIMEOUT_SECONDS = 3
+_V3_SCREENSHOT_PAINT_PROBE_TIMEOUT_SECONDS = 0.5
+_V3_SCREENSHOT_PAINT_RUN_BUDGET_SECONDS = 6.0
+# Reuse the page probe's document nonce; it is diagnostic, not a security identity.
+_V3_SCREENSHOT_PAINTED_JS = """() => {
+    const documentId = window.__skyvern_doc_nonce ||= String(Math.random());
+    const body = document.body;
+    if (!body) return [documentId, false];
+    if (body.innerText.trim()) return [documentId, true];
+    for (const element of body.querySelectorAll('*')) {
+        const rect = element.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 &&
+            (!element.checkVisibility || element.checkVisibility({opacityProperty: true, visibilityProperty: true})))
+            return [documentId, true];
+    }
+    return [documentId, false];
+}"""
 
 
 def _taskv3_row_response(outcome: dict[str, Any]) -> str | None:
@@ -1408,6 +1429,7 @@ def recovery_credential_release_guard(
                 tested_url=tested_url,
                 vault_sites=workflow_run_context.bitwarden_login_sites.get(key),
                 enforce_vault_sites=enforce_vault_sites,
+                extra_site_urls=workflow_run_context.credential_extra_site_urls.get(key, ()),
             )
             if isinstance(fields, dict)
             else []
@@ -1922,6 +1944,107 @@ async def _settle_before_post_action_screenshot(browser_state: BrowserState) -> 
         await skyvern_frame.safe_wait_for_animation_end(caller="taskv3_post_action_artifact")
     except Exception:
         LOG.debug("task_v3 could not settle the page before the post-action screenshot", exc_info=True)
+
+
+@dataclass
+class _V3ScreenshotPaintState:
+    remaining_seconds: float
+    timed_out_documents: dict[Page, str] = field(default_factory=dict)
+
+
+async def _take_v3_post_action_screenshot(browser_state: BrowserState, state: _V3ScreenshotPaintState) -> bytes:
+    await _settle_before_post_action_screenshot(browser_state)
+
+    async def probe() -> tuple[Page | None, str | None, bool | None]:
+        if state.remaining_seconds <= 0:
+            return None, None, None
+        page: Page | None = None
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(min(_V3_SCREENSHOT_PAINT_PROBE_TIMEOUT_SECONDS, state.remaining_seconds)):
+                page = await browser_state.get_working_page(prune_excess_pages=False)
+                # shortcut: empty containers with a visible box can look painted; upgrade to pixel checks if needed.
+                if page is not None:
+                    document_id, painted = await page.evaluate(_V3_SCREENSHOT_PAINTED_JS)
+                    if painted:
+                        state.timed_out_documents.pop(page, None)
+                    return page, document_id, painted
+        except Exception as exc:
+            LOG.debug("task_v3 could not check post-action paint", exc_info=True)
+            if isinstance(exc, TimeoutError) or _is_transient_page_read_refusal(exc):
+                return page, None, False
+        finally:
+            state.remaining_seconds = max(0.0, state.remaining_seconds - (time.monotonic() - started))
+        return page, None, None
+
+    budget_before_probes = state.remaining_seconds
+    before_page, before_document, before_painted = await probe()
+    screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
+    page, document_id, painted = await probe()
+    probe_seconds = budget_before_probes - state.remaining_seconds
+    document_changed = (
+        before_document is not None
+        and document_id is not None
+        and (before_page is not page or before_document != document_id)
+    )
+    unpainted = before_painted is False or painted is False or document_changed
+    # shortcut: a timed-out document waits again only after paint, upgrade if same-document transitions need retries.
+    if (
+        not unpainted
+        or state.remaining_seconds <= 0
+        or (page is not None and document_id is not None and state.timed_out_documents.get(page) == document_id)
+    ):
+        return screenshot
+
+    wait_started = time.monotonic()
+    outcome = "painted"
+    try:
+        async with asyncio.timeout(min(_V3_SCREENSHOT_PAINT_TIMEOUT_SECONDS, state.remaining_seconds)):
+            while True:
+                try:
+                    page = await browser_state.get_working_page(prune_excess_pages=False)
+                    if page is not None:
+                        document_id, painted = await page.evaluate(_V3_SCREENSHOT_PAINTED_JS)
+                        if painted:
+                            state.timed_out_documents.pop(page, None)
+                            break
+                except Exception as exc:
+                    if not _is_transient_page_read_refusal(exc):
+                        raise
+                await asyncio.sleep(0.2)
+    except TimeoutError:
+        outcome = "timeout"
+        if page is not None and document_id is not None:
+            state.timed_out_documents[page] = document_id
+    except Exception:
+        outcome = "error"
+        LOG.debug("task_v3 could not wait for post-action paint", exc_info=True)
+    wait_seconds = time.monotonic() - wait_started
+    state.remaining_seconds = max(0.0, state.remaining_seconds - wait_seconds)
+
+    retry_seconds = 0.0
+    if outcome == "painted" and state.remaining_seconds > 0:
+        retry_started = time.monotonic()
+        try:
+            async with asyncio.timeout(min(_V3_SCREENSHOT_PAINT_TIMEOUT_SECONDS, state.remaining_seconds)):
+                screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
+        except Exception:
+            outcome = "retry_failed"
+            LOG.debug("task_v3 could not recapture post-action screenshot", exc_info=True)
+        finally:
+            retry_seconds = time.monotonic() - retry_started
+            state.remaining_seconds = max(0.0, state.remaining_seconds - retry_seconds)
+    elif outcome == "painted":
+        outcome = "budget_exhausted"
+    LOG.info(
+        "taskv3 post-action screenshot paint retry",
+        outcome=outcome,
+        probe_seconds=round(probe_seconds, 3),
+        wait_seconds=round(wait_seconds, 3),
+        retry_seconds=round(retry_seconds, 3),
+        budget_remaining_seconds=round(state.remaining_seconds, 3),
+    )
+    return screenshot
 
 
 def _task_v3_goal_check_redactor(task: Task, context: SkyvernContext | None) -> Callable[[str], str]:
@@ -3045,13 +3168,6 @@ class ForgeAgent:
             )
             await resolve_run_arm(
                 context,
-                DEAD_END_RETURN_FLAG,
-                distinct_id=task.workflow_run_id or task.task_id,
-                organization_id=task.organization_id,
-                forced=settings.TASK_V3_DEAD_END_RETURN,
-            )
-            await resolve_run_arm(
-                context,
                 APPLICATION_CONTEXT_FLAG,
                 distinct_id=task.workflow_run_id or task.task_id,
                 organization_id=task.organization_id,
@@ -3589,6 +3705,7 @@ class ForgeAgent:
         v3_persisted_actions: list[Action] = []
         v3_round_index = 0
         v3_round_billed = False
+        v3_screenshot_paint_state = _V3ScreenshotPaintState(remaining_seconds=_V3_SCREENSHOT_PAINT_RUN_BUDGET_SECONDS)
 
         def _close_v3_action_round() -> None:
             nonlocal v3_round_index, v3_round_billed
@@ -3714,8 +3831,7 @@ class ForgeAgent:
                 # A tool call returns as soon as the page accepts it, so a navigating click leaves this
                 # capture racing the next paint and it lands on a blank page (SKY-18163). Settle first,
                 # bounded, the way the step engine's own post-action capture does.
-                await _settle_before_post_action_screenshot(browser_state)
-                screenshot = await browser_state.take_post_action_screenshot(scrolling_number=0)
+                screenshot = await _take_v3_post_action_screenshot(browser_state, v3_screenshot_paint_state)
                 screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_artifact(
                     step=v3_turn_step or step, artifact_type=ArtifactType.SCREENSHOT_ACTION, data=screenshot
                 )
@@ -10618,17 +10734,25 @@ class ForgeAgent:
             workflow_run_id=task.workflow_run_id,
             runnable_ids=[task.task_id],
         )
+        child_access = (
+            await child_run_artifact_access(task.organization_id, task.workflow_run_id)
+            if task.workflow_run_id
+            else access
+        )
+        descendant_denied = bool(task.workflow_run_id and not child_access.allowed)
+        if descendant_denied:
+            access = child_access
+            if failure_reason is not None:
+                failure_reason = REDACTED_ARTIFACT
         artifacts_accessible = access.allowed
         # no last step means the task didn't start, so we don't have any other artifacts
         if last_step is None:
-            if not artifacts_accessible:
-                task = task.model_copy(
-                    update={"extracted_information": access.redact_output(task.extracted_information)}
-                )
+            if descendant_denied:
+                task = redact_descendant_entity(task, preserve=TASK_V1_METADATA)
             response = task.to_task_response(failure_reason=failure_reason, step_count=step_count)
             if not artifacts_accessible:
                 response.errors = task.errors
-            return response
+            return access.redact_output(response)
 
         screenshot_url = None
         recording_url = None
@@ -10695,12 +10819,16 @@ class ForgeAgent:
                 latest_action_screenshot_urls = filtered_urls if filtered_urls else None
 
         if artifacts_accessible and task.organization_id:
+            download_run_id = (
+                resolve_run_download_id(skyvern_context.current(), fallback_run_id=task.workflow_run_id) or task.task_id
+            )
+            # Listing and the PDF comparison share one download budget instead of each getting a full one.
+            comparison = ResponseComparison()
             try:
-                async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
-                    context = skyvern_context.current()
+                async with asyncio.timeout_at(comparison.deadline):
                     downloaded_files = await app.STORAGE.get_downloaded_files(
                         organization_id=task.organization_id,
-                        run_id=resolve_run_download_id(context, fallback_run_id=task.workflow_run_id) or task.task_id,
+                        run_id=download_run_id,
                     )
             except asyncio.TimeoutError:
                 LOG.warning(
@@ -10714,6 +10842,10 @@ class ForgeAgent:
                     exc_info=True,
                     task_id=task.task_id,
                     workflow_run_id=task.workflow_run_id,
+                )
+            if downloaded_files and len(downloaded_files) > 1:
+                downloaded_files = await app.WORKFLOW_SERVICE.unique_task_pdf_file_infos(
+                    downloaded_files, task, download_run_id, comparison
                 )
 
         if need_browser_log and artifacts_accessible:
@@ -10731,13 +10863,7 @@ class ForgeAgent:
             LOG.error("Failed to get task from db when sending task response")
             raise TaskNotFound(task_id=task.task_id)
 
-        task = (
-            task_from_db
-            if artifacts_accessible
-            else task_from_db.model_copy(
-                update={"extracted_information": access.redact_output(task_from_db.extracted_information)}
-            )
-        )
+        task = redact_descendant_entity(task_from_db, preserve=TASK_V1_METADATA) if descendant_denied else task_from_db
         response = task.to_task_response(
             action_screenshot_urls=latest_action_screenshot_urls,
             screenshot_url=screenshot_url,
@@ -10750,7 +10876,7 @@ class ForgeAgent:
         )
         if not artifacts_accessible:
             response.errors = task.errors
-        return response
+        return access.redact_output(response)
 
     async def cleanup_browser_and_create_artifacts(
         self,

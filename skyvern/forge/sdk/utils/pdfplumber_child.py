@@ -5,44 +5,27 @@ import io
 from typing import Any
 
 import pdfplumber
+from pdfplumber.page import Page
 
-from skyvern.forge.sdk.utils.capped_subprocess_child import ResultTooLarge
+from skyvern.forge.sdk.utils.capped_subprocess_child import collect_texts
 
 
 class PageImagesTooLarge(Exception):
     pass
 
 
-# Room kept under the result cap for the rest of the pickle: the page count, the flag and framing.
-_RESULT_MARGIN_BYTES = 1024 * 1024
-# What pickling a str adds to its UTF-8 bytes, rounded up.
-_PAGE_OVERHEAD_BYTES = 16
+def _page_text(page: Page) -> str:
+    text = page.extract_text() or ""
+    page.close()
+    return text
 
 
 def page_texts(file_path: str, char_limit: int | None, max_bytes: int) -> tuple[list[str], int, bool]:
-    """Return the page texts in order, the page count, and whether every page was read. Reading stops once char_limit
-    characters are collected, or before a page that would push the pickled texts past max_bytes less a margin, and a
-    first page that does not fit is a result that is too large."""
-    budget = max_bytes - min(_RESULT_MARGIN_BYTES, max_bytes // 2)
-    texts: list[str] = []
-    chars = 0
-    pickled_bytes = 0
+    """Return the page texts in order, the page count, and whether every page was read, within collect_texts'
+    limits."""
     with pdfplumber.open(file_path) as pdf:
-        page_count = len(pdf.pages)
-        for page in pdf.pages:
-            if char_limit is not None and chars > char_limit:
-                return texts, page_count, False
-            page_text = page.extract_text() or ""
-            page.close()
-            utf8_bytes = len(page_text) if page_text.isascii() else len(page_text.encode("utf-8", "surrogatepass"))
-            if pickled_bytes + utf8_bytes + _PAGE_OVERHEAD_BYTES > budget:
-                if not texts:
-                    raise ResultTooLarge("the text of the first page passes the limit on page texts")
-                return texts, page_count, False
-            texts.append(page_text)
-            chars += len(page_text)
-            pickled_bytes += utf8_bytes + _PAGE_OVERHEAD_BYTES
-    return texts, page_count, True
+        texts, read_every_page = collect_texts(pdf.pages, _page_text, char_limit, max_bytes)
+        return texts, len(pdf.pages), read_every_page
 
 
 def page_count(file_path: str) -> int:

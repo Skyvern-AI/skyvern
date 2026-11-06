@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from skyvern.cli.core.session_manager import RequestFailureLog
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.browser_ablation import CopilotEvalMode, CopilotToolSurfaceIdentity
+    from skyvern.forge.sdk.copilot.build_test_connect_failure import BuildTestConnectFailure
     from skyvern.forge.sdk.copilot.build_test_outcome import RecordedBuildTestOutcome
     from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
@@ -117,17 +118,26 @@ class PreRunPageReference:
     workflow_run_id: str
 
 
+RegisteredDownloadTextError: TypeAlias = Literal["unavailable", "parse_failed", "parse_timeout", "not_utf8"]
+
+
 @dataclass(frozen=True)
 class RegisteredArtifactEntry:
     artifact_id: str
-    file_name: str
-    parsed_text: str
+    file_name: str | None
+    text: str | None = None
+    page_count: int | None = None
+    char_count: int | None = None
+    truncated: bool | None = None
+    text_layer_problem: str | None = None
+    error: RegisteredDownloadTextError | None = None
 
 
 @dataclass(frozen=True)
 class RegisteredArtifactEvidence:
     entries: tuple[RegisteredArtifactEntry, ...]
     workflow_run_id: str
+    omission_notices: tuple[str, ...] = ()
 
 
 class ScoutedEquivalentInput(TypedDict):
@@ -342,6 +352,7 @@ class AgentContext:
     # Whether the session this turn lost was ended by the deadline its infrastructure fixes, rather
     # than by an unexplained browser failure. Reported to the model and the user as the cause.
     browser_session_continuity_deadline_expired: bool = False
+    browser_session_continuity_acquisition_failure: BuildTestConnectFailure | None = None
     # Each unsolved challenge solve can bill an external solver, so it is counted per browser session.
     unsolved_page_challenges_by_session_id: dict[str, int] = field(default_factory=dict)
     image_captcha_reads: int = 0

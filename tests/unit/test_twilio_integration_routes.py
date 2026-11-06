@@ -1283,7 +1283,9 @@ async def test_login_route_parameters_reach_converter(
         run_blocks,
         "app",
         SimpleNamespace(
-            WORKFLOW_SERVICE=workflow_service, RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock())
+            WORKFLOW_SERVICE=workflow_service,
+            RATE_LIMITER=SimpleNamespace(rate_limit_submit_run=AsyncMock()),
+            AGENT_FUNCTION=SimpleNamespace(enforce_platform_bitwarden_item_ownership=AsyncMock(return_value=False)),
         ),
     )
     run_result = object()
@@ -1410,6 +1412,7 @@ def test_password_response_exposes_seed_presence_without_secret() -> None:
         auto_profile_disabled=False,
         pin_saved_session_ip=False,
         tested_url=None,
+        extra_site_urls=[],
         user_context=None,
         save_browser_session_intent=False,
         run_sequentially=False,

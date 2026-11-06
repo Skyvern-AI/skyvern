@@ -558,6 +558,7 @@ class _ListedCredential:
         self.credential_id = credential_id
         self.name = name
         self.tested_url = tested_url
+        self.extra_site_urls: list[str] = []
         self.credential_type = "password"
         self.username = None
         self.totp_type = None

@@ -76,6 +76,20 @@ async def test_decrypt_secret_field_value_round_trips(enabled_encryption: None) 
 
 
 @pytest.mark.asyncio
+async def test_decrypt_failures_are_indistinguishable(enabled_encryption: None) -> None:
+    encrypted = await encrypt_secret_field_value("hunter2", organization_id="o_a", field_name="sftp_password")
+    assert encrypted is not None
+    tampered = encrypted[:-4] + ("AAAA" if not encrypted.endswith("AAAA") else "BBBB")
+    errors = []
+    for value in ("plain text, never encrypted", tampered, f"{ENCRYPTED_SECRET_PREFIX}aesgcm-v1:not-base64!"):
+        with pytest.raises(ValueError) as excinfo:
+            await decrypt_secret_field_value(value, organization_id="o_a", field_name="sftp_password")
+        assert excinfo.value.__cause__ is None
+        errors.append(str(excinfo.value))
+    assert len(set(errors)) == 1
+
+
+@pytest.mark.asyncio
 async def test_encrypted_secret_cannot_move_to_another_field(enabled_encryption: None) -> None:
     plaintext = "field-binding-test-value"
     encrypted = await encrypt_secret_field_value(

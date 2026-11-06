@@ -75,9 +75,12 @@ from skyvern.forge.sdk.schemas.task_v2 import (
 )
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.services.browser_session_artifacts import (
+    TASK_V2_METADATA,
+    THOUGHT_METADATA,
     browser_session_artifact_access,
     browser_session_artifact_system_read,
     child_run_artifact_access,
+    redact_descendant_entity,
 )
 from skyvern.forge.sdk.services.request_principal import RequestPrincipal
 from skyvern.forge.sdk.trace import traced
@@ -2487,7 +2490,7 @@ async def _generate_goto_url_task(
 
 
 async def get_thought_timelines(
-    *, task_v2_id: str, organization_id: str, cap_output_values: bool = False
+    *, task_v2_id: str, organization_id: str, cap_output_values: bool = False, workflow_run_id: str | None = None
 ) -> list[WorkflowRunTimeline]:
     thoughts = await app.DATABASE.observer.get_thoughts(
         task_v2_id=task_v2_id,
@@ -2498,19 +2501,29 @@ async def get_thought_timelines(
         ],
     )
     if thoughts:
-        workflow_run_id = next((thought.workflow_run_id for thought in thoughts if thought.workflow_run_id), None)
+        run_ids = {thought.workflow_run_id for thought in thoughts if thought.workflow_run_id}
+        if workflow_run_id:
+            run_ids.add(workflow_run_id)
+        if not run_ids:
+            task_v2 = await app.DATABASE.observer.get_task_v2(task_v2_id, organization_id=organization_id)
+            if task_v2 and task_v2.workflow_run_id:
+                run_ids.add(task_v2.workflow_run_id)
         access = await browser_session_artifact_access(
             organization_id,
-            workflow_run_id=workflow_run_id,
+            workflow_run_id=workflow_run_id or next(iter(run_ids), None),
             runnable_ids=[task_v2_id],
             include_run_tasks=True,
         )
-        if access.allowed and workflow_run_id:
-            access = await child_run_artifact_access(organization_id, workflow_run_id)
-        if not access.allowed:
-            thoughts = [
-                thought.model_copy(update={"output": access.redact_output(thought.output)}) for thought in thoughts
-            ]
+        descendant_denied = any(
+            not access.allowed
+            for access in await asyncio.gather(
+                *(child_run_artifact_access(organization_id, run_id) for run_id in run_ids)
+            )
+        )
+        if descendant_denied:
+            thoughts = [redact_descendant_entity(thought, preserve=THOUGHT_METADATA) for thought in thoughts]
+        elif not access.allowed:
+            thoughts = [access.redact_output(thought) for thought in thoughts]
     if cap_output_values:
         # A thought's generated text and structured output ride this response beside
         # block outputs and are rendered directly by the run-detail UI.
@@ -3217,11 +3230,17 @@ async def build_task_v2_run_response(task_v2: TaskV2, cap_output_values: bool = 
         workflow_run_id=task_v2.workflow_run_id,
         runnable_ids=[task_v2.observer_cruise_id],
     )
-    artifacts_accessible = access.allowed
-    output = access.redact_output(task_v2.output)
-    if access.allowed and task_v2.workflow_run_id:
-        child_access = await child_run_artifact_access(task_v2.organization_id, task_v2.workflow_run_id)
-        output = child_access.redact_output(output)
+    descendant_denied = bool(
+        task_v2.workflow_run_id
+        and not (await child_run_artifact_access(task_v2.organization_id, task_v2.workflow_run_id)).allowed
+    )
+    artifacts_accessible = access.allowed and not descendant_denied
+    task_v2 = (
+        redact_descendant_entity(task_v2, preserve=TASK_V2_METADATA)
+        if descendant_denied
+        else access.redact_output(task_v2)
+    )
+    output = task_v2.output
 
     app_url = None
     if task_v2.workflow_run_id:

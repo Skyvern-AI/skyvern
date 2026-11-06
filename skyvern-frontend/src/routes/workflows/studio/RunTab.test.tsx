@@ -12,6 +12,8 @@ import {
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ProxyLocation, Status } from "@/api/types";
+import { useWorkflowPresentationStore } from "@/store/WorkflowPresentationStore";
+import { useDocRunStore } from "../editor/doc/docRunStore";
 import { RunTab } from "./RunTab";
 
 const { runsQueryMock, workflowRunQueryMock } = vi.hoisted(() => ({
@@ -33,6 +35,7 @@ vi.mock("./runview/RunView", () => ({
     onRetry?: () => void;
     milestoneRerun?: Readonly<{ to: string; state?: unknown }>;
     runIdPending?: boolean;
+    mirrorSelectionToUrl?: boolean;
   }) => (
     <div
       data-testid="runview"
@@ -41,6 +44,9 @@ vi.mock("./runview/RunView", () => ({
       data-milestone-rerun-to={props.milestoneRerun?.to}
       data-milestone-rerun-state={String(props.milestoneRerun?.state)}
       data-run-id-pending={props.runIdPending ? "yes" : "no"}
+      data-mirror-selection={
+        props.mirrorSelectionToUrl === false ? "no" : "yes"
+      }
     >
       {props.onRetry ? (
         <button type="button" onClick={props.onRetry}>
@@ -289,5 +295,42 @@ describe("RunTab run-id resolution", () => {
     expect(
       screen.getByTestId("runview").getAttribute("data-run-id-pending"),
     ).toBe("yes");
+  });
+});
+
+describe("RunTab selection mirroring behind the Doc", () => {
+  afterEach(() => {
+    useWorkflowPresentationStore.setState({
+      enabled: false,
+      presentation: "visual",
+    });
+    useDocRunStore.setState({ mounted: false });
+  });
+  const mirror = () =>
+    screen.getByTestId("runview").getAttribute("data-mirror-selection");
+
+  test("keeps the closed Run pane's selection out of the URL while the Doc is open", () => {
+    useWorkflowPresentationStore.setState({
+      enabled: true,
+      presentation: "doc",
+    });
+    useDocRunStore.setState({ mounted: true });
+    renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
+    expect(mirror()).toBe("no");
+  });
+
+  test("mirrors as before when the Run pane is open or the editor is Visual", () => {
+    useWorkflowPresentationStore.setState({
+      enabled: true,
+      presentation: "doc",
+    });
+    useDocRunStore.setState({ mounted: true });
+    renderAt("/workflows/wpid_abc/studio?panes=overview,editor");
+    expect(mirror()).toBe("yes");
+    cleanup();
+    useWorkflowPresentationStore.setState({ presentation: "visual" });
+    useDocRunStore.setState({ mounted: false });
+    renderAt("/workflows/wpid_abc/studio?panes=copilot,editor");
+    expect(mirror()).toBe("yes");
   });
 });

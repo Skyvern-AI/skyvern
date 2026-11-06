@@ -254,6 +254,7 @@ async def test_current_page_inspection_finalizes_runtime_repair_context_for_next
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = _ctx()
+    ctx.browser_session_id = "pbs_current"
     ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     run_execution_module._record_run_blocks_result(
         ctx,
@@ -739,6 +740,7 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
 ) -> None:
     login_url = "https://analytics.example.test/login?next=%2Fweb"
     ctx = _ctx()
+    ctx.browser_session_id = "pbs_current"
 
     async def fallback_page_info(_ctx: CopilotContext, _session_id_override: str | None = None) -> tuple[str, str]:
         return login_url, "Sign in"
@@ -777,6 +779,7 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
             credential_id="cred_analytics",
             name="analytics",
             tested_url="https://analytics.example.test/login",
+            extra_site_urls=[],
             credential_type=CredentialType.PASSWORD,
             totp_type=TotpType.NONE,
         )

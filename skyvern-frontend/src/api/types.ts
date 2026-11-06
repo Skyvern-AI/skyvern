@@ -1136,6 +1136,7 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  created_at?: string | null;
   // On the base Action, so it survives the timeline's `list[Action]` serialization. Subclass-only
   // fields (url, keys) do not and must not be declared here.
   file_name?: string | null;
@@ -1252,6 +1253,8 @@ export type CredentialApiResponse = {
   auto_profile_disabled?: boolean | null;
   pin_saved_session_ip?: boolean | null;
   tested_url?: string | null;
+  // More sites this login signs in on, each covering its whole site.
+  extra_site_urls?: string[] | null;
   user_context?: string | null;
   save_browser_session_intent?: boolean | null;
   run_sequentially?: boolean | null;

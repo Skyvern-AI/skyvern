@@ -16,6 +16,11 @@ from skyvern.forge.sdk.routes.pagination import MAX_INT4, MAX_PAGE, MAX_PAGE_SIZ
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
+from skyvern.forge.sdk.services.browser_session_artifacts import (
+    browser_session_artifact_read,
+    redact_workflow_run_artifact_rows,
+)
+from skyvern.forge.sdk.services.request_principal import get_request_principal
 from skyvern.schemas.scripts import (
     ClearCacheResponse,
     CreateScriptRequest,
@@ -1090,18 +1095,21 @@ async def get_script_runs(
         created_before=created_before,
     )
 
+    summaries = [
+        ScriptRunSummary(
+            workflow_run_id=r.workflow_run_id,
+            status=r.status or "unknown",
+            started_at=r.started_at,
+            finished_at=r.finished_at,
+            created_at=r.created_at,
+            failure_reason=r.failure_reason,
+        )
+        for r in runs
+    ]
+    with browser_session_artifact_read(get_request_principal()):
+        summaries = await redact_workflow_run_artifact_rows(summaries, organization_id)
     return ScriptRunsResponse(
-        runs=[
-            ScriptRunSummary(
-                workflow_run_id=r.workflow_run_id,
-                status=r.status or "unknown",
-                started_at=r.started_at,
-                finished_at=r.finished_at,
-                created_at=r.created_at,
-                failure_reason=r.failure_reason,
-            )
-            for r in runs
-        ],
+        runs=summaries,
         total_count=total_count,
         status_counts=status_counts,
         avg_fallbacks_per_run=avg_fallbacks_per_run,

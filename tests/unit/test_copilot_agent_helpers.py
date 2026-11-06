@@ -74,6 +74,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     BROWSER_SESSION_LOST_BLOCKER_REASON_CODE,
     CopilotToolBlockerSignal,
 )
+from skyvern.forge.sdk.copilot.build_test_connect_failure import build_test_connect_failure_sentence
 from skyvern.forge.sdk.copilot.build_test_outcome import (
     ACTION_TRACE_PER_TASK_LIMIT,
     BuildTestConnectFailure,
@@ -107,6 +108,7 @@ from skyvern.forge.sdk.copilot.context import (
     CodeAuthoringRepairContext,
     CopilotContext,
 )
+from skyvern.forge.sdk.copilot.credential_pause import SiteAnswer
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
     DiagnosisInput,
@@ -727,6 +729,59 @@ class TestFailedTestResponseNormalization:
             "Keep the draft to iterate on, or discard."
         )
 
+    def test_browser_start_capacity_refusal_reports_its_facts_and_never_claims_a_test_ran(self) -> None:
+        refusal = BuildTestConnectFailure(
+            state="browser_start_capacity",
+            starting_sessions=12,
+            max_starting_sessions=10,
+            retry_after_seconds=17,
+        )
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_failure_category_top="UNRECOVERABLE_TOOL_ERROR",
+            last_test_failure_reason=build_test_connect_failure_sentence(refusal),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                connect_failure=refusal,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        for fact in ("12", "10", "17"):
+            assert fact in rewritten
+        assert "I tested the draft" not in rewritten
+
+    def test_a_browser_lost_after_the_run_started_never_claims_the_draft_was_tested(self) -> None:
+        lost = BuildTestConnectFailure(state="provisioning_unavailable", workflow_run_id="wr_lost")
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_test_run_started=True,
+            last_test_failure_reason=build_test_connect_failure_sentence(lost),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                workflow_run_id="wr_lost",
+                connect_failure=lost,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        assert build_test_connect_failure_sentence(lost) in rewritten
+        assert "I tested the draft" not in rewritten
+
     def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
         ctx = _challenge_failure_ctx()
         ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
@@ -773,11 +828,6 @@ class TestFailedTestResponseNormalization:
         ("branch", "lead"),
         [
             (
-                "credentials_unbound",
-                "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-                "the required credentials. Add them in Credentials, then I can try again.",
-            ),
-            (
                 "billing",
                 "I couldn't start a test. Build test did not start because credits are exhausted. "
                 "No browser or run started. Upgrade your plan in Billing. The draft is untested.",
@@ -802,10 +852,7 @@ class TestFailedTestResponseNormalization:
             last_test_failure_reason="Login rejected.",
             last_test_proxy_owned_failure=True,
         )
-        if branch == "credentials_unbound":
-            ctx.last_test_ok = None
-            ctx.request_policy = RequestPolicy(clarification_reason="workflow_credential_inputs_unbound")
-        elif branch == "billing":
+        if branch == "billing":
             ctx.latest_recorded_build_test_outcome = RecordedBuildTestOutcome(
                 phase="persisted_block_run",
                 attempted_tool="update_and_run_blocks",
@@ -1089,16 +1136,22 @@ workflow_definition:
         assert verdict.reason_codes == []
 
     @pytest.mark.parametrize(
-        ("card", "expected"),
+        ("card", "site_answer", "expected"),
         [
-            ("skipped", "You chose not to connect a saved credential"),
-            ("timeout", "The credential card went unanswered"),
-            ("declined", "The credential card could not be shown"),
-            ("not_admitted", "saved for a different site"),
+            ("skipped", None, "You chose not to connect a saved credential"),
+            ("timeout", None, "The credential card went unanswered"),
+            ("declined", None, "The credential card could not be shown"),
+            ("not_admitted", None, "saved for a different site"),
+            (
+                "not_admitted",
+                SiteAnswer("no", "https://a.example.com", "https://b.example.com"),
+                "You chose not to use",
+            ),
+            ("not_admitted", SiteAnswer("add", "https://a.example.com", "https://b.example.com"), "a different site"),
         ],
     )
     def test_rewrite_states_why_no_credential_connected_on_a_redacted_secret_draft(
-        self, card: str, expected: str
+        self, card: str, site_answer: SiteAnswer | None, expected: str
     ) -> None:
         ctx = _ctx(
             last_workflow=object(),
@@ -1106,6 +1159,7 @@ workflow_definition:
             last_update_block_count=2,
             last_test_ok=None,
             credential_pause_outcome=card,
+            credential_pause_site_answer=site_answer,
             request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
         )
 
@@ -1166,26 +1220,6 @@ workflow_definition:
 
         assert _should_surface_untested_draft_despite_question(ctx, "ASK_QUESTION") is True
         assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
-
-    def test_rewrite_uses_credential_framing_when_policy_flags_unbound_inputs(self) -> None:
-        ctx = _ctx(
-            last_workflow=object(),
-            last_workflow_yaml="title: drafted",
-            last_update_block_count=12,
-            last_test_ok=None,
-            request_policy=RequestPolicy(
-                clarification_reason="workflow_credential_inputs_unbound",
-                allow_run_blocks=False,
-                allow_missing_credentials_in_draft=True,
-            ),
-        )
-        rewritten = _rewrite_failed_test_response("agent text", ctx)
-
-        assert rewritten == (
-            "I applied your requested change as a draft, but I couldn't test it because I couldn't find "
-            "the required credentials. Add them in Credentials, then I can try again. agent text "
-            "Keep the draft to iterate on, or discard."
-        )
 
     def test_runtime_repair_context_prompt_exposes_literal_page_location(self) -> None:
         repair_context = CodeAuthoringRepairContext(
@@ -1368,8 +1402,9 @@ workflow_definition:
         prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
 
         assert "select_option timed out" in prompt
-        assert "browser_acquisition_failed:" in prompt
-        assert "cdp_connect_failed" in prompt
+        sentence = build_test_connect_failure_sentence(BuildTestConnectFailure(state="cdp_connect_failed"))
+        assert len(sentence) > 160
+        assert f"browser_acquisition_failed: {sentence}" in prompt
 
     def test_recorded_build_test_outcome_prompt_says_what_to_do_about_an_occupied_browser(self) -> None:
         """The bare state does not say what to do. The occupying run id stays out of prompt text, and
@@ -3074,7 +3109,11 @@ workflow_definition:
         assert isinstance(captured["persisted_yaml"], str)
         assert captured["persisted_yaml"].replace('"#amount"', '"#total"') == workflow_yaml
         assert ctx.workflow_yaml == captured["persisted_yaml"], "a failed run must retain the edited draft"
-        assert captured["run_params"] == {"block_labels": ["read_total"], "parameters": {}}
+        assert captured["run_params"] == {
+            "block_labels": ["read_total"],
+            "parameters": {},
+            "run_every_loop_iteration": False,
+        }
 
     @pytest.mark.asyncio
     async def test_unbound_credentials_persist_draft_and_skip_run(self, monkeypatch) -> None:

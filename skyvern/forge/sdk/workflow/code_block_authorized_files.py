@@ -451,10 +451,14 @@ class BlockDownloadLog:
         The same equivalence the registered rows are matched under: whatever spelling can select a row must
         also count as a collision here, or a sibling's row could be taken as the claim's own.
         """
-        names = _download_name_spellings(download)
+        return self.shares_name_with(*_download_name_spellings(download), excluding=download)
+
+    def shares_name_with(self, *names: str, excluding: DownloadLike | None = None) -> bool:
+        """True when any download this block started, other than ``excluding``, could own a row registered
+        under one of ``names``."""
         patterns = [_registered_row_pattern(name) for name in names]
         for other in self._downloads:
-            if other is download:
+            if other is excluding:
                 continue
             other_names = _download_name_spellings(other)
             if any(pattern.fullmatch(other_name) for pattern in patterns for other_name in other_names):
@@ -613,7 +617,7 @@ def _write_private_copy(run_directory: Path, content: bytes) -> Path:
 
 
 async def _materialize_registered_download(
-    download: DownloadLike,
+    spellings: tuple[str, ...],
     registered: RegisteredDownloadSource,
     *,
     run_directory: Path,
@@ -632,7 +636,7 @@ async def _materialize_registered_download(
     if baseline is None:
         raise refuse("refused_registration_baseline_unreadable")
     # Matched under every spelling a writer could have used: an extra match is ambiguity, which refuses.
-    collision_patterns = [_registered_row_pattern(name) for name in _download_name_spellings(download)]
+    collision_patterns = [_registered_row_pattern(name) for name in spellings]
     matches: list[FileInfo] = []
     unreadable = False
     probe_timeouts = 0
@@ -792,7 +796,7 @@ async def capture_claimed_download(
                 raise AuthorizedFileAccessError(AUTHORIZED_FILE_UNAVAILABLE_ERROR)
             from_registered_artifact = True
             settled = await _materialize_registered_download(
-                download,
+                _download_name_spellings(download),
                 registered,
                 run_directory=run_directory,
                 max_bytes=max_bytes,
@@ -834,6 +838,66 @@ async def capture_claimed_download(
                 await asyncio.to_thread(shutil.rmtree, private_copy)
         raise
     decide("authorized_registered_artifact" if from_registered_artifact else "authorized")
+    return materialized
+
+
+async def capture_registered_download(
+    name: str,
+    *,
+    registered: RegisteredDownloadSource,
+    download_root: str | Path,
+    download_run_id: str,
+    organization_id: str | None,
+    max_bytes: int,
+    download_log: BlockDownloadLog | None,
+) -> MaterializedAuthorizedFile:
+    """Capture the one DOWNLOAD artifact registered under ``name`` after the claim's baseline, for a claim
+    whose binding delivered the file without a Download event reaching the page."""
+    run_directory = _run_directory(download_root, download_run_id)
+    decision: dict[str, str | bool | int | None] = {
+        "download_run_id": download_run_id,
+        "organization_id": organization_id,
+        "registered_name_fp": diagnostic_fingerprint(name),
+    }
+
+    def decide(outcome: str) -> None:
+        LOG.info("codeblock.download_authorize_decision", outcome=outcome, **decision)
+
+    # As in capture_claimed_download: a row carries no link to a Download, so any same-name download the
+    # block started could own the row this claim finds.
+    if download_log is None:
+        decide("refused_no_download_log")
+        raise AuthorizedFileAccessError(AUTHORIZED_FILE_UNAVAILABLE_ERROR)
+    if download_log.shares_name_with(name):
+        decide("refused_same_name_download_in_block")
+        raise AuthorizedFileAccessError(AUTHORIZED_FILE_UNAVAILABLE_ERROR)
+    settled = await _materialize_registered_download(
+        (name,),
+        registered,
+        run_directory=run_directory,
+        max_bytes=max_bytes,
+        deadline=asyncio.get_running_loop().time() + SAVE_DOWNLOADED_FILES_TIMEOUT,
+        decision=decision,
+        decide=decide,
+    )
+    try:
+        materialized = await asyncio.to_thread(
+            capture_authorized_file,
+            settled,
+            download_root=download_root,
+            workflow_run_id=download_run_id,
+            organization_id=organization_id,
+            max_bytes=max_bytes,
+            filename=name,
+        )
+        if download_log.shares_name_with(name):
+            decide("refused_same_name_download_during_capture")
+            raise AuthorizedFileAccessError(AUTHORIZED_FILE_UNAVAILABLE_ERROR)
+    except BaseException:
+        with suppress(OSError):
+            await asyncio.to_thread(shutil.rmtree, settled.parent)
+        raise
+    decide("authorized_registered_name")
     return materialized
 
 
@@ -975,6 +1039,7 @@ def bind_inline_attach_authorized_file(
     registered_downloads: RegisteredDownloadSource | None = None,
     file_chooser: FileChooserPins | None = None,
     deadline: float | None = None,
+    inherited_files: frozenset[tuple[str, int, int, int]] | None = None,
 ) -> InlineAttach:
     authorized_by_path = {
         inline_authorized_file_path(item, download_root=download_root): item
@@ -992,7 +1057,8 @@ def bind_inline_attach_authorized_file(
         locate = partial(page_locator, expected_page)
 
     download_key = download_run_id or workflow_run_id
-    inherited_files = run_directory_entry_identities(download_root, download_key)
+    if inherited_files is None:
+        inherited_files = run_directory_entry_identities(download_root, download_key)
     # One capture per claimed download: a block can attach the same download to several inputs, and the
     # registered-artifact path writes a private copy each time it runs. Identity keeps the list short and
     # exact; redemption re-verifies the copy on every attach, as it does for a file_url.

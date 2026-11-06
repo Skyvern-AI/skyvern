@@ -38,7 +38,11 @@ import {
   useCallback,
   memo,
 } from "react";
-import type { AxiosInstance, AxiosRequestConfig } from "axios";
+import {
+  isAxiosError,
+  type AxiosInstance,
+  type AxiosRequestConfig,
+} from "axios";
 import { getClient, deleteUploadedFileOnPageExit } from "@/api/AxiosClient";
 import { queryClient } from "@/api/QueryClient";
 import {
@@ -128,6 +132,8 @@ import {
   WorkflowCopilotCredentialGenerateResult,
   WorkflowCopilotCredentialResponseResult,
   WorkflowCopilotCredentialPauseResolvedUpdate,
+  CredentialSiteAnswer,
+  CredentialSiteQuestion,
   WorkflowCopilotDemonstrationInsertion,
   WorkflowCopilotTitleUpdate,
   WorkflowCopilotChatSender,
@@ -426,6 +432,8 @@ const RECOVERY_POLL_BUDGET_MS = 1_500_000;
 const CANONICAL_READ_TIMEOUT_MS = 5_000;
 // Matches the server's MANUAL_SIGN_IN_CLAIM_SECONDS, which bounds a Generate and save.
 const REGISTRATION_SAVE_WINDOW_MS = 120_000;
+// Silence after dictated speech that ends one spoken demonstration note.
+const DICTATED_NOTE_PAUSE_MS = 1_500;
 const REGISTRATION_SAVE_POLL_MS = 2_000;
 const INTERRUPTED_TERMINAL_REASON = "interrupted";
 // Taking the Copilot lock under a save, YAML commit or Accept would toast.
@@ -721,6 +729,7 @@ const ATTACHMENT_EXTENSIONS = [
   ".xlsx",
   ".xls",
   ".pdf",
+  ".docx",
   ".png",
   ".jpg",
   ".jpeg",
@@ -1067,20 +1076,28 @@ function autoBoundReceiptFor(
   return credentialCardFrameFor(turn) ? null : turn.credentialAutoBound;
 }
 
-// The persisted credentialPause carries no name, so a tab that received the live
-// credential_pause_resolved frame names the receipt from it.
 function historicalCredentialOutcome(
   pause: TurnNarrativeState["credentialPause"],
   pauseCardResolutions: Record<string, CredentialPauseHistorical>,
 ): CredentialPauseHistorical | undefined {
   if (!pause || pause.outcome === "declined") return undefined;
   const credentialId = pause.credentialId ?? undefined;
-  const name = credentialId
-    ? Object.values(pauseCardResolutions).find(
-        (resolution) => resolution.credentialId === credentialId,
-      )?.name
-    : undefined;
-  return { outcome: pause.outcome, credentialId, name };
+  const name =
+    pause.name ??
+    (credentialId
+      ? Object.values(pauseCardResolutions).find(
+          (resolution) => resolution.credentialId === credentialId,
+        )?.name
+      : undefined);
+  return {
+    outcome: pause.outcome,
+    credentialId,
+    name,
+    siteAnswer: pause.siteAnswer,
+    siteA: pause.siteA,
+    siteB: pause.siteB,
+    savedSites: pause.savedSites,
+  };
 }
 
 type CredentialResolution = CredentialPauseHistorical & {
@@ -1795,6 +1812,9 @@ export function WorkflowCopilotChat({
     setAutoAccept(value);
   };
   const [inputValue, setInputValue] = useState("");
+  const lastDictatedTextRef = useRef("");
+  const takenNoteTextRef = useRef<string | null>(null);
+  const addDemonstrationNoteRef = useRef<() => Promise<void>>(async () => {});
   // The prompt being written when a question arrived. It waits here while the composer answers
   // the question, so neither text can land in the other's place.
   const [promptHeldForQuestion, setPromptHeldForQuestion] = useState("");
@@ -1895,6 +1915,14 @@ export function WorkflowCopilotChat({
   // Live pause answers keyed by resume_token: one turn can raise a pick card and then an update card.
   const [pauseCardResolutions, setPauseCardResolutions] = useState<
     Record<string, CredentialResolution>
+  >({});
+  // Per resume token: the site question a pick raised, and whether its answer is still being saved.
+  const [siteQuestions, setSiteQuestions] = useState<
+    Record<string, { question: CredentialSiteQuestion; pending: boolean }>
+  >({});
+  // Per resume token: the user set aside the question the card opened with, to pick another login.
+  const [dismissedFrameQuestions, setDismissedFrameQuestions] = useState<
+    Record<string, true>
   >({});
   // Per resume token: a Done in flight, the site a Done found no sign-in for, or a Done that failed to save.
   const [manualSignIns, setManualSignIns] = useState<
@@ -2749,6 +2777,8 @@ export function WorkflowCopilotChat({
       action: "connected" | "skip" | "signing_in" | "signed_in" | "generate",
       credentialId?: string,
       name?: string,
+      siteAnswer?: CredentialSiteAnswer,
+      question?: CredentialSiteQuestion,
     ): Promise<WorkflowCopilotCredentialResponseResult | undefined> => {
       if (credentialResponseInFlight.current) return;
       if (
@@ -2789,6 +2819,12 @@ export function WorkflowCopilotChat({
           // Any answer, even an unconfirmed one, can mean a new saved login the picker should list.
           setCredentialsReloadKey((key) => key + 1);
         } else {
+          if (siteAnswer && question) {
+            setSiteQuestions((prev) => ({
+              ...prev,
+              [frame.resume_token]: { question, pending: true },
+            }));
+          }
           const response =
             await client.post<WorkflowCopilotCredentialResponseResult>(
               "/workflow/copilot/credential-response",
@@ -2797,6 +2833,8 @@ export function WorkflowCopilotChat({
                 action,
                 credential_id:
                   action === "connected" ? credentialId : undefined,
+                ...(action === "connected" ? { asks_site: true } : {}),
+                ...(siteAnswer ? { site_answer: siteAnswer } : {}),
               },
             );
           // A backend that predates sign-in answers 204 with no body.
@@ -2843,17 +2881,46 @@ export function WorkflowCopilotChat({
         ) {
           return result;
         }
+        const askedSite = result.site_question;
+        if (result.result === "site_question" && askedSite) {
+          setSiteQuestions((prev) => ({
+            ...prev,
+            [frame.resume_token]: { question: askedSite, pending: false },
+          }));
+          return result;
+        }
+        // The paused turn reads the login back and its credential_pause_resolved frame settles the card.
+        if (result.result === "site_change_unknown") return result;
+        const siteFacts =
+          siteAnswer && question
+            ? {
+                siteAnswer,
+                siteA: question.saved_sites[0],
+                savedSites: question.saved_sites,
+                siteB: question.site,
+                name: question.name,
+              }
+            : {};
         const resolution: CredentialResolution = generated
           ? {
               outcome: "connected",
               credentialId: generated.credential_id ?? undefined,
               name: generated.name ?? undefined,
             }
-          : action === "connected"
-            ? { outcome: "connected", credentialId, name }
-            : action === "signed_in"
-              ? { outcome: "signed_in" }
-              : { outcome: "skipped" };
+          : result.result === "site_changed_not_connected"
+            ? {
+                outcome: "timeout",
+                credentialId,
+                ...siteFacts,
+                siteSavedNotConnected: true,
+              }
+            : action === "connected" && siteAnswer === "no"
+              ? { outcome: "not_admitted", credentialId, ...siteFacts }
+              : action === "connected"
+                ? { outcome: "connected", credentialId, name, ...siteFacts }
+                : action === "signed_in"
+                  ? { outcome: "signed_in" }
+                  : { outcome: "skipped" };
         // The waiter's credential_pause_resolved frame can land first and carries the admitted verdict.
         setPauseCardResolutions((prev) =>
           prev[frame.resume_token]
@@ -2888,6 +2955,52 @@ export function WorkflowCopilotChat({
         if (action === "generate") {
           void refreshRegistrationCard(frame);
           return;
+        }
+        if (siteAnswer) {
+          // A 409 or 422 saved nothing and reopened the card, so the question is asked again on the next pick.
+          const status = isAxiosError(error)
+            ? error.response?.status
+            : undefined;
+          const conflict = status === 409 || status === 422;
+          setSiteQuestions((prev) => {
+            const next = { ...prev };
+            if (conflict) {
+              delete next[frame.resume_token];
+            } else if (next[frame.resume_token]) {
+              next[frame.resume_token] = {
+                ...next[frame.resume_token]!,
+                pending: false,
+              };
+            }
+            return next;
+          });
+          if (conflict) {
+            setDismissedFrameQuestions((prev) => ({
+              ...prev,
+              [frame.resume_token]: true,
+            }));
+          }
+          if (status === 422) {
+            const detail = isAxiosError(error)
+              ? error.response?.data?.detail
+              : undefined;
+            toast({
+              title: "Couldn't save this site on the login",
+              description:
+                typeof detail === "string" ? detail : "Pick another login.",
+              variant: "destructive",
+            });
+            return;
+          }
+          if (conflict) {
+            toast({
+              title: "This login changed",
+              description:
+                "Its sites changed since the card asked. Pick it again.",
+              variant: "destructive",
+            });
+            return;
+          }
         }
         toast({
           title: "Couldn't send your credential response",
@@ -3191,11 +3304,16 @@ export function WorkflowCopilotChat({
     isListening: isSpeechListening,
     isHearingSpeech: isSpeechHearing,
     stop: stopSpeech,
+    cancel: cancelSpeech,
     toggle: toggleSpeech,
     takeAudioBlob: takeSpeechAudioBlob,
+    clearTranscript: clearSpeechTranscript,
   } = useSpeechToTextField({
     value: inputValue,
-    onChange: setInputValue,
+    onChange: (text) => {
+      lastDictatedTextRef.current = text;
+      setInputValue(text);
+    },
     // Dictation follows the textarea: it stays live while a prompt is parked,
     // because that text is now editable and replaceable rather than frozen.
     enabled: isOpen,
@@ -7384,6 +7502,53 @@ export function WorkflowCopilotChat({
         : "",
     );
   }
+  const demonstrationRecording = demonstrationRecorder.phase === "recording";
+  useEffect(() => {
+    if (inputValue === "") takenNoteTextRef.current = null;
+  }, [inputValue]);
+  // The composer text only counts as dictated while it is exactly what speech last wrote.
+  const composerIsDictated =
+    isSpeechListening &&
+    inputValue.trim().length > 0 &&
+    inputValue === lastDictatedTextRef.current;
+  useEffect(() => {
+    if (!demonstrationRecording || !composerIsDictated) return;
+    const timer = setTimeout(
+      () => void addDemonstrationNoteRef.current(),
+      DICTATED_NOTE_PAUSE_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [composerIsDictated, demonstrationRecording, inputValue]);
+  useEffect(() => {
+    if (!demonstrationRecording || !composerIsDictated) return;
+    // What was said before a click in the live browser belongs before the step it records.
+    const sendBeforeBrowserClick = (event: PointerEvent) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest(".browser-stream")
+      )
+        void addDemonstrationNoteRef.current();
+    };
+    window.addEventListener("pointerdown", sendBeforeBrowserClick, true);
+    return () =>
+      window.removeEventListener("pointerdown", sendBeforeBrowserClick, true);
+  }, [composerIsDictated, demonstrationRecording]);
+  const wasDemonstrationRecordingRef = useRef(demonstrationRecording);
+  useEffect(() => {
+    const wasRecording = wasDemonstrationRecordingRef.current;
+    wasDemonstrationRecordingRef.current = demonstrationRecording;
+    if (!wasRecording || demonstrationRecording || !isSpeechListening) return;
+    // Narration belongs to the recording; cancel drops results still in flight, which would
+    // otherwise land in the chat composer after the recording ends.
+    cancelSpeech();
+    takeSpeechAudioBlob();
+    setInputValue("");
+  }, [
+    cancelSpeech,
+    demonstrationRecording,
+    isSpeechListening,
+    takeSpeechAudioBlob,
+  ]);
   const dictatedQuestionIdRef = useRef(trayQuestionId);
   useEffect(() => {
     const previous = dictatedQuestionIdRef.current;
@@ -8905,9 +9070,21 @@ export function WorkflowCopilotChat({
                   outcome: pause.outcome,
                   credentialId: pause.credentialId ?? undefined,
                   name: payload.name ?? undefined,
+                  ...(payload.site_answer
+                    ? {
+                        siteAnswer: payload.site_answer,
+                        siteA: payload.site_a ?? undefined,
+                        savedSites: payload.saved_sites ?? undefined,
+                        siteB: payload.site_b ?? undefined,
+                      }
+                    : {}),
                 };
                 setPauseCardResolutions((prev) =>
-                  withCappedResolution(prev, payload.resume_token, resolution),
+                  withCappedResolution(prev, payload.resume_token, {
+                    ...prev[payload.resume_token],
+                    ...resolution,
+                    name: resolution.name ?? prev[payload.resume_token]?.name,
+                  }),
                 );
                 return false;
               }
@@ -9507,7 +9684,8 @@ export function WorkflowCopilotChat({
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      if (isDemonstrating) void addDemonstrationNote();
+      else handleSend();
     }
   };
 
@@ -9926,7 +10104,11 @@ export function WorkflowCopilotChat({
   ) => (
     <CredentialCard
       key={frame.resume_token}
-      frame={liveFrameToCardFrame(frame)}
+      frame={liveFrameToCardFrame(
+        dismissedFrameQuestions[frame.resume_token]
+          ? { ...frame, site_question: null }
+          : frame,
+      )}
       mode="inline-pause"
       reloadKey={credentialsReloadKey}
       resolvedOutcome={pauseCardResolutions[frame.resume_token]}
@@ -9947,6 +10129,35 @@ export function WorkflowCopilotChat({
       }
       onSkip={() => void respondToCredentialPause(frame, "skip")}
       onGenerate={() => void respondToCredentialPause(frame, "generate")}
+      siteQuestion={siteQuestions[frame.resume_token]?.question}
+      siteAnswerPending={Boolean(siteQuestions[frame.resume_token]?.pending)}
+      onSiteAnswer={(answer) => {
+        const question =
+          siteQuestions[frame.resume_token]?.question ??
+          (dismissedFrameQuestions[frame.resume_token]
+            ? null
+            : frame.site_question);
+        if (!question) return;
+        void respondToCredentialPause(
+          frame,
+          "connected",
+          question.credential_id,
+          question.name,
+          answer,
+          question,
+        );
+      }}
+      onDismissSiteQuestion={() => {
+        setSiteQuestions((prev) => {
+          const next = { ...prev };
+          delete next[frame.resume_token];
+          return next;
+        });
+        setDismissedFrameQuestions((prev) => ({
+          ...prev,
+          [frame.resume_token]: true,
+        }));
+      }}
       signIn={
         frame.sign_in_browser_session_id &&
         frame.sign_in_browser_session_id === liveBrowserSessionId
@@ -10390,8 +10601,31 @@ export function WorkflowCopilotChat({
                   : hasComposerText
                     ? "Queue for next turn"
                     : "Stop";
-  const demonstrationSendButtonLabel =
-    demonstrationRecorder.phase === "recording"
+  const demonstrationNoteReady =
+    demonstrationRecorder.phase === "recording" && inputValue.trim().length > 0;
+  const addDemonstrationNote = async () => {
+    const text = inputValue.trim();
+    // The pause timer, a browser click and Enter can all fire before React re-renders the cleared composer.
+    if (!demonstrationNoteReady || takenNoteTextRef.current === inputValue)
+      return;
+    takenNoteTextRef.current = inputValue;
+    // Dictation keeps running across notes; this only takes what was heard so far.
+    if (isSpeechListening) clearSpeechTranscript();
+    lastDictatedTextRef.current = "";
+    setInputValue("");
+    if (!(await demonstrationRecorder.addNote(text))) {
+      takenNoteTextRef.current = null;
+      // Dictation rewrites the composer on every result, so it stops here to keep the failed note for a retry.
+      if (isSpeechListening) cancelSpeech();
+      setInputValue((current) =>
+        [text, current.trim()].filter(Boolean).join(" "),
+      );
+    }
+  };
+  addDemonstrationNoteRef.current = addDemonstrationNote;
+  const demonstrationSendButtonLabel = demonstrationNoteReady
+    ? "Add note"
+    : demonstrationRecorder.phase === "recording"
       ? "Done, build the workflow"
       : "Build the workflow";
   // While recording, typing still in a focused field is only counted once Done flushes it.
@@ -10399,7 +10633,8 @@ export function WorkflowCopilotChat({
     demonstrationRecorder.phase !== "recording" &&
     demonstrationRecorder.actionCount === 0;
   const demonstrationSendButtonDisabled =
-    demonstrationRecorder.busy || demonstrationNothingRecorded;
+    !demonstrationNoteReady &&
+    (demonstrationRecorder.busy || demonstrationNothingRecorded);
   const demonstrationSendButtonReason = demonstrationNothingRecorded
     ? "Do something in the browser first"
     : null;
@@ -11840,7 +12075,9 @@ export function WorkflowCopilotChat({
                     : QUESTION_PROMPT_ID
                   : undefined
               }
-              disabled={isDemonstrating}
+              disabled={
+                isDemonstrating && demonstrationRecorder.phase !== "recording"
+              }
               rows={1}
               className="min-h-10 flex-1 resize-none border-0 bg-transparent py-2 text-sm leading-6 text-foreground placeholder:truncate placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
               style={{
@@ -11877,8 +12114,11 @@ export function WorkflowCopilotChat({
                 isSupported={isSpeechSupported}
                 isListening={isSpeechListening}
                 isHearingSpeech={isSpeechHearing}
-                disabled={isDemonstrating}
+                disabled={
+                  isDemonstrating && demonstrationRecorder.phase !== "recording"
+                }
                 onToggle={toggleSpeech}
+                label={isDemonstrating ? "Dictate context" : undefined}
                 className="h-8 w-8 rounded-full border-0 bg-transparent"
                 iconClassName="h-3.5 w-3.5"
               />
@@ -11921,7 +12161,9 @@ export function WorkflowCopilotChat({
                     }
                     onClick={() => {
                       if (isDemonstrating) {
-                        void demonstrationRecorder.done();
+                        void (demonstrationNoteReady
+                          ? addDemonstrationNote()
+                          : demonstrationRecorder.done());
                         return;
                       }
                       if (turnObservablyRunning && !hasComposerText) {
@@ -11949,7 +12191,8 @@ export function WorkflowCopilotChat({
                       />
                     ) : null}
                     {isDemonstrating ? (
-                      demonstrationRecorder.phase === "recording" ? (
+                      demonstrationRecorder.phase === "recording" &&
+                      !demonstrationNoteReady ? (
                         <span
                           aria-hidden
                           className="h-2 w-2 rounded-[1.5px] bg-current"

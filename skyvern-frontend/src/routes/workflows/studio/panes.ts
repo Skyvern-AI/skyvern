@@ -79,6 +79,48 @@ export const STUDIO_PANE_MIN_WIDTH: Record<StudioPaneId, number> = {
 export const STUDIO_STAGE_PADDING_PX = 24;
 export const STUDIO_STAGE_GAP_PX = 12;
 
+// The Doc reads as prose, so the Editor keeps more room while it shows the Doc.
+export const STUDIO_DOC_MIN_WIDTH = 360;
+// A pane collapsed to make room for the Doc keeps this strip in its slot.
+export const STUDIO_PANE_STRIP_WIDTH_PX = 36;
+// Panes give way to the Doc in this order; the Editor never collapses.
+const DOC_COLLAPSE_ORDER: readonly StudioPaneId[] = [
+  "browser",
+  "overview",
+  "copilot",
+];
+
+// Panes to collapse into strips so the Editor's Doc keeps STUDIO_DOC_MIN_WIDTH.
+// Stops as soon as the row fits, or when nothing else can give way.
+export function panesCollapsedForDoc(
+  panes: readonly StudioPaneId[],
+  stageWidth: number,
+): StudioPaneId[] {
+  if (stageWidth <= 0 || !panes.includes("editor")) {
+    return [];
+  }
+  const collapsed: StudioPaneId[] = [];
+  const fits = () => {
+    const laid = panes.filter((id) => !collapsed.includes(id));
+    const total =
+      laid.reduce(
+        (sum, id) =>
+          sum +
+          (id === "editor" ? STUDIO_DOC_MIN_WIDTH : STUDIO_PANE_MIN_WIDTH[id]),
+        0,
+      ) +
+      collapsed.length * (STUDIO_PANE_STRIP_WIDTH_PX + STUDIO_STAGE_GAP_PX) +
+      STUDIO_STAGE_GAP_PX * (laid.length - 1) +
+      STUDIO_STAGE_PADDING_PX;
+    return total <= stageWidth;
+  };
+  for (const id of DOC_COLLAPSE_ORDER) {
+    if (fits()) break;
+    if (panes.includes(id)) collapsed.push(id);
+  }
+  return collapsed;
+}
+
 function isStudioPaneId(value: string): value is StudioPaneId {
   return (STUDIO_PANE_IDS as readonly string[]).includes(value);
 }

@@ -3,7 +3,6 @@
 # -- begin speed up unit tests
 import asyncio
 import contextlib
-import functools
 import hashlib
 import itertools
 import json
@@ -40,7 +39,6 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import ViewportSize, async_playwright
-from playwright.sync_api import sync_playwright
 from sqlalchemy import Engine, create_engine, event, func, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -79,7 +77,7 @@ from skyvern.forge.sdk.services.credential.connected_bitwarden_credential_vault_
 from skyvern.forge.sdk.services.request_principal import AuthKind, RequestPrincipal
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow import web_search, web_search_client
-from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
+from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.models import block as block_module
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, TaskBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, WorkflowParameterType
@@ -90,6 +88,7 @@ from skyvern.webeye.browser_engine import SKYCDP_ENGINE_NAME, BrowserEngineMetad
 from skyvern.webeye.utils import page as page_module
 from skyvern.webeye.utils.page import ScreenshotMode
 from tests.unit._fingerprint_expectations import FINGERPRINT_TEST_SECRET_KEY
+from tests.unit.chromium_probe import chromium_available, full_chromium_available
 from tests.unit.dns_fixtures import no_env_proxy, public_dns, unresolvable_dns  # noqa: F401
 from tests.unit.force_stub_app import start_forge_stub_app
 from tests.unit.google.conftest import mock_sheets_transport  # noqa: F401
@@ -211,6 +210,31 @@ def workflow_context_manager_factory() -> Callable[..., WorkflowContextManager]:
         return manager
 
     return _make
+
+
+CARD_SECRET_RUN_ID = "wr_card_secret"
+
+
+@pytest.fixture
+def card_secret_run(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """A live run with Mask Secrets off whose vault card was registered the way the 1Password path does it.
+    Returns each field's placeholder id: card_number and card_cvv are card data, card_holder_name is not."""
+    context = WorkflowRunContext(
+        workflow_title="t",
+        workflow_id="w_card",
+        workflow_permanent_id="wpid_card",
+        workflow_run_id=CARD_SECRET_RUN_ID,
+        aws_client=MagicMock(),
+        mask_secrets=False,
+    )
+    parameter = MagicMock(key="card")
+    context.values[parameter.key] = {}
+    for key, value in (("card_number", "4111111111111111"), ("card_cvv", "587"), ("card_holder_name", "Test Holder")):
+        context._add_secret_parameter_value(parameter, key, value)
+    manager = WorkflowContextManager()
+    manager.workflow_run_contexts[CARD_SECRET_RUN_ID] = context
+    monkeypatch.setattr(app, "WORKFLOW_CONTEXT_MANAGER", manager)
+    return context.values[parameter.key]
 
 
 # Wire structlog through stdlib so caplog can capture log records in tests.
@@ -1459,19 +1483,17 @@ async def org_vault(monkeypatch: pytest.MonkeyPatch, sqlite_engine: AsyncEngine)
 MARKER_RGB = (12, 200, 34)
 
 
-@functools.cache
-def chromium_available() -> bool:
-    try:
-        with sync_playwright() as playwright:
-            return Path(playwright.chromium.executable_path).exists()
-    except Exception:
-        return False
-
-
 def requires_chromium(test: _T) -> _T:
     return pytest.mark.skipif(
         not chromium_available(),
         reason="Requires Playwright browsers installed (run: playwright install chromium)",
+    )(test)
+
+
+def requires_full_chromium(test: _T) -> _T:
+    return pytest.mark.skipif(
+        not full_chromium_available(),
+        reason="Requires Playwright's full Chromium build (run: playwright install chromium)",
     )(test)
 
 

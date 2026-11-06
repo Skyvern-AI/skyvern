@@ -906,6 +906,80 @@ async def test_health_silent_capture_starts_on_raw_cdp_and_ends_inside_the_deadl
     session.detach.assert_awaited_once()
 
 
+async def _health_silent_capture_that_never_answers(
+    page: MagicMock, timeout_ms: int
+) -> tuple[float, SkyvernContext, set[asyncio.Task[object]]]:
+    session = page.context.new_cdp_session.return_value
+    answers = session.send.side_effect
+
+    async def never_answers(method: str, params: dict) -> dict:
+        if method == "Page.captureScreenshot":
+            await asyncio.Event().wait()
+        return await answers(method, params)
+
+    session.send.side_effect = never_answers
+    existing_tasks = asyncio.all_tasks()
+    with skyvern_context.scoped(SkyvernContext()) as context:
+        started = time.monotonic()
+        with pytest.raises(FailedToTakeScreenshot):
+            # A hang guard only.
+            await asyncio.wait_for(
+                SkyvernFrame.take_scrolling_screenshot(
+                    page,
+                    timeout=timeout_ms,
+                    mode=ScreenshotMode.LITE,
+                    scrolling_number=0,
+                    animations="allow",
+                    record_health=False,
+                ),
+                timeout=30,
+            )
+        elapsed = time.monotonic() - started
+    return elapsed, context, asyncio.all_tasks() - existing_tasks
+
+
+@pytest.mark.asyncio
+async def test_health_silent_capture_keeps_the_capture_stage_cap_on_a_long_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _production_rescue_timeouts(monkeypatch)
+    monkeypatch.setattr(page_module, "CDP_RESCUE_CAPTURE_TIMEOUT_SECONDS", 0.5)
+    page = _page()
+
+    elapsed, context, leftover = await _health_silent_capture_that_never_answers(page, timeout_ms=20000)
+
+    assert 0.5 <= elapsed < 1.5
+    assert not leftover
+    assert context.browser_health.consecutive_timeouts == 0
+    page.context.new_cdp_session.return_value.detach.assert_awaited_once()
+    page.screenshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_health_silent_capture_wedged_after_geometry_ends_inside_the_deadline_without_strikes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The bounds are real asyncio deadlines, so only wall-clock elapsed time shows they hold. Unit CI has no Chromium,
+    # so this is the wedge check that runs there.
+    _production_rescue_timeouts(monkeypatch)
+    page = _page()
+    session = page.context.new_cdp_session.return_value
+
+    async def detach_waits_for_the_wedged_capture() -> None:
+        await asyncio.Event().wait()
+
+    session.detach.side_effect = detach_waits_for_the_wedged_capture
+
+    elapsed, context, leftover = await _health_silent_capture_that_never_answers(page, timeout_ms=1000)
+
+    assert elapsed < 1.0
+    assert not leftover
+    assert context.browser_health.consecutive_timeouts == 0
+    assert context.browser_health.stuck_operations == set()
+    session.detach.assert_awaited_once()
+    page.screenshot.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "geometry",

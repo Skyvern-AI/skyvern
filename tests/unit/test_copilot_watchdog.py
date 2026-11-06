@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from skyvern.forge import app as forge_app
 from skyvern.forge.sdk.copilot.agent_context import OriginRunRedactionRegistry
@@ -64,6 +65,8 @@ def _fake_run(status: str = "running", modified_at: datetime | None = None) -> A
         modified_at=modified_at or datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc),
         browser_session_id=None,
         failure_reason=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
 
 
@@ -906,6 +909,29 @@ async def test_never_terminal_worker_run_is_cancelled_at_the_safety_ceiling(monk
 
 
 @pytest.mark.asyncio
+async def test_a_watchdog_exit_that_cannot_read_the_run_row_reports_unknown_credits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_EXTRACTION_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+    forge_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(side_effect=RuntimeError("DB flake"))
+    _install_advancing_clock(monkeypatch)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["extract_heading"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling", result
+    assert result["data"]["credits_used"] is None
+    assert run_execution.build_test_evidence_packet(ctx, result).run.credits_used is None
+
+
+@pytest.mark.asyncio
 async def test_terminal_row_written_before_the_ceiling_cancel_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     harness = await _install_run_harness(
         monkeypatch,
@@ -924,6 +950,281 @@ async def test_terminal_row_written_before_the_ceiling_cancel_wins(monkeypatch: 
     harness["cooperative_cancel"].assert_not_awaited()
     assert result["ok"] is True, result
     assert result["data"]["overall_status"] == "completed"
+
+
+_LOOP_WORKFLOW_YAML = """
+title: loop example
+workflow_definition:
+  parameters:
+    - key: rows
+      parameter_type: workflow
+      workflow_parameter_type: json
+      default_value: [0, 1, 2]
+  blocks:
+    - block_type: for_loop
+      label: each_row
+      loop_over_parameter_key: rows
+      loop_blocks:
+        - block_type: extraction
+          label: fill_dates
+          continue_on_failure: true
+          next_block_label: save_row
+          url: https://example.com
+          data_extraction_goal: Read the date fields.
+        - block_type: extraction
+          label: save_row
+          url: https://example.com
+          data_extraction_goal: Read the saved row.
+"""
+
+_LOOP_T0 = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
+_ROW_ZERO_ERROR = "Locator.fill: Timeout 10000ms exceeded waiting for #prior-expiration"
+
+
+def _loop_row(
+    block_id: str,
+    label: str,
+    status: str,
+    second: int,
+    *,
+    index: int | None = None,
+    failure_reason: str | None = None,
+    run_id: str = "wr_paused",
+) -> WorkflowRunBlock:
+    is_loop = index is None
+    return WorkflowRunBlock(
+        workflow_run_block_id=block_id,
+        workflow_run_id=run_id,
+        organization_id="org-1",
+        parent_workflow_run_block_id=None if is_loop else "wrb_loop",
+        block_type=BlockType.FOR_LOOP if is_loop else BlockType.EXTRACTION,
+        label=label,
+        status=status,
+        failure_reason=failure_reason,
+        current_index=index,
+        loop_values=list(range(120)) if is_loop else None,
+        created_at=_LOOP_T0 + timedelta(seconds=second),
+        modified_at=_LOOP_T0 + timedelta(seconds=second),
+    )
+
+
+def _row_zero_failed_then_row_one_started(run_id: str = "wr_paused") -> list[WorkflowRunBlock]:
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0, run_id=run_id),
+        _loop_row("wrb_0", "fill_dates", "failed", 1, index=0, failure_reason=_ROW_ZERO_ERROR, run_id=run_id),
+        _loop_row("wrb_1", "fill_dates", "running", 2, index=1, run_id=run_id),
+    ]
+
+
+def _row_zero_failed_inside_a_conditional() -> list[WorkflowRunBlock]:
+    condition = _loop_row("wrb_cond", "pick_branch", "completed", 1, index=0).model_copy(
+        update={"block_type": BlockType.CONDITIONAL}
+    )
+    branch = _loop_row("wrb_0", "fill_dates", "failed", 2, index=0, failure_reason=_ROW_ZERO_ERROR).model_copy(
+        update={"parent_workflow_run_block_id": "wrb_cond"}
+    )
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0),
+        condition,
+        branch,
+        _loop_row("wrb_1", "pick_branch", "running", 3, index=1),
+    ]
+
+
+def _install_moving_block_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    ticks = 0
+
+    async def _read_progress(_ctx: CopilotContext, _run_id: str) -> tuple[Any, datetime]:
+        nonlocal ticks
+        ticks += 1
+        return _fake_run(status="running"), _LOOP_T0 + timedelta(seconds=ticks)
+
+    monkeypatch.setattr(run_execution, "_read_progress_sources", _read_progress)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_to_worker", [True, False], ids=["worker_run", "inline_run"])
+@pytest.mark.parametrize(
+    "rows",
+    [_row_zero_failed_then_row_one_started(), _row_zero_failed_inside_a_conditional()],
+    ids=["loop_child_failed", "conditional_branch_failed"],
+)
+async def test_a_loop_iteration_that_ended_on_a_failed_block_stops_the_test(
+    monkeypatch: pytest.MonkeyPatch, dispatch_to_worker: bool, rows: list[WorkflowRunBlock]
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=dispatch_to_worker,
+        terminal_blocks=rows,
+    )
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    with capture_logs() as logs:
+        result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    used_cancel, unused_cancel = (
+        (harness["cooperative_cancel"], harness["cancel_run_task"])
+        if dispatch_to_worker
+        else (harness["cancel_run_task"], harness["cooperative_cancel"])
+    )
+    used_cancel.assert_awaited_once()
+    unused_cancel.assert_not_awaited()
+    assert result["ok"] is False, result
+    assert result["data"]["control_signal"]["kind"] == "watchdog_loop_iteration_failed"
+    error = result["error"]
+    assert _ROW_ZERO_ERROR in error
+    assert "118 of 120 iterations did not run" in error
+    assert "run_every_loop_iteration=true" in error
+    assert "uncertain" not in error.lower()
+    assert "timed out" not in error.lower()
+    summary = result["data"]["user_facing_summary"]
+    assert summary == "Stopped the test after row 1 failed; 118 of 120 rows did not run."
+    assert contains_internal_machinery_leak(summary) is False
+    assert_clean_user_facing_text(summary)
+    stops = [log for log in logs if log["event"] == "copilot_test_stopped_at_failed_iteration"]
+    assert [
+        (s["loop_label"], s["failed_iteration_index"], s["iterations_started"], s["loop_length"]) for s in stops
+    ] == [("each_row", 0, 2, 120)]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_recorded_before_the_first_poll_still_stops_the_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The harness's progress reader returns one fixed timestamp, so block progress never moves after the first read.
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=_row_zero_failed_then_row_one_started(),
+    )
+    _install_advancing_clock(monkeypatch)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_loop_iteration_failed", result
+    harness["cooperative_cancel"].assert_awaited_once_with("wr_paused")
+
+
+_RUNTIME_VALUE = "runtime-obtained-4412"
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_test_scrubs_typed_input_from_the_failed_blocks_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    echoed_reason = (
+        "Locator.fill: Timeout 10000ms exceeded.\nCall log:\n"
+        f'  -   fill("{_RUNTIME_VALUE}")\n'
+        "  - waiting for element to be visible, enabled and editable\n"
+        f'  - <input id="pw" value="{_RUNTIME_VALUE}">'
+    )
+    rows = _row_zero_failed_then_row_one_started()
+    rows[1] = rows[1].model_copy(update={"failure_reason": echoed_reason})
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=rows,
+    )
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_loop_iteration_failed"
+    assert "Locator.fill: Timeout 10000ms exceeded." in result["error"]
+    assert _RUNTIME_VALUE not in str(result)
+
+
+def _failed_row_then_success_in_the_same_iteration() -> list[WorkflowRunBlock]:
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0),
+        _loop_row("wrb_0", "fill_dates", "failed", 1, index=0, failure_reason=_ROW_ZERO_ERROR),
+        _loop_row("wrb_0b", "save_row", "completed", 2, index=0),
+        _loop_row("wrb_1", "fill_dates", "running", 3, index=1),
+    ]
+
+
+def _failed_final_iteration() -> list[WorkflowRunBlock]:
+    return [
+        _loop_row("wrb_loop", "each_row", "running", 0),
+        _loop_row("wrb_0", "save_row", "completed", 1, index=0),
+        _loop_row("wrb_1", "fill_dates", "failed", 2, index=1, failure_reason=_ROW_ZERO_ERROR),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows_for_run", "run_every_loop_iteration"),
+    [
+        (lambda _run_id: _failed_row_then_success_in_the_same_iteration(), False),
+        (lambda _run_id: _failed_final_iteration(), False),
+        (lambda run_id: _row_zero_failed_then_row_one_started(run_id) if run_id == "wr_child" else [], False),
+        (_row_zero_failed_then_row_one_started, True),
+    ],
+    ids=["later_block_succeeded", "final_iteration_failed", "failure_in_child_run", "run_every_loop_iteration"],
+)
+async def test_the_test_keeps_waiting_when_no_iteration_failed_past_its_end(
+    monkeypatch: pytest.MonkeyPatch,
+    rows_for_run: Callable[[str], list[WorkflowRunBlock]],
+    run_every_loop_iteration: bool,
+) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+    )
+
+    async def _rows(*, workflow_run_id: str, **_kwargs: object) -> list[WorkflowRunBlock]:
+        return rows_for_run(workflow_run_id)
+
+    forge_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(side_effect=_rows)
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug(
+        {"block_labels": ["each_row"], "parameters": {}, "run_every_loop_iteration": run_every_loop_iteration}, ctx
+    )
+
+    assert result["data"]["control_signal"]["kind"] == "watchdog_ceiling", result
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_row_written_before_the_failed_iteration_cancel_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    harness = await _install_run_harness(
+        monkeypatch,
+        workflow_yaml=_LOOP_WORKFLOW_YAML,
+        polled_status="running",
+        dispatch_to_worker=True,
+        terminal_blocks=_row_zero_failed_then_row_one_started(),
+    )
+    forge_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=_fake_run(status="completed"))
+    _install_moving_block_progress(monkeypatch)
+    _install_advancing_clock(monkeypatch)
+    ctx = make_copilot_ctx(browser_session_id="pbs_chat")
+    ctx.staged_workflow = harness["workflow"]
+    ctx.frontier_resume_session_id = "pbs_run"
+
+    result = await _run_blocks_and_collect_debug({"block_labels": ["each_row"], "parameters": {}}, ctx)
+
+    harness["cooperative_cancel"].assert_not_awaited()
+    assert result["data"]["overall_status"] == "completed", result
+    assert "control_signal" not in result["data"]
 
 
 @pytest.mark.asyncio

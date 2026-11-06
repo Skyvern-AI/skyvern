@@ -14,6 +14,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from skyvern.constants import ScrapeType
 from skyvern.exceptions import FailedToReloadPage
 from skyvern.forge.agent import ForgeAgent
+from skyvern.webeye import real_browser_state as real_browser_state_mod
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, DownloadBinding
 from skyvern.webeye.real_browser_state import RealBrowserState
 
@@ -146,6 +147,60 @@ async def test_reload_page_degradation_succeeds_on_first_try(browser_state: Real
         await browser_state.reload_page(degradation=True)
 
     assert strategies_tried == ["load"]
+
+
+def _history_at(url: str) -> dict[str, object]:
+    return {"currentIndex": 0, "entries": [{"url": url}]}
+
+
+@pytest.mark.asyncio
+async def test_reload_page_waits_for_the_browser_to_record_the_committed_page(browser_state: RealBrowserState) -> None:
+    """Playwright hears of a commit from the renderer before the browser records it as the current history entry,
+    and a reload in that gap reloads the previous entry: here the auto-submitting sign-in page."""
+    events: list[str] = []
+
+    async def reload(**_: object) -> None:
+        events.append("reload")
+
+    async def history(_method: str) -> dict[str, object]:
+        events.append("history")
+        stale = len(events) < 3
+        return _history_at("https://example.test/signin" if stale else "https://example.test/spa")
+
+    page = _make_page(reload)
+    page.context.new_cdp_session = AsyncMock(return_value=MagicMock(send=history, detach=AsyncMock()))
+    browser_state._wait_for_settle = AsyncMock()
+    browser_state._wait_for_challenge_solver = AsyncMock()
+
+    with patch.object(browser_state, "_RealBrowserState__assert_page", return_value=page):
+        await browser_state.reload_page(degradation=True)
+
+    assert events == ["history", "history", "history", "reload"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["session_unavailable", "never_recorded", "error_page"])
+async def test_reload_page_still_reloads_when_the_browser_cannot_confirm_the_page(
+    browser_state: RealBrowserState, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    monkeypatch.setattr(real_browser_state_mod, "_COMMITTED_ENTRY_WAIT_SECONDS", 0.05)
+    page = _make_page()
+    if failure == "session_unavailable":
+        page.context.new_cdp_session = AsyncMock(side_effect=RuntimeError("no CDP on this engine"))
+    else:
+        send = AsyncMock(return_value=_history_at("https://example.test/signin"))
+        page.context.new_cdp_session = AsyncMock(return_value=MagicMock(send=send, detach=AsyncMock()))
+    if failure == "error_page":
+        page.url = "chrome-error://chromewebdata/"
+    browser_state._wait_for_settle = AsyncMock()
+    browser_state._wait_for_challenge_solver = AsyncMock()
+
+    with patch.object(browser_state, "_RealBrowserState__assert_page", return_value=page):
+        await browser_state.reload_page(degradation=True)
+
+    page.reload.assert_awaited_once()
+    if failure == "error_page":
+        page.context.new_cdp_session.assert_not_awaited()
 
 
 # --- Scrape retry integration: RELOAD always uses degradation ---

@@ -31,7 +31,6 @@ from urllib.parse import urlsplit
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.errors.errors import resolve_error_code_mapping_key
 from skyvern.exceptions import (
     ActionDeadlineExceeded,
@@ -55,7 +54,6 @@ from skyvern.forge.taskv3.goal_check import (
 from skyvern.forge.taskv3.handoff_redaction import MAX_HANDOFF_URL_CHARS, normalized_url, sanitize_published_url
 from skyvern.forge.taskv3.intercepted_submission import InterceptedSubmission, SubmissionOutcome
 from skyvern.forge.taskv3.llm_call_params import fallback_error_class, rejects_carried_reasoning
-from skyvern.forge.taskv3.run_arms import DEAD_END_RETURN_FLAG, run_arm_enabled
 from skyvern.forge.taskv3.target_label import describe_target
 from skyvern.schemas.steps import StepToolCall
 from skyvern.schemas.workflows import ERROR_CODE_MAPPING_MAX_ENTRIES, ERROR_CODE_MAPPING_MAX_UTF8_BYTES
@@ -233,6 +231,8 @@ ToolOkClass = Literal[
 CoveredBranch = Literal[
     # The layer was named and its controls enumerated into the message.
     "named",
+    # A layer named only by its own text was quoted, with its controls, instead of told to be dismissed and retried.
+    "quoted",
     # The layer holds a challenge frame, so the message names it and omits the dismissal sentence.
     "challenge",
     # The walk qualified nothing, the hit was the field's OWN container, AND an ancestor was found
@@ -1175,9 +1175,9 @@ def _dead_end_provenance(urls: tuple[object, ...], task_target_urls: Collection[
 PAGE_UNAVAILABLE_ERROR = "browser page unavailable"
 
 # A navigation landed on a hard dead-end (HTTP 404/410): the target posting does not exist or was
-# removed, so the goal cannot be completed there. Ends the run as `terminated`, matching v1's terminate
-# verdict for the same condition. Covers both the in-loop `navigate` tool and the pre-loop initial-URL
-# navigation. Facetable sibling of the classes above.
+# removed. Ends the run as `terminated`, matching v1's terminate verdict, for the pre-loop initial-URL
+# navigation and for an in-loop `navigate` on the granted final turn; any other in-loop dead end is returned to
+# the model. Facetable sibling of the classes above.
 NAV_DEAD_END_GUARD = "navigation_dead_end"
 # A page-level handler kept asking for the page to be reloaded past the per-run cap: the page cannot
 # be stabilized, and acting on it would mean acting on a page declared stale.
@@ -2636,6 +2636,7 @@ OBSERVE_SUMMARY_FIELDS = frozenset(
         "frame_unreadable_regions",
         "elements_listed",
         "pointer_roots_listed",
+        "pointer_extras_listed",
         "pointer_capped",
         "pointer_truncated",
         "pointer_dropped",
@@ -6673,14 +6674,11 @@ async def run_agent_tool_loop(
                 st.final_turn_staged_output = staged
 
         # The batch settled on a dead page (an in-loop navigate hit a hard 404/410 and no later navigate
-        # recovered): end the run as terminated deterministically, matching v1, rather than leaving the
-        # failed/terminated choice to the model's finish tool (which does not converge on this class).
+        # recovered): the navigate's result is returned to the model, except on the granted final turn, where
+        # no turn is left to act on it and the run ends terminated rather than budget_exhausted.
         if st.outcome is None and st.pending_nav_dead_end is not None:
             dead = st.pending_nav_dead_end
-            # Not on the granted final turn: with no turn left to act on it, a return would end the run budget_exhausted.
-            returned = not (activity is not None and activity.final_turn_active) and run_arm_enabled(
-                DEAD_END_RETURN_FLAG, settings.TASK_V3_DEAD_END_RETURN
-            )
+            returned = not (activity is not None and activity.final_turn_active)
             LOG.info(
                 "taskv3 loop navigation dead end",
                 http_status=dead.status,

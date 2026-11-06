@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from unittest.mock import AsyncMock
 
 import pytest
 
 import skyvern.cli.mcp_tools.workflow as workflow_tools
 from skyvern.cli.core.result import Artifact, BrowserContext, make_result, set_concise_responses
+from skyvern.cli.mcp_tools import mcp
 
 
 @pytest.fixture(autouse=True)
@@ -266,3 +268,118 @@ def test_workflow_status_summary_shrinks_simple_payload() -> None:
     assert len(json.dumps(full_payload)) > 1_500
     assert len(json.dumps(summary_payload)) < 800
     assert summary_payload["output_summary"]["scalar_preview"] == {"result": "success", "order_id": "ord_123"}
+
+
+def _block_error(block_id: str, code: str = "user_code_error") -> dict[str, object]:
+    return {
+        "error_code": code,
+        "reasoning": f"{block_id} failed: " + "ValueError: no quote row for this account. " * 20,
+        "confidence_float": 1.0,
+        "workflow_run_block_id": block_id,
+        "block_label": f"label_{block_id}",
+        "block_type": "code",
+        "loop_index": 0,
+        "final_url": "https://quote.test/",
+    }
+
+
+_COMPLETED_WITH_FAILURES = {
+    "workflow_run_id": "wr_continued",
+    "status": "completed",
+    "errors": [
+        {"error_code": "task_error", "reasoning": "task", "confidence_float": 1.0},
+        _block_error("wrb_a"),
+        _block_error("wrb_a", code="net::ERR_TIMED_OUT"),
+        _block_error("wrb_b"),
+        _block_error("wrb_c"),
+        _block_error("wrb_d"),
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_summary_reports_block_failures_of_a_completed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_status", AsyncMock(return_value=_COMPLETED_WITH_FAILURES))
+    signed_action_url = "https://shots.test/action?X-Amz-Signature=" + "a" * 600
+    artifacts = AsyncMock(
+        return_value=[
+            {"artifact_type": "screenshot_llm", "archived": False, "signed_url": "https://shots.test/llm"},
+            {"artifact_type": "screenshot_action", "archived": True, "signed_url": "https://shots.test/old"},
+            {"artifact_type": "screenshot_action", "archived": False, "signed_url": signed_action_url},
+        ]
+    )
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_block_artifacts", artifacts)
+
+    # Through the registered tool, so the response formatter cannot clip the rows or the signed URL.
+    result = await (await mcp.get_tool("skyvern_workflow_status")).fn(run_id="wr_continued")
+
+    block_failures = result["data"]["block_failures"]
+    assert block_failures["total"] == 4
+    assert block_failures["rows"] == [
+        {**_block_error("wrb_a"), "screenshot_url": signed_action_url},
+        _block_error("wrb_b"),
+        _block_error("wrb_c"),
+    ]
+    assert artifacts.await_args.args == ("wrb_a",)
+    assert any("4 block run(s) failed" in warning for warning in result["warnings"])
+    assert workflow_tools._serialize_run_summary(_COMPLETED_WITH_FAILURES)["block_failures"] == {"total": 4}
+
+    full = await workflow_tools.skyvern_workflow_status("wr_continued", verbosity="full")
+    first_block_rows = [row for row in full["data"]["errors"] if row.get("workflow_run_block_id") == "wrb_a"]
+    assert [row.get("screenshot_url") for row in first_block_rows] == [signed_action_url, None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param(
+            {"workflow_run_id": "wr_clean", "status": "completed", "errors": [{"error_code": "task_error"}]},
+            id="completed_without_block_failures",
+        ),
+        pytest.param({**_COMPLETED_WITH_FAILURES, "status": "failed"}, id="failed_run"),
+    ],
+)
+async def test_workflow_status_warns_only_for_a_completed_run_with_block_failures(
+    monkeypatch: pytest.MonkeyPatch, run: dict[str, object]
+) -> None:
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_status", AsyncMock(return_value=run))
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_block_artifacts", AsyncMock(return_value=[]))
+
+    result = await workflow_tools.skyvern_workflow_status(str(run["workflow_run_id"]))
+
+    assert not any("block run(s) failed" in warning for warning in result.get("warnings", []))
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_size_fallback_keeps_the_block_failure_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_status", AsyncMock(return_value=_COMPLETED_WITH_FAILURES))
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_block_artifacts", AsyncMock(side_effect=RuntimeError))
+    monkeypatch.setattr(workflow_tools, "within_response_limits", lambda result: False)
+
+    result = await workflow_tools.skyvern_workflow_status("wr_continued")
+
+    assert result["data"]["status"] == "completed"
+    assert "block_failures" not in result["data"]
+    assert any("4 block run(s) failed" in warning for warning in result["warnings"])
+    assert any("size limit" in warning for warning in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_workflow_status_of_a_running_run_skips_the_block_screenshot_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        workflow_tools,
+        "get_workflow_run_status",
+        AsyncMock(return_value={**_COMPLETED_WITH_FAILURES, "status": "running"}),
+    )
+    artifacts = AsyncMock(return_value=[])
+    monkeypatch.setattr(workflow_tools, "get_workflow_run_block_artifacts", artifacts)
+
+    result = await workflow_tools.skyvern_workflow_status("wr_continued")
+
+    artifacts.assert_not_awaited()
+    assert "rows" not in result["data"].get("block_failures", {})

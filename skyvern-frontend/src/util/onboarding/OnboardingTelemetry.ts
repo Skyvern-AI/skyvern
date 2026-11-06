@@ -150,7 +150,6 @@ function tourDismissed(surface: Surface, lastStep: string): void {
 function questionnaireResponseProperties(input: QuestionnaireResponseInput) {
   return {
     questionnaire_version: 1,
-    "$feature/onboarding_questionnaire_v1": true,
     surface: QUESTIONNAIRE_SURFACE,
     response_id: input.responseId,
     revision: input.revision,
@@ -175,7 +174,6 @@ function questionnaireAnswerProperties(answers: QuestionnaireAnswersV1) {
 function questionnaireShown(input: QuestionnaireShownInput): boolean {
   return capture("onboarding_questionnaire_shown", {
     questionnaire_version: 1,
-    "$feature/onboarding_questionnaire_v1": true,
     surface: QUESTIONNAIRE_SURFACE,
     primary_intent: input.primaryIntent,
     prompt_reason: input.promptReason,

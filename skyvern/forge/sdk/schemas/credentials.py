@@ -1,12 +1,12 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from fastapi import status
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from skyvern.exceptions import SkyvernHTTPException
-from skyvern.forge.sdk.credential_site_policy import LoginSite
+from skyvern.forge.sdk.credential_site_policy import MAX_EXTRA_SITE_URLS, MAX_SITE_URL_LENGTH, LoginSite
 from skyvern.forge.sdk.schemas.organizations import OnePasswordTokenSource
 from skyvern.schemas.proxy_location import ProxyLocationInput
 from skyvern.schemas.proxy_pinning import parse_proxy_location_input, validate_proxy_session_id
@@ -220,6 +220,17 @@ class SecretCredential(BaseModel):
     secret_label: str | None = Field(default=None, description="Optional label describing the secret")
 
 
+class VaultPasskey(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    rp_id: str
+    credential_id: str
+    private_key: SecretStr = Field(repr=False, exclude=True)
+    user_handle: str | None
+    counter: int
+    discoverable: bool
+
+
 class CredentialItem(BaseModel):
     """Model representing a credential item in the system."""
 
@@ -235,6 +246,18 @@ class CredentialItem(BaseModel):
     )
     # Set only by a vault whose items scope each site by match mode; a fill or release must then match one.
     login_sites: list[LoginSite] | None = Field(default=None, exclude=True)
+    passkeys: list[VaultPasskey] = Field(default_factory=list, exclude=True, repr=False)
+
+    def named_login_sites(self) -> list[LoginSite]:
+        """Its scoped sites, else the whole site of each login URI."""
+        if self.login_sites is not None:
+            return self.login_sites
+        return [LoginSite(uri, whole_site=True) for uri in self.login_uris]
+
+    def __getstate__(self) -> dict[Any, Any]:
+        state = super().__getstate__()
+        state["__dict__"] = {**state["__dict__"], "passkeys": []}
+        return state
 
 
 class CreateCredentialRequest(BaseModel):
@@ -319,6 +342,9 @@ class CredentialResponse(BaseModel):
         description="Whether sign-ins reusing this credential's saved profile keep the same IP",
     )
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
+    extra_site_urls: list[str] = Field(
+        default_factory=list, description="More sites this login may sign in on, each covering its whole site"
+    )
     user_context: str | None = Field(
         default=None,
         description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
@@ -490,6 +516,9 @@ class Credential(BaseModel):
         description="Whether sign-ins reusing this credential's saved profile keep the same IP",
     )
     tested_url: str | None = Field(default=None, description="Login page URL used during the credential test")
+    extra_site_urls: list[str] = Field(
+        default_factory=list, description="More sites this login may sign in on, each covering its whole site"
+    )
     user_context: str | None = Field(
         default=None,
         description="User-provided context describing the login sequence (e.g., 'click SSO button first')",
@@ -529,6 +558,11 @@ class Credential(BaseModel):
     def validate_proxy_session_id_field(cls, value: str | None) -> str | None:
         return validate_proxy_session_id(value)
 
+    @field_validator("extra_site_urls", mode="before")
+    @classmethod
+    def default_extra_site_urls(cls, value: list[str] | None) -> list[str]:
+        return [] if value is None else value
+
 
 def credential_auto_profile_disabled(credential: Credential) -> bool:
     """Opt-out is explicit-True only; False and legacy NULL keep automatic behavior."""
@@ -548,6 +582,17 @@ class UpdateCredentialRequest(BaseModel):
         default=None,
         description="Optional login page URL associated with this credential",
         examples=["https://example.com/login"],
+    )
+    extra_site_urls: list[Annotated[str, Field(max_length=MAX_SITE_URL_LENGTH)]] | None = Field(
+        default=None,
+        max_length=MAX_EXTRA_SITE_URLS,
+        description="Replaces the login's extra sites; each covers its whole site",
+        examples=[["https://example.org/login"]],
+    )
+    expected_site_urls: list[Annotated[str, Field(max_length=MAX_SITE_URL_LENGTH)]] | None = Field(
+        default=None,
+        max_length=MAX_EXTRA_SITE_URLS + 1,
+        description="The login's saved sites (tested URL first) the edit was made from; a mismatch is refused",
     )
     user_context: str | None = Field(
         default=None,

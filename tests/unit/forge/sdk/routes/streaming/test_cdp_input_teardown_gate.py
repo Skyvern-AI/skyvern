@@ -8,6 +8,7 @@ from fastapi import WebSocketDisconnect
 from skyvern.forge.sdk.routes.streaming import cdp_input
 from skyvern.forge.sdk.streaming import registries
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+from tests.unit.scoped_time import ScopedTime
 
 
 def _browser_session_stream_agent_functions() -> SimpleNamespace:
@@ -24,7 +25,9 @@ async def test_cdp_reauthorization_retries_transient_errors_within_grace(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     monkeypatch.setattr(cdp_input, "STREAM_AUTHORIZATION_RECHECK_SECONDS", 0.01)
-    closed = asyncio.Event()
+    clock = ScopedTime()
+    monkeypatch.setattr(cdp_input, "time", clock)
+    closed, rechecking = asyncio.Event(), asyncio.Event()
     close_calls: list[tuple[int, str]] = []
     calls = 0
 
@@ -35,10 +38,16 @@ async def test_cdp_reauthorization_retries_transient_errors_within_grace(
     async def reauthorize() -> bool:
         nonlocal calls
         calls += 1
+        clock.now += cdp_input.STREAM_AUTHORIZATION_RECHECK_SECONDS
         if failure == "denied":
             raise PermissionError("credential not accessible")
         if failure == "sustained" or calls == 1:
             raise RuntimeError("transient authorization lookup failure")
+        if calls > 2:
+            # Later lookups stay pending so the test's cancel never lands just after one finished, which the
+            # stream's wait_for drops on Python 3.11 (CPython gh-86296).
+            rechecking.set()
+            await asyncio.Event().wait()
         return True
 
     task = asyncio.create_task(
@@ -51,8 +60,7 @@ async def test_cdp_reauthorization_retries_transient_errors_within_grace(
         if failure == "denied":
             assert calls == 1
     else:
-        while calls < 2:
-            await asyncio.sleep(0.001)
+        await asyncio.wait_for(rechecking.wait(), timeout=1)
         assert close_calls == []
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

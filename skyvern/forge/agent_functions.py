@@ -88,7 +88,7 @@ from skyvern.forge.sdk.services.request_principal import (
     scoped_api_key_id_from_actor,
 )
 from skyvern.forge.sdk.trace import traced
-from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar
+from skyvern.forge.sdk.workflow.models.block import BaseTaskBlock, BlockTypeVar, CodeFailure
 from skyvern.forge.sdk.workflow.retry_policy import WORKFLOW_WEBHOOK_HTTP_TIMEOUT_SECONDS
 from skyvern.schemas.run_enums import RunEngine, RunType
 from skyvern.schemas.workflows import BlockResult, CodeBlockFailureKind, FileStorageType, FileUploadDestination
@@ -298,7 +298,7 @@ class CopilotTriggerSummary:
 
 
 TriggerMappingReasonCode = Literal[
-    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed"
+    "mapping_path_missing", "invalid_mapping", "invalid_parameters", "owner_lookup_failed", "owner_not_authorized"
 ]
 
 
@@ -354,6 +354,7 @@ class CodeBlockEngineFailure:
     native_exception_class: str | None = None
     # Decided by the executor from the runner's typed code, so it survives when redaction empties the reason.
     failure_kind: CodeBlockFailureKind | None = None
+    code_failure: CodeFailure | None = None
 
 
 DownloadClaimOutcome = Literal["returned_proven", "returned_unproven", "raised"]
@@ -1071,6 +1072,10 @@ class AgentFunction:
         """Cloud may hide OSS email-forwarding routes until its ingress is configured."""
         return True
 
+    async def ensure_email_forwarding_management_available(self, organization_id: str) -> bool:
+        """Whether the organization may use the shared email-forwarding management routes."""
+        return await self.ensure_email_forwarding_available(organization_id)
+
     def report_download_failure(self, reason: str, *, failure_key: str | None = None) -> None:
         return None
 
@@ -1237,6 +1242,21 @@ class AgentFunction:
     async def enforce_platform_azure_vault_item_ownership(
         self, organization_id: str, vault_name: str, item_ids: set[str], azure_client_factory: AzureClientFactory
     ) -> None:
+        return None
+
+    async def enforce_platform_bitwarden_item_ownership(
+        self,
+        organization_id: str,
+        item_ids: set[str],
+        collection_ids: set[str],
+        *,
+        allow_own_token: bool = False,
+    ) -> bool:
+        """Return whether collection searches must be restricted to the validated collection."""
+        return False
+
+    def bitwarden_refetch_email(self, selected_email: str | None) -> str | None:
+        """Keep the legacy self-hosted refetch behavior."""
         return None
 
     async def enforce_platform_aws_secret_ownership(
@@ -1501,6 +1521,11 @@ class AgentFunction:
         run_id: str | None,
     ) -> None:
         """Clear navigation-failure strikes after a server-assigned browser address navigates."""
+        return None
+
+    async def proxy_unreachable_target_status(self, *, host: str, since: float) -> int | None:
+        """The upstream status the run's proxy provider refused a CONNECT to ``host`` with at or after ``since``
+        (``time.monotonic()``), when that status says the host did not accept the provider's connection."""
         return None
 
     async def capture_workflow_run_created(
@@ -1832,6 +1857,7 @@ class AgentFunction:
         download_binding: DownloadBinding | None = None,
         download_evidence: DownloadEvidenceProbe | None = None,
         download_log: BlockDownloadLog | None = None,
+        authored_code: str | None = None,
     ) -> CodeBlockEngineResult | None:
         """Run a CodeBlock through the secure runner, or return None for legacy.
 
@@ -2142,6 +2168,9 @@ class AgentFunction:
     def is_residential_browser_egress(self, browser_context: BrowserContext) -> bool:
         return False
 
+    def note_page_action(self, page: Page, action: Action) -> None:
+        return None
+
     async def on_browser_context_acquired(
         self,
         browser_context: Any,
@@ -2253,7 +2282,9 @@ class AgentFunction:
     ) -> None:
         return
 
-    def browser_session_create_admission(self, organization_id: str) -> AbstractAsyncContextManager[None]:
+    def browser_session_create_admission(
+        self, organization_id: str, *, copilot: bool = False
+    ) -> AbstractAsyncContextManager[None]:
         """Held around a browser-session create; a deployment refuses it by raising TooManyStartingBrowserSessions."""
         return nullcontext()
 
@@ -2315,7 +2346,7 @@ class AgentFunction:
         db_credential: Credential,
         credential_item: CredentialItem,
     ) -> CredentialItem:
-        return credential_item
+        return credential_item.model_copy(update={"passkeys": []})
 
     async def get_extra_extract_action_guidance(self, task: Task) -> str | None:
         return None
@@ -2436,8 +2467,9 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
-    async def post_code_block_execution(self, task: Task, step: Step) -> None:
-        """Billing seam for a code block's container task; called only after a successful execution."""
+    async def post_code_block_execution(self, task: Task, step: Step, *, is_first_successful_execution: bool) -> None:
+        """Billing seam for a code block's container task, called only after a successful execution.
+        is_first_successful_execution is True the first time the block's label reaches this hook in a run attempt."""
         return
 
     async def post_agent_step_execution(
