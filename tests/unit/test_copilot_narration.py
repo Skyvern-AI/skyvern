@@ -99,7 +99,9 @@ async def test_actual_run_polling_bridge_emits_progress_while_action_is_pending(
             return SimpleNamespace(status="running", modified_at=stamp), stamp + timedelta(seconds=1)
         await release.wait()
         return (
-            SimpleNamespace(status="completed", modified_at=stamp, failure_reason=None),
+            SimpleNamespace(
+                status="completed", modified_at=stamp, failure_reason=None, credits_used=0, cached_credits_used=0
+            ),
             stamp + timedelta(seconds=2),
         )
 

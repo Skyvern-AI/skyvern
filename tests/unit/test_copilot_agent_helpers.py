@@ -757,6 +757,30 @@ class TestFailedTestResponseNormalization:
             assert fact in rewritten
         assert "I tested the draft" not in rewritten
 
+    def test_a_browser_lost_after_the_run_started_never_claims_the_draft_was_tested(self) -> None:
+        lost = BuildTestConnectFailure(state="provisioning_unavailable", workflow_run_id="wr_lost")
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow: yes",
+            last_update_block_count=1,
+            last_test_ok=False,
+            last_test_run_started=True,
+            last_test_failure_reason=build_test_connect_failure_sentence(lost),
+            latest_recorded_build_test_outcome=RecordedBuildTestOutcome(
+                phase="persisted_block_run",
+                attempted_tool="update_and_run_blocks",
+                verdict="not_authoritative",
+                reason_code="unrecoverable_tool_error",
+                workflow_run_id="wr_lost",
+                connect_failure=lost,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("", ctx)
+
+        assert build_test_connect_failure_sentence(lost) in rewritten
+        assert "I tested the draft" not in rewritten
+
     def test_a_proxy_hop_failure_keeps_its_label_when_the_page_also_detected_a_challenge(self) -> None:
         ctx = _challenge_failure_ctx()
         ctx.effective_workflow_proxy_location = ProxyLocation.RESIDENTIAL_ES
@@ -1370,8 +1394,9 @@ workflow_definition:
         prompt = agent_module._recorded_build_test_outcome_prompt(ctx)
 
         assert "select_option timed out" in prompt
-        assert "browser_acquisition_failed:" in prompt
-        assert "cdp_connect_failed" in prompt
+        sentence = build_test_connect_failure_sentence(BuildTestConnectFailure(state="cdp_connect_failed"))
+        assert len(sentence) > 160
+        assert f"browser_acquisition_failed: {sentence}" in prompt
 
     def test_recorded_build_test_outcome_prompt_says_what_to_do_about_an_occupied_browser(self) -> None:
         """The bare state does not say what to do. The occupying run id stays out of prompt text, and
@@ -3076,7 +3101,11 @@ workflow_definition:
         assert isinstance(captured["persisted_yaml"], str)
         assert captured["persisted_yaml"].replace('"#amount"', '"#total"') == workflow_yaml
         assert ctx.workflow_yaml == captured["persisted_yaml"], "a failed run must retain the edited draft"
-        assert captured["run_params"] == {"block_labels": ["read_total"], "parameters": {}}
+        assert captured["run_params"] == {
+            "block_labels": ["read_total"],
+            "parameters": {},
+            "run_every_loop_iteration": False,
+        }
 
     @pytest.mark.asyncio
     async def test_unbound_credentials_persist_draft_and_skip_run(self, monkeypatch) -> None:
