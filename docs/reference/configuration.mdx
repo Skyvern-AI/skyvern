@@ -554,7 +554,7 @@ NACE_MODEL=drex-max
 ```
 
 <Note>
-A workflow system prompt (`workflow_system_prompt`) is sent to Drex ahead of the prompt, so its constraints still apply to these decisions. Drex Max returns probabilities, not text, so the `thoughts`/`reasoning` fields of these prompts carry the decision and its probability. Validation-type tasks (`decisive-criterion-validate`) are answered by the `NACE_DREX_MAX` LLM key when a run selects it through its `llm_key` override; any other prompt sent to that key is rejected.
+A workflow system prompt (`workflow_system_prompt`) is sent to Drex ahead of the prompt, so its constraints still apply to these decisions. Drex Max returns probabilities, not text, so the `thoughts`/`reasoning` fields of these prompts carry the decision and its probability. Validation-type tasks (`decisive-criterion-validate`) keep their usual LLM handler; the deployment-wide opt-in does not route them to Drex Max. The decision caller supports that prompt for internal callers using the registered `NACE_DREX_MAX` LLM key directly, but Drex Max is not available as a task `model.model_name` override. Any unsupported prompt sent to that key is rejected.
 </Note>
 
 ---
