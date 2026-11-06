@@ -13,6 +13,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StudioPaneDefaultsProvider } from "@/routes/workflows/studio/StudioPaneDefaults";
+import { StudioShellContext } from "@/routes/workflows/studio/StudioShellContext";
 import { useStudioPanes } from "@/routes/workflows/studio/useStudioPanes";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
@@ -207,8 +208,12 @@ async function renderChat(
     );
 }
 
+const showPaneCalls: string[] = [];
+let closeCopilotPane: (() => void) | null = null;
+
 function StudioPanesProbe() {
-  const { panes } = useStudioPanes();
+  const { panes, closePane } = useStudioPanes();
+  closeCopilotPane = () => closePane("copilot");
   return <output data-testid="studio-panes">{panes.join(",")}</output>;
 }
 
@@ -223,10 +228,21 @@ async function renderStudioChat(
   });
   render(
     <QueryClientProvider client={queryClient}>
-      <StudioPaneDefaultsProvider hasBlocks>
-        <StudioPanesProbe />
-        <WorkflowCopilotChat docked portalTarget={portalTarget} {...props} />
-      </StudioPaneDefaultsProvider>
+      <StudioShellContext.Provider
+        value={{
+          copilotPortalEl: null,
+          panelPortalEl: null,
+          setEditorStreamSlot: () => {},
+          setBrowserStreamSlot: () => {},
+          setRunStreamSlot: () => {},
+          showPane: (id) => showPaneCalls.push(id),
+        }}
+      >
+        <StudioPaneDefaultsProvider hasBlocks>
+          <StudioPanesProbe />
+          <WorkflowCopilotChat docked portalTarget={portalTarget} {...props} />
+        </StudioPaneDefaultsProvider>
+      </StudioShellContext.Provider>
     </QueryClientProvider>,
   );
   await waitFor(() =>
@@ -360,6 +376,31 @@ describe("WorkflowCopilotChat demonstration", () => {
       name: "Start demonstration",
     })) as HTMLButtonElement;
     expect(offer.disabled).toBe(true);
+  });
+
+  it("keeping the Editor open still asks to show the Browser last, so a folded Browser expands", async () => {
+    const removePortalTarget = await renderStudioChat({
+      liveBrowserSessionId: "browser-1",
+    });
+    try {
+      act(() => closeCopilotPane?.());
+      await waitFor(() =>
+        expect(screen.getByTestId("studio-panes").textContent).toBe("editor"),
+      );
+      showPaneCalls.length = 0;
+      act(() => {
+        useRecordingLauncherStore.getState().startDemonstration?.({
+          insertion: { after_label: "open_form", before_label: "finish" },
+          keepEditor: true,
+        });
+      });
+      expect(showPaneCalls[showPaneCalls.length - 1]).toBe("browser");
+      expect(screen.getByTestId("studio-panes").textContent).toContain(
+        "editor",
+      );
+    } finally {
+      removePortalTarget();
+    }
   });
 
   it("swaps Editor for the Browser pane while demonstrating and brings Editor back for the build", async () => {

@@ -1,5 +1,5 @@
 import { createContext } from "react";
-import type { DocEditApi, DocDestination } from "./docEditApi";
+import type { DocEditApi, DocDestination, DocPlace } from "./docEditApi";
 
 export type DocPendingNote = {
   ownerNodeId: string;
@@ -23,6 +23,9 @@ export const WorkflowDocActionsContext = createContext<{
   // Null when the doc is read-only (flag on but locked, a run going, or a read-only scope).
   edit: DocEditApi | null;
   destinations: () => DocDestination[];
+  // Starts a demonstration at this place; null where one can't start, so the menu leaves the item out.
+  // `replacing` is an empty step the recording takes the place of.
+  demonstrateAt: (place: DocPlace, replacing?: string) => (() => void) | null;
   outputUsers: (
     id: string,
   ) => Array<{ id: string; label: string; text: string }>;
@@ -51,6 +54,7 @@ export const WorkflowDocActionsContext = createContext<{
   toggleConditional: () => {},
   edit: null,
   destinations: () => [],
+  demonstrateAt: () => null,
   outputUsers: () => [],
   missingReference: () => false,
   createInput: null,
