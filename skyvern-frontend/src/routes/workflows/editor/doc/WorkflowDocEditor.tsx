@@ -33,6 +33,8 @@ import {
   WorkflowParameterValueType,
 } from "../../types/workflowTypes";
 import { isWorkflowBlockNode, type AppNode } from "../nodes";
+import { useBrowserTypeOptionsQuery } from "@/routes/workflows/utils";
+import { changedSettingCount } from "../nodes/StartNode/agentSettingsSummary";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { isEditableTarget } from "../editableTarget";
 import {
@@ -320,6 +322,13 @@ export function WorkflowDocEditor({
   const [validationProblems, setValidationProblems] = useState<
     WorkflowValidationProblem[]
   >([]);
+  const { data: browserTypeOptions } = useBrowserTypeOptionsQuery();
+  const changedSettingsCount = useMemo(() => {
+    const start = nodes.find((n) => n.type === "start" && !n.parentId);
+    return start?.type === "start" && start.data.withWorkflowSettings
+      ? changedSettingCount(start.data, { browserTypeOptions })
+      : 0;
+  }, [nodes, browserTypeOptions]);
   // The settings store is filled by the canvas Start node only once it renders.
   const finallyBlockLabel = useMemo(() => {
     const start = nodes.find((n) => n.type === "start" && !n.parentId);
@@ -1374,6 +1383,9 @@ export function WorkflowDocEditor({
                 >
                   <GearIcon className="size-[13px]" />
                   Agent settings
+                  {changedSettingsCount > 0
+                    ? ` · ${changedSettingsCount} changed`
+                    : ""}
                 </button>
               )}
               {inputs.length === 0 && !edit && (
@@ -1533,6 +1545,7 @@ export function WorkflowDocEditor({
             onTabChange={setPanelTab}
             selectedStep={selectedStepId ? byId.get(selectedStepId) : undefined}
             editable={editable}
+            settingsReadable={!proposal}
             learn={learn}
             onLearn={setLearn}
             onClose={closePanel}

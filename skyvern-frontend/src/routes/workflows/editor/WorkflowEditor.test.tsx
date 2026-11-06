@@ -523,6 +523,15 @@ beforeEach(() => {
   });
 });
 
+function openSettingsGroup(id: string) {
+  const trigger = screen
+    .getByTestId(`settings-group-${id}`)
+    .querySelector("button") as HTMLButtonElement;
+  if (trigger.getAttribute("aria-expanded") === "false") {
+    fireEvent.click(trigger);
+  }
+}
+
 describe("WorkflowEditor deleted-agent run fallback", () => {
   test("renders the studio run view from the run snapshot when the workflow query 404s", () => {
     workflowQueryMock.mockReturnValue({
@@ -1825,6 +1834,7 @@ describe("save failures stop navigation and block runs", () => {
     workflowQueryMock.mockReturnValue({ data: workflow, isLoading: false });
     const view = renderSettingsWorkspace(workflow);
     try {
+      openSettingsGroup("webhook");
       const webhook = screen.getByPlaceholderText(
         "https://",
       ) as HTMLInputElement;
@@ -4747,6 +4757,7 @@ describe("A49 metadata authorship through editor actions", () => {
             canvas.current!.nodes.find((node) => node.type === "start")!.id,
           ),
       );
+      openSettingsGroup("model");
       const selector = screen
         .getAllByRole("combobox")
         .find((element) => element.textContent?.includes("Proposal model"))!;
