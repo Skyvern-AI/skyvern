@@ -1782,6 +1782,30 @@ describe("summarizeFinishedTurn", () => {
     expect(fixed.fixed).toBe(true);
   });
 
+  it("does not count a run call refused before it dispatched as a failed test", () => {
+    const { rows } = deriveActivityLog(
+      turnWith(
+        [
+          entry({
+            id: "tr-1",
+            kind: "tool_result",
+            toolName: "update_and_run_blocks",
+            success: false,
+          }),
+          entry({
+            id: "tr-2",
+            kind: "tool_result",
+            toolName: "run_blocks_and_collect_debug",
+            success: false,
+            workflowRunId: "wr_1",
+          }),
+        ],
+        [],
+      ),
+    );
+    expect(summarizeFinishedTurn(rows, null).failedTests).toBe(1);
+  });
+
   it("names the blocks the newest test left failing", () => {
     const first = failedRun("tr-1", "wrb_a");
     const second = failedRun("tr-3", "wrb_b");
