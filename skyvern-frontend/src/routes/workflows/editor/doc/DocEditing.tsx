@@ -52,7 +52,7 @@ import {
   type PickerOpener,
 } from "./docKeys";
 import { DocText } from "./DocText";
-import { describeSaveFailure, releaseUnansweredSave } from "./docSaveState";
+import { saveAndReport, useDocSaveFailureStore } from "./docSaveState";
 import { WorkflowDocActionsContext } from "./WorkflowDocActionsContext";
 
 // Menus anchored to a Doc line stay between the Doc pane's top and bottom and inside the window, cap their
@@ -916,7 +916,12 @@ export function DocEditBar({
   const { undoShortcutLabel, redoShortcutLabel } = useUndoRedoShortcutLabels();
   const save = useSaveWorkflow();
   const [saving, setSaving] = useState(false);
-  const [saveFailure, setSaveFailure] = useState<string | null>(null);
+  const workflowPermanentId = useWorkflowYamlEditorStore(
+    (s) => s.editorOwner?.workflowPermanentId,
+  );
+  const saveFailure = useDocSaveFailureStore((s) =>
+    workflowPermanentId ? s.failures[workflowPermanentId] : undefined,
+  );
   // The studio's own dirty check: the draft is back to the saved baseline after a user edit.
   const matchesSaved = useWorkflowSnapshotStore(
     (s) => s.snapshot !== null && s.userHasEdited && !s.contentDirty,
@@ -955,15 +960,7 @@ export function DocEditBar({
   }, []);
   const runSave = () => {
     setSaving(true);
-    setSaveFailure(null);
-    // The save that fails is the one started here, even if the editor has moved on to another workflow by then.
-    const owner = useWorkflowYamlEditorStore.getState().editorOwner;
-    void save()
-      .catch((error: unknown) => {
-        releaseUnansweredSave(error, owner);
-        setSaveFailure(describeSaveFailure(error));
-      })
-      .finally(() => setSaving(false));
+    void saveAndReport(save).finally(() => setSaving(false));
   };
   useEffect(() => {
     if (hasChanges && matchesSaved && !saving) {
@@ -971,8 +968,17 @@ export function DocEditBar({
     }
   }, [hasChanges, matchesSaved, saving]);
   useEffect(() => {
-    if (!hasChanges) setSaveFailure(null);
-  }, [hasChanges]);
+    if (!hasChanges && workflowPermanentId)
+      useDocSaveFailureStore.getState().setFailure(workflowPermanentId, null);
+  }, [hasChanges, workflowPermanentId]);
+  // A save made while the Doc is hidden (Visual, Code) never clears the entry, so the bar drops it when it unmounts.
+  useEffect(
+    () => () => {
+      if (workflowPermanentId)
+        useDocSaveFailureStore.getState().setFailure(workflowPermanentId, null);
+    },
+    [workflowPermanentId],
+  );
   if (proposalPending || (!hasChanges && !canUndo && !canRedo))
     return floating ? (
       <div aria-hidden className="mb-3 h-[28px] sm:hidden" />
