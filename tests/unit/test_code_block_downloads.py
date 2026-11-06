@@ -1607,7 +1607,7 @@ async def test_raising_block_binds_download_that_already_landed(
     assert output["downloaded_file_artifact_ids"] == ["a_dl_1"]
     assert result.failure_reason == "Failed to execute code block. Reason: RuntimeError: Download is starting"
     assert result.failure_reason != block_module.DOWNLOAD_BINDING_FAILURE_REASON
-    assert _persisted_output() == output
+    assert {**_persisted_output(), "code_failure": output["code_failure"]} == output
 
 
 @pytest.mark.asyncio
@@ -1636,14 +1636,14 @@ async def test_raising_block_with_unregistered_download_persists_non_null_output
     persisted = _persisted_output()
     assert persisted is not None
     assert persisted[block_module.UNBOUND_DOWNLOAD_OUTPUT_KEY] is True
-    assert persisted == result.output_parameter_value
+    assert {**persisted, "code_failure": result.output_parameter_value["code_failure"]} == result.output_parameter_value
 
 
 @pytest.mark.asyncio
 async def test_raising_block_without_download_still_persists_no_output(
     monkeypatch: pytest.MonkeyPatch, _isolated_download_path: str
 ) -> None:
-    """A failure that downloaded nothing is unchanged: no registration, no output."""
+    """A failure that downloaded nothing records no output; only the block row carries the failure."""
     skyvern_context.set(SkyvernContext(organization_id="o_1", workflow_run_id="wr_1", run_id="wr_1"))
 
     _fake_storage_app(monkeypatch, save=AsyncMock(), get=AsyncMock(return_value=[]))
@@ -1662,7 +1662,10 @@ async def test_raising_block_without_download_still_persists_no_output(
     result = await block.execute(workflow_run_id="wr_1", workflow_run_block_id="", organization_id="o_1")
 
     assert result.success is False
-    assert result.output_parameter_value is None
+    assert result.error_codes == ["user_code_error"]
+    assert result.output_parameter_value == block_module.build_block_failure_output(result.failure_reason, []) | {
+        "code_failure": {"exception_class": "RuntimeError", "message": "boom", "line": None}
+    }
     CodeBlock.record_output_parameter_value.assert_not_awaited()
 
 
@@ -2740,7 +2743,12 @@ async def test_session_lane_is_inert_without_artifact_content_signing(
     claim.assert_not_awaited()
     fake_app.DATABASE.observer.get_workflow_run_block.assert_not_awaited()
     save_mock.assert_not_awaited()
-    assert result.output_parameter_value is None
+    assert result.output_parameter_value is not None
+    assert not result.output_parameter_value.keys() & {
+        "downloaded_files",
+        "downloaded_file_urls",
+        block_module.UNBOUND_DOWNLOAD_OUTPUT_KEY,
+    }
 
 
 @pytest.mark.asyncio

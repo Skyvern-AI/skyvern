@@ -27,6 +27,7 @@ import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
+import { splitAtCaret } from "./docCaret";
 import { block, conditional, forLoop, settings } from "./docTestBlocks";
 import type { DocGraphEdits } from "./docEditApi";
 import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
@@ -125,6 +126,155 @@ describe("WorkflowDocEditor navigation", () => {
     cleanup();
     useLocateBlockStore.getState().clearLocate();
     vi.unstubAllGlobals();
+  });
+
+  describe("keyboard-first editing", () => {
+    const editsWithAdd = (): DocGraphEdits => ({
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(() => "new_step"),
+      duplicate: vi.fn(),
+    });
+    // Opens the line and puts the caret `at` characters in; jsdom has no innerText, so the text is set both ways.
+    const openLine = (name: string, text: string, at: number) => {
+      fireEvent.focus(screen.getByRole("textbox", { name }));
+      const box = screen.getByRole("textbox", { name });
+      Object.defineProperty(box, "innerText", {
+        value: text,
+        configurable: true,
+      });
+      box.textContent = text;
+      const range = document.createRange();
+      if (box.firstChild) range.setStart(box.firstChild, at);
+      else range.setStart(box, 0);
+      range.collapse(true);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      return box;
+    };
+    const prompt = () =>
+      block("text_prompt", "write_it", null, { prompt: "Do the next thing" });
+
+    test("Enter at the end of a step adds a step of the same type below", () => {
+      const edits = editsWithAdd();
+      const nodes = renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 17);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(edits.addStep).mock.calls[0]![0].nodeType).toBe(
+        nodes.find(isWorkflowBlockNode)!.type,
+      );
+    });
+
+    test("Enter in the middle of a step splits its text between the two steps", () => {
+      const edits = editsWithAdd();
+      const nodes = renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 6);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).toHaveBeenCalledTimes(1);
+      const updates = vi.mocked(edits.update).mock.calls;
+      const last = updates[updates.length - 1]![0];
+      const first = last(nodes).find(isWorkflowBlockNode)!.data as Record<
+        string,
+        unknown
+      >;
+      expect(first.prompt).toBe("Do the");
+    });
+
+    test("Shift+Enter is a line break inside the step, not a new step", () => {
+      const edits = editsWithAdd();
+      renderDoc([prompt()], edits);
+      const box = openLine("write_it prompt", "Do the next thing", 17);
+      const proceeded = fireEvent.keyDown(box, {
+        key: "Enter",
+        shiftKey: true,
+      });
+
+      expect(proceeded).toBe(true);
+      expect(edits.addStep).not.toHaveBeenCalled();
+    });
+
+    test("a save while the caret is in a step leaves its text on screen", () => {
+      // jsdom has no innerText; the line reads and writes its text through it.
+      const innerText = Object.getOwnPropertyDescriptor(
+        HTMLElement.prototype,
+        "innerText",
+      );
+      Object.defineProperty(HTMLElement.prototype, "innerText", {
+        configurable: true,
+        get(this: HTMLElement) {
+          return this.textContent ?? "";
+        },
+        set(this: HTMLElement, text: string) {
+          this.textContent = text;
+        },
+      });
+      try {
+        const goal = "Find the book and return its price";
+        renderDoc(
+          [
+            block("extraction", "find_it", null, {
+              data_extraction_goal: goal,
+            }),
+          ],
+          editsWithAdd(),
+        );
+        fireEvent.focus(
+          screen.getByRole("textbox", { name: "find_it dataExtractionGoal" }),
+        );
+        const typing = screen.getByRole("textbox", {
+          name: "find_it dataExtractionGoal",
+        });
+        expect(typing.textContent).toBe(goal);
+        const caret = document.createRange();
+        caret.setStart(typing.firstChild!, "Find the ".length);
+        caret.setEnd(typing.firstChild!, "Find the book".length);
+        window.getSelection()?.removeAllRanges();
+        window.getSelection()?.addRange(caret);
+        fireEvent.keyDown(typing, { key: "s", metaKey: true });
+
+        // Saving holds the editor lock until the request settles.
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: true }),
+        );
+        act(() =>
+          useWorkflowYamlEditorStore.setState({ commitInProgress: false }),
+        );
+
+        const line = screen.getByRole("textbox", {
+          name: "find_it dataExtractionGoal",
+        });
+        expect(line.textContent).toBe(goal);
+        expect(document.activeElement).toBe(line);
+        expect(splitAtCaret(line)).toEqual([
+          "Find the ",
+          " and return its price",
+        ]);
+      } finally {
+        if (innerText)
+          Object.defineProperty(HTMLElement.prototype, "innerText", innerText);
+        else delete (HTMLElement.prototype as { innerText?: string }).innerText;
+      }
+    });
+
+    test("Tab on a note under an empty loop opens the step menu and picks no type", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [
+          forLoop("books", null, [], {
+            trailing_notes: "Open each book page",
+          }),
+        ],
+        edits,
+      );
+      const box = openLine("Note", "Open each book page", 19);
+      fireEvent.keyDown(box, { key: "Tab" });
+
+      expect(screen.getByPlaceholderText("Add a step…")).toBeTruthy();
+      expect(edits.addStep).not.toHaveBeenCalled();
+    });
   });
 
   test("Tab nests into the run branch displayed on screen without a manual selection", () => {
@@ -295,6 +445,26 @@ describe("WorkflowDocEditor navigation", () => {
     const input = screen.getByPlaceholderText("Search steps…");
     fireEvent.change(input, { target: { value: "find_by_label" } });
     expect(screen.getAllByRole("option")).toHaveLength(1);
+  });
+
+  test("the branch actions button shows only when the branch has an action", () => {
+    const edits: DocGraphEdits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(),
+      duplicate: vi.fn(),
+    };
+    renderDoc(
+      [
+        conditional("route", null, [
+          { id: "yes", next: "if_step", when: "found" },
+          { id: "otherwise", next: null },
+        ]),
+        code("if_step", null),
+      ],
+      edits,
+    );
+    expect(screen.queryByRole("button", { name: /Branch actions/ })).toBeNull();
   });
 
   test("collapse all closes loops and conditionals", () => {
@@ -685,6 +855,52 @@ describe("a step that was just added", () => {
       "1 problem",
     );
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
+  });
+
+  test("a loop over a whole extraction result holds Run; the typed list path does not", () => {
+    const steps = (reference: string) => [
+      block("extraction", "extraction_1", "books", {
+        data_extraction_goal: "List the titles",
+        data_schema: null,
+      }),
+      forLoop("books", null, [block("navigation", "open_book", null)], {
+        loop_over: null,
+        loop_variable_reference: reference,
+      }),
+    ];
+    renderDoc(steps("{{ extraction_1_output }}"));
+    expect(
+      screen.getByText(/^Pick the list inside extraction_1_output/),
+    ).toBeTruthy();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+    cleanup();
+    renderDoc(steps("{{ extraction_1_output.extracted_information.titles }}"));
+    expect(screen.queryByText(/Pick the list/)).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+  });
+
+  test("a freshly added loop over a picked whole result holds Run once the user leaves it", () => {
+    const nodes = renderDoc([
+      block("extraction", "extraction_1", "books", {
+        data_extraction_goal: "List the titles",
+        data_schema: null,
+      }),
+      forLoop("books", null, [block("navigation", "open_book", null)], {
+        loop_over: null,
+        loop_variable_reference: "{{extraction_1_output}}",
+      }),
+    ]);
+    const loop = nodes.find((n) => n.type === "loop")!;
+    act(() => useDocUnfinishedStore.getState().add(loop.id));
+    expect(screen.queryByText(/^Pick the list inside/)).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+
+    fireEvent.pointerDown(document.body);
+
+    expect(
+      screen.getByText(/^Pick the list inside extraction_1_output/),
+    ).toBeTruthy();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
   });
 
   test("a click inside a floating menu does not count as leaving the new step", () => {

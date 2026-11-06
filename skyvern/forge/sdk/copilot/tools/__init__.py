@@ -622,6 +622,7 @@ async def edit_block_and_run_tool(
     block_labels: list[str] | None = None,
     parameters: dict[str, Any] | None = None,
     reuse_outputs_from_run_id: str | None = None,
+    run_every_loop_iteration: bool = False,
 ) -> str:
     """Apply one exact code edit and immediately test the affected frontier.
 
@@ -647,6 +648,9 @@ async def edit_block_and_run_tool(
     inputs and execution settings. The result's `reused_block_outputs` lists each output used and its
     source run; `origin_output_not_reused` names a producer the other sources could not supply and why, and
     `named_output_not_reused` the first output the named run could not supply and why.
+
+    By default the test stops when a loop iteration ends on a failed block and returns that failure.
+    Set `run_every_loop_iteration` true to run every iteration, as a saved run would.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
@@ -665,6 +669,7 @@ async def edit_block_and_run_tool(
         "has_code_edit": True,
         "edit_source": "executed_source_reference" if reference_route else "anchored_replacement",
         "reuse_outputs_from_run_id": reuse_outputs_from_run_id,
+        "run_every_loop_iteration": run_every_loop_iteration,
     }
 
     def fail_before_run(result: dict[str, Any]) -> str:
@@ -821,6 +826,7 @@ async def edit_block_and_run_tool(
         parameters=runtime_parameters,
         handler_start=handler_start,
         reuse_outputs_from_run_id=reuse_outputs_from_run_id,
+        run_every_loop_iteration=run_every_loop_iteration,
     )
 
 
@@ -1486,6 +1492,7 @@ async def run_blocks_tool(
     parameters: dict[str, Any] | None = None,
     new_exit: bool = False,
     reuse_outputs_from_run_id: str | None = None,
+    run_every_loop_iteration: bool = False,
 ) -> Any:
     """Run one or more blocks of the current workflow, wait for completion,
     and return compact debug output (status, failure reason, visible elements).
@@ -1517,6 +1524,9 @@ async def run_blocks_tool(
     inputs and execution settings. The result's `reused_block_outputs` lists each output used and its
     source run; `origin_output_not_reused` names a producer the other sources could not supply and why, and
     `named_output_not_reused` the first output the named run could not supply and why.
+
+    By default the test stops when a loop iteration ends on a failed block and returns that failure.
+    Set `run_every_loop_iteration` true to run every iteration, as a saved run would.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
@@ -1527,6 +1537,7 @@ async def run_blocks_tool(
         "parameters": parameters or {},
         "new_exit": new_exit,
         "reuse_outputs_from_run_id": reuse_outputs_from_run_id,
+        "run_every_loop_iteration": run_every_loop_iteration,
     }
     authority_error = _authority_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
     if authority_error:
@@ -1589,7 +1600,7 @@ async def run_blocks_tool(
     strict_mode=False,
 )
 async def test_workflow_from_blank_browser_tool(
-    ctx: RunContextWrapper, parameters: dict[str, Any] | None = None
+    ctx: RunContextWrapper, parameters: dict[str, Any] | None = None, run_every_loop_iteration: bool = False
 ) -> str:
     """Test the staged candidate, or current canonical workflow, end to end.
 
@@ -1598,12 +1609,20 @@ async def test_workflow_from_blank_browser_tool(
     the workflow's saved profile settings are retained. Choose this test when useful; ordinary
     partial-run tools keep their current scope. Supply runtime workflow inputs in parameters.
     For a raw secret value (for example, a password), use a saved credential reference instead.
+
+    By default the test stops when a loop iteration ends on a failed block and returns that failure.
+    Set `run_every_loop_iteration` true to run every iteration, as a saved run would.
     """
     copilot_ctx = ctx.context
     await await_pending_credential_pause(copilot_ctx)
-    result = await run_workflow_end_to_end(copilot_ctx, parameters=parameters)
+    result = await run_workflow_end_to_end(
+        copilot_ctx, parameters=parameters, run_every_loop_iteration=run_every_loop_iteration
+    )
     record_tool_step_result_for_ctx(
-        copilot_ctx, "test_workflow_from_blank_browser", {"parameters": parameters or {}}, result
+        copilot_ctx,
+        "test_workflow_from_blank_browser",
+        {"parameters": parameters or {}, "run_every_loop_iteration": run_every_loop_iteration},
+        result,
     )
     enqueue_screenshot_from_result(
         copilot_ctx,
@@ -1746,6 +1765,7 @@ async def update_and_run_blocks_tool(
     parameters: dict[str, Any] | None = None,
     executed_source_references: dict[str, str] | None = None,
     reuse_outputs_from_run_id: str | None = None,
+    run_every_loop_iteration: bool = False,
 ) -> Any:
     """Update the workflow and immediately run the specified blocks in one step.
     Pass the complete workflow as a `workflow` object with the same keys as the workflow YAML, as in
@@ -1794,6 +1814,9 @@ async def update_and_run_blocks_tool(
     inputs and execution settings. The result's `reused_block_outputs` lists each output used and its
     source run; `origin_output_not_reused` names a producer the other sources could not supply and why, and
     `named_output_not_reused` the first output the named run could not supply and why.
+
+    By default the test stops when a loop iteration ends on a failed block and returns that failure.
+    Set `run_every_loop_iteration` true to run every iteration, as a saved run would.
     """
     workflow_yaml = dump_workflow_yaml(workflow)
     copilot_ctx = ctx.context
@@ -1810,6 +1833,7 @@ async def update_and_run_blocks_tool(
         "parameters": parameters or {},
         "executed_source_labels": sorted(executed_source_references or {}),
         "reuse_outputs_from_run_id": reuse_outputs_from_run_id,
+        "run_every_loop_iteration": run_every_loop_iteration,
     }
     skip_run_after_update = _update_and_run_requires_skipped_run(copilot_ctx, "update_and_run_blocks")
     # Cleared unconditionally up front and only set True at the actual skip
@@ -1883,6 +1907,7 @@ async def update_and_run_blocks_tool(
         parameters=parameters or {},
         handler_start=handler_start,
         reuse_outputs_from_run_id=reuse_outputs_from_run_id,
+        run_every_loop_iteration=run_every_loop_iteration,
     )
 
 
@@ -1937,6 +1962,7 @@ async def _run_updated_workflow_blocks(
     parameters: dict[str, Any],
     handler_start: float,
     reuse_outputs_from_run_id: str | None = None,
+    run_every_loop_iteration: bool = False,
 ) -> str:
     """Run a just-persisted definition through the shared frontier and debug-evidence seam."""
     async with use_named_output_source(copilot_ctx, reuse_outputs_from_run_id):
@@ -1963,7 +1989,11 @@ async def _run_updated_workflow_blocks(
         ):
             with pending_operation("tool.update_and_run_blocks"):
                 run_result = await _run_blocks_and_collect_debug(
-                    {"block_labels": block_labels, "parameters": parameters},
+                    {
+                        "block_labels": block_labels,
+                        "parameters": parameters,
+                        "run_every_loop_iteration": run_every_loop_iteration,
+                    },
                     copilot_ctx,
                     labels_to_execute=labels_to_execute,
                     block_outputs_to_seed=block_outputs_to_seed,
@@ -2173,14 +2203,16 @@ async def upload_attached_file_tool(ctx: RunContextWrapper, file_id: str, select
 
 @function_tool(failure_error_function=copilot_tool_failure, name_override=READ_PDF_TOOL_NAME)
 async def read_attached_pdf_tool(ctx: RunContextWrapper, file_id: str, offset: int = 0) -> str:
-    """Return the text of a PDF the user attached to this chat (`file_id` exactly as listed in the attached files),
-    without a browser or a workflow run, and without adding anything to the workflow. Long text comes back in windows:
-    `total_chars` is the length of the whole document's text, and passing `next_offset` as `offset` reads the next
-    window (null when this window reaches the end). Any other `offset` is moved back to the start of the window that
-    contains it. Pages past the first 256,000 tokens of a document's text are not
-    extracted, so `total_chars` stops there. Passwords, keys and other secrets in the text read
+    """Return the text of a PDF or Word .docx document the user attached to this chat (`file_id` exactly as listed in
+    the attached files), without a browser or a workflow run, and without adding anything to the workflow. Long text
+    comes back in windows: `total_chars` is the length of the whole document's text, and passing `next_offset` as
+    `offset` reads the next window (null when this window reaches the end). Any other `offset` is moved back to the
+    start of the window that contains it. Text past the first 256,000 tokens of a document is not extracted, so
+    `total_chars` stops there. A .docx comes back as its paragraphs and table rows (cells joined by ` | `) in
+    document order. Passwords, keys and other secrets in the text read
     `[REDACTED_SECRET]`. `text_layer_warning` is present when the PDF's embedded font maps characters wrongly, so
-    letters and digits in `text` may not match the page. A PDF whose pages are only images has no text to return."""
+    letters and digits in `text` may not match the page. Images inside the file are not read, so a PDF whose pages
+    are only images has no text to return."""
     authority_error = _authority_tool_error(ctx.context, READ_PDF_TOOL_NAME)
     if authority_error:
         return _diagnosis_repair_tool_error(ctx.context, READ_PDF_TOOL_NAME, authority_error)

@@ -3445,6 +3445,8 @@ async def test_completed_missing_output_complete_fact_packet_reaches_ordinary_re
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     block = WorkflowRunBlock(
         workflow_run_block_id="wrb_completed_missing_output",

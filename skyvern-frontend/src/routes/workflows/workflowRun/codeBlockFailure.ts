@@ -1,4 +1,9 @@
-import { Status, type ActionsApiResponse } from "@/api/types";
+import {
+  ActionTypes,
+  getReadableActionType,
+  Status,
+  type ActionsApiResponse,
+} from "@/api/types";
 import { isRecord } from "@/util/utils";
 
 import {
@@ -29,6 +34,10 @@ export type CodeBlockFailure = {
   // rewriting something that was never wrong; a NameError, conversely, will
   // raise again on every retry.
   recovery: CodeBlockRecovery;
+  // From output.code_failure, which rows written before it existed lack. Never parsed out of the reason.
+  message: string | null;
+  exceptionClass: string | null;
+  sourceLine: string | null;
 };
 
 export type RunCodeBlockFailure = CodeBlockFailure & {
@@ -41,13 +50,16 @@ export function failureSupportsScreenshot(failure: CodeBlockFailure): boolean {
   return failure.kind === "user-code" || failure.kind === "browser";
 }
 
-type CodeBlockFailureTemplate = Omit<CodeBlockFailure, "code" | "line">;
+type CodeBlockFailureTemplate = Omit<
+  CodeBlockFailure,
+  "code" | "line" | "message" | "exceptionClass" | "sourceLine"
+>;
 
 const INFRASTRUCTURE: CodeBlockFailureTemplate = {
   kind: "infrastructure",
   title: "The code sandbox failed before the block finished",
   guidance:
-    "This is a Skyvern-side fault, not a problem with your code. Retry the run, and reach out if it keeps happening.",
+    "This is a Skyvern-side fault, not a problem with the block's code. Retry the run, and reach out if it keeps happening.",
   recovery: "retry",
 };
 
@@ -58,35 +70,35 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "user-code",
     title: "The block's code raised an error",
     guidance:
-      "Open the block and fix the line that raised. Rerunning without an edit fails the same way.",
+      "The block's code stopped on an error it raised, so rerunning it unchanged fails the same way. Fix with Copilot reads this run and repairs the block.",
     recovery: "fix",
   },
   insecure_code_detected: {
     kind: "user-code",
     title: "The code used a blocked operation",
     guidance:
-      "Code blocks run in a locked-down sandbox. Rewrite the step using a supported Skyvern helper instead.",
+      "Code blocks run in a locked-down sandbox, and this operation is not allowed there. Fix with Copilot can replace the step with a supported Skyvern helper.",
     recovery: "fix",
   },
   unsupported_page_operation: {
     kind: "user-code",
     title: "The code called an unsupported browser operation",
     guidance:
-      "Only the page operations Skyvern proxies into the sandbox are available. Use a supported page method, or move the step into a browser block.",
+      "Only the page operations Skyvern proxies into the sandbox are available. Fix with Copilot can switch the step to a supported page method or a browser block.",
     recovery: "fix",
   },
   unsupported_skyvern_helper: {
     kind: "user-code",
     title: "The code called an unsupported Skyvern helper",
     guidance:
-      "Only the helpers Skyvern proxies into the sandbox are available. Check the helper name against the code block reference.",
+      "Only the helpers Skyvern proxies into the sandbox are available, and this one is not among them. Fix with Copilot can switch it to a supported helper.",
     recovery: "fix",
   },
   browser_operation_failed: {
     kind: "browser",
     title: "A browser operation failed",
     guidance:
-      "The page did not respond as the code expected — the site may be blocking the browser, or the element may not have loaded. Check this block's screenshot, then retry.",
+      "The page did not respond as the code expected — the site may be blocking the browser, or the element may not have loaded. Check this block's screenshot, then retry, or use Fix with Copilot if the page has changed.",
     recovery: "either",
   },
   browser_disconnected: {
@@ -100,28 +112,28 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The code block ran out of time",
     guidance:
-      "It hit the code block time limit. Shorten the work, wait on a narrower condition, or split it across blocks.",
+      "It hit the code block time limit. Retry if the site was slow; Fix with Copilot can narrow what the block waits on or split the work across blocks.",
     recovery: "either",
   },
   output_limit_exceeded: {
     kind: "limit",
     title: "The block returned too much data",
     guidance:
-      "Return only the fields the next block needs instead of the whole payload.",
+      "The block returned more data than can be passed on. Fix with Copilot can trim it to the fields the next block needs.",
     recovery: "fix",
   },
   result_limit_exceeded: {
     kind: "limit",
     title: "The block returned too much data",
     guidance:
-      "Return only the fields the next block needs instead of the whole payload.",
+      "The block returned more data than can be passed on. Fix with Copilot can trim it to the fields the next block needs.",
     recovery: "fix",
   },
   memory_limit_exceeded: {
     kind: "limit",
     title: "The block ran out of memory",
     guidance:
-      "Process data in smaller batches, or return only the fields the next block needs.",
+      "The block's data did not fit in the sandbox's memory. Fix with Copilot can process it in smaller batches or return fewer fields.",
     recovery: "fix",
   },
   parameter_reassembly_memory_limit_exceeded: {
@@ -156,20 +168,20 @@ const FAILURE_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     ...INFRASTRUCTURE,
     title: "The block's inputs could not be transferred",
     guidance:
-      "The block's inputs could not be transferred to the sandbox safely. This is a Skyvern-side transport fault, not your code — retry, and reach out if it keeps happening.",
+      "The block's inputs could not be transferred to the sandbox safely. This is a Skyvern-side transport fault, not the block's code — retry, and reach out if it keeps happening.",
   },
   parameter_limit_exceeded: {
     kind: "limit",
     title: "The block's inputs are too large to transfer",
     guidance:
-      "The block's inputs exceeded the maximum size that can be transferred to the sandbox. Have an earlier block pass in less data.",
+      "The block's inputs exceeded the maximum size that can be transferred to the sandbox. Fix with Copilot can have an earlier block pass in less data.",
     recovery: "fix",
   },
   unspecified: {
     kind: "user-code",
     title: "The code block failed",
     guidance:
-      "Open the block to see which line stopped the run, then edit it or retry.",
+      "The block's code stopped without a recognized cause. Retry it, or use Fix with Copilot to diagnose the run.",
     recovery: "either",
   },
 };
@@ -220,7 +232,7 @@ const REASON_ONLY_FAILURES: Array<{
       kind: "user-code",
       title: "The block raised an undeclared error code",
       guidance:
-        "ErrorCode() was raised with a code that is not in the workflow's error code mapping, so it could not be reported as a workflow error. Declare the code in the mapping, or raise one that is already declared.",
+        "ErrorCode() was raised with a code that is not in the workflow's error code mapping, so it could not be reported as a workflow error. Fix with Copilot can declare the code or raise one that is already declared.",
       recovery: "fix",
     },
   },
@@ -271,6 +283,26 @@ function lineFromReason(reason: string): number | null {
   return Number.isFinite(line) && line > 0 ? line : null;
 }
 
+function codeFailureFacts(output: WorkflowRunBlock["output"]): {
+  message: string | null;
+  exceptionClass: string | null;
+  line: number | null;
+  sourceLine: string | null;
+} {
+  const facts: Record<string, unknown> =
+    isRecord(output) && isRecord(output.code_failure)
+      ? output.code_failure
+      : {};
+  const text = (value: unknown) =>
+    typeof value === "string" && value.trim() ? value.trim() : null;
+  return {
+    message: text(facts.message),
+    exceptionClass: text(facts.exception_class),
+    line: typeof facts.line === "number" && facts.line > 0 ? facts.line : null,
+    sourceLine: text(facts.source_line),
+  };
+}
+
 export function actionCodeLine(action: ActionsApiResponse): number | null {
   const output = action.output;
   if (!output || typeof output !== "object" || Array.isArray(output)) {
@@ -304,21 +336,21 @@ const DENIAL_TEMPLATES: Record<string, CodeBlockFailureTemplate> = {
     kind: "limit",
     title: "The block used too many browser operations",
     guidance:
-      "This block issued more browser operations in a single run than the per-run limit allows. Split the work across several runs, or narrow what each run processes.",
+      "This block issued more browser operations in a single run than the per-run limit allows. Fix with Copilot can split the work across several runs or narrow what each run processes.",
     recovery: "fix",
   },
   "codeblock.page_operation_broker.HandleLimitExceeded": {
     kind: "limit",
     title: "The block held too many browser objects",
     guidance:
-      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object until it is released with dispose() or the run ends. Read rows through page.locator(...), .nth() and .all() chains instead, which hold none, release each temporary object with dispose() in a finally block, or split the work across several runs.",
+      "This block used more live browser objects in a single run than the per-run limit allows. Every query_selector or element_handle result, .all() on a filtered, get_by_* or frame-rooted locator, and each locator passed as an argument holds one object until it is released or the run ends. Fix with Copilot can move the block to locator chains that hold none, release each object as it goes, or split the work across several runs.",
     recovery: "fix",
   },
   "codeblock.page_operation_broker.BlockedEgressError": {
     kind: "browser",
     title: "The block navigated to a blocked destination",
     guidance:
-      "Navigation is limited to reachable external web addresses. Check the URL this block navigates to \u2014 internal, unroutable, and non-web destinations are refused.",
+      "Navigation is limited to reachable external web addresses; internal, unroutable, and non-web destinations are refused. Fix with Copilot can correct the URL this block navigates to.",
     recovery: "fix",
   },
 };
@@ -446,17 +478,27 @@ export function describeCodeBlockFailure(
     return null;
   }
   const { template, code } = resolved;
+  const facts = codeFailureFacts(block.output);
   const line =
-    lineFromReason(reason) ?? failingCodeLineFromActions(block.actions);
-  // A named exception is the clearest headline there is, and it also settles a
-  // reason the generic templates can only call "the code block failed".
-  const raised = template.kind === "user-code" ? exceptionName(reason) : null;
+    facts.line ??
+    lineFromReason(reason) ??
+    failingCodeLineFromActions(block.actions);
 
   return {
     ...template,
-    title: raised ? `The block's code raised ${raised}` : template.title,
+    // Only an allowlisted builtin raise carries the author's own sentence; runner refusals and
+    // class-less inline text are platform or driver text, so they keep the template title.
+    title:
+      template.kind === "user-code" && facts.exceptionClass && facts.message
+        ? facts.message
+        : template.title,
     code,
     line,
+    message: facts.message,
+    exceptionClass:
+      facts.exceptionClass ??
+      (template.kind === "user-code" ? exceptionName(reason) : null),
+    sourceLine: facts.sourceLine,
   };
 }
 
@@ -506,6 +548,33 @@ export function findRunCodeBlockFailure(
   return failure === null
     ? null
     : { ...failure, workflowRunBlockId: culprit.workflow_run_block_id };
+}
+
+// Actions arrive newest-first; the failed row the recorder adds for a raise is a null action, not a
+// browser step.
+export function lastBrowserStep(
+  actions: Array<ActionsApiResponse> | null | undefined,
+): { label: string; secondsBeforeError: number | null } | null {
+  const recorded = actions ?? [];
+  const step = recorded.find(
+    (action) => action.action_type !== ActionTypes.NullAction,
+  );
+  if (!step) {
+    return null;
+  }
+  const errorAt = Date.parse(
+    recorded.find((action) => action.status === Status.Failed)?.created_at ??
+      "",
+  );
+  const stepAt = Date.parse(step.created_at ?? "");
+  const gap = errorAt - stepAt;
+  return {
+    label: getReadableActionType(step.action_type),
+    secondsBeforeError:
+      step.status !== Status.Failed && Number.isFinite(gap) && gap >= 0
+        ? gap / 1000
+        : null,
+  };
 }
 
 export function formatCodeBlockErrorCode(code: string): string {

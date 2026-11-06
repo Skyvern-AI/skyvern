@@ -1,7 +1,10 @@
+import { useState } from "react";
 import { CheckIcon, Cross2Icon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/util/utils";
+import { TIPS, docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { docStarterDone } from "./useDocStarter";
+import { modLabel } from "./docKeys";
 
 export const DOC_SAMPLE_NOTE =
   "One thing per line. Lines without a tag, like this one, are notes the agent reads while it runs.";
@@ -27,13 +30,20 @@ function Key({ children }: { children: string }) {
 }
 
 export function DocKeyHints() {
+  const mod = modLabel();
   return (
     <p
       aria-label="Keyboard shortcuts"
       className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[12.5px] text-muted-foreground"
     >
       <span>
-        <Key>/</Key>add a step
+        <Key>Enter</Key>new step
+      </span>
+      <span>
+        <Key>Shift+Enter</Key>line break
+      </span>
+      <span>
+        <Key>/</Key>change the step type
       </span>
       <span>
         <Key>@</Key>use an input or earlier result
@@ -41,50 +51,21 @@ export function DocKeyHints() {
       <span>
         <Key>Tab</Key>nest under the step above
       </span>
+      <span>
+        <Key>{`${mod}.`}</Key>settings
+      </span>
+      <span>
+        <Key>{`${mod}Enter`}</Key>run step
+      </span>
+      <span>
+        <Key>{`${mod}Shift+Enter`}</Key>run agent
+      </span>
+      <span>
+        <Key>{`${mod}S`}</Key>save
+      </span>
     </p>
   );
 }
-
-export type DocStarterProgress = {
-  steps: number;
-  usedReference: boolean;
-  nested: boolean;
-  hasContainer: boolean;
-  problems: number;
-  ran: boolean;
-};
-
-const TIPS: Array<{
-  id: string;
-  when: (p: DocStarterProgress) => boolean;
-  text: string;
-}> = [
-  {
-    id: "slash",
-    when: () => true,
-    text: "On any line, type / to add a step, or @ to use an input or an earlier result.",
-  },
-  {
-    id: "step",
-    when: (p) => p.steps > 0,
-    text: "It's a step now. Backspace at the start of its line turns it back into a note.",
-  },
-  {
-    id: "nest",
-    when: (p) => p.hasContainer,
-    text: "Tab moves a line into the loop or If above it. Shift+Tab moves it back out.",
-  },
-  {
-    id: "problems",
-    when: (p) => p.problems > 0,
-    text: "What a step still needs is flagged in red as you go. Run waits until it's fixed.",
-  },
-  {
-    id: "run",
-    when: (p) => p.steps >= 2 && p.problems === 0,
-    text: "Ready to try it? Press Run, top right.",
-  },
-];
 
 export function DocTip({
   progress,
@@ -95,7 +76,7 @@ export function DocTip({
   seen: string[];
   onSeen: (tip: string) => void;
 }) {
-  const index = TIPS.findIndex((t) => !seen.includes(t.id) && t.when(progress));
+  const index = docTipIndex(progress, seen);
   const tip = TIPS[index];
   if (!tip) return null;
   return (
@@ -129,12 +110,23 @@ export function DocGettingStarted({
   progress,
   kept = [],
   onHide,
+  folded = false,
+  compact = false,
+  clearOfPanel = false,
 }: {
+  // The side panel takes up to 24rem or 45% of the pane on its right; stay left of it.
+  clearOfPanel?: boolean;
+  // A narrow pane shows a small pill that opens the card, so it never covers the step being edited.
+  compact?: boolean;
   progress: DocStarterProgress;
+  // Inert pill while a toast needs the corner; it is short-lived, so there is nothing to open.
+  folded?: boolean;
   // Items ticked earlier in this agent; they stay ticked when the draft no longer satisfies them.
   kept?: string[];
   onHide: () => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const asPill = folded || (compact && !expanded);
   const doneIds = [...docStarterDone(progress), ...kept];
   const items: Array<[boolean, string, string]> = [
     [doneIds.includes("step"), "Make a step yourself", "Type / on a line"],
@@ -151,10 +143,33 @@ export function DocGettingStarted({
     [doneIds.includes("run"), "Run it", "Run, top right"],
   ];
   const done = items.filter(([d]) => d).length;
+  const position = cn(
+    "absolute bottom-4 z-40",
+    clearOfPanel ? "right-[calc(min(24rem,45%)+1.25rem)]" : "right-5",
+  );
+  if (asPill) {
+    return (
+      <button
+        type="button"
+        aria-label={`Getting started, ${done} of ${items.length} done`}
+        disabled={folded}
+        onClick={() => setExpanded(true)}
+        className={cn(
+          position,
+          "rounded-full border border-border bg-popover px-3 py-1.5 text-[13px] font-medium text-popover-foreground shadow-md outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        )}
+      >
+        Getting started · {done}/{items.length}
+      </button>
+    );
+  }
   return (
     <aside
       aria-label="Getting started"
-      className="mt-4 w-[250px] max-w-full rounded-[10px] border border-border bg-popover px-3 py-2.5 text-[13.5px] text-popover-foreground shadow-md"
+      className={cn(
+        position,
+        "w-[250px] max-w-[calc(100%-2.5rem)] rounded-[10px] border border-border bg-popover px-3 py-2.5 text-[13.5px] text-popover-foreground shadow-md",
+      )}
     >
       <div className="flex items-center gap-2">
         <b className="flex-1 text-[13.5px] font-bold">Getting started</b>
@@ -163,8 +178,8 @@ export function DocGettingStarted({
         </span>
         <button
           type="button"
-          aria-label="Hide checklist"
-          onClick={onHide}
+          aria-label={compact ? "Collapse checklist" : "Hide checklist"}
+          onClick={compact ? () => setExpanded(false) : onHide}
           className="grid size-5 place-items-center rounded text-muted-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
         >
           <Cross2Icon className="size-3" />

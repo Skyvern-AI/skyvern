@@ -4,6 +4,9 @@ import {
   type WorkflowRunBlock,
   type WorkflowRunTimelineItem,
 } from "../../types/workflowRunTypes";
+import { describeCodeBlockFailure } from "../../workflowRun/codeBlockFailure";
+import { formatFailureReason } from "../../workflowRun/failureReasonFormat";
+import { failureHeadlineInPlainWords } from "./docFailureText";
 
 export type DocTagState =
   | "running"
@@ -19,6 +22,18 @@ const FAILED = new Set<string | null>([
   Status.TimedOut,
   Status.Terminated,
 ]);
+
+/** The short headline the Run panel states for a failed block; one source for every Doc line. */
+export function blockFailureHeadline(block: WorkflowRunBlock): string | null {
+  if (!block.failure_reason?.trim()) return null;
+  return (
+    describeCodeBlockFailure(block)?.title ??
+    failureHeadlineInPlainWords(
+      block.failure_reason,
+      (raw) => formatFailureReason(raw).headline,
+    )
+  );
+}
 
 // A Stop step that did its job ends "terminated"; one whose reason failed to render ends "failed".
 export const stoppedOnPurpose = (block: WorkflowRunBlock) =>
@@ -62,7 +77,7 @@ export type DocLoopItem = {
   index: number;
   value: string | null;
   state: "running" | "succeeded" | "failed" | "waiting";
-  failureReason: string | null;
+  failureHeadline: string | null;
 };
 
 export type DocLoopProgress = { total: number | null; items: DocLoopItem[] };
@@ -129,7 +144,7 @@ export function collectLoopProgress(
               index,
               value: blocks.find((b) => b.current_value)?.current_value ?? null,
               state: itemState(blocks),
-              failureReason: failed?.failure_reason ?? null,
+              failureHeadline: failed ? blockFailureHeadline(failed) : null,
             };
           });
         into.set(block.label, {

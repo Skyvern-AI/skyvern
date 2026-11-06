@@ -41,6 +41,7 @@ export type WorkflowRunBlock = {
   continue_on_failure: boolean;
   task_id: string | null;
   url: string | null;
+  final_url?: string | null;
   navigation_goal: string | null;
   navigation_payload: Record<string, unknown> | null;
   data_extraction_goal: string | null;

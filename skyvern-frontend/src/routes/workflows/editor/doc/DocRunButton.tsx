@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { DOC_RUN_AGENT_EVENT } from "./docKeys";
 import { PlayIcon, ReloadIcon, StopIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -45,6 +46,7 @@ import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import { useStudioRunId } from "../../studio/useStudioRunId";
 import { docRunEndMessage, docRunRowsSettled } from "./docRunState";
 import { useDocRunStore, type DocRunInput } from "./docRunStore";
+import { saveAndReport } from "./docSaveState";
 import { docLatestRunKey, useDocRun } from "./useDocRun";
 
 class DocSaveFailedError extends Error {}
@@ -190,6 +192,7 @@ export function DocRunButton() {
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [needed, setNeeded] = useState<Set<string>>(new Set());
   const fields = useRef(new Map<string, HTMLElement | null>());
+  const submitRef = useRef<HTMLButtonElement>(null);
 
   const stayInDoc = (search: string) => {
     preserveNextEntry(search, resolveLivePanes());
@@ -201,11 +204,18 @@ export function DocRunButton() {
     mutationFn: async (data: Record<string, unknown>) => {
       // Never run an older saved version than the doc on screen.
       if (useWorkflowHasChangesStore.getState().hasChanges) {
-        try {
-          await saveWorkflow.mutateAsync(undefined);
-        } catch {
-          throw new DocSaveFailedError();
-        }
+        // A refusal is not stored: the save's own toast already says it.
+        const outcome = await saveAndReport(
+          () => saveWorkflow.mutateAsync(undefined),
+          { recordRefusals: false },
+        );
+        // An unanswered save has no toast of its own, and the edit bar's reason can be scrolled out of view.
+        if (outcome === "released")
+          toast({
+            variant: "destructive",
+            title: "Couldn't save: can't reach the server",
+          });
+        if (outcome !== "saved") throw new DocSaveFailedError();
         if (useWorkflowHasChangesStore.getState().hasChanges)
           throw new Error("Save the agent before running");
       }
@@ -248,7 +258,7 @@ export function DocRunButton() {
     onError: (
       error: Error & { response?: { data?: { detail?: unknown } } },
     ) => {
-      // A failed save already showed its own reason.
+      // A failed save already told the person.
       if (error instanceof DocSaveFailedError) return;
       const detail = error.response?.data?.detail;
       toast({
@@ -393,6 +403,18 @@ export function DocRunButton() {
     if (urlRunId) stayInDoc(searchWithoutRun(liveSearch(location.search)));
   };
 
+  const runShortcut = useRef<() => void>(() => {});
+  runShortcut.current = () => {
+    if (open) run_();
+    else if (!start.isPending && !runBlocked && !(live && owned && runId))
+      openPopover();
+  };
+  useEffect(() => {
+    const onRun = () => runShortcut.current();
+    window.addEventListener(DOC_RUN_AGENT_EVENT, onRun);
+    return () => window.removeEventListener(DOC_RUN_AGENT_EVENT, onRun);
+  }, []);
+
   if (live && owned && runId)
     return (
       <Button
@@ -458,6 +480,10 @@ export function DocRunButton() {
             if (target) {
               event.preventDefault();
               target.focus();
+            } else {
+              // No inputs: Enter should run, not press whichever button comes first.
+              event.preventDefault();
+              submitRef.current?.focus();
             }
           }}
         >
@@ -510,7 +536,7 @@ export function DocRunButton() {
               >
                 Cancel
               </Button>
-              <Button type="submit" className="h-8 px-3">
+              <Button type="submit" ref={submitRef} className="h-8 px-3">
                 Run
               </Button>
             </div>

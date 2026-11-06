@@ -391,6 +391,11 @@ async def get_current_org_for_credential_routes(
 async def get_current_org_for_email_forwarding(
     current_org: Organization = Depends(get_current_org_for_credential_routes),
 ) -> Organization:
+    if not await app.AGENT_FUNCTION.ensure_email_forwarding_management_available(current_org.organization_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email 2FA forwarding requires the Pro plan.",
+        )
     return current_org
 
 

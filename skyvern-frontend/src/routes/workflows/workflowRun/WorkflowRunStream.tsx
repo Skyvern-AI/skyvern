@@ -8,6 +8,7 @@ import { useFirstParam } from "@/hooks/useFirstParam";
 import { getWebSocketProtocols } from "@/util/env";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
+import { generateClientId } from "@/routes/streaming/webSocketParams";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
 import {
   StreamStatusPanel,
@@ -97,6 +98,7 @@ function WorkflowRunStream({
   const { data: workflowRun } = useWorkflowRunWithWorkflowQuery(
     workflowRunIdProp ? { workflowRunId: workflowRunIdProp } : undefined,
   );
+  const [clientId] = useState(generateClientId);
   const [streamImgSrc, setStreamImgSrc] = useState<string>("");
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
@@ -139,6 +141,7 @@ function WorkflowRunStream({
     containerRef,
     handlers,
   } = useCdpInput({
+    clientId,
     inputWsUrl,
     interactive,
     viewportWidth,

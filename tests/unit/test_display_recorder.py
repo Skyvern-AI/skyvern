@@ -184,6 +184,7 @@ def test_acquired_video_artifact_advertises_mp4_before_first_artifact_creation(
     try:
         acq = asyncio.run(run())
         assert acq.started is True
+        assert acq.spawn_seconds is not None and acq.ready_wait_seconds is not None
         assert acq.video_artifact is not None
         assert acq.video_artifact.video_file_extension == "mp4"
         assert (acq.video_artifact.video_path or "").endswith(".mp4")

@@ -219,7 +219,7 @@ def decode_demonstration_record(raw: Any) -> DemonstrationRecord | None:
             {
                 key: value
                 for key, value in data["insertion"].items()
-                if key in {"after_label", "before_label"} and (isinstance(value, str) or value is None)
+                if key in {"after_label", "before_label", "replace_label"} and (isinstance(value, str) or value is None)
             }
             if isinstance(data.get("insertion"), dict)
             else None
@@ -622,6 +622,7 @@ class DemonstrationRecorder:
         self.sensitive_count = 0
         self.event_limit_reached = False
         self.credential_filled_selectors: set[str] = set()
+        self.sensitive_field_frames: dict[str, dict[str, Any]] = {}
         # The page keeps running while a request is open, so later choosers wait their turn.
         self.file_requests: list[dict[str, Any]] = []
         self.intercepting_file_chooser = False
@@ -794,6 +795,8 @@ class DemonstrationRecorder:
             return
         if kind == "secret_focus":
             field = payload.get("field")
+            if isinstance(selector, str):
+                self.sensitive_field_frames[selector] = frame
             await self.stream.send(
                 {
                     "type": "demonstration_sensitive_field",
@@ -1049,9 +1052,13 @@ class DemonstrationRecorder:
         policy.credential_ask_login_page_urls = [credential.tested_url or source_url]
         apply_connected_credential_to_policy(self.recording_ctx, policy, credential)
         before = len(self.recording_ctx.scout_trajectory)
+        frame = self.sensitive_field_frames.get(selector, {"is_main": True, "name": ""})
+        frame_path = frame.get("path") or [None]
         self.credential_filled_selectors.add(selector)
         try:
-            result = await fill_credential_field(self.recording_ctx, selector, credential_id, field)
+            result = await fill_credential_field(
+                self.recording_ctx, selector, credential_id, field, frame=frame_path[0]
+            )
         finally:
             if self.tap is not None:
                 with contextlib.suppress(Exception):
@@ -1060,6 +1067,12 @@ class DemonstrationRecorder:
             self.credential_filled_selectors.discard(selector)
         scrubbed = scrub_secrets_from_structure(self.recording_ctx, result)
         if not isinstance(scrubbed, dict) or scrubbed.get("ok") is not True:
+            LOG.info(
+                "copilot_demonstration_credential_fill_failed",
+                field=field,
+                in_frame=not frame.get("is_main"),
+                error=scrubbed.get("error") if isinstance(scrubbed, dict) else None,
+            )
             await self._notice("The saved credential could not be filled.", level="error")
             return
         scout_fact: ScoutedInteraction | None = None
@@ -1071,7 +1084,7 @@ class DemonstrationRecorder:
             "kind": "credential_fill",
             "selector": selector,
             "source_url": source_url,
-            "frame": {"is_main": True, "name": ""},
+            "frame": frame,
             "credential_id": credential_id,
             "credential_name": credential.name,
             "field": field,

@@ -5,8 +5,12 @@ cannot be missing here, or vice versa.
 """
 
 import asyncio
+import inspect
+import runpy
 import sqlite3
-from types import SimpleNamespace
+import sys
+import threading
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -158,3 +162,27 @@ async def test_retry_recovery_never_blocks_startup_or_requests(monkeypatch, reco
         await asyncio.wait_for(context.__aexit__(None, None, None), timeout=1)
     stop_retry_recovery.assert_awaited_once()
     assert exited.is_set()
+
+
+def test_created_api_app_resolves_frozen_frames_without_rescanning_every_module(monkeypatch) -> None:
+    """Under `python -m`, Playwright calls without a saved stack resolve runpy's frozen frames via inspect.stack()."""
+    monkeypatch.setattr(inspect, "modulesbyfile", dict(inspect.modulesbyfile))
+    monkeypatch.delitem(inspect.modulesbyfile, "<frozen runpy>", raising=False)
+    scanned: list[str] = []
+
+    class ScanProbe(ModuleType):
+        @property
+        def __file__(self) -> str:
+            scanned.append(self.__name__)
+            raise AttributeError
+
+    monkeypatch.setitem(sys.modules, "_frozen_scan_probe", ScanProbe("_frozen_scan_probe"))
+    hooks = (sys.excepthook, threading.excepthook, sys.unraisablehook)
+    try:
+        api_app.create_api_app()
+    finally:
+        sys.excepthook, threading.excepthook, sys.unraisablehook = hooks
+    scanned.clear()
+
+    assert inspect.getmodule(object(), "<frozen runpy>") is runpy
+    assert scanned == []
