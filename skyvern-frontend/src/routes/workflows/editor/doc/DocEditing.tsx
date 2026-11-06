@@ -11,7 +11,7 @@ import {
 } from "react";
 import { ResetIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
-import { caretOnEdge, splitAtCaret } from "./docCaret";
+import { caretOnEdge, placeCaretAt, splitAtCaret } from "./docCaret";
 import {
   Command,
   CommandDialog,
@@ -47,6 +47,7 @@ import {
   DOC_RUN_AGENT_EVENT,
   armNextCaretAtStart,
   rememberReferenceLine,
+  takeNextCaretOffset,
   takeNextCaretAtStart,
   type LineSplit,
   type PickerOpener,
@@ -333,7 +334,15 @@ export function DocEditableLine({
       el.closest(IN_DOC)?.querySelectorAll<HTMLElement>("[data-doc-line]") ??
         [],
     ).filter((line) => line.getAttribute("aria-label") === label);
-    rememberReferenceLine(label ? { label, index: same.indexOf(el) } : null);
+    rememberReferenceLine(
+      label
+        ? {
+            label,
+            index: same.indexOf(el),
+            offset: splitAtCaret(el)?.[0].length ?? el.innerText.length,
+          }
+        : null,
+    );
   };
   useLayoutEffect(() => {
     const el = ref.current;
@@ -382,6 +391,8 @@ export function DocEditableLine({
     }
     window.getSelection()?.removeAllRanges();
     window.getSelection()?.addRange(range);
+    const offset = takeNextCaretOffset();
+    if (offset !== null) placeCaretAt(el, offset);
     // Only on entering edit mode, or coming back to it after a read-only spell.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing, editable]);

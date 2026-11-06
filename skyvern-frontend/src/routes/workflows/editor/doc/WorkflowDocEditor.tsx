@@ -51,7 +51,7 @@ import {
   saveDocInput,
 } from "./docInputs";
 import { DocInputEditor } from "./DocInputEditor";
-import { takeReferenceLine } from "./docKeys";
+import { armNextCaretOffset, takeReferenceLine } from "./docKeys";
 import type { ParametersState } from "../types";
 import { toast, useToast } from "@/components/ui/use-toast";
 import {
@@ -285,11 +285,14 @@ export function WorkflowDocEditor({
       const line = takeReferenceLine();
       const active = document.activeElement;
       if (!line || (active && active !== document.body)) return;
-      Array.from(
+      const target = Array.from(
         rootRef.current?.querySelectorAll<HTMLElement>("[data-doc-line]") ?? [],
-      )
-        .filter((el) => el.getAttribute("aria-label") === line.label)
-        [line.index]?.focus();
+      ).filter((el) => el.getAttribute("aria-label") === line.label)[
+        line.index
+      ];
+      if (!target) return;
+      armNextCaretOffset(line.offset);
+      target.focus();
     });
     return () => cancelAnimationFrame(frame);
   }, [editingInput]);
@@ -423,7 +426,6 @@ export function WorkflowDocEditor({
     insertStep: (place: DocPlace, nodeType: NodeType) => {
       const added = baseEdit.insertStep(place, nodeType);
       if (added) {
-        useDocUnfinishedStore.getState().add(added);
         // A login has nothing to run without its credential, so its settings open on it.
         if (nodeType === "login") openStepSettings(added);
       }

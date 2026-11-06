@@ -882,6 +882,21 @@ describe("back to plain text", () => {
     );
   });
 
+  test("an empty step goes and leaves a note spot where it stood", () => {
+    const graph = graphOf([
+      code("first", "empty", { prompt: "Open the page" }),
+      code("empty", null),
+    ]);
+    const result = toNote(graph, idOf(graph, "empty"))!;
+    expect(result.note).toEqual({
+      ownerNodeId: idOf(graph, "first"),
+      placement: "trailing",
+    });
+    expect(
+      (shape(result.graph) as Array<{ label: string }>).map((b) => b.label),
+    ).toEqual(["first"]);
+  });
+
   test("a step with settings beyond its text is not offered as plain text", () => {
     const graph = graphOf([
       code("configured", "plain", { code: "print(1)" }),
@@ -891,6 +906,17 @@ describe("back to plain text", () => {
       graph.nodes.find((n) => n.id === idOf(graph, label))!;
     expect(hasSettingsBeyondText(node("configured"))).toBe(true);
     expect(hasSettingsBeyondText(node("plain"))).toBe(false);
+  });
+
+  test("a switch turned off from its on-by-default setting counts as a setting", () => {
+    const graph = graphOf([
+      block("http_request", "fetch", null, { follow_redirects: false }),
+      block("http_request", "untouched", null),
+    ]);
+    const node = (label: string) =>
+      graph.nodes.find((n) => n.id === idOf(graph, label))!;
+    expect(hasSettingsBeyondText(node("fetch"))).toBe(true);
+    expect(hasSettingsBeyondText(node("untouched"))).toBe(false);
   });
 });
 

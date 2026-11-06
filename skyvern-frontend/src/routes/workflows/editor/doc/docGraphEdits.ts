@@ -585,19 +585,25 @@ export function checkLabel(
   return null;
 }
 
+/** The name stem for a step type: "Go to URL Block" gives go_to_url. */
+export function labelStem(title: string): string {
+  return (
+    title
+      .replace(/ Block$/, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .replace(/^(?=\d)/, "step_") || "step"
+  );
+}
+
 /** A free name read from the step type: "Go to URL Block" gives go_to_url_1. */
 export function newStepLabel(
   nodes: AppNode[],
   title: string,
   parameterKeys: readonly string[] = [],
 ): string {
-  const base =
-    title
-      .replace(/ Block$/, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .replace(/^(?=\d)/, "step_") || "step";
+  const base = labelStem(title);
   const taken = new Set(
     nodes.filter(isWorkflowBlockNode).map((n) => n.data.label),
   );
@@ -979,7 +985,8 @@ export function hasSettingsBeyondText(node: AppNode): boolean {
       !key.startsWith("_") &&
       // Where the step sits in a conditional is not a setting.
       !key.startsWith("conditional") &&
-      !blank(value) &&
+      // A switch turned off from an on-by-default setting is a choice, not an empty field.
+      (!blank(value) || (value === false && defaults[key] === true)) &&
       JSON.stringify(value) !== JSON.stringify(defaults[key]),
   );
 }
@@ -1024,7 +1031,6 @@ export function toNote(
   );
   const removed = removeBlock(graph, id, finallyId);
   if (!removed) return null;
-  if (!text) return { graph: removed, note: null };
   const next = ids[at + 1];
   const previous = ids[at - 1];
   const note: DocNoteRef | null = next
@@ -1032,6 +1038,8 @@ export function toNote(
     : previous
       ? { ownerNodeId: previous, placement: "trailing" }
       : null;
+  // An empty step leaves an empty note where it stood, for the caret to land in.
+  if (!text) return { graph: removed, note };
   if (!note) return null;
   const key = note.placement === "above" ? "notes" : "trailingNotes";
   const nodes = removed.nodes.map((n) => {

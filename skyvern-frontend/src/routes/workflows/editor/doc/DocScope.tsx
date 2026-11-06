@@ -246,12 +246,17 @@ function DocNode({
               requestAnimationFrame(() => actions.setFocusId(node.id));
               return;
             }
-            actions.setFocusId(
-              actions.edit.insertStep(
-                { scope: place.scope, index: place.index + 1 },
-                type,
-              ),
-            );
+            // "/" on an empty step replaces it, whatever the type picked.
+            const added =
+              item.kind === "step" &&
+              !place.isFinally &&
+              actions.edit.isEmptyStep(node.id)
+                ? actions.edit.replaceStep(node.id, type)
+                : actions.edit.insertStep(
+                    { scope: place.scope, index: place.index + 1 },
+                    type,
+                  );
+            actions.setFocusId(added);
           }}
         >
           <div>

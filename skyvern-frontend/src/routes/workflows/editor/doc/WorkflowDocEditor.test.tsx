@@ -183,6 +183,40 @@ describe("WorkflowDocEditor navigation", () => {
       expect(first.prompt).toBe("Do the");
     });
 
+    test("Enter on an empty step turns it into a note instead of adding another step", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [
+          block("goto_url", "open_site", "empty_one", {
+            url: "https://a.test",
+          }),
+          block("goto_url", "empty_one", null, { url: "" }),
+        ],
+        edits,
+      );
+      const box = openLine("empty_one url", "", 0);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).not.toHaveBeenCalled();
+      const applied = vi.mocked(edits.apply).mock.calls[0]![0].nodes;
+      expect(
+        applied.filter(isWorkflowBlockNode).map((n) => n.data.label),
+      ).toEqual(["open_site"]);
+    });
+
+    test("Picking a loop with / on an empty step replaces the step", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [block("goto_url", "empty_one", null, { url: "" }), prompt()],
+        edits,
+      );
+      const box = openLine("empty_one url", "", 0);
+      fireEvent.keyDown(box, { key: "/" });
+      fireEvent.click(screen.getByText(/^Loop/));
+
+      expect(vi.mocked(edits.addStep).mock.calls[0]![0].nodeType).toBe("loop");
+    });
+
     test("Shift+Enter is a line break inside the step, not a new step", () => {
       const edits = editsWithAdd();
       renderDoc([prompt()], edits);
@@ -855,6 +889,20 @@ describe("a step that was just added", () => {
       "1 problem",
     );
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
+  });
+
+  test("a new Go to URL step shows no URL-required chip until the user leaves it", () => {
+    const nodes = renderDoc([
+      block("goto_url", "open_site", null, { url: "" }),
+    ]);
+    act(() =>
+      useDocUnfinishedStore.getState().add(nodes.find(isWorkflowBlockNode)!.id),
+    );
+    expect(document.querySelector("[data-doc-missing]")).toBeNull();
+
+    fireEvent.pointerDown(document.body);
+
+    expect(document.querySelector('[data-doc-missing="URL"]')).toBeTruthy();
   });
 
   test("a loop over a whole extraction result holds Run; the typed list path does not", () => {

@@ -11,6 +11,8 @@ import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 import { docStepProblems } from "./docProblems";
 import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+import { useDocUnfinishedStore } from "./docUnfinished";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -670,6 +672,112 @@ describe("building from scratch in the doc", () => {
     const other = nodes.find((n) => n.id !== only.id)!;
     expect((other.data as Record<string, unknown>).prompt ?? "").not.toContain(
       "Open the page",
+    );
+  });
+
+  test("a step made by Enter stays quiet until the person leaves it", () => {
+    useDocUnfinishedStore.getState().clear();
+    const graph = getElements(
+      [code("only", null, { prompt: "Open the page" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const only = byLabel(graph, "only");
+    const { api } = editingAdding(graph);
+    const added = api.splitStep({ scope: TOP_SCOPE, index: 0 }, only.id, {
+      key: "prompt",
+      before: "Open the page",
+      after: "",
+    });
+    expect(useDocUnfinishedStore.getState().ids.has(added!)).toBe(true);
+    useDocUnfinishedStore.getState().clear();
+  });
+
+  test("/ on an empty step replaces it in one add, with the neighbours joined around the new step", () => {
+    const graph = getElements(
+      [
+        code("before", "empty_one", { prompt: "Open the page" }),
+        block("goto_url", "empty_one", "after", { url: "" }),
+        code("after", null),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const addStep = vi.fn(() => "new_loop");
+    const api = createDocEditApi({
+      ...graph,
+      edits: { apply: vi.fn(), update: () => {}, addStep, duplicate: () => {} },
+      finallyId: null,
+      workflowId: "wpid_test",
+      selectBranch: () => {},
+      selectedBranch: () => undefined,
+      inputKeys: [],
+      credentialKeys: new Set(),
+    });
+    const empty = byLabel(graph, "empty_one");
+
+    expect(api.isEmptyStep(empty.id)).toBe(true);
+    expect(api.replaceStep(empty.id, "loop")).toBe("new_loop");
+
+    expect(addStep).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodeType: "loop",
+        replacing: empty.id,
+        previous: byLabel(graph, "before").id,
+        next: byLabel(graph, "after").id,
+      }),
+    );
+  });
+
+  test("an empty step whose output feeds a context input is not replaced", () => {
+    const graph = getElements(
+      [block("goto_url", "empty_one", null, { url: "" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const empty = byLabel(graph, "empty_one");
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "from_step",
+          parameterType: "context",
+          sourceParameterKey: "empty_one_output",
+        },
+      ] as never,
+    });
+    const { api } = editing(graph);
+    expect(api.isEmptyStep(empty.id)).toBe(false);
+    useWorkflowParametersStore.setState({ parameters: [] });
+  });
+
+  test("turning an untouched step into another type renames it and its output for the new type", () => {
+    const graph = getElements(
+      [block("goto_url", "go_to_url_2", null, { url: "" })],
+      settings(),
+      true,
+    ) as DocGraph;
+    const step = byLabel(graph, "go_to_url_2");
+    const { api, latest } = editing(graph);
+    api.turnInto(step.id, "extraction");
+    const turned = latest().nodes.find((n) => n.id === step.id)!;
+    expect(turned.type).toBe("extraction");
+    expect(turned.data.label).toBe("extraction_1");
+  });
+
+  test("turning a step that something refers to keeps its name", () => {
+    const graph = getElements(
+      [
+        block("goto_url", "go_to_url_2", "after", { url: "" }),
+        code("after", null, { code: "{{ go_to_url_2_output }}" }),
+      ],
+      settings(),
+      true,
+    ) as DocGraph;
+    const step = byLabel(graph, "go_to_url_2");
+    const { api, latest } = editing(graph);
+    api.turnInto(step.id, "extraction");
+    expect(latest().nodes.find((n) => n.id === step.id)!.data.label).toBe(
+      "go_to_url_2",
     );
   });
 

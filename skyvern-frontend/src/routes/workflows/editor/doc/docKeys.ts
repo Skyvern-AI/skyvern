@@ -23,7 +23,7 @@ export function runStepByKey(nodeId: string): boolean {
 
 // The line an "@" reference was inserted in, so closing the input editor that opens can give it the caret back.
 // Notes all share one label, so the line is told apart by its place among the lines with that label.
-type ReferenceLine = { label: string; index: number };
+type ReferenceLine = { label: string; index: number; offset: number };
 let referenceLine: ReferenceLine | null = null;
 export const rememberReferenceLine = (line: ReferenceLine | null) => {
   referenceLine = line;
@@ -53,4 +53,15 @@ export const takeCaretAtStart = (nodeId: string): boolean => {
   if (caretAtStartFor !== nodeId) return false;
   caretAtStartFor = null;
   return true;
+};
+
+// Closing the input editor reopens the line with the caret where the reference ended.
+let nextCaretOffset: number | null = null;
+export const armNextCaretOffset = (offset: number) => {
+  nextCaretOffset = offset;
+};
+export const takeNextCaretOffset = (): number | null => {
+  const offset = nextCaretOffset;
+  nextCaretOffset = null;
+  return offset;
 };
