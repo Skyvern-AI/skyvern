@@ -17,6 +17,7 @@ import structlog
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 
 LOG = structlog.get_logger()
 
@@ -150,7 +151,8 @@ def loggable_origin(url: str) -> str:
         port = f":{parsed.port}" if parsed.port else ""
     except ValueError:
         port = ""
-    return f"{parsed.scheme.lower()}://{parsed.hostname}{port}"
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme.lower()}://{host}{port}"
 
 
 def is_resolved_page_url(url: str) -> bool:
@@ -241,7 +243,8 @@ def _match_by_url_tiered(
     indexed = [
         (credential, parts)
         for credential in credentials
-        if credential.tested_url and (parts := url_parts(credential.tested_url))
+        for url in saved_site_urls(credential.tested_url, credential.extra_site_urls)
+        if (parts := url_parts(url))
     ]
     requested = [parts for url in urls if (parts := url_parts(url))]
     # Ranked in _URL_TIERS order whatever order the caller listed them in: an exact match must

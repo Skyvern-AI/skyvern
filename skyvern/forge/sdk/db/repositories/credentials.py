@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
 from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
-from skyvern.forge.sdk.db.exceptions import NotFoundError
+from skyvern.forge.sdk.db.exceptions import CredentialSitesChangedError, NotFoundError
 from skyvern.forge.sdk.db.models import CredentialModel, OrganizationBitwardenCollectionModel, TOTPCodeModel
 from skyvern.forge.sdk.db.repositories.proxy_pin_update import apply_proxy_pin_to_model, normalize_proxy_pin_for_create
 from skyvern.forge.sdk.db.utils import serialize_proxy_location
@@ -23,6 +23,7 @@ from skyvern.forge.sdk.schemas.credentials import (
     TotpType,
 )
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
+from skyvern.forge.sdk.workflow.models.credential_release import normalize_extra_site_urls, saved_site_urls
 from skyvern.schemas.proxy_pinning import generate_proxy_session_id, should_generate_proxy_session_id
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.utils.email_validation import (
@@ -59,6 +60,13 @@ def _totp_identifiers_match(left: str, right: str) -> bool:
         and looks_like_phone_identifier(right)
         and bool(_phone_identifier_aliases(left) & _phone_identifier_aliases(right))
     )
+
+
+def _drop_extra_sites_on_tested_site(credential: CredentialModel) -> None:
+    if credential.extra_site_urls:
+        credential.extra_site_urls = (
+            normalize_extra_site_urls(credential.tested_url, credential.extra_site_urls) or None
+        )
 
 
 class CredentialRepository(BaseRepository):
@@ -617,7 +625,7 @@ class CredentialRepository(BaseRepository):
             ).all()
             return [Credential.model_validate(credential) for credential in credentials]
 
-    @db_operation("update_credential")
+    @db_operation("update_credential", expected_errors=(CredentialSitesChangedError,))
     async def update_credential(
         self,
         credential_id: str,
@@ -626,6 +634,8 @@ class CredentialRepository(BaseRepository):
         browser_profile_id: str | None | object = _UNSET,
         pin_saved_session_ip: bool | None = None,
         tested_url: str | None = None,
+        extra_site_urls: list[str] | None = None,
+        expected_site_urls: list[str] | None = None,
         user_context: str | None = None,
         save_browser_session_intent: bool | None = None,
         auto_profile_disabled: bool | None = None,
@@ -636,17 +646,23 @@ class CredentialRepository(BaseRepository):
         is_test_login_temporary: bool | None = None,
         is_passkey_setup_pending: bool | None = None,
     ) -> Credential:
+        """``expected_site_urls`` makes the write conditional on the row's saved sites, read under a row lock."""
         async with self.Session() as session:
-            credential = (
-                await session.scalars(
-                    select(CredentialModel)
-                    .filter_by(credential_id=credential_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter(CredentialModel.deleted_at.is_(None))
-                )
-            ).first()
+            query = (
+                select(CredentialModel)
+                .filter_by(credential_id=credential_id)
+                .filter_by(organization_id=organization_id)
+                .filter(CredentialModel.deleted_at.is_(None))
+            )
+            if expected_site_urls is not None:
+                query = query.with_for_update()
+            credential = (await session.scalars(query)).first()
             if not credential:
                 raise NotFoundError(f"Credential {credential_id} not found")
+            if expected_site_urls is not None and expected_site_urls != saved_site_urls(
+                credential.tested_url, credential.extra_site_urls or []
+            ):
+                raise CredentialSitesChangedError(credential_id)
             if name is not None:
                 credential.name = name
             # Sentinel-gated so an explicit None unlinks (user picks Auto after attaching a profile),
@@ -657,6 +673,10 @@ class CredentialRepository(BaseRepository):
                 credential.pin_saved_session_ip = pin_saved_session_ip
             if tested_url is not None:
                 credential.tested_url = tested_url
+            if extra_site_urls is not None:
+                credential.extra_site_urls = extra_site_urls or None
+            if tested_url:
+                _drop_extra_sites_on_tested_site(credential)
             if user_context is not None:
                 credential.user_context = user_context
             if save_browser_session_intent is not None:
@@ -775,6 +795,8 @@ class CredentialRepository(BaseRepository):
             credential.secret_label = secret_label
             if tested_url is not None:
                 credential.tested_url = tested_url
+            if tested_url:
+                _drop_extra_sites_on_tested_site(credential)
             apply_proxy_pin_to_model(
                 credential,
                 entity_id=credential_id,

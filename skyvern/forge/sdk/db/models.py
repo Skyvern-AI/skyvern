@@ -2102,6 +2102,7 @@ class CredentialModel(Base):
     browser_profile_id = Column(String, nullable=True)
     auto_profile_disabled = Column(Boolean, nullable=True, default=False)
     tested_url = Column(String, nullable=True)
+    extra_site_urls = Column(JSON, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
     pin_saved_session_ip = Column(Boolean, nullable=False, default=False, server_default=sqlalchemy.false())

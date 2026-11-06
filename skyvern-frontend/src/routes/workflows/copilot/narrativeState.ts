@@ -10,6 +10,7 @@ import {
   ConnectedAccountChoice,
   CopilotResponseType,
   CopilotSteerMessage,
+  type CredentialSiteAnswer,
   type CopilotTestInput,
   type CopilotTestInputSource,
   DeliveredOutputFile,
@@ -474,8 +475,19 @@ export interface TurnNarrativeState {
   // Resolved pause outcome, from the credentialPause narrative signal.
   // "declined" means the pause engaged but never sent a frame, so no card.
   credentialPause: {
-    outcome: "connected" | "skipped" | "timeout" | "declined" | "signed_in";
+    outcome:
+      | "connected"
+      | "skipped"
+      | "timeout"
+      | "declined"
+      | "signed_in"
+      | "not_admitted";
     credentialId: string | null;
+    name?: string;
+    siteAnswer?: CredentialSiteAnswer;
+    siteA?: string;
+    savedSites?: string[];
+    siteB?: string;
     // The tool call whose row was newest when the card was raised. Absent on
     // turns recorded before it was stamped.
     anchorToolCallId?: string;
@@ -630,23 +642,39 @@ export function parseCredentialPause(
     typeof o.anchorToolCallId === "string" && o.anchorToolCallId
       ? o.anchorToolCallId
       : undefined;
-  // The user answered but nothing was bound, which the card already renders as a skip.
-  if (outcome === "not_admitted") {
-    return { outcome: "skipped", credentialId: null, anchorToolCallId };
-  }
   if (
     outcome !== "connected" &&
     outcome !== "skipped" &&
     outcome !== "timeout" &&
     outcome !== "declined" &&
-    outcome !== "signed_in"
+    outcome !== "signed_in" &&
+    outcome !== "not_admitted"
   ) {
     return null;
   }
+  const siteAnswer =
+    o.siteAnswer === "add" || o.siteAnswer === "move" || o.siteAnswer === "no"
+      ? o.siteAnswer
+      : undefined;
   return {
     outcome,
     credentialId: typeof o.credentialId === "string" ? o.credentialId : null,
     anchorToolCallId,
+    ...(typeof o.name === "string" && o.name ? { name: o.name } : {}),
+    ...(siteAnswer
+      ? {
+          siteAnswer,
+          siteA: typeof o.siteA === "string" ? o.siteA : undefined,
+          savedSites:
+            Array.isArray(o.savedSites) &&
+            o.savedSites.every(
+              (site): site is string => typeof site === "string",
+            )
+              ? o.savedSites
+              : undefined,
+          siteB: typeof o.siteB === "string" ? o.siteB : undefined,
+        }
+      : {}),
   };
 }
 

@@ -779,6 +779,7 @@ async def test_inspecting_a_login_page_binds_the_credential_that_page_vouches_fo
             credential_id="cred_analytics",
             name="analytics",
             tested_url="https://analytics.example.test/login",
+            extra_site_urls=[],
             credential_type=CredentialType.PASSWORD,
             totp_type=TotpType.NONE,
         )

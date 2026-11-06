@@ -545,7 +545,22 @@ export interface WorkflowCopilotCredentialRequiredUpdate {
     attempted?: boolean;
     outcome?: "rejected" | "unknown" | "created_not_connected" | null;
   } | null;
+  // The site question asked about a picked login, so a reloaded card asks it again.
+  site_question?: CredentialSiteQuestion | null;
   timestamp: string;
+}
+
+export type CredentialSiteAnswer = "add" | "move" | "no";
+
+export interface CredentialSiteQuestion {
+  credential_id: string;
+  name: string;
+  // The origin this card signs in on.
+  site: string;
+  // Origins the login is saved for.
+  saved_sites: string[];
+  // The sites come from a connected vault, so only that vault can add one.
+  vault_sourced: boolean;
 }
 
 export interface WorkflowCopilotDemonstrationStartedUpdate {
@@ -651,7 +666,15 @@ export interface WorkflowCopilotActiveDemonstration {
 }
 
 export interface WorkflowCopilotCredentialResponseResult {
-  result: "accepted" | "signed_in" | "no_sign_in_found" | "save_failed";
+  result:
+    | "accepted"
+    | "signed_in"
+    | "no_sign_in_found"
+    | "save_failed"
+    | "site_question"
+    | "site_changed_not_connected"
+    | "site_change_unknown";
+  site_question?: CredentialSiteQuestion | null;
   expires_at?: string | null;
   host?: string | null;
   browser_profile_id?: string | null;
@@ -675,6 +698,10 @@ export interface WorkflowCopilotCredentialPauseResolvedUpdate {
   credential_id: string | null;
   name: string | null;
   browser_profile_id?: string | null;
+  site_answer?: CredentialSiteAnswer | null;
+  site_a?: string | null;
+  saved_sites?: string[] | null;
+  site_b?: string | null;
   timestamp: string;
 }
 
