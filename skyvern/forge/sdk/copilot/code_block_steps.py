@@ -5,7 +5,7 @@ import re
 import textwrap
 import unicodedata
 from dataclasses import dataclass, replace
-from typing import Any, Collection, Iterator
+from typing import Any, Collection, Iterator, Mapping
 from urllib.parse import urlsplit
 
 import structlog
@@ -840,6 +840,27 @@ class UserOwnedGoalCarry:
             "These blocks carried a Goal the user wrote and are absent from the accepted workflow, so "
             "their Goal is gone: " + ", ".join(self.dropped) + "."
         )
+
+
+def fill_missing_code_block_goals_in_yaml(workflow_yaml: str, declared_goals: Mapping[str, str]) -> str:
+    """Sets a code block's missing or blank prompt to its declared goal; a present prompt is never replaced."""
+    if not declared_goals:
+        return workflow_yaml
+    try:
+        data = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return workflow_yaml
+    if not isinstance(data, dict):
+        return workflow_yaml
+    changed = False
+    for block in _iter_code_block_dicts(data):
+        label = block.get("label")
+        goal = declared_goals.get(label) if isinstance(label, str) else None
+        prompt = block.get("prompt")
+        if goal and (prompt is None or (isinstance(prompt, str) and not prompt.strip())):
+            block["prompt"] = goal
+            changed = True
+    return dump_workflow_yaml(data) if changed else workflow_yaml
 
 
 def carry_user_owned_goals_in_yaml(
