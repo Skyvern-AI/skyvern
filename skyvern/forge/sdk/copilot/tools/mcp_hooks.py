@@ -753,17 +753,22 @@ async def _get_block_schema_post_hook(
                     properties["prompt"] = {
                         "type": "string",
                         "description": (
-                            "Every new or wholly rewritten code block must include this non-null string: "
-                            "the model-authored plain-language Goal shown in the editor, written for this code. "
-                            "Open with one sentence naming only what a person sees on the page once the block has "
-                            "succeeded, showing every value the block returns as it appears there, with no actions, "
-                            "conditions, 'after' or 'returns' clauses. Then give the route that reaches "
-                            "it: the site or page the block works on, the controls it uses by their visible label "
-                            "or role, the order it acts in, the inputs it reads by workflow parameter name (never "
-                            "a value), and what the block returns, naming only page content that first sentence "
-                            "already shows, never a data structure. A few sentences, enough for an agent to redo "
-                            "this block on a live browser without reading the code. Rewrite the Goal whenever you "
-                            "rewrite the code."
+                            "Every new or wholly rewritten code block must include this non-null string: the "
+                            "model-authored plain-language Goal shown in the editor, written for this code. Open with "
+                            "one sentence stating the outcome once the block has succeeded as a fact, never as a task "
+                            "('Determine whether ...'), with no actions, conditions or 'after' clauses. For a block "
+                            "that acts on the page, that sentence names only what a person sees on the page, showing "
+                            "every value the block returns as it appears there, with no 'returns' clause. For a block "
+                            "that makes no page call, the sentence starts with the keys of the values the block "
+                            "returns and says what each holds, not what the block computes. Any other value the page "
+                            "never shows (a computed value, or a downloaded or attached file's name) is also named by "
+                            "the key the block returns it under. The Goal never says what the block does not do. Then "
+                            "give the route that reaches it. A block that acts on the page names the site or page it "
+                            "works on, the controls it uses by their visible label or role and the order it acts in, "
+                            "never a data structure. Every block names the inputs it reads by workflow parameter name "
+                            "or an earlier block's `<label>_output` (never a value) and what it computes from them. A "
+                            "few sentences, enough for an agent to redo this block without reading the code, on a live "
+                            "browser when it acts on the page. Rewrite the Goal whenever you rewrite the code."
                         ),
                     }
                     properties["data_schema"] = {

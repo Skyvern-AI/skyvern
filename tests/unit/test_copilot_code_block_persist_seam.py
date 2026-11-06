@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import AsyncMock
@@ -57,7 +58,7 @@ from skyvern.forge.sdk.copilot.workflow_yaml import (
 from skyvern.forge.sdk.db.exceptions import CopilotProposalConflictError
 from skyvern.forge.sdk.services.google_oauth_service import GOOGLE_SHEETS_DATA_SCOPE
 from skyvern.forge.sdk.workflow.secret_encryption import WORKFLOW_SECRET_MASK
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.utils.yaml_loader import dump_workflow_yaml, safe_load_no_dates
 from tests.unit._copilot_workflow_fakes import fake_workflow
 
 
@@ -290,6 +291,53 @@ async def test_accept_path_does_not_synthesize_an_omitted_goal_prompt(monkeypatc
     persisted_block = workflow_blocks(parse_workflow_yaml(persisted[0]))[0]
     assert "prompt" not in submitted_block
     assert "prompt" not in persisted_block
+
+
+_DATA_ONLY_WITHOUT_GOAL_YAML = (
+    Path(__file__).parent / "copilot" / "fixtures" / "data_only_code_block_without_goal.yaml"
+).read_text()
+_DATA_ONLY_DECLARED_GOAL = (
+    "within_six_months, days_since_release and release_date describe whether the latest release is under six "
+    "months old. Computed from find_release_output's release_date versus today."
+)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_goal_takes_the_declared_goal_from_a_rejected_row_but_a_user_owned_goal_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "block_label": "check_recency",
+        "declared_goal": _DATA_ONLY_DECLARED_GOAL,
+        "completion_criteria": [{"id": "c1", "text": "Returns within_six_months boolean", "terminal": True}],
+    }
+    owned_definition = safe_load_no_dates(_DATA_ONLY_WITHOUT_GOAL_YAML)
+    owned_block = next(block for block in workflow_blocks(owned_definition) if block.get("label") == "check_recency")
+    owned_block.update(prompt="The person's own Goal.", user_owned_goal=True)
+
+    saved_prompts: list[object] = []
+    for prior_yaml in ("", dump_workflow_yaml(owned_definition)):
+        persisted: list[str] = []
+        _stub_successful_update(monkeypatch, persisted)
+        ctx = _ctx(prior_yaml, policy=BlockAuthoringPolicy.STANDARD)
+        ctx.agent_step_available = True
+
+        result = await _update_workflow(
+            {"workflow_yaml": _DATA_ONLY_WITHOUT_GOAL_YAML, "code_artifact_metadata": [row]},
+            ctx,
+            allow_missing_credentials=True,
+        )
+
+        assert result["ok"] is True
+        assert "check_recency" not in (ctx.code_artifact_metadata or {})
+        saved_block = next(
+            block
+            for block in workflow_blocks(parse_workflow_yaml(persisted[0]))
+            if block.get("label") == "check_recency"
+        )
+        saved_prompts.append(saved_block.get("prompt"))
+
+    assert saved_prompts == [_DATA_ONLY_DECLARED_GOAL, "The person's own Goal."]
 
 
 def _user_owned_goal_yaml(*, prompt: str, code: str, needs_regeneration: bool) -> str:
