@@ -60,16 +60,25 @@ describe("Doc run state", () => {
   it("counts a looped step's runs that returned a value, apart from those that returned nothing", () => {
     const code = (
       output: WorkflowRunBlock["output"],
+      index: number,
       status: Status = Status.Completed,
-    ) => item(row("check_price", { block_type: "code", output, status }));
+    ) =>
+      item(
+        row("check_price", {
+          block_type: "code",
+          output,
+          status,
+          current_index: index,
+        }),
+      );
     const runs = new Map<string, DocBlockRuns>();
     collectBlockRuns(
       [
         item(row("each_book", { block_type: "for_loop" }), [
-          code({ result: "under budget" }),
-          code(null),
-          code({ result: "under budget" }),
-          code(null, Status.Skipped),
+          code({ result: "under budget" }, 0),
+          code(null, 1),
+          code({ result: "under budget" }, 2),
+          code(null, 3, Status.Skipped),
         ]),
       ],
       RUN,
@@ -82,6 +91,35 @@ describe("Doc run state", () => {
       canceled: 0,
       withOutput: 2,
     });
+  });
+
+  it("counts a script fallback's two rows as one run, and a Task V2 step by its replaced row", () => {
+    const runs = new Map<string, DocBlockRuns>();
+    const task = (status: Status, extra: Partial<WorkflowRunBlock> = {}) =>
+      row("open_site", {
+        status,
+        parent_workflow_run_block_id: "wfrb_parent",
+        ...extra,
+      });
+    const v2Row = {
+      ...item(row("inner_task")),
+      task_v2_blocks: [row("research", { block_type: "task_v2" })],
+    } as WorkflowRunTimelineItem;
+    collectBlockRuns(
+      [
+        item(task(Status.Failed)),
+        item(task(Status.Completed)),
+        item(row("each_book", { block_type: "for_loop" }), [
+          v2Row,
+          item(row("research", { current_index: 1 })),
+        ]),
+      ],
+      RUN,
+      runs,
+      () => false,
+    );
+    expect(runs.get("open_site")).toMatchObject({ count: 1, failed: 0 });
+    expect(runs.get("research")?.count).toBe(2);
   });
 
   it("gives each step's tag its live state, and Not reached once the run settles", () => {
@@ -299,6 +337,20 @@ describe("stepsUnknownToRun authored identifiers", () => {
     expect([
       ...stepsUnknownToRun(exportStep("integer"), exportStep("string")),
     ]).toEqual(["export"]);
+  });
+});
+
+describe("stepsUnknownToRun implicit chain", () => {
+  it("does not read the editor's filled-in next step as an edit", () => {
+    const step = (label: string, next?: string) => ({
+      label,
+      block_type: "code",
+      code: "pass",
+      ...(next ? { next_block_label: next } : {}),
+    });
+    const first = { blocks: [step("a"), step("b"), step("c")] };
+    const saved = { blocks: [step("a", "b"), step("b", "c"), step("c")] };
+    expect(stepsUnknownToRun(first, saved).size).toBe(0);
   });
 });
 

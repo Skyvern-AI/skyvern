@@ -7,6 +7,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -528,6 +529,25 @@ describe("WorkflowDocEditor navigation", () => {
 
       fireEvent.keyDown(nested, { key: "/" });
       expect(screen.getByPlaceholderText("Add a step…")).toBeTruthy();
+    });
+
+    test("Tab into a collapsed empty loop opens it, says nothing moved yet, and puts the caret at the line's start", async () => {
+      renderDoc(
+        [
+          forLoop("books", null, [], {
+            trailing_notes: "Open each book page",
+          }),
+        ],
+        editsWithAdd(),
+      );
+      fireEvent.click(screen.getByRole("button", { name: /^Collapse/ }));
+      const box = openLine("Note", "Open each book page", 19);
+      fireEvent.keyDown(box, { key: "Tab" });
+      await act(() => new Promise((r) => requestAnimationFrame(r)));
+
+      expect(docAnnouncement()).toBe("In the loop. Type / to pick its step");
+      const nested = screen.getByRole("textbox", { name: "Note" });
+      expect(nested.closest(".border-l")).toBeTruthy();
     });
   });
 
@@ -1459,6 +1479,57 @@ describe("Demonstrate task in the step menu", () => {
       demonstration: null,
     });
     vi.unstubAllGlobals();
+  });
+
+  test("dragging a step above its neighbour says it moved up, not the list's name", () => {
+    clearDocAnnouncement();
+    const edits: DocGraphEdits = {
+      apply: vi.fn(),
+      update: vi.fn(),
+      addStep: vi.fn(() => null),
+      duplicate: vi.fn(),
+    };
+    renderDoc(twoSteps, edits);
+    const grip = screen.getByRole("button", {
+      name: "Actions for second_step",
+    });
+    fireEvent.dragStart(grip, {
+      dataTransfer: {
+        setData: () => {},
+        setDragImage: () => {},
+        effectAllowed: "",
+      },
+    });
+    const zone = document.querySelector<HTMLElement>(
+      "div[aria-hidden].h-3.-my-3",
+    );
+    expect(zone).toBeTruthy();
+    fireEvent.drop(zone!, { dataTransfer: {} });
+    expect(docAnnouncement()).toBe("Moved up");
+  });
+
+  test("the + between steps offers no Demonstrate task, with or without a note above the step", async () => {
+    renderDoc(twoSteps, edits);
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Add a step here" })[0]!,
+    );
+    expect(await screen.findByPlaceholderText("Add a step…")).toBeTruthy();
+    expect(screen.queryByText("Demonstrate task")).toBe(null);
+  });
+
+  test("Escape on the + between steps, with a note above the step, puts focus back on that +", async () => {
+    renderDoc(
+      [
+        code("first_step", "second_step"),
+        { ...code("second_step", null), notes: "Check the totals" },
+      ],
+      edits,
+    );
+    const plus = screen.getAllByRole("button", { name: "Add a step here" })[0]!;
+    fireEvent.click(plus);
+    const search = await screen.findByPlaceholderText("Add a step…");
+    fireEvent.keyDown(search, { key: "Escape" });
+    await waitFor(() => expect(document.activeElement).toBe(plus));
   });
 
   test("Add step records after the last step, keeps the Doc open, and the item is searchable", () => {

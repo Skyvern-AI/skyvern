@@ -41,6 +41,11 @@ describe("docProduced", () => {
       ),
     ).toBeNull();
     expect(docProduced(block({ success: true }, "wait"))).toBeNull();
+    expect(docProduced(block({ books: [] }, "extraction"))).toBeNull();
+    expect(docProduced(block({ success: false }, "code"))).toEqual({
+      kind: "pairs",
+      pairs: [["success", false]],
+    });
     expect(docProduced(block([{ a: 1 }], "for_loop"))).toBeNull();
   });
 });

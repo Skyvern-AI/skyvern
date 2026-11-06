@@ -45,11 +45,16 @@ function producedValue(block: WorkflowRunBlock): unknown {
   if (isTaskVariantBlock(block)) return null;
   const output = block.output;
   if (!isRecord(output)) return output;
-  // A bare success flag (a Wait step) says nothing; files get their own links.
+  // A bare success flag only Wait and Send email steps emit says nothing; files get their own links.
   const rest = Object.entries(output).filter(
     ([key]) => key !== "downloaded_file_urls",
   );
-  if (rest.length === 1 && rest[0]![0] === "success") return null;
+  if (
+    (block.block_type === "wait" || block.block_type === "send_email") &&
+    rest.length === 1 &&
+    rest[0]![0] === "success"
+  )
+    return null;
   return Object.fromEntries(rest);
 }
 
@@ -62,7 +67,6 @@ function unwrapList(value: unknown): unknown {
   const values = Object.values(value);
   return values.length === 1 &&
     Array.isArray(values[0]) &&
-    values[0].length > 0 &&
     values[0].every(isRecord)
     ? values[0]
     : value;
