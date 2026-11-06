@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     workflow_credential_origins_from_parsed,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import OutputPolicyReason
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 
 WORKFLOW_PRESENT_SENTINEL = object()
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
@@ -472,6 +473,7 @@ def _existing_workflow_broadens_credential_scope(
             if not _blocks_stay_on_intended_origin(parsed_workflow, credential_id, request_policy):
                 return True
             continue
+        allowed_origins = allowed_origins | request_policy.user_confirmed_site_origins.get(credential_id, set())
         if any(origin not in allowed_origins for origin in new_origins):
             return True
     return False
@@ -480,12 +482,18 @@ def _existing_workflow_broadens_credential_scope(
 def _blocks_stay_on_intended_origin(
     parsed_workflow: dict[str, Any], credential_id: str, request_policy: RequestPolicy
 ) -> bool:
-    # With no prior origin, only the one origin the fill seam would fill can authorize a block URL;
-    # discovered credentials never do.
+    # With no prior origin, only a site the login fill would use can authorize a block URL, as the fill seam
+    # decides it: any saved site of a login saved for several, else the one intended URL. Discovered never do.
     if not any(c.credential_id == credential_id for c in request_policy.resolved_credentials):
         return False
-    intended_origin = canonicalize_origin(request_policy.credential_intended_url(credential_id))
-    if intended_origin is None:
+    saved_sites = request_policy.credential_saved_site_urls(credential_id)
+    fill_urls = list(saved_sites) if len(saved_sites) > 1 else []
+    intended_origins = {
+        origin
+        for url in [*fill_urls, request_policy.credential_intended_url(credential_id)]
+        if (origin := canonicalize_origin(url)) is not None
+    }
+    if not intended_origins:
         return False
     workflow_definition = parsed_workflow.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
@@ -495,7 +503,7 @@ def _blocks_stay_on_intended_origin(
         if credential_id not in block_credential_ids(block, credential_params_by_key):
             continue
         block_url = block.get("url")
-        if isinstance(block_url, str) and block_url.strip() and canonicalize_origin(block_url) != intended_origin:
+        if isinstance(block_url, str) and block_url.strip() and canonicalize_origin(block_url) not in intended_origins:
             return False
     return True
 
@@ -526,12 +534,10 @@ def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request
 def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]]:
     origins: dict[str, set[str]] = {}
     for credential in [*request_policy.resolved_credentials, *request_policy.discovered_credentials]:
-        credential_id = getattr(credential, "credential_id", None)
-        tested_url = getattr(credential, "tested_url", None)
-        if isinstance(credential_id, str) and isinstance(tested_url, str):
-            origin = url_origin(tested_url)
+        for url in saved_site_urls(credential.tested_url, credential.extra_site_urls):
+            origin = url_origin(url)
             if origin:
-                origins.setdefault(credential_id, set()).add(origin)
+                origins.setdefault(credential.credential_id, set()).add(origin)
     return origins
 
 

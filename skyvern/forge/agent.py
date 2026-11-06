@@ -1428,6 +1428,7 @@ def recovery_credential_release_guard(
                 tested_url=tested_url,
                 vault_sites=workflow_run_context.bitwarden_login_sites.get(key),
                 enforce_vault_sites=enforce_vault_sites,
+                extra_site_urls=workflow_run_context.credential_extra_site_urls.get(key, ()),
             )
             if isinstance(fields, dict)
             else []

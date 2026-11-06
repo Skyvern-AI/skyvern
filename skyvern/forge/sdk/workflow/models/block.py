@@ -10365,6 +10365,7 @@ async def wrapper({default_args}):
                         tested_url=workflow_run_context.credential_tested_urls.get(parameter.key),
                         vault_sites=workflow_run_context.bitwarden_login_sites.get(parameter.key),
                         enforce_vault_sites=enforce_vault_sites,
+                        extra_site_urls=workflow_run_context.credential_extra_site_urls.get(parameter.key, ()),
                     )
                     armed_any = any(entry.enforced for entry in armed)
                     observed_any = any(not entry.enforced for entry in armed)
@@ -18178,7 +18179,11 @@ class HttpRequestBlock(Block):
 
     def _release_sites(self, workflow_run_context: WorkflowRunContext, key: str) -> tuple[LoginSite, ...] | None:
         vault_sites = workflow_run_context.bitwarden_login_sites.get(key) if self._enforce_vault_sites else None
-        sites = login_release_sites(workflow_run_context.credential_tested_urls.get(key), vault_sites)
+        sites = login_release_sites(
+            workflow_run_context.credential_tested_urls.get(key),
+            vault_sites,
+            workflow_run_context.credential_extra_site_urls.get(key, ()),
+        )
         return None if sites is None else tuple(sites)
 
     def _confined_credential_references(

@@ -40,9 +40,11 @@ from skyvern.forge.sdk.copilot.credential_pause import (
     SignedInProfile,
     credential_pause_transport_ready,
     defang_card_text,
+    login_saved_for_site,
     raw_secret_card_origin,
     request_credential_pause,
     signed_in_facts,
+    site_answer_unused_text,
 )
 from skyvern.forge.sdk.copilot.credential_resolution import (
     is_resolved_page_url,
@@ -95,6 +97,7 @@ from skyvern.forge.sdk.schemas.credentials import (
 from skyvern.forge.sdk.schemas.workflow_copilot import CredentialRegistration, WorkflowCopilotCredentialRegistration
 from skyvern.forge.sdk.services.credentials import generate_totp_code, normalize_totp_config
 from skyvern.forge.sdk.services.request_principal import get_request_principal
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 from ._shared import _emit_tool_blocker_signal
@@ -288,11 +291,15 @@ def _decline_credential_origin_recovery(
     return {"ok": True, "status": status, "next": _credential_origin_declined_text(origin)}
 
 
+def _refused_login_recovery_card_text(origin: str) -> str:
+    return f"The login tried on {origin} is saved for a different site. Pick the login to use on {origin}."
+
+
 async def _credential_evidence_admits_origin(
     copilot_ctx: AgentContext, recovery: CredentialOriginRecovery, credential: Credential
 ) -> bool:
-    """Whether the credential itself places it on the recovery origin, and nowhere else, and no fill on that site
-    refused it this turn."""
+    """Whether a site the credential is saved for and every site its vault entry names cover the recovery origin,
+    and no standing fill refusal on that site names it."""
     refused_on_site = {recovery.refused_credential_id} | {
         refused_id
         for origin, refused_id in copilot_ctx.credential_origin_refusals
@@ -306,9 +313,9 @@ async def _credential_evidence_admits_origin(
         return False
     if vault_sites is None:
         return False
-    tested = [credential.tested_url] if credential.tested_url else []
-    return bool(tested or vault_sites) and (
-        all(same_release_scope(url, recovery.origin) for url in tested)
+    saved = saved_site_urls(credential.tested_url, credential.extra_site_urls)
+    return bool(saved or vault_sites) and (
+        (not saved or login_saved_for_site(credential, recovery.origin))
         and all(site.admits(recovery.origin) for site in vault_sites)
     )
 
@@ -417,7 +424,7 @@ async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str)
     cached = copilot_ctx.vault_login_uris_by_credential_id.get(credential_id)
     if cached is not None:
         return [LoginSite(uri, whole_site=True) for uri in cached]
-    uris: list[str] = []
+    item: CredentialItem | None = None
     try:
         db_credential = await app.DATABASE.credentials.get_credential(
             credential_id, organization_id=copilot_ctx.organization_id
@@ -426,17 +433,19 @@ async def _read_vault_named_sites(copilot_ctx: AgentContext, credential_id: str)
             service = app.CREDENTIAL_VAULT_SERVICES.get(db_credential.vault_type or CredentialVaultType.BITWARDEN)
             if service is not None:
                 item = await service.get_credential_item(db_credential)
-                if item.login_sites is not None:
-                    copilot_ctx.scoped_login_sites_by_credential_id[credential_id] = item.login_sites
-                    return item.login_sites
-                uris = list(item.login_uris)
     except Exception:
         # Not cached: a vault read that failed once says nothing about where the credential belongs,
         # and caching the empty answer would refuse every later fill this turn for a transient fault.
         LOG.info("copilot could not read the vault entry's sites", credential_id=credential_id, exc_info=True)
         return None
-    copilot_ctx.vault_login_uris_by_credential_id[credential_id] = uris
-    return [LoginSite(uri, whole_site=True) for uri in uris]
+    if item is None:
+        copilot_ctx.vault_login_uris_by_credential_id[credential_id] = []
+        return []
+    if item.login_sites is not None:
+        copilot_ctx.scoped_login_sites_by_credential_id[credential_id] = item.login_sites
+    else:
+        copilot_ctx.vault_login_uris_by_credential_id[credential_id] = list(item.login_uris)
+    return item.named_login_sites()
 
 
 def _missing_credential_origin_error(credential_id: str, page_url: str | None, *, user_named: bool = False) -> str:
@@ -702,27 +711,29 @@ async def _request_credential(
             }
 
     recovery_open = copilot_ctx.credential_origin_recovery
+    refused_here = [
+        earlier
+        for earlier in (
+            recovery_open,
+            *(
+                CredentialOriginRecovery(origin, "declined", refused_id)
+                for origin, refused_id in sorted(copilot_ctx.credential_origin_refusals)
+            ),
+        )
+        if earlier is not None and same_release_scope(login_page_url, earlier.origin)
+    ]
+    # An update ask for the login a fill refused on this site cannot help, so it opens the recovery pick card instead.
+    update_ask_replaced = bool(credential_id) and any(
+        earlier.refused_credential_id == credential_id for earlier in refused_here
+    )
+    if update_ask_replaced:
+        credential_id = None
+        rejected_by_site = False
+        reason = _refused_login_recovery_card_text(ask_origin.canonical)
     # The authenticator update card grants no origin, so it has its own latch and never spends the recovery's.
     # Any pick ask on a site where a fill was refused this turn gets a recovery card, so a plain card cannot bind a
     # refused login there.
-    on_recovery_site = (
-        None
-        if credential_id
-        else next(
-            (
-                earlier
-                for earlier in (
-                    recovery_open,
-                    *(
-                        CredentialOriginRecovery(origin, "declined", refused_id)
-                        for origin, refused_id in sorted(copilot_ctx.credential_origin_refusals)
-                    ),
-                )
-                if earlier is not None and same_release_scope(login_page_url, earlier.origin)
-            ),
-            None,
-        )
-    )
+    on_recovery_site = None if credential_id else next(iter(refused_here), None)
     recovery: CredentialOriginRecovery | None = None
     if on_recovery_site is not None:
         if recovery_open is not None and recovery_open.state == "pending" and on_recovery_site is not recovery_open:
@@ -794,6 +805,7 @@ async def _request_credential(
             admit_connected=admit_connected,
             anchor_tool_call_id=anchor_tool_call_id,
             registration=card_registration,
+            lead_credential_id=recovery.refused_credential_id if recovery is not None else None,
         )
     except BaseException:
         if recovery is not None:
@@ -829,6 +841,13 @@ async def _request_credential(
                 status = "connected_other_site"
             return _decline_credential_origin_recovery(copilot_ctx, recovery, status)
         copilot_ctx.credential_origin_recovery = None
+        if credential is not None and resolution is not None and resolution.site_answer is not None:
+            # The user saved this login for the site, so its earlier refusals there no longer stand.
+            copilot_ctx.credential_origin_refusals -= {
+                (origin, refused_id)
+                for origin, refused_id in copilot_ctx.credential_origin_refusals
+                if refused_id == credential.credential_id and same_release_scope(origin, recovery.origin)
+            }
         policy.origin_recovery_kept_named_credential_ids |= named_before_ask & {recovery.refused_credential_id}
         clear_tool_blocker_signals_for_reason_codes(
             copilot_ctx,
@@ -870,12 +889,31 @@ async def _request_credential(
                 "in the draft, and say a test run may stop at the login step."
             )
         return skipped
+    site_answer = resolution.site_answer
+    if site_answer is not None and copilot_ctx.credential_pause_outcome == "not_admitted":
+        return {
+            "ok": True,
+            "status": "declined_site" if site_answer.action == "no" else "site_change_unconfirmed",
+            "next": site_answer_unused_text(credential, site_answer),
+        }
     connected: dict[str, Any] = {
         "ok": True,
         "status": "connected",
         "credential_id": credential.credential_id,
         "credential_name": credential.name,
     }
+    if update_ask_replaced:
+        connected["update_card"] = (
+            "not shown: a fill on this site refused the login it named, so the card asked the user to pick a login"
+        )
+    if site_answer is not None:
+        connected["saved_site_change"] = (
+            f"The user moved this login to {site_answer.site_b}; it no longer signs in on "
+            f"{site_answer.saved_sites_text}."
+            if site_answer.action == "move"
+            else f"The user added {site_answer.site_b} to this login's sites; it still signs in on "
+            f"{site_answer.saved_sites_text}."
+        )
     if policy.raw_secret_redacted_draft:
         connected["next"] = RAW_SECRET_CONNECTED_NEXT
     elif card_registration is not None:
@@ -1027,6 +1065,14 @@ async def _credential_fill_origin_grant(
     if not authority_error:
         if not isinstance(policy, RequestPolicy):
             return None, _missing_credential_origin_error(credential_id, None)
+        saved_sites = policy.credential_saved_site_urls(credential_id)
+        if len(saved_sites) > 1:
+            # A login saved for several sites fills on the one this page is on, scoped to that saved origin.
+            page_url = await _live_working_page_url(copilot_ctx) or ""
+            saved_on_page = next((url for url in saved_sites if _still_on_admitted_site(page_url, url)), None)
+            if saved_on_page is not None:
+                _log_fill_grant("saved_site", page_url, credential_id)
+                return _CredentialFillOriginGrant(saved_on_page), None
         intended_url = policy.credential_intended_url(credential_id)
         if intended_url:
             _log_fill_grant("admitted_or_tested", intended_url, credential_id)
