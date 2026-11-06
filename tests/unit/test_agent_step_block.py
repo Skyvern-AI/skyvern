@@ -51,6 +51,7 @@ from skyvern.forge.sdk.experimentation.providers import NoOpExperimentationProvi
 from skyvern.forge.sdk.models import StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import InvalidWorkflowDefinition
 from skyvern.forge.sdk.workflow.models import agent_step_loop, agent_step_tools
@@ -252,6 +253,7 @@ async def _run_agent_block(
     tools: list[str] | None = sorted(agent_step_tools.tool_descriptions()),
     parameter_keys: list[str] | None = None,
     stored_tools: list[str] | None = None,
+    block_model: dict[str, str | dict[str, str]] | None = None,
     **block_fields: bool,
 ) -> tuple[BlockResult, _FlagProvider]:
     """With no model, the block resolves the variant's real model, which sends through litellm.acompletion."""
@@ -268,6 +270,7 @@ async def _run_agent_block(
             max_turns=max_turns,
             tools=tools,
             parameter_keys=parameter_keys,
+            model=block_model,
             **block_fields,
         ),
         {
@@ -748,6 +751,59 @@ async def test_agent_block_runs_only_on_a_flag_variant_that_pins_model_and_effor
     else:
         assert row.status == "failed"
         assert "AGENT_BLOCK_LLM_NAME" in (row.failure_reason or "")
+        assert model.inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("variant", "model_name", "expected_key", "reasons"),
+    [
+        (HAIKU_MEDIUM, None, HAIKU_MEDIUM, None),
+        (HAIKU_MEDIUM, "luna-medium", LUNA_MEDIUM, None),
+        (HAIKU_MEDIUM, "luna-unpinned", None, ("'luna-unpinned'", "'LUNA_UNPINNED'")),
+        (HAIKU_MEDIUM, "not-in-the-list", HAIKU_MEDIUM, None),
+        (HAIKU_MEDIUM, {"name": "luna-medium"}, HAIKU_MEDIUM, None),
+        (None, "luna-medium", None, ("AGENT_BLOCK_LLM_NAME",)),
+    ],
+)
+async def test_the_block_model_picks_a_pinned_key_only_after_the_flag_enables_the_block(
+    monkeypatch: pytest.MonkeyPatch,
+    database: AgentDB,
+    variant: str | None,
+    model_name: str | dict[str, str] | None,
+    expected_key: str | None,
+    reasons: tuple[str, ...] | None,
+) -> None:
+    monkeypatch.setitem(LLMConfigRegistry._configs, HAIKU_MEDIUM, _pinned("medium", HAIKU))
+    monkeypatch.setitem(LLMConfigRegistry._configs, LUNA_MEDIUM, _pinned("medium"))
+    monkeypatch.setitem(
+        LLMConfigRegistry._configs,
+        "LUNA_UNPINNED",
+        LLMConfig("openai/test", [], supports_vision=False, add_assistant_prefix=False, reasoning_effort="medium"),
+    )
+    mapping = {
+        "luna-medium": {"llm_key": LUNA_MEDIUM, "label": "Luna (medium)"},
+        "luna-unpinned": {"llm_key": "LUNA_UNPINNED", "label": "Luna"},
+    }
+    monkeypatch.setattr(
+        type(SettingsManager.get_settings()),
+        "get_model_name_to_llm_key",
+        lambda _self, organization_id=None: mapping,
+    )
+    model = _ScriptedModel([[scripted_call("finish", {"answer": "ok"}, call_id="c1")]])
+
+    result, _ = await _run_agent_block(
+        monkeypatch, variant, model, block_model=None if model_name is None else {"model_name": model_name}
+    )
+
+    (row,) = await database.observer.get_workflow_run_blocks(workflow_run_id=RUN, organization_id=ORG)
+    if expected_key:
+        assert row.status == "completed"
+        assert isinstance(result.output_parameter_value, dict)
+        assert result.output_parameter_value["model"]["llm_key"] == expected_key
+    else:
+        assert row.status == "failed"
+        assert reasons and all(reason in (row.failure_reason or "") for reason in reasons)
         assert model.inputs == []
 
 
