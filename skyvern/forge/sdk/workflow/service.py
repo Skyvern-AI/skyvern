@@ -247,6 +247,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     WorkflowVersionConflict,
 )
 from skyvern.forge.sdk.workflow.models._jinja import mask_jinja_in_python_comments
+from skyvern.forge.sdk.workflow.models.agent_step_block import AgentStepBlock
 from skyvern.forge.sdk.workflow.models.block import (
     _ENGINE_INERT_BLOCK_TYPES,
     BaseTaskBlock,
@@ -1286,7 +1287,10 @@ def _collect_enterprise_gated_workflow_features(
             engine = block.engine
         block_uses_model = (
             task_block_uses_engine_and_model
-            or isinstance(block, (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock))
+            or isinstance(
+                block,
+                (AgentStepBlock, TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock, SplitPdfBlock),
+            )
             or (
                 isinstance(block, WebSearchBlock)
                 and bool(

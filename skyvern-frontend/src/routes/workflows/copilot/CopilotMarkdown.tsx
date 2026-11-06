@@ -110,8 +110,8 @@ function markdownRevealPlugin(reveal: CopilotMarkdownReveal) {
 // construct the agent can write needs its look spelled out here or it renders as bare text.
 const MARKDOWN_CLASSES = [
   "whitespace-normal [&>:first-child]:mt-0 [&>:last-child]:mb-0",
-  "[&_a]:underline [&_a]:underline-offset-2",
-  "[&_code]:rounded [&_code]:bg-slate-500/15 [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.92em]",
+  "[&_a]:underline [&_a]:underline-offset-2 [&_a]:[overflow-wrap:anywhere]",
+  "[&_code]:rounded [&_code]:bg-slate-500/15 [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.92em] [&_code]:[overflow-wrap:anywhere]",
   "[&_pre]:my-3 [&_pre]:overflow-x-auto [&_pre]:whitespace-pre-wrap [&_pre]:rounded-md [&_pre]:bg-slate-500/15 [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0",
   "[&_p+p]:mt-3",
   "[&_li+li]:mt-1 [&_ol]:my-3 [&_ol]:list-decimal [&_ol]:pl-5 [&_ul]:my-3 [&_ul]:list-disc [&_ul]:pl-5",

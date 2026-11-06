@@ -317,6 +317,47 @@ describe("WorkflowDocEditor navigation", () => {
       ).toEqual(["open_site"]);
     });
 
+    test.each([
+      ["print_page", "printed", { include_timestamp: true }],
+      ["wait", "pause", { wait_sec: 1 }],
+    ])(
+      "Enter on a %s step that needs no text keeps it and opens an empty line below",
+      (type, label, extra) => {
+        const edits = editsWithAdd();
+        renderDoc(
+          [
+            block("goto_url", "open_site", label, { url: "https://a.test" }),
+            block(type, label, null, extra),
+          ],
+          edits,
+        );
+        const box = openLine(`${label} description`, "", 0);
+        fireEvent.keyDown(box, { key: "Enter" });
+
+        expect(edits.addStep).not.toHaveBeenCalled();
+        expect(edits.apply).not.toHaveBeenCalled();
+        expect(screen.getByRole("textbox", { name: "Note" })).toBeTruthy();
+      },
+    );
+
+    test("Enter on an empty step that needs text still turns it into a note (text prompt)", () => {
+      const edits = editsWithAdd();
+      renderDoc(
+        [
+          block("goto_url", "open_site", "empty_one", {
+            url: "https://a.test",
+          }),
+          block("text_prompt", "empty_one", null, { prompt: "" }),
+        ],
+        edits,
+      );
+      const box = openLine("empty_one prompt", "", 0);
+      fireEvent.keyDown(box, { key: "Enter" });
+
+      expect(edits.addStep).not.toHaveBeenCalled();
+      expect(edits.apply).toHaveBeenCalled();
+    });
+
     test("Picking a loop with / on an empty step replaces the step", () => {
       const edits = editsWithAdd();
       renderDoc(

@@ -31,7 +31,11 @@ import {
   contextInputsFedBy,
   type DocGraph,
 } from "./docGraphEdits";
-import { withLineSetting } from "./docLineSettings";
+import {
+  isWaitAmountLine,
+  waitSecondsFromLine,
+  withLineSetting,
+} from "./docLineSettings";
 import { block, code, conditional, forLoop, settings } from "./docTestBlocks";
 
 function graphOf(blocks: WorkflowBlock[], finallyLabel: string | null = null) {
@@ -815,6 +819,27 @@ describe("a Wait's line sets its time", () => {
     const zero = { ...pause, data: { ...pause.data, waitInSeconds: "0" } };
     expect(getDocMissingSettings(zero)).toEqual(["Seconds"]);
     expect(getDocMissingSettings(pause)).toEqual([]);
+  });
+
+  test("a Wait line that is only an amount sets the wait and is not a note", () => {
+    expect(["2", "10 min", "wait 10 seconds"].map(isWaitAmountLine)).toEqual([
+      true,
+      true,
+      true,
+    ]);
+    expect(isWaitAmountLine("let the page settle")).toBe(false);
+  });
+
+  test("a Wait amount in words (one..sixty-nine) counts, but only with a unit", () => {
+    expect(
+      [
+        "two seconds",
+        "Wait twenty-one seconds",
+        "sixteen sec",
+        "one minute",
+      ].map(waitSecondsFromLine),
+    ).toEqual([2, 21, 16, 60]);
+    expect(waitSecondsFromLine("wait for one of the pages")).toBeNull();
   });
 });
 
