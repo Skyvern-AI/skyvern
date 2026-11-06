@@ -857,6 +857,52 @@ describe("a step that was just added", () => {
     expect(screen.queryByText(/need.* fixing/)).toBeNull();
   });
 
+  test("a loop over a whole extraction result holds Run; the typed list path does not", () => {
+    const steps = (reference: string) => [
+      block("extraction", "extraction_1", "books", {
+        data_extraction_goal: "List the titles",
+        data_schema: null,
+      }),
+      forLoop("books", null, [block("navigation", "open_book", null)], {
+        loop_over: null,
+        loop_variable_reference: reference,
+      }),
+    ];
+    renderDoc(steps("{{ extraction_1_output }}"));
+    expect(
+      screen.getByText(/^Pick the list inside extraction_1_output/),
+    ).toBeTruthy();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+    cleanup();
+    renderDoc(steps("{{ extraction_1_output.extracted_information.titles }}"));
+    expect(screen.queryByText(/Pick the list/)).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+  });
+
+  test("a freshly added loop over a picked whole result holds Run once the user leaves it", () => {
+    const nodes = renderDoc([
+      block("extraction", "extraction_1", "books", {
+        data_extraction_goal: "List the titles",
+        data_schema: null,
+      }),
+      forLoop("books", null, [block("navigation", "open_book", null)], {
+        loop_over: null,
+        loop_variable_reference: "{{extraction_1_output}}",
+      }),
+    ]);
+    const loop = nodes.find((n) => n.type === "loop")!;
+    act(() => useDocUnfinishedStore.getState().add(loop.id));
+    expect(screen.queryByText(/^Pick the list inside/)).toBeNull();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(0);
+
+    fireEvent.pointerDown(document.body);
+
+    expect(
+      screen.getByText(/^Pick the list inside extraction_1_output/),
+    ).toBeTruthy();
+    expect(useRunValidationStore.getState().docProblemCount).toBe(1);
+  });
+
   test("a click inside a floating menu does not count as leaving the new step", () => {
     const nodes = renderDoc([block("login", "sign_in", null, { url: "" })]);
     const login = nodes.find((n) => isWorkflowBlockNode(n))!;
