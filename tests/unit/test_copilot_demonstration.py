@@ -2167,18 +2167,21 @@ async def test_recorder_persists_each_capture_gap_kind() -> None:
             "child",
             {"kind": "drag", "ts": 4, "selector": "#card", "target_selector": "#done"},
         ),
+        TapEvent(page, "tap", "main", True, "", {"kind": "click_navigation_unconfirmed", "ts": 5, "url": page.url}),
     ]
 
     for event in events:
         await recorder._record_tap_event(event)
 
-    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 5)]
+    stored = [json.loads(cache.store[demonstration_event_key("org-1", "demo-1", seq)]) for seq in range(1, 6)]
     assert [event["reason"] for event in stored] == [
         "nested_frame",
         "frame_navigation",
         "unsupported_event:unsupported_input",
         "freeform_drag",
+        "click_navigation_unconfirmed",
     ]
+    assert stored[-1]["label"] == "Click not recorded"
 
 
 @pytest.mark.asyncio
