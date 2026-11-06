@@ -312,14 +312,107 @@ describe("Add a step search", () => {
     expect(screen.getByRole("option", { name: /Power BI Query/ })).toBeTruthy();
   });
 
-  test("an exact step name comes first, above steps that only mention it", () => {
-    render(<DocStepPicker onPick={() => {}} />);
-    fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
-      target: { value: "Wait" },
-    });
+  test.each([false, true])(
+    "an exact step name comes first, above steps that only mention it (Demonstrate offered: %s)",
+    (withDemonstrate) => {
+      render(
+        <DocStepPicker
+          onPick={() => {}}
+          onDemonstrate={withDemonstrate ? () => {} : undefined}
+        />,
+      );
+      fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+        target: { value: "Wait" },
+      });
+      const options = screen.getAllByRole("option");
+      expect(options[0]!.textContent).toMatch(/^Wait/);
+      expect(options[0]!.getAttribute("aria-selected")).toBe("true");
+    },
+  );
+
+  function enterPick(query: string, withDemonstrate: boolean) {
+    let picked = "nothing";
+    render(
+      <DocStepPicker
+        onPick={(type) => {
+          picked = type;
+        }}
+        onDemonstrate={
+          withDemonstrate
+            ? () => {
+                picked = "demonstrate";
+              }
+            : undefined
+        }
+      />,
+    );
+    const input = screen.getByPlaceholderText("Add a step…");
+    fireEvent.change(input, { target: { value: query } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    cleanup();
+    return picked;
+  }
+
+  test.each([
+    "co",
+    "te",
+    "task",
+    "ac",
+    "em",
+    "re",
+    "wait",
+    "if",
+    "for",
+    "email",
+    "browser",
+    "loop",
+    "text",
+  ])(
+    "Enter after %j picks the same step whether Demonstrate is offered or not",
+    (query) => {
+      const without = enterPick(query, false);
+      expect(without).not.toBe("nothing");
+      expect(enterPick(query, true)).toBe(without);
+    },
+  );
+
+  test.each(["co", "re"])(
+    "a %j query leaves Demonstrate task out of the list",
+    (query) => {
+      render(<DocStepPicker onPick={() => {}} onDemonstrate={() => {}} />);
+      fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+        target: { value: query },
+      });
+      expect(
+        screen.queryByRole("option", { name: /Demonstrate task/ }),
+      ).toBeNull();
+    },
+  );
+
+  test("Demonstrate task is the first item while nothing is typed", () => {
+    render(<DocStepPicker onPick={() => {}} onDemonstrate={() => {}} />);
     const options = screen.getAllByRole("option");
-    expect(options[0]!.textContent).toMatch(/^Wait/);
+    expect(options[0]!.textContent).toMatch(/^Demonstrate task/);
     expect(options[0]!.getAttribute("aria-selected")).toBe("true");
+  });
+
+  test.each(["demonstrate", "demo"])(
+    "Enter after %j starts a demonstration",
+    (query) => {
+      expect(enterPick(query, true)).toBe("demonstrate");
+    },
+  );
+
+  test("a query that matches a step and Demonstrate lists Demonstrate after the step", () => {
+    render(<DocStepPicker onPick={() => {}} onDemonstrate={() => {}} />);
+    fireEvent.change(screen.getByPlaceholderText("Add a step…"), {
+      target: { value: "task" },
+    });
+    const names = screen.getAllByRole("option").map((o) => o.textContent);
+    const demonstrate = names.findIndex((n) =>
+      n?.startsWith("Demonstrate task"),
+    );
+    expect(demonstrate).toBeGreaterThan(0);
   });
 
   test("the words the Doc shows put Conditional and Loop first, even when another group mentions them", () => {

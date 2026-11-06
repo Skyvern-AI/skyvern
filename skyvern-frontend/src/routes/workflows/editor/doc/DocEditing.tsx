@@ -88,7 +88,7 @@ export function DocStepPicker({
   placeholder = "Add a step…",
 }: {
   onPick: (nodeType: NodeType) => void;
-  // Offers "Demonstrate task" first; left out where a demonstration can't start.
+  // Offers "Demonstrate task" (first while nothing is typed); left out where a demonstration can't start.
   onDemonstrate?: () => void;
   exclude?: string[];
   placeholder?: string;
@@ -112,6 +112,29 @@ export function DocStepPicker({
       );
     return [...choices].sort((a, b) => best(b) - best(a));
   }, [choices, search]);
+  const query = search.trim();
+  // cmdk highlights the first visible item, so a typed query lists this after the steps.
+  // One or two letters would match only its keywords, so it waits for three.
+  const demonstrate = onDemonstrate && (!query || query.length >= 3) && (
+    <CommandGroup heading="Copilot">
+      <CommandItem
+        value="Demonstrate task"
+        keywords={["demonstrate", "record", "teach"]}
+        onSelect={onDemonstrate}
+        className="gap-2.5"
+      >
+        <span className="grid size-7 shrink-0 place-items-center rounded-md border border-border">
+          <span aria-hidden className="h-2.5 w-2.5 rounded-full bg-red-500" />
+        </span>
+        <span className="min-w-0">
+          <span className="block text-sm leading-tight">Demonstrate task</span>
+          <span className="block text-xs leading-tight text-muted-foreground">
+            Show Copilot how in the browser
+          </span>
+        </span>
+      </CommandItem>
+    </CommandGroup>
+  );
   return (
     <Command loop filter={docStepFilter} className="min-h-0">
       <CommandInput
@@ -122,31 +145,7 @@ export function DocStepPicker({
       />
       <CommandList className="max-h-[min(340px,50vh)]">
         <CommandEmpty>No step matches.</CommandEmpty>
-        {onDemonstrate && (
-          <CommandGroup heading="Copilot">
-            <CommandItem
-              value="Demonstrate task"
-              keywords={["demonstrate", "record", "teach"]}
-              onSelect={onDemonstrate}
-              className="gap-2.5"
-            >
-              <span className="grid size-7 shrink-0 place-items-center rounded-md border border-border">
-                <span
-                  aria-hidden
-                  className="h-2.5 w-2.5 rounded-full bg-red-500"
-                />
-              </span>
-              <span className="min-w-0">
-                <span className="block text-sm leading-tight">
-                  Demonstrate task
-                </span>
-                <span className="block text-xs leading-tight text-muted-foreground">
-                  Show Copilot how in the browser
-                </span>
-              </span>
-            </CommandItem>
-          </CommandGroup>
-        )}
+        {!query && demonstrate}
         {groups.map((group) => (
           <CommandGroup key={group.name} heading={group.name}>
             {group.items
@@ -179,6 +178,7 @@ export function DocStepPicker({
               ))}
           </CommandGroup>
         ))}
+        {query && demonstrate}
       </CommandList>
     </Command>
   );
