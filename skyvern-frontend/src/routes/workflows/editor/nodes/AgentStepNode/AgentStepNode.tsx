@@ -8,8 +8,10 @@ import { cn } from "@/util/utils";
 import { useCollapseContext } from "../../collapse/CollapseContext";
 import { NodeBody } from "../../collapse/NodeBody";
 import { BuildModeOnly } from "../BuildModeOnly";
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { NodeHeader } from "../components/NodeHeader";
 import { AgentStepEditor } from "./AgentStepEditor";
+import { AgentStepTrail } from "./AgentStepTrail";
 import type { AgentStepNode } from "./types";
 
 function AgentStepNode({ id, data }: NodeProps<AgentStepNode>) {
@@ -17,11 +19,12 @@ function AgentStepNode({ id, data }: NodeProps<AgentStepNode>) {
   const { blockLabel: urlBlockLabel } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const { open } = useCollapseContext();
+  const readOnlyScope = useWorkflowScopeReadOnly();
   const isTargeted = urlBlockLabel !== undefined && urlBlockLabel === label;
   const isRunning = workflowRun && statusIsRunningOrQueued(workflowRun);
 
   return (
-    <div>
+    <div className="relative">
       <Handle
         type="source"
         position={Position.Bottom}
@@ -58,6 +61,7 @@ function AgentStepNode({ id, data }: NodeProps<AgentStepNode>) {
           </BuildModeOnly>
         </NodeBody>
       </div>
+      {readOnlyScope ? null : <AgentStepTrail agentStepLabel={label} />}
     </div>
   );
 }

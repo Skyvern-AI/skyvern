@@ -10,6 +10,7 @@ type CmMockProps = {
   onBlur?: unknown;
   value?: string;
   theme?: unknown;
+  readOnly?: boolean;
 };
 
 const cmMockCalls: CmMockProps[] = [];
@@ -34,6 +35,8 @@ beforeEach(() => {
   cmMockCalls.length = 0;
   themeModeMock.mockReturnValue("dark");
 });
+
+import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
 
 import { CodeEditor } from "./CodeEditor";
 import { tokyoNightStorm } from "@uiw/codemirror-theme-tokyo-night-storm";
@@ -188,4 +191,16 @@ describe("CodeEditor theme (SKY-12414)", () => {
     themeModeMock.mockReturnValue("dark");
     expect(await mountAndReadTheme()).toBe(tokyoNightStorm);
   });
+});
+
+test("a read-only workflow scope makes the editor read-only", () => {
+  // @ts-expect-error simulate environments without the API
+  delete globalThis.IntersectionObserver;
+  render(
+    <WorkflowScopeContext.Provider value={{ workflowId: null, readOnly: true }}>
+      <CodeEditor value="print('hi')" language="python" onChange={vi.fn()} />
+    </WorkflowScopeContext.Provider>,
+  );
+
+  expect(cmMockCalls[cmMockCalls.length - 1]?.readOnly).toBe(true);
 });

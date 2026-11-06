@@ -7,6 +7,7 @@ type Props = {
   pane: string;
   onError: (error: unknown, componentStack?: string | null) => void;
   fallbackContainer?: HTMLElement | null;
+  fallback?: ReactNode;
   children: ReactNode;
 };
 
@@ -34,7 +35,7 @@ class PaneErrorBoundary extends Component<Props, State> {
       return this.props.children;
     }
 
-    const fallback = (
+    const fallback = this.props.fallback ?? (
       <div
         aria-label={`${this.props.pane} panel error`}
         className="flex h-full min-h-32 w-full items-center justify-center p-4"
