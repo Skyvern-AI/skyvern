@@ -7,8 +7,9 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { Status } from "@/api/types";
 import { NarrativeView } from "./NarrativeView";
 import {
   BlockState,
@@ -20,6 +21,23 @@ import {
   hydrateNarrativeFromPayload,
 } from "./narrativeState";
 import capture from "./narrativeState.hydrationParity.fixture.json";
+
+type RecordedRun = {
+  status: Status;
+  retry_pending?: boolean;
+  credits_used: number;
+  cached_credits_used: number;
+};
+
+const recordedRuns = vi.hoisted(() => new Map<string, RecordedRun>());
+
+vi.mock("../hooks/useWorkflowRunQuery", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../hooks/useWorkflowRunQuery")>()),
+  useWorkflowRunByIdQuery: (workflowRunId: string | undefined) => ({
+    data: workflowRunId ? recordedRuns.get(workflowRunId) : undefined,
+    isError: false,
+  }),
+}));
 
 const completedBlock = (): BlockState => ({
   workflowRunBlockId: "wrb_open_site",
@@ -49,7 +67,10 @@ const structuredTurn = (
   ...overrides,
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  recordedRuns.clear();
+});
 
 describe("NarrativeView structured turn presentation", () => {
   it("uses one detailed reading view without the legacy rollup", () => {
@@ -1019,5 +1040,106 @@ describe("NarrativeView failed test attempts", () => {
       />,
     );
     expect(occurrences(`Outcome not confirmed — ${reason}`)).toBe(1);
+  });
+});
+
+describe("NarrativeView test run cost", () => {
+  const testTurn = (testInputs?: { key: string; source: string }[]) =>
+    playTurn([
+      runCall("call-1", 1),
+      ...failedBlock("wr_cost", "wrb_cost", 2),
+      {
+        type: "tool_result",
+        tool_name: "update_and_run_blocks",
+        success: false,
+        summary: "Couldn't complete that step.",
+        detail: "Locator timed out",
+        workflow_run_id: "wr_cost",
+        test_inputs: testInputs,
+        iteration: 5,
+        tool_call_id: "call-1",
+        timestamp: at(5),
+      } as NarrativeEvent,
+    ]);
+  const testRun = (testInputs?: { key: string; source: string }[]) =>
+    ended(testTurn(testInputs));
+
+  it("holds a finished run's cost until Copilot's turn ends", () => {
+    recordedRuns.set("wr_cost", {
+      status: "failed",
+      credits_used: 40,
+      cached_credits_used: 15,
+    });
+    const { rerender } = render(<NarrativeView turn={testTurn()} />);
+
+    expect(testCards()).toHaveLength(1);
+    expect(occurrences("credits")).toBe(0);
+
+    rerender(<NarrativeView turn={testRun()} />);
+    fireEvent.click(activityLines()[0]!);
+
+    expect(occurrences("55 credits")).toBe(1);
+  });
+
+  it("shows a finished run's live and cached credits once, as the run view words them", () => {
+    recordedRuns.set("wr_cost", {
+      status: "failed",
+      credits_used: 40,
+      cached_credits_used: 15,
+    });
+    render(
+      <NarrativeView
+        turn={testRun([{ key: "policy_date", source: "copilot" }])}
+      />,
+    );
+    fireEvent.click(activityLines()[0]!);
+
+    expect(occurrences("55 credits")).toBe(1);
+    expect(
+      document.querySelector("[data-test-run-cost]")?.getAttribute("title"),
+    ).toBe("Credits consumed by this run (live + cached)");
+    expect(
+      screen.getByRole("button", { name: /Test inputs \(1\)/ }),
+    ).toBeTruthy();
+  });
+
+  it("shows the cost once for a test with no inputs", () => {
+    recordedRuns.set("wr_cost", {
+      status: "failed",
+      credits_used: 40,
+      cached_credits_used: 15,
+    });
+    render(<NarrativeView turn={testRun()} />);
+    fireEvent.click(activityLines()[0]!);
+
+    expect(occurrences("55 credits")).toBe(1);
+    expect(screen.queryByRole("button", { name: /Test inputs/ })).toBeNull();
+  });
+
+  it.each<[string, RecordedRun]>([
+    [
+      "still running",
+      { status: "running", credits_used: 40, cached_credits_used: 15 },
+    ],
+    [
+      "failed with a retry pending",
+      {
+        status: "failed",
+        retry_pending: true,
+        credits_used: 40,
+        cached_credits_used: 15,
+      },
+    ],
+  ])("shows no cost for a run %s", (_label, run) => {
+    recordedRuns.set("wr_cost", run);
+    render(<NarrativeView turn={testRun()} />);
+    fireEvent.click(activityLines()[0]!);
+    expect(testCards()).toHaveLength(1);
+
+    expect(occurrences("credits")).toBe(0);
+    const emptyLists = Array.from(document.querySelectorAll("ul")).filter(
+      (list) => !list.textContent?.trim(),
+    );
+    expect(emptyLists).toHaveLength(0);
   });
 });

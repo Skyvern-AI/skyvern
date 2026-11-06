@@ -34,6 +34,8 @@ from skyvern.forge.sdk.copilot.agent import (
 )
 from skyvern.forge.sdk.copilot.agent_context import RegisteredArtifactEntry, RegisteredArtifactEvidence
 from skyvern.forge.sdk.copilot.build_test_connect_failure import (
+    BROWSER_TOOLS_UNAVAILABLE_ERROR,
+    RAW_SECRET_BROWSER_ERROR,
     BuildTestConnectFailureState,
     build_test_connect_failure_sentence,
 )
@@ -595,7 +597,7 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     )
     result = {
         "ok": False,
-        "error": "Build-test browser acquisition stopped: cdp_connect_failed.",
+        "error": build_test_connect_failure_sentence(failure),
         "data": {
             "workflow_run_id": "wr_1",
             "overall_status": "setup_failed",
@@ -615,6 +617,77 @@ def test_connect_failure_projects_through_recorded_outcome_and_packet() -> None:
     assert packet.failure is not None
     assert packet.failure.connect_failure == failure
     assert packet.canonical_workflow_yaml == "title: preserved draft"
+
+
+_BROWSER_LOST_AFTER_RUN_START = (
+    "The test run started, but its browser was lost before any block ran, so nothing was tested. "
+    "Trying again in a fresh browser may work."
+)
+
+
+@pytest.mark.parametrize(
+    ("state", "workflow_run_id", "sentence"),
+    [
+        (
+            "provisioning_unavailable",
+            None,
+            "Build test did not start: no test browser was ready in time. This was a problem on Skyvern's side, "
+            "not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "cdp_connect_failed",
+            None,
+            "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+            "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work.",
+        ),
+        (
+            "already_closed",
+            None,
+            "Build test did not start: the test browser had already closed. No run started. "
+            "Trying again in a fresh browser may work.",
+        ),
+        ("provisioning_unavailable", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("cdp_connect_failed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+        ("already_closed", "wr_1", _BROWSER_LOST_AFTER_RUN_START),
+    ],
+)
+def test_a_browser_start_failure_reads_as_a_plain_sentence_and_keeps_its_typed_state(
+    state: BuildTestConnectFailureState, workflow_run_id: str | None, sentence: str
+) -> None:
+    failure = BuildTestConnectFailure(state=state, workflow_run_id=workflow_run_id)
+
+    result = runtime._build_test_connect_failure_result(failure)
+
+    assert build_test_connect_failure_sentence(failure) == sentence
+    assert state not in sentence
+    assert result["error"] == sentence
+    assert result["data"]["build_test_connect_failure"]["state"] == state
+
+
+@pytest.mark.parametrize("diagnostic", [BROWSER_TOOLS_UNAVAILABLE_ERROR, RAW_SECRET_BROWSER_ERROR])
+def test_a_denied_browser_keeps_its_denial_instead_of_a_retry_invitation(diagnostic: str) -> None:
+    failure = BuildTestConnectFailure(state="provisioning_unavailable", diagnostic=diagnostic)
+
+    assert build_test_connect_failure_sentence(failure) == diagnostic
+
+
+@pytest.mark.asyncio
+async def test_a_finished_run_hands_its_recorded_live_and_cached_credits_to_the_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_get_run_results_harness(
+        monkeypatch,
+        run_status="completed",
+        blocks=[run_result_block_row("open_site", "completed", "https://fixture.test/")],
+        run_credits=(40, 15),
+    )
+
+    hydrated = await run_execution_module.hydrate_prior_run_packet(
+        make_copilot_ctx(workflow_permanent_id="wpid-1"), workflow_run_id="wr-1"
+    )
+
+    assert hydrated is not None
+    assert hydrated["run"]["credits_used"] == 55
 
 
 def test_billing_credit_refusal_schema_requires_no_retry_or_new_identity() -> None:
@@ -855,7 +928,10 @@ def test_a_post_run_connect_failure_keeps_the_block_failures_diagnostic_evidence
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
             structural_failure_identity="build_test_connect:cdp_connect_failed",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -902,7 +978,10 @@ def test_a_block_that_died_on_a_plain_exception_is_preserved_like_a_browser_fail
             verdict="not_authoritative",
             reason_code="unrecoverable_tool_error",
             workflow_run_id="wr_1",
-            observed_evidence_summary="Build-test browser acquisition stopped: cdp_connect_failed.",
+            observed_evidence_summary=(
+                "Build test did not start: Skyvern could not connect to the test browser. This was a problem on "
+                "Skyvern's side, not with the workflow or the account's credits. No run started. Trying again may work."
+            ),
             connect_failure=BuildTestConnectFailure(
                 state="cdp_connect_failed",
                 browser_session_id="pbs_stale",
@@ -2249,6 +2328,8 @@ async def test_failed_run_complete_fact_packet_reaches_ordinary_repair_input(
         created_at=datetime(2026, 4, 21, 12, 0),
         trigger_type=None,
         workflow_definition_sha256=None,
+        credits_used=0,
+        cached_credits_used=0,
     )
     block = SimpleNamespace(
         workflow_run_block_id="wrb_failed_complete_packet",

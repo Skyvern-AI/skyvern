@@ -288,6 +288,8 @@ def harness_run(
     workflow_permanent_id: str = "wpid-1",
     organization_id: str = "org-1",
     workflow_definition_sha256: str | None = None,
+    credits_used: int = 0,
+    cached_credits_used: int = 0,
 ) -> SimpleNamespace:
     """Naive-UTC created_at, as the database returns it."""
     return SimpleNamespace(
@@ -302,6 +304,8 @@ def harness_run(
         failure_reason=None,
         browser_session_id="pbs-1",
         workflow_definition_sha256=workflow_definition_sha256,
+        credits_used=credits_used,
+        cached_credits_used=cached_credits_used,
     )
 
 
@@ -320,11 +324,18 @@ def install_get_run_results_harness(
     carried_run_id: str | None = None,
     heal_episodes: list[HealEpisode] | None = None,
     run_definition_sha256: str | None = None,
+    run_credits: tuple[int, int] = (0, 0),
 ) -> SimpleNamespace:
     """Stub the collaborators ``_get_run_results`` reaches and return the ctx to call it with; the run pool is
     ``wr-1`` plus ``other_runs``, and run lookup and history listing honor their arguments."""
     pool = [
-        harness_run("wr-1", status=run_status, workflow_definition_sha256=run_definition_sha256),
+        harness_run(
+            "wr-1",
+            status=run_status,
+            workflow_definition_sha256=run_definition_sha256,
+            credits_used=run_credits[0],
+            cached_credits_used=run_credits[1],
+        ),
         *(other_runs or []),
     ]
     workflow = SimpleNamespace(

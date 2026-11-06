@@ -1531,7 +1531,10 @@ def _recorded_build_test_outcome_prompt(ctx: CopilotContext | None) -> str:
         # The occupying run id is cleared first -- prompt atoms carry no raw run ids, and leaving it
         # in makes the leak guard drop the whole line rather than redact the id.
         sentence = build_test_connect_failure_sentence(connect_failure.model_copy(update={"occupier_run_id": None}))
-        lines.append(f"browser_acquisition_failed: {_clean_authoring_repair_prompt_atom(sentence)}")
+        lines.append(
+            "browser_acquisition_failed: "
+            f"{_clean_authoring_repair_prompt_atom(sentence, max_chars=RUNTIME_FAILURE_REASON_MAX_CHARS)}"
+        )
     # Facts render for every outcome; the two post-run page-path directives bind the model's next
     # action, so they keep the authority check and stay on turns that may author code, the only ones
     # they were built and measured for.
@@ -1842,6 +1845,8 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         if connect_failure is not None and connect_failure.state == "billing_credit_admission_refusal":
             sentence = build_test_connect_failure_sentence(connect_failure)
             return lead_then_reply(f"I couldn't start a test. {sentence} The draft is untested.")
+        if connect_failure is not None and connect_failure.workflow_run_id:
+            return lead_then_reply(f"I couldn't test the draft. {build_test_connect_failure_sentence(connect_failure)}")
 
         # No run row means nothing executed, so claiming the draft was tested is false.
         if (
