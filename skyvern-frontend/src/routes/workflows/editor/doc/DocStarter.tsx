@@ -4,7 +4,6 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/util/utils";
 import { TIPS, docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { docStarterDone } from "./useDocStarter";
-import { modLabel } from "./docKeys";
 
 export const DOC_SAMPLE_NOTE =
   "One thing per line. Lines without a tag, like this one, are notes the agent reads while it runs.";
@@ -17,52 +16,6 @@ export function DocStarterNote() {
       className="mb-3 text-base leading-[1.55] text-muted-foreground"
     >
       {DOC_SAMPLE_NOTE}
-    </p>
-  );
-}
-
-function Key({ children }: { children: string }) {
-  return (
-    <kbd className="mr-1.5 inline-grid min-w-[18px] place-items-center rounded border border-border bg-muted px-[5px] font-sans text-[11.5px] leading-[16px] text-foreground">
-      {children}
-    </kbd>
-  );
-}
-
-export function DocKeyHints() {
-  const mod = modLabel();
-  return (
-    <p
-      aria-label="Keyboard shortcuts"
-      className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-[12.5px] text-muted-foreground"
-    >
-      <span>
-        <Key>Enter</Key>new step
-      </span>
-      <span>
-        <Key>Shift+Enter</Key>line break
-      </span>
-      <span>
-        <Key>/</Key>change the step type
-      </span>
-      <span>
-        <Key>@</Key>use an input or earlier result
-      </span>
-      <span>
-        <Key>Tab</Key>nest under the step above
-      </span>
-      <span>
-        <Key>{`${mod}.`}</Key>settings
-      </span>
-      <span>
-        <Key>{`${mod}Enter`}</Key>run step
-      </span>
-      <span>
-        <Key>{`${mod}Shift+Enter`}</Key>run agent
-      </span>
-      <span>
-        <Key>{`${mod}S`}</Key>save
-      </span>
     </p>
   );
 }

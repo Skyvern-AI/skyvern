@@ -7,14 +7,19 @@ import type {
 } from "../../types/workflowRunTypes";
 import {
   loopItemText,
+  collectBlockRuns,
   collectLoopProgress,
+  type DocBlockRuns,
   docLoopProgressText,
   docRunEndMessage,
   docRunRowsSettled,
   docTagState,
+  ranAnotherVersion,
+  settleRowsOfEndedRun,
   stepsUnknownToRun,
   type DocLoopProgress,
 } from "./docRunState";
+import { docProduced } from "./docStepProduced";
 import { collectBlocks } from "./useDocRun";
 
 const RUN = "wr_1";
@@ -52,6 +57,33 @@ function project(timeline: WorkflowRunTimelineItem[]) {
 }
 
 describe("Doc run state", () => {
+  it("counts a looped step's runs that returned a value, apart from those that returned nothing", () => {
+    const code = (
+      output: WorkflowRunBlock["output"],
+      status: Status = Status.Completed,
+    ) => item(row("check_price", { block_type: "code", output, status }));
+    const runs = new Map<string, DocBlockRuns>();
+    collectBlockRuns(
+      [
+        item(row("each_book", { block_type: "for_loop" }), [
+          code({ result: "under budget" }),
+          code(null),
+          code({ result: "under budget" }),
+          code(null, Status.Skipped),
+        ]),
+      ],
+      RUN,
+      runs,
+      (block) => docProduced(block) !== null,
+    );
+    expect(runs.get("check_price")).toEqual({
+      count: 3,
+      failed: 0,
+      canceled: 0,
+      withOutput: 2,
+    });
+  });
+
   it("gives each step's tag its live state, and Not reached once the run settles", () => {
     const { blocks } = project([
       item(row("open_site")),
@@ -267,5 +299,207 @@ describe("stepsUnknownToRun authored identifiers", () => {
     expect([
       ...stepsUnknownToRun(exportStep("integer"), exportStep("string")),
     ]).toEqual(["export"]);
+  });
+});
+
+describe("stepsUnknownToRun across saves", () => {
+  // Shaped like two stored versions of one agent: the first made outside the editor, the second its first Doc save.
+  const version = (
+    save: "first" | "editor",
+    stamp: string,
+    extraction: Record<string, unknown> = {},
+  ) => ({
+    parameters: [
+      {
+        key: "books",
+        workflow_parameter_id: `wp_${stamp}`,
+        workflow_id: stamp,
+      },
+    ],
+    blocks: [
+      {
+        label: "loop_1",
+        block_type: "for_loop",
+        title: save === "first" ? "" : "loop_1",
+        loop_over: {
+          key: "books",
+          parameter_type: "workflow",
+          workflow_parameter_id: `wp_${stamp}`,
+          workflow_id: stamp,
+          created_at: stamp,
+          modified_at: stamp,
+        },
+        loop_blocks: [
+          {
+            label: "extraction_1",
+            block_type: "extraction",
+            title: save === "first" ? "" : "extraction_1",
+            url: save === "first" ? null : "",
+            data_extraction_goal: "Title and price of each book",
+            export_enabled: false,
+            export_data_schema:
+              save === "first"
+                ? null
+                : {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: { value: { type: "string" } },
+                    },
+                  },
+            output_parameter: { output_parameter_id: `op_${stamp}` },
+            ...extraction,
+          },
+          { label: "code_1", block_type: "code", code: "pass" },
+        ],
+      },
+    ],
+  });
+
+  it("keeps every step's result after a save with no edits", () => {
+    expect(
+      stepsUnknownToRun(version("first", "a"), version("editor", "b")).size,
+    ).toBe(0);
+    expect(
+      stepsUnknownToRun(version("editor", "b"), version("editor", "c")).size,
+    ).toBe(0);
+  });
+
+  it("hides only the edited step, not the loop around it", () => {
+    expect([
+      ...stepsUnknownToRun(
+        version("first", "a"),
+        version("editor", "b", {
+          data_extraction_goal: "Title and price of each book and its price",
+        }),
+      ),
+    ]).toEqual(["extraction_1"]);
+  });
+
+  it("still sees an authored url or an export schema in use as an edit", () => {
+    const withUrl = version("editor", "b", { url: "https://example.com" });
+    expect([...stepsUnknownToRun(version("editor", "a"), withUrl)]).toEqual([
+      "extraction_1",
+    ]);
+    const schemaField = version("editor", "b", {
+      data_schema: { properties: { workflow_id: { type: "string" } } },
+    });
+    expect([...stepsUnknownToRun(version("editor", "a"), schemaField)]).toEqual(
+      ["extraction_1"],
+    );
+    const exporting = version("editor", "b", { export_enabled: true });
+    expect([...stepsUnknownToRun(version("first", "a"), exporting)]).toEqual([
+      "extraction_1",
+    ]);
+  });
+});
+
+describe("a run that has ended", () => {
+  // Stop pressed during item 3 of 3: the step on item 3 is still "running" in the rows.
+  const stoppedLoop = (inner: Status) => [
+    item(
+      row("each_page", {
+        block_type: "for_loop",
+        loop_values: ["a", "b", "c"],
+        status: inner,
+      }),
+      [2, 1, 0].map((index) =>
+        item(
+          row("open_page", {
+            current_index: index,
+            current_value: "abc"[index],
+            status: index === 2 ? inner : Status.Completed,
+          }),
+        ),
+      ),
+    ),
+  ];
+
+  it("shows the item that was running at Stop as canceled, before and after the rows catch up", () => {
+    for (const inner of [Status.Running, Status.Canceled]) {
+      const timeline = settleRowsOfEndedRun(stoppedLoop(inner), {
+        status: Status.Canceled,
+      });
+      const { blocks, loops } = project(timeline);
+      expect(loops.get("each_page")!.items.map((i) => i.state)).toEqual([
+        "succeeded",
+        "succeeded",
+        "canceled",
+      ]);
+      expect(blocks.get("open_page")!.status).toBe(Status.Canceled);
+      const runs = new Map<string, DocBlockRuns>();
+      collectBlockRuns(timeline, RUN, runs, () => false);
+      expect(runs.get("open_page")).toMatchObject({ count: 3, canceled: 1 });
+    }
+  });
+
+  it("reads a step the backend still has running on a failed run as that failure, not as stopped", () => {
+    const timeline = settleRowsOfEndedRun(
+      [item(row("open_site", { status: Status.Running }))],
+      { status: Status.Failed, failure_reason: "Failed to navigate to url" },
+    );
+    const block = project(timeline).blocks.get("open_site")!;
+    expect(block.status).toBe(Status.Failed);
+    expect(block.failure_reason).toBe("Failed to navigate to url");
+    expect(docTagState(block, false, true)).toBe("failed");
+  });
+
+  it("leaves a completed or terminated run's rows, and a lagging Stop step, as they are", () => {
+    const timeline = [item(row("open_site", { status: Status.Running }))];
+    for (const status of [Status.Completed, Status.Terminated])
+      expect(settleRowsOfEndedRun(timeline, { status })).toBe(timeline);
+    const stop = [
+      item(
+        row("stop_here", { block_type: "terminate", status: Status.Running }),
+      ),
+    ];
+    const settled = settleRowsOfEndedRun(stop, { status: Status.TimedOut });
+    expect(project(settled).blocks.get("stop_here")!.status).toBe(
+      Status.Running,
+    );
+  });
+});
+
+describe("ranAnotherVersion", () => {
+  const steps = (goal: string) => ({
+    blocks: [{ label: "open_site", block_type: "goto_url", url: goal }],
+  });
+  const at = (version: number, goal: string) => ({
+    version,
+    workflow_definition: steps(goal),
+  });
+  const test = { copilotTest: true, proposalPending: false };
+  const plain = { copilotTest: false, proposalPending: false };
+
+  it("treats a rejected proposal's test run as another version than the saved agent", () => {
+    // Copilot tested the proposal as v4, then it was rejected; the agent is still v3.
+    expect(ranAnotherVersion(at(4, "proposal"), at(3, "saved"), test)).toBe(
+      true,
+    );
+    // Its draft version is deleted once the run ends, whatever the run says.
+    expect(
+      ranAnotherVersion(
+        { ...at(4, "proposal"), deleted_at: "2026-11-06T16:22:47" },
+        at(3, "saved"),
+        plain,
+      ),
+    ).toBe(true);
+    expect(ranAnotherVersion(at(2, "older"), at(3, "saved"), plain)).toBe(true);
+  });
+
+  it("keeps a proposal's test while it is under review, a newer save, and a version with the same steps", () => {
+    expect(
+      ranAnotherVersion(at(4, "proposal"), at(3, "saved"), {
+        copilotTest: true,
+        proposalPending: true,
+      }),
+    ).toBe(false);
+    expect(
+      ranAnotherVersion(at(4, "saved elsewhere"), at(3, "saved"), plain),
+    ).toBe(false);
+    expect(ranAnotherVersion(at(3, "saved"), at(4, "saved"), test)).toBe(false);
+    expect(ranAnotherVersion(at(3, "saved"), at(3, "saved"), plain)).toBe(
+      false,
+    );
   });
 });

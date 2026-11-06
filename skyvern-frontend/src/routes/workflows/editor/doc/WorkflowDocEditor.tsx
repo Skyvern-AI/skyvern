@@ -52,7 +52,7 @@ import {
   saveDocInput,
 } from "./docInputs";
 import { DocInputEditor } from "./DocInputEditor";
-import { armNextCaretOffset, takeReferenceLine } from "./docKeys";
+import { armNextCaretOffset, takeReferenceLine, useDocTouch } from "./docKeys";
 import type { ParametersState } from "../types";
 import { toast, useToast } from "@/components/ui/use-toast";
 import {
@@ -65,6 +65,7 @@ import { useDocRunStore, type DocRunInput } from "./docRunStore";
 import { DocLiveIndicator } from "./DocLiveIndicator";
 import { DocOutline } from "./DocOutline";
 import { DocStepSearch } from "./DocStepSearch";
+import { DocAnnouncer } from "./DocAnnouncer";
 import { DocAddStep, DocScope, type DocNoteProblem } from "./DocScope";
 import { useRecordingLauncherStore } from "@/store/useRecordingLauncherStore";
 import { DocSidePanel } from "./DocSidePanel";
@@ -82,12 +83,7 @@ import { countReferences, findOutputUsers } from "./docGraphEdits";
 import { docStepTitle } from "./docStepRegistry";
 import { docStepProblems } from "./docProblems";
 import { stepsLeftBy, useDocUnfinishedStore } from "./docUnfinished";
-import {
-  DocGettingStarted,
-  DocKeyHints,
-  DocStarterNote,
-  DocTip,
-} from "./DocStarter";
+import { DocGettingStarted, DocStarterNote, DocTip } from "./DocStarter";
 import { docTipIndex, type DocStarterProgress } from "./docStarterTips";
 import { useRunValidationStore } from "../runValidation/useRunValidationStore";
 import {
@@ -269,6 +265,7 @@ export function WorkflowDocEditor({
     () => new Set(),
   );
   const [searchOpen, setSearchOpen] = useState(false);
+  const touch = useDocTouch();
   const locateRequest = useLocateBlockStore((s) => s.request);
   const clearLocate = useLocateBlockStore((s) => s.clearLocate);
   const [wide, setWide] = useState(false);
@@ -1078,6 +1075,7 @@ export function WorkflowDocEditor({
       value={{
         editable,
         runControlsVisible: !scopeReadOnly && !proposal && !fullRunGoing,
+        runGoing: docRun.live && docRun.owned,
         openSettings: openStepSettings,
         openVisual: () =>
           useWorkflowPresentationStore.getState().setPresentation("visual"),
@@ -1217,14 +1215,15 @@ export function WorkflowDocEditor({
         <div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto">
           <div
             className={cn(
-              "relative mx-auto w-full max-w-[820px] px-8 pb-40 pt-7 sm:pt-11",
-              wide && "sm:px-10",
+              // From sm up, the left margin holds each step's grip beside a loop's arrow.
+              "relative mx-auto w-full max-w-[820px] pb-40 pl-8 pr-8 pt-7 sm:pl-16 sm:pt-11",
+              wide && "sm:pr-10",
             )}
           >
             <div
               className={cn(
-                "sm:absolute sm:inset-x-0 sm:top-2 sm:px-8",
-                wide && "sm:px-10",
+                "sm:absolute sm:inset-x-0 sm:top-2 sm:pl-16 sm:pr-8",
+                wide && "sm:pr-10",
               )}
             >
               <DocEditBar
@@ -1404,8 +1403,13 @@ export function WorkflowDocEditor({
                 onClick={() => setSearchOpen(true)}
                 className="rounded-md px-2 py-[3px] outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
               >
-                Search{" "}
-                <kbd className="text-[11px] text-muted-foreground">⌘K</kbd>
+                Search
+                {!touch && (
+                  <>
+                    {" "}
+                    <kbd className="text-[11px] text-muted-foreground">⌘K</kbd>
+                  </>
+                )}
               </button>
               {containerIds.length >= 2 && (
                 <>
@@ -1481,6 +1485,7 @@ export function WorkflowDocEditor({
                 noteProblems={noteProblems}
               />
               <DocUnanchoredRemovals />
+              <DocAnnouncer />
               {edit && (
                 <div className="mt-3">
                   <DocAddStep
@@ -1490,7 +1495,6 @@ export function WorkflowDocEditor({
                     }}
                     label="Add step"
                   />
-                  <DocKeyHints />
                   {showTip && (
                     <DocTip
                       progress={starterProgress}
