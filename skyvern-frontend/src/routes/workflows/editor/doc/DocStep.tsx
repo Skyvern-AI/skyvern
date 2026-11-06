@@ -96,10 +96,19 @@ const tagClass = (
 
 /** The step's state in the Doc's run, for its tag. */
 function useDocTagState(label: string): DocTagState | null {
-  const { runId, blocksByLabel, live, blockRun, unknownLabels } = useDocRun();
+  const {
+    runId,
+    blocksByLabel,
+    live,
+    blockRun,
+    unknownLabels,
+    ranLabels,
+    rowsLoaded,
+  } = useDocRun();
   const block = blocksByLabel.get(label);
-  if (unknownLabels.has(label)) return null;
+  if (unknownLabels.has(label) || !rowsLoaded) return null;
   if (blockRun && !block) return null;
+  if (!block && ranLabels && !ranLabels.has(label)) return null;
   return docTagState(block, live, Boolean(runId));
 }
 

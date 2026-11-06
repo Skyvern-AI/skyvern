@@ -25,6 +25,7 @@ import {
 import { isWorkflowBlockNode } from "../nodes";
 import { getElements } from "../workflowEditorUtils";
 import { useLocateBlockStore } from "../runValidation/useLocateBlockStore";
+import { useDocRunStore } from "./docRunStore";
 import { WorkflowDocEditor } from "./WorkflowDocEditor";
 import { useDocUnfinishedStore } from "./docUnfinished";
 import { splitAtCaret } from "./docCaret";
@@ -34,7 +35,11 @@ import { useWorkflowYamlEditorStore } from "@/store/WorkflowYamlEditorStore";
 
 const docRun = vi.hoisted(() => ({ current: {} as Record<string, unknown> }));
 vi.mock("./useDocRun", () => ({
-  useDocRun: () => ({ unknownLabels: new Set(), ...docRun.current }),
+  useDocRun: () => ({
+    unknownLabels: new Set(),
+    rowsLoaded: true,
+    ...docRun.current,
+  }),
 }));
 import type { DocGraph } from "./docGraphEdits";
 import * as axiosClientModule from "@/api/AxiosClient";
@@ -1049,6 +1054,24 @@ describe("Doc inputs", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+  });
+
+  test("a credential input no step uses, with no saved credential, is not needed to run", () => {
+    useWorkflowParametersStore.setState({
+      parameters: [
+        {
+          key: "site_login",
+          parameterType: "credential",
+          dataType: WorkflowParameterValueType.CredentialId,
+          credentialId: "",
+          description: null,
+        } as never,
+      ],
+    });
+    renderDoc([code("tidy_up", null)]);
+    expect(
+      useDocRunStore.getState().inputs.map((input) => input.key),
+    ).not.toContain("site_login");
   });
 
   test("an input added, renamed and deleted in the Doc is the workflow's parameter and its mentions follow", () => {

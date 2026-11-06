@@ -10,8 +10,8 @@ import {
 import { expect, it, vi } from "vitest";
 import { ActiveOrgContext } from "@/store/ActiveOrgContext";
 import type { WorkflowRunTimelineItem } from "../../types/workflowRunTypes";
-import { markStepRun, useDocRunStore } from "./docRunStore";
-import { useDocRun } from "./useDocRun";
+import { isStepRun, markStepRun, useDocRunStore } from "./docRunStore";
+import { docLatestRunKey, useDocRun } from "./useDocRun";
 
 const timeline = vi.hoisted(() => ({
   data: [] as WorkflowRunTimelineItem[],
@@ -334,4 +334,95 @@ it("skips a step run started in this browser when choosing the latest run", asyn
   const { result } = renderHook(() => useDocRun(), { wrapper: sharedWrapper });
   await waitFor(() => expect(result.current.runId).toBe("wr_full"));
   urlRun.id = "wr_1";
+});
+
+it("skips a one-step run the server marks as a debug-session run, even from a browser that did not start it", async () => {
+  urlRun.id = undefined;
+  localStorage.clear();
+  client.get.mockResolvedValue({
+    data: [
+      { workflow_run_id: "wr_step", debug_session_id: "ds_1" },
+      { workflow_run_id: "wr_full", debug_session_id: null },
+    ],
+  });
+  const { result } = renderHook(() => useDocRun(), { wrapper: sharedWrapper });
+  await waitFor(() => expect(result.current.runId).toBe("wr_full"));
+  urlRun.id = "wr_1";
+});
+
+it("pages back past one-step runs once, then later polls read the first page only", async () => {
+  urlRun.id = undefined;
+  localStorage.clear();
+  const page = (n: number, full?: string) =>
+    Array.from({ length: 20 }, (_, i) => ({
+      workflow_run_id: i === 19 && full ? full : `wr_step_${n}_${i}`,
+      debug_session_id: i === 19 && full ? null : "ds_1",
+    }));
+  client.get.mockReset();
+  let firstPage = page(1);
+  client.get.mockImplementation(
+    async (_url: string, config?: { params?: { page?: number } }) => ({
+      data:
+        config?.params?.page === 1
+          ? firstPage
+          : config?.params?.page === 2
+            ? page(2, "wr_full")
+            : page(config?.params?.page ?? 0),
+    }),
+  );
+  const queryClient = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <ActiveOrgContext.Provider value="org_a">
+          {children}
+        </ActiveOrgContext.Provider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  const { result } = renderHook(
+    () => {
+      // Every step calls the hook; they share one query and one answer.
+      useDocRun();
+      return useDocRun();
+    },
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.runId).toBe("wr_full"));
+  expect(client.get).toHaveBeenCalledTimes(2);
+
+  // Later polls: one more request each, and the full run found earlier stays.
+  firstPage = page(3);
+  await act(() =>
+    queryClient.invalidateQueries({
+      queryKey: docLatestRunKey("org_a", "wpid_1"),
+    }),
+  );
+  await waitFor(() => expect(client.get).toHaveBeenCalledTimes(3));
+  expect(result.current.runId).toBe("wr_full");
+
+  // A new full run on the first page replaces it.
+  firstPage = [
+    { workflow_run_id: "wr_newer", debug_session_id: null },
+  ] as never;
+  await act(() =>
+    queryClient.invalidateQueries({
+      queryKey: docLatestRunKey("org_a", "wpid_1"),
+    }),
+  );
+  await waitFor(() => expect(result.current.runId).toBe("wr_newer"));
+  expect(client.get).toHaveBeenCalledTimes(4);
+  client.get.mockReset();
+  urlRun.id = "wr_1";
+});
+
+it("still recognises a step run when storage is blocked", () => {
+  const blocked = vi
+    .spyOn(Storage.prototype, "setItem")
+    .mockImplementation(() => {
+      throw new Error("blocked");
+    });
+  markStepRun("wr_blocked");
+  blocked.mockRestore();
+  expect(isStepRun("wr_blocked")).toBe(true);
 });

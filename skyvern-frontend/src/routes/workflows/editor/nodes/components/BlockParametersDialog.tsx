@@ -80,6 +80,8 @@ interface BlockParametersDialogProps {
   initialValues: Record<string, unknown>;
   onSubmit: (values: Record<string, unknown>) => void;
   isLoading?: boolean;
+  // Opened from the Doc: name the step in Doc words, not its internal label.
+  inDoc?: boolean;
 }
 
 function getDefaultValues(
@@ -120,6 +122,7 @@ function BlockParametersDialog({
   initialValues,
   onSubmit,
   isLoading = false,
+  inDoc = false,
 }: BlockParametersDialogProps) {
   const [values, setValues] = useState<Record<string, unknown>>({});
 
@@ -166,13 +169,39 @@ function BlockParametersDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Enter Input Values</DialogTitle>
+          <DialogTitle>
+            {inDoc ? "Run this step with" : "Enter Input Values"}
+          </DialogTitle>
           <DialogDescription>
-            The block "{blockLabel}" requires the following inputs to run.
+            {inDoc
+              ? "This step uses these inputs."
+              : `The block "${blockLabel}" requires the following inputs to run.`}
           </DialogDescription>
         </DialogHeader>
 
-        <ScrollArea>
+        <ScrollArea
+          onKeyDown={(event) => {
+            // Enter runs from a typed field; Shift+Enter keeps its line break. Key events from
+            // portaled pickers (credential search) bubble here through React but are not ours.
+            const field = event.target as HTMLElement;
+            if (
+              event.key !== "Enter" ||
+              event.defaultPrevented ||
+              !event.currentTarget.contains(field) ||
+              event.shiftKey ||
+              event.nativeEvent.isComposing ||
+              // Safari ends composition before the Enter that commits a candidate, which then reports keyCode 229.
+              event.keyCode === 229 ||
+              !(
+                field instanceof HTMLTextAreaElement ||
+                field instanceof HTMLInputElement
+              )
+            )
+              return;
+            event.preventDefault();
+            if (!isLoading) handleSubmit();
+          }}
+        >
           {/* Height set to ~3.5 parameters to create visual cutoff hint */}
           <ScrollAreaViewport className="max-h-[340px]">
             {/* px-1 prevents focus ring from being clipped on left/right edges */}
@@ -232,6 +261,8 @@ function BlockParametersDialog({
                 <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                 Running...
               </>
+            ) : inDoc ? (
+              "Run"
             ) : (
               "Run Block"
             )}

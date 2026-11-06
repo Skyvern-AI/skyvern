@@ -22,14 +22,86 @@ import {
 import { useHeroScreenshot } from "../../studio/runview/useHeroScreenshot";
 import { useBlockScreenshot } from "../../workflowRun/useBlockScreenshot";
 import type { WorkflowRunBlock } from "../../types/workflowRunTypes";
+import { useBlockRunTarget } from "../hooks/useBlockRunTarget";
 import { useDocRun } from "./useDocRun";
 import {
   blockFailureHeadline,
   docLoopProgressText,
   docRunStoppedByStep,
+  runFailureHeadline,
   stoppedOnPurpose,
+  type DocLoopItem,
   type DocLoopProgress,
 } from "./docRunState";
+
+function DocLoopItemLine({ item }: { item: DocLoopItem }) {
+  const [open, setOpen] = useState(false);
+  const words = (
+    <span className="min-w-0 [overflow-wrap:anywhere]">
+      Item {item.index + 1}
+      {item.title ? ` · ${item.title}` : ""}
+      {item.state === "failed" && item.failureHeadline
+        ? ` · ${item.failureHeadline}`
+        : ""}
+    </span>
+  );
+  const dot = (
+    <span className="mt-[3px] flex">
+      <StatusDot
+        status={
+          item.state === "failed"
+            ? Status.Failed
+            : item.state === "running"
+              ? Status.Running
+              : item.state === "waiting"
+                ? Status.Paused
+                : Status.Completed
+        }
+        isFinalized={item.state !== "running"}
+      />
+    </span>
+  );
+  return (
+    <li
+      className={cn(
+        "min-w-0",
+        item.state === "failed" ? "text-destructive" : "text-muted-foreground",
+      )}
+    >
+      {item.detail ? (
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-label={`${open ? "Hide" : "Show"} item ${item.index + 1}`}
+          onClick={() => setOpen((v) => !v)}
+          className="flex min-w-0 items-start gap-1.5 rounded text-left outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <ChevronRightIcon
+            className={cn(
+              "mt-[3px] size-3 shrink-0 transition-transform",
+              open && "rotate-90",
+            )}
+          />
+          {dot}
+          {words}
+        </button>
+      ) : (
+        <div className="flex min-w-0 items-start gap-1.5 pl-[18px]">
+          {dot}
+          {words}
+        </div>
+      )}
+      {open && item.detail && (
+        <pre
+          className="ml-[18px] mt-1 max-h-[240px] overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted p-2 font-mono text-xs text-foreground [overflow-wrap:anywhere]"
+          data-testid="doc-loop-item-value"
+        >
+          {item.detail}
+        </pre>
+      )}
+    </li>
+  );
+}
 
 function DocLoopItems({ progress }: { progress: DocLoopProgress }) {
   return (
@@ -38,42 +110,7 @@ function DocLoopItems({ progress }: { progress: DocLoopProgress }) {
       data-testid="doc-loop-items"
     >
       {progress.items.map((item) => (
-        <li
-          key={item.index}
-          className={cn(
-            "flex min-w-0 items-start gap-1.5",
-            item.state === "failed"
-              ? "text-destructive"
-              : "text-muted-foreground",
-          )}
-        >
-          <span className="mt-[3px] flex">
-            <StatusDot
-              status={
-                item.state === "failed"
-                  ? Status.Failed
-                  : item.state === "running"
-                    ? Status.Running
-                    : item.state === "waiting"
-                      ? Status.Paused
-                      : Status.Completed
-              }
-              isFinalized={item.state !== "running"}
-            />
-          </span>
-          <span
-            className={cn(
-              "min-w-0",
-              item.state === "failed" ? "truncate" : "[overflow-wrap:anywhere]",
-            )}
-          >
-            Item {item.index + 1}
-            {item.value ? ` · ${item.value}` : ""}
-            {item.state === "failed" && item.failureHeadline
-              ? ` · ${item.failureHeadline}`
-              : ""}
-          </span>
-        </li>
+        <DocLoopItemLine key={item.index} item={item} />
       ))}
     </ul>
   );
@@ -159,8 +196,11 @@ export function DocStepResult({
     live,
     blockRun,
     unknownLabels,
+    ranLabels,
+    rowsLoaded,
   } = useDocRun();
   const [open, setOpen] = useState(false);
+  const { blockLabel: targetLabel } = useBlockRunTarget();
   const block = blocksByLabel.get(label);
   const screenshot = useBlockScreenshot(
     block?.workflow_run_block_id,
@@ -169,7 +209,20 @@ export function DocStepResult({
   );
   if (!runId || unknownLabels.has(label)) return null;
   if (!block) {
-    if (!run || blockRun) return null;
+    // A one-step run can fail before its step has a row (a missing input or credential); the line says so.
+    const runFailure = run && !live ? runFailureHeadline(run) : null;
+    if (blockRun && rowsLoaded && label === targetLabel && runFailure)
+      return (
+        <div
+          className="mb-1 mt-1 text-[13px] text-destructive"
+          data-testid="doc-step-result"
+          data-doc-run-failed
+        >
+          Failed: {runFailure}
+        </div>
+      );
+    if (!run || blockRun || !rowsLoaded) return null;
+    if (ranLabels && !ranLabels.has(label)) return null;
     // A live run has not got here yet: say so, so every step in the run shows one state.
     if (live) {
       return (

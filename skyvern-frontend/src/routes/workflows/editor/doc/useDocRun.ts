@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { AxiosError } from "axios";
 import { getClient } from "@/api/AxiosClient";
@@ -28,6 +28,7 @@ import type {
 import {
   collectLoopProgress,
   sameSteps,
+  stepLabelsOf,
   stepsUnknownToRun,
   type DocLoopProgress,
 } from "./docRunState";
@@ -97,23 +98,54 @@ export const docLatestRunKey = (
 
 // Polls only while the tab is visible (react-query pauses interval refetches in a hidden tab).
 const LATEST_RUN_POLL_MS = 15_000;
+const LATEST_RUN_PAGE_SIZE = 20;
+const MAX_LATEST_RUN_PAGES = 5;
 
 // The agent's newest run from any browser or origin; every browser and tab reads the same one.
 function useLatestRun(workflowPermanentId: string | undefined) {
   const credentialGetter = useCredentialGetter();
   const orgId = useActiveOrgId();
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: docLatestRunKey(orgId, workflowPermanentId),
     refetchInterval: LATEST_RUN_POLL_MS,
     refetchOnWindowFocus: "always",
     queryFn: async () => {
       const client = await getClient(credentialGetter);
-      const runs = (
-        await client.get<Array<WorkflowRunApiResponse>>(
-          `/workflows/${workflowPermanentId}/runs?page_size=5`,
-        )
-      ).data;
-      return runs.map((candidate) => candidate.workflow_run_id);
+      const fetchPage = async (page: number) =>
+        (
+          await client.get<
+            Array<WorkflowRunApiResponse & { debug_session_id?: string | null }>
+          >(`/workflows/${workflowPermanentId}/runs`, {
+            params: { page, page_size: LATEST_RUN_PAGE_SIZE },
+          })
+        ).data;
+      // A one-step (Play) run carries a debug session; it says nothing about the steps it did not run.
+      const fullRuns = (runs: Awaited<ReturnType<typeof fetchPage>>) =>
+        runs
+          .filter((candidate) => !candidate.debug_session_id)
+          .map((candidate) => candidate.workflow_run_id);
+      let page = 1;
+      let runs = await fetchPage(page);
+      let ids = fullRuns(runs);
+      // A full run on the first page is the answer. Without one, page back only while the query has no answer yet;
+      // later polls keep that answer until the first page shows a newer full run.
+      const earlier = queryClient.getQueryData<string[]>(
+        docLatestRunKey(orgId, workflowPermanentId),
+      );
+      if (ids.length === 0 && earlier) {
+        ids = earlier;
+      } else if (ids.length === 0) {
+        while (
+          ids.length === 0 &&
+          runs.length === LATEST_RUN_PAGE_SIZE &&
+          page < MAX_LATEST_RUN_PAGES
+        ) {
+          runs = await fetchPage(++page);
+          ids = fullRuns(runs);
+        }
+      }
+      return ids;
     },
     enabled: Boolean(workflowPermanentId),
   });
@@ -207,7 +239,13 @@ export function useDocRun() {
         : NO_LABELS,
     [run, current, earlierVersion],
   );
+  // A step added since the run (even unsaved) was not in it, so it cannot be "not reached".
+  const ranLabels = useMemo(
+    () => (run ? stepLabelsOf(run.workflow.workflow_definition) : null),
+    [run],
+  );
   return {
+    ranLabels,
     earlierVersion,
     unknownLabels,
     sharedRunId: storedGone ? null : sharedRunId,
@@ -216,6 +254,8 @@ export function useDocRun() {
     blocksByLabel: projection?.blocks ?? EMPTY,
     loopsByLabel: projection?.loops ?? NO_LOOPS,
     live: Boolean(run && runIsLogicallyActive(run)),
+    // Until the run's step rows arrive, a missing row means "not loaded", not "not reached".
+    rowsLoaded: Boolean(projection),
     // Whether this browser started the run (or opened it by URL). Only an owned run locks the Doc,
     // offers Stop and ends with a toast; a run from elsewhere is drawn the same but read-only.
     owned: Boolean(urlRunId || (runId && runId === storedRunId)),
