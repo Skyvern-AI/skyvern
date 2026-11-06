@@ -6849,7 +6849,7 @@ wheels = [
 
 [[package]]
 name = "skyvern"
-version = "1.0.57"
+version = "1.0.56"
 source = { editable = "." }
 dependencies = [
     { name = "cachetools" },
