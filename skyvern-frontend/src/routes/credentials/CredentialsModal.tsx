@@ -1372,7 +1372,9 @@ function CredentialsModal({
       }
       if (extra_site_urls !== undefined) {
         body.extra_site_urls = extra_site_urls;
-        body.expected_site_urls = expected_site_urls ?? [];
+      }
+      if (expected_site_urls !== undefined) {
+        body.expected_site_urls = expected_site_urls;
       }
       if (user_context !== undefined) {
         body.user_context = user_context;
@@ -1483,6 +1485,12 @@ function CredentialsModal({
       supportsInlineTest &&
       testAndSave !== savedBrowserSessionIntent;
 
+    const trimmedTestUrl = testUrl.trim();
+    const testUrlChanged =
+      isEditMode &&
+      trimmedTestUrl !== "" &&
+      trimmedTestUrl !== (editingCredential?.tested_url ?? "");
+
     // In edit mode, use editingGroups to determine what changed (type-agnostic)
     if (isEditMode && editingCredential) {
       if (
@@ -1492,7 +1500,8 @@ function CredentialsModal({
         !bmChanged &&
         !runSequentiallyChanged &&
         !saveBrowserSessionIntentChanged &&
-        !extraSitesChanged
+        !extraSitesChanged &&
+        !testUrlChanged
       ) {
         // Nothing was edited — close silently
         reset();
@@ -1510,6 +1519,12 @@ function CredentialsModal({
             : {}),
           ...(saveBrowserSessionIntentChanged
             ? { save_browser_session_intent: testAndSave }
+            : {}),
+          ...(testUrlChanged
+            ? {
+                tested_url: trimmedTestUrl,
+                expected_site_urls: expectedSiteUrls,
+              }
             : {}),
           ...extraSitesPatch,
         });

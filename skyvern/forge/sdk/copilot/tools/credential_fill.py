@@ -908,11 +908,7 @@ async def _request_credential(
         )
     if site_answer is not None:
         connected["saved_site_change"] = (
-            f"The user moved this login to {site_answer.site_b}; it no longer signs in on "
-            f"{site_answer.saved_sites_text}."
-            if site_answer.action == "move"
-            else f"The user added {site_answer.site_b} to this login's sites; it still signs in on "
-            f"{site_answer.saved_sites_text}."
+            f"The user allowed this login on {site_answer.site_b}; it still signs in on {site_answer.saved_sites_text}."
         )
     if policy.raw_secret_redacted_draft:
         connected["next"] = RAW_SECRET_CONNECTED_NEXT

@@ -152,7 +152,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotCredentialResponseResult,
     WorkflowCopilotStreamMessageType,
 )
-from skyvern.forge.sdk.workflow.models.credential_release import CredentialReleaseGuard, saved_site_urls
+from skyvern.forge.sdk.workflow.models.credential_release import saved_site_urls
 from tests.unit.conftest import make_copilot_context
 from tests.unit.copilot_test_helpers import wire_credential_vault
 from tests.unit.scoped_asyncio import ScopedAsyncio
@@ -4848,7 +4848,7 @@ async def test_a_recovery_card_opens_with_the_site_question_for_the_refused_logi
 
     async def answer_first_frame(frame: WorkflowCopilotCredentialRequiredUpdate) -> bool:
         if frame.type == WorkflowCopilotStreamMessageType.CREDENTIAL_REQUIRED:
-            posted.append(await _post_card_answer(frame, "cred_svc", "move"))
+            posted.append(await _post_card_answer(frame, "cred_svc", "add"))
         return True
 
     ctx.stream.send = AsyncMock(side_effect=answer_first_frame)
@@ -4860,7 +4860,7 @@ async def test_a_recovery_card_opens_with_the_site_question_for_the_refused_logi
     assert (card.site_question.credential_id, card.site_question.site) == ("cred_svc", _SITE_B_ORIGIN)
     assert card.site_question.saved_sites == ["https://portal.example.com"]
     assert [answer.result for answer in posted] == ["accepted"]
-    assert rows.rows["cred_svc"].tested_url == f"{_SITE_B_ORIGIN}/login"
+    assert rows.rows["cred_svc"].extra_site_urls == [f"{_SITE_B_ORIGIN}/login"]
     assert result["status"] == "connected"
 
 
@@ -4870,69 +4870,9 @@ def _page_on(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_moving_a_login_to_the_recovery_site_saves_that_site_and_fills_there_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rows = _CredentialRows(_site_a_login())
-    ctx, _ = _site_question_ctx(monkeypatch, rows)
-    posted: list[WorkflowCopilotCredentialResponseResult] = []
-    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("move", posted))
-
-    with capture_logs() as logs:
-        result = await _ask(ctx, _SITE_B_ASK)
-
-    asked, moved = posted
-    assert asked.result == "site_question"
-    assert asked.site_question.site == _SITE_B_ORIGIN
-    assert asked.site_question.saved_sites == ["https://portal.example.com"]
-    assert asked.site_question.vault_sourced is False
-    assert asked.site_question.name == "Service Login"
-    assert moved.result == "accepted"
-    assert rows.rows["cred_svc"].tested_url == f"{_SITE_B_ORIGIN}/login"
-    assert rows.rows["cred_svc"].extra_site_urls == []
-    assert result["status"] == "connected"
-    assert "saved_site_change" in result
-    assert ctx.credential_origin_recovery is None
-    [resolved] = _sent_resolutions(ctx)
-    assert (resolved.outcome, resolved.site_answer, resolved.site_a, resolved.site_b) == (
-        "connected",
-        "move",
-        "https://portal.example.com",
-        _SITE_B_ORIGIN,
-    )
-    receipt = credential_pause_module.credential_pause_receipt(ctx)
-    assert (receipt["siteAnswer"], receipt["name"]) == ("move", "Service Login")
-    TypeAdapter(TurnNarrativePayload).validate_python(
-        copilot_routes._make_error_narrative_payload(None, 0, "done")
-        | {"credentialPause": receipt, "credentialPauses": [receipt, receipt]}
-    )
-    [changed] = [line for line in logs if line["event"] == "copilot_credential_site_changed"]
-    assert (changed["action"], changed["site_a"], changed["site_b"]) == (
-        "move",
-        "https://portal.example.com",
-        _SITE_B_ORIGIN,
-    )
-
-    _page_on(monkeypatch, f"{_SITE_B_ORIGIN}/login")
-    grant, error = await credential_fill_module._credential_fill_origin_grant(ctx, "cred_svc")
-    assert error is None and grant is not None
-    assert credential_fill_module._within_grant(f"{_SITE_B_ORIGIN}/password", grant)
-    assert not credential_fill_module._within_grant(_SITE_A, grant)
-    [armed] = CredentialReleaseGuard().arm_login(
-        ["synthetic-password"],
-        "service_login",
-        tested_url=rows.rows["cred_svc"].tested_url,
-        vault_sites=None,
-        enforce_vault_sites=True,
-        extra_site_urls=rows.rows["cred_svc"].extra_site_urls,
-    )
-    assert armed.admits(f"{_SITE_B_ORIGIN}/home") and not armed.admits(_SITE_A)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("rejected_by_site", [False, True])
 @pytest.mark.parametrize("refusal", ["open_recovery", "refusals_only"])
-async def test_an_update_ask_for_the_refused_login_opens_the_recovery_card_until_move_saves_it_there(
+async def test_an_update_ask_for_the_refused_login_opens_the_recovery_card_until_allow_saves_it_there(
     monkeypatch: pytest.MonkeyPatch, rejected_by_site: bool, refusal: str
 ) -> None:
     rows = _CredentialRows(_site_a_login())
@@ -4941,7 +4881,7 @@ async def test_an_update_ask_for_the_refused_login_opens_the_recovery_card_until
         ctx.credential_origin_recovery = None
         ctx.credential_origin_refusals = {(_SITE_B_ORIGIN, "cred_svc")}
     posted: list[WorkflowCopilotCredentialResponseResult] = []
-    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("move", posted))
+    ctx.stream.send = AsyncMock(side_effect=_answer_site_question("add", posted))
 
     result = await _request_credential(
         _SITE_B_ASK, "Add 2FA.", ctx, credential_id="cred_svc", rejected_by_site=rejected_by_site
@@ -4954,7 +4894,7 @@ async def test_an_update_ask_for_the_refused_login_opens_the_recovery_card_until
     assert posted[0].result == "site_question"
     assert result["status"] == "connected"
     assert "update_card" in result
-    assert rows.rows["cred_svc"].tested_url == f"{_SITE_B_ORIGIN}/login"
+    assert rows.rows["cred_svc"].extra_site_urls == [f"{_SITE_B_ORIGIN}/login"]
     assert ctx.credential_origin_recovery is None
     assert ctx.credential_origin_refusals == set()
 
@@ -4975,9 +4915,37 @@ async def test_adding_the_recovery_site_keeps_the_first_and_later_turns_fill_on_
     posted: list[WorkflowCopilotCredentialResponseResult] = []
     ctx.stream.send = AsyncMock(side_effect=_answer_site_question("add", posted))
 
-    result = await _ask(ctx, _SITE_B_ASK)
+    with capture_logs() as logs:
+        result = await _ask(ctx, _SITE_B_ASK)
 
+    asked, allowed = posted
+    assert asked.result == "site_question"
+    assert asked.site_question.site == _SITE_B_ORIGIN
+    assert asked.site_question.saved_sites == ["https://portal.example.com"]
+    assert asked.site_question.vault_sourced is False
+    assert asked.site_question.name == "Service Login"
+    assert allowed.result == "accepted"
     assert result["status"] == "connected"
+    assert "saved_site_change" in result
+    [resolved] = _sent_resolutions(ctx)
+    assert (resolved.outcome, resolved.site_answer, resolved.site_a, resolved.site_b) == (
+        "connected",
+        "add",
+        "https://portal.example.com",
+        _SITE_B_ORIGIN,
+    )
+    [changed] = [line for line in logs if line["event"] == "copilot_credential_site_changed"]
+    assert (changed["action"], changed["site_a"], changed["site_b"]) == (
+        "add",
+        "https://portal.example.com",
+        _SITE_B_ORIGIN,
+    )
+    receipt = credential_pause_module.credential_pause_receipt(ctx)
+    assert (receipt["siteAnswer"], receipt["name"]) == ("add", "Service Login")
+    TypeAdapter(TurnNarrativePayload).validate_python(
+        copilot_routes._make_error_narrative_payload(None, 0, "done")
+        | {"credentialPause": receipt, "credentialPauses": [receipt, receipt]}
+    )
     assert rows.rows["cred_svc"].tested_url == _SITE_A
     assert rows.rows["cred_svc"].extra_site_urls == [f"{_SITE_B_ORIGIN}/login"]
     [held] = [c for c in ctx.request_policy.resolved_credentials if c.credential_id == "cred_svc"]
@@ -5056,7 +5024,7 @@ def _existing_workflow_on_site_b_broadens_scope(ctx: CopilotContext) -> bool:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("answer", "broadens"), [("add", False), ("move", False), ("no", True)])
+@pytest.mark.parametrize(("answer", "broadens"), [("add", False), ("no", True)])
 async def test_an_existing_workflow_moves_onto_the_site_only_after_the_user_saved_the_login_there(
     monkeypatch: pytest.MonkeyPatch, answer: str, broadens: bool
 ) -> None:
@@ -5142,19 +5110,9 @@ _ASKED_FRAME = SimpleNamespace(turn_id="turn-1", workflow_copilot_chat_id="chat-
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("case", "answer"),
-    [
-        ("other_login", "move"),
-        ("vault_sourced", "move"),
-        ("sites_changed", "move"),
-        ("no_question", "move"),
-        ("userinfo_site", "move"),
-        ("userinfo_site", "add"),
-    ],
-)
+@pytest.mark.parametrize("case", ["other_login", "vault_sourced", "sites_changed", "no_question", "userinfo_site"])
 async def test_a_site_answer_the_card_did_not_ask_for_writes_nothing(
-    monkeypatch: pytest.MonkeyPatch, case: str, answer: str
+    monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
     rows = _CredentialRows(_site_a_login(), _site_a_login("cred_other"))
     _site_question_ctx(monkeypatch, rows)
@@ -5170,7 +5128,7 @@ async def test_a_site_answer_the_card_did_not_ask_for_writes_nothing(
     monkeypatch.setattr(app._inst, "CACHE", cache, raising=False)
 
     with pytest.raises(HTTPException) as excinfo:
-        await _post_card_answer(_ASKED_FRAME, "cred_other" if case == "other_login" else "cred_svc", answer)
+        await _post_card_answer(_ASKED_FRAME, "cred_other" if case == "other_login" else "cred_svc", "add")
 
     expected = status.HTTP_422_UNPROCESSABLE_ENTITY if case == "userinfo_site" else status.HTTP_409_CONFLICT
     assert excinfo.value.status_code == expected
@@ -5321,7 +5279,7 @@ async def test_a_site_saved_after_the_pause_ended_reports_the_login_not_connecte
     ],
     ids=["vault_uris", "connected_vault_without_sites"],
 )
-async def test_a_login_whose_sites_come_from_a_vault_is_asked_without_add_or_move(
+async def test_a_login_whose_sites_come_from_a_vault_is_asked_without_allow(
     monkeypatch: pytest.MonkeyPatch, vault_item: CredentialItem
 ) -> None:
     rows = _CredentialRows(_site_a_login(tested_url=None))
@@ -5343,7 +5301,7 @@ async def test_a_login_whose_sites_come_from_a_vault_is_asked_without_add_or_mov
     assert asked.result == "site_question"
     assert asked.site_question.vault_sourced is True
     with pytest.raises(HTTPException) as excinfo:
-        await _post_card_answer(_ASKED_FRAME, "cred_svc", "move")
+        await _post_card_answer(_ASKED_FRAME, "cred_svc", "add")
     assert excinfo.value.status_code == status.HTTP_409_CONFLICT
     assert rows.updates == []
 

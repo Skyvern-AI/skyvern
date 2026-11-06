@@ -701,9 +701,8 @@ async def claim_credential_site_change(
     turn_id: str,
     resume_token: str,
     credential_id: str,
-    action: Literal["add", "move"],
 ) -> SiteChangeClaim:
-    """Reserve the pause for one Add or Move while the login's sites are saved outside the pause lock."""
+    """Reserve the pause for one Allow while the login's sites are saved outside the pause lock."""
     active_key = credential_pause_active_key(organization_id, workflow_copilot_chat_id, turn_id)
     async with cache.get_lock(_credential_pause_lock_key(organization_id, workflow_copilot_chat_id, turn_id)):
         record = _validate_pending_pause(_decode_active_pause(await cache.get(active_key)), resume_token)
@@ -718,7 +717,7 @@ async def claim_credential_site_change(
             claim_id=claim_id,
             site_url=record.site_url or "",
             question=question,
-            answer=_site_answer(action, record, question),
+            answer=_site_answer("add", record, question),
         )
 
 
@@ -816,7 +815,7 @@ def _decode_site_answer(data: Any) -> SiteAnswer | None:
     if not isinstance(data, dict):
         return None
     action, site_a, site_b = data.get("action"), data.get("site_a"), data.get("site_b")
-    if action not in ("add", "move", "no") or not isinstance(site_a, str) or not isinstance(site_b, str):
+    if action not in ("add", "no") or not isinstance(site_a, str) or not isinstance(site_b, str):
         return None
     name, saved_sites = data.get("name"), data.get("saved_sites")
     return SiteAnswer(
@@ -1694,9 +1693,6 @@ async def _run_credential_pause(
             return resolution
         if isinstance(policy, RequestPolicy):
             policy.refresh_credential(credential)
-            carried = policy.carried_credential_urls.get(credential.credential_id)
-            if site_answer.action == "move" and carried and not same_release_scope(carried, site_answer.site_b):
-                policy.carried_credential_urls.pop(credential.credential_id)
             apply_connected_credential_to_policy(ctx, policy, credential, confirmed_site_url=site_answer.site_b)
         settle("connected", site_answer)
         await answered("connected", credential, site_answer=site_answer)
